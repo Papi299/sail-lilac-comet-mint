@@ -1,0 +1,38 @@
+{
+  "url": "http://127.0.0.1:8081/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "VideoFetch",
+      "hasCanvas": false,
+      "bodyTextLen": 365,
+      "bodyTextHash": "4a046720f661435c2dcce1061799fb8f1a04ee62b4e1257f2df107d2bcb0c805",
+      "bodyTextPrefix": "VideoFetch Home Supported Sites FAQ VideoFetch Download videos i",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "VideoFetch",
+      "hasCanvas": false,
+      "bodyTextLen": 291,
+      "bodyTextHash": "095064c87e7a64d5fccb7eb67f3a45f77df9c7479df2dfb265638717e63c812e",
+      "bodyTextPrefix": "VideoFetch Sites FAQ VideoFetch Download videos in the format yo",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-built.json",
+  "divergesFromBaseline": false,
+  "baselineReasons": []
+}

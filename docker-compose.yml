@@ -1,0 +1,15 @@
+services:
+  videofetch:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      NODE_ENV: production
+      TEMP_DIRECTORY: /tmp/videofetch
+      MAX_FILE_SIZE: "524288000"
+      MAX_VIDEO_DURATION: "7200"
+      FILE_EXPIRATION_MINUTES: "45"
+      MAX_CONCURRENT_DOWNLOADS: "3"
+      RATE_LIMIT: "20"
+    tmpfs:
+      - /tmp/videofetch:size=2g
