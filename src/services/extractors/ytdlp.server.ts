@@ -1,8 +1,9 @@
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { config, resolveYtdlp } from "@/lib/config";
+import { config, isYtdlpNetworkIsolated, resolveYtdlp } from "@/lib/config";
 import { AppError, mapExtractorMessage } from "@/lib/errors";
 import { log, redactUrl } from "@/lib/logger";
+import { assertSafeUrl } from "@/lib/security/ssrf.server";
 import { extractDomain } from "@/lib/validation/url";
 import {
   buildPresets,
@@ -14,7 +15,7 @@ import {
 } from "@/services/extractors/normalize";
 import type { DownloadContext, DownloadFormatRequest, DownloadResult, MediaExtractor } from "@/services/extractors/types";
 import { ffmpegAvailable } from "@/services/processing/ffmpeg.server";
-import { runProcess } from "@/services/processing/process-runner.server";
+import { runProcess, type RunResult } from "@/services/processing/process-runner.server";
 import type { NormalizedFormat, VideoMetadata } from "@/types/media";
 
 type YtdlpInfo = {
@@ -37,6 +38,24 @@ type YtdlpInfo = {
   acodec?: string;
   format_id?: string;
 };
+
+type ProcessRunner = typeof runProcess;
+let processRunner: ProcessRunner = runProcess;
+
+export function setYtdlpProcessRunnerForTests(runner: ProcessRunner | null): void {
+  processRunner = runner ?? runProcess;
+}
+
+/**
+ * Fail-closed unless the operator attests that yt-dlp runs with independent
+ * egress isolation. Initial URL validation is still applied when enabled;
+ * it is not a substitute for that isolation.
+ */
+export function assertYtdlpNetworkPolicy(): void {
+  if (!isYtdlpNetworkIsolated()) {
+    throw new AppError("EXTRACTOR_UNAVAILABLE");
+  }
+}
 
 function ytdlpArgs(extra: string[], opts?: { quiet?: boolean }): string[] {
   const { argsPrefix } = resolveYtdlp();
@@ -70,6 +89,11 @@ function parseJsonPayload(stdout: string): YtdlpInfo {
   }
 }
 
+async function spawnYtdlpNetwork(opts: Parameters<ProcessRunner>[0]): Promise<RunResult> {
+  assertYtdlpNetworkPolicy();
+  return processRunner(opts);
+}
+
 export async function ytdlpAvailable(): Promise<boolean> {
   try {
     const { command } = resolveYtdlp();
@@ -86,7 +110,7 @@ export async function ytdlpAvailable(): Promise<boolean> {
 
 async function dumpInfo(url: string): Promise<YtdlpInfo> {
   const { command } = resolveYtdlp();
-  const result = await runProcess({
+  const result = await spawnYtdlpNetwork({
     command,
     args: ytdlpArgs(["-J", "--skip-download", url], { quiet: true }),
     timeoutMs: config.analysisTimeoutMs,
@@ -150,9 +174,11 @@ export const ytdlpExtractor: MediaExtractor = {
     return /^https?:\/\//i.test(url);
   },
   async getMetadata(url: string) {
+    assertYtdlpNetworkPolicy();
+    const safe = await assertSafeUrl(url);
     const mp3 = await ffmpegAvailable();
-    const info = await dumpInfo(url);
-    const meta = metadataFromInfo(info, url, mp3);
+    const info = await dumpInfo(safe.url);
+    const meta = metadataFromInfo(info, safe.url, mp3);
     if (!meta.formats.length && !meta.presets.length) {
       throw new AppError("EXTRACTION_FAILED");
     }
@@ -175,6 +201,8 @@ export async function downloadWithYtdlp(
   format: DownloadFormatRequest,
   ctx: DownloadContext,
 ): Promise<DownloadResult> {
+  assertYtdlpNetworkPolicy();
+  const safe = await assertSafeUrl(url);
   const { command } = resolveYtdlp();
   const plan = ytDlpFormatSelector(format.formatId);
   const outTemplate = join(ctx.workDir, "download.%(ext)s");
@@ -186,9 +214,9 @@ export async function downloadWithYtdlp(
   }
 
   let lastProgress: number | null = 0;
-  const result = await runProcess({
+  const result = await spawnYtdlpNetwork({
     command,
-    args: ytdlpArgs([...extra, url]),
+    args: ytdlpArgs([...extra, safe.url]),
     timeoutMs: config.downloadTimeoutMs,
     cwd: ctx.workDir,
     signal: ctx.signal,
@@ -202,7 +230,7 @@ export async function downloadWithYtdlp(
 
   if (result.code !== 0) {
     log.warn("yt-dlp download failed", {
-      url: redactUrl(url),
+      url: redactUrl(safe.url),
       stderr: result.stderr.slice(-800),
     });
     throw mapExtractorMessage(result.stderr || result.stdout);

@@ -9,6 +9,7 @@ export type ErrorCode =
   | "TIMEOUT"
   | "NETWORK_ERROR"
   | "EXTRACTION_FAILED"
+  | "EXTRACTOR_UNAVAILABLE"
   | "TOO_LARGE"
   | "TOO_LONG"
   | "RATE_LIMITED"
@@ -28,6 +29,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   TIMEOUT: "The video took too long to process.",
   NETWORK_ERROR: "We couldn't connect to the source website.",
   EXTRACTION_FAILED: "We couldn't extract the video streams from this page.",
+  EXTRACTOR_UNAVAILABLE:
+    "Generic website extraction is temporarily unavailable on this server.",
   TOO_LARGE: "This video exceeds the maximum supported download size.",
   TOO_LONG: "This video exceeds the maximum supported duration.",
   RATE_LIMITED: "Too many requests. Please wait a moment and try again.",
@@ -47,6 +50,7 @@ const STATUS_BY_CODE: Record<ErrorCode, number> = {
   TIMEOUT: 504,
   NETWORK_ERROR: 502,
   EXTRACTION_FAILED: 502,
+  EXTRACTOR_UNAVAILABLE: 503,
   TOO_LARGE: 413,
   TOO_LONG: 413,
   RATE_LIMITED: 429,

@@ -29,6 +29,18 @@ export const config = {
   nodeEnv: str("NODE_ENV", "development"),
 };
 
+/**
+ * Operator assertion that yt-dlp will run inside an independently enforced
+ * safe-egress environment (private network namespace / egress filter).
+ *
+ * This flag is NOT itself an isolation boundary. Default is fail-closed.
+ * Read at call time so tests can toggle it without reloading the module.
+ */
+export function isYtdlpNetworkIsolated(): boolean {
+  const raw = process.env.YTDLP_NETWORK_ISOLATED?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
 export function resolveYtdlp(): { command: string; argsPrefix: string[] } {
   const explicit = process.env.YTDLP_PATH;
   if (explicit && explicit.length > 0) {

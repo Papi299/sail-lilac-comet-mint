@@ -2,7 +2,6 @@ import { randomBytes } from "node:crypto";
 import { config } from "../../lib/config.ts";
 import type { JobRecord, JobStatusName } from "../../types/job.ts";
 
-
 const jobs = new Map<string, JobRecord>();
 
 export function createJobId(): string {
@@ -18,12 +17,13 @@ export function createJob(input: {
   formatId: string;
   ip: string;
   workDir: string;
+  id?: string;
   title?: string | null;
   thumbnail?: string | null;
   source?: string | null;
   extractor?: string | null;
 }): JobRecord {
-  const id = createJobId();
+  const id = input.id ?? createJobId();
   const createdAt = nowMs();
   const job: JobRecord = {
     id,

@@ -1,11 +1,15 @@
-import { lookup } from "node:dns/promises";
 import { AppError } from "@/lib/errors";
-import {
-  hostnameLooksBlocked,
-  isPrivateIp,
-  validatePublicHttpUrl,
-} from "@/lib/validation/url";
+import { hostnameLooksBlocked, validatePublicHttpUrl } from "@/lib/validation/url";
+import { lookupHost, validateResolvedAddresses } from "@/lib/security/safe-http.server";
 
+/**
+ * Defense-in-depth URL + DNS policy check.
+ *
+ * This is NOT DNS-rebinding protection for a subsequent fetch(hostname):
+ * application-controlled HTTP must use safeHttpRequest(), which pins the
+ * connection to a validated address. yt-dlp performs its own networking and
+ * is fail-closed unless YTDLP_NETWORK_ISOLATED is explicitly attested.
+ */
 export async function assertSafeUrl(raw: string): Promise<{ url: string; hostname: string }> {
   const checked = validatePublicHttpUrl(raw);
   if (!checked.ok) {
@@ -21,30 +25,14 @@ export async function assertSafeUrl(raw: string): Promise<{ url: string; hostnam
     throw new AppError("INVALID_URL");
   }
 
-  let addresses: { address: string; family: number }[];
+  let answers;
   try {
-    addresses = await lookup(hostname, { all: true, verbatim: true });
-  } catch {
+    answers = await lookupHost(hostname);
+  } catch (err) {
+    if (err instanceof AppError) throw err;
     throw new AppError("NETWORK_ERROR");
   }
 
-  if (!addresses.length) {
-    throw new AppError("NETWORK_ERROR");
-  }
-
-  for (const addr of addresses) {
-    if (isPrivateIp(addr.address)) {
-      throw new AppError("INVALID_URL");
-    }
-  }
-
+  await validateResolvedAddresses(hostname, answers);
   return { url: checked.url, hostname };
-}
-
-export function assertRedirectTarget(url: string) {
-  const checked = validatePublicHttpUrl(url);
-  if (!checked.ok) {
-    throw new AppError("INVALID_URL");
-  }
-  return checked;
 }
