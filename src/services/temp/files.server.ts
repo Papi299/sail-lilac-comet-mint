@@ -45,33 +45,45 @@ function assertNotSentinel(path: string): void {
 }
 
 /**
- * Temp root and jobs root are trust boundaries: real directories, not
- * symbolic links, with canonical paths matching the configured layout
- * `<temp>/jobs`.
+ * Temp root and jobs root are trust boundaries: real directories (the
+ * configured entry itself must not be a symlink), with the canonical
+ * layout `<temp>/jobs`.
+ *
+ * Ancestor symlinks (e.g. macOS `/var -> /private/var`) are permitted
+ * because they are system-controlled and do not violate containment.
+ * Only the final path component of each trust boundary is verified via
+ * `lstat` to ensure it is not itself a symlink.
  */
 export async function assertTrustedJobRoots(): Promise<{ temp: string; jobs: string }> {
   const tempLogical = tempRoot();
-  const jobsLogical = jobsRoot();
   assertNotSentinel(tempLogical);
-  assertNotSentinel(jobsLogical);
 
+  // The configured temp root entry itself must be a real directory.
   const tempSt = await lstatIfExists(tempLogical);
   if (!tempSt || tempSt.isSymbolicLink() || !tempSt.isDirectory()) {
     throw new UnsafePathError();
   }
+  // Establish canonical trusted temp root (may differ from logical if
+  // an ancestor directory is a symlink, e.g. /var -> /private/var).
   const tempCanonical = await realpath(tempLogical);
-  if (tempCanonical !== tempLogical) {
-    throw new UnsafePathError();
-  }
 
+  // Re-apply sentinel protection to the canonical trust anchor
+  // BEFORE any jobs lookup/creation.
+  assertNotSentinel(tempCanonical);
+
+  const jobsLogical = jobsRoot();
+  assertNotSentinel(jobsLogical);
+
+  // The jobs entry itself must be a real directory.
   const jobsSt = await lstatIfExists(jobsLogical);
   if (!jobsSt || jobsSt.isSymbolicLink() || !jobsSt.isDirectory()) {
     throw new UnsafePathError();
   }
+  // Establish canonical trusted jobs root.
   const jobsCanonical = await realpath(jobsLogical);
-  if (jobsCanonical !== jobsLogical) {
-    throw new UnsafePathError();
-  }
+  assertNotSentinel(jobsCanonical);
+
+  // Canonical layout: jobs is exactly `<tempCanonical>/jobs`.
   if (dirname(jobsCanonical) !== tempCanonical || basename(jobsCanonical) !== "jobs") {
     throw new UnsafePathError();
   }
@@ -122,9 +134,10 @@ export async function createJobDir(jobId: string): Promise<string> {
   if (!isJobId(jobId)) {
     throw new UnsafePathError("Refusing to create a job directory without a valid job id.");
   }
-  const jobs = await ensureJobsRoot();
-  const dir = resolve(join(jobs, jobId));
-  assertRemovableJobDir(dir);
+  // ensureJobsRoot returns the canonical jobs root.
+  const jobsCanonical = await ensureJobsRoot();
+  const dir = resolve(join(jobsCanonical, jobId));
+  assertRemovableJobDirCanonical(dir, jobsCanonical);
   const existing = await lstatIfExists(dir);
   if (existing?.isSymbolicLink()) {
     throw new UnsafePathError();
@@ -137,7 +150,6 @@ export async function createJobDir(jobId: string): Promise<string> {
     throw new UnsafePathError();
   }
   const canonical = await realpath(dir);
-  const { jobs: jobsCanonical } = await assertTrustedJobRoots();
   if (dirname(canonical) !== jobsCanonical || basename(canonical) !== jobId || canonical !== dir) {
     throw new UnsafePathError();
   }
@@ -145,8 +157,49 @@ export async function createJobDir(jobId: string): Promise<string> {
 }
 
 /**
- * Canonical path that may be recursively deleted: exactly
- * `<TEMP_DIRECTORY>/jobs/<32-hex-job-id>`.
+ * Synchronous syntactic validation that a path is exactly
+ * `<canonicalJobsRoot>/<32-hex-job-id>`.
+ */
+function assertRemovableJobDirCanonical(workDir: string, canonicalJobsRoot: string): string {
+  if (!workDir || !workDir.trim()) {
+    throw new UnsafePathError("Empty path.");
+  }
+
+  const target = resolve(workDir);
+  const temp = dirname(canonicalJobsRoot);
+
+  if (target === sep || target === resolve("/") || target === resolve("/tmp") || target === temp || target === canonicalJobsRoot) {
+    throw new UnsafePathError();
+  }
+
+  const rel = relative(canonicalJobsRoot, target);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new UnsafePathError();
+  }
+
+  if (dirname(target) !== canonicalJobsRoot) {
+    throw new UnsafePathError();
+  }
+
+  const leaf = basename(target);
+  if (!isJobId(leaf)) {
+    throw new UnsafePathError();
+  }
+
+  if (join(canonicalJobsRoot, leaf) !== target) {
+    throw new UnsafePathError();
+  }
+
+  return target;
+}
+
+/**
+ * Public synchronous guard: validates against the LOGICAL jobs root.
+ * For paths that were already canonicalized (returned by createJobDir),
+ * callers should use the canonical overload or removeJobDir directly.
+ *
+ * Retained for backward compatibility with existing tests that pass
+ * logical paths.
  */
 export function assertRemovableJobDir(workDir: string): string {
   if (!workDir || !workDir.trim()) {
@@ -183,8 +236,10 @@ export function assertRemovableJobDir(workDir: string): string {
 }
 
 export async function removeJobDir(workDir: string): Promise<void> {
-  const target = assertRemovableJobDir(workDir);
-  const { jobs } = await assertTrustedJobRoots();
+  // Establish canonical trust roots first.
+  const { jobs: jobsCanonical } = await assertTrustedJobRoots();
+  // Validate against canonical root.
+  const target = assertRemovableJobDirCanonical(workDir, jobsCanonical);
   const leaf = await lstatIfExists(target);
   if (!leaf) return;
   if (leaf.isSymbolicLink() || !leaf.isDirectory()) {
@@ -198,7 +253,7 @@ export async function removeJobDir(workDir: string): Promise<void> {
     if (code === "ENOENT") return;
     throw err;
   }
-  if (dirname(canonical) !== jobs || basename(canonical) !== basename(target) || canonical !== target) {
+  if (dirname(canonical) !== jobsCanonical || basename(canonical) !== basename(target) || canonical !== target) {
     throw new UnsafePathError();
   }
   await rm(canonical, { recursive: true, force: true });

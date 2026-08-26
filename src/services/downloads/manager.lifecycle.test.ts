@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, stat } from "node:fs/promises";
+import { mkdtemp, realpath, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AppError } from "../../lib/errors.ts";
@@ -34,7 +34,9 @@ describe("job lifecycle paths", () => {
       principalId: PRIVATE_ACCESS_PRINCIPAL_ID,
     });
     assert.notEqual(job.workDir, "/tmp");
-    assert.equal(job.workDir, join(jobsRoot(), job.id));
+    // createJobDir returns the canonical path; compare against canonical jobs root.
+    const canonicalJobs = await realpath(jobsRoot());
+    assert.equal(job.workDir, join(canonicalJobs, job.id));
     assert.equal(job.principalId, PRIVATE_ACCESS_PRINCIPAL_ID);
     assert.match(job.id, /^[0-9a-f]{32}$/);
     const st = await stat(job.workDir);
