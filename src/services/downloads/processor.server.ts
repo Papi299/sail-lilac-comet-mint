@@ -3,6 +3,7 @@ import { config } from "@/lib/config";
 import { AppError } from "@/lib/errors";
 import { buildDownloadFilename } from "@/lib/filenames";
 import { log, redactUrl } from "@/lib/logger";
+import { assertSafeUrl } from "@/lib/security/ssrf.server";
 import { getExtractorFor } from "@/services/extractors/registry.server";
 import { convertMedia } from "@/services/processing/ffmpeg.server";
 import { removeJobDir } from "@/services/temp/files.server";
@@ -37,10 +38,11 @@ export async function processJob(jobId: string): Promise<void> {
 
   const started = Date.now();
   try {
-    const extractor = getExtractorFor(job.url);
+    const safe = await assertSafeUrl(job.url);
+    const extractor = getExtractorFor(safe.url);
     updateJob(jobId, { extractor: extractor.id });
     const result = await extractor.download(
-      job.url,
+      safe.url,
       { formatId: job.formatId },
       {
         workDir: job.workDir,

@@ -4,6 +4,13 @@ import { config } from "@/lib/config";
 import { AppError } from "@/lib/errors";
 import { runProcess } from "@/services/processing/process-runner.server";
 
+export function assertLocalMediaPath(inputPath: string): void {
+  const value = inputPath.trim();
+  if (!value || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value) || value.startsWith("//")) {
+    throw new AppError("PROCESSING_FAILED");
+  }
+}
+
 export async function ffmpegAvailable(): Promise<boolean> {
   try {
     await access(config.ffmpegPath);
@@ -26,6 +33,7 @@ export async function convertMedia(opts: {
   signal?: AbortSignal;
   onProgress?: (progress: number | null) => void;
 }): Promise<string> {
+  assertLocalMediaPath(opts.inputPath);
   const outName =
     opts.target === "mp3" ? "converted.mp3" : opts.target === "webm" ? "converted.webm" : "converted.mp4";
   const outputPath = join(opts.workDir, outName);
@@ -97,6 +105,7 @@ export async function remuxCopy(opts: {
   timeoutMs: number;
   signal?: AbortSignal;
 }): Promise<string> {
+  assertLocalMediaPath(opts.inputPath);
   const outputPath = join(opts.workDir, `remux.${opts.ext}`);
   const result = await runProcess({
     command: config.ffmpegPath,

@@ -63,6 +63,24 @@ describe("URL validation", () => {
   it("rejects hostnames without a dot", () => {
     assert.equal(validatePublicHttpUrl("http://intranet/video").ok, false);
   });
+
+  it("rejects userinfo and non-http schemes", () => {
+    assert.equal(validatePublicHttpUrl("https://user:pass@example.com/v").ok, false);
+    assert.equal(validatePublicHttpUrl("https://user@example.com/v").ok, false);
+    assert.equal(validatePublicHttpUrl("data:text/html,hi").ok, false);
+  });
+
+  it("rejects IPv6-encoded loopback in URLs", () => {
+    assert.equal(validatePublicHttpUrl("http://[::ffff:127.0.0.1]/v").ok, false);
+    assert.equal(validatePublicHttpUrl("http://[::127.0.0.1]/v").ok, false);
+    assert.equal(validatePublicHttpUrl("http://[2002:7f00:1::]/v").ok, false);
+    assert.equal(validatePublicHttpUrl("http://[64:ff9b::7f00:1]/v").ok, false);
+  });
+
+  it("allows public addresses as positive controls", () => {
+    assert.equal(validatePublicHttpUrl("https://1.1.1.1/video.mp4").ok, true);
+    assert.equal(validatePublicHttpUrl("http://[2001:4860:4860::8888]/v").ok, true);
+  });
 });
 
 describe("SSRF helpers", () => {
@@ -79,6 +97,39 @@ describe("SSRF helpers", () => {
     assert.equal(isPrivateIp("::1"), true);
     assert.equal(isPrivateIp("fc00::1"), true);
     assert.equal(isPrivateIp("fe80::1"), true);
+  });
+
+  it("blocks IPv4-mapped and IPv4-compatible encodings of loopback", () => {
+    assert.equal(isPrivateIp("::ffff:127.0.0.1"), true);
+    assert.equal(isPrivateIp("::ffff:7f00:1"), true);
+    assert.equal(isPrivateIp("::7f00:1"), true);
+    assert.equal(isPrivateIp("::127.0.0.1"), true);
+  });
+
+  it("blocks 6to4 and NAT64 encodings of private IPv4", () => {
+    assert.equal(isPrivateIp("2002:7f00:1::"), true);
+    assert.equal(isPrivateIp("2002:0a00:0001::1"), true);
+    assert.equal(isPrivateIp("64:ff9b::7f00:1"), true);
+    assert.equal(isPrivateIp("64:ff9b::10.0.0.1"), true);
+    assert.equal(isPrivateIp("2001:0::1"), true);
+  });
+
+  it("allows public IPv4-mapped and public global IPv6", () => {
+    assert.equal(isPrivateIp("::ffff:8.8.8.8"), false);
+    assert.equal(isPrivateIp("2001:4860:4860::8888"), false);
+    assert.equal(isPrivateIp("2606:4700:4700::1111"), false);
+  });
+
+  it("blocks IPv4-mapped encodings of RFC1918, link-local, and loopback", () => {
+    assert.equal(isPrivateIp("::ffff:10.0.0.1"), true);
+    assert.equal(isPrivateIp("::ffff:169.254.169.254"), true);
+    assert.equal(isPrivateIp("::ffff:192.168.1.8"), true);
+    assert.equal(isPrivateIp("::ffff:127.0.0.1"), true);
+  });
+
+  it("treats unparseable IPv6-like values as private (fail closed)", () => {
+    assert.equal(isPrivateIp("gggg::1"), true);
+    assert.equal(isPrivateIp("::zzzz"), true);
   });
 
   it("blocks metadata hostnames", () => {

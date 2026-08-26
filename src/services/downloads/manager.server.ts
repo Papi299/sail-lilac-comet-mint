@@ -1,6 +1,7 @@
 import { config } from "@/lib/config";
 import { AppError } from "@/lib/errors";
 import { log, redactUrl } from "@/lib/logger";
+import { assertSafeUrl } from "@/lib/security/ssrf.server";
 import { analyzeUrl } from "@/services/extractors/registry.server";
 import { processJob } from "@/services/downloads/processor.server";
 import {
@@ -8,12 +9,12 @@ import {
   countActive,
   countActiveForIp,
   createJob,
+  createJobId,
   deleteJob,
   expiredJobs,
   getJob,
   listJobs,
   toPublicJob,
-  updateJob,
 } from "@/services/jobs/store.server";
 import { createJobDir, removeJobDir, tempUsage } from "@/services/temp/files.server";
 import { ffmpegAvailable } from "@/services/processing/ffmpeg.server";
@@ -37,7 +38,7 @@ export async function cleanupExpired(): Promise<number> {
     try {
       await removeJobDir(job.workDir);
     } catch {
-      // ignore
+      // ignore containment/fs errors; still drop the record
     }
     deleteJob(job.id);
   }
@@ -58,13 +59,39 @@ function pump() {
   }
 }
 
+export async function allocateJob(input: {
+  url: string;
+  formatId: string;
+  ip: string;
+  id?: string;
+  title?: string | null;
+  thumbnail?: string | null;
+  source?: string | null;
+  extractor?: string | null;
+}) {
+  const id = input.id ?? createJobId();
+  const workDir = await createJobDir(id);
+  return createJob({
+    id,
+    url: input.url,
+    formatId: input.formatId,
+    ip: input.ip,
+    workDir,
+    title: input.title,
+    thumbnail: input.thumbnail,
+    source: input.source,
+    extractor: input.extractor,
+  });
+}
+
 export async function analyzeVideo(url: string) {
   ensureCleanup();
-  log.info("analyze start", { url: redactUrl(url) });
+  const safe = await assertSafeUrl(url);
+  log.info("analyze start", { url: redactUrl(safe.url) });
   const started = Date.now();
-  const result = await analyzeUrl(url);
+  const result = await analyzeUrl(safe.url);
   log.info("analyze complete", {
-    url: redactUrl(url),
+    url: redactUrl(safe.url),
     extractor: result.extractor,
     domain: result.video.source,
     durationMs: Date.now() - started,
@@ -96,12 +123,14 @@ export async function enqueueDownload(input: {
     throw new AppError("SERVER_OVERLOAD");
   }
 
+  const safe = await assertSafeUrl(input.url);
+
   let metaTitle = input.title ?? null;
   let metaThumb = input.thumbnail ?? null;
   let metaSource = input.source ?? null;
   let extractorId: string | null = null;
   try {
-    const analyzed = await analyzeUrl(input.url);
+    const analyzed = await analyzeUrl(safe.url);
     const video = analyzed.video;
     extractorId = analyzed.extractor;
     metaTitle = metaTitle || video.title;
@@ -119,18 +148,15 @@ export async function enqueueDownload(input: {
     throw new AppError("ANALYSIS_FAILED");
   }
 
-  const job = createJob({
-    url: input.url,
+  const job = await allocateJob({
+    url: safe.url,
     formatId: input.formatId,
     ip: input.ip,
-    workDir: "/tmp",
     title: metaTitle,
     thumbnail: metaThumb,
     source: metaSource,
     extractor: extractorId,
   });
-  const workDir = await createJobDir(job.id);
-  updateJob(job.id, { workDir });
   queue.push(job.id);
   log.info("job queued", {
     jobId: job.id,

@@ -64,6 +64,7 @@ See `.env.example`. Important knobs:
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | Global worker cap |
 | `RATE_LIMIT` | 20/min | Analyze requests per IP |
 | `TEMP_DIRECTORY` | OS temp `/videofetch` | Isolated job folders |
+| `YTDLP_NETWORK_ISOLATED` | unset / `false` | Operator attestation that yt-dlp has an independent safe-egress boundary. Default is fail-closed. The flag is **not** itself isolation. |
 | `DIAGNOSTICS_TOKEN` | empty | Required for `/diagnostics` in production |
 
 ## API
@@ -87,8 +88,10 @@ Temporary media is written to a tmpfs volume.
 
 ## Tests
 
-Unit tests cover URL validation, SSRF helpers, filename sanitization, format normalization, progress parsing, job status, rate limiting, and error mapping. External downloads are not performed in CI.
+Unit tests cover URL validation, SSRF helpers, pinned HTTP transport, yt-dlp network policy, temp-directory containment, filename sanitization, format normalization, progress parsing, job status, rate limiting, and error mapping. External downloads are not performed in CI.
 
 ## Notes
+
+yt-dlp remains the generic HTTP/HTTPS extractor. It performs its own DNS lookups, redirects, and media requests, so application URL validation is **not** yt-dlp egress enforcement. Generic extraction is therefore refused unless `YTDLP_NETWORK_ISOLATED=true` is set by an operator who has independently isolated yt-dlp's network. Do not enable that flag in this repository's defaults.
 
 Some websites (including YouTube and Vimeo) may require a signed-in session or block datacenter IP addresses. Direct media files and public archive sources are the most reliable. Only download media you have the right to save.
