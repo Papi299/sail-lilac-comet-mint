@@ -51,6 +51,7 @@ The app listens on port 8080.
 - `npm run typecheck` — TypeScript
 - `npm test` — unit tests (no live downloads)
 - `npm run lint` — ESLint
+- `npm run check:artifacts` — fail if Git-tracked files exist under `.vercel/`
 
 ## Environment
 
@@ -96,6 +97,20 @@ docker compose up --build
 ```
 
 Temporary media is written to a tmpfs volume.
+
+## Deployment provenance
+
+`.vercel/` is generated Vercel local/build output and is intentionally not version-controlled.
+
+Production artifacts must be generated from the exact reviewed source commit. Do not treat historical repository-resident `.vercel/output` as deployable source.
+
+A future Vercel deployment must build from source. If a prebuilt deployment workflow is introduced later, that prebuilt output must be freshly generated from the exact approved commit in that workflow.
+
+Production deployment is not currently authorized.
+
+Docker already excludes `.vercel` (see `.dockerignore`) and runs `npm run build` from source inside the image. This repository does not copy generated Vercel output into the image.
+
+`npm run check:artifacts` fails if Git-tracked files appear under `.vercel/`.
 
 ## Tests
 

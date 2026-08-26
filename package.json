@@ -14,6 +14,7 @@
     "preview": "node scripts/with-app-env.mjs vite preview",
     "typecheck": "tsc --noEmit",
     "check:auth": "node scripts/check-auth-invariant.mjs",
+    "check:artifacts": "node scripts/check-generated-artifacts.mjs",
     "test": "node --import ./scripts/register-ts-aliases.mjs --experimental-strip-types --test 'src/**/*.test.ts' && node --test 'scripts/**/*.test.mjs'",
     "lint": "eslint .",
     "format": "prettier --write ."
