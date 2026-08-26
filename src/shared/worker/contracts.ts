@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { WORKER_PRIVATE_PRINCIPAL } from "./constants.ts";
+import { WORKER_PRIVATE_PRINCIPAL, WORKER_JOBS_PATH } from "./constants.ts";
 import { WorkerErrorCodeSchema } from "./errors.ts";
 
 // --- Identifiers ---
@@ -17,6 +17,18 @@ export const WorkerObjectKeySchema = z
     "Object key must be opaque, server-generated, and match exact pattern",
   );
 export type WorkerObjectKey = z.infer<typeof WorkerObjectKeySchema>;
+
+// --- Dynamic Path Builders ---
+
+export function workerJobPath(jobId: string): string {
+  const validId = WorkerJobIdSchema.parse(jobId);
+  return `${WORKER_JOBS_PATH}/${validId}`;
+}
+
+export function workerJobCancelPath(jobId: string): string {
+  const validId = WorkerJobIdSchema.parse(jobId);
+  return `${WORKER_JOBS_PATH}/${validId}/cancel`;
+}
 
 // --- Status & DTOs ---
 
@@ -63,7 +75,14 @@ export type WorkerJobView = z.infer<typeof WorkerJobViewSchema>;
 
 // --- Requests ---
 
-const UrlSchema = z.string().url().max(2048);
+const UrlSchema = z
+  .string()
+  .url()
+  .max(2048)
+  .refine(
+    (val) => val.startsWith("http://") || val.startsWith("https://"),
+    "URL must use http or https protocol"
+  );
 
 export const WorkerCreateJobRequestSchema = z
   .object({
@@ -175,20 +194,20 @@ export type WorkerCancelJobSuccess = z.infer<typeof WorkerCancelJobSuccessSchema
 
 export const WorkerDiagnosticsSuccessSchema = z
   .object({
-    status: z.string(),
+    status: z.enum(["ok", "degraded"]),
     queueDepth: z.number().int().nonnegative(),
     runningJobs: z.number().int().nonnegative(),
     maxConcurrent: z.number().int().nonnegative(),
     binaries: z
       .object({
-        ffmpeg: z.string(),
-        ytdlp: z.string(),
+        ffmpeg: z.boolean(),
+        ytdlp: z.boolean(),
       })
       .strict(),
     safeEgress: z
       .object({
         attested: z.boolean(),
-        policyVersion: z.string(),
+        policyVersion: z.string().nullable(),
       })
       .strict(),
   })
@@ -210,4 +229,3 @@ import type { NormalizedFormat, QualityPreset, VideoMetadata } from "../../types
 const _formatCheck: NormalizedFormat = {} as WorkerNormalizedFormat;
 const _presetCheck: QualityPreset = {} as WorkerQualityPreset;
 const _metaCheck: VideoMetadata = {} as WorkerVideoMetadata;
-

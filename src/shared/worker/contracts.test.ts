@@ -5,6 +5,9 @@ import {
   WorkerJobViewSchema,
   WorkerCreateJobRequestSchema,
   VideoMetadataSchema,
+  WorkerDiagnosticsSuccessSchema,
+  workerJobPath,
+  workerJobCancelPath,
 } from "./contracts.ts";
 import { WORKER_PRIVATE_PRINCIPAL } from "./constants.ts";
 
@@ -78,11 +81,35 @@ test("Worker Contracts - WorkerJobView", async (t) => {
   });
 });
 
-test("Worker Contracts - Requests", async (t) => {
-  await t.test("Create job accepts valid principal and URL", () => {
+test("Worker Contracts - Dynamic Paths", async (t) => {
+  const validId = "0123456789abcdef0123456789abcdef";
+
+  await t.test("workerJobPath builds path correctly", () => {
+    assert.strictEqual(workerJobPath(validId), "/v1/jobs/0123456789abcdef0123456789abcdef");
+  });
+
+  await t.test("workerJobCancelPath builds path correctly", () => {
+    assert.strictEqual(workerJobCancelPath(validId), "/v1/jobs/0123456789abcdef0123456789abcdef/cancel");
+  });
+
+  await t.test("path builders reject malformed job ID", () => {
+    assert.throws(() => workerJobPath("not-a-job-id"));
+    assert.throws(() => workerJobCancelPath("0123456789ABCDEF0123456789ABCDEF")); // uppercase rejected
+  });
+});
+
+test("Worker Contracts - Requests and URLs", async (t) => {
+  await t.test("Create job accepts valid principal and HTTP/HTTPS URL", () => {
     assert.doesNotThrow(() =>
       WorkerCreateJobRequestSchema.parse({
         url: "https://youtube.com/watch?v=123",
+        formatId: "best",
+        principalId: WORKER_PRIVATE_PRINCIPAL,
+      }),
+    );
+    assert.doesNotThrow(() =>
+      WorkerCreateJobRequestSchema.parse({
+        url: "http://youtube.com/watch?v=123",
         formatId: "best",
         principalId: WORKER_PRIVATE_PRINCIPAL,
       }),
@@ -99,12 +126,69 @@ test("Worker Contracts - Requests", async (t) => {
     );
   });
 
-  await t.test("Create job rejects invalid URL", () => {
+  await t.test("Create job rejects non-HTTP URLs", () => {
+    const invalidUrls = [
+      "not-a-url",
+      "ftp://example.com/video",
+      "file:///etc/passwd",
+      "data:text/plain;base64,SGVsbG8sIFdvcmxkIQ==",
+      "javascript:alert(1)",
+      "mailto:test@example.com"
+    ];
+
+    for (const url of invalidUrls) {
+      assert.throws(() =>
+        WorkerCreateJobRequestSchema.parse({
+          url,
+          formatId: "best",
+          principalId: WORKER_PRIVATE_PRINCIPAL,
+        }),
+      );
+    }
+  });
+});
+
+test("Worker Contracts - Diagnostics", async (t) => {
+  const validDiagnostics = {
+    status: "ok",
+    queueDepth: 0,
+    runningJobs: 0,
+    maxConcurrent: 1,
+    binaries: {
+      ffmpeg: true,
+      ytdlp: true,
+    },
+    safeEgress: {
+      attested: false,
+      policyVersion: "not-enabled",
+    },
+  };
+
+  await t.test("accepts valid diagnostics DTO", () => {
+    assert.doesNotThrow(() => WorkerDiagnosticsSuccessSchema.parse(validDiagnostics));
+  });
+
+  await t.test("rejects degraded object shape if status is wrong", () => {
+    assert.throws(() => WorkerDiagnosticsSuccessSchema.parse({ ...validDiagnostics, status: "unknown" }));
+  });
+
+  await t.test("rejects string binary paths", () => {
     assert.throws(() =>
-      WorkerCreateJobRequestSchema.parse({
-        url: "not-a-url",
-        formatId: "best",
-        principalId: WORKER_PRIVATE_PRINCIPAL,
+      WorkerDiagnosticsSuccessSchema.parse({
+        ...validDiagnostics,
+        binaries: {
+          ffmpeg: "/usr/bin/ffmpeg", // Must be boolean
+          ytdlp: true,
+        },
+      }),
+    );
+  });
+
+  await t.test("rejects unexpected fields", () => {
+    assert.throws(() =>
+      WorkerDiagnosticsSuccessSchema.parse({
+        ...validDiagnostics,
+        hostOS: "linux",
       }),
     );
   });
