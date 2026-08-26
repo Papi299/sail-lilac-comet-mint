@@ -15,82 +15,98 @@ The worker executes `yt-dlp` against user-supplied URLs. Attackers may supply UR
 
 > A process running inside the media worker—including `yt-dlp`, `FFmpeg`, and descendants—cannot establish network connections to forbidden local, private, link-local, metadata, loopback, or otherwise non-public destinations even if application-level DNS/redirect validation is bypassed or becomes stale.
 
-This enforcement must be **EXTERNAL** to `yt-dlp` itself. It operates at the network layer.
+## Enforcement Ownership Model
 
-## Recommended Linux Isolation Model
+The entity running yt-dlp/FFmpeg MUST NOT be able to alter or remove its own egress policy.
 
-To guarantee the invariant, the worker must run in an environment with the following properties:
-- **Network Namespace:** Dedicated Linux network namespace or container network (e.g., bridge network without route to host).
-- **No Host Networking:** `network_mode: host` is strictly forbidden.
-- **Worker Privilege:** Runs as a non-root user. The media processes lack `CAP_NET_ADMIN` and cannot alter firewall rules.
-- **Docker Socket:** No access to `/var/run/docker.sock`.
-- **Enforcement Layer:** Egress firewall (e.g., `nftables`, `iptables`) or cloud-provider network policy applied to the worker's network interface.
-- **Dual Stack:** Filtering must cover BOTH IPv4 and IPv6 independently.
+**Required Architecture:** The enforcement controller lives OUTSIDE the media container.
+Examples of acceptable realizations:
+- Host-level `nftables`/`iptables` applied to the worker's bridge/veth interface.
+- Infrastructure/cloud egress firewall/security policy whose control plane is inaccessible to the worker.
+In-container application-managed firewall rules are strictly INSUFFICIENT.
+
+**Worker Privilege:**
+- Non-root where practical.
+- No `CAP_NET_ADMIN` or `CAP_SYS_ADMIN`.
+- No host networking (`network_mode: host` forbidden).
+- No Docker socket (`/var/run/docker.sock`).
+- No privileged mode.
 
 ## Denied Destination Classes
 
-The egress firewall MUST block all outbound connections to the following:
+The egress firewall MUST block all outbound connections to at least the following explicit ranges. The deployment policy must be at least as conservative as the existing Phase 1 application classification.
 
 **IPv4:**
-- Loopback (`127.0.0.0/8`)
-- RFC1918 Private Space (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
-- Link-local (`169.254.0.0/16`) - Crucial for blocking cloud metadata APIs.
-- Carrier-grade NAT (`100.64.0.0/10`)
-- Unspecified / Reserved multicasts.
+- `0.0.0.0/8` (Current network)
+- `10.0.0.0/8` (RFC1918)
+- `100.64.0.0/10` (Carrier-grade NAT)
+- `127.0.0.0/8` (Loopback)
+- `169.254.0.0/16` (Link-local / Cloud Metadata)
+- `172.16.0.0/12` (RFC1918)
+- `192.0.0.0/24` (IETF Protocol Assignments)
+- `192.0.2.0/24` (TEST-NET-1)
+- `192.168.0.0/16` (RFC1918)
+- `198.18.0.0/15` (Benchmark testing)
+- `198.51.100.0/24` (TEST-NET-2)
+- `203.0.113.0/24` (TEST-NET-3)
+- `224.0.0.0/4` (Multicast)
+- `240.0.0.0/4` (Reserved)
+- `255.255.255.255/32` (Broadcast)
 
 **IPv6:**
-- Loopback (`::1/128`)
-- Unspecified (`::/128`)
-- Unique-local (`fc00::/7`)
-- Link-local (`fe80::/10`)
-- IPv4-mapped/embedded addresses targeting the denied IPv4 ranges.
+- `::/128` (Unspecified)
+- `::1/128` (Loopback)
+- `fc00::/7` (Unique-local / ULA)
+- `fe80::/10` (Link-local)
+- `ff00::/8` (Multicast)
+- IPv4-mapped/compatible addresses.
+- `2002::/16` (6to4)
+- `2001:0000::/32` (Teredo)
+- `64:ff9b::/32` (NAT64 well-known prefix)
 
 ## DNS Policy
 
 The firewall must not require broad private-network access for DNS.
-**Recommendation:** 
-Allow outbound UDP/TCP 53 strictly to designated public DNS resolvers (e.g., `1.1.1.1`, `8.8.8.8`).
-If an internal VPC resolver must be used, allow port 53 ONLY to that specific internal IP address, while all other ports to that IP (and the rest of the private range) remain blocked.
-
-DNS rebinding attacks are mitigated because even if DNS resolves to `127.0.0.1`, the egress firewall will drop the subsequent TCP connection.
+**Recommendation:**
+Allow outbound UDP/TCP 53 strictly to specifically designated public DNS resolvers.
+If an internal resolver must be used, allow DNS traffic ONLY to that exact resolver address. No general private-range route is created.
+A private DNS answer must still be useless because the destination firewall blocks the resulting connection.
 
 ## Allowed Outbound Protocols/Ports
 
-To support ordinary `yt-dlp` media delivery while minimizing risk:
+To support ordinary `yt-dlp` media delivery:
 - **TCP 80 (HTTP)** - Allowed to public destinations.
 - **TCP 443 (HTTPS)** - Allowed to public destinations.
 - **UDP/TCP 53 (DNS)** - Allowed only to designated resolvers.
 
-Arbitrary public TCP ports (e.g., 22, 25, 3306) should be blocked. We do not use a domain allowlist; unknown public websites must remain generically attemptable for the downloader to function.
-
 ## Object Storage Reachability
 
-The worker must upload completed media to Object Storage.
-- The object-storage endpoint must be a public HTTPS endpoint compatible with the TCP 443 public-egress policy.
-- Do NOT broadly permit a private network range to reach a private storage endpoint, as this creates a path for SSRF.
-- If a VPC endpoint must be used, document a hyper-narrow IP/port exception in the firewall that strictly matches the storage provider's IPs and nothing else.
+The object-storage endpoint MUST be a public HTTPS endpoint compatible with the TCP 443 public-egress policy. Do NOT create a broad private/VPC exception merely for storage.
 
 ## Acceptance Tests
 
-Before `YTDLP_NETWORK_ISOLATED=true` can be enabled in production, the deployment pipeline must run integration tests *from inside* the actual production worker container.
+Before `YTDLP_NETWORK_ISOLATED=true` can be enabled, deployment integration tests MUST pass *from inside the exact deployed worker network boundary*. A bare "connection refused" to an address with no listener is NOT strong proof. Use targets known to be listening or verify firewall-policy counters.
 
-**Must fail to connect (Timeout/Connection Refused):**
-- `curl -I http://127.0.0.1`
-- `curl -I http://169.254.169.254` (Cloud Metadata)
-- `curl -I http://10.0.0.1`
-- `curl -I http://[::1]`
-- `curl -I http://[fe80::1]`
-
-**Must succeed:**
-- `curl -I https://github.com` (or controlled public HTTPS endpoint)
-
-Additionally, it must be verified that a subprocess (like FFmpeg) inherits these identical restrictions, and that the worker user cannot run `iptables -F`.
+1. **Direct-address denial:** Prove loopback IPv4, RFC1918, metadata/link-local IPv4, CGNAT, `::1`, IPv6 ULA, and IPv6 link-local are unreachable.
+2. **Redirect test:** Request a controlled PUBLIC HTTP endpoint that responds with a redirect to a controlled forbidden target. Prove the worker cannot establish the forbidden connection.
+3. **DNS forbidden-answer test:** Request a controlled hostname where the designated test DNS returns a forbidden destination. Prove the connection fails at the network boundary.
+4. **Rebinding test:** Hostname initially validates as public, but later resolves to a forbidden address. Prove the forbidden connection fails.
+5. **Descendant test:** Run FFmpeg (or another controlled child process) attempting to reach a forbidden destination. Prove it is blocked.
+6. **Firewall-mutation test:** Prove the worker process lacks privileges to alter the firewall/network policy.
+7. **Controlled public success:** Prove a controlled public HTTPS endpoint succeeds.
 
 ## The Meaning of `YTDLP_NETWORK_ISOLATED`
 
 The environment variable `YTDLP_NETWORK_ISOLATED=true`:
-- Is configured **ONLY** in the worker deployment.
-- Vercel does not know about or configure this flag.
-- Must **NEVER** be set simply because the worker is in Docker, on another host, or because application-level URL validation is running.
-- Is an operator's attestation that the externally enforced egress boundary (firewall) is actively installed and the acceptance tests have passed.
-- Serves as the exact enablement gate allowing `yt-dlp` to execute. Without it, the worker fails closed.
+- Is configured **ONLY** in the worker deployment. Vercel does not use this value.
+- Remains `false` (fail-closed) by default.
+- Serves as the exact enablement gate allowing `yt-dlp` to execute.
+- **Becomes `true` ONLY WHEN:**
+  - The production worker deployment exists.
+  - Externally controlled egress enforcement is active.
+  - The worker lacks privileges to modify it.
+  - Both IPv4 and IPv6 policies are installed.
+  - The DNS policy is installed.
+  - The entire acceptance suite (redirect, DNS, rebinding, direct-address, descendant) passes from within that EXACT deployed network boundary.
+
+Docker alone is never sufficient. `assertSafeUrl()` alone is never sufficient.

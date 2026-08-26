@@ -16,12 +16,6 @@ flowchart TD
     Browser <--|Download| Vercel
 ```
 
-**Constraints:**
-- Job state is an ephemeral, in-memory `Map`. It vanishes on restart.
-- The web runtime directly executes `yt-dlp` and `FFmpeg`.
-- Output media files are stored on the local temp filesystem.
-- Vercel functions cannot reliably run long-lived FFmpeg processing or store large local temporary media files.
-
 ## Target Architecture
 
 The target architecture moves all media analysis, downloading, and processing out of the web runtime into a long-lived external worker. The Vercel runtime acts strictly as the web/control plane.
@@ -41,16 +35,15 @@ flowchart TD
 
 ### Trust Boundary
 
-- **Vercel Web Runtime:** Owns user-facing authentication (private-access cookie), principal identity, request schema validation, rate limiting, orchestration, and worker request signing.
-- **Worker Runtime:** Owns durable job state, execution queue, second URL validation, media networking, `yt-dlp`, `FFmpeg`, process lifecycle, local temp files, output upload to object storage, and cleanup.
-- **Worker Egress:** A connection-time network boundary entirely prevents private network traversal by yt-dlp/FFmpeg.
+- **Vercel Web Runtime:** Owns user-facing authentication, request schema validation, rate limiting, orchestration, worker request signing (anti-replay), and generating signed object-storage URLs.
+- **Worker Runtime:** Owns durable job state, second URL validation, media networking, `yt-dlp`, `FFmpeg`, local temp files, and uploading objects to temporary storage.
+- **Worker Egress:** A host/infrastructure-enforced connection-time network boundary entirely prevents private network traversal by yt-dlp/FFmpeg.
 
 ## Durable Job State
 
 **Decision:** Worker-local SQLite on a persistent volume.
-**Why:** The product is private, single-user, and low-concurrency. Introducing a separate managed database or external Redis cluster introduces unnecessary operational overhead and cost. SQLite provides transactional durability matching the single-worker topology perfectly.
-**Rejected alternatives:** Redis (ephemeral/complex), Postgres (overkill for v1 single-user), In-memory (fails on restart).
-**Persistence:** The worker must be deployed with a persistent volume containing the SQLite database and temporary processing directories.
+**Single-Worker Invariant:** The v1 replica count is EXACTLY ONE. Horizontal autoscaling is not supported. The SQLite persistent volume MUST NOT be shared or mounted read/write by multiple worker replicas.
+**Why:** The product is private, single-user, and low-concurrency. SQLite provides transactional durability matching the single-worker topology perfectly.
 
 ### Job State Machine
 
@@ -82,47 +75,53 @@ stateDiagram-v2
 **Terminal States:** `ready`, `cancelled`, `failed`.
 **Recovery Policy (Conservative):**
 - **Queued job on restart:** Remains queued and may resume execution.
-- **Running job on restart:** Marked as `failed` with a deterministic worker-restart error. We do NOT automatically restart partially executed network/media work to avoid duplicated bandwidth.
+- **Running job on restart:** Marked as `failed` with a deterministic worker-restart error. We do NOT automatically restart partially executed network/media work.
 - **Ready job:** Remains ready as long as the object exists and hasn't expired.
 
 ## Cancellation Contract
 
-**End-to-end flow:**
-1. Browser requests cancellation.
-2. Vercel validates session, sends signed cancel request to Worker.
-3. Worker idempotently updates durable state to `cancelled`.
-4. Worker triggers `AbortController`.
-5. Process-group termination (SIGKILL) halts yt-dlp/FFmpeg.
-6. Local temp cleanup runs.
+Cancellation operates on a strictly deterministic contract:
+- **Queued / Running:** Transition to `cancelled`. The `AbortController` triggers SIGKILL, and local temp cleanup runs.
+- **Already Cancelled:** Idempotent success (HTTP 200).
+- **Ready:** Remains `ready`. Cancellation does NOT delete completed output.
+- **Failed:** Remains `failed`.
 
-**Race Conditions:**
-- Cancel vs Completion: If already `ready`, cancel fails or acts as a delete.
-- Cancel vs Upload: Process aborts, partial object is cleaned up by lifecycle rules.
-- Cancel vs Restart: Worker reads `cancelled` state on boot and ignores.
+Object deletion occurs ONLY through expiration cleanup or a future explicit deletion operation. `/cancel` is never overloaded to mean "delete completed object."
 
 ## Temporary Storage Model
 
 **Abstraction:** Provider-neutral object storage.
-**Status:** Recommended for implementation (e.g., Cloudflare R2, AWS S3, or Vercel Blob) because local disk cannot be streamed through Vercel serverless functions reliably for large files.
-**Object Lifetime:** Short-lived. Worker initiates cleanup upon expiration, with an object-storage lifecycle rule (TTL) as a safety backstop.
-**Signed Download Behavior:** Vercel authenticates the user, checks job readiness, generates a very short-lived (e.g., 5-minute) signed object URL, and returns an HTTP redirect to the browser. The Content-Disposition header should be enforced via the signed URL if the provider supports it.
+**Object-Key Design:** Opaque and generated server-side. Object keys contain no original URL, no media title, no principal identifier, no user-supplied path segments, and allow no traversal.
+Example conceptual form: `videofetch/jobs/<32-hex-job-id>/<random-128-bit-token>`
+
+**Responsibility Split:**
+- **Worker (ObjectStoreWriter):** Has credentials to `put`, `head`, and `delete`. The worker DOES NOT sign download URLs.
+- **Vercel (ObjectStoreSigner):** Has credentials to `signGet`. Vercel DOES NOT have upload/delete credentials.
+
+**File Delivery Sequence:**
+1. Browser calls `GET /api/download/:jobId/file`.
+2. Vercel performs private-access authorization.
+3. Vercel requests `WorkerJobView` from the Worker.
+4. Vercel verifies status == `ready` and not `expired`.
+5. Vercel uses the opaque `objectKey` to generate a very short-lived (e.g., < 5 minutes) signed GET URL.
+6. **Content-Disposition Guarantee:** `signGet(...)` MUST ensure the final storage response uses the safe, intended Content-Disposition header. This is achieved via signed response-header overrides or immutable safe object metadata set during upload.
+7. Vercel issues a 302/303 redirect.
+8. Browser downloads directly from Object Storage.
 
 ## Analysis and Processing Ownership
 
-| Current Module | Current Responsibility | Future Owner | Migration Action | Reason |
-| :--- | :--- | :--- | :--- | :--- |
-| `src/services/extractors/ytdlp.server.ts` | Metadata and download via yt-dlp | Worker | Move completely | Untrusted network access must run behind the safe-egress boundary. |
-| `src/services/downloads/manager.server.ts` | Queue management, job allocation | Split | Vercel (Orchestration) / Worker (Queue) | Vercel forwards requests; Worker handles the durable queue. |
-| `src/services/downloads/processor.server.ts` | End-to-end execution flow | Worker | Move completely | Worker executes all media handling. |
-| `src/services/processing/ffmpeg.server.ts` | FFmpeg remuxing/conversion | Worker | Move completely | FFmpeg must run in the worker environment. |
-| `src/services/temp/files.server.ts` | Local temp file containment | Worker | Move completely | Vercel will no longer handle local media files. |
-
-**Second URL Validation:** The worker must independently revalidate URLs before fetching. It cannot assume Vercel's validation is sufficient, as DNS resolution may differ.
+| Current Module | Current Responsibility | Future Owner | Reason |
+| :--- | :--- | :--- | :--- |
+| `src/services/extractors/ytdlp.server.ts` | Metadata and download via yt-dlp | Worker | Untrusted network access must run behind the safe-egress boundary. |
+| `src/services/downloads/manager.server.ts` | Queue management, job allocation | Split | Vercel orchestrates; Worker handles the durable SQLite queue. |
+| `src/services/downloads/processor.server.ts` | End-to-end execution flow | Worker | Worker executes all media handling. |
+| `src/services/processing/ffmpeg.server.ts` | FFmpeg remuxing/conversion | Worker | FFmpeg must run in the worker environment. |
+| `src/services/temp/files.server.ts` | Local temp file containment | Worker | Vercel will no longer handle local media files. |
 
 ## Health and Diagnostics
 
 - **Web Health (`/api/health`):** Unauthenticated, minimal Vercel uptime check. Does not expose worker secrets.
-- **Private Diagnostics (`/api/diagnostics`):** Authenticated via user cookie. Vercel requests worker diagnostics. Aggregates worker reachability, queue depth, running jobs, object-storage availability, and safe-egress policy status.
+- **Private Diagnostics (`/api/diagnostics`):** Authenticated via user cookie. Proxies status from the worker.
 
 ## Secrets Matrix
 
@@ -130,7 +129,7 @@ stateDiagram-v2
 | :--- | :--- | :--- | :--- | :--- |
 | `VIDEOFETCH_ACCESS_SECRET` | YES | NO | NO | User private-access authentication. |
 | `WORKER_CONTROL_SECRET` | YES | YES | NO | HMAC signing for Vercel-to-Worker API. |
-| Storage Credentials | NO | YES | NO | Worker uploads to Object Storage. |
+| Storage Writer Creds | NO | YES | NO | Worker uploads to Object Storage. |
 | Storage Signing Creds | YES | NO | NO | Vercel generates signed download URLs. |
 
 ## Repository Packaging Strategy
@@ -140,22 +139,18 @@ stateDiagram-v2
 src/
   web/         (Vercel runtime: auth, routes, worker-client)
   worker/      (Worker runtime: sqlite, yt-dlp, ffmpeg, api)
-  shared/      (Contracts, job types, config schemas)
+  shared/      (Contracts, public DTOs, config schemas)
 ```
-The repository will remain a single monorepo.
+The repository remains a single monorepo.
 
 ## Docker Evolution
 
 The current `Dockerfile` contains Node, FFmpeg, Python, and yt-dlp.
 **Future Direction:**
-- A new `Dockerfile.worker` will be created specifically for the worker runtime (Linux container + yt-dlp + FFmpeg + Node.js).
-- Vercel will handle the web runtime without needing a custom Docker image for FFmpeg/Python.
+- A new `Dockerfile.worker` will be created specifically for the worker runtime.
+- Vercel handles the web runtime without needing a custom Docker image.
 
 ## Rollback Model
 
 **Fail-closed behavior:**
-If the worker is unavailable, Vercel must fail closed and return a clear service error (e.g., `WORKER_UNAVAILABLE`). Production must NEVER silently fall back to running `yt-dlp` locally in the Vercel runtime.
-
-## Open Decisions
-- Exact object storage provider selection (S3 vs R2 vs Blob).
-- Exact SQLite library selection (`better-sqlite3` vs `libsql`).
+If the worker is unavailable, Vercel fails closed returning the planned new `WORKER_UNAVAILABLE` code. Production NEVER silently falls back to running `yt-dlp` locally in the Vercel runtime.

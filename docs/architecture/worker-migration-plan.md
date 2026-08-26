@@ -1,65 +1,54 @@
 # Worker Migration Plan
 
-Moving media processing from the Vercel web runtime to a long-lived external worker is a significant architectural shift. To avoid a "flag day" (a massive, risky single pull request), the migration must be broken into incremental, independently testable phases.
+Moving media processing from the Vercel web runtime to a long-lived external worker is a significant architectural shift. To avoid a "flag day", the migration must be broken into incremental, independently testable phases.
 
 ## Phase Strategy
 
-The migration relies on building the worker in parallel with the existing system, then shifting traffic route-by-route. Production must never silently fall back from isolated worker yt-dlp to unisolated web-runtime yt-dlp.
-
 ### 1. Shared Worker Protocol & Contracts
-Extract data types, config schemas, and job definitions into a `src/shared/` or equivalent directory.
-- Define `JobRecord` enhancements (e.g., adding cancellation tracking).
+- Define the public/control DTOs (`WorkerJobView`, `WorkerJobInternal`).
 - Define the JSON schemas for the new `/v1/...` worker API.
+- Define the HMAC-SHA256 authenticated envelope structure.
 
 ### 2. Worker HTTP Skeleton & Authentication
-Initialize the standalone worker runtime (`src/worker/`).
+- Initialize the standalone worker runtime (`src/worker/`).
 - Create an Express/Fastify/Hono skeleton.
-- Implement the HMAC-SHA256 signature verification middleware using `WORKER_CONTROL_SECRET`.
-- Create a dummy `/v1/healthz` endpoint.
-- Add `Dockerfile.worker`.
+- Implement the exact sequence for HMAC-SHA256 signature verification (enforce size limits, validate timestamps, verify HMAC, then parse JSON).
+- Implement the secret rotation logic handling `WORKER_CONTROL_SECRET`.
 
 ### 3. Durable Worker Job Store (SQLite)
-Implement the SQLite database within the worker.
-- Replace the in-memory `Map` inside the worker boundary with SQLite tables (Jobs).
-- Implement idempotent job creation, status updates, and retrieval.
-- Build the `/v1/jobs` and `/v1/jobs/:jobId` endpoints.
+- Implement the SQLite database within the worker.
+- Create tables for Jobs, Idempotency Records, and Replay-Request Records.
+- Implement idempotent job creation and replay protection using the SQLite store.
 
 ### 4. Object Storage Abstraction & Upload
-Implement the provider-neutral object storage client in the worker.
-- Define the interface (upload, delete, generate signed URL).
-- Implement the upload logic inside the worker for completed media.
+- Implement the provider-neutral object storage client in the worker.
+- The worker interface is `upload`, `head`, and `delete` ONLY. (Worker does NOT sign download URLs).
 - Setup the temporary storage lifecycle/TTL rules in the chosen provider.
 
-### 5. Worker Direct-Media Execution (Fail-closed yt-dlp)
-Migrate the actual processing logic (`processJob`, `ffmpeg`, `yt-dlp`) into the worker.
-- Connect the SQLite job queue to the execution loop.
-- `yt-dlp` remains strictly disabled (fail-closed) because the egress boundary is not yet proven.
-- Test with direct media URLs and local dummy files.
-
-### 6. Control-Plane Worker Client
-Implement the HMAC-signing HTTP client in the Vercel web runtime (`src/web/`).
-- The client constructs signed requests to communicate with the worker's `/v1/...` API.
+### 5. Control-Plane Client & Storage Signing
+- Implement the HMAC-signing HTTP client in the Vercel web runtime (`src/web/`).
+- Implement the object-storage signing logic in Vercel (`signGet`) ensuring Content-Disposition guarantees.
 - Add error mapping (translating worker HTTP errors to `AppError`).
 
+### 6. Worker Direct-Media Execution (Fail-closed yt-dlp)
+- Migrate the actual processing logic (`processJob`, `ffmpeg`, `yt-dlp`) into the worker.
+- Connect the SQLite job queue to the execution loop.
+- `yt-dlp` remains strictly disabled (fail-closed).
+
 ### 7. Shift Traffic (Analyze, Download, Status)
-Modify the existing Vercel `/api/...` routes to proxy orchestration to the worker.
-- `/api/analyze` → calls Worker `/v1/analyze`.
-- `/api/downloads` → calls Worker `/v1/jobs`.
-- Modify Vercel to generate short-lived signed download URLs via the object storage SDK, redirecting the browser for file delivery.
+- Modify the existing Vercel `/api/...` routes to proxy orchestration to the worker.
+- Vercel `/api/download/:jobId/file` generates the short-lived signed object URL and redirects.
 
 ### 8. Deploy Worker with Safe Egress (yt-dlp disabled)
-Deploy the new worker infrastructure (container, persistent volume, egress firewall).
+- Deploy the new worker infrastructure (container, persistent volume).
+- Apply the externally owned egress policy (e.g., host-level `nftables`).
 - `YTDLP_NETWORK_ISOLATED` remains `false`.
-- Ensure Vercel can reach the worker over HTTPS using `WORKER_CONTROL_SECRET`.
 
 ### 9. Safe-Egress Acceptance Suite
-Run the egress integration tests *from inside* the deployed production worker container.
-- Prove that local, private, metadata, and link-local addresses are unreachable.
-- Prove that public HTTPS is reachable.
+- Run the full egress integration tests (direct-address, redirect, DNS, rebinding, descendant, firewall-mutation, public-success) *from inside* the deployed production worker container.
 
 ### 10. Enable yt-dlp Network Execution
-Once the egress boundary is proven, configure the environment variable:
-- Set `YTDLP_NETWORK_ISOLATED=true` in the worker deployment.
+- ONLY AFTER Phase 9 passes, configure `YTDLP_NETWORK_ISOLATED=true` in the worker deployment.
 - `yt-dlp` is now permitted to execute against user-supplied URLs.
 
 ---
@@ -69,5 +58,5 @@ Once the egress boundary is proven, configure the environment variable:
 During transition, local development should remain seamless.
 - A local start script (`npm run dev`) should spin up both the Vercel dev server and a local worker process concurrently.
 - The local worker uses a local SQLite file (e.g., `dev.sqlite`).
-- Local object storage can be mocked via the local filesystem or a lightweight S3 clone (like MinIO) if necessary, or simply bypass signed URLs locally.
-- The local worker runs with `YTDLP_NETWORK_ISOLATED=false` (fail-closed) unless the developer explicitly overrides it, ensuring they don't accidentally execute untrusted URLs on their home network without isolation.
+- The local worker runs with `YTDLP_NETWORK_ISOLATED=false` (fail-closed).
+- Do NOT instruct developers to casually override `YTDLP_NETWORK_ISOLATED=true` on a normal home/workstation network. If local network testing is eventually needed, it must use a deliberately isolated local container boundary equivalent in intent to production.
