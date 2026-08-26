@@ -1,8 +1,9 @@
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { Readable } from "node:stream";
-import { config, isProd } from "@/lib/config";
+import { config } from "@/lib/config";
 import { AppError, jsonError } from "@/lib/errors";
+import { buildAttachmentContentDisposition } from "@/lib/filenames";
 import { SITE_CATALOG } from "@/lib/sites-catalog";
 import { consumeRateLimit } from "@/lib/security/rate-limit.server";
 import { assertSafeUrl } from "@/lib/security/ssrf.server";
@@ -13,6 +14,7 @@ import {
   authenticateAccessSecret,
   describeAccessSession,
   noStoreHeaders,
+  requireConfiguredPrivateAccess,
   requirePrivateAccess,
   serializeAccessCookie,
   serializeClearedAccessCookie,
@@ -198,12 +200,11 @@ export async function handleDownloadFile(request: Request, jobId: string): Promi
     }
     const fileStat = await stat(job.outputPath);
     const stream = Readable.toWeb(createReadStream(job.outputPath)) as ReadableStream<Uint8Array>;
-    const filename = (job.filename || "video.bin").replace(/"/g, "");
     return new Response(stream, {
       headers: {
         "Content-Type": job.outputMime || "application/octet-stream",
         "Content-Length": String(fileStat.size),
-        "Content-Disposition": `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+        "Content-Disposition": buildAttachmentContentDisposition(job.filename || "video.bin"),
         "Cache-Control": "no-store",
       },
     });
@@ -221,20 +222,12 @@ export async function handleSites(request: Request): Promise<Response> {
   }
 }
 
-function diagnosticsTokenAllowed(request: Request): boolean {
-  if (!isProd()) return true;
-  const token = config.diagnosticsToken;
-  if (!token) return false;
-  return request.headers.get("x-diagnostics-token") === token;
-}
-
 export async function handleDiagnostics(request: Request): Promise<Response> {
   try {
-    requirePrivateAccess(request);
-    if (!diagnosticsTokenAllowed(request)) throw new AppError("FORBIDDEN");
+    requireConfiguredPrivateAccess(request);
     const data = await diagnosticsOp();
-    return Response.json(data);
+    return jsonNoStore(data);
   } catch (err) {
-    return jsonError(err instanceof Error ? err : new Error("diagnostics"), "FORBIDDEN");
+    return jsonError(err instanceof Error ? err : new Error("diagnostics"), "ACCESS_REQUIRED");
   }
 }

@@ -208,17 +208,6 @@ export async function diagnosticsSnapshot() {
     failed: jobs.filter((j) => j.status === "failed").length,
   };
   return {
-    jobs: jobs.slice(0, 50).map((j) => ({
-      id: j.id,
-      status: j.status,
-      source: j.source,
-      extractor: j.extractor,
-      quality: j.quality,
-      createdAt: j.createdAt,
-      updatedAt: j.updatedAt,
-      fileSize: j.fileSize,
-      error: j.error,
-    })),
     counts: grouped,
     disk,
     averageProcessingMs: averageProcessingMs(),

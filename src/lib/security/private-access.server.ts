@@ -163,6 +163,14 @@ export function assertPrivateAccessIsolation(request: Request): void {
   throw new AppError("FORBIDDEN", "This request is not allowed.");
 }
 
+function requireConfiguredSession(mode: Extract<AccessMode, { kind: "configured" }>, request: Request): PrivateAccessPrincipal {
+  const token = readAccessCookie(request);
+  if (!token || !verifySessionToken(mode.secret, token)) {
+    throw new AppError("ACCESS_REQUIRED");
+  }
+  return PRIVATE_ACCESS_PRINCIPAL;
+}
+
 export function requirePrivateAccess(request: Request): PrivateAccessPrincipal {
   assertPrivateAccessIsolation(request);
   const mode = getAccessMode();
@@ -170,11 +178,16 @@ export function requirePrivateAccess(request: Request): PrivateAccessPrincipal {
   if (mode.kind === "not-configured") {
     throw new AppError("ACCESS_NOT_CONFIGURED");
   }
-  const token = readAccessCookie(request);
-  if (!token || !verifySessionToken(mode.secret, token)) {
-    throw new AppError("ACCESS_REQUIRED");
+  return requireConfiguredSession(mode, request);
+}
+
+export function requireConfiguredPrivateAccess(request: Request): PrivateAccessPrincipal {
+  assertPrivateAccessIsolation(request);
+  const mode = getAccessMode();
+  if (mode.kind !== "configured") {
+    throw new AppError("ACCESS_NOT_CONFIGURED");
   }
-  return PRIVATE_ACCESS_PRINCIPAL;
+  return requireConfiguredSession(mode, request);
 }
 
 export function describeAccessSession(request: Request): AccessSessionInfo {

@@ -34,6 +34,8 @@ import {
   setSitesOperationForTests,
 } from "./private-access-api.server.ts";
 import { createJob, listJobs, resetJobsForTests, updateJob } from "../../services/jobs/store.server.ts";
+import { diagnosticsSnapshot } from "../../services/downloads/manager.server.ts";
+import { buildAttachmentContentDisposition } from "../filenames.ts";
 
 const SECRET = "0123456789abcdef0123456789abcdef";
 const ANALYZE_LIMIT = config.rateLimitPerMinute;
@@ -559,5 +561,164 @@ describe("private access resource identity", () => {
     assert.equal(res.status, 429);
     assert.equal((await readJson(res)).error?.code, "SERVER_OVERLOAD");
     assert.equal(listJobs().length, before);
+  });
+});
+
+describe("diagnostics configured-access policy", () => {
+  afterEach(() => {
+    resetPrivateAccessApiForTests();
+    setPrivateAccessTestEnv(null);
+    setPrivateAccessNowForTests(null);
+    resetJobsForTests();
+  });
+
+  it("allows diagnostics with a configured secret and valid session without a diagnostics token", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    let invoked = 0;
+    setDiagnosticsOperationForTests(async () => {
+      invoked += 1;
+      return { counts: { queued: 0, active: 0, completed: 0, failed: 0 } } as never;
+    });
+    const res = await handleDiagnostics(
+      apiRequest("/api/diagnostics", { cookie: authedCookie(), site: "same-origin" }),
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    assert.equal(invoked, 1);
+    assert.equal(res.headers.get("x-diagnostics-token"), null);
+  });
+
+  it("fails closed in development when the access secret is missing", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "development", secret: undefined });
+    let invoked = 0;
+    setDiagnosticsOperationForTests(async () => {
+      invoked += 1;
+      return { leaked: true } as never;
+    });
+    const res = await handleDiagnostics(apiRequest("/api/diagnostics"));
+    assert.equal(res.status, 503);
+    assert.equal((await readJson(res)).error?.code, "ACCESS_NOT_CONFIGURED");
+    assert.equal(invoked, 0);
+  });
+
+  it("fails closed in production when the access secret is missing", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: undefined });
+    let invoked = 0;
+    setDiagnosticsOperationForTests(async () => {
+      invoked += 1;
+      return { leaked: true } as never;
+    });
+    const res = await handleDiagnostics(apiRequest("/api/diagnostics"));
+    assert.equal(res.status, 503);
+    assert.equal((await readJson(res)).error?.code, "ACCESS_NOT_CONFIGURED");
+    assert.equal(invoked, 0);
+  });
+
+  it("does not invoke diagnostics for a forged cookie", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    let invoked = 0;
+    setDiagnosticsOperationForTests(async () => {
+      invoked += 1;
+      return { leaked: true } as never;
+    });
+    const res = await handleDiagnostics(
+      apiRequest("/api/diagnostics", {
+        cookie: `${ACCESS_COOKIE_NAME}=v1.9999999999.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`,
+        site: "same-origin",
+      }),
+    );
+    assert.equal(res.status, 401);
+    assert.equal((await readJson(res)).error?.code, "ACCESS_REQUIRED");
+    assert.equal(invoked, 0);
+  });
+
+  it("rejects cross-site diagnostics even with a valid cookie", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    let invoked = 0;
+    setDiagnosticsOperationForTests(async () => {
+      invoked += 1;
+      return { leaked: true } as never;
+    });
+    const res = await handleDiagnostics(
+      apiRequest("/api/diagnostics", { cookie: authedCookie(), site: "cross-site" }),
+    );
+    assert.equal(res.status, 403);
+    assert.equal((await readJson(res)).error?.code, "FORBIDDEN");
+    assert.equal(invoked, 0);
+  });
+
+  it("returns an aggregate snapshot without per-job records", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    const job = createJob({
+      url: "https://cdn.example/secret.mp4",
+      formatId: "direct-original",
+      principalId: PRIVATE_ACCESS_PRINCIPAL_ID,
+      workDir: "/tmp/videofetch-diagnostics-secret",
+    });
+    updateJob(job.id, { status: "failed", error: "do-not-leak", source: "cdn.example", extractor: "direct" });
+    const snap = await diagnosticsSnapshot();
+    const encoded = JSON.stringify(snap);
+    assert.equal("jobs" in snap, false);
+    assert.equal(encoded.includes(job.id), false);
+    assert.equal(encoded.includes("do-not-leak"), false);
+    assert.equal(encoded.includes("cdn.example"), false);
+    assert.equal(encoded.includes(PRIVATE_ACCESS_PRINCIPAL_ID), false);
+    assert.equal(encoded.includes("/tmp/videofetch-diagnostics-secret"), false);
+    assert.ok(snap.counts);
+    assert.ok(snap.disk);
+    assert.ok(snap.worker);
+    assert.ok(snap.limits);
+    const res = await handleDiagnostics(
+      apiRequest("/api/diagnostics", { cookie: authedCookie(), site: "same-origin" }),
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    const body = await readJson(res);
+    assert.equal("jobs" in body, false);
+  });
+});
+
+describe("download file Content-Disposition", () => {
+  afterEach(() => {
+    resetPrivateAccessApiForTests();
+    setPrivateAccessTestEnv(null);
+    setPrivateAccessNowForTests(null);
+    resetJobsForTests();
+  });
+
+  it("streams a ready file with a safe header for a hostile stored filename", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    const dir = await mkdtemp(join(tmpdir(), "videofetch-disposition-"));
+    const outputPath = join(dir, "clip.mp4");
+    await writeFile(outputPath, "FILE_BYTES");
+    const hostile = 'good.mp4\r\nX-Evil: injected"; filename=stolen';
+    const job = createJob({
+      url: "https://example.com/v.mp4",
+      formatId: "direct-original",
+      principalId: PRIVATE_ACCESS_PRINCIPAL_ID,
+      workDir: dir,
+    });
+    updateJob(job.id, {
+      status: "ready",
+      outputPath,
+      filename: hostile,
+      outputMime: "video/mp4",
+    });
+    const res = await handleDownloadFile(
+      apiRequest(`/api/download/${job.id}/file`, { cookie: authedCookie(), site: "same-origin" }),
+      job.id,
+    );
+    assert.equal(res.status, 200);
+    const disposition = res.headers.get("content-disposition") ?? "";
+    assert.equal(disposition, buildAttachmentContentDisposition(hostile));
+    assert.equal(disposition.includes("\r"), false);
+    assert.equal(disposition.includes("\n"), false);
+    assert.equal(res.headers.get("x-evil"), null);
+    assert.match(disposition, /^attachment; filename="[^"]+"; filename\*=UTF-8''/);
+    assert.equal(/filename="/.test(disposition) && disposition.indexOf("filename=") < disposition.indexOf("filename*="), true);
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    assert.equal(res.headers.get("content-type"), "video/mp4");
+    assert.equal(res.headers.get("content-length"), String(Buffer.byteLength("FILE_BYTES")));
+    assert.equal(await res.text(), "FILE_BYTES");
   });
 });

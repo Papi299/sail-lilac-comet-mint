@@ -13,7 +13,7 @@ import {
   updateJob,
 } from "../jobs/store.server.ts";
 import { jobsRoot, setTempDirectoryForTests, UnsafePathError } from "../temp/files.server.ts";
-import { allocateJob, cleanupExpired, enqueueDownload } from "./manager.server.ts";
+import { allocateJob, cleanupExpired, diagnosticsSnapshot, enqueueDownload } from "./manager.server.ts";
 
 describe("job lifecycle paths", () => {
   afterEach(() => {
@@ -96,5 +96,37 @@ describe("job lifecycle paths", () => {
       (err: unknown) => err instanceof AppError && err.code === "SERVER_OVERLOAD",
     );
     assert.equal(listJobs().length, 2);
+  });
+
+  it("returns aggregate diagnostics without enumerating jobs", async () => {
+    const job = createJob({
+      url: "https://cdn.example/leaked.mp4",
+      formatId: "sample-720",
+      principalId: PRIVATE_ACCESS_PRINCIPAL_ID,
+      workDir: "/tmp/videofetch-diag-job",
+    });
+    updateJob(job.id, {
+      status: "failed",
+      error: "extractor-secret",
+      source: "cdn.example",
+      extractor: "direct",
+      filename: "leaked.mp4",
+    });
+    const snap = await diagnosticsSnapshot();
+    const encoded = JSON.stringify(snap);
+    assert.deepEqual(Object.keys(snap).sort(), [
+      "averageProcessingMs",
+      "counts",
+      "disk",
+      "limits",
+      "worker",
+    ]);
+    assert.equal("jobs" in snap, false);
+    assert.equal(encoded.includes(job.id), false);
+    assert.equal(encoded.includes("extractor-secret"), false);
+    assert.equal(encoded.includes("cdn.example"), false);
+    assert.equal(encoded.includes("leaked.mp4"), false);
+    assert.equal(encoded.includes(PRIVATE_ACCESS_PRINCIPAL_ID), false);
+    assert.equal(snap.counts.failed, 1);
   });
 });
