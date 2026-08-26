@@ -11,7 +11,7 @@ VideoFetch analyzes public video pages and direct media URLs, normalizes availab
 - Background jobs with real progress (bytes, speed, ETA)
 - MP4 / WebM / audio-only / MP3 conversion
 - Temporary files with automatic expiry
-- SSRF protections, rate limits, and sanitized filenames
+- SSRF protections, rate limits, sanitized filenames, and a private-access gate
 
 ## Architecture
 
@@ -65,16 +65,24 @@ See `.env.example`. Important knobs:
 | `RATE_LIMIT` | 20/min | Analyze requests per IP |
 | `TEMP_DIRECTORY` | OS temp `/videofetch` | Isolated job folders |
 | `YTDLP_NETWORK_ISOLATED` | unset / `false` | Operator attestation that yt-dlp has an independent safe-egress boundary. Default is fail-closed. The flag is **not** itself isolation. |
+| `VIDEOFETCH_ACCESS_SECRET` | unset | Server-only private-access secret. Minimum 32 UTF-8 bytes. Required in production; missing/short values fail closed (HTTP 503) instead of exposing the downloader. Rotating it invalidates active sessions. Generate with `openssl rand -base64 32`. Never expose via `VITE_*`. |
 | `DIAGNOSTICS_TOKEN` | empty | Required for `/diagnostics` in production |
 
 ## API
 
+Downloader endpoints require a private-access session cookie except as noted.
+
+- `GET /api/access/session`
+- `POST /api/access/login` `{ "secret": "..." }`
+- `POST /api/access/logout`
 - `POST /api/analyze` `{ "url": "https://..." }`
 - `POST /api/download` `{ "url": "...", "formatId": "preset:1080" }`
 - `GET /api/download/:jobId/status`
 - `GET /api/download/:jobId/file`
-- `GET /api/health`
+- `GET /api/health` (public; for platform health checks)
 - `GET /api/sites`
+
+Local development may omit `VIDEOFETCH_ACCESS_SECRET`. Production never becomes public merely because the secret was forgotten.
 
 ## Docker
 
@@ -88,7 +96,7 @@ Temporary media is written to a tmpfs volume.
 
 ## Tests
 
-Unit tests cover URL validation, SSRF helpers, pinned HTTP transport, yt-dlp network policy, temp-directory containment, filename sanitization, format normalization, progress parsing, job status, rate limiting, and error mapping. External downloads are not performed in CI.
+Unit tests cover URL validation, SSRF helpers, pinned HTTP transport, yt-dlp network policy, temp-directory containment, private-access gating, filename sanitization, format normalization, progress parsing, job status, rate limiting, and error mapping. External downloads are not performed in CI.
 
 ## Notes
 

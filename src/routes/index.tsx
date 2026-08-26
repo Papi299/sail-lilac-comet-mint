@@ -7,6 +7,7 @@ import { FormatSelector } from "@/components/video/format-selector";
 import { ProgressCard } from "@/components/video/progress-card";
 import { CompleteCard } from "@/components/video/complete-card";
 import { DownloadHistory } from "@/components/video/history";
+import { PrivateAccessGate } from "@/components/video/private-access-gate";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -23,9 +24,17 @@ import type { JobProgress } from "@/types/job";
 
 export const Route = createFileRoute("/")({ component: Home });
 
+function Home() {
+  return (
+    <PrivateAccessGate>
+      <Downloader />
+    </PrivateAccessGate>
+  );
+}
+
 type Phase = "idle" | "analyzing" | "ready" | "processing" | "complete" | "error";
 
-function Home() {
+function Downloader() {
   const [url, setUrl] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
   const [video, setVideo] = useState<VideoMetadata | null>(null);

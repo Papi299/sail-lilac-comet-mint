@@ -18,6 +18,9 @@ import { Route as ApiDiagnosticsRouteImport } from './routes/api/diagnostics'
 import { Route as ApiDownloadRouteImport } from './routes/api/download'
 import { Route as ApiHealthRouteImport } from './routes/api/health'
 import { Route as ApiSitesRouteImport } from './routes/api/sites'
+import { Route as ApiAccessLoginRouteImport } from './routes/api/access.login'
+import { Route as ApiAccessLogoutRouteImport } from './routes/api/access.logout'
+import { Route as ApiAccessSessionRouteImport } from './routes/api/access.session'
 import { Route as ApiDownloadJobIdFileRouteImport } from './routes/api/download.$jobId.file'
 import { Route as ApiDownloadJobIdStatusRouteImport } from './routes/api/download.$jobId.status'
 
@@ -66,6 +69,21 @@ const ApiSitesRoute = ApiSitesRouteImport.update({
   path: '/api/sites',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiAccessLoginRoute = ApiAccessLoginRouteImport.update({
+  id: '/api/access/login',
+  path: '/api/access/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiAccessLogoutRoute = ApiAccessLogoutRouteImport.update({
+  id: '/api/access/logout',
+  path: '/api/access/logout',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiAccessSessionRoute = ApiAccessSessionRouteImport.update({
+  id: '/api/access/session',
+  path: '/api/access/session',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiDownloadJobIdFileRoute = ApiDownloadJobIdFileRouteImport.update({
   id: '/$jobId/file',
   path: '/$jobId/file',
@@ -87,6 +105,9 @@ export interface FileRoutesByFullPath {
   '/api/download': typeof ApiDownloadRouteWithChildren
   '/api/health': typeof ApiHealthRoute
   '/api/sites': typeof ApiSitesRoute
+  '/api/access/login': typeof ApiAccessLoginRoute
+  '/api/access/logout': typeof ApiAccessLogoutRoute
+  '/api/access/session': typeof ApiAccessSessionRoute
   '/api/download/$jobId/file': typeof ApiDownloadJobIdFileRoute
   '/api/download/$jobId/status': typeof ApiDownloadJobIdStatusRoute
 }
@@ -100,6 +121,9 @@ export interface FileRoutesByTo {
   '/api/download': typeof ApiDownloadRouteWithChildren
   '/api/health': typeof ApiHealthRoute
   '/api/sites': typeof ApiSitesRoute
+  '/api/access/login': typeof ApiAccessLoginRoute
+  '/api/access/logout': typeof ApiAccessLogoutRoute
+  '/api/access/session': typeof ApiAccessSessionRoute
   '/api/download/$jobId/file': typeof ApiDownloadJobIdFileRoute
   '/api/download/$jobId/status': typeof ApiDownloadJobIdStatusRoute
 }
@@ -114,6 +138,9 @@ export interface FileRoutesById {
   '/api/download': typeof ApiDownloadRouteWithChildren
   '/api/health': typeof ApiHealthRoute
   '/api/sites': typeof ApiSitesRoute
+  '/api/access/login': typeof ApiAccessLoginRoute
+  '/api/access/logout': typeof ApiAccessLogoutRoute
+  '/api/access/session': typeof ApiAccessSessionRoute
   '/api/download/$jobId/file': typeof ApiDownloadJobIdFileRoute
   '/api/download/$jobId/status': typeof ApiDownloadJobIdStatusRoute
 }
@@ -129,6 +156,9 @@ export interface FileRouteTypes {
     | '/api/download'
     | '/api/health'
     | '/api/sites'
+    | '/api/access/login'
+    | '/api/access/logout'
+    | '/api/access/session'
     | '/api/download/$jobId/file'
     | '/api/download/$jobId/status'
   fileRoutesByTo: FileRoutesByTo
@@ -142,6 +172,9 @@ export interface FileRouteTypes {
     | '/api/download'
     | '/api/health'
     | '/api/sites'
+    | '/api/access/login'
+    | '/api/access/logout'
+    | '/api/access/session'
     | '/api/download/$jobId/file'
     | '/api/download/$jobId/status'
   id:
@@ -155,6 +188,9 @@ export interface FileRouteTypes {
     | '/api/download'
     | '/api/health'
     | '/api/sites'
+    | '/api/access/login'
+    | '/api/access/logout'
+    | '/api/access/session'
     | '/api/download/$jobId/file'
     | '/api/download/$jobId/status'
   fileRoutesById: FileRoutesById
@@ -169,6 +205,9 @@ export interface RootRouteChildren {
   ApiDownloadRoute: typeof ApiDownloadRouteWithChildren
   ApiHealthRoute: typeof ApiHealthRoute
   ApiSitesRoute: typeof ApiSitesRoute
+  ApiAccessLoginRoute: typeof ApiAccessLoginRoute
+  ApiAccessLogoutRoute: typeof ApiAccessLogoutRoute
+  ApiAccessSessionRoute: typeof ApiAccessSessionRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -236,6 +275,27 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiSitesRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/access/login': {
+      id: '/api/access/login'
+      path: '/api/access/login'
+      fullPath: '/api/access/login'
+      preLoaderRoute: typeof ApiAccessLoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/access/logout': {
+      id: '/api/access/logout'
+      path: '/api/access/logout'
+      fullPath: '/api/access/logout'
+      preLoaderRoute: typeof ApiAccessLogoutRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/access/session': {
+      id: '/api/access/session'
+      path: '/api/access/session'
+      fullPath: '/api/access/session'
+      preLoaderRoute: typeof ApiAccessSessionRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/download/$jobId/file': {
       id: '/api/download/$jobId/file'
       path: '/$jobId/file'
@@ -277,6 +337,9 @@ const rootRouteChildren: RootRouteChildren = {
   ApiDownloadRoute: ApiDownloadRouteWithChildren,
   ApiHealthRoute: ApiHealthRoute,
   ApiSitesRoute: ApiSitesRoute,
+  ApiAccessLoginRoute: ApiAccessLoginRoute,
+  ApiAccessLogoutRoute: ApiAccessLogoutRoute,
+  ApiAccessSessionRoute: ApiAccessSessionRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
