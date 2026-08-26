@@ -25,7 +25,6 @@ export const config = {
   downloadTimeoutMs: num("DOWNLOAD_TIMEOUT", 600) * 1000,
   analysisTimeoutMs: num("ANALYSIS_TIMEOUT", 45) * 1000,
   maxRedirects: num("MAX_REDIRECTS", 5),
-  diagnosticsToken: str("DIAGNOSTICS_TOKEN", ""),
   nodeEnv: str("NODE_ENV", "development"),
 };
 

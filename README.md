@@ -66,8 +66,7 @@ See `.env.example`. Important knobs:
 | `RATE_LIMIT` | 20/min | Analyze requests per authenticated operator. Process-local. Forwarded-IP headers are not used as identity. |
 | `TEMP_DIRECTORY` | OS temp `/videofetch` | Isolated job folders |
 | `YTDLP_NETWORK_ISOLATED` | unset / `false` | Operator attestation that yt-dlp has an independent safe-egress boundary. Default is fail-closed. The flag is **not** itself isolation. |
-| `VIDEOFETCH_ACCESS_SECRET` | unset | Server-only private-access secret. Minimum 32 UTF-8 bytes. Required in production; missing/short values fail closed (HTTP 503) instead of exposing the downloader. Rotating it invalidates active sessions. Generate with `openssl rand -base64 32`. Never expose via `VITE_*`. |
-| `DIAGNOSTICS_TOKEN` | empty | Required for `/diagnostics` in production |
+| `VIDEOFETCH_ACCESS_SECRET` | unset | Server-only private-access secret. Minimum 32 UTF-8 bytes. Required in production for downloader APIs; missing/short values fail closed (HTTP 503) instead of exposing the downloader. **`GET /api/diagnostics` requires a configured secret and a valid session in every environment**, including local development — the ordinary development bypass does not apply there. Rotating it invalidates active sessions. Generate with `openssl rand -base64 32`. Never expose via `VITE_*`. |
 
 Analyze/download rate limits and per-operator concurrency are keyed on the private-access principal after a successful gate, not on `X-Forwarded-For` or other client-address headers. Limits are process-local and are not shared across horizontally scaled instances.
 
@@ -84,8 +83,9 @@ Downloader endpoints require a private-access session cookie except as noted.
 - `GET /api/download/:jobId/file`
 - `GET /api/health` (public; for platform health checks)
 - `GET /api/sites`
+- `GET /api/diagnostics` (sensitive operator endpoint; requires a configured `VIDEOFETCH_ACCESS_SECRET` and a valid private-access session even in local development)
 
-Local development may omit `VIDEOFETCH_ACCESS_SECRET`. Production never becomes public merely because the secret was forgotten.
+Local development may omit `VIDEOFETCH_ACCESS_SECRET` for ordinary downloader operations (analyze/download/status/file/sites). Diagnostics never uses that bypass. Production never becomes public merely because the secret was forgotten.
 
 ## Docker
 

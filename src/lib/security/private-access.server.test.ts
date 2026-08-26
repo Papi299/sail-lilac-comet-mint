@@ -10,6 +10,7 @@ import {
   getAccessMode,
   mintSessionToken,
   readAccessCookie,
+  requireConfiguredPrivateAccess,
   requirePrivateAccess,
   secretsEqual,
   serializeAccessCookie,
@@ -327,5 +328,63 @@ describe("private access principal", () => {
     );
     assert.equal(first.id, PRIVATE_ACCESS_PRINCIPAL_ID);
     assert.deepEqual(first, second);
+  });
+});
+
+describe("configured private access for diagnostics", () => {
+  afterEach(() => {
+    setPrivateAccessTestEnv(null);
+    setPrivateAccessNowForTests(null);
+  });
+
+  it("rejects development bypass and requires a configured secret", () => {
+    setPrivateAccessTestEnv({ nodeEnv: "development", secret: undefined });
+    assert.doesNotThrow(() => requirePrivateAccess(requestWith()));
+    assert.throws(
+      () => requireConfiguredPrivateAccess(requestWith()),
+      (err: unknown) => err instanceof AppError && err.code === "ACCESS_NOT_CONFIGURED" && err.status === 503,
+    );
+  });
+
+  it("rejects production and test environments without a secret", () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: undefined });
+    assert.throws(
+      () => requireConfiguredPrivateAccess(requestWith()),
+      (err: unknown) => err instanceof AppError && err.code === "ACCESS_NOT_CONFIGURED",
+    );
+    setPrivateAccessTestEnv({ nodeEnv: "test", secret: undefined });
+    assert.throws(
+      () => requireConfiguredPrivateAccess(requestWith()),
+      (err: unknown) => err instanceof AppError && err.code === "ACCESS_NOT_CONFIGURED",
+    );
+  });
+
+  it("returns the private principal for a valid configured session", () => {
+    setPrivateAccessTestEnv({ nodeEnv: "development", secret: SECRET });
+    const token = mintSessionToken(SECRET);
+    const principal = requireConfiguredPrivateAccess(
+      requestWith({ cookie: `${ACCESS_COOKIE_NAME}=${token}`, site: "same-origin" }),
+    );
+    assert.deepEqual(principal, PRIVATE_ACCESS_PRINCIPAL);
+  });
+
+  it("rejects a missing session even when the secret is configured", () => {
+    setPrivateAccessTestEnv({ nodeEnv: "development", secret: SECRET });
+    assert.throws(
+      () => requireConfiguredPrivateAccess(requestWith({ site: "same-origin" })),
+      (err: unknown) => err instanceof AppError && err.code === "ACCESS_REQUIRED" && err.status === 401,
+    );
+  });
+
+  it("rejects cross-site requests even with a valid cookie", () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    const token = mintSessionToken(SECRET);
+    assert.throws(
+      () =>
+        requireConfiguredPrivateAccess(
+          requestWith({ cookie: `${ACCESS_COOKIE_NAME}=${token}`, site: "cross-site" }),
+        ),
+      (err: unknown) => err instanceof AppError && err.code === "FORBIDDEN",
+    );
   });
 });
