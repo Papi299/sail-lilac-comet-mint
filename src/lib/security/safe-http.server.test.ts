@@ -1,14 +1,21 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import type { IncomingMessage } from "node:http";
 import { Readable } from "node:stream";
 import { AppError } from "../errors.ts";
 import {
+  buildPinnedRequestOptions,
   safeHttpRequest,
+  setPinnedRequestFactoryForTests,
   setSafeHttpTestHooks,
   type DnsAnswer,
+  type NodeRequestFactory,
+  type PinnedRequestOptions,
 } from "./safe-http.server.ts";
 
 const PUBLIC: DnsAnswer = { address: "8.8.8.8", family: 4 };
+const PUBLIC_ALT: DnsAnswer = { address: "1.1.1.1", family: 4 };
 
 function answersFor(hostname: string, table: Record<string, DnsAnswer[]>): DnsAnswer[] {
   const found = table[hostname];
@@ -16,9 +23,46 @@ function answersFor(hostname: string, table: Record<string, DnsAnswer[]>): DnsAn
   return found;
 }
 
+function lookupResult(
+  lookup: PinnedRequestOptions["lookup"],
+): Promise<{ address: string; family: number }> {
+  return new Promise((resolve, reject) => {
+    lookup("cdn.example", {}, (err, address, family) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve({ address: String(address), family: Number(family) });
+    });
+  });
+}
+
+function capturingRequestFactory(captured: PinnedRequestOptions[]): NodeRequestFactory {
+  return (options, callback) => {
+    captured.push(options);
+    const req = new EventEmitter() as ReturnType<NodeRequestFactory>;
+    req.setTimeout = (() => req) as ReturnType<NodeRequestFactory>["setTimeout"];
+    req.destroy = ((err?: Error) => {
+      if (err) req.emit("error", err);
+      return req;
+    }) as ReturnType<NodeRequestFactory>["destroy"];
+    req.end = (() => {
+      queueMicrotask(() => {
+        const res = Readable.from([Buffer.from("ok")]) as IncomingMessage;
+        res.statusCode = 200;
+        res.headers = { "content-type": "video/mp4" };
+        callback(res);
+      });
+      return req;
+    }) as ReturnType<NodeRequestFactory>["end"];
+    return req;
+  };
+}
+
 describe("safe HTTP transport", () => {
   afterEach(() => {
     setSafeHttpTestHooks(null);
+    setPinnedRequestFactoryForTests(null);
   });
 
   it("rejects a resolver answer of 127.0.0.1 before connecting", async () => {
@@ -166,5 +210,53 @@ describe("safe HTTP transport", () => {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
     assert.equal(Buffer.concat(chunks).toString(), "abc");
+  });
+
+  it("builds one-shot request options with agent:false and the request pin", async () => {
+    const first = buildPinnedRequestOptions({
+      url: new URL("https://cdn.example/a.mp4"),
+      method: "GET",
+      pinned: PUBLIC,
+      headers: { "User-Agent": "VideoFetch/1.0" },
+    });
+    const second = buildPinnedRequestOptions({
+      url: new URL("https://cdn.example/b.mp4"),
+      method: "GET",
+      pinned: PUBLIC_ALT,
+      headers: { "User-Agent": "VideoFetch/1.0" },
+    });
+    assert.equal(first.agent, false);
+    assert.equal(second.agent, false);
+    assert.equal(first.hostname, "cdn.example");
+    assert.equal(first.servername, "cdn.example");
+    assert.equal((first.headers as { host?: string }).host, "cdn.example");
+    assert.notEqual(first.lookup, second.lookup);
+    assert.deepEqual(await lookupResult(first.lookup), { address: PUBLIC.address, family: 4 });
+    assert.deepEqual(await lookupResult(second.lookup), { address: PUBLIC_ALT.address, family: 4 });
+  });
+
+  it("does not reuse a shared Agent across two real pinned requests to the same host", async () => {
+    const captured: PinnedRequestOptions[] = [];
+    const factory = capturingRequestFactory(captured);
+    let pin: DnsAnswer = PUBLIC;
+    setSafeHttpTestHooks({
+      lookup: async () => [pin],
+    });
+    setPinnedRequestFactoryForTests({ http: factory, https: factory });
+
+    pin = PUBLIC;
+    await safeHttpRequest({ url: "https://cdn.example/a.mp4" });
+    pin = PUBLIC_ALT;
+    await safeHttpRequest({ url: "https://cdn.example/b.mp4" });
+
+    assert.equal(captured.length, 2);
+    assert.equal(captured[0]?.agent, false);
+    assert.equal(captured[1]?.agent, false);
+    assert.equal(captured[0]?.hostname, "cdn.example");
+    assert.equal(captured[1]?.hostname, "cdn.example");
+    assert.equal(captured[0]?.servername, "cdn.example");
+    assert.notEqual(captured[0]?.lookup, captured[1]?.lookup);
+    assert.deepEqual(await lookupResult(captured[0]!.lookup), { address: PUBLIC.address, family: 4 });
+    assert.deepEqual(await lookupResult(captured[1]!.lookup), { address: PUBLIC_ALT.address, family: 4 });
   });
 });

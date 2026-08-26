@@ -1,4 +1,4 @@
-import { mkdir, readdir, realpath, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, readdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { config } from "@/lib/config";
 
@@ -29,23 +29,116 @@ export function isJobId(id: string): boolean {
   return JOB_ID_RE.test(id);
 }
 
+async function lstatIfExists(path: string) {
+  try {
+    return await lstat(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+function assertNotSentinel(path: string): void {
+  if (path === sep || path === resolve("/") || path === resolve("/tmp")) {
+    throw new UnsafePathError();
+  }
+}
+
+/**
+ * Temp root and jobs root are trust boundaries: real directories, not
+ * symbolic links, with canonical paths matching the configured layout
+ * `<temp>/jobs`.
+ */
+export async function assertTrustedJobRoots(): Promise<{ temp: string; jobs: string }> {
+  const tempLogical = tempRoot();
+  const jobsLogical = jobsRoot();
+  assertNotSentinel(tempLogical);
+  assertNotSentinel(jobsLogical);
+
+  const tempSt = await lstatIfExists(tempLogical);
+  if (!tempSt || tempSt.isSymbolicLink() || !tempSt.isDirectory()) {
+    throw new UnsafePathError();
+  }
+  const tempCanonical = await realpath(tempLogical);
+  if (tempCanonical !== tempLogical) {
+    throw new UnsafePathError();
+  }
+
+  const jobsSt = await lstatIfExists(jobsLogical);
+  if (!jobsSt || jobsSt.isSymbolicLink() || !jobsSt.isDirectory()) {
+    throw new UnsafePathError();
+  }
+  const jobsCanonical = await realpath(jobsLogical);
+  if (jobsCanonical !== jobsLogical) {
+    throw new UnsafePathError();
+  }
+  if (dirname(jobsCanonical) !== tempCanonical || basename(jobsCanonical) !== "jobs") {
+    throw new UnsafePathError();
+  }
+  return { temp: tempCanonical, jobs: jobsCanonical };
+}
+
 export async function ensureTempRoot(): Promise<string> {
   const root = tempRoot();
-  await mkdir(root, { recursive: true });
+  const existing = await lstatIfExists(root);
+  if (existing?.isSymbolicLink()) {
+    throw new UnsafePathError();
+  }
+  if (!existing) {
+    await mkdir(root, { recursive: true });
+  }
+  const after = await lstat(root);
+  if (after.isSymbolicLink() || !after.isDirectory()) {
+    throw new UnsafePathError();
+  }
   return root;
+}
+
+async function ensureJobsRoot(): Promise<string> {
+  await ensureTempRoot();
+  const jobs = jobsRoot();
+  const existing = await lstatIfExists(jobs);
+  if (existing?.isSymbolicLink()) {
+    throw new UnsafePathError();
+  }
+  if (!existing) {
+    try {
+      await mkdir(jobs, { recursive: false });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw new UnsafePathError();
+      }
+    }
+  }
+  const after = await lstat(jobs);
+  if (after.isSymbolicLink() || !after.isDirectory()) {
+    throw new UnsafePathError();
+  }
+  const trusted = await assertTrustedJobRoots();
+  return trusted.jobs;
 }
 
 export async function createJobDir(jobId: string): Promise<string> {
   if (!isJobId(jobId)) {
     throw new UnsafePathError("Refusing to create a job directory without a valid job id.");
   }
-  await ensureTempRoot();
-  const dir = resolve(join(jobsRoot(), jobId));
+  const jobs = await ensureJobsRoot();
+  const dir = resolve(join(jobs, jobId));
   assertRemovableJobDir(dir);
-  await mkdir(dir, { recursive: true });
+  const existing = await lstatIfExists(dir);
+  if (existing?.isSymbolicLink()) {
+    throw new UnsafePathError();
+  }
+  if (!existing) {
+    await mkdir(dir, { recursive: false });
+  }
+  const leaf = await lstat(dir);
+  if (leaf.isSymbolicLink() || !leaf.isDirectory()) {
+    throw new UnsafePathError();
+  }
   const canonical = await realpath(dir);
-  const rootCanonical = await realpath(jobsRoot());
-  if (dirname(canonical) !== rootCanonical || basename(canonical) !== jobId) {
+  const { jobs: jobsCanonical } = await assertTrustedJobRoots();
+  if (dirname(canonical) !== jobsCanonical || basename(canonical) !== jobId || canonical !== dir) {
     throw new UnsafePathError();
   }
   return canonical;
@@ -91,6 +184,12 @@ export function assertRemovableJobDir(workDir: string): string {
 
 export async function removeJobDir(workDir: string): Promise<void> {
   const target = assertRemovableJobDir(workDir);
+  const { jobs } = await assertTrustedJobRoots();
+  const leaf = await lstatIfExists(target);
+  if (!leaf) return;
+  if (leaf.isSymbolicLink() || !leaf.isDirectory()) {
+    throw new UnsafePathError();
+  }
   let canonical: string;
   try {
     canonical = await realpath(target);
@@ -99,18 +198,9 @@ export async function removeJobDir(workDir: string): Promise<void> {
     if (code === "ENOENT") return;
     throw err;
   }
-
-  let rootCanonical: string;
-  try {
-    rootCanonical = await realpath(jobsRoot());
-  } catch {
+  if (dirname(canonical) !== jobs || basename(canonical) !== basename(target) || canonical !== target) {
     throw new UnsafePathError();
   }
-
-  if (dirname(canonical) !== rootCanonical || basename(canonical) !== basename(target)) {
-    throw new UnsafePathError();
-  }
-
   await rm(canonical, { recursive: true, force: true });
 }
 

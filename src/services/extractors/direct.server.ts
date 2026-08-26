@@ -6,7 +6,7 @@ import { Readable } from "node:stream";
 import { config } from "@/lib/config";
 import { AppError } from "@/lib/errors";
 import { extractDomain } from "@/lib/validation/url";
-import { safeGet, safeHead } from "@/lib/security/safe-http.server";
+import { disposeHttpBody, safeGet, safeHead } from "@/lib/security/safe-http.server";
 import {
   buildPresets,
   mimeForContainer,
@@ -167,15 +167,17 @@ async function streamDownload(url: string, dest: string, ctx: DownloadContext) {
     signal: ctx.signal,
     timeoutMs: config.downloadTimeoutMs,
   });
-  if (res.status === 404) throw new AppError("VIDEO_UNAVAILABLE");
+  if (res.status === 404) {
+    disposeHttpBody(res.body);
+    throw new AppError("VIDEO_UNAVAILABLE");
+  }
   if (res.status < 200 || res.status >= 300 || !res.body) {
+    disposeHttpBody(res.body);
     throw new AppError("NETWORK_ERROR");
   }
   const type = headerString(res.headers["content-type"]) || "";
   if (type.startsWith("text/html")) {
-    if (typeof (res.body as Readable).destroy === "function") {
-      (res.body as Readable).destroy();
-    }
+    disposeHttpBody(res.body);
     throw new AppError("EXTRACTION_FAILED");
   }
   const total = parseLen(headerString(res.headers["content-length"]));

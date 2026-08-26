@@ -1,7 +1,7 @@
 import http from "node:http";
 import https from "node:https";
 import { lookup as dnsLookup } from "node:dns/promises";
-import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
+import type { ClientRequest, IncomingHttpHeaders, IncomingMessage, RequestOptions } from "node:http";
 import { Readable } from "node:stream";
 import { config } from "@/lib/config";
 import { AppError } from "@/lib/errors";
@@ -40,14 +40,35 @@ export type SafeHttpResponse = {
   body: IncomingMessage | Readable | null;
 };
 
+export type PinnedRequestOptions = RequestOptions & {
+  agent: false;
+  servername: string;
+  lookup: NonNullable<RequestOptions["lookup"]>;
+  family: 4 | 6;
+};
+
+export type NodeRequestFactory = (
+  options: PinnedRequestOptions,
+  callback: (res: IncomingMessage) => void,
+) => ClientRequest;
+
 let lookupImpl: LookupFn = defaultLookup;
 let requestOnceImpl: SafeRequestOnce = nodeRequestOnce;
+let httpRequestImpl: NodeRequestFactory = http.request.bind(http) as NodeRequestFactory;
+let httpsRequestImpl: NodeRequestFactory = https.request.bind(https) as NodeRequestFactory;
 
 export function setSafeHttpTestHooks(
   hooks: { lookup?: LookupFn; requestOnce?: SafeRequestOnce } | null,
 ): void {
   lookupImpl = hooks?.lookup ?? defaultLookup;
   requestOnceImpl = hooks?.requestOnce ?? nodeRequestOnce;
+}
+
+export function setPinnedRequestFactoryForTests(
+  factory: { http?: NodeRequestFactory; https?: NodeRequestFactory } | null,
+): void {
+  httpRequestImpl = factory?.http ?? (http.request.bind(http) as NodeRequestFactory);
+  httpsRequestImpl = factory?.https ?? (https.request.bind(https) as NodeRequestFactory);
 }
 
 export async function lookupHost(hostname: string): Promise<DnsAnswer[]> {
@@ -121,11 +142,7 @@ function familyOf(address: string, family?: number): 4 | 6 {
 
 function pinnedLookup(
   pinned: DnsAnswer,
-): (
-  hostname: string,
-  options: unknown,
-  callback?: (err: Error | null, address: unknown, family?: number) => void,
-) => void {
+): NonNullable<RequestOptions["lookup"]> {
   return (_hostname, options, callback) => {
     const cb =
       typeof options === "function"
@@ -142,6 +159,40 @@ function pinnedLookup(
   };
 }
 
+/**
+ * Options for the real Node HTTP(S) request.
+ *
+ * `agent: false` forces a one-shot Agent so socket reuse cannot skip the
+ * newly supplied pinned lookup for this request.
+ */
+export function buildPinnedRequestOptions(args: {
+  url: URL;
+  method: "GET" | "HEAD";
+  pinned: DnsAnswer;
+  headers: Record<string, string>;
+  signal?: AbortSignal;
+}): PinnedRequestOptions {
+  const { url, method, pinned, headers, signal } = args;
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+  return {
+    protocol: url.protocol,
+    hostname,
+    port,
+    path: `${url.pathname}${url.search}`,
+    method,
+    headers: {
+      ...headers,
+      host: url.host,
+    },
+    servername: hostname,
+    lookup: pinnedLookup(pinned),
+    family: familyOf(pinned.address, pinned.family),
+    agent: false,
+    signal,
+  };
+}
+
 function nodeRequestOnce(args: {
   url: URL;
   method: "GET" | "HEAD";
@@ -155,35 +206,17 @@ function nodeRequestOnce(args: {
   body: IncomingMessage | null;
 }> {
   const { url, method, pinned, headers, signal, timeoutMs } = args;
-  const lib = url.protocol === "https:" ? https : http;
-  const hostname = url.hostname.replace(/^\[|\]$/g, "");
-  const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+  const request = url.protocol === "https:" ? httpsRequestImpl : httpRequestImpl;
+  const options = buildPinnedRequestOptions({ url, method, pinned, headers, signal });
 
   return new Promise((resolve, reject) => {
-    const req = lib.request(
-      {
-        protocol: url.protocol,
-        hostname,
-        port,
-        path: `${url.pathname}${url.search}`,
-        method,
-        headers: {
-          ...headers,
-          host: url.host,
-        },
-        servername: hostname,
-        lookup: pinnedLookup(pinned) as unknown as typeof import("node:dns").lookup,
-        family: familyOf(pinned.address, pinned.family),
-        signal,
-      },
-      (res) => {
-        resolve({
-          status: res.statusCode ?? 0,
-          headers: res.headers,
-          body: method === "HEAD" ? drainAndNull(res) : res,
-        });
-      },
-    );
+    const req = request(options, (res) => {
+      resolve({
+        status: res.statusCode ?? 0,
+        headers: res.headers,
+        body: method === "HEAD" ? drainAndNull(res) : res,
+      });
+    });
 
     req.setTimeout(timeoutMs, () => {
       req.destroy(new AppError("TIMEOUT"));
@@ -199,6 +232,18 @@ function nodeRequestOnce(args: {
 function drainAndNull(res: IncomingMessage): null {
   res.resume();
   return null;
+}
+
+export function disposeHttpBody(body: IncomingMessage | Readable | null | undefined): void {
+  if (!body) return;
+  const stream = body as Readable;
+  if (typeof stream.destroy === "function") {
+    stream.destroy();
+    return;
+  }
+  if (typeof stream.resume === "function") {
+    stream.resume();
+  }
 }
 
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
@@ -226,9 +271,7 @@ export async function safeHttpRequest(opts: SafeHttpRequestOptions): Promise<Saf
     });
 
     if (REDIRECT_STATUS.has(result.status)) {
-      if (result.body && typeof (result.body as Readable).destroy === "function") {
-        (result.body as Readable).destroy();
-      }
+      disposeHttpBody(result.body);
       const location = headerValue(result.headers, "location");
       if (!location) throw new AppError("NETWORK_ERROR");
       let next: URL;

@@ -1,6 +1,6 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJobId } from "../jobs/store.server.ts";
@@ -76,6 +76,52 @@ describe("job directory containment", () => {
     const link = join(jobsRoot(), id);
     await symlink(outside, link);
     await assert.rejects(() => removeJobDir(link), UnsafePathError);
+    const still = await stat(canary);
+    assert.equal(still.isFile(), true);
+  });
+
+  it("rejects createJobDir when the jobs root is a symlink to an outside directory", async () => {
+    await withTempRoot();
+    const outside = await mkdtemp(join(tmpdir(), "videofetch-jobs-outside-"));
+    const canary = join(outside, "keep-me");
+    await writeFile(canary, "safe");
+    await symlink(outside, jobsRoot());
+    const id = createJobId();
+    await assert.rejects(() => createJobDir(id), UnsafePathError);
+    await assert.rejects(() => stat(join(outside, id)), { code: "ENOENT" });
+    const names = await readdir(outside);
+    assert.equal(names.includes(id), false);
+    const still = await stat(canary);
+    assert.equal(still.isFile(), true);
+  });
+
+  it("rejects removeJobDir when the jobs root is a symlink to an outside directory", async () => {
+    await withTempRoot();
+    const outside = await mkdtemp(join(tmpdir(), "videofetch-jobs-rm-outside-"));
+    const canary = join(outside, "keep-me");
+    await writeFile(canary, "safe");
+    const id = createJobId();
+    await mkdir(join(outside, id));
+    await writeFile(join(outside, id, "clip.mp4"), "secret");
+    await symlink(outside, jobsRoot());
+    await assert.rejects(() => removeJobDir(join(jobsRoot(), id)), UnsafePathError);
+    const still = await stat(canary);
+    assert.equal(still.isFile(), true);
+    const leftover = await stat(join(outside, id, "clip.mp4"));
+    assert.equal(leftover.isFile(), true);
+  });
+
+  it("rejects a temp root that is a symlink", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "videofetch-temp-parent-"));
+    const outside = await mkdtemp(join(tmpdir(), "videofetch-temp-outside-"));
+    const canary = join(outside, "keep-me");
+    await writeFile(canary, "safe");
+    const tempLink = join(parent, "temp");
+    await symlink(outside, tempLink);
+    setTempDirectoryForTests(tempLink);
+    const id = createJobId();
+    await assert.rejects(() => createJobDir(id), UnsafePathError);
+    await assert.rejects(() => stat(join(outside, "jobs", id)), { code: "ENOENT" });
     const still = await stat(canary);
     assert.equal(still.isFile(), true);
   });
