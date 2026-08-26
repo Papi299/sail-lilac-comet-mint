@@ -18,7 +18,7 @@ export const config = {
   maxVideoDuration: num("MAX_VIDEO_DURATION", 2 * 60 * 60),
   fileExpirationMinutes: num("FILE_EXPIRATION_MINUTES", 45),
   maxConcurrentDownloads: num("MAX_CONCURRENT_DOWNLOADS", 3),
-  maxConcurrentPerIp: num("MAX_CONCURRENT_PER_IP", 2),
+  maxConcurrentPerPrincipal: num("MAX_CONCURRENT_PER_PRINCIPAL", 2),
   rateLimitPerMinute: num("RATE_LIMIT", 20),
   tempDirectory: str("TEMP_DIRECTORY", join(tmpdir(), "videofetch")),
   ffmpegPath: str("FFMPEG_PATH", "/usr/local/bin/ffmpeg"),

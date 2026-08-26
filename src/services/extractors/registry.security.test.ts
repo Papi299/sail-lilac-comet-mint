@@ -86,7 +86,7 @@ describe("extractor URL boundary", () => {
     const job = createJob({
       url: "http://127.0.0.1/secret.mp4",
       formatId: "direct-original",
-      ip: "203.0.113.10",
+      principalId: "private-access-user",
       workDir: "/tmp/videofetch-processjob-sentinel",
     });
     await processJob(job.id);

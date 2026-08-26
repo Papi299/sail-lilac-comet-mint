@@ -36,7 +36,7 @@ export type JobRecord = JobProgress & {
   id: string;
   url: string;
   formatId: string;
-  ip: string;
+  principalId: string;
   outputPath: string | null;
   outputMime: string | null;
   workDir: string;
