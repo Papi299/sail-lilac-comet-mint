@@ -7,7 +7,7 @@ import { processJob } from "@/services/downloads/processor.server";
 import {
   averageProcessingMs,
   countActive,
-  countActiveForIp,
+  countActiveForPrincipal,
   createJob,
   createJobId,
   deleteJob,
@@ -62,7 +62,7 @@ function pump() {
 export async function allocateJob(input: {
   url: string;
   formatId: string;
-  ip: string;
+  principalId: string;
   id?: string;
   title?: string | null;
   thumbnail?: string | null;
@@ -75,7 +75,7 @@ export async function allocateJob(input: {
     id,
     url: input.url,
     formatId: input.formatId,
-    ip: input.ip,
+    principalId: input.principalId,
     workDir,
     title: input.title,
     thumbnail: input.thumbnail,
@@ -110,7 +110,7 @@ export async function analyzeVideo(url: string) {
 export async function enqueueDownload(input: {
   url: string;
   formatId: string;
-  ip: string;
+  principalId: string;
   title?: string | null;
   thumbnail?: string | null;
   source?: string | null;
@@ -119,7 +119,7 @@ export async function enqueueDownload(input: {
   if (countActive() >= config.maxConcurrentDownloads + 8) {
     throw new AppError("SERVER_OVERLOAD");
   }
-  if (countActiveForIp(input.ip) >= config.maxConcurrentPerIp) {
+  if (countActiveForPrincipal(input.principalId) >= config.maxConcurrentPerPrincipal) {
     throw new AppError("SERVER_OVERLOAD");
   }
 
@@ -151,7 +151,7 @@ export async function enqueueDownload(input: {
   const job = await allocateJob({
     url: safe.url,
     formatId: input.formatId,
-    ip: input.ip,
+    principalId: input.principalId,
     title: metaTitle,
     thumbnail: metaThumb,
     source: metaSource,

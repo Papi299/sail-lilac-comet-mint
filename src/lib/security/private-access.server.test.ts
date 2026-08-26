@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { AppError } from "../errors.ts";
 import {
   ACCESS_COOKIE_NAME,
+  PRIVATE_ACCESS_PRINCIPAL,
+  PRIVATE_ACCESS_PRINCIPAL_ID,
   authenticateAccessSecret,
   describeAccessSession,
   getAccessMode,
@@ -20,8 +22,13 @@ import {
 const SECRET = "0123456789abcdef0123456789abcdef";
 const OTHER_SECRET = "fedcba9876543210fedcba9876543210";
 
-function requestWith(init?: { cookie?: string; site?: string; method?: string }): Request {
-  const headers = new Headers();
+function requestWith(init?: {
+  cookie?: string;
+  site?: string;
+  method?: string;
+  headers?: Record<string, string>;
+}): Request {
+  const headers = new Headers(init?.headers);
   if (init?.cookie) headers.set("cookie", init.cookie);
   if (init?.site) headers.set("sec-fetch-site", init.site);
   return new Request("https://videofetch.example/api/analyze", {
@@ -48,7 +55,9 @@ describe("private access secret handling", () => {
   it("uses an explicit development bypass when no secret is configured", () => {
     setPrivateAccessTestEnv({ nodeEnv: "development", secret: undefined });
     assert.equal(getAccessMode().kind, "development-bypass");
-    assert.doesNotThrow(() => requirePrivateAccess(requestWith()));
+    const principal = requirePrivateAccess(requestWith());
+    assert.equal(principal.id, PRIVATE_ACCESS_PRINCIPAL_ID);
+    assert.deepEqual(principal, PRIVATE_ACCESS_PRINCIPAL);
   });
 
   it("enforces the gate when a valid secret is configured", () => {
@@ -176,7 +185,8 @@ describe("private access request isolation", () => {
   }
 
   it("allows same-origin requests with a valid session", () => {
-    assert.doesNotThrow(() => requirePrivateAccess(authedRequest("same-origin")));
+    const principal = requirePrivateAccess(authedRequest("same-origin"));
+    assert.equal(principal.id, PRIVATE_ACCESS_PRINCIPAL_ID);
   });
 
   it("allows Sec-Fetch-Site none with a valid session", () => {
@@ -249,5 +259,73 @@ describe("secret comparison", () => {
   it("accepts equal secrets and rejects unequal secrets", () => {
     assert.equal(secretsEqual(SECRET, SECRET), true);
     assert.equal(secretsEqual("abc", SECRET), false);
+  });
+});
+
+describe("private access principal", () => {
+  afterEach(() => {
+    setPrivateAccessTestEnv(null);
+    setPrivateAccessNowForTests(null);
+  });
+
+  function authedRequest(headers?: Record<string, string>): Request {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    const token = mintSessionToken(SECRET);
+    return requestWith({
+      cookie: `${ACCESS_COOKIE_NAME}=${token}`,
+      site: "same-origin",
+      headers,
+    });
+  }
+
+  it("returns the fixed server principal for a valid configured session", () => {
+    const principal = requirePrivateAccess(authedRequest());
+    assert.equal(principal.id, "private-access-user");
+    assert.deepEqual(principal, PRIVATE_ACCESS_PRINCIPAL);
+  });
+
+  it("returns the same principal under development bypass", () => {
+    setPrivateAccessTestEnv({ nodeEnv: "development", secret: undefined });
+    const principal = requirePrivateAccess(requestWith());
+    assert.equal(principal.id, PRIVATE_ACCESS_PRINCIPAL_ID);
+    assert.deepEqual(principal, PRIVATE_ACCESS_PRINCIPAL);
+  });
+
+  it("does not return a principal for an invalid session", () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    let returned: unknown;
+    try {
+      returned = requirePrivateAccess(requestWith());
+    } catch (err) {
+      assert.ok(err instanceof AppError);
+      assert.equal(err.code, "ACCESS_REQUIRED");
+      returned = "threw";
+    }
+    assert.equal(returned, "threw");
+  });
+
+  it("does not derive the principal from forwarded address headers", () => {
+    const first = requirePrivateAccess(
+      authedRequest({
+        "x-forwarded-for": "1.1.1.1",
+        "x-real-ip": "2.2.2.2",
+        forwarded: "for=3.3.3.3",
+        "x-vercel-forwarded-for": "4.4.4.4",
+        "cf-connecting-ip": "5.5.5.5",
+        "true-client-ip": "6.6.6.6",
+      }),
+    );
+    const second = requirePrivateAccess(
+      authedRequest({
+        "x-forwarded-for": "8.8.8.8",
+        "x-real-ip": "9.9.9.9",
+        forwarded: "for=10.10.10.10",
+        "x-vercel-forwarded-for": "11.11.11.11",
+        "cf-connecting-ip": "12.12.12.12",
+        "true-client-ip": "13.13.13.13",
+      }),
+    );
+    assert.equal(first.id, PRIVATE_ACCESS_PRINCIPAL_ID);
+    assert.deepEqual(first, second);
   });
 });

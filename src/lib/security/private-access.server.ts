@@ -7,6 +7,16 @@ export const ACCESS_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const ACCESS_LOGIN_RATE_KEY = "private-access-login";
 export const ACCESS_LOGIN_RATE_LIMIT = 10;
 
+export const PRIVATE_ACCESS_PRINCIPAL_ID = "private-access-user" as const;
+
+export type PrivateAccessPrincipal = {
+  readonly id: typeof PRIVATE_ACCESS_PRINCIPAL_ID;
+};
+
+export const PRIVATE_ACCESS_PRINCIPAL: PrivateAccessPrincipal = Object.freeze({
+  id: PRIVATE_ACCESS_PRINCIPAL_ID,
+});
+
 const TOKEN_VERSION = "v1";
 const MAC_PURPOSE = "videofetch-private-access";
 
@@ -153,10 +163,10 @@ export function assertPrivateAccessIsolation(request: Request): void {
   throw new AppError("FORBIDDEN", "This request is not allowed.");
 }
 
-export function requirePrivateAccess(request: Request): void {
+export function requirePrivateAccess(request: Request): PrivateAccessPrincipal {
   assertPrivateAccessIsolation(request);
   const mode = getAccessMode();
-  if (mode.kind === "development-bypass") return;
+  if (mode.kind === "development-bypass") return PRIVATE_ACCESS_PRINCIPAL;
   if (mode.kind === "not-configured") {
     throw new AppError("ACCESS_NOT_CONFIGURED");
   }
@@ -164,6 +174,7 @@ export function requirePrivateAccess(request: Request): void {
   if (!token || !verifySessionToken(mode.secret, token)) {
     throw new AppError("ACCESS_REQUIRED");
   }
+  return PRIVATE_ACCESS_PRINCIPAL;
 }
 
 export function describeAccessSession(request: Request): AccessSessionInfo {

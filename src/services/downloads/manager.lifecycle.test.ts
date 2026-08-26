@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AppError } from "../../lib/errors.ts";
+import { PRIVATE_ACCESS_PRINCIPAL_ID } from "../../lib/security/private-access.server.ts";
 import {
   createJob,
   getJob,
@@ -11,7 +13,7 @@ import {
   updateJob,
 } from "../jobs/store.server.ts";
 import { jobsRoot, setTempDirectoryForTests, UnsafePathError } from "../temp/files.server.ts";
-import { allocateJob, cleanupExpired } from "./manager.server.ts";
+import { allocateJob, cleanupExpired, enqueueDownload } from "./manager.server.ts";
 
 describe("job lifecycle paths", () => {
   afterEach(() => {
@@ -29,10 +31,11 @@ describe("job lifecycle paths", () => {
     const job = await allocateJob({
       url: "sample://demo",
       formatId: "sample-720",
-      ip: "203.0.113.10",
+      principalId: PRIVATE_ACCESS_PRINCIPAL_ID,
     });
     assert.notEqual(job.workDir, "/tmp");
     assert.equal(job.workDir, join(jobsRoot(), job.id));
+    assert.equal(job.principalId, PRIVATE_ACCESS_PRINCIPAL_ID);
     assert.match(job.id, /^[0-9a-f]{32}$/);
     const st = await stat(job.workDir);
     assert.equal(st.isDirectory(), true);
@@ -48,7 +51,7 @@ describe("job lifecycle paths", () => {
           id: "not-a-valid-job-id",
           url: "sample://demo",
           formatId: "sample-720",
-          ip: "203.0.113.10",
+          principalId: PRIVATE_ACCESS_PRINCIPAL_ID,
         }),
       UnsafePathError,
     );
@@ -59,7 +62,7 @@ describe("job lifecycle paths", () => {
     const job = createJob({
       url: "sample://demo",
       formatId: "sample-720",
-      ip: "203.0.113.10",
+      principalId: PRIVATE_ACCESS_PRINCIPAL_ID,
       workDir: "/tmp",
     });
     updateJob(job.id, { expiresAt: Date.now() - 1000 });
@@ -68,5 +71,30 @@ describe("job lifecycle paths", () => {
     assert.equal(getJob(job.id), undefined);
     const tmp = await stat("/tmp");
     assert.equal(tmp.isDirectory(), true);
+  });
+
+  it("rejects another download for the same principal without creating a job", async () => {
+    createJob({
+      url: "sample://demo",
+      formatId: "sample-720",
+      principalId: PRIVATE_ACCESS_PRINCIPAL_ID,
+      workDir: "/tmp/videofetch-principal-a",
+    });
+    createJob({
+      url: "sample://demo",
+      formatId: "sample-720",
+      principalId: PRIVATE_ACCESS_PRINCIPAL_ID,
+      workDir: "/tmp/videofetch-principal-b",
+    });
+    await assert.rejects(
+      () =>
+        enqueueDownload({
+          url: "https://example.com/v.mp4",
+          formatId: "direct-original",
+          principalId: PRIVATE_ACCESS_PRINCIPAL_ID,
+        }),
+      (err: unknown) => err instanceof AppError && err.code === "SERVER_OVERLOAD",
+    );
+    assert.equal(listJobs().length, 2);
   });
 });

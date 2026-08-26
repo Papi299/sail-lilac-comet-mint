@@ -15,7 +15,7 @@ export function nowMs(): number {
 export function createJob(input: {
   url: string;
   formatId: string;
-  ip: string;
+  principalId: string;
   workDir: string;
   id?: string;
   title?: string | null;
@@ -29,7 +29,7 @@ export function createJob(input: {
     id,
     url: input.url,
     formatId: input.formatId,
-    ip: input.ip,
+    principalId: input.principalId,
     workDir: input.workDir,
     outputPath: null,
     outputMime: null,
@@ -91,10 +91,10 @@ export function countActive(): number {
   return n;
 }
 
-export function countActiveForIp(ip: string): number {
+export function countActiveForPrincipal(principalId: string): number {
   let n = 0;
   for (const job of jobs.values()) {
-    if (job.ip === ip && job.status !== "ready" && job.status !== "failed") n += 1;
+    if (job.principalId === principalId && job.status !== "ready" && job.status !== "failed") n += 1;
   }
   return n;
 }

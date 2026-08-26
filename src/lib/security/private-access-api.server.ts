@@ -3,7 +3,6 @@ import { stat } from "node:fs/promises";
 import { Readable } from "node:stream";
 import { config, isProd } from "@/lib/config";
 import { AppError, jsonError } from "@/lib/errors";
-import { clientIp } from "@/lib/request-ip.server";
 import { SITE_CATALOG } from "@/lib/sites-catalog";
 import { consumeRateLimit } from "@/lib/security/rate-limit.server";
 import { assertSafeUrl } from "@/lib/security/ssrf.server";
@@ -134,9 +133,8 @@ export async function handleAccessLogout(request: Request): Promise<Response> {
 
 export async function handleAnalyze(request: Request): Promise<Response> {
   try {
-    requirePrivateAccess(request);
-    const ip = clientIp();
-    if (!consumeRateLimit(`analyze:${ip}`, config.rateLimitPerMinute)) {
+    const principal = requirePrivateAccess(request);
+    if (!consumeRateLimit(`analyze:${principal.id}`, config.rateLimitPerMinute)) {
       throw new AppError("RATE_LIMITED");
     }
     const body = (await request.json().catch(() => null)) as { url?: unknown } | null;
@@ -151,9 +149,8 @@ export async function handleAnalyze(request: Request): Promise<Response> {
 
 export async function handleDownload(request: Request): Promise<Response> {
   try {
-    requirePrivateAccess(request);
-    const ip = clientIp();
-    if (!consumeRateLimit(`download:${ip}`, Math.max(8, Math.floor(config.rateLimitPerMinute / 2)))) {
+    const principal = requirePrivateAccess(request);
+    if (!consumeRateLimit(`download:${principal.id}`, Math.max(8, Math.floor(config.rateLimitPerMinute / 2)))) {
       throw new AppError("RATE_LIMITED");
     }
     const body = (await request.json().catch(() => null)) as {
@@ -170,7 +167,7 @@ export async function handleDownload(request: Request): Promise<Response> {
     const job = await enqueueOp({
       url: safe.url,
       formatId,
-      ip,
+      principalId: principal.id,
       title: typeof body?.title === "string" ? body.title : null,
       thumbnail: typeof body?.thumbnail === "string" ? body.thumbnail : null,
       source: typeof body?.source === "string" ? body.source : null,

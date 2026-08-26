@@ -11,7 +11,7 @@ VideoFetch analyzes public video pages and direct media URLs, normalizes availab
 - Background jobs with real progress (bytes, speed, ETA)
 - MP4 / WebM / audio-only / MP3 conversion
 - Temporary files with automatic expiry
-- SSRF protections, rate limits, sanitized filenames, and a private-access gate
+- SSRF protections, process-local rate limits, sanitized filenames, and a private-access gate
 
 ## Architecture
 
@@ -62,11 +62,14 @@ See `.env.example`. Important knobs:
 | `MAX_VIDEO_DURATION` | 2 hours | Reject longer videos |
 | `FILE_EXPIRATION_MINUTES` | 45 | Temporary file lifetime |
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | Global worker cap |
-| `RATE_LIMIT` | 20/min | Analyze requests per IP |
+| `MAX_CONCURRENT_PER_PRINCIPAL` | 2 | Active downloads per authenticated operator. Process-local. |
+| `RATE_LIMIT` | 20/min | Analyze requests per authenticated operator. Process-local. Forwarded-IP headers are not used as identity. |
 | `TEMP_DIRECTORY` | OS temp `/videofetch` | Isolated job folders |
 | `YTDLP_NETWORK_ISOLATED` | unset / `false` | Operator attestation that yt-dlp has an independent safe-egress boundary. Default is fail-closed. The flag is **not** itself isolation. |
 | `VIDEOFETCH_ACCESS_SECRET` | unset | Server-only private-access secret. Minimum 32 UTF-8 bytes. Required in production; missing/short values fail closed (HTTP 503) instead of exposing the downloader. Rotating it invalidates active sessions. Generate with `openssl rand -base64 32`. Never expose via `VITE_*`. |
 | `DIAGNOSTICS_TOKEN` | empty | Required for `/diagnostics` in production |
+
+Analyze/download rate limits and per-operator concurrency are keyed on the private-access principal after a successful gate, not on `X-Forwarded-For` or other client-address headers. Limits are process-local and are not shared across horizontally scaled instances.
 
 ## API
 
