@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createJobId } from "../jobs/store.server.ts";
 import {
   assertRemovableJobDir,
+  assertTrustedJobRoots,
   createJobDir,
   jobsRoot,
   removeJobDir,
@@ -167,5 +168,15 @@ describe("job directory containment", () => {
     assert.equal(jobsStat.isDirectory(), true);
     const tempStat = await stat(canonicalTemp);
     assert.equal(tempStat.isDirectory(), true);
+  });
+
+  it("rejects a canonical /tmp sentinel reached through an ancestor alias", async () => {
+    const base = await mkdtemp(join(tmpdir(), "videofetch-sentinel-alias-"));
+    const rootAlias = join(base, "root-alias");
+    await symlink("/", rootAlias);
+    const aliasTemp = join(rootAlias, "tmp");
+    setTempDirectoryForTests(aliasTemp);
+
+    await assert.rejects(() => assertTrustedJobRoots(), UnsafePathError);
   });
 });

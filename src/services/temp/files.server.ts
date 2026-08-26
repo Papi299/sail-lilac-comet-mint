@@ -56,9 +56,7 @@ function assertNotSentinel(path: string): void {
  */
 export async function assertTrustedJobRoots(): Promise<{ temp: string; jobs: string }> {
   const tempLogical = tempRoot();
-  const jobsLogical = jobsRoot();
   assertNotSentinel(tempLogical);
-  assertNotSentinel(jobsLogical);
 
   // The configured temp root entry itself must be a real directory.
   const tempSt = await lstatIfExists(tempLogical);
@@ -69,6 +67,13 @@ export async function assertTrustedJobRoots(): Promise<{ temp: string; jobs: str
   // an ancestor directory is a symlink, e.g. /var -> /private/var).
   const tempCanonical = await realpath(tempLogical);
 
+  // Re-apply sentinel protection to the canonical trust anchor
+  // BEFORE any jobs lookup/creation.
+  assertNotSentinel(tempCanonical);
+
+  const jobsLogical = jobsRoot();
+  assertNotSentinel(jobsLogical);
+
   // The jobs entry itself must be a real directory.
   const jobsSt = await lstatIfExists(jobsLogical);
   if (!jobsSt || jobsSt.isSymbolicLink() || !jobsSt.isDirectory()) {
@@ -76,6 +81,7 @@ export async function assertTrustedJobRoots(): Promise<{ temp: string; jobs: str
   }
   // Establish canonical trusted jobs root.
   const jobsCanonical = await realpath(jobsLogical);
+  assertNotSentinel(jobsCanonical);
 
   // Canonical layout: jobs is exactly `<tempCanonical>/jobs`.
   if (dirname(jobsCanonical) !== tempCanonical || basename(jobsCanonical) !== "jobs") {
