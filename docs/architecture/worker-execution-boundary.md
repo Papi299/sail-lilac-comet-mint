@@ -35,7 +35,7 @@ flowchart TD
 
 ### Trust Boundary
 
-- **Vercel Web Runtime:** Owns user-facing authentication, request schema validation, rate limiting, orchestration, worker request signing (anti-replay), and generating signed object-storage URLs.
+- **Vercel Web Runtime:** Owns user-facing authentication, request schema validation, rate limiting, orchestration, worker request signing (anti-replay), generating idempotency keys, and generating signed object-storage URLs.
 - **Worker Runtime:** Owns durable job state, second URL validation, media networking, `yt-dlp`, `FFmpeg`, local temp files, and uploading objects to temporary storage.
 - **Worker Egress:** A host/infrastructure-enforced connection-time network boundary entirely prevents private network traversal by yt-dlp/FFmpeg.
 
@@ -55,7 +55,7 @@ stateDiagram-v2
     downloading --> processing
     processing --> uploading
     uploading --> ready
-    
+
     queued --> cancelled
     analyzing --> cancelled
     downloading --> cancelled
@@ -80,13 +80,15 @@ stateDiagram-v2
 
 ## Cancellation Contract
 
-Cancellation operates on a strictly deterministic contract:
-- **Queued / Running:** Transition to `cancelled`. The `AbortController` triggers SIGKILL, and local temp cleanup runs.
+Cancellation operates on a strictly deterministic contract using atomic/conditional SQLite state updates: **FIRST SUCCESSFULLY COMMITTED TERMINAL TRANSITION WINS.**
+
+- **Queued / Running (Cancel wins):** Transitions to `cancelled`. The worker MUST NEVER claim it afterward. The `AbortController` triggers SIGKILL, preventing all later progress/ready state writes, and local temp cleanup runs.
+- **Cancel vs Object Upload:** If cancellation wins while an upload is in progress, the final job remains cancelled. If the object was partially or fully created, the worker deletes the EXACT stored object key, with the provider lifecycle remaining as a cleanup backstop.
+- **Cancel vs Ready:** If `ready` commits first, a later cancel returns the current `ready` state (no-op). Cancellation DOES NOT delete completed output.
 - **Already Cancelled:** Idempotent success (HTTP 200).
-- **Ready:** Remains `ready`. Cancellation does NOT delete completed output.
 - **Failed:** Remains `failed`.
 
-Object deletion occurs ONLY through expiration cleanup or a future explicit deletion operation. `/cancel` is never overloaded to mean "delete completed object."
+Object deletion occurs ONLY through expiration cleanup or a future explicit deletion operation. Any deletion caused during a cancellation race is merely cleanup of an incomplete execution.
 
 ## Temporary Storage Model
 
@@ -98,12 +100,27 @@ Example conceptual form: `videofetch/jobs/<32-hex-job-id>/<random-128-bit-token>
 - **Worker (ObjectStoreWriter):** Has credentials to `put`, `head`, and `delete`. The worker DOES NOT sign download URLs.
 - **Vercel (ObjectStoreSigner):** Has credentials to `signGet`. Vercel DOES NOT have upload/delete credentials.
 
-**File Delivery Sequence:**
+### Object & Metadata Lifecycle
+
+There are two distinct lifetimes: durable job metadata (authoritative) and the completed object itself.
+
+- **Before `expiresAt`:** Ready object may be authorized.
+- **At/after `expiresAt`:** Vercel REFUSES new signed URLs even if the object still physically exists.
+- **Worker Expiration Cleanup:** Worker periodically attempts exact-object deletion using the stored `objectKey`.
+- **Provider Lifecycle (TTL):** Acts as a safety backstop if worker cleanup is unavailable or fails. Retention may be slightly longer than app expiration so normal worker cleanup attempts first.
+- **Failure Handling:** Object deletion failure is recorded for diagnostics but NEVER extends user authorization. Metadata cleanup failure leaves stale metadata internally, but `expiresAt` still prevents authorization. If the worker is unavailable at expiry, Vercel still refuses new URLs, and provider TTL eventually removes the object.
+
+### File Delivery Sequence
+
 1. Browser calls `GET /api/download/:jobId/file`.
 2. Vercel performs private-access authorization.
 3. Vercel requests `WorkerJobView` from the Worker.
 4. Vercel verifies status == `ready` and not `expired`.
-5. Vercel uses the opaque `objectKey` to generate a very short-lived (e.g., < 5 minutes) signed GET URL.
+5. Vercel uses the opaque `objectKey` to generate a short-lived signed GET URL.
+   - **Lifetime Bounding:** `signedUrlExpiresAt <= job.expiresAt`.
+   - `remainingLifetime = job.expiresAt - now`
+   - If `remainingLifetime <= 0`, do not sign, return `EXPIRED`.
+   - Otherwise, `signedUrlTTL = min(5 minutes, remainingLifetime)`. The signed URL must authorize exactly one object.
 6. **Content-Disposition Guarantee:** `signGet(...)` MUST ensure the final storage response uses the safe, intended Content-Disposition header. This is achieved via signed response-header overrides or immutable safe object metadata set during upload.
 7. Vercel issues a 302/303 redirect.
 8. Browser downloads directly from Object Storage.
