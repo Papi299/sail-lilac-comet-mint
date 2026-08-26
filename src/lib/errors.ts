@@ -15,7 +15,9 @@ export type ErrorCode =
   | "RATE_LIMITED"
   | "NOT_FOUND"
   | "EXPIRED"
-  | "FORBIDDEN";
+  | "FORBIDDEN"
+  | "ACCESS_REQUIRED"
+  | "ACCESS_NOT_CONFIGURED";
 
 export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   INVALID_URL: "Please enter a valid video URL.",
@@ -37,6 +39,8 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   NOT_FOUND: "We couldn't find that download.",
   EXPIRED: "This download link has expired. Please analyze the video again.",
   FORBIDDEN: "Diagnostics are not available in this environment.",
+  ACCESS_REQUIRED: "Private access is required.",
+  ACCESS_NOT_CONFIGURED: "Private access is not configured on this server.",
 };
 
 const STATUS_BY_CODE: Record<ErrorCode, number> = {
@@ -57,6 +61,8 @@ const STATUS_BY_CODE: Record<ErrorCode, number> = {
   NOT_FOUND: 404,
   EXPIRED: 410,
   FORBIDDEN: 403,
+  ACCESS_REQUIRED: 401,
+  ACCESS_NOT_CONFIGURED: 503,
 };
 
 export class AppError extends Error {

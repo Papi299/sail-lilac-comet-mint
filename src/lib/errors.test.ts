@@ -28,3 +28,16 @@ describe("extractor unavailable", () => {
     assert.notEqual(err.code, "UNSUPPORTED_SITE");
   });
 });
+
+describe("private access errors", () => {
+  it("maps ACCESS_REQUIRED to 401 and ACCESS_NOT_CONFIGURED to 503", () => {
+    const required = new AppError("ACCESS_REQUIRED");
+    const missing = new AppError("ACCESS_NOT_CONFIGURED");
+    assert.equal(required.status, 401);
+    assert.equal(missing.status, 503);
+    assert.equal(required.message, ERROR_MESSAGES.ACCESS_REQUIRED);
+    assert.equal(missing.message, ERROR_MESSAGES.ACCESS_NOT_CONFIGURED);
+    assert.notEqual(required.code, "NOT_FOUND");
+    assert.notEqual(missing.code, "ANALYSIS_FAILED");
+  });
+});

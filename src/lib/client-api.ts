@@ -1,6 +1,12 @@
 import type { AnalyzeSuccess, ApiErrorBody, VideoMetadata } from "@/types/media";
 import type { JobProgress } from "@/types/job";
 
+export type AccessSession = {
+  authenticated: boolean;
+  configured: boolean;
+  developmentBypass: boolean;
+};
+
 async function readError(res: Response): Promise<string> {
   try {
     const body = (await res.json()) as ApiErrorBody;
@@ -8,6 +14,32 @@ async function readError(res: Response): Promise<string> {
   } catch {
     return "Something went wrong.";
   }
+}
+
+export async function getAccessSession(): Promise<AccessSession> {
+  const res = await fetch("/api/access/session", { credentials: "same-origin" });
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as AccessSession;
+}
+
+export async function loginWithAccessSecret(secret: string): Promise<AccessSession> {
+  const res = await fetch("/api/access/login", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ secret }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return getAccessSession();
+}
+
+export async function logoutAccess(): Promise<AccessSession> {
+  const res = await fetch("/api/access/logout", {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return getAccessSession();
 }
 
 export async function analyzeVideo(url: string): Promise<VideoMetadata> {
