@@ -121,3 +121,10 @@ Unit tests cover URL validation, SSRF helpers, pinned HTTP transport, yt-dlp net
 yt-dlp remains the generic HTTP/HTTPS extractor. It performs its own DNS lookups, redirects, and media requests, so application URL validation is **not** yt-dlp egress enforcement. Generic extraction is therefore refused unless `YTDLP_NETWORK_ISOLATED=true` is set by an operator who has independently isolated yt-dlp's network. Do not enable that flag in this repository's defaults.
 
 Some websites (including YouTube and Vimeo) may require a signed-in session or block datacenter IP addresses. Direct media files and public archive sources are the most reliable. Only download media you have the right to save.
+
+## Architecture (APPROVED TARGET / NOT YET IMPLEMENTED)
+
+- [Worker Execution Boundary](docs/architecture/worker-execution-boundary.md)
+- [Worker API Contract](docs/architecture/worker-api-contract.md)
+- [Safe Egress](docs/architecture/safe-egress.md)
+- [Migration Plan](docs/architecture/worker-migration-plan.md)
