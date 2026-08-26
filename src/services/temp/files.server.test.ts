@@ -1,6 +1,6 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJobId } from "../jobs/store.server.ts";
@@ -30,12 +30,15 @@ describe("job directory containment", () => {
     const id = createJobId();
     const dir = await createJobDir(id);
     await writeFile(join(dir, "clip.mp4"), "x");
-    assert.equal(assertRemovableJobDir(dir), dir);
+    // createJobDir returns the canonical path; removeJobDir accepts it.
     await removeJobDir(dir);
     await assert.rejects(() => stat(dir), { code: "ENOENT" });
-    const root = await stat(jobsRoot());
+    // Verify the canonical jobs root and temp root still exist.
+    const canonicalJobs = await realpath(jobsRoot());
+    const root = await stat(canonicalJobs);
     assert.equal(root.isDirectory(), true);
-    const temp = await stat(tempRoot());
+    const canonicalTemp = await realpath(tempRoot());
+    const temp = await stat(canonicalTemp);
     assert.equal(temp.isDirectory(), true);
   });
 
@@ -124,5 +127,45 @@ describe("job directory containment", () => {
     await assert.rejects(() => stat(join(outside, "jobs", id)), { code: "ENOENT" });
     const still = await stat(canary);
     assert.equal(still.isFile(), true);
+  });
+
+  it("accepts a temp root reached through a symlinked ancestor directory", async () => {
+    // Construct: realRoot/temp (real dir), then aliasParent -> realRoot
+    // so aliasParent/temp resolves through a symlinked ancestor.
+    const base = await mkdtemp(join(tmpdir(), "videofetch-ancestor-"));
+    const realRoot = join(base, "real-root");
+    const tempDir = join(realRoot, "temp");
+    await mkdir(tempDir, { recursive: true });
+
+    const aliasParent = join(base, "alias-parent");
+    await symlink(realRoot, aliasParent);
+
+    // Configure temp root through the alias.
+    const aliasTemp = join(aliasParent, "temp");
+    setTempDirectoryForTests(aliasTemp);
+
+    const id = createJobId();
+    // createJobDir must succeed even though the ancestor is a symlink.
+    const dir = await createJobDir(id);
+
+    // Returned path must be beneath the canonical jobs root.
+    // Note: canonicalize tempDir too, since tmpdir() itself may have
+    // symlinked ancestors (e.g. macOS /var -> /private/var).
+    const canonicalTemp = await realpath(aliasTemp);
+    const expectedCanonicalTemp = await realpath(tempDir);
+    assert.equal(canonicalTemp, expectedCanonicalTemp, "canonical temp should resolve to real dir");
+    const canonicalJobs = join(canonicalTemp, "jobs");
+    assert.equal(dir, join(canonicalJobs, id));
+
+    // Write a file and verify removal works.
+    await writeFile(join(dir, "clip.mp4"), "x");
+    await removeJobDir(dir);
+    await assert.rejects(() => stat(dir), { code: "ENOENT" });
+
+    // The canonical jobs root and temp root still exist.
+    const jobsStat = await stat(canonicalJobs);
+    assert.equal(jobsStat.isDirectory(), true);
+    const tempStat = await stat(canonicalTemp);
+    assert.equal(tempStat.isDirectory(), true);
   });
 });
