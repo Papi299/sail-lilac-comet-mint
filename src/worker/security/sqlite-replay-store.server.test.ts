@@ -57,17 +57,13 @@ describe("SQLiteWorkerReplayStore", () => {
     let mockTime = 1000;
     const store = new SQLiteWorkerReplayStore(db, () => mockTime);
     
-    // Reserve expires at 1050
     await store.reserve("123e4567-e89b-42d3-a456-426614174002", 1050);
     assert.strictEqual(await store.reserve("123e4567-e89b-42d3-a456-426614174002", 1050), "duplicate");
 
     // Advance time past expiration
     mockTime = 1100;
-    
-    // Cleanup is called inside reserve, or explicitly
     store.cleanup();
 
-    // Now req can be reserved again since it was deleted
     const res = await store.reserve("123e4567-e89b-42d3-a456-426614174002", 1150);
     assert.strictEqual(res, "reserved");
   });
@@ -82,13 +78,14 @@ describe("SQLiteWorkerReplayStore", () => {
     );
   });
 
-  it("restart-safe replay regression", async () => {
+  it("restart-safe replay: real WorkerAuthenticator survives file-backed reopen", async () => {
+    // WorkerAuthenticator's injected clock returns epoch SECONDS.
     const store1 = new SQLiteWorkerReplayStore(db, () => 1000);
     const secret = "01234567890123456789012345678901";
     const authenticator1 = new WorkerAuthenticator({
       currentKeyId: "key-1",
       currentSecret: secret,
-      clock: () => 1000, // Date.now() representation in ms... wait, clock in seconds according to my changes but it was ms initially? Let's check WorkerAuthenticator
+      clock: () => 1000, // epoch seconds
       replayStore: store1,
     });
 
@@ -114,26 +111,37 @@ describe("SQLiteWorkerReplayStore", () => {
       signatureHex: signature
     };
 
+    // First attempt: should succeed
     await authenticator1.authenticateAndReserve(authParams);
     
+    // Close and reopen the database file to simulate restart
     db.close();
 
-    // Reopen same database
     const db2 = new DatabaseSync(dbPath);
     const store2 = new SQLiteWorkerReplayStore(db2, () => 1000);
     
     const authenticator2 = new WorkerAuthenticator({
       currentKeyId: "key-1",
       currentSecret: secret,
-      clock: () => 1000, // clock in seconds
+      clock: () => 1000, // epoch seconds
       replayStore: store2,
     });
 
+    // Replay the exact same signed request after restart — must be rejected.
+    // WorkerAuthenticationError is the strongest discriminator exposed;
+    // the replay store returned "duplicate" which the authenticator surfaces
+    // as an opaque WorkerAuthenticationError (not WorkerReplayStoreUnavailableError).
     await assert.rejects(
       async () => {
         await authenticator2.authenticateAndReserve(authParams);
       },
-      (err: any) => err instanceof WorkerAuthenticationError
+      (err: any) => {
+        if (!(err instanceof WorkerAuthenticationError)) return false;
+        // The error must NOT be a store-unavailable error — it must be the
+        // generic "unauthorized" which is the replay/duplicate path.
+        assert.strictEqual(err.message, "unauthorized");
+        return true;
+      }
     );
     
     db2.close();

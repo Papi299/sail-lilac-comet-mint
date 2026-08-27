@@ -8,6 +8,11 @@ import {
 } from "../../shared/worker/contracts.ts";
 import { WorkerErrorCodeSchema } from "../../shared/worker/errors.ts";
 
+/**
+ * Internal durable worker job schema.
+ * Validates raw SQLite rows into trusted execution state.
+ * Enforces objectKey/status ownership invariant at the storage boundary.
+ */
 export const DurableWorkerJobSchema = z.object({
   jobId: WorkerJobIdSchema,
   url: z.string().url().max(2048).refine(val => val.startsWith("http://") || val.startsWith("https://")),
@@ -45,7 +50,35 @@ export const DurableWorkerJobSchema = z.object({
 
   startedAt: z.number().int().nonnegative().nullable(),
   finishedAt: z.number().int().nonnegative().nullable(),
-}).strict();
+}).strict().superRefine((data, ctx) => {
+  if (data.status === "ready") {
+    if (data.objectKey === null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "ready job must have a non-null objectKey",
+        path: ["objectKey"],
+      });
+    } else {
+      // objectKey format: videofetch/jobs/<jobId>/<hash32>
+      const expectedPrefix = `videofetch/jobs/${data.jobId}/`;
+      if (!data.objectKey.startsWith(expectedPrefix)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "objectKey embedded job ID must equal jobId",
+          path: ["objectKey"],
+        });
+      }
+    }
+  } else {
+    if (data.objectKey !== null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "non-ready job must have null objectKey",
+        path: ["objectKey"],
+      });
+    }
+  }
+});
 
 export type DurableWorkerJob = z.infer<typeof DurableWorkerJobSchema>;
 
@@ -77,4 +110,6 @@ export interface WorkerJobStore {
   getJob(jobId: string): WorkerJobView | null;
 
   recover(): void;
+
+  cleanupExpiredIdempotencyRecords(): number;
 }

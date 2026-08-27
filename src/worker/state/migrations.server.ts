@@ -93,7 +93,43 @@ export function applyMigrations(db: DatabaseSync): void {
   }
 }
 
+// ── Schema V1 integrity verification ──────────────────────────────────────────
+
+interface ColumnInfo {
+  cid: number;
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: any;
+  pk: number;
+}
+
+const REQUIRED_WORKER_JOBS_COLUMNS: string[] = [
+  "job_id", "url", "format_id", "principal_id", "status",
+  "progress", "stage_label", "downloaded_bytes", "total_bytes",
+  "speed", "eta", "error_code", "safe_error_message",
+  "filename", "file_size", "mime", "quality", "container",
+  "title", "thumbnail", "source", "extractor",
+  "created_at_ms", "updated_at_ms", "expires_at_ms",
+  "object_key", "started_at_ms", "finished_at_ms",
+];
+
+const REQUIRED_IDEMPOTENCY_COLUMNS: string[] = [
+  "idempotency_key", "payload_hash", "job_id",
+  "created_at_ms", "job_expires_at_ms", "expires_at_ms",
+];
+
+const REQUIRED_REPLAY_COLUMNS: string[] = [
+  "request_id", "expires_at_seconds", "created_at_seconds",
+];
+
+const REQUIRED_INDEXES: Array<{ table: string; name: string }> = [
+  { table: "worker_replay_requests", name: "idx_worker_replay_requests_expires_at_seconds" },
+  { table: "worker_idempotency_records", name: "idx_worker_idempotency_records_expires_at_ms" },
+];
+
 function assertWorkerSchemaV1(db: DatabaseSync): void {
+  // 1. Table existence
   const checkTable = (tableName: string) => {
     const row = db.prepare("SELECT count(*) as count FROM sqlite_master WHERE type='table' AND name=?").get(tableName) as { count: number };
     if (row.count === 0) {
@@ -104,4 +140,29 @@ function assertWorkerSchemaV1(db: DatabaseSync): void {
   checkTable("worker_jobs");
   checkTable("worker_idempotency_records");
   checkTable("worker_replay_requests");
+
+  // 2. Critical column verification via PRAGMA table_info
+  const checkColumns = (tableName: string, requiredColumns: string[]) => {
+    const columns = db.prepare(`PRAGMA table_info(${tableName})`).all() as unknown as ColumnInfo[];
+    const columnNames = new Set(columns.map(c => c.name));
+    for (const col of requiredColumns) {
+      if (!columnNames.has(col)) {
+        throw new Error(`Worker schema integrity check failed: missing column ${col} in ${tableName}`);
+      }
+    }
+  };
+
+  checkColumns("worker_jobs", REQUIRED_WORKER_JOBS_COLUMNS);
+  checkColumns("worker_idempotency_records", REQUIRED_IDEMPOTENCY_COLUMNS);
+  checkColumns("worker_replay_requests", REQUIRED_REPLAY_COLUMNS);
+
+  // 3. Required index verification
+  for (const idx of REQUIRED_INDEXES) {
+    const row = db.prepare(
+      "SELECT count(*) as count FROM sqlite_master WHERE type='index' AND tbl_name=? AND name=?"
+    ).get(idx.table, idx.name) as { count: number };
+    if (row.count === 0) {
+      throw new Error(`Worker schema integrity check failed: missing index ${idx.name} on ${idx.table}`);
+    }
+  }
 }
