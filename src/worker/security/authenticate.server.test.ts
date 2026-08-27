@@ -135,11 +135,23 @@ test("WorkerAuthenticator", async (t) => {
     replayStore.shouldThrow = true;
     await assert.rejects(authenticator.authenticateAndReserve(p), WorkerReplayStoreUnavailableError);
   });
-  
+
   await t.test("fails closed on replay store failure even if error message is unauthorized", async () => {
     const p = createParams();
     replayStore.shouldThrow = new Error("unauthorized");
     await assert.rejects(authenticator.authenticateAndReserve(p), WorkerReplayStoreUnavailableError);
+  });
+
+  await t.test("fails closed on replay store throwing WorkerAuthenticationError", async () => {
+    const p = createParams();
+    replayStore.shouldThrow = new WorkerAuthenticationError();
+    await assert.rejects(authenticator.authenticateAndReserve(p), WorkerReplayStoreUnavailableError);
+  });
+
+  await t.test("duplicate replay returns WorkerAuthenticationError", async () => {
+    const p = createParams();
+    await authenticator.authenticateAndReserve(p); // first: reserved
+    await assert.rejects(authenticator.authenticateAndReserve(p), WorkerAuthenticationError);
   });
 
   await t.test("constructor validates config", () => {
@@ -158,7 +170,7 @@ test("WorkerAuthenticator", async (t) => {
         previousKeyId: "key-1", // same as current
         previousSecret,
         replayStore,
-        });
+      });
     }, /distinct/);
   });
 });

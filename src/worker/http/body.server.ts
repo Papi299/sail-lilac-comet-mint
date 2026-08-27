@@ -26,24 +26,32 @@ export class MalformedContentLengthError extends Error {
 /**
  * Reads the exact bounded raw bytes from the HTTP request.
  * Enforces `WORKER_CONTROL_MAX_BODY_BYTES`.
+ *
+ * Drain policy: when the body is known-overlimit (Content-Length) or discovered
+ * overlimit during streaming, the remainder is discarded via `req.resume()` so
+ * a keep-alive connection is not left with an unread request body.
  */
 export async function readBoundedRawBody(req: IncomingMessage): Promise<Buffer> {
   const contentLength = req.headers["content-length"];
   if (contentLength !== undefined) {
     if (!/^(0|[1-9][0-9]*)$/.test(contentLength)) {
+      req.resume(); // drain
       throw new MalformedContentLengthError();
     }
     const length = Number(contentLength);
     if (!Number.isSafeInteger(length)) {
+      req.resume(); // drain
       throw new MalformedContentLengthError();
     }
     if (length > WORKER_CONTROL_MAX_BODY_BYTES) {
+      req.resume(); // drain
       throw new PayloadTooLargeError();
     }
   }
 
   const contentEncoding = req.headers["content-encoding"];
   if (contentEncoding !== undefined && contentEncoding !== "identity") {
+    req.resume(); // drain
     throw new UnsupportedMediaTypeError();
   }
 
@@ -55,7 +63,7 @@ export async function readBoundedRawBody(req: IncomingMessage): Promise<Buffer> 
       totalBytes += chunk.length;
       if (totalBytes > WORKER_CONTROL_MAX_BODY_BYTES) {
         cleanup();
-        req.on("data", () => {}); // drain remainder without buffering
+        req.resume(); // drain remainder without buffering
         reject(new PayloadTooLargeError());
         return;
       }

@@ -53,7 +53,7 @@ interface ParsedRoute {
   jobId: string | null;
 }
 
-function parseWorkerRoute(rawTarget: string, method: string): ParsedRoute | { error: number, message: string } {
+function parseWorkerRoute(rawTarget: string, method: string): ParsedRoute | { error: number; message: string } {
   if (rawTarget === WORKER_HEALTH_PATH) {
     if (method !== "GET") return { error: 405, message: "Method Not Allowed" };
     return { category: "health", jobId: null };
@@ -72,21 +72,26 @@ function parseWorkerRoute(rawTarget: string, method: string): ParsedRoute | { er
   }
   if (rawTarget.startsWith(WORKER_JOBS_PATH + "/")) {
     const remainder = rawTarget.substring(WORKER_JOBS_PATH.length + 1);
-    
-    // /v1/jobs/<id>
-    if (/^[0-9a-f]{32}$/.test(remainder)) {
+
+    // /v1/jobs/<id> — use authoritative Phase-1 schema
+    const statusParse = WorkerJobIdSchema.safeParse(remainder);
+    if (statusParse.success) {
       if (method !== "GET") return { error: 405, message: "Method Not Allowed" };
-      return { category: "jobs_get", jobId: remainder };
+      return { category: "jobs_get", jobId: statusParse.data };
     }
-    
-    // /v1/jobs/<id>/cancel
-    const cancelMatch = remainder.match(/^([0-9a-f]{32})\/cancel$/);
-    if (cancelMatch) {
-      if (method !== "POST") return { error: 405, message: "Method Not Allowed" };
-      return { category: "jobs_cancel", jobId: cancelMatch[1] };
+
+    // /v1/jobs/<id>/cancel — extract candidate, validate with schema
+    const slashIdx = remainder.indexOf("/");
+    if (slashIdx > 0 && remainder.substring(slashIdx) === "/cancel") {
+      const candidate = remainder.substring(0, slashIdx);
+      const cancelParse = WorkerJobIdSchema.safeParse(candidate);
+      if (cancelParse.success) {
+        if (method !== "POST") return { error: 405, message: "Method Not Allowed" };
+        return { category: "jobs_cancel", jobId: cancelParse.data };
+      }
     }
   }
-  
+
   return { error: 404, message: "Not Found" };
 }
 

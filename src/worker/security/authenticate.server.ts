@@ -140,14 +140,14 @@ export class WorkerAuthenticator {
     const expiresAtSeconds =
       requestTs + WORKER_TIMESTAMP_TOLERANCE_SECONDS + WORKER_REPLAY_GRACE_SECONDS;
 
-    // A storage failure will throw and fail closed (service unavailable)
+    // A storage failure will throw and fail closed (service unavailable).
+    // ANY exception from the replay store is an operational failure — the store
+    // must never be able to influence authentication classification by choosing
+    // an exception class.
     let reserveResult;
     try {
       reserveResult = await this.replayStore.reserve(params.requestId, expiresAtSeconds);
-    } catch (e: any) {
-      if (e instanceof WorkerAuthenticationError) {
-        throw e;
-      }
+    } catch {
       throw new WorkerReplayStoreUnavailableError();
     }
 
