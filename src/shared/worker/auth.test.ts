@@ -8,6 +8,7 @@ import {
   WorkerKeyIdSchema,
   WorkerCanonicalPathSchema,
   WorkerTimestampSchema,
+  parseWorkerTimestampSeconds,
 } from "./auth.ts";
 
 test("HMAC Auth Contract - sha256WorkerBody", async (t) => {
@@ -76,15 +77,28 @@ test("HMAC Auth Contract - schema validation", async (t) => {
     assert.throws(() => WorkerCanonicalPathSchema.parse("/v1/jobs\rINJECTED"));
   });
   
-  await t.test("Timestamp exact format", () => {
+  await t.test("Timestamp exact format and numeric safety", () => {
     assert.doesNotThrow(() => WorkerTimestampSchema.parse("1600000000"));
     assert.doesNotThrow(() => WorkerTimestampSchema.parse("0"));
+    
+    // Exact safe bounds
+    const maxSafe = Number.MAX_SAFE_INTEGER.toString(10); // "9007199254740991"
+    assert.doesNotThrow(() => WorkerTimestampSchema.parse(maxSafe));
+    
+    // Unsafe upper bound
+    assert.throws(() => WorkerTimestampSchema.parse("9007199254740992")); // MAX_SAFE_INTEGER + 1
 
     assert.throws(() => WorkerTimestampSchema.parse("01600000000"));
     assert.throws(() => WorkerTimestampSchema.parse("+1600000000"));
     assert.throws(() => WorkerTimestampSchema.parse("1600000000.0"));
     assert.throws(() => WorkerTimestampSchema.parse(" 1600000000"));
     assert.throws(() => WorkerTimestampSchema.parse("1600000000\nX"));
+  });
+  
+  await t.test("Timestamp helper conversion", () => {
+    const val = parseWorkerTimestampSeconds("1600000000");
+    assert.strictEqual(val, 1600000000);
+    assert.throws(() => parseWorkerTimestampSeconds("9007199254740992"));
   });
 });
 

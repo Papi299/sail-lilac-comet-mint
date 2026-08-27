@@ -79,6 +79,25 @@ test("Worker Contracts - WorkerJobView", async (t) => {
   await t.test("rejects malformed objectKey", () => {
     assert.throws(() => WorkerJobViewSchema.parse({ ...validJob, objectKey: "some/other/path" }));
   });
+
+  await t.test("ready job requires matching objectKey", () => {
+    // Valid objectKey for a DIFFERENT job
+    const wrongKey = "videofetch/jobs/fedcba9876543210fedcba9876543210/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    assert.throws(() => WorkerJobViewSchema.parse({ ...validJob, status: "ready", objectKey: wrongKey }));
+    
+    // Missing objectKey for ready job
+    assert.throws(() => WorkerJobViewSchema.parse({ ...validJob, status: "ready", objectKey: null }));
+  });
+
+  await t.test("non-ready jobs require null objectKey", () => {
+    const nonReadyStates = ["queued", "analyzing", "downloading", "processing", "uploading", "failed", "cancelled"];
+    
+    // valid job has a non-null objectKey, so setting status to non-ready should fail
+    for (const status of nonReadyStates) {
+      assert.throws(() => WorkerJobViewSchema.parse({ ...validJob, status }));
+      assert.doesNotThrow(() => WorkerJobViewSchema.parse({ ...validJob, status, objectKey: null }));
+    }
+  });
 });
 
 test("Worker Contracts - Dynamic Paths", async (t) => {

@@ -70,7 +70,20 @@ export const WorkerJobViewSchema = z
     expiresAt: z.number().int().nonnegative(),
     objectKey: WorkerObjectKeySchema.nullable(), // SERVER-TO-SERVER ONLY. Vercel strips this for browser.
   })
-  .strict();
+  .strict()
+  .refine(
+    (data) => {
+      if (data.status === "ready") {
+        if (!data.objectKey) return false;
+        const embeddedJobId = data.objectKey.split("/")[2];
+        if (embeddedJobId !== data.jobId) return false;
+      } else {
+        if (data.objectKey !== null) return false;
+      }
+      return true;
+    },
+    { message: "objectKey must be non-null and match jobId if ready, else null" }
+  );
 export type WorkerJobView = z.infer<typeof WorkerJobViewSchema>;
 
 // --- Requests ---

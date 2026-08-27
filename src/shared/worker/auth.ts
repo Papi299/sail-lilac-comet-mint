@@ -8,10 +8,24 @@ export const WorkerRequestIdSchema = z.string().regex(UuidV4Regex, "Must be a va
 export const WorkerIdempotencyKeySchema = z.string().regex(UuidV4Regex, "Must be a valid UUID v4");
 export const WorkerKeyIdSchema = z.string().min(1).max(64).regex(/^[A-Za-z0-9._-]+$/);
 
+const MAX_SAFE_INT = BigInt(Number.MAX_SAFE_INTEGER);
+
 // Must be exactly the base-10 integer string (e.g. "1700000000")
 export const WorkerTimestampSchema = z
   .string()
-  .regex(/^(0|[1-9][0-9]*)$/, "Must be canonical base-10 integer string");
+  .regex(/^(0|[1-9][0-9]*)$/, "Must be canonical base-10 integer string")
+  .refine((val) => {
+    try {
+      return BigInt(val) <= MAX_SAFE_INT;
+    } catch {
+      return false;
+    }
+  }, "Timestamp exceeds Number.MAX_SAFE_INTEGER");
+
+export function parseWorkerTimestampSeconds(value: string): number {
+  const valid = WorkerTimestampSchema.parse(value);
+  return Number(valid);
+}
 
 export const WorkerMethodSchema = z.enum(["GET", "POST"]);
 
