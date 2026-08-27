@@ -11,6 +11,20 @@ import type { WorkerReplayStore } from "./replay-store.ts";
 
 export const WORKER_REPLAY_GRACE_SECONDS = 60;
 
+export class WorkerAuthenticationError extends Error {
+  constructor(message: string = "unauthorized") {
+    super(message);
+    this.name = "WorkerAuthenticationError";
+  }
+}
+
+export class WorkerReplayStoreUnavailableError extends Error {
+  constructor(message: string = "Service Unavailable") {
+    super(message);
+    this.name = "WorkerReplayStoreUnavailableError";
+  }
+}
+
 export interface WorkerAuthConfig {
   currentKeyId: string;
   currentSecret: string | Buffer | Uint8Array;
@@ -38,9 +52,7 @@ export class WorkerAuthenticator {
   constructor(config: WorkerAuthConfig) {
     this.currentKeyId = WorkerKeyIdSchema.parse(config.currentKeyId);
     assertSecretStrength(config.currentSecret, "currentSecret");
-    this.currentSecret = Buffer.isBuffer(config.currentSecret)
-      ? config.currentSecret
-      : Buffer.from(config.currentSecret);
+    this.currentSecret = Buffer.from(config.currentSecret);
 
     if (config.previousKeyId) {
       if (config.previousKeyId === this.currentKeyId) {
@@ -51,9 +63,7 @@ export class WorkerAuthenticator {
         throw new Error("previousSecret is required when previousKeyId is provided");
       }
       assertSecretStrength(config.previousSecret, "previousSecret");
-      this.previousSecret = Buffer.isBuffer(config.previousSecret)
-        ? config.previousSecret
-        : Buffer.from(config.previousSecret);
+      this.previousSecret = Buffer.from(config.previousSecret);
     } else if (config.previousSecret) {
       throw new Error("previousKeyId is required when previousSecret is provided");
     }
@@ -85,7 +95,7 @@ export class WorkerAuthenticator {
     } else if (this.previousKeyId && params.keyId === this.previousKeyId) {
       activeSecret = this.previousSecret!;
     } else {
-      throw new Error("unauthorized");
+      throw new WorkerAuthenticationError();
     }
 
     // 2. Timestamp Validation
@@ -93,11 +103,11 @@ export class WorkerAuthenticator {
     try {
       requestTs = parseWorkerTimestampSeconds(params.timestampSeconds);
     } catch {
-      throw new Error("unauthorized");
+      throw new WorkerAuthenticationError();
     }
     const now = this.clock();
     if (Math.abs(requestTs - now) > WORKER_TIMESTAMP_TOLERANCE_SECONDS) {
-      throw new Error("unauthorized");
+      throw new WorkerAuthenticationError();
     }
 
     // 3. HMAC Verification
@@ -117,11 +127,11 @@ export class WorkerAuthenticator {
       isValid = verifyWorkerSignature(activeSecret, signingParams, params.signatureHex);
     } catch {
       // e.g. path or other schema validation inside buildWorkerSigningInput failed
-      throw new Error("unauthorized");
+      throw new WorkerAuthenticationError();
     }
 
     if (!isValid) {
-      throw new Error("unauthorized");
+      throw new WorkerAuthenticationError();
     }
 
     // 4. Replay Reservation (ATOMIC)
@@ -131,9 +141,18 @@ export class WorkerAuthenticator {
       requestTs + WORKER_TIMESTAMP_TOLERANCE_SECONDS + WORKER_REPLAY_GRACE_SECONDS;
 
     // A storage failure will throw and fail closed (service unavailable)
-    const reserveResult = await this.replayStore.reserve(params.requestId, expiresAtSeconds);
+    let reserveResult;
+    try {
+      reserveResult = await this.replayStore.reserve(params.requestId, expiresAtSeconds);
+    } catch (e: any) {
+      if (e instanceof WorkerAuthenticationError) {
+        throw e;
+      }
+      throw new WorkerReplayStoreUnavailableError();
+    }
+
     if (reserveResult === "duplicate") {
-      throw new Error("unauthorized");
+      throw new WorkerAuthenticationError();
     }
 
     // Success.

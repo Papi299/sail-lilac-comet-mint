@@ -16,6 +16,13 @@ export class UnsupportedMediaTypeError extends Error {
   }
 }
 
+export class MalformedContentLengthError extends Error {
+  constructor() {
+    super("Malformed Content-Length");
+    this.name = "MalformedContentLengthError";
+  }
+}
+
 /**
  * Reads the exact bounded raw bytes from the HTTP request.
  * Enforces `WORKER_CONTROL_MAX_BODY_BYTES`.
@@ -23,8 +30,14 @@ export class UnsupportedMediaTypeError extends Error {
 export async function readBoundedRawBody(req: IncomingMessage): Promise<Buffer> {
   const contentLength = req.headers["content-length"];
   if (contentLength !== undefined) {
-    const length = parseInt(contentLength, 10);
-    if (!Number.isNaN(length) && length > WORKER_CONTROL_MAX_BODY_BYTES) {
+    if (!/^(0|[1-9][0-9]*)$/.test(contentLength)) {
+      throw new MalformedContentLengthError();
+    }
+    const length = Number(contentLength);
+    if (!Number.isSafeInteger(length)) {
+      throw new MalformedContentLengthError();
+    }
+    if (length > WORKER_CONTROL_MAX_BODY_BYTES) {
       throw new PayloadTooLargeError();
     }
   }
@@ -42,6 +55,7 @@ export async function readBoundedRawBody(req: IncomingMessage): Promise<Buffer> 
       totalBytes += chunk.length;
       if (totalBytes > WORKER_CONTROL_MAX_BODY_BYTES) {
         cleanup();
+        req.on("data", () => {}); // drain remainder without buffering
         reject(new PayloadTooLargeError());
         return;
       }

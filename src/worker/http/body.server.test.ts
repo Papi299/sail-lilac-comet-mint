@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert";
 import { Buffer } from "node:buffer";
 import { EventEmitter } from "node:events";
-import { readBoundedRawBody, PayloadTooLargeError, UnsupportedMediaTypeError } from "./body.server.ts";
+import { readBoundedRawBody, PayloadTooLargeError, UnsupportedMediaTypeError, MalformedContentLengthError } from "./body.server.ts";
 import { WORKER_CONTROL_MAX_BODY_BYTES } from "../../shared/worker/constants.ts";
 import type { IncomingMessage } from "node:http";
 
@@ -26,6 +26,15 @@ test("bounded raw body reading", async (t) => {
   await t.test("rejects over limit content-length", async () => {
     const req = createMockReq({ "content-length": String(WORKER_CONTROL_MAX_BODY_BYTES + 1) });
     await assert.rejects(readBoundedRawBody(req), PayloadTooLargeError);
+  });
+  
+  await t.test("rejects malformed content-length", async () => {
+    await assert.rejects(readBoundedRawBody(createMockReq({ "content-length": "-1" })), MalformedContentLengthError);
+    await assert.rejects(readBoundedRawBody(createMockReq({ "content-length": "+10" })), MalformedContentLengthError);
+    await assert.rejects(readBoundedRawBody(createMockReq({ "content-length": "10x" })), MalformedContentLengthError);
+    await assert.rejects(readBoundedRawBody(createMockReq({ "content-length": "1.5" })), MalformedContentLengthError);
+    await assert.rejects(readBoundedRawBody(createMockReq({ "content-length": " 10" })), MalformedContentLengthError);
+    await assert.rejects(readBoundedRawBody(createMockReq({ "content-length": "999999999999999999999999" })), MalformedContentLengthError); // unsafe int
   });
 
   await t.test("rejects unsupported content-encoding", async () => {

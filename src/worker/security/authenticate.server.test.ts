@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert";
 import { Buffer } from "node:buffer";
-import { WorkerAuthenticator, WORKER_REPLAY_GRACE_SECONDS } from "./authenticate.server.ts";
+import { WorkerAuthenticator, WORKER_REPLAY_GRACE_SECONDS, WorkerAuthenticationError, WorkerReplayStoreUnavailableError } from "./authenticate.server.ts";
 import { WORKER_TIMESTAMP_TOLERANCE_SECONDS } from "../../shared/worker/constants.ts";
 import { createWorkerSignatureHex } from "../../shared/worker/hmac.server.ts";
 import type { WorkerReplayStore } from "./replay-store.ts";
@@ -10,10 +10,12 @@ import { createHash } from "node:crypto";
 class MockReplayStore implements WorkerReplayStore {
   private reserved = new Set<string>();
   public reserveCalls: { requestId: string; expiresAtSeconds: number }[] = [];
-  public shouldThrow = false;
+  public shouldThrow: boolean | Error = false;
 
   async reserve(requestId: string, expiresAtSeconds: number): Promise<"reserved" | "duplicate"> {
-    if (this.shouldThrow) throw new Error("Database unavailable");
+    if (this.shouldThrow) {
+      throw (this.shouldThrow instanceof Error ? this.shouldThrow : new Error("Database unavailable"));
+    }
     this.reserveCalls.push({ requestId, expiresAtSeconds });
     if (this.reserved.has(requestId)) return "duplicate";
     this.reserved.add(requestId);
@@ -87,13 +89,13 @@ test("WorkerAuthenticator", async (t) => {
 
   await t.test("rejects unknown key", async () => {
     const p = createParams({ keyId: "key-2" });
-    await assert.rejects(authenticator.authenticateAndReserve(p), /unauthorized/);
+    await assert.rejects(authenticator.authenticateAndReserve(p), WorkerAuthenticationError);
     assert.strictEqual(replayStore.reserveCalls.length, 0); // No reserve on bad auth
   });
 
   await t.test("rejects bad signature", async () => {
     const p = createParams({ signatureHex: "0000000000000000000000000000000000000000000000000000000000000000" });
-    await assert.rejects(authenticator.authenticateAndReserve(p), /unauthorized/);
+    await assert.rejects(authenticator.authenticateAndReserve(p), WorkerAuthenticationError);
     assert.strictEqual(replayStore.reserveCalls.length, 0);
   });
 
@@ -111,27 +113,33 @@ test("WorkerAuthenticator", async (t) => {
 
   await t.test("rejects -301s timestamp", async () => {
     const p = createParams({ timestampSeconds: String(now - 301) });
-    await assert.rejects(authenticator.authenticateAndReserve(p), /unauthorized/);
+    await assert.rejects(authenticator.authenticateAndReserve(p), WorkerAuthenticationError);
     assert.strictEqual(replayStore.reserveCalls.length, 0);
   });
 
   await t.test("rejects +301s timestamp", async () => {
     const p = createParams({ timestampSeconds: String(now + 301) });
-    await assert.rejects(authenticator.authenticateAndReserve(p), /unauthorized/);
+    await assert.rejects(authenticator.authenticateAndReserve(p), WorkerAuthenticationError);
     assert.strictEqual(replayStore.reserveCalls.length, 0);
   });
 
   await t.test("rejects duplicate request ID (replay)", async () => {
     const p = createParams();
     await authenticator.authenticateAndReserve(p); // First succeeds
-    await assert.rejects(authenticator.authenticateAndReserve(p), /unauthorized/); // Second fails
+    await assert.rejects(authenticator.authenticateAndReserve(p), WorkerAuthenticationError); // Second fails
     assert.strictEqual(replayStore.reserveCalls.length, 2);
   });
 
   await t.test("fails closed on replay store failure", async () => {
     const p = createParams();
     replayStore.shouldThrow = true;
-    await assert.rejects(authenticator.authenticateAndReserve(p), /Database unavailable/);
+    await assert.rejects(authenticator.authenticateAndReserve(p), WorkerReplayStoreUnavailableError);
+  });
+  
+  await t.test("fails closed on replay store failure even if error message is unauthorized", async () => {
+    const p = createParams();
+    replayStore.shouldThrow = new Error("unauthorized");
+    await assert.rejects(authenticator.authenticateAndReserve(p), WorkerReplayStoreUnavailableError);
   });
 
   await t.test("constructor validates config", () => {
@@ -150,7 +158,7 @@ test("WorkerAuthenticator", async (t) => {
         previousKeyId: "key-1", // same as current
         previousSecret,
         replayStore,
-      });
+        });
     }, /distinct/);
   });
 });

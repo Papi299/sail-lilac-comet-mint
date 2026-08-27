@@ -7,10 +7,11 @@ import { Buffer } from "node:buffer";
 import { createWorkerSignatureHex } from "../../shared/worker/hmac.server.ts";
 import { createHash } from "node:crypto";
 import { request } from "node:http";
+import net from "node:net";
 import { WORKER_CONTROL_MAX_BODY_BYTES } from "../../shared/worker/constants.ts";
 
 class MockReplayStore implements WorkerReplayStore {
-  private reserved = new Set<string>();
+  public reserved = new Set<string>();
   async reserve(requestId: string): Promise<"reserved" | "duplicate"> {
     if (this.reserved.has(requestId)) return "duplicate";
     this.reserved.add(requestId);
@@ -69,6 +70,31 @@ function makeRequest(server: Server, method: string, path: string, headers: Reco
   });
 }
 
+function makeRawRequest(server: Server, requestString: string): Promise<{ status: number, headers: string, body: string }> {
+  return new Promise((resolve, reject) => {
+    const addr = server.address() as any;
+    const client = net.createConnection({ port: addr.port }, () => {
+      client.write(requestString);
+    });
+    
+    let data = "";
+    client.on("data", (chunk) => data += chunk.toString());
+    client.on("end", () => {
+      const [headerPart, ...bodyParts] = data.split("\r\n\r\n");
+      const headersLines = headerPart.split("\r\n");
+      const statusLine = headersLines[0];
+      const match = statusLine.match(/^HTTP\/1\.\d (\d{3})/);
+      const status = match ? parseInt(match[1], 10) : 0;
+      resolve({
+        status,
+        headers: headerPart,
+        body: bodyParts.join("\r\n\r\n")
+      });
+    });
+    client.on("error", reject);
+  });
+}
+
 test("Worker HTTP Server", async (t) => {
   const replayStore = new MockReplayStore();
   const now = 1700000000;
@@ -85,7 +111,7 @@ test("Worker HTTP Server", async (t) => {
   await t.test("GET /v1/healthz is unauthenticated and 200", async () => {
     const res = await makeRequest(server, "GET", "/v1/healthz");
     assert.strictEqual(res.status, 200);
-    assert.strictEqual(JSON.parse(res.body).status, "ok");
+    assert.deepStrictEqual(JSON.parse(res.body), { status: "ok" });
   });
 
   await t.test("POST /v1/healthz gives 405", async () => {
@@ -129,8 +155,8 @@ test("Worker HTTP Server", async (t) => {
   });
 
   await t.test("Query string is rejected", async () => {
-    const res = await makeRequest(server, "GET", "/v1/healthz?foo=1");
-    assert.strictEqual(res.status, 400);
+    const res = await makeRawRequest(server, "GET /v1/healthz?foo=1 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    assert.strictEqual(res.status, 404); // Not Found via strict exact routing
   });
 
   await t.test("Duplicate headers are rejected", async () => {
@@ -174,5 +200,62 @@ test("Worker HTTP Server", async (t) => {
     headers["content-type"] = "application/json";
     const res = await makeRequest(server, "POST", "/v1/analyze", headers, body);
     assert.strictEqual(res.status, 413);
+  });
+  
+  await t.test("Raw request-target normalization resistance", async () => {
+    const targets = [
+      "http://evil.example/v1/healthz",
+      "https://evil.example/v1/analyze",
+      "//evil.example/v1/healthz",
+      "/v1/jobs/../diagnostics",
+      "/v1/jobs/%2e%2e/diagnostics",
+      "/v1/jobs/.%2e/diagnostics",
+      "/v1\\diagnostics",
+      "/v1/jobs\\..\\diagnostics",
+      "/v1//diagnostics",
+      "/v1/%64iagnostics",
+      "/v1/jobs/%2Fanything",
+    ];
+    for (const target of targets) {
+      const res = await makeRawRequest(server, `GET ${target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
+      assert.notStrictEqual(res.status, 200, `Expected failure for ${target}`);
+    }
+  });
+
+  await t.test("Signed request with mismatched raw target fails", async () => {
+    const body = Buffer.from("");
+    const headers = generateAuthHeaders("GET", "/v1/diagnostics", body, "cccccccc-cccc-4ccc-accc-cccccccccccc", now);
+    
+    // Construct raw HTTP request with wrong target but valid signature for the right target
+    let rawReq = `GET /v1/jobs/../diagnostics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n`;
+    for (const [k, v] of Object.entries(headers)) {
+      rawReq += `${k}: ${v}\r\n`;
+    }
+    rawReq += `\r\n`;
+    
+    const res = await makeRawRequest(server, rawReq);
+    assert.notStrictEqual(res.status, 200);
+    assert.notStrictEqual(res.status, 501);
+  });
+
+  await t.test("Ordering: malformed JSON with valid auth reserves ID then 400", async () => {
+    const body = Buffer.from("{ bad json");
+    const reqId = "dddddddd-dddd-4ddd-addd-dddddddddddd";
+    const headers = generateAuthHeaders("POST", "/v1/analyze", body, reqId, now);
+    headers["content-type"] = "application/json";
+    
+    const res = await makeRequest(server, "POST", "/v1/analyze", headers, body);
+    assert.strictEqual(res.status, 400); // Fails parsing
+    assert.ok(replayStore.reserved.has(reqId)); // But ID was reserved
+  });
+
+  await t.test("Ordering: duplicate replay with malformed JSON gives 401 without parsing", async () => {
+    const body = Buffer.from("{ bad json");
+    const reqId = "dddddddd-dddd-4ddd-addd-dddddddddddd"; // reused from above
+    const headers = generateAuthHeaders("POST", "/v1/analyze", body, reqId, now);
+    headers["content-type"] = "application/json";
+    
+    const res = await makeRequest(server, "POST", "/v1/analyze", headers, body);
+    assert.strictEqual(res.status, 401); // 401 Duplicate Replay, not 400 Bad Request
   });
 });

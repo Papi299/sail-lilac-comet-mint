@@ -1,8 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-
 import { Buffer } from "node:buffer";
-import { readBoundedRawBody, PayloadTooLargeError, UnsupportedMediaTypeError } from "./body.server.ts";
-import { WorkerAuthenticator, type WorkerAuthConfig } from "../security/authenticate.server.ts";
+import { readBoundedRawBody, PayloadTooLargeError, UnsupportedMediaTypeError, MalformedContentLengthError } from "./body.server.ts";
+import { WorkerAuthenticator, WorkerAuthenticationError, WorkerReplayStoreUnavailableError, type WorkerAuthConfig } from "../security/authenticate.server.ts";
 import {
   WORKER_ANALYZE_PATH,
   WORKER_JOBS_PATH,
@@ -33,10 +32,8 @@ function sendUnauthorized(res: ServerResponse) {
 function getHeaderStrict(req: IncomingMessage, name: string): string | undefined {
   const val = req.headers[name.toLowerCase()];
   if (Array.isArray(val)) {
-    // If there's an array, it's duplicate occurrences
     throw new Error("duplicate header");
   }
-  // Also check rawHeaders for exact name duplication because some headers might be combined by comma
   let count = 0;
   for (let i = 0; i < req.rawHeaders.length; i += 2) {
     if (req.rawHeaders[i].toLowerCase() === name.toLowerCase()) {
@@ -49,71 +46,66 @@ function getHeaderStrict(req: IncomingMessage, name: string): string | undefined
   return val;
 }
 
+type RouteCategory = "health" | "analyze" | "jobs_create" | "jobs_get" | "jobs_cancel" | "diagnostics";
+
+interface ParsedRoute {
+  category: RouteCategory;
+  jobId: string | null;
+}
+
+function parseWorkerRoute(rawTarget: string, method: string): ParsedRoute | { error: number, message: string } {
+  if (rawTarget === WORKER_HEALTH_PATH) {
+    if (method !== "GET") return { error: 405, message: "Method Not Allowed" };
+    return { category: "health", jobId: null };
+  }
+  if (rawTarget === WORKER_ANALYZE_PATH) {
+    if (method !== "POST") return { error: 405, message: "Method Not Allowed" };
+    return { category: "analyze", jobId: null };
+  }
+  if (rawTarget === WORKER_JOBS_PATH) {
+    if (method !== "POST") return { error: 405, message: "Method Not Allowed" };
+    return { category: "jobs_create", jobId: null };
+  }
+  if (rawTarget === WORKER_DIAGNOSTICS_PATH) {
+    if (method !== "GET") return { error: 405, message: "Method Not Allowed" };
+    return { category: "diagnostics", jobId: null };
+  }
+  if (rawTarget.startsWith(WORKER_JOBS_PATH + "/")) {
+    const remainder = rawTarget.substring(WORKER_JOBS_PATH.length + 1);
+    
+    // /v1/jobs/<id>
+    if (/^[0-9a-f]{32}$/.test(remainder)) {
+      if (method !== "GET") return { error: 405, message: "Method Not Allowed" };
+      return { category: "jobs_get", jobId: remainder };
+    }
+    
+    // /v1/jobs/<id>/cancel
+    const cancelMatch = remainder.match(/^([0-9a-f]{32})\/cancel$/);
+    if (cancelMatch) {
+      if (method !== "POST") return { error: 405, message: "Method Not Allowed" };
+      return { category: "jobs_cancel", jobId: cancelMatch[1] };
+    }
+  }
+  
+  return { error: 404, message: "Not Found" };
+}
+
 export function createWorkerServer(authConfig: WorkerAuthConfig): Server {
   const authenticator = new WorkerAuthenticator(authConfig);
 
   return createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
-      let parsedUrl: URL;
-      try {
-        parsedUrl = new URL(req.url || "/", "http://localhost");
-      } catch {
+      if (!req.url) {
         return sendError(res, 400, "Bad Request");
       }
+
+      // 1. Exact raw METHOD + PATH matching
+      const routeResult = parseWorkerRoute(req.url, req.method || "GET");
+      if ("error" in routeResult) {
+        return sendError(res, routeResult.error, routeResult.message);
+      }
+      const routeCategory = routeResult.category;
       
-      if (parsedUrl.search) {
-        return sendError(res, 400, "Bad Request: Query strings are not allowed");
-      }
-      if (parsedUrl.hash) {
-        return sendError(res, 400, "Bad Request: Fragments are not allowed");
-      }
-
-      const path = parsedUrl.pathname;
-
-      // 1. Exact METHOD + PATH matching
-      let routeCategory: "health" | "analyze" | "jobs_create" | "jobs_get" | "jobs_cancel" | "diagnostics" | null = null;
-      let _jobId: string | null = null;
-
-      if (path === WORKER_HEALTH_PATH) {
-        if (req.method !== "GET") return sendError(res, 405, "Method Not Allowed");
-        routeCategory = "health";
-      } else if (path === WORKER_ANALYZE_PATH) {
-        if (req.method !== "POST") return sendError(res, 405, "Method Not Allowed");
-        routeCategory = "analyze";
-      } else if (path === WORKER_JOBS_PATH) {
-        if (req.method !== "POST") return sendError(res, 405, "Method Not Allowed");
-        routeCategory = "jobs_create";
-      } else if (path.startsWith(WORKER_JOBS_PATH + "/")) {
-        const parts = path.substring(WORKER_JOBS_PATH.length + 1).split("/");
-        if (parts.length === 1) {
-          // /v1/jobs/<id>
-          if (req.method !== "GET") return sendError(res, 405, "Method Not Allowed");
-          const resParse = WorkerJobIdSchema.safeParse(parts[0]);
-          if (!resParse.success) {
-            // Not a valid job ID format, so treat as unknown route
-            return sendError(res, 404, "Not Found");
-          }
-          _jobId = resParse.data;
-          routeCategory = "jobs_get";
-        } else if (parts.length === 2 && parts[1] === "cancel") {
-          // /v1/jobs/<id>/cancel
-          if (req.method !== "POST") return sendError(res, 405, "Method Not Allowed");
-          const resParse = WorkerJobIdSchema.safeParse(parts[0]);
-          if (!resParse.success) {
-            return sendError(res, 404, "Not Found");
-          }
-          _jobId = resParse.data;
-          routeCategory = "jobs_cancel";
-        } else {
-          return sendError(res, 404, "Not Found");
-        }
-      } else if (path === WORKER_DIAGNOSTICS_PATH) {
-        if (req.method !== "GET") return sendError(res, 405, "Method Not Allowed");
-        routeCategory = "diagnostics";
-      } else {
-        return sendError(res, 404, "Not Found");
-      }
-
       // Unauthenticated health route
       if (routeCategory === "health") {
         return sendJson(res, 200, { status: "ok" });
@@ -128,6 +120,8 @@ export function createWorkerServer(authConfig: WorkerAuthConfig): Server {
           return sendError(res, 413, "Payload Too Large");
         } else if (err instanceof UnsupportedMediaTypeError) {
           return sendError(res, 415, "Unsupported Media Type");
+        } else if (err instanceof MalformedContentLengthError) {
+          return sendError(res, 400, "Bad Request");
         }
         return sendError(res, 400, "Bad Request");
       }
@@ -152,8 +146,8 @@ export function createWorkerServer(authConfig: WorkerAuthConfig): Server {
       try {
         await authenticator.authenticateAndReserve({
           keyId,
-          method: req.method as "GET" | "POST",
-          canonicalPath: path,
+          method: (req.method || "GET") as "GET" | "POST",
+          canonicalPath: req.url, // rawTarget === canonicalPath
           timestampSeconds: timestamp,
           requestId,
           idempotencyKey,
@@ -161,8 +155,10 @@ export function createWorkerServer(authConfig: WorkerAuthConfig): Server {
           signatureHex: signature,
         });
       } catch (err: any) {
-        if (err.message === "unauthorized") {
+        if (err instanceof WorkerAuthenticationError) {
           return sendUnauthorized(res);
+        } else if (err instanceof WorkerReplayStoreUnavailableError) {
+          return sendError(res, 503, "Service Unavailable");
         }
         // Fallback for unexpected failures (e.g., storage down)
         return sendError(res, 503, "Service Unavailable");
