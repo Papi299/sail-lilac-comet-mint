@@ -30,12 +30,12 @@ export function applyMigrations(db: DatabaseSync): void {
           format_id TEXT NOT NULL,
           principal_id TEXT NOT NULL,
           status TEXT NOT NULL CHECK(status IN ('queued', 'analyzing', 'downloading', 'processing', 'uploading', 'ready', 'failed', 'cancelled')),
-          progress INTEGER,
+          progress REAL,
           stage_label TEXT,
           downloaded_bytes INTEGER,
           total_bytes INTEGER,
-          speed INTEGER,
-          eta INTEGER,
+          speed REAL,
+          eta REAL,
           error_code TEXT,
           safe_error_message TEXT,
           filename TEXT,
@@ -53,6 +53,13 @@ export function applyMigrations(db: DatabaseSync): void {
           object_key TEXT,
           started_at_ms INTEGER,
           finished_at_ms INTEGER,
+          CHECK(length(job_id) = 32 AND job_id NOT GLOB '*[^0-9a-f]*'),
+          CHECK(principal_id = 'private-access-user'),
+          CHECK(created_at_ms >= 0),
+          CHECK(updated_at_ms >= 0),
+          CHECK(expires_at_ms >= 0),
+          CHECK(started_at_ms IS NULL OR started_at_ms >= 0),
+          CHECK(finished_at_ms IS NULL OR finished_at_ms >= 0),
           CHECK(expires_at_ms >= created_at_ms),
           CHECK(progress IS NULL OR (progress >= 0 AND progress <= 100)),
           CHECK(downloaded_bytes IS NULL OR downloaded_bytes >= 0),
@@ -81,5 +88,20 @@ export function applyMigrations(db: DatabaseSync): void {
       db.exec("ROLLBACK");
       throw err;
     }
+  } else if (currentVersion === 1) {
+    assertWorkerSchemaV1(db);
   }
+}
+
+function assertWorkerSchemaV1(db: DatabaseSync): void {
+  const checkTable = (tableName: string) => {
+    const row = db.prepare("SELECT count(*) as count FROM sqlite_master WHERE type='table' AND name=?").get(tableName) as { count: number };
+    if (row.count === 0) {
+      throw new Error(`Worker schema integrity check failed: missing table ${tableName}`);
+    }
+  };
+
+  checkTable("worker_jobs");
+  checkTable("worker_idempotency_records");
+  checkTable("worker_replay_requests");
 }

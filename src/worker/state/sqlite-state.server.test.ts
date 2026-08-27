@@ -38,11 +38,9 @@ describe("Worker SQLite State", () => {
   });
 
   it("new DB migration and reopen migration idempotence", () => {
-    // Migration applied in beforeEach
     const versionObj = db.prepare("PRAGMA user_version").get() as { user_version: number };
     assert.strictEqual(versionObj.user_version, WORKER_SCHEMA_VERSION);
 
-    // Idempotent
     assert.doesNotThrow(() => {
       applyMigrations(db);
     });
@@ -53,6 +51,13 @@ describe("Worker SQLite State", () => {
     assert.throws(() => {
       applyMigrations(db);
     }, /Unsupported future schema version/);
+  });
+
+  it("missing tables on v1 rejected", () => {
+    db.exec("DROP TABLE worker_jobs");
+    assert.throws(() => {
+      applyMigrations(db);
+    }, /missing table worker_jobs/);
   });
 
   it("STRICT-table behavior", () => {
@@ -76,13 +81,16 @@ describe("Worker SQLite State", () => {
       principalId: "private-access-user"
     };
 
-    const result = store.createJob(req, "idem-1");
+    const result = store.createJob(req, "123e4567-e89b-42d3-a456-426614174001");
     assert.strictEqual(result.type, "created");
     if (result.type !== "created") return;
 
-    const row = store.getJob(result.job.jobId);
-    assert.ok(row);
-    assert.strictEqual(row.jobId, result.job.jobId);
+    const claimed = store.claimNextQueuedJob();
+    assert.ok(claimed);
+    assert.strictEqual(claimed.jobId, result.job.jobId);
+    assert.strictEqual(claimed.url, req.url);
+    assert.strictEqual(claimed.formatId, req.formatId);
+    assert.strictEqual(claimed.principalId, req.principalId);
   });
 
   it("job view validation", () => {
@@ -91,7 +99,7 @@ describe("Worker SQLite State", () => {
       url: "https://example.com/",
       formatId: "fmt",
       principalId: "private-access-user"
-    }, "idem-2");
+    }, "123e4567-e89b-42d3-a456-426614174002");
     
     assert.strictEqual(result.type, "created");
     if (result.type !== "created") return;
@@ -101,13 +109,45 @@ describe("Worker SQLite State", () => {
     assert.ok(job.createdAt > 0);
   });
 
+  it("invalid generator rollback", () => {
+    const store = new SQLiteJobStore({ db, generateJobId: () => "invalid-uppercase-ID-123" });
+    assert.throws(() => {
+      store.createJob({
+        url: "https://example.com/",
+        formatId: "fmt",
+        principalId: "private-access-user"
+      }, "123e4567-e89b-42d3-a456-426614174003");
+    });
+    
+    const countJobs = (db.prepare("SELECT count(*) as c FROM worker_jobs").get() as any).c;
+    const countIdemp = (db.prepare("SELECT count(*) as c FROM worker_idempotency_records").get() as any).c;
+    assert.strictEqual(countJobs, 0);
+    assert.strictEqual(countIdemp, 0);
+  });
+
+  it("invalid idempotency key rejected", () => {
+    const store = new SQLiteJobStore({ db });
+    assert.throws(() => {
+      store.createJob({
+        url: "https://example.com/",
+        formatId: "fmt",
+        principalId: "private-access-user"
+      }, "not-a-uuid");
+    });
+    
+    const countJobs = (db.prepare("SELECT count(*) as c FROM worker_jobs").get() as any).c;
+    const countIdemp = (db.prepare("SELECT count(*) as c FROM worker_idempotency_records").get() as any).c;
+    assert.strictEqual(countJobs, 0);
+    assert.strictEqual(countIdemp, 0);
+  });
+
   it("FIFO queue ordering and atomic queued claim", () => {
     let mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, generateJobId: () => Math.random().toString(16).slice(2).padStart(32, '0') });
     
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "idem-q1");
+    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174004");
     mockTime = 2000;
-    store.createJob({ url: "http://b", formatId: "2", principalId: "private-access-user" }, "idem-q2");
+    store.createJob({ url: "http://b", formatId: "2", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174005");
     
     const queued = store.listQueuedJobs(10);
     assert.strictEqual(queued.length, 2);
@@ -127,59 +167,78 @@ describe("Worker SQLite State", () => {
     let mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000, generateJobId: () => "00000000000000000000000000000001" });
     
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "idem-q3");
+    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174006");
     
-    // Time travel past TTL (job expires at 6000)
     mockTime = 7000;
-    
     const claimed = store.claimNextQueuedJob();
     assert.strictEqual(claimed, null);
   });
 
-  it("cancel CAS and failure CAS", () => {
+  it("cancel CAS and failure CAS explicit returns", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000002" });
-    const res = store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "idem-cas1");
+    const res = store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174007");
     if (res.type !== "created") assert.fail("not created");
     
-    // First terminal transition wins
     const cancelled = store.cancelJob(res.job.jobId);
-    assert.strictEqual(cancelled, true);
+    assert.strictEqual(cancelled.type, "cancelled");
 
     const failed = store.failJob(res.job.jobId, "PROCESSING_FAILED", "failed");
     assert.strictEqual(failed, false);
 
     const job = store.getJob(res.job.jobId);
     assert.strictEqual(job?.status, "cancelled");
+    
+    const cancelledAgain = store.cancelJob(res.job.jobId);
+    assert.strictEqual(cancelledAgain.type, "unchanged");
   });
 
   it("fail-first then cancel CAS", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000003" });
-    const res = store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "idem-cas2");
+    const res = store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174008");
     if (res.type !== "created") assert.fail("not created");
     
     const failed = store.failJob(res.job.jobId, "NETWORK_ERROR", "failed");
     assert.strictEqual(failed, true);
 
     const cancelled = store.cancelJob(res.job.jobId);
-    assert.strictEqual(cancelled, false);
+    assert.strictEqual(cancelled.type, "unchanged");
 
     const job = store.getJob(res.job.jobId);
     assert.strictEqual(job?.status, "failed");
   });
 
-  it("restart recovery", () => {
-    let idCounter = 1;
-    const store = new SQLiteJobStore({ db, generateJobId: () => `0000000000000000000000000000000${idCounter++}` });
-    
-    const res1 = store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "idem-rr1");
-    const res2 = store.createJob({ url: "http://b", formatId: "2", principalId: "private-access-user" }, "idem-rr2");
-    const res3 = store.createJob({ url: "http://c", formatId: "3", principalId: "private-access-user" }, "idem-rr3");
-    
-    if (res1.type !== "created" || res2.type !== "created" || res3.type !== "created") assert.fail("not created");
+  it("cancel missing job", () => {
+    const store = new SQLiteJobStore({ db });
+    const cancelled = store.cancelJob("00000000000000000000000000000009");
+    assert.strictEqual(cancelled.type, "not_found");
+  });
 
-    store.claimNextQueuedJob(); // res1 becomes analyzing
-    store.cancelJob(res3.job.jobId); // res3 becomes cancelled
-    // res2 remains queued
+  it("full restart recovery matrix", () => {
+    let idCounter = 1;
+    const store = new SQLiteJobStore({ db, generateJobId: () => (idCounter++).toString().padStart(32, '0') });
+    
+    const create = () => {
+      const res = store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, `123e4567-e89b-42d3-a456-42661417401${idCounter}`);
+      if (res.type !== "created") throw new Error("not created");
+      return res.job.jobId;
+    };
+    
+    const jq = create();
+    const ja = create();
+    const jd = create();
+    const jp = create();
+    const ju = create();
+    const jr = create();
+    const jf = create();
+    const jc = create();
+    
+    db.exec(`UPDATE worker_jobs SET status = 'analyzing' WHERE job_id = '${ja}'`);
+    db.exec(`UPDATE worker_jobs SET status = 'downloading' WHERE job_id = '${jd}'`);
+    db.exec(`UPDATE worker_jobs SET status = 'processing' WHERE job_id = '${jp}'`);
+    db.exec(`UPDATE worker_jobs SET status = 'uploading' WHERE job_id = '${ju}'`);
+    db.exec(`UPDATE worker_jobs SET status = 'ready', object_key = 'videofetch/jobs/${jr}/12345678901234567890123456789012' WHERE job_id = '${jr}'`);
+    db.exec(`UPDATE worker_jobs SET status = 'failed' WHERE job_id = '${jf}'`);
+    db.exec(`UPDATE worker_jobs SET status = 'cancelled' WHERE job_id = '${jc}'`);
 
     db.close();
 
@@ -188,15 +247,23 @@ describe("Worker SQLite State", () => {
     
     store2.recover();
 
-    const job1 = store2.getJob(res1.job.jobId);
-    assert.strictEqual(job1?.status, "failed");
-    assert.strictEqual(job1?.errorCode, "PROCESSING_FAILED");
+    assert.strictEqual(store2.getJob(jq)?.status, "queued");
+    
+    const verifyInterrupted = (id: string) => {
+      const j = store2.getJob(id);
+      assert.strictEqual(j?.status, "failed");
+      assert.strictEqual(j?.errorCode, "PROCESSING_FAILED");
+      assert.strictEqual(j?.safeErrorMessage, "Worker restarted before the job completed.");
+    };
+    
+    verifyInterrupted(ja);
+    verifyInterrupted(jd);
+    verifyInterrupted(jp);
+    verifyInterrupted(ju);
 
-    const job2 = store2.getJob(res2.job.jobId);
-    assert.strictEqual(job2?.status, "queued");
-
-    const job3 = store2.getJob(res3.job.jobId);
-    assert.strictEqual(job3?.status, "cancelled");
+    assert.strictEqual(store2.getJob(jr)?.status, "ready");
+    assert.strictEqual(store2.getJob(jf)?.status, "failed");
+    assert.strictEqual(store2.getJob(jc)?.status, "cancelled");
 
     db2.close();
   });
@@ -207,39 +274,35 @@ describe("Worker SQLite State", () => {
     
     const req1: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
     
-    // Created
-    const res1 = store.createJob(req1, "key-1");
+    const res1 = store.createJob(req1, "123e4567-e89b-42d3-a456-426614174020");
     assert.strictEqual(res1.type, "created");
     
-    // Same key, same payload -> Existing
-    const res2 = store.createJob(req1, "key-1");
+    const res2 = store.createJob(req1, "123e4567-e89b-42d3-a456-426614174020");
     assert.strictEqual(res2.type, "existing");
     if (res1.type === "created" && res2.type === "existing") {
       assert.strictEqual(res1.job.jobId, res2.job.jobId);
     }
 
-    // Same key, different payload -> Conflict
     const req2: WorkerCreateJobRequest = { url: "http://b", formatId: "1", principalId: "private-access-user" };
-    const res3 = store.createJob(req2, "key-1");
+    const res3 = store.createJob(req2, "123e4567-e89b-42d3-a456-426614174020");
     assert.strictEqual(res3.type, "conflict");
 
-    // Expired referenced job
-    mockTime = 10000; // Past job TTL (which was 5000), but inside idempotency TTL (24h)
-    const res4 = store.createJob(req1, "key-1");
+    mockTime = 10000;
+    const res4 = store.createJob(req1, "123e4567-e89b-42d3-a456-426614174020");
     assert.strictEqual(res4.type, "expired");
   });
 
   it("idempotency restart persistence", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000005" });
     const req: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
-    store.createJob(req, "key-persistence");
+    store.createJob(req, "123e4567-e89b-42d3-a456-426614174021");
     
     db.close();
 
     const db2 = openWorkerDatabase({ path: dbPath });
     const store2 = new SQLiteJobStore({ db: db2 });
     
-    const res2 = store2.createJob(req, "key-persistence");
+    const res2 = store2.createJob(req, "123e4567-e89b-42d3-a456-426614174021");
     assert.strictEqual(res2.type, "existing");
     
     db2.close();
@@ -249,13 +312,12 @@ describe("Worker SQLite State", () => {
     const mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, generateJobId: () => "00000000000000000000000000000006" });
     const req: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
-    store.createJob(req, "key-tomb");
+    store.createJob(req, "123e4567-e89b-42d3-a456-426614174022");
     
-    // Manually delete the job to simulate tombstone behavior
     db.exec("DELETE FROM worker_jobs");
 
-    const res2 = store.createJob(req, "key-tomb");
-    assert.strictEqual(res2.type, "expired"); // Expected logical result
+    const res2 = store.createJob(req, "123e4567-e89b-42d3-a456-426614174022");
+    assert.strictEqual(res2.type, "expired");
   });
 
   it("expired idempotency record reuse", () => {
@@ -263,14 +325,12 @@ describe("Worker SQLite State", () => {
     const store = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000, generateJobId: () => Math.random().toString(16).slice(2).padStart(32, '0') });
     
     const req1: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
-    store.createJob(req1, "key-reuse");
+    store.createJob(req1, "123e4567-e89b-42d3-a456-426614174023");
     
-    // Advance past idempotency min retention (24h)
     mockTime = 1000 + 25 * 60 * 60 * 1000;
     
-    // Different payload should not conflict because it's expired
     const req2: WorkerCreateJobRequest = { url: "http://b", formatId: "1", principalId: "private-access-user" };
-    const res2 = store.createJob(req2, "key-reuse");
+    const res2 = store.createJob(req2, "123e4567-e89b-42d3-a456-426614174023");
     assert.strictEqual(res2.type, "created");
   });
 });

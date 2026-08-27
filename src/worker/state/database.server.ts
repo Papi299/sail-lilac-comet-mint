@@ -1,6 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
 
-export const WORKER_SCHEMA_VERSION = 1;
 
 export interface OpenWorkerDatabaseOptions {
   path: string;

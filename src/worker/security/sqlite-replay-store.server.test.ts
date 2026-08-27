@@ -6,7 +6,9 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { SQLiteWorkerReplayStore } from "./sqlite-replay-store.server.ts";
 import { applyMigrations } from "../state/migrations.server.ts";
-import { WorkerAuthenticator } from "./authenticate.server.ts";
+import { WorkerAuthenticator, WorkerAuthenticationError } from "./authenticate.server.ts";
+import { createWorkerSignatureHex } from "../../shared/worker/hmac.server.ts";
+import { sha256WorkerBody } from "../../shared/worker/auth.ts";
 
 describe("SQLiteWorkerReplayStore", () => {
   let tempDir: string;
@@ -36,18 +38,17 @@ describe("SQLiteWorkerReplayStore", () => {
     if (fs.existsSync(dbPath + "-shm")) fs.unlinkSync(dbPath + "-shm");
   });
 
-
   it("reserves a new request successfully", async () => {
     const store = new SQLiteWorkerReplayStore(db);
-    const result = await store.reserve("req-1", Math.floor(Date.now() / 1000) + 60);
+    const result = await store.reserve("123e4567-e89b-42d3-a456-426614174000", Math.floor(Date.now() / 1000) + 60);
     assert.strictEqual(result, "reserved");
   });
 
   it("returns duplicate for already reserved request", async () => {
     const store = new SQLiteWorkerReplayStore(db);
     const expires = Math.floor(Date.now() / 1000) + 60;
-    const res1 = await store.reserve("req-2", expires);
-    const res2 = await store.reserve("req-2", expires);
+    const res1 = await store.reserve("123e4567-e89b-42d3-a456-426614174001", expires);
+    const res2 = await store.reserve("123e4567-e89b-42d3-a456-426614174001", expires);
     assert.strictEqual(res1, "reserved");
     assert.strictEqual(res2, "duplicate");
   });
@@ -57,8 +58,8 @@ describe("SQLiteWorkerReplayStore", () => {
     const store = new SQLiteWorkerReplayStore(db, () => mockTime);
     
     // Reserve expires at 1050
-    await store.reserve("req-3", 1050);
-    assert.strictEqual(await store.reserve("req-3", 1050), "duplicate");
+    await store.reserve("123e4567-e89b-42d3-a456-426614174002", 1050);
+    assert.strictEqual(await store.reserve("123e4567-e89b-42d3-a456-426614174002", 1050), "duplicate");
 
     // Advance time past expiration
     mockTime = 1100;
@@ -66,8 +67,8 @@ describe("SQLiteWorkerReplayStore", () => {
     // Cleanup is called inside reserve, or explicitly
     store.cleanup();
 
-    // Now req-3 can be reserved again since it was deleted
-    const res = await store.reserve("req-3", 1150);
+    // Now req can be reserved again since it was deleted
+    const res = await store.reserve("123e4567-e89b-42d3-a456-426614174002", 1150);
     assert.strictEqual(res, "reserved");
   });
 
@@ -76,35 +77,64 @@ describe("SQLiteWorkerReplayStore", () => {
     db.exec("DROP TABLE worker_replay_requests");
     await assert.rejects(
       async () => {
-        await store.reserve("req-throw", 99999);
+        await store.reserve("123e4567-e89b-42d3-a456-426614174003", 99999);
       }
     );
   });
 
   it("restart-safe replay regression", async () => {
-    const expiresAt = Math.floor(Date.now() / 1000) + 3600;
-
-    const store1 = new SQLiteWorkerReplayStore(db);
+    const store1 = new SQLiteWorkerReplayStore(db, () => 1000);
+    const secret = "01234567890123456789012345678901";
     const authenticator1 = new WorkerAuthenticator({
       currentKeyId: "key-1",
-      currentSecret: "01234567890123456789012345678901",
-      clock: () => Date.now(),
+      currentSecret: secret,
+      clock: () => 1000, // Date.now() representation in ms... wait, clock in seconds according to my changes but it was ms initially? Let's check WorkerAuthenticator
       replayStore: store1,
     });
-    // Just a placeholder to use authenticator1 to avoid unused var lint warning
-    assert.ok(authenticator1);
+
+    const requestId = "c0f81d83-4950-4824-9b21-654db9035be4";
+    const timestamp = 1000;
     
-    const res1 = await store1.reserve("c0f81d83-4950-4824-9b21-654db9035be4", expiresAt);
-    assert.strictEqual(res1, "reserved");
+    const signature = createWorkerSignatureHex(secret, {
+      method: "POST",
+      canonicalPath: "/v1/jobs",
+      sha256RawBody: sha256WorkerBody(Buffer.from("test")),
+      timestampSeconds: timestamp.toString(),
+      requestId,
+      keyId: "key-1"
+    });
+
+    const authParams = {
+      keyId: "key-1",
+      method: "POST" as const,
+      canonicalPath: "/v1/jobs",
+      timestampSeconds: timestamp.toString(),
+      requestId,
+      rawBody: Buffer.from("test"),
+      signatureHex: signature
+    };
+
+    await authenticator1.authenticateAndReserve(authParams);
     
     db.close();
 
     // Reopen same database
     const db2 = new DatabaseSync(dbPath);
-    const store2 = new SQLiteWorkerReplayStore(db2);
+    const store2 = new SQLiteWorkerReplayStore(db2, () => 1000);
+    
+    const authenticator2 = new WorkerAuthenticator({
+      currentKeyId: "key-1",
+      currentSecret: secret,
+      clock: () => 1000, // clock in seconds
+      replayStore: store2,
+    });
 
-    const res2 = await store2.reserve("c0f81d83-4950-4824-9b21-654db9035be4", expiresAt);
-    assert.strictEqual(res2, "duplicate");
+    await assert.rejects(
+      async () => {
+        await authenticator2.authenticateAndReserve(authParams);
+      },
+      (err: any) => err instanceof WorkerAuthenticationError
+    );
     
     db2.close();
   });

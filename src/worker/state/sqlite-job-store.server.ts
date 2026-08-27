@@ -3,11 +3,14 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   WorkerJobViewSchema,
   WorkerCreateJobRequestSchema,
+  WorkerJobIdSchema,
   type WorkerJobView,
   type WorkerCreateJobRequest
 } from "../../shared/worker/contracts.ts";
+import { WorkerIdempotencyKeySchema } from "../../shared/worker/auth.ts";
 import { WorkerErrorCodeSchema } from "../../shared/worker/errors.ts";
-import type { WorkerJobStore, CreateJobResult } from "./job-store.ts";
+import type { WorkerJobStore, CreateJobResult, CancelJobResult, DurableWorkerJob } from "./job-store.ts";
+import { DurableWorkerJobSchema } from "./job-store.ts";
 import { generateIdempotencyFingerprint, WORKER_IDEMPOTENCY_MIN_RETENTION_MS } from "./idempotency.server.ts";
 
 export interface SQLiteJobStoreOptions {
@@ -17,9 +20,12 @@ export interface SQLiteJobStoreOptions {
   generateJobId?: () => string;
 }
 
-function rowToJobView(row: any): WorkerJobView {
+function rowToDurableJob(row: any): DurableWorkerJob {
   const data = {
     jobId: row.job_id,
+    url: row.url,
+    formatId: row.format_id,
+    principalId: row.principal_id,
     status: row.status,
     progress: row.progress,
     stageLabel: row.stage_label,
@@ -42,6 +48,37 @@ function rowToJobView(row: any): WorkerJobView {
     updatedAt: row.updated_at_ms,
     expiresAt: row.expires_at_ms,
     objectKey: row.object_key,
+    startedAt: row.started_at_ms,
+    finishedAt: row.finished_at_ms,
+  };
+  return DurableWorkerJobSchema.parse(data);
+}
+
+function durableJobToView(job: DurableWorkerJob): WorkerJobView {
+  const data = {
+    jobId: job.jobId,
+    status: job.status,
+    progress: job.progress,
+    stageLabel: job.stageLabel,
+    downloadedBytes: job.downloadedBytes,
+    totalBytes: job.totalBytes,
+    speed: job.speed,
+    eta: job.eta,
+    errorCode: job.errorCode,
+    safeErrorMessage: job.safeErrorMessage,
+    filename: job.filename,
+    fileSize: job.fileSize,
+    mime: job.mime,
+    quality: job.quality,
+    container: job.container,
+    title: job.title,
+    thumbnail: job.thumbnail,
+    source: job.source,
+    extractor: job.extractor,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    expiresAt: job.expiresAt,
+    objectKey: job.objectKey,
   };
   return WorkerJobViewSchema.parse(data);
 }
@@ -64,20 +101,33 @@ export class SQLiteJobStore implements WorkerJobStore {
 
   createJob(request: WorkerCreateJobRequest, idempotencyKey: string): CreateJobResult {
     const validRequest = WorkerCreateJobRequestSchema.parse(request);
+    const validIdempotencyKey = WorkerIdempotencyKeySchema.parse(idempotencyKey);
     const payloadHash = generateIdempotencyFingerprint(validRequest);
     const now = this.clock();
+    
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new Error("Clock generated an invalid or unsafe timestamp");
+    }
 
-    // Expire old idempotency records before processing
-    this.cleanupIdempotency(now);
+    const jobExpiresAt = now + this.jobTtlMs;
+    const idempotencyExpiresAt = Math.max(now + WORKER_IDEMPOTENCY_MIN_RETENTION_MS, jobExpiresAt);
+    
+    if (!Number.isSafeInteger(jobExpiresAt) || !Number.isSafeInteger(idempotencyExpiresAt)) {
+      throw new Error("Expiration computation exceeded safe integers");
+    }
+
+    const jobId = WorkerJobIdSchema.parse(this.generateJobId());
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      // Check for existing idempotency record
+      // Periodic cleanup of expired idempotency records
+      const cleanupStmt = this.db.prepare("DELETE FROM worker_idempotency_records WHERE expires_at_ms <= ? AND idempotency_key != ?");
+      cleanupStmt.run(now, validIdempotencyKey);
+
       const idempStmt = this.db.prepare("SELECT * FROM worker_idempotency_records WHERE idempotency_key = ?");
-      const existingIdemp = idempStmt.get(idempotencyKey) as any;
+      const existingIdemp = idempStmt.get(validIdempotencyKey) as any;
 
       if (existingIdemp) {
-        // Expiration is checked implicitly or explicitly (we already ran cleanup, but just in case)
         if (existingIdemp.expires_at_ms > now) {
           if (existingIdemp.payload_hash !== payloadHash) {
             this.db.exec("COMMIT");
@@ -95,22 +145,15 @@ export class SQLiteJobStore implements WorkerJobStore {
           this.db.exec("COMMIT");
 
           if (!jobRow) {
-            // Missing job, surviving tombstone
-            return { type: "expired" }; // Safe logical result
+            return { type: "expired" };
           }
 
-          return { type: "existing", job: rowToJobView(jobRow) };
+          return { type: "existing", job: durableJobToView(rowToDurableJob(jobRow)) };
         } else {
-            // Delete expired idempotency key explicitly and allow reuse below
             const delStmt = this.db.prepare("DELETE FROM worker_idempotency_records WHERE idempotency_key = ?");
-            delStmt.run(idempotencyKey);
+            delStmt.run(validIdempotencyKey);
         }
       }
-
-      // New key or reused expired key
-      const jobId = this.generateJobId();
-      const jobExpiresAt = now + this.jobTtlMs;
-      const idempotencyExpiresAt = Math.max(now + WORKER_IDEMPOTENCY_MIN_RETENTION_MS, jobExpiresAt);
 
       const insertJobStmt = this.db.prepare(`
         INSERT INTO worker_jobs (
@@ -130,7 +173,7 @@ export class SQLiteJobStore implements WorkerJobStore {
         ) VALUES (?, ?, ?, ?, ?, ?)
       `);
       insertIdempStmt.run(
-        idempotencyKey, payloadHash, jobId,
+        validIdempotencyKey, payloadHash, jobId,
         now, jobExpiresAt, idempotencyExpiresAt
       );
 
@@ -139,8 +182,7 @@ export class SQLiteJobStore implements WorkerJobStore {
       const jobStmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
       const newJobRow = jobStmt.get(jobId);
       
-      return { type: "created", job: rowToJobView(newJobRow) };
-
+      return { type: "created", job: durableJobToView(rowToDurableJob(newJobRow)) };
     } catch (e) {
       this.db.exec("ROLLBACK");
       throw e;
@@ -151,18 +193,20 @@ export class SQLiteJobStore implements WorkerJobStore {
     const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
     const row = stmt.get(jobId);
     if (!row) return null;
-    return rowToJobView(row);
+    return durableJobToView(rowToDurableJob(row));
   }
 
-  listQueuedJobs(limit: number): WorkerJobView[] {
+  listQueuedJobs(limit: number): DurableWorkerJob[] {
     const now = this.clock();
     const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE status = 'queued' AND expires_at_ms > ? ORDER BY created_at_ms ASC, job_id ASC LIMIT ?");
     const rows = stmt.all(now, limit);
-    return rows.map(rowToJobView);
+    return rows.map(rowToDurableJob);
   }
 
-  claimNextQueuedJob(): WorkerJobView | null {
+  claimNextQueuedJob(): DurableWorkerJob | null {
     const now = this.clock();
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error("Unsafe clock");
+
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const selectStmt = this.db.prepare(`
@@ -191,22 +235,49 @@ export class SQLiteJobStore implements WorkerJobStore {
       
       const newStmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
       const newRow = newStmt.get(row.job_id);
-      return rowToJobView(newRow);
+      return rowToDurableJob(newRow);
     } catch (e) {
       this.db.exec("ROLLBACK");
       throw e;
     }
   }
 
-  cancelJob(jobId: string): boolean {
+  cancelJob(jobId: string): CancelJobResult {
     const now = this.clock();
-    const stmt = this.db.prepare(`
-      UPDATE worker_jobs 
-      SET status = 'cancelled', updated_at_ms = ? 
-      WHERE job_id = ? AND status IN ('queued', 'analyzing', 'downloading', 'processing', 'uploading')
-    `);
-    const result = stmt.run(now, jobId);
-    return result.changes === 1;
+    
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
+      const row = stmt.get(jobId);
+      
+      if (!row) {
+        this.db.exec("COMMIT");
+        return { type: "not_found" };
+      }
+      
+      const durableJob = rowToDurableJob(row);
+      const isTerminal = ['ready', 'failed', 'cancelled'].includes(durableJob.status);
+      
+      if (isTerminal) {
+        this.db.exec("COMMIT");
+        return { type: "unchanged", job: durableJobToView(durableJob) };
+      }
+
+      const updateStmt = this.db.prepare(`
+        UPDATE worker_jobs 
+        SET status = 'cancelled', updated_at_ms = ?, finished_at_ms = COALESCE(finished_at_ms, ?)
+        WHERE job_id = ? AND status IN ('queued', 'analyzing', 'downloading', 'processing', 'uploading')
+      `);
+      updateStmt.run(now, now, jobId);
+      
+      this.db.exec("COMMIT");
+      
+      const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(jobId);
+      return { type: "cancelled", job: durableJobToView(rowToDurableJob(newRow)) };
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
   }
 
   failJob(jobId: string, errorCode: string, errorMessage: string): boolean {
@@ -238,11 +309,5 @@ export class SQLiteJobStore implements WorkerJobStore {
       WHERE status IN ('analyzing', 'downloading', 'processing', 'uploading')
     `);
     stmt.run(now, now);
-  }
-
-  cleanupIdempotency(nowOverride?: number): void {
-    const now = nowOverride ?? this.clock();
-    const stmt = this.db.prepare("DELETE FROM worker_idempotency_records WHERE expires_at_ms <= ?");
-    stmt.run(now);
   }
 }

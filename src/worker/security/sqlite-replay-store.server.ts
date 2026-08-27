@@ -1,6 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { WorkerReplayStore } from "./replay-store.ts";
 
+import { WorkerRequestIdSchema } from "../../shared/worker/auth.ts";
+
 export class SQLiteWorkerReplayStore implements WorkerReplayStore {
   private readonly db: DatabaseSync;
   private readonly clock: () => number;
@@ -14,6 +16,15 @@ export class SQLiteWorkerReplayStore implements WorkerReplayStore {
   }
 
   async reserve(requestId: string, expiresAtSeconds: number): Promise<"reserved" | "duplicate"> {
+    const validRequestId = WorkerRequestIdSchema.parse(requestId);
+    
+    if (!Number.isSafeInteger(expiresAtSeconds) || expiresAtSeconds < 0) {
+      throw new Error("expiresAtSeconds must be a nonnegative safe integer");
+    }
+    
+    if (expiresAtSeconds <= this.clock()) {
+      throw new Error("expiresAtSeconds must be in the future");
+    }
     // Optional explicit cleanup on reserve
     this.cleanup();
 
@@ -23,7 +34,7 @@ export class SQLiteWorkerReplayStore implements WorkerReplayStore {
       ON CONFLICT(request_id) DO NOTHING
     `);
 
-    const result = stmt.run(requestId, expiresAtSeconds, this.clock());
+    const result = stmt.run(validRequestId, expiresAtSeconds, this.clock());
 
     if (result.changes === 1) {
       return "reserved";
