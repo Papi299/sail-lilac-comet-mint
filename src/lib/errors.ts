@@ -17,7 +17,8 @@ export type ErrorCode =
   | "EXPIRED"
   | "FORBIDDEN"
   | "ACCESS_REQUIRED"
-  | "ACCESS_NOT_CONFIGURED";
+  | "ACCESS_NOT_CONFIGURED"
+  | "WORKER_UNAVAILABLE";
 
 export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   INVALID_URL: "Please enter a valid video URL.",
@@ -41,6 +42,7 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   FORBIDDEN: "Diagnostics are not available in this environment.",
   ACCESS_REQUIRED: "Private access is required.",
   ACCESS_NOT_CONFIGURED: "Private access is not configured on this server.",
+  WORKER_UNAVAILABLE: "The processing worker is temporarily unavailable. Please try again shortly.",
 };
 
 const STATUS_BY_CODE: Record<ErrorCode, number> = {
@@ -63,6 +65,7 @@ const STATUS_BY_CODE: Record<ErrorCode, number> = {
   FORBIDDEN: 403,
   ACCESS_REQUIRED: 401,
   ACCESS_NOT_CONFIGURED: 503,
+  WORKER_UNAVAILABLE: 503,
 };
 
 export class AppError extends Error {
