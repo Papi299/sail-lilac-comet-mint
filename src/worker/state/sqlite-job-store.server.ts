@@ -432,10 +432,11 @@ export class SQLiteJobStore implements WorkerJobStore {
       if (resultingJob.status !== 'downloading') {
         throw new Error("Job must be downloading after completeAnalysis");
       }
+      const view = durableJobToView(resultingJob);
       this.db.exec("COMMIT");
-      return { type: "updated", job: durableJobToView(resultingJob) };
+      return { type: "updated", job: view };
     } catch (e) {
-      try { this.db.exec("ROLLBACK"); } catch (_err) { /* ignore */ }
+      try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
       throw e;
     }
   }
@@ -485,7 +486,7 @@ export class SQLiteJobStore implements WorkerJobStore {
       this.db.exec("COMMIT");
       return { type: "updated", job: durableJobToView(resultingJob) };
     } catch (e) {
-      try { this.db.exec("ROLLBACK"); } catch (_err) { /* ignore */ }
+      try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
       throw e;
     }
   }
@@ -537,7 +538,7 @@ export class SQLiteJobStore implements WorkerJobStore {
       this.db.exec("COMMIT");
       return { type: "updated", job: durableJobToView(resultingJob) };
     } catch (e) {
-      try { this.db.exec("ROLLBACK"); } catch (_err) { /* ignore */ }
+      try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
       throw e;
     }
   }

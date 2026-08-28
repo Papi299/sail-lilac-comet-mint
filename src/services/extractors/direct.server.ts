@@ -82,6 +82,9 @@ async function _probeDirect(url: string, signal?: AbortSignal): Promise<VideoMet
     contentLength = parseLen(headerString(head.headers["content-length"]));
     contentType = headerString(head.headers["content-type"]);
   } catch {
+    if (signal?.aborted) {
+      signal.throwIfAborted();
+    }
     // HEAD is optional; do not fetch the body during analyze, and never
     // pass a remote URL to FFmpeg.
   }
@@ -115,7 +118,7 @@ async function _probeDirect(url: string, signal?: AbortSignal): Promise<VideoMet
     extractor: "direct",
     webpageUrl: url,
     formats: [format],
-    presets: buildPresets([format], { mp3 }),
+    presets: buildPresets([format], { mp3, ffmpeg: mp3 }),
     capabilities: { mp3, merge: mp3 },
   };
 }

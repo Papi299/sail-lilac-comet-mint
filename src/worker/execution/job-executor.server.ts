@@ -1,9 +1,6 @@
 import { createReadStream } from "node:fs";
 import { buildDownloadFilename } from "@/lib/filenames";
-import { join } from "node:path";
-import { stat } from "node:fs/promises";
 import { AppError, ERROR_MESSAGES } from "@/lib/errors";
-import { config } from "@/lib/config";
 import { createJobDir, removeJobDir } from "@/services/temp/files.server";
 import { analyzeDirectMedia } from "./direct-media.server.ts";
 import { directExtractor } from "@/services/extractors/direct.server";
@@ -42,7 +39,13 @@ export class JobExecutor {
 
   public async execute(job: DurableWorkerJob): Promise<void> {
     const jobId = job.jobId;
-    const workDir = await createJobDir(jobId);
+    let workDir = "";
+    try {
+      workDir = await createJobDir(jobId);
+    } catch {
+      this.store.failJob(jobId, "PROCESSING_FAILED", ERROR_MESSAGES.PROCESSING_FAILED);
+      return;
+    }
     const controller = new AbortController();
     this.activeControllers.set(jobId, controller);
     const signal = controller.signal;
@@ -76,7 +79,7 @@ export class JobExecutor {
         if (parsed2.success) code = parsed2.data;
       }
       const safeMsg = ERROR_MESSAGES[code as keyof typeof ERROR_MESSAGES] || ERROR_MESSAGES.PROCESSING_FAILED;
-      console.error("Executor caught error:", err);
+      // diagnostics safely removed
       this.store.failJob(jobId, code, safeMsg);
     } finally {
       this.activeControllers.delete(jobId);
@@ -122,21 +125,31 @@ export class JobExecutor {
       workDir,
       signal,
       onProgress: (p) => {
-        const now = this.getClock();
-        if (now - lastProgressTime >= throttleMs || p.progress === 100 || p.progress === null) {
-          lastProgressTime = now;
-          const upRes = this.store.updateExecutionProgress(jobId, "downloading", {
-            progress: p.progress,
-            downloadedBytes: p.downloadedBytes ?? null,
-            totalBytes: p.totalBytes ?? null,
-            speed: p.speed ?? null,
-            eta: p.eta ?? null,
-      // eslint-disable-next-line no-control-regex
-            stageLabel: (p.stage || "Downloading").substring(0, 255).replace(/[\u0000-\u001F]/g, ""),
-          });
-          if (upRes.type !== "updated") {
-            this.activeControllers.get(jobId)?.abort();
+        try {
+          const now = this.getClock();
+          if (now - lastProgressTime >= throttleMs || p.progress === 100 || p.progress === null) {
+            lastProgressTime = now;
+            const progress = p.progress != null && Number.isFinite(p.progress) ? p.progress : null;
+            const downloadedBytes = p.downloadedBytes != null && Number.isInteger(p.downloadedBytes) && p.downloadedBytes >= 0 ? p.downloadedBytes : null;
+            const totalBytes = p.totalBytes != null && Number.isInteger(p.totalBytes) && p.totalBytes >= 0 ? p.totalBytes : null;
+            const speed = p.speed != null && Number.isFinite(p.speed) && p.speed >= 0 ? p.speed : null;
+            const eta = p.eta != null && Number.isFinite(p.eta) && p.eta >= 0 ? p.eta : null;
+            
+            const upRes = this.store.updateExecutionProgress(jobId, "downloading", {
+              progress,
+              downloadedBytes,
+              totalBytes,
+              speed,
+              eta,
+              // eslint-disable-next-line no-control-regex
+              stageLabel: (p.stage || "Downloading").substring(0, 255).replace(/[\u0000-\u001F\u007F]/g, ""),
+            });
+            if (upRes.type !== "updated") {
+              this.activeControllers.get(jobId)?.abort(new AppError("PROCESSING_FAILED"));
+            }
           }
+        } catch {
+          this.activeControllers.get(jobId)?.abort(new AppError("PROCESSING_FAILED"));
         }
       }
     });
@@ -156,7 +169,7 @@ export class JobExecutor {
     this.checkExpiry(job);
     
     // get stream directly
-        const stream = createReadStream(dlResult.filePath);
+        const stream = createReadStream(validOut.path);
     
     // We import buildDownloadFilename locally or reimplement safe equivalent
     const filename = buildDownloadFilename({ title: meta.title, quality: dlResult.quality, container: dlResult.container });
@@ -173,7 +186,7 @@ export class JobExecutor {
       container: dlResult.container,
     });
 
-    if (readyResult.type === "storage_failure") { console.error("storage_failure:", readyResult);
+    if (readyResult.type === "storage_failure") { // storage failure
       throw new AppError("PROCESSING_FAILED");
     }
   }

@@ -12,6 +12,7 @@ export function assertLocalMediaPath(inputPath: string): void {
 }
 
 export async function ffmpegAvailable(signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) signal.throwIfAborted();
   try {
     await access(config.ffmpegPath);
     const result = await runProcess({
@@ -22,6 +23,7 @@ export async function ffmpegAvailable(signal?: AbortSignal): Promise<boolean> {
     });
     return (result.stdout + result.stderr).toLowerCase().includes("ffmpeg version");
   } catch {
+    if (signal?.aborted) signal.throwIfAborted();
     return false;
   }
 }

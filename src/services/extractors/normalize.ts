@@ -152,7 +152,7 @@ const PRESET_LABELS: Record<string, string> = {
 
 export function buildPresets(
   formats: NormalizedFormat[],
-  options: { mp3: boolean },
+  options: { mp3: boolean, ffmpeg?: boolean },
 ): QualityPreset[] {
   const videoFormats = formats.filter((f) => f.hasVideo);
   const audioFormats = formats.filter((f) => f.hasAudio && !f.hasVideo);
@@ -161,19 +161,24 @@ export function buildPresets(
 
   const bestVideo = pickBest(combinedOrVideo);
   if (bestVideo) {
-    presets.push({
-      id: "preset:best",
-      label: "Best available",
-      resolution: bestVideo.resolution,
-      container: preferContainer(bestVideo),
-      fileSize: bestVideo.fileSize,
-      hasVideo: true,
-      hasAudio: true,
-      formatId: "preset:best",
-      videoCodec: bestVideo.videoCodec,
-      audioCodec: bestVideo.audioCodec,
-      fps: bestVideo.fps,
-    });
+    const targetContainer = preferContainer(bestVideo);
+    const requiresConversion = targetContainer !== bestVideo.container;
+    const canConvert = requiresConversion ? (options.ffmpeg ?? options.mp3) : true;
+    if (canConvert) {
+      presets.push({
+        id: "preset:best",
+        label: "Best available",
+        resolution: bestVideo.resolution,
+        container: targetContainer,
+        fileSize: bestVideo.fileSize,
+        hasVideo: true,
+        hasAudio: true,
+        formatId: "preset:best",
+        videoCodec: bestVideo.videoCodec,
+        audioCodec: bestVideo.audioCodec,
+        fps: bestVideo.fps,
+      });
+    }
   }
 
   const byRes = new Map<string, NormalizedFormat[]>();
@@ -189,36 +194,45 @@ export function buildPresets(
     if (!group?.length) continue;
     const best = pickBest(group);
     if (!best) continue;
-    presets.push({
-      id: `preset:${step.min}`,
-      label: PRESET_LABELS[step.label] ?? step.label,
-      resolution: step.label,
-      container: preferContainer(best),
-      fileSize: best.fileSize,
-      hasVideo: true,
-      hasAudio: true,
-      formatId: `preset:${step.min}`,
-      videoCodec: best.videoCodec,
-      audioCodec: best.audioCodec,
-      fps: best.fps,
-    });
+    const targetContainer = preferContainer(best);
+    const requiresConversion = targetContainer !== best.container;
+    const canConvert = requiresConversion ? (options.ffmpeg ?? options.mp3) : true;
+    if (canConvert) {
+      presets.push({
+        id: `preset:${step.min}`,
+        label: PRESET_LABELS[step.label] ?? step.label,
+        resolution: step.label,
+        container: targetContainer,
+        fileSize: best.fileSize,
+        hasVideo: true,
+        hasAudio: true,
+        formatId: `preset:${step.min}`,
+        videoCodec: best.videoCodec,
+        audioCodec: best.audioCodec,
+        fps: best.fps,
+      });
+    }
   }
 
   const bestAudio = pickBest(audioFormats.length ? audioFormats : formats.filter((f) => f.hasAudio));
   if (bestAudio) {
-    presets.push({
-      id: "preset:audio",
-      label: "Audio only",
-      resolution: "audio",
-      container: bestAudio.hasVideo ? "m4a" : bestAudio.container,
-      fileSize: bestAudio.fileSize,
-      hasVideo: false,
-      hasAudio: true,
-      formatId: "preset:audio",
-      videoCodec: null,
-      audioCodec: bestAudio.audioCodec,
-      fps: null,
-    });
+    const requiresConversion = bestAudio.hasVideo;
+    const canExtract = requiresConversion ? options.ffmpeg ?? options.mp3 : true;
+    if (canExtract) {
+      presets.push({
+        id: "preset:audio",
+        label: "Audio only",
+        resolution: "audio",
+        container: bestAudio.hasVideo ? "m4a" : bestAudio.container,
+        fileSize: bestAudio.fileSize,
+        hasVideo: false,
+        hasAudio: true,
+        formatId: "preset:audio",
+        videoCodec: null,
+        audioCodec: bestAudio.audioCodec,
+        fps: null,
+      });
+    }
     if (options.mp3) {
       presets.push({
         id: "preset:mp3",
