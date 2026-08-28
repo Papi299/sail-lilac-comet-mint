@@ -1,6 +1,6 @@
 import { z } from "zod";
 import crypto from "node:crypto";
-import { AppError } from "../../lib/errors.ts";
+import { AppError, type ErrorCode } from "../../lib/errors.ts";
 import {
   WorkerKeyIdSchema,
   sha256WorkerBody,
@@ -15,10 +15,12 @@ import {
   WorkerCancelJobSuccessSchema,
   WorkerDiagnosticsSuccessSchema,
   WorkerHealthSuccessSchema,
+  WorkerAnalyzeRequestSchema,
+  WorkerCreateJobRequestSchema,
+  workerJobPath,
+  workerJobCancelPath,
   type WorkerDiagnosticsSuccess,
   type WorkerHealthSuccess,
-  type WorkerAnalyzeRequest,
-  type WorkerCreateJobRequest,
   type WorkerAnalyzeSuccess,
   type WorkerCreateJobSuccess,
   type WorkerJobStatusSuccess,
@@ -53,20 +55,24 @@ export const WorkerClientConfigSchema = z.object({
     if (url.pathname !== "/" && url.pathname !== "") {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Pathname must be empty or /" });
     }
-    const isLoopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "::1";
+    const isLoopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "::1";
     if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback)) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Must be HTTPS for non-loopback" });
     }
   }),
   currentKeyId: WorkerKeyIdSchema,
-  currentSecret: z.string().refine((val) => Buffer.from(val, "utf8").length >= 32, {
-    message: "Secret must be at least 32 UTF-8 bytes",
+  currentSecret: z.string().refine((val) => {
+    const len = Buffer.from(val, "utf8").length;
+    return len >= 32 && len <= 8192;
+  }, {
+    message: "Secret must be 32 to 8192 UTF-8 bytes",
   }),
   requestTimeoutMs: z.number().int().min(1000).max(120000).default(30000),
-  requestIdFactory: z.custom<() => string>().optional(),
-  idempotencyKeyFactory: z.custom<() => string>().optional(),
-  fetchImplementation: z.any().optional(),
-});
+  requestIdFactory: z.custom<() => string>((val) => typeof val === "function").optional(),
+  idempotencyKeyFactory: z.custom<() => string>((val) => typeof val === "function").optional(),
+  fetchImplementation: z.custom<typeof fetch>((val) => typeof val === "function").optional(),
+  clock: z.custom<() => number>((val) => typeof val === "function").optional(),
+}).strict();
 
 export type WorkerClientConfig = z.input<typeof WorkerClientConfigSchema>;
 
@@ -84,6 +90,14 @@ export class WorkerClient {
     return url.origin;
   }
 
+  private getNowMs(): number {
+    const now = this.config.clock ? this.config.clock() : Date.now();
+    if (!Number.isFinite(now) || !Number.isSafeInteger(now) || now < 0) {
+      throw new Error("Invalid clock value");
+    }
+    return now;
+  }
+
   private generateRequestId(): string {
     const id = this.config.requestIdFactory ? this.config.requestIdFactory() : crypto.randomUUID();
     return WorkerRequestIdSchema.parse(id);
@@ -92,6 +106,28 @@ export class WorkerClient {
   private generateIdempotencyKey(): string {
     const key = this.config.idempotencyKeyFactory ? this.config.idempotencyKeyFactory() : crypto.randomUUID();
     return WorkerIdempotencyKeySchema.parse(key);
+  }
+
+  private validateContentType(header: string | null): void {
+    if (!header) throw new AppError("PROCESSING_FAILED");
+    const parts = header.split(";").map(s => s.trim().toLowerCase());
+    if (parts[0] !== "application/json") {
+      throw new AppError("PROCESSING_FAILED");
+    }
+  }
+
+  private validateContentLength(header: string | null): void {
+    if (!header) return;
+    if (!/^(0|[1-9][0-9]*)$/.test(header)) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    const len = Number(header);
+    if (!Number.isSafeInteger(len)) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    if (len > 2 * 1024 * 1024) {
+      throw new AppError("PROCESSING_FAILED");
+    }
   }
 
   private async makeRequest<T>(
@@ -103,7 +139,8 @@ export class WorkerClient {
     expectedStatus: number | number[]
   ): Promise<T> {
     const requestId = this.generateRequestId();
-    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const nowMs = this.getNowMs();
+    const timestamp = Math.floor(nowMs / 1000).toString();
     const statuses = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
 
     let rawBodyBytes = Buffer.alloc(0);
@@ -158,17 +195,10 @@ export class WorkerClient {
       throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
     }
 
-    const contentType = response.headers.get("content-type");
-    if (!contentType || !contentType.toLowerCase().startsWith("application/json")) {
-      throw new AppError("PROCESSING_FAILED");
-    }
+    this.validateContentType(response.headers.get("content-type"));
+    this.validateContentLength(response.headers.get("content-length"));
 
-    const contentLength = response.headers.get("content-length");
     const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
-    if (contentLength && parseInt(contentLength, 10) > MAX_RESPONSE_BYTES) {
-      throw new AppError("PROCESSING_FAILED");
-    }
-
     const responseBuffer = await this.readBoundedStream(response, MAX_RESPONSE_BYTES);
     const responseText = responseBuffer.toString("utf8");
 
@@ -187,7 +217,7 @@ export class WorkerClient {
       const code = parsedError.data.error.code;
       const isValidCode = WorkerErrorCodeSchema.safeParse(code).success;
       if (isValidCode) {
-        throw new AppError(code as any);
+        throw new AppError(code as ErrorCode);
       }
       throw new AppError("PROCESSING_FAILED");
     }
@@ -211,43 +241,54 @@ export class WorkerClient {
     const reader = response.body.getReader();
     let receivedBytes = 0;
     const chunks: Uint8Array[] = [];
-    
+
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        let readResult;
+        try {
+          readResult = await reader.read();
+        } catch {
+          throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
+        }
+        const { done, value } = readResult;
         if (done) {
           break;
         }
         if (value) {
           receivedBytes += value.length;
           if (receivedBytes > maxBytes) {
-            throw new Error("Response body exceeds maximum allowed size");
+            throw new AppError("PROCESSING_FAILED");
           }
           chunks.push(value);
         }
       }
     } finally {
       reader.releaseLock();
+      response.body.cancel().catch(() => {});
     }
-    
+
     return Buffer.concat(chunks);
   }
 
-  public async analyze(body: WorkerAnalyzeRequest): Promise<WorkerAnalyzeSuccess> {
-    return this.makeRequest("POST", WORKER_ANALYZE_PATH, body, undefined, WorkerAnalyzeSuccessSchema, 200);
+  public async analyze(input: unknown): Promise<WorkerAnalyzeSuccess> {
+    const valid = WorkerAnalyzeRequestSchema.parse(input);
+    return this.makeRequest("POST", WORKER_ANALYZE_PATH, valid, undefined, WorkerAnalyzeSuccessSchema, 200);
   }
 
-  public async createJob(body: WorkerCreateJobRequest): Promise<WorkerCreateJobSuccess> {
+  public async createJob(input: unknown): Promise<WorkerCreateJobSuccess> {
+    const valid = WorkerCreateJobRequestSchema.parse(input);
     const idempotencyKey = this.generateIdempotencyKey();
-    return this.makeRequest("POST", WORKER_JOBS_PATH, body, idempotencyKey, WorkerCreateJobSuccessSchema, [200, 201]);
+    return this.makeRequest("POST", WORKER_JOBS_PATH, valid, idempotencyKey, WorkerCreateJobSuccessSchema, [200, 201]);
   }
 
   public async getJob(jobId: string): Promise<WorkerJobStatusSuccess> {
-    return this.makeRequest("GET", `${WORKER_JOBS_PATH}/${jobId}`, null, undefined, WorkerJobStatusSuccessSchema, 200);
+    const path = workerJobPath(jobId);
+    return this.makeRequest("GET", path, null, undefined, WorkerJobStatusSuccessSchema, 200);
   }
 
   public async cancelJob(jobId: string): Promise<WorkerCancelJobSuccess> {
-    return this.makeRequest("POST", `${WORKER_JOBS_PATH}/${jobId}/cancel`, null, undefined, WorkerCancelJobSuccessSchema, 200);
+    const path = workerJobCancelPath(jobId);
+    return this.makeRequest("POST", path, null, undefined, WorkerCancelJobSuccessSchema, 200);
   }
 
   public async diagnostics(): Promise<WorkerDiagnosticsSuccess> {
@@ -269,20 +310,18 @@ export class WorkerClient {
     } finally {
       clearTimeout(timeoutId);
     }
-    
+
     if (response.status === 401 || response.status === 503) {
       throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
     }
-    
-    if (!response.ok) {
+
+    if (response.status !== 200) {
       throw new AppError("PROCESSING_FAILED");
     }
-    
-    const contentType = response.headers.get("content-type");
-    if (!contentType || !contentType.toLowerCase().startsWith("application/json")) {
-      throw new AppError("PROCESSING_FAILED");
-    }
-    
+
+    this.validateContentType(response.headers.get("content-type"));
+    this.validateContentLength(response.headers.get("content-length"));
+
     const responseBuffer = await this.readBoundedStream(response, 2 * 1024 * 1024);
     const responseText = responseBuffer.toString("utf8");
     let responseData: unknown;
@@ -291,12 +330,12 @@ export class WorkerClient {
     } catch {
       throw new AppError("PROCESSING_FAILED");
     }
-    
+
     const parsedSuccess = WorkerHealthSuccessSchema.safeParse(responseData);
     if (!parsedSuccess.success) {
       throw new AppError("PROCESSING_FAILED");
     }
-    
+
     return parsedSuccess.data;
   }
 }

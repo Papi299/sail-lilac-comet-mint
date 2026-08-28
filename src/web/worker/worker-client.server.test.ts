@@ -13,7 +13,7 @@ describe("WorkerClient", () => {
   it("calculates HMAC correctly for analyze (no idempotency)", async () => {
     let capturedOptions: any;
 
-    const mockFetch = async (_url: string, options: any) => {
+    const mockFetch: any = async (_url: string, options: any) => {
       capturedOptions = options;
       return new Response(JSON.stringify({ success: true, video: {} }), {
         status: 200,
@@ -27,22 +27,15 @@ describe("WorkerClient", () => {
       currentSecret: TEST_SECRET,
       fetchImplementation: mockFetch,
       requestIdFactory: () => "00000000-0000-4000-8000-000000000000",
+      clock: () => 1234567890000,
     });
 
     const body = { url: "https://example.com/video" };
-    
-    // We mock Date.now to be deterministic for this test by replacing global Date.now
-    const originalDateNow = Date.now;
-    global.Date.now = () => 1234567890000;
-    
-    try {
-      // Mock success schema parse to bypass strict validation of returned video metadata
-      const analyzePromise = client.analyze(body as any);
-      // Wait for it to fail validation on return, but fetch will have been called.
-      await analyzePromise.catch(() => {});
-    } finally {
-      global.Date.now = originalDateNow;
-    }
+
+    // Mock success schema parse to bypass strict validation of returned video metadata
+    const analyzePromise = client.analyze(body);
+    // Wait for it to fail validation on return, but fetch will have been called.
+    await analyzePromise.catch(() => {});
 
     assert.ok(capturedOptions);
     const headers = capturedOptions.headers as Headers;
@@ -54,7 +47,7 @@ describe("WorkerClient", () => {
     const sentBodyStr = capturedOptions.body.toString("utf8");
     const rawBodyBuffer = Buffer.from(sentBodyStr, "utf8");
     const sentSha256 = sha256WorkerBody(rawBodyBuffer);
-    
+
     const expectedSig = createWorkerSignatureHex(TEST_SECRET, {
       keyId: TEST_KEY_ID,
       method: "POST",
@@ -72,7 +65,7 @@ describe("WorkerClient", () => {
   it("calculates HMAC correctly for createJob (with idempotency)", async () => {
     let capturedOptions: any;
 
-    const mockFetch = async (url: string, options: any) => {
+    const mockFetch: any = async (_url: string, options: any) => {
       capturedOptions = options;
       return new Response(JSON.stringify({ success: true, job: {} }), {
         status: 200,
@@ -87,18 +80,12 @@ describe("WorkerClient", () => {
       fetchImplementation: mockFetch,
       requestIdFactory: () => "00000000-0000-4000-8000-000000000000",
       idempotencyKeyFactory: () => "11111111-1111-4111-8111-111111111111",
+      clock: () => 1234567890000,
     });
 
-    const body = { url: "https://example.com/video", formatId: "best" };
-    
-    const originalDateNow = Date.now;
-    global.Date.now = () => 1234567890000;
-    
-    try {
-      await client.createJob(body as any).catch(() => {});
-    } finally {
-      global.Date.now = originalDateNow;
-    }
+    const body = { url: "https://example.com/video", formatId: "best", principalId: "private-access-user" };
+
+    await client.createJob(body).catch(() => {});
 
     const headers = capturedOptions.headers as Headers;
     assert.strictEqual(headers.get("Idempotency-Key"), "11111111-1111-4111-8111-111111111111");
@@ -106,7 +93,7 @@ describe("WorkerClient", () => {
     const sentBodyStr = capturedOptions.body.toString("utf8");
     const rawBodyBuffer = Buffer.from(sentBodyStr, "utf8");
     const sentSha256 = sha256WorkerBody(rawBodyBuffer);
-    
+
     const expectedSig = createWorkerSignatureHex(TEST_SECRET, {
       keyId: TEST_KEY_ID,
       method: "POST",
@@ -140,7 +127,7 @@ describe("WorkerClient", () => {
       currentKeyId: TEST_KEY_ID,
       currentSecret: TEST_SECRET,
       requestTimeoutMs: 1000,
-      fetchImplementation: async (url: string, opts: any) => {
+      fetchImplementation: async (_url: any, opts: any) => {
         return new Promise((_, reject) => {
           opts.signal.addEventListener("abort", () => reject(new Error("abort")));
         });
@@ -161,7 +148,7 @@ describe("WorkerClient", () => {
       fetchImplementation: async () => new Response(JSON.stringify({
         success: false,
         error: { code: "RATE_LIMITED", message: "ignored msg" }
-      }), { status: 429, headers: { "Content-Type": "application/json" } }),
+      }), { status: 429, headers: { "Content-Type": "application/json" } }) as any,
     });
 
     await assert.rejects(
@@ -169,7 +156,7 @@ describe("WorkerClient", () => {
       (err: any) => err instanceof AppError && err.code === "RATE_LIMITED" && err.message !== "ignored msg"
     );
   });
-  
+
   it("maps unknown worker error code to PROCESSING_FAILED", async () => {
     const client = new WorkerClient({
       baseUrl: BASE_URL,
@@ -178,7 +165,7 @@ describe("WorkerClient", () => {
       fetchImplementation: async () => new Response(JSON.stringify({
         success: false,
         error: { code: "BOGUS_CODE", message: "ignored msg" }
-      }), { status: 400, headers: { "Content-Type": "application/json" } }),
+      }), { status: 400, headers: { "Content-Type": "application/json" } }) as any,
     });
 
     await assert.rejects(

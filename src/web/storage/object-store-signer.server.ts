@@ -1,7 +1,9 @@
+import type { WorkerObjectKey } from "../../shared/worker/contracts.ts";
+
 export interface ObjectStoreSigner {
   signGet(input: {
-    objectKey: string; // WorkerObjectKey
-    expiresAt: number; // epoch ms
+    objectKey: WorkerObjectKey;
+    expiresAt: number;
   }): Promise<{
     url: string;
     expiresAt: number;

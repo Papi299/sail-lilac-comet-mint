@@ -2,16 +2,17 @@ import { z } from "zod";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { AppError } from "../../lib/errors.ts";
-import { WorkerObjectKeySchema } from "../../shared/worker/contracts.ts";
+import { WorkerObjectKeySchema, type WorkerObjectKey } from "../../shared/worker/contracts.ts";
 import type { ObjectStoreSigner } from "./object-store-signer.server.ts";
 
 export const CloudflareR2SignerConfigSchema = z.object({
   accountId: z.string().regex(/^[a-f0-9]{32}$/, "accountId must be 32 hex lowercase chars"),
-  bucket: z.string().regex(/^[a-z0-9-]{3,63}$/, "bucket must be 3-63 lowercase alphanumeric or hyphens"),
+  bucket: z.string().regex(/^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$/, "bucket must be 3-63 lowercase alphanumeric or hyphens, no leading/trailing hyphen"),
   jurisdiction: z.enum(["default", "eu", "us"]).default("default"),
-  accessKeyId: z.string().min(1).max(128),
-  secretAccessKey: z.string().min(1).max(128),
-  sessionToken: z.string().min(1).max(2048).optional(),
+  accessKeyId: z.string().min(1).max(8192),
+  secretAccessKey: z.string().min(1).max(8192),
+  sessionToken: z.string().min(1).max(8192).optional(),
+  clock: z.custom<() => number>((val) => typeof val === "function").optional(),
 }).strict();
 
 export type CloudflareR2SignerConfig = z.input<typeof CloudflareR2SignerConfigSchema>;
@@ -44,9 +45,22 @@ export class CloudflareR2Signer implements ObjectStoreSigner {
     });
   }
 
-  public async signGet(input: { objectKey: string; expiresAt: number }): Promise<{ url: string; expiresAt: number }> {
+  private getNowMs(): number {
+    const now = this.config.clock ? this.config.clock() : Date.now();
+    if (!Number.isFinite(now) || !Number.isSafeInteger(now) || now < 0) {
+      throw new Error("Invalid clock value");
+    }
+    return now;
+  }
+
+  public async signGet(input: { objectKey: WorkerObjectKey; expiresAt: number }): Promise<{ url: string; expiresAt: number }> {
     const objectKey = WorkerObjectKeySchema.parse(input.objectKey);
-    const nowMs = Date.now();
+
+    if (!Number.isFinite(input.expiresAt) || !Number.isSafeInteger(input.expiresAt) || input.expiresAt < 0) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+
+    const nowMs = this.getNowMs();
     const remainingMs = input.expiresAt - nowMs;
 
     if (remainingMs <= 0) {
@@ -101,17 +115,52 @@ export class CloudflareR2Signer implements ObjectStoreSigner {
     if (url.hash) {
       throw new AppError("PROCESSING_FAILED");
     }
-    
+
     const pathnameParts = url.pathname.split('/');
     if (pathnameParts.length < 3 || pathnameParts[1] !== this.config.bucket) {
        throw new AppError("PROCESSING_FAILED");
     }
+
     const derivedKey = url.pathname.substring(this.config.bucket.length + 2); // /bucket/key -> key
-    if (decodeURIComponent(derivedKey) !== objectKey) {
+    let decodedKey: string;
+    try {
+      decodedKey = decodeURIComponent(derivedKey);
+    } catch {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    if (decodedKey !== objectKey) {
        throw new AppError("PROCESSING_FAILED");
     }
 
-    if (!url.searchParams.has("X-Amz-Signature")) {
+    const searchParams = url.searchParams;
+    const amzExpires = searchParams.getAll("X-Amz-Expires");
+    if (amzExpires.length !== 1) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    if (!/^(0|[1-9][0-9]*)$/.test(amzExpires[0])) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    const actualExpires = Number(amzExpires[0]);
+    if (actualExpires !== ttlSeconds || actualExpires < 1 || actualExpires > 300) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+
+    const amzDate = searchParams.getAll("X-Amz-Date");
+    if (amzDate.length !== 1) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    const expectedDate = signingDate.toISOString().replace(/[:-]/g, "").split(".")[0] + "Z";
+    if (amzDate[0] !== expectedDate) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+
+    const amzAlgorithm = searchParams.getAll("X-Amz-Algorithm");
+    if (amzAlgorithm.length !== 1 || amzAlgorithm[0] !== "AWS4-HMAC-SHA256") {
+      throw new AppError("PROCESSING_FAILED");
+    }
+
+    const amzSignature = searchParams.getAll("X-Amz-Signature");
+    if (amzSignature.length !== 1 || !/^[0-9a-f]{64}$/i.test(amzSignature[0])) {
       throw new AppError("PROCESSING_FAILED");
     }
 
