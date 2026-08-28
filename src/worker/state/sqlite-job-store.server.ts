@@ -10,6 +10,11 @@ import {
 import { WorkerIdempotencyKeySchema } from "../../shared/worker/auth.ts";
 import { WorkerErrorCodeSchema } from "../../shared/worker/errors.ts";
 import {
+  CompleteAnalysisInputSchema,
+  UpdateProgressInputSchema,
+  type CompleteAnalysisInput,
+  type UpdateProgressInput,
+  type ExecutionMutationResult,
   type CreateJobResult,
   DurableWorkerJobSchema,
   type DurableWorkerJob,
@@ -381,6 +386,158 @@ export class SQLiteJobStore implements WorkerJobStore {
       return true;
     } catch (e) {
       try { this.db.exec("ROLLBACK"); } catch (_rollbackErr) { void _rollbackErr; }
+      throw e;
+    }
+  }
+
+
+  completeAnalysis(jobId: string, input: CompleteAnalysisInput): ExecutionMutationResult {
+    const validJobId = WorkerJobIdSchema.parse(jobId);
+    const validated = CompleteAnalysisInputSchema.parse(input);
+    const now = this.nowMs();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
+      const row = stmt.get(validJobId);
+      if (!row) {
+        this.db.exec("COMMIT");
+        return { type: "not_found" };
+      }
+      const durableJob = rowToDurableJob(row);
+      if (['ready', 'failed', 'cancelled'].includes(durableJob.status)) {
+        this.db.exec("COMMIT");
+        return { type: "terminal", job: durableJobToView(durableJob) };
+      }
+      if (durableJob.status !== 'analyzing') {
+        this.db.exec("COMMIT");
+        return { type: "state_conflict", job: durableJobToView(durableJob) };
+      }
+      
+      const updateStmt = this.db.prepare(`
+        UPDATE worker_jobs 
+        SET status = 'downloading',
+            title = ?,
+            thumbnail = ?,
+            source = ?,
+            extractor = ?,
+            updated_at_ms = ?
+        WHERE job_id = ? AND status = 'analyzing'
+      `);
+      const result = updateStmt.run(validated.title, validated.thumbnail, validated.source, validated.extractor, now, validJobId);
+      if (result.changes !== 1) {
+        throw new Error("Failed to transition job to downloading");
+      }
+      const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(validJobId);
+      const resultingJob = rowToDurableJob(newRow);
+      if (resultingJob.status !== 'downloading') {
+        throw new Error("Job must be downloading after completeAnalysis");
+      }
+      this.db.exec("COMMIT");
+      return { type: "updated", job: durableJobToView(resultingJob) };
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch (_err) {}
+      throw e;
+    }
+  }
+
+  updateExecutionProgress(jobId: string, expectedStatus: import("../../shared/worker/contracts.ts").WorkerJobStatus, input: UpdateProgressInput): ExecutionMutationResult {
+    const validJobId = WorkerJobIdSchema.parse(jobId);
+    const validated = UpdateProgressInputSchema.parse(input);
+    const now = this.nowMs();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
+      const row = stmt.get(validJobId);
+      if (!row) {
+        this.db.exec("COMMIT");
+        return { type: "not_found" };
+      }
+      const durableJob = rowToDurableJob(row);
+      if (['ready', 'failed', 'cancelled'].includes(durableJob.status)) {
+        this.db.exec("COMMIT");
+        return { type: "terminal", job: durableJobToView(durableJob) };
+      }
+      if (durableJob.status !== expectedStatus) {
+        this.db.exec("COMMIT");
+        return { type: "state_conflict", job: durableJobToView(durableJob) };
+      }
+      
+      const updateStmt = this.db.prepare(`
+        UPDATE worker_jobs 
+        SET progress = ?,
+            downloaded_bytes = ?,
+            total_bytes = ?,
+            speed = ?,
+            eta = ?,
+            stage_label = ?,
+            updated_at_ms = ?
+        WHERE job_id = ? AND status = ?
+      `);
+      const result = updateStmt.run(validated.progress, validated.downloadedBytes, validated.totalBytes, validated.speed, validated.eta, validated.stageLabel, now, validJobId, expectedStatus);
+      if (result.changes !== 1) {
+        throw new Error("Failed to update progress");
+      }
+      const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(validJobId);
+      const resultingJob = rowToDurableJob(newRow);
+      if (resultingJob.status !== expectedStatus) {
+        throw new Error("Job status changed unexpectedly during updateExecutionProgress");
+      }
+      this.db.exec("COMMIT");
+      return { type: "updated", job: durableJobToView(resultingJob) };
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch (_err) {}
+      throw e;
+    }
+  }
+
+  beginProcessing(jobId: string): ExecutionMutationResult {
+    return this._transitionExecutionState(jobId, 'downloading', 'processing');
+  }
+
+  beginUploading(jobId: string): ExecutionMutationResult {
+    return this._transitionExecutionState(jobId, 'processing', 'uploading');
+  }
+
+  private _transitionExecutionState(jobId: string, fromState: import("../../shared/worker/contracts.ts").WorkerJobStatus, toState: import("../../shared/worker/contracts.ts").WorkerJobStatus): ExecutionMutationResult {
+    const validJobId = WorkerJobIdSchema.parse(jobId);
+    const now = this.nowMs();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
+      const row = stmt.get(validJobId);
+      if (!row) {
+        this.db.exec("COMMIT");
+        return { type: "not_found" };
+      }
+      const durableJob = rowToDurableJob(row);
+      if (['ready', 'failed', 'cancelled'].includes(durableJob.status)) {
+        this.db.exec("COMMIT");
+        return { type: "terminal", job: durableJobToView(durableJob) };
+      }
+      if (durableJob.status !== fromState) {
+        this.db.exec("COMMIT");
+        return { type: "state_conflict", job: durableJobToView(durableJob) };
+      }
+      
+      const updateStmt = this.db.prepare(`
+        UPDATE worker_jobs 
+        SET status = ?,
+            updated_at_ms = ?
+        WHERE job_id = ? AND status = ?
+      `);
+      const result = updateStmt.run(toState, now, validJobId, fromState);
+      if (result.changes !== 1) {
+        throw new Error(`Failed to transition job to ${toState}`);
+      }
+      const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(validJobId);
+      const resultingJob = rowToDurableJob(newRow);
+      if (resultingJob.status !== toState) {
+        throw new Error(`Job must be ${toState} after transition`);
+      }
+      this.db.exec("COMMIT");
+      return { type: "updated", job: durableJobToView(resultingJob) };
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch (_err) {}
       throw e;
     }
   }

@@ -11,13 +11,14 @@ export function assertLocalMediaPath(inputPath: string): void {
   }
 }
 
-export async function ffmpegAvailable(): Promise<boolean> {
+export async function ffmpegAvailable(signal?: AbortSignal): Promise<boolean> {
   try {
     await access(config.ffmpegPath);
     const result = await runProcess({
       command: config.ffmpegPath,
       args: ["-version"],
       timeoutMs: 8_000,
+      signal,
     });
     return (result.stdout + result.stderr).toLowerCase().includes("ffmpeg version");
   } catch {
@@ -28,14 +29,14 @@ export async function ffmpegAvailable(): Promise<boolean> {
 export async function convertMedia(opts: {
   inputPath: string;
   workDir: string;
-  target: "mp4" | "webm" | "mp3";
+  target: "mp4" | "webm" | "mp3" | "m4a";
   timeoutMs: number;
   signal?: AbortSignal;
   onProgress?: (progress: number | null) => void;
 }): Promise<string> {
   assertLocalMediaPath(opts.inputPath);
   const outName =
-    opts.target === "mp3" ? "converted.mp3" : opts.target === "webm" ? "converted.webm" : "converted.mp4";
+    opts.target === "mp3" ? "converted.mp3" : opts.target === "webm" ? "converted.webm" : opts.target === "m4a" ? "converted.m4a" : "converted.mp4";
   const outputPath = join(opts.workDir, outName);
   const args =
     opts.target === "mp3"
@@ -49,6 +50,19 @@ export async function convertMedia(opts: {
           "libmp3lame",
           "-q:a",
           "2",
+          outputPath,
+        ]
+      : opts.target === "m4a"
+      ? [
+          "-y",
+          "-nostdin",
+          "-i",
+          opts.inputPath,
+          "-vn",
+          "-c:a",
+          "aac",
+          "-b:a",
+          "128k",
           outputPath,
         ]
       : opts.target === "webm"

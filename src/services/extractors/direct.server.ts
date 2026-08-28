@@ -58,10 +58,10 @@ export const directExtractor: MediaExtractor = {
     return Boolean(extensionFromUrl(url));
   },
   async getMetadata(url: string) {
-    return probeDirect(url);
+    return _probeDirect(url);
   },
   async getFormats(url: string) {
-    const meta = await probeDirect(url);
+    const meta = await _probeDirect(url);
     return meta.formats;
   },
   async download(url, format, ctx) {
@@ -69,12 +69,16 @@ export const directExtractor: MediaExtractor = {
   },
 };
 
-async function probeDirect(url: string): Promise<VideoMetadata> {
+export async function probeDirectWorker(url: string, signal?: AbortSignal): Promise<VideoMetadata> {
+  return _probeDirect(url, signal);
+}
+
+async function _probeDirect(url: string, signal?: AbortSignal): Promise<VideoMetadata> {
   const ext = extensionFromUrl(url) || "mp4";
   let contentLength: number | null = null;
   let contentType: string | null = null;
   try {
-    const head = await safeHead(url, { timeoutMs: Math.min(config.analysisTimeoutMs, 20_000) });
+    const head = await safeHead(url, { timeoutMs: Math.min(config.analysisTimeoutMs, 20_000), signal });
     contentLength = parseLen(headerString(head.headers["content-length"]));
     contentType = headerString(head.headers["content-type"]);
   } catch {
@@ -101,7 +105,7 @@ async function probeDirect(url: string): Promise<VideoMetadata> {
     formatNote: contentType,
   };
 
-  const mp3 = await ffmpegAvailable();
+  const mp3 = await ffmpegAvailable(signal);
   const title = decodeURIComponent(new URL(url).pathname.split("/").filter(Boolean).pop() || "Video");
   return {
     title: title.replace(/\.[a-z0-9]+$/i, "") || "Video",
@@ -139,6 +143,16 @@ async function downloadDirect(
       signal: ctx.signal,
     });
     container = "mp3";
+  } else if (format.formatId === "preset:audio") {
+    ctx.onProgress?.({ progress: null, stage: "converting" });
+    filePath = await convertMedia({
+      inputPath: dest,
+      workDir: ctx.workDir,
+      target: "m4a",
+      timeoutMs: config.downloadTimeoutMs,
+      signal: ctx.signal,
+    });
+    container = "m4a";
   } else if (format.preferredContainer && format.preferredContainer !== ext) {
     const target = format.preferredContainer === "webm" ? "webm" : "mp4";
     ctx.onProgress?.({ progress: null, stage: "converting" });
