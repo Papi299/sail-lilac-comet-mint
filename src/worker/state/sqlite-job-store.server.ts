@@ -9,8 +9,18 @@ import {
 } from "../../shared/worker/contracts.ts";
 import { WorkerIdempotencyKeySchema } from "../../shared/worker/auth.ts";
 import { WorkerErrorCodeSchema } from "../../shared/worker/errors.ts";
-import type { WorkerJobStore, CreateJobResult, CancelJobResult, DurableWorkerJob } from "./job-store.ts";
-import { DurableWorkerJobSchema } from "./job-store.ts";
+import {
+  type CreateJobResult,
+  DurableWorkerJobSchema,
+  type DurableWorkerJob,
+  type WorkerJobStore,
+  type CancelJobResult,
+  type CommitReadyInput,
+  type CommitReadyResult,
+  CommitReadyInputSchema,
+  type ExpiredReadyObject,
+  ExpiredReadyObjectSchema
+} from "./job-store.ts";
 import { generateIdempotencyFingerprint, WORKER_IDEMPOTENCY_MIN_RETENTION_MS } from "./idempotency.server.ts";
 
 export interface SQLiteJobStoreOptions {
@@ -373,6 +383,104 @@ export class SQLiteJobStore implements WorkerJobStore {
       try { this.db.exec("ROLLBACK"); } catch (_rollbackErr) { void _rollbackErr; }
       throw e;
     }
+  }
+
+  commitReadyFromUploading(jobId: string, input: CommitReadyInput): CommitReadyResult {
+    const validatedInput = CommitReadyInputSchema.parse(input);
+    const now = this.nowMs();
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
+      const row = stmt.get(jobId);
+
+      if (!row) {
+        this.db.exec("COMMIT");
+        return { type: "not_found" };
+      }
+
+      const durableJob = rowToDurableJob(row);
+
+      if (['ready', 'failed', 'cancelled'].includes(durableJob.status)) {
+        this.db.exec("COMMIT");
+        return { type: "terminal", job: durableJobToView(durableJob) };
+      }
+
+      if (durableJob.status !== 'uploading') {
+        this.db.exec("COMMIT");
+        return { type: "not_uploading", job: durableJobToView(durableJob) };
+      }
+
+      const updateStmt = this.db.prepare(`
+        UPDATE worker_jobs 
+        SET status = 'ready',
+            object_key = ?,
+            filename = ?,
+            file_size = ?,
+            mime = ?,
+            quality = ?,
+            container = ?,
+            progress = 100,
+            stage_label = 'Ready',
+            updated_at_ms = ?,
+            finished_at_ms = COALESCE(finished_at_ms, ?)
+        WHERE job_id = ? AND status = 'uploading'
+      `);
+      
+      const result = updateStmt.run(
+        validatedInput.objectKey,
+        validatedInput.filename,
+        validatedInput.fileSize,
+        validatedInput.mime,
+        validatedInput.quality,
+        validatedInput.container,
+        now,
+        now,
+        jobId
+      );
+
+      if (result.changes !== 1) {
+        throw new Error("Failed to transition job to ready");
+      }
+
+      const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(jobId);
+      const resultingJob = rowToDurableJob(newRow);
+      
+      if (resultingJob.status !== 'ready') {
+        throw new Error("Job must be ready after commitReadyFromUploading");
+      }
+      if (resultingJob.objectKey !== validatedInput.objectKey) {
+        throw new Error("objectKey mismatch after commitReadyFromUploading");
+      }
+
+      const view = durableJobToView(resultingJob);
+
+      this.db.exec("COMMIT");
+      return { type: "ready", job: view };
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch (_rollbackErr) { void _rollbackErr; }
+      throw e;
+    }
+  }
+
+  listExpiredReadyObjects(limit: number): ExpiredReadyObject[] {
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1000) {
+      throw new Error("limit must be a safe integer between 1 and 1000");
+    }
+    const now = this.nowMs();
+    const stmt = this.db.prepare(`
+      SELECT job_id, object_key, expires_at_ms
+      FROM worker_jobs
+      WHERE status = 'ready' AND expires_at_ms <= ? AND object_key IS NOT NULL
+      ORDER BY expires_at_ms ASC, job_id ASC
+      LIMIT ?
+    `);
+    const rows = stmt.all(now, limit) as any[];
+    return rows.map(row => ExpiredReadyObjectSchema.parse({
+      jobId: row.job_id,
+      objectKey: row.object_key,
+      expiresAt: row.expires_at_ms
+    }));
   }
 
   recover(): void {

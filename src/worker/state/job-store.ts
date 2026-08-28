@@ -93,6 +93,40 @@ export type CancelJobResult =
   | { type: "unchanged"; job: WorkerJobView }
   | { type: "not_found" };
 
+export const CommitReadyInputSchema = z.object({
+  objectKey: WorkerObjectKeySchema,
+  filename: z.string().min(1),
+  fileSize: z.number().int().nonnegative(),
+  mime: z.string().min(1).regex(/^[^\r\n]+$/, "no control characters allowed"),
+  quality: z.string().nullable(),
+  container: z.string().nullable(),
+}).strict();
+
+export type CommitReadyInput = z.infer<typeof CommitReadyInputSchema>;
+
+export type CommitReadyResult = 
+  | { type: "ready"; job: WorkerJobView }
+  | { type: "terminal"; job: WorkerJobView }
+  | { type: "not_uploading"; job: WorkerJobView }
+  | { type: "not_found" };
+
+export const ExpiredReadyObjectSchema = z.object({
+  jobId: WorkerJobIdSchema,
+  objectKey: WorkerObjectKeySchema,
+  expiresAt: z.number().int().nonnegative(),
+}).strict().superRefine((data, ctx) => {
+  const expectedPrefix = `videofetch/jobs/${data.jobId}/`;
+  if (!data.objectKey.startsWith(expectedPrefix)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "objectKey embedded job ID must equal jobId",
+      path: ["objectKey"],
+    });
+  }
+});
+
+export type ExpiredReadyObject = z.infer<typeof ExpiredReadyObjectSchema>;
+
 export interface WorkerJobStore {
   createJob(
     request: WorkerCreateJobRequest,
@@ -108,6 +142,10 @@ export interface WorkerJobStore {
   failJob(jobId: string, errorCode: string, errorMessage: string): boolean;
 
   getJob(jobId: string): WorkerJobView | null;
+
+  commitReadyFromUploading(jobId: string, input: CommitReadyInput): CommitReadyResult;
+
+  listExpiredReadyObjects(limit: number): ExpiredReadyObject[];
 
   recover(): void;
 
