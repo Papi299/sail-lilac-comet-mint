@@ -6,6 +6,7 @@ import { SQLiteJobStore } from "../state/sqlite-job-store.server.ts";
 import { openWorkerDatabase } from "../state/database.server.ts";
 import { applyMigrations } from "../state/migrations.server.ts";
 import { randomUUID } from "node:crypto";
+import { WorkerObjectKeySchema } from "../../shared/worker/contracts.ts";
 import { buildAttachmentContentDisposition } from "../../lib/filenames.ts";
 import type { WorkerJobView } from "../../shared/worker/contracts.ts";
 
@@ -18,7 +19,8 @@ class FakeObjectStoreWriter implements ObjectStoreWriter {
   public putShouldThrow: boolean | Error = false;
   public headShouldReturnNull = false;
   public headShouldThrow: boolean | Error = false;
-  public deleteShouldThrow = false;
+  public deleteShouldThrow: boolean | Error = false;
+  public deleteFailures = new Set<string>();
   public headOverride: ((obj: ObjectStorePutInput) => ObjectStoreHead) | null = null;
 
   async put(input: ObjectStorePutInput): Promise<void> {
@@ -51,7 +53,11 @@ class FakeObjectStoreWriter implements ObjectStoreWriter {
 
   async delete(objectKey: string): Promise<void> {
     this.deleteCalls.push(objectKey);
-    if (this.deleteShouldThrow) throw new Error("Fake delete failure");
+    // Exact-key assertion required by prompt
+    WorkerObjectKeySchema.parse(objectKey);
+    if (this.deleteShouldThrow || this.deleteFailures.has(objectKey)) {
+      throw this.deleteShouldThrow instanceof Error ? this.deleteShouldThrow : new Error("Fake delete failure for " + objectKey);
+    }
     this.objects.delete(objectKey);
   }
 }
@@ -348,6 +354,33 @@ describe("Upload Lifecycle Coordinator", () => {
     assert.strictEqual(dbJob!.status, "cancelled");
   });
 
+  it("fail race: delete succeeds -> cleanup == deleted", async () => {
+    const job = setupUploadingJob();
+    const input = getUploadInput(job.jobId);
+
+    const originalHead = writer.head.bind(writer);
+    let capturedKey = "";
+    writer.head = async (key) => {
+      capturedKey = key;
+      const res = await originalHead(key);
+      store.failJob(job.jobId, "PROCESSING_FAILED", "Failed during upload");
+      return res;
+    };
+
+    const result = await finalizeJobUpload(input);
+    
+    assert.strictEqual(result.type, "job_state_conflict");
+    if (result.type === "job_state_conflict") {
+      assert.strictEqual(result.reason, "failed");
+      assert.strictEqual(result.cleanup, "deleted");
+    }
+    const dbJob = store.getJob(job.jobId);
+    assert.strictEqual(dbJob!.status, "failed");
+    assert.strictEqual(writer.deleteCalls.length, 1);
+    assert.strictEqual(writer.deleteCalls[0], capturedKey);
+    assert.strictEqual(capturedKey.length, 81);
+  });
+
   it("fail race: delete throws -> cleanup == failed", async () => {
     const job = setupUploadingJob();
     const input = getUploadInput(job.jobId);
@@ -371,21 +404,27 @@ describe("Upload Lifecycle Coordinator", () => {
     assert.strictEqual(dbJob!.status, "failed");
   });
 
-  it("put/head failure + delete failure -> safe storage failure, cleanup == failed", async () => {
+  it("head-failure + delete-failure regression (leakage test)", async () => {
     const job = setupUploadingJob();
     const input = getUploadInput(job.jobId);
-    writer.putShouldThrow = true;
-    writer.deleteShouldThrow = true;
+    writer.headShouldThrow = new Error("SECRET_BUCKET_INTERNAL_ERROR provider-request-id-123");
+    writer.deleteShouldThrow = new Error("SECRET_DELETE_ERROR provider-request-id-456");
 
     const result = await finalizeJobUpload(input);
     
     assert.strictEqual(result.type, "storage_failure");
     if (result.type === "storage_failure") {
-      assert.strictEqual(result.code, "put_failed");
+      assert.strictEqual(result.code, "head_failed");
       assert.strictEqual(result.cleanup, "failed");
     }
     const json = JSON.stringify(result);
-    assert.ok(!json.includes("Fake delete failure"));
+    assert.ok(!json.includes("SECRET_BUCKET_INTERNAL_ERROR"));
+    assert.ok(!json.includes("SECRET_DELETE_ERROR"));
+    
+    const dbJob = store.getJob(job.jobId);
+    assert.strictEqual(dbJob!.status, "uploading");
+    assert.strictEqual(writer.deleteCalls.length, 1);
+    assert.strictEqual(writer.deleteCalls[0].length, 81);
   });
 
   it("conflict-state regression matrix before storage starts", async () => {
@@ -482,14 +521,23 @@ describe("Upload Lifecycle Coordinator", () => {
     assert.strictEqual(writer.deleteCalls.length, 0);
   });
 
-  it("ready CAS rollback: invalid validation rolls back transaction", () => {
+  it("ready CAS rollback: invalid post-update state rolls back transaction", () => {
     const jobA = setupUploadingJob();
-    const jobIdB = randomUUID(); 
+    const goodKey = `videofetch/jobs/${jobA.jobId}/` + "a".repeat(32); 
 
-    const badKey = `videofetch/jobs/${jobIdB}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`;
+    // Install a TEST-ONLY SQLite trigger that corrupts the row after update
+    db.exec(`
+      CREATE TRIGGER test_corrupt_ready 
+      AFTER UPDATE ON worker_jobs 
+      WHEN new.status = 'ready' 
+      BEGIN 
+        UPDATE worker_jobs SET object_key = NULL WHERE job_id = new.job_id; 
+      END;
+    `);
+
     assert.throws(() => {
       store.commitReadyFromUploading(jobA.jobId, {
-        objectKey: badKey,
+        objectKey: goodKey,
         filename: "test.mp4",
         fileSize: 100,
         mime: "video/mp4",
@@ -498,35 +546,56 @@ describe("Upload Lifecycle Coordinator", () => {
       });
     });
 
+    db.exec("DROP TRIGGER test_corrupt_ready;");
+
+    const rawRow = db.prepare("SELECT status, object_key FROM worker_jobs WHERE job_id = ?").get(jobA.jobId) as any;
+    assert.strictEqual(rawRow.status, "uploading");
+    assert.strictEqual(rawRow.object_key, null);
+
     const dbJob = store.getJob(jobA.jobId);
     assert.strictEqual(dbJob!.status, "uploading");
   });
 
-  it("expiration cleanup: exactly deletes expired ready object keys", async () => {
+  it("expiration cleanup: failure isolation (one fails, one succeeds)", async () => {
     const jobA = setupUploadingJob();
     const jobB = setupUploadingJob();
-    const jobC = setupUploadingJob();
 
     await finalizeJobUpload(getUploadInput(jobA.jobId));
     await finalizeJobUpload(getUploadInput(jobB.jobId));
-    await finalizeJobUpload(getUploadInput(jobC.jobId));
 
     db.prepare("UPDATE worker_jobs SET expires_at_ms = created_at_ms WHERE job_id IN (?, ?)").run(jobA.jobId, jobB.jobId);
 
+    const jobAData = store.getJob(jobA.jobId)!;
+    const jobBData = store.getJob(jobB.jobId)!;
+    const keyA = jobAData.objectKey!;
+    const keyB = jobBData.objectKey!;
+
     writer.deleteCalls.length = 0; 
+    
+    // Cause A to fail, B to succeed
+    writer.deleteFailures.add(keyA);
 
     const result = await cleanupExpiredObjects(store, writer, 10);
     
     assert.strictEqual(result.attempted, 2);
-    assert.strictEqual(result.deleted, 2);
-    assert.strictEqual(result.failed, 0);
-    assert.strictEqual(writer.deleteCalls.length, 2);
+    assert.strictEqual(result.deleted, 1);
+    assert.strictEqual(result.failed, 1);
     
-    assert.ok(store.getJob(jobA.jobId));
-    assert.ok(store.getJob(jobB.jobId));
-    assert.ok(store.getJob(jobC.jobId));
-
-    assert.ok(store.getJob(jobA.jobId)!.objectKey !== null);
+    assert.strictEqual(writer.deleteCalls.length, 2);
+    assert.ok(writer.deleteCalls.includes(keyA));
+    assert.ok(writer.deleteCalls.includes(keyB));
+    
+    // Verify metadata remains intact for both
+    const finalA = store.getJob(jobA.jobId)!;
+    const finalB = store.getJob(jobB.jobId)!;
+    
+    assert.strictEqual(finalA.status, "ready");
+    assert.strictEqual(finalA.objectKey, keyA);
+    assert.strictEqual(finalA.expiresAt, jobAData.expiresAt);
+    
+    assert.strictEqual(finalB.status, "ready");
+    assert.strictEqual(finalB.objectKey, keyB);
+    assert.strictEqual(finalB.expiresAt, jobBData.expiresAt);
   });
 
   it("exact-key deletion: no prefix deletion allowed", async () => {
