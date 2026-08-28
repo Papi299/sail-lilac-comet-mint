@@ -118,13 +118,58 @@ startup lock and enable the flag.
 
 ## 5. Object storage (R2)
 
+Two boundaries operate here, and they are **not** the same strength. Conflating
+them overstates the security posture, so they are documented separately.
+
+### 5a. Application operation boundary (enforced in software)
+
+This boundary is real, is enforced by the code in this repository, and is
+covered by tests.
+
+| Runtime | Operations the production code can perform |
+| :--- | :--- |
+| Worker (`ObjectStoreWriter`) | `PutObject`, `HeadObject`, `DeleteObject` — nothing else. |
+| Vercel (signer) | Signs `GetObject` — nothing else. |
+
+The Worker's `ObjectStoreWriter` interface exposes exactly `put`, `head` and
+`delete`. It has no `get`, no `list`, no presign and no bucket-administration
+method, so no Worker code path can express those operations. Deletion is always
+by exact object key; there is no prefix, wildcard, list or bucket-clear path.
+
+The Worker never receives `R2_SIGNER_*`; Vercel never receives `R2_WRITER_*`.
+
+### 5b. Provider credential boundary (weaker than 5a)
+
+> **Important, and easy to get wrong.** Cloudflare R2's **persistent** S3 API
+> token permission model is **coarser** than the application operation surface
+> above. Its object-level presets are approximately:
+>
+> - **Object Read & Write** — read + write + list
+> - **Object Read only** — read + list
+>
+> There is no persistent preset granting exactly `PutObject + HeadObject +
+> DeleteObject` and nothing else. Exact S3 action lists are reachable through
+> **action-scoped temporary credentials / local signing**, which for a
+> long-lived Worker would require a renewal and rotation design.
+
+Therefore, with the current static credential model, **do not claim** that:
+
+- the persistent Worker token lacks `GetObject` or `ListObjects`; or
+- the persistent signer token lacks `ListObjects`.
+
+Those claims are not true of what the provider actually issues. The honest
+statement is: *the application only ever invokes its own narrow operation set,
+while the underlying token may permit more.*
+
+### 5c. What is still required at provisioning time
+
 | Invariant | Requirement |
 | :--- | :--- |
 | Bucket | Private, Standard class. Never public-read. |
-| Worker identity | `PutObject`, `HeadObject`, `DeleteObject` only. |
-| Worker identity must NOT have | `GetObject`, presigning, `ListObjects`, or bucket administration. |
-| Vercel identity | Signed `GetObject` only — a **separate** credential. |
-| Credential separation | The Worker never receives `R2_SIGNER_*`; Vercel never receives `R2_WRITER_*`. |
+| Identities | Two **separate** credentials — one for the Worker, one for Vercel. Never one shared token. |
+| Scope | Bucket-specific. Never account-wide. |
+| Administration | No bucket administration on either credential. |
+| Separation of use | Enforced in software per 5a, and by never cross-supplying `R2_WRITER_*` / `R2_SIGNER_*`. |
 | Provider lifecycle | A TTL backstop, configured only during authorized provisioning. |
 
 Set the provider lifecycle retention slightly **longer** than the application
@@ -135,6 +180,22 @@ missed.
 Expiration is enforced by `expiresAt` in durable metadata, independently of
 whether cleanup succeeded. A failed object deletion never extends user
 authorization.
+
+### 5d. Open decision — `R2-CREDENTIAL-SCOPE-DECISION-001`
+
+**Status: OPEN — BLOCKING BEFORE PHASE-8B CREDENTIAL PROVISIONING.**
+
+No real R2 token may be created until the Product Owner explicitly closes this:
+
+- **Option A** — accept bucket-scoped **persistent** R2 credentials whose
+  provider permissions are broader than the application operation surface,
+  relying on the strict software separation in 5a for v1.
+- **Option B** — design **renewable, action-scoped temporary credentials**
+  before production, accepting the added renewal/rotation complexity for a
+  long-lived Worker.
+
+This decision is deliberately **not** made in Phase 8A, and no credential broker
+or temporary-credential renewal system is implemented here.
 
 ---
 
@@ -270,11 +331,25 @@ authorization.
 - [ ] All capabilities dropped; no privileged mode, host network or Docker socket.
 - [ ] External egress deny policy applied and owned outside the container.
 - [ ] TLS endpoint terminated in front of the Worker and reachable by Vercel.
+- [ ] **`R2-CREDENTIAL-SCOPE-DECISION-001` closed by the Product Owner (Option A or B).**
+      No R2 credential may be created before this. See §5d.
 - [ ] Private R2 bucket created; lifecycle TTL backstop configured.
-- [ ] Worker writer credentials created, scoped to Put/Head/Delete only.
-- [ ] Vercel signer credentials created separately, scoped to signed GET only.
+- [ ] Worker writer credential created — separate identity, bucket-scoped, no
+      bucket administration. Provider permissions may be broader than the
+      application's Put/Head/Delete surface; see §5b.
+- [ ] Vercel signer credential created **separately** — bucket-scoped, no bucket
+      administration. Provider permissions may be broader than signed GET; see §5b.
 - [ ] `WORKER_CONTROL_*` generated and configured on both runtimes.
 - [ ] `YTDLP_NETWORK_ISOLATED` confirmed false/unset.
 - [ ] Termination grace period >= Worker shutdown grace.
 - [ ] `GET /v1/healthz` returns 200 through the TLS endpoint.
 - [ ] Phase-9 safe-egress acceptance suite executed from inside the deployed boundary.
+
+---
+
+## 11. Tracked follow-ups
+
+| Id | Status | Notes |
+| :--- | :--- | :--- |
+| `R2-CREDENTIAL-SCOPE-DECISION-001` | **OPEN — BLOCKING before any Phase-8B R2 credential provisioning** | Option A (accept broader persistent bucket-scoped credentials, rely on software separation) vs Option B (renewable action-scoped temporary credentials). See §5d. Product Owner decision; not made in Phase 8A. |
+| `NPM-LOCKFILE-RECONCILIATION-001` | OPEN — non-blocking for Phase 8A | `package-lock.json` carries a pre-existing devDependency resolution (`nitro` → `unstorage` requires `lru-cache@^11`, the lock pins `5.1.1`) that npm 10 rejects and npm 11 accepts. The Worker image works around it with an exact-pinned ephemeral npm 11 running `ci`; no `npm install` is used and the lockfile is unmodified. Repository maintenance should reconcile it separately. |

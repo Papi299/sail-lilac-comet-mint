@@ -163,18 +163,24 @@ describe("Dockerfile.worker container policy", () => {
       }
     });
 
-    it("install project dependencies with npm install", () => {
+    it("use npm install anywhere — local OR global", () => {
+      // Installation is always `ci`. There is no global-toolchain exception:
+      // `npm install -g` is rejected exactly like a local `npm install`.
       const runs = directives("RUN").map((i) => i.args);
       for (const command of runs) {
-        // A global toolchain install (`npm install -g`) is not a project
-        // dependency install; anything else must use `npm ci`.
-        const projectInstall = /npm\s+(install|i)\b(?![^\n]*\s-g\b)/.test(command);
-        assert.equal(
-          projectInstall,
-          false,
-          `project dependencies must be installed with npm ci, found: ${command}`,
+        assert.doesNotMatch(
+          command,
+          /npm\s+(install|i)\b/,
+          `dependencies must be installed with npm ci, found: ${command}`,
         );
       }
+    });
+
+    it("contain a literal npm install in any executable instruction", () => {
+      // Belt-and-braces over the whole executable surface (RUN, CMD,
+      // ENTRYPOINT, HEALTHCHECK), not just RUN.
+      assert.doesNotMatch(executable, /npm\s+install\b/);
+      assert.doesNotMatch(executable, /npm\s+i\b/);
     });
   });
 
@@ -203,7 +209,29 @@ describe("Dockerfile.worker container policy", () => {
 
     it("install production dependencies with npm ci", () => {
       const runs = directives("RUN").map((i) => i.args).join("\n");
-      assert.match(runs, /npm\s+ci\b/, "dependencies must be installed with npm ci");
+      // Accepts both `npm ci` and an exact-pinned ephemeral runner such as
+      // `npx --yes npm@11.19.1 ci`. Either way the verb is `ci`.
+      assert.match(
+        runs,
+        /npm(@[\w.-]+)?\s+ci\b/,
+        "dependencies must be installed with npm ci",
+      );
+      assert.match(runs, /--omit=dev\b/, "the production image omits devDependencies");
+    });
+
+    it("pin an exact version when bootstrapping an npm toolchain", () => {
+      const runs = directives("RUN").map((i) => i.args).join("\n");
+      if (!/\bnpx\b/.test(runs)) return; // no bootstrap in use
+      assert.match(
+        runs,
+        /npx[^\n]*\snpm@\d+\.\d+\.\d+\s/,
+        "an npx npm bootstrap must pin an exact version",
+      );
+      assert.match(
+        runs,
+        /rm\s+-rf[^\n]*_npx/,
+        "the fetched toolchain must not be retained in the final image",
+      );
     });
 
     it("declare a non-root runtime user before the final CMD", () => {

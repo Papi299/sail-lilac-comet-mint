@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { AppError } from "../../lib/errors.ts";
 import type { WorkerVideoMetadata, WorkerObjectKey } from "../../shared/worker/contracts.ts";
 import { WorkerClient } from "../../web/worker/worker-client.server.ts";
+import { openWorkerDatabase } from "../state/database.server.ts";
 import type {
   ObjectStoreHead,
   ObjectStorePutInput,
@@ -100,7 +101,11 @@ async function reservePort(): Promise<number> {
   });
 }
 
-function makeConfig(dataDirectory: string, port: number): WorkerRuntimeConfig {
+function makeConfig(
+  dataDirectory: string,
+  port: number,
+  mediaOverrides: Partial<WorkerRuntimeConfig["media"]> = {},
+): WorkerRuntimeConfig {
   return {
     bindHost: "127.0.0.1",
     port,
@@ -122,6 +127,7 @@ function makeConfig(dataDirectory: string, port: number): WorkerRuntimeConfig {
       maxRedirects: 5,
       tempDirectory: null,
       ffmpegPath: null,
+      ...mediaOverrides,
     },
   };
 }
@@ -516,8 +522,236 @@ describe("Worker runtime composition", () => {
     });
   });
 
+  // ── Correction-01: FILE_EXPIRATION_MINUTES reaches durable state ──────────
+  describe("configured job TTL", () => {
+    it("derives the DURABLE expiresAt from fileExpirationMinutes", async () => {
+      const FIXED_NOW = 1_800_000_000_000;
+      const runtime = await createWorkerRuntime(
+        makeConfig(join(root, "state"), await reservePort(), { fileExpirationMinutes: 7 }),
+        {
+          objectStoreWriter: new MemoryWriter(),
+          executorDeps: mediaDeps(),
+          clock: () => FIXED_NOW,
+        },
+      );
+
+      try {
+        const created = runtime.store.createJob(
+          { url: MEDIA_URL, formatId: FORMAT_ID, principalId: "private-access-user" },
+          randomUUID(),
+        );
+        assert.equal(created.type, "created");
+        const job = created.type === "created" ? created.job : null;
+        assert.ok(job);
+
+        // The durable row itself — not the parsed config — must carry the TTL.
+        assert.equal(job.createdAt, FIXED_NOW);
+        assert.equal(job.expiresAt - job.createdAt, 420_000, "7 minutes in milliseconds");
+        assert.equal(job.expiresAt, FIXED_NOW + 420_000);
+
+        // Confirmed straight from SQLite, bypassing the view entirely.
+        const row = runtime.db
+          .prepare("SELECT created_at_ms, expires_at_ms FROM worker_jobs WHERE job_id = ?")
+          .get(job.jobId) as { created_at_ms: number; expires_at_ms: number };
+        assert.equal(Number(row.expires_at_ms) - Number(row.created_at_ms), 420_000);
+      } finally {
+        await runtime.shutdown();
+      }
+    });
+
+    it("uses a different configured retention for a different value", async () => {
+      const FIXED_NOW = 1_800_000_000_000;
+      const runtime = await createWorkerRuntime(
+        makeConfig(join(root, "state"), await reservePort(), { fileExpirationMinutes: 90 }),
+        {
+          objectStoreWriter: new MemoryWriter(),
+          executorDeps: mediaDeps(),
+          clock: () => FIXED_NOW,
+        },
+      );
+
+      try {
+        const created = runtime.store.createJob(
+          { url: MEDIA_URL, formatId: FORMAT_ID, principalId: "private-access-user" },
+          randomUUID(),
+        );
+        const job = created.type === "created" ? created.job : null;
+        assert.ok(job);
+        assert.equal(job.expiresAt - job.createdAt, 5_400_000, "90 minutes in milliseconds");
+      } finally {
+        await runtime.shutdown();
+      }
+    });
+
+    it("lets an explicit test override win over the configured retention", async () => {
+      const FIXED_NOW = 1_800_000_000_000;
+      const runtime = await createWorkerRuntime(
+        makeConfig(join(root, "state"), await reservePort(), { fileExpirationMinutes: 45 }),
+        {
+          objectStoreWriter: new MemoryWriter(),
+          executorDeps: mediaDeps(),
+          clock: () => FIXED_NOW,
+          jobTtlMs: 1_000,
+        },
+      );
+
+      try {
+        const created = runtime.store.createJob(
+          { url: MEDIA_URL, formatId: FORMAT_ID, principalId: "private-access-user" },
+          randomUUID(),
+        );
+        const job = created.type === "created" ? created.job : null;
+        assert.ok(job);
+        assert.equal(job.expiresAt - job.createdAt, 1_000);
+      } finally {
+        await runtime.shutdown();
+      }
+    });
+  });
+
   // ── §22 shutdown behaviour ────────────────────────────────────────────────
   describe("shutdown", () => {
+    it("is NOT delayed by an in-flight maintenance operation", async () => {
+      const GRACE_MS = 300;
+      const port = await reservePort();
+      const record = { analyzed: [] as string[], downloaded: [] as string[] };
+
+      // A writer whose delete never settles until the test releases it. This is
+      // the hang that previously blocked the entire shutdown sequence.
+      const gate: { release: (() => void) | null } = { release: null };
+      const maintenanceGate = new Promise<void>((resolve) => {
+        gate.release = resolve;
+      });
+      const releaseMaintenance = () => gate.release?.();
+      let maintenanceEntered = false;
+
+      const hangingWriter = new MemoryWriter();
+      hangingWriter.delete = async () => {
+        maintenanceEntered = true;
+        await maintenanceGate;
+      };
+
+      const runtime = await createWorkerRuntime(makeConfig(join(root, "state"), port), {
+        objectStoreWriter: hangingWriter,
+        executorDeps: mediaDeps(record),
+        shutdownGraceMs: GRACE_MS,
+      });
+
+      let shutdownSettled = false;
+      try {
+        const address = await runtime.listen();
+        const baseUrl = `http://127.0.0.1:${address.port}`;
+
+        // An expired ready object gives maintenance something to hang on.
+        const jobId = "0".repeat(32);
+        const objectKey = `videofetch/jobs/${jobId}/${"a".repeat(32)}`;
+        const now = Date.now();
+        runtime.db
+          .prepare(
+            `INSERT INTO worker_jobs
+              (job_id, url, format_id, principal_id, status, object_key,
+               created_at_ms, updated_at_ms, expires_at_ms)
+             VALUES (?, ?, ?, 'private-access-user', 'ready', ?, ?, ?, ?)`,
+          )
+          .run(jobId, MEDIA_URL, FORMAT_ID, objectKey, now - 10_000, now - 10_000, now - 1);
+
+        // Start a maintenance pass and let it reach the hanging delete.
+        const maintenancePass = runtime.maintenance.runOnce();
+        await waitFor(() => maintenanceEntered, "maintenance to reach the hanging delete");
+        assert.equal(runtime.maintenance.isRunning, true);
+
+        // A durable queued job exists; nothing may claim it once shutdown began.
+        runtime.store.createJob(
+          { url: MEDIA_URL, formatId: FORMAT_ID, principalId: "private-access-user" },
+          randomUUID(),
+        );
+
+        const started = Date.now();
+        const shutdown = runtime.shutdown().then(() => {
+          shutdownSettled = true;
+        });
+
+        // The non-blocking phase must already have taken effect, well before
+        // the hanging maintenance operation settles.
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        assert.equal(maintenanceEntered, true, "maintenance is still hanging");
+        assert.equal(shutdownSettled, false, "shutdown has not returned yet");
+
+        // 1. No further queued work may be claimed.
+        runtime.wakeQueue();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.deepEqual(record.analyzed, [], "no queued job may be claimed during shutdown");
+
+        // 2. The maintenance timer is disarmed and no new pass can begin.
+        assert.equal(runtime.maintenance.isStarted, false, "maintenance timer disarmed");
+
+        // 3. The listener is closing: new connections are refused.
+        await assert.rejects(
+          () => fetch(`${baseUrl}/v1/healthz`),
+          "the listener must stop accepting new connections immediately",
+        );
+
+        // Shutdown must return on the bounded grace, NOT on the hung operation.
+        await shutdown;
+        const elapsed = Date.now() - started;
+        assert.equal(shutdownSettled, true);
+        assert.ok(
+          elapsed < GRACE_MS * 6,
+          `shutdown must be bounded by the grace period, took ${elapsed}ms`,
+        );
+        assert.equal(maintenanceEntered, true);
+
+        // The maintenance operation is still hanging at this point: shutdown
+        // did not wait for it.
+        releaseMaintenance();
+        await maintenancePass;
+
+        // 4. SQLite closed last, so the durable evidence is read from a FRESH
+        //    handle on the same file: an operator shutdown wrote no `cancelled`
+        //    state, and the queued job survived for the next boot.
+        const reopened = openWorkerDatabase({ path: runtime.databasePath });
+        try {
+          const cancelled = reopened
+            .prepare("SELECT count(*) AS count FROM worker_jobs WHERE status = 'cancelled'")
+            .get() as { count: number };
+          assert.equal(
+            Number(cancelled.count),
+            0,
+            "an operator shutdown must never write `cancelled`",
+          );
+
+          const stillQueued = reopened
+            .prepare("SELECT count(*) AS count FROM worker_jobs WHERE status = 'queued'")
+            .get() as { count: number };
+          assert.equal(Number(stillQueued.count), 1, "the queued job survives for the next boot");
+        } finally {
+          reopened.close();
+        }
+      } finally {
+        releaseMaintenance();
+      }
+    });
+
+    it("closes SQLite last, after the bounded wait", async () => {
+      const port = await reservePort();
+      const runtime = await createWorkerRuntime(makeConfig(join(root, "state"), port), {
+        objectStoreWriter: new MemoryWriter(),
+        executorDeps: mediaDeps(),
+        shutdownGraceMs: 250,
+      });
+      await runtime.listen();
+
+      // Live before shutdown.
+      assert.ok(runtime.db.prepare("SELECT 1 AS ok").get());
+
+      await runtime.shutdown();
+
+      assert.throws(
+        () => runtime.db.prepare("SELECT 1").get(),
+        "SQLite must be closed once shutdown completes",
+      );
+    });
+
     it("stops maintenance and refuses to claim further queued work", async () => {
       const port = await reservePort();
       const record = { analyzed: [] as string[], downloaded: [] as string[] };

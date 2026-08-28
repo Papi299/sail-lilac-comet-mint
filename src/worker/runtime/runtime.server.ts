@@ -129,9 +129,19 @@ export async function createWorkerRuntime(
   try {
     applyMigrations(db);
 
+    // The operator-configured retention is authoritative for durable job rows:
+    // every job's `expiresAt` is derived from it, and Vercel refuses to sign a
+    // download URL past that instant. `FILE_EXPIRATION_MINUTES` is validated to
+    // 1..1440, so the product stays far inside the safe-integer range.
+    const configuredJobTtlMs = config.media.fileExpirationMinutes * 60_000;
+    if (!Number.isSafeInteger(configuredJobTtlMs) || configuredJobTtlMs <= 0) {
+      throw new Error("configured job TTL must be a positive safe integer");
+    }
+    const effectiveJobTtlMs = overrides.jobTtlMs ?? configuredJobTtlMs;
+
     const store = new SQLiteJobStore({
       db,
-      ...(overrides.jobTtlMs !== undefined ? { jobTtlMs: overrides.jobTtlMs } : {}),
+      jobTtlMs: effectiveJobTtlMs,
       ...(overrides.clock ? { clock: overrides.clock } : {}),
     });
 
@@ -269,38 +279,45 @@ export async function createWorkerRuntime(
     };
 
     async function performShutdown(): Promise<void> {
-      // 1. Stop periodic maintenance and let any in-flight pass settle.
-      await maintenance.stop();
+      // ONE overall deadline for the whole shutdown. Every wait below shares
+      // it, so a slow component cannot multiply the total shutdown duration.
+      const deadline = Date.now() + graceMs;
 
-      // 2. Refuse to claim further queued work. Already-durable queued rows
-      //    stay queued for the next boot — they are NOT cancelled.
+      // ── Phase 1: non-blocking state changes ONLY ─────────────────────────
+      // Nothing here awaits. An in-flight maintenance pass, a lingering
+      // connection or a running job must never delay these.
+
+      // Refuse to claim further queued work. Already-durable queued rows stay
+      // queued for the next boot — they are NOT cancelled.
       runner.stopClaiming();
 
-      // 3. Stop accepting new HTTP connections.
+      // Disarm the maintenance timer and latch the permanent stop. An
+      // already-running pass is waited for later, under the shared deadline.
+      maintenance.requestStop();
+
+      // Stop accepting new HTTP connections.
       const closed = new Promise<void>((resolve) => {
         server.close(() => resolve());
       });
       server.closeIdleConnections?.();
 
-      // 4. Abort in-flight media so no FFmpeg descendant outlives the process.
-      //    This never writes a `cancelled` state — a restart is not a user
-      //    cancellation.
+      // Abort in-flight media so no FFmpeg descendant outlives the process.
+      // This never writes a `cancelled` state — a restart is not a user
+      // cancellation.
       executor.abortActiveForShutdown();
 
-      // 5. Bounded grace. Whatever has not finished by now is forced closed.
-      const graceTimer = setTimeout(() => {
-        server.closeAllConnections?.();
-      }, graceMs);
-      graceTimer.unref?.();
+      // ── Phase 2: one bounded wait covering every drain ───────────────────
+      await awaitUntilDeadline(
+        [closed, pump.whenDrained(), maintenance.whenSettled()],
+        deadline,
+      );
 
-      try {
-        await withTimeout(closed, graceMs, () => server.closeAllConnections?.());
-        await withTimeout(pump.whenDrained(), graceMs, () => {});
-      } finally {
-        clearTimeout(graceTimer);
-      }
+      // At (or before) the deadline, force-close anything still held open. This
+      // is idempotent and harmless when everything already closed cleanly.
+      server.closeAllConnections?.();
 
-      // 6. SQLite closes LAST, strictly after new HTTP work has stopped.
+      // ── Phase 3: SQLite closes LAST ──────────────────────────────────────
+      // Strictly after new HTTP work has stopped and no further job can start.
       try {
         db.close();
       } catch {
@@ -319,22 +336,28 @@ export async function createWorkerRuntime(
   }
 }
 
-/** Resolves when `promise` settles or the bound elapses, whichever is first. */
-async function withTimeout(
-  promise: Promise<unknown>,
-  ms: number,
-  onTimeout: () => void,
+/**
+ * Waits for every promise to settle, or for the SHARED deadline to pass —
+ * whichever comes first. Never rejects, and never extends past the deadline no
+ * matter how many promises are supplied.
+ */
+async function awaitUntilDeadline(
+  promises: readonly Promise<unknown>[],
+  deadlineMs: number,
 ): Promise<void> {
+  const remaining = deadlineMs - Date.now();
+  if (remaining <= 0) return;
+
   let timer: ReturnType<typeof setTimeout> | undefined;
   const bound = new Promise<void>((resolve) => {
-    timer = setTimeout(() => {
-      onTimeout();
-      resolve();
-    }, ms);
+    timer = setTimeout(resolve, remaining);
     timer.unref?.();
   });
+
+  const settled = Promise.allSettled(promises).then(() => {});
+
   try {
-    await Promise.race([promise.then(() => {}).catch(() => {}), bound]);
+    await Promise.race([settled, bound]);
   } finally {
     if (timer) clearTimeout(timer);
   }

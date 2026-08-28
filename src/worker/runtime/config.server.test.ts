@@ -138,6 +138,126 @@ describe("Worker runtime configuration", () => {
         "WORKER_DATA_DIRECTORY",
       );
     });
+
+    describe("ephemeral-storage boundary", () => {
+      it("REJECTS the ephemeral root itself", () => {
+        expectInvalid(baseEnv({ WORKER_DATA_DIRECTORY: "/tmp" }), "WORKER_DATA_DIRECTORY");
+        expectInvalid(baseEnv({ WORKER_DATA_DIRECTORY: "/tmp/" }), "WORKER_DATA_DIRECTORY");
+        expectInvalid(baseEnv({ WORKER_DATA_DIRECTORY: "/tmp//" }), "WORKER_DATA_DIRECTORY");
+      });
+
+      it("REJECTS any descendant of the ephemeral root", () => {
+        for (const path of [
+          "/tmp/videofetch-state",
+          "/tmp/a/b",
+          "/tmp/a/b/c/d",
+          "/tmp/videofetch",
+        ]) {
+          expectInvalid(
+            baseEnv({ WORKER_DATA_DIRECTORY: path }),
+            "WORKER_DATA_DIRECTORY",
+          );
+        }
+      });
+
+      it("does NOT reject by mere string prefix", () => {
+        // Component-aware containment: /tmp2 is a different directory entirely.
+        for (const path of ["/tmp2/videofetch", "/tmpfs/state", "/tmp2", "/var/tmp/state"]) {
+          const config = loadWorkerRuntimeConfig(baseEnv({ WORKER_DATA_DIRECTORY: path }));
+          assert.equal(config.dataDirectory, path, `${path} must be accepted`);
+        }
+      });
+
+      it("still accepts an ordinary persistent path", () => {
+        assert.equal(
+          loadWorkerRuntimeConfig(baseEnv({ WORKER_DATA_DIRECTORY: "/var/lib/videofetch" }))
+            .dataDirectory,
+          "/var/lib/videofetch",
+        );
+      });
+
+      it("permits TEMP_DIRECTORY under the ephemeral root", () => {
+        // Media scratch SHOULD be ephemeral; only durable state must not be.
+        const config = loadWorkerRuntimeConfig(
+          baseEnv({
+            WORKER_DATA_DIRECTORY: "/var/lib/videofetch",
+            TEMP_DIRECTORY: "/tmp/videofetch",
+          }),
+        );
+        assert.equal(config.media.tempDirectory, "/tmp/videofetch");
+      });
+    });
+
+    describe("state/media directory overlap", () => {
+      it("REJECTS identical directories", () => {
+        const env = baseEnv({
+          WORKER_DATA_DIRECTORY: "/var/lib/videofetch",
+          TEMP_DIRECTORY: "/var/lib/videofetch",
+        });
+        expectInvalid(env, "WORKER_DATA_DIRECTORY");
+        expectInvalid(env, "TEMP_DIRECTORY");
+      });
+
+      it("REJECTS a temp directory nested under the state directory", () => {
+        expectInvalid(
+          baseEnv({
+            WORKER_DATA_DIRECTORY: "/var/lib/videofetch",
+            TEMP_DIRECTORY: "/var/lib/videofetch/media",
+          }),
+          "TEMP_DIRECTORY",
+        );
+      });
+
+      it("REJECTS a state directory nested under the temp directory", () => {
+        expectInvalid(
+          baseEnv({
+            WORKER_DATA_DIRECTORY: "/srv/scratch/state",
+            TEMP_DIRECTORY: "/srv/scratch",
+          }),
+          "WORKER_DATA_DIRECTORY",
+        );
+      });
+
+      it("ACCEPTS unrelated paths that merely share a string prefix", () => {
+        const config = loadWorkerRuntimeConfig(
+          baseEnv({
+            WORKER_DATA_DIRECTORY: "/var/lib/video",
+            TEMP_DIRECTORY: "/var/lib/videofetch2",
+          }),
+        );
+        assert.equal(config.dataDirectory, "/var/lib/video");
+        assert.equal(config.media.tempDirectory, "/var/lib/videofetch2");
+      });
+
+      it("ACCEPTS sibling directories under a common parent", () => {
+        const config = loadWorkerRuntimeConfig(
+          baseEnv({
+            WORKER_DATA_DIRECTORY: "/srv/videofetch/state",
+            TEMP_DIRECTORY: "/srv/videofetch/media",
+          }),
+        );
+        assert.equal(config.dataDirectory, "/srv/videofetch/state");
+        assert.equal(config.media.tempDirectory, "/srv/videofetch/media");
+      });
+
+      it("ACCEPTS the documented container defaults", () => {
+        const config = loadWorkerRuntimeConfig(
+          baseEnv({
+            WORKER_DATA_DIRECTORY: "/var/lib/videofetch",
+            TEMP_DIRECTORY: "/tmp/videofetch",
+          }),
+        );
+        assert.equal(config.dataDirectory, "/var/lib/videofetch");
+        assert.equal(config.media.tempDirectory, "/tmp/videofetch");
+      });
+
+      it("performs no overlap check when TEMP_DIRECTORY is absent", () => {
+        const config = loadWorkerRuntimeConfig(
+          baseEnv({ WORKER_DATA_DIRECTORY: "/var/lib/videofetch" }),
+        );
+        assert.equal(config.media.tempDirectory, null);
+      });
+    });
   });
 
   describe("Worker control credentials", () => {

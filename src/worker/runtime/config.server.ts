@@ -61,6 +61,41 @@ const AbsoluteDirectorySchema = z
     "must not contain relative path segments",
   );
 
+/**
+ * Filesystem roots that are ephemeral by contract. Durable Worker state placed
+ * here is silently lost on restart, so the production loader refuses it.
+ */
+const EPHEMERAL_ROOTS = ["/tmp"] as const;
+
+/** Splits an absolute POSIX path into its non-empty components. */
+function pathComponents(p: string): string[] {
+  return p.split("/").filter((segment) => segment.length > 0);
+}
+
+/**
+ * Component-aware containment: true when `inner` IS `outer` or lies beneath it.
+ *
+ * Deliberately not a string-prefix test — `/tmp2/videofetch` is not under
+ * `/tmp`, and `/var/lib/videofetch2` is not under `/var/lib/video`.
+ */
+function isWithinPath(outer: string, inner: string): boolean {
+  const outerParts = pathComponents(outer);
+  const innerParts = pathComponents(inner);
+  if (outerParts.length > innerParts.length) return false;
+  return outerParts.every((segment, index) => segment === innerParts[index]);
+}
+
+/**
+ * The durable state directory. Everything `AbsoluteDirectorySchema` requires,
+ * plus the Phase-8A contract that SQLite state never lives on ephemeral
+ * storage. Low-level tests may still point an INJECTED `WorkerRuntimeConfig` at
+ * a temporary directory; this restriction binds the production loader only.
+ */
+const PersistentDirectorySchema = AbsoluteDirectorySchema.refine(
+  (p) => !EPHEMERAL_ROOTS.some((root) => isWithinPath(root, p)),
+  "must not be under an ephemeral filesystem root",
+);
+
 const ControlSecretSchema = z
   .string()
   .max(MAX_SECRET_BYTES)
@@ -283,7 +318,7 @@ export function loadWorkerRuntimeConfig(
   const dataDirectory = readField(
     "WORKER_DATA_DIRECTORY",
     optional(env.WORKER_DATA_DIRECTORY),
-    AbsoluteDirectorySchema,
+    PersistentDirectorySchema,
     invalid,
   );
 
@@ -433,6 +468,24 @@ export function loadWorkerRuntimeConfig(
       null as string | null,
     ),
   };
+
+  // Cross-field: the durable state volume and the ephemeral media scratch are
+  // two distinct filesystem roles and must not overlap. An overlap would put
+  // media on the SQLite volume (or durable state on ephemeral storage), which
+  // no amount of correct per-field validation would catch.
+  //
+  // Only checked when TEMP_DIRECTORY was explicitly supplied; the deployment
+  // still owns the actual mount topology, but an obviously contradictory
+  // configuration fails closed here rather than at the first durable write.
+  if (dataDirectory.ok && media.tempDirectory !== null) {
+    const overlaps =
+      isWithinPath(dataDirectory.value, media.tempDirectory) ||
+      isWithinPath(media.tempDirectory, dataDirectory.value);
+    if (overlaps) {
+      invalid.push("WORKER_DATA_DIRECTORY");
+      invalid.push("TEMP_DIRECTORY");
+    }
+  }
 
   if (
     invalid.length > 0 ||

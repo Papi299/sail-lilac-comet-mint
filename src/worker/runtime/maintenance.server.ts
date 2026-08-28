@@ -146,18 +146,38 @@ export class WorkerMaintenance {
   }
 
   /**
-   * Stops the timer and waits for any in-flight pass to settle. After this the
-   * service is permanently stopped; `start()` will not re-arm it.
+   * SYNCHRONOUS, non-blocking stop request.
+   *
+   * Disarms the timer and permanently latches the stopped flag so no further
+   * pass can begin — without waiting for an in-flight pass. Shutdown calls this
+   * first so a slow maintenance operation can never delay the actions that must
+   * happen immediately (refusing new queue claims, closing the listener).
    */
-  public async stop(): Promise<void> {
+  public requestStop(): void {
     this.stopped = true;
     if (this.timer !== null) {
       this.clearIntervalFn(this.timer);
       this.timer = null;
     }
+  }
+
+  /** Resolves once any in-flight pass has settled. Never rejects. */
+  public async whenSettled(): Promise<void> {
     if (this.inFlight) {
       await this.inFlight.catch(() => {});
     }
+  }
+
+  /**
+   * Stops the timer and waits for any in-flight pass to settle. After this the
+   * service is permanently stopped; `start()` will not re-arm it.
+   *
+   * This waits without a bound. Shutdown deliberately does NOT use it — see
+   * `requestStop()` + `whenSettled()` under one overall deadline.
+   */
+  public async stop(): Promise<void> {
+    this.requestStop();
+    await this.whenSettled();
   }
 
   /**

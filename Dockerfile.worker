@@ -24,18 +24,22 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Build-toolchain pin only. The npm bundled with node:22 (10.9.x) rejects this
-# repository's committed lockfile over a pre-existing devDependency resolution
-# (nitro -> unstorage wants lru-cache@^11, the lock pins 5.1.1); npm 11 resolves
-# the same lockfile cleanly. This upgrades the BUILDER's npm and changes neither
-# package.json nor package-lock.json, so the repository dependency graph is
-# untouched. None of the affected devDependencies ship in this image.
-RUN npm install -g npm@11.19.1
-
-# Production dependency graph only. `npm ci` (never `npm install`) so the
-# lockfile is authoritative and the build is reproducible.
+# Production dependency graph only. Installation is always `ci` — never
+# `install` — so the committed lockfile is authoritative and the build is
+# reproducible.
+#
+# The npm bundled with node:22 (10.9.x) rejects this repository's committed
+# lockfile over a PRE-EXISTING devDependency resolution (nitro -> unstorage
+# wants lru-cache@^11, the lock pins 5.1.1). npm 11 resolves the same lockfile
+# cleanly, so an EXACT PINNED npm 11 is fetched ephemerally to run `ci` and is
+# then discarded with the caches. Nothing is installed globally, and neither
+# package.json nor package-lock.json is modified — the repository dependency
+# graph is untouched, and none of the affected devDependencies ship here.
+# Tracked separately as NPM-LOCKFILE-RECONCILIATION-001.
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npx --yes npm@11.19.1 ci --omit=dev \
+  && npm cache clean --force \
+  && rm -rf /root/.npm/_npx /root/.npm/_cacache
 
 # The Worker runs TypeScript directly through Node's native type stripping plus
 # the repository's existing alias loader. No transpiler is added for this image.
