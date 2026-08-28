@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { handleHealth } from "../health/health.server.ts";
 
 /**
  * Static architecture gates for the Phase-7 traffic shift.
@@ -314,6 +315,189 @@ describe("Vercel control-plane boundary", () => {
           `${rel(file)} reads ${name} outside the server-only composition layer`,
         );
       }
+    }
+  });
+});
+
+// ── Complete Vercel API route surface ───────────────────────────────────────
+
+/**
+ * Every production route entry point, not just the private-access helper.
+ *
+ * Scoping the gate to a single entry file is exactly how `/api/health` kept a
+ * legacy `manager.server` dependency through Phase 7, so the assertion now
+ * starts from each route file and walks its full transitive graph.
+ */
+function apiRouteFiles(): string[] {
+  const dir = join(SRC, "routes", "api");
+  const out: string[] = [];
+  const walk = (current: string) => {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (/\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)) out.push(full);
+    }
+  };
+  walk(dir);
+  return out.sort();
+}
+
+describe("Vercel API route surface", () => {
+  const routes = apiRouteFiles();
+
+  it("enumerates every production API route", () => {
+    const names = routes.map((f) => relative(join(SRC, "routes", "api"), f));
+    for (const expected of [
+      "analyze.ts",
+      "diagnostics.ts",
+      "download.$jobId.file.ts",
+      "download.$jobId.status.ts",
+      "download.ts",
+      "health.ts",
+      "sites.ts",
+    ]) {
+      assert.ok(names.includes(expected), `route ${expected} is missing from the gate`);
+    }
+    assert.ok(routes.length >= 8, `expected the full route surface, saw ${routes.length}`);
+  });
+
+  it("no API route can reach the legacy media or job stack", () => {
+    // Media execution AND legacy health/operational reporting are both banned.
+    const banned = [...LEGACY_MEDIA_MODULES, "src/services/jobs/store.server.ts"];
+    for (const route of routes) {
+      const graph = productionGraph(relative(ROOT, route));
+      for (const legacy of banned) {
+        assert.equal(
+          graph.has(join(ROOT, legacy)),
+          false,
+          `${rel(route)} can reach ${legacy}`,
+        );
+      }
+    }
+  });
+
+  it("no API route imports the local media stack by specifier", () => {
+    for (const route of routes) {
+      const graph = productionGraph(relative(ROOT, route));
+      for (const [file, source] of graph) {
+        for (const spec of specifiers(stripComments(source))) {
+          assert.equal(
+            /services\/(downloads|extractors|processing|temp|jobs)\//.test(spec),
+            false,
+            `${rel(route)} → ${rel(file)} imports '${spec}'`,
+          );
+        }
+      }
+    }
+  });
+
+  it("no API route probes a binary, the filesystem, or legacy job state", () => {
+    const forbidden = [
+      "healthSnapshot",
+      "diagnosticsSnapshot",
+      "ffmpegAvailable",
+      "ytdlpAvailable",
+      "tempUsage",
+      "listExtractors",
+      "getExtractorFor",
+      "enqueueDownload",
+      "listJobs",
+      "countActive",
+    ];
+    for (const route of routes) {
+      const graph = productionGraph(relative(ROOT, route));
+      for (const [file, rawSource] of graph) {
+        const source = stripComments(rawSource);
+        for (const token of forbidden) {
+          assert.equal(
+            source.includes(token),
+            false,
+            `${rel(route)} → ${rel(file)} references '${token}'`,
+          );
+        }
+      }
+    }
+  });
+});
+
+// ── Vercel liveness contract ────────────────────────────────────────────────
+
+describe("Vercel /api/health is a minimal, independent liveness check", () => {
+  const HEALTH_HANDLER = join(SRC, "web/health/health.server.ts");
+  const HEALTH_ROUTE = join(SRC, "routes/api/health.ts");
+
+  it("responds 200 with exactly { status: \"ok\" } and no-store", async () => {
+    const res = handleHealth();
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("cache-control"), "no-store");
+
+    const body = await res.json();
+    assert.deepEqual(body, { status: "ok" });
+    assert.deepEqual(Object.keys(body as object), ["status"]);
+  });
+
+  it("leaks no operational, binary, or configuration state", async () => {
+    const serialized = JSON.stringify(await handleHealth().json());
+    for (const leak of [
+      "ffmpeg",
+      "extractor",
+      "ytdlp",
+      "queue",
+      "activeJobs",
+      "queuedJobs",
+      "tempBytes",
+      "safeEgress",
+      "worker",
+      "objectKey",
+      "R2_",
+      "WORKER_",
+    ]) {
+      assert.equal(
+        serialized.toLowerCase().includes(leak.toLowerCase()),
+        false,
+        `the liveness body exposes '${leak}'`,
+      );
+    }
+  });
+
+  it("performs zero calls: the handler module imports nothing at all", () => {
+    // A module with no imports cannot reach the legacy manager, the worker
+    // client, a binary probe, or the filesystem. This is a structural proof,
+    // stronger than counting spy invocations.
+    const graph = productionGraph(relative(ROOT, HEALTH_HANDLER));
+    assert.equal(graph.size, 1, "the liveness handler must be self-contained");
+
+    const source = stripComments(readSource(HEALTH_HANDLER));
+    assert.deepEqual(specifiers(source), [], "the liveness handler must import nothing");
+  });
+
+  it("never references the legacy manager, a probe, or the worker client", () => {
+    for (const file of [HEALTH_HANDLER, HEALTH_ROUTE]) {
+      const source = stripComments(readSource(file));
+      for (const token of [
+        "healthSnapshot",
+        "manager.server",
+        "ffmpegAvailable",
+        "ytdlpAvailable",
+        "tempUsage",
+        "getWorkerClient",
+        "WorkerClient",
+        "diagnostics",
+      ]) {
+        assert.equal(source.includes(token), false, `${rel(file)} references '${token}'`);
+      }
+    }
+  });
+
+  it("does not make Vercel liveness depend on worker reachability", () => {
+    const graph = productionGraph(relative(ROOT, HEALTH_ROUTE));
+    assert.equal(
+      graph.has(join(SRC, "web/config/worker-runtime.server.ts")),
+      false,
+      "the health route can reach the worker composition layer",
+    );
+    for (const [, source] of graph) {
+      assert.equal(stripComments(source).includes("getWorkerClient"), false);
     }
   });
 });
