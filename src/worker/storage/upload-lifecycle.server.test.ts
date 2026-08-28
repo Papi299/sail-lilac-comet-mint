@@ -88,7 +88,6 @@ describe("Upload Lifecycle Coordinator", () => {
   });
 
   function setupUploadingJob(): string {
-    const jobId = randomUUID();
     const req = {
       url: "https://example.com/video",
       formatId: "137",

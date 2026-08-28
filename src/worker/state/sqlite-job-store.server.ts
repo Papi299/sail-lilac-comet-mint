@@ -386,7 +386,13 @@ export class SQLiteJobStore implements WorkerJobStore {
   }
 
   commitReadyFromUploading(jobId: string, input: CommitReadyInput): CommitReadyResult {
+    const validJobId = WorkerJobIdSchema.parse(jobId);
     const validatedInput = CommitReadyInputSchema.parse(input);
+    const embeddedJobId = validatedInput.objectKey.split("/")[2];
+    if (embeddedJobId !== validJobId) {
+      throw new Error("Embedded job ID in objectKey does not match the target job ID");
+    }
+
     const now = this.nowMs();
 
     this.db.exec("BEGIN IMMEDIATE");
