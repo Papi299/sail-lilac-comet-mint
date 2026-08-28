@@ -435,7 +435,7 @@ export class SQLiteJobStore implements WorkerJobStore {
       this.db.exec("COMMIT");
       return { type: "updated", job: durableJobToView(resultingJob) };
     } catch (e) {
-      try { this.db.exec("ROLLBACK"); } catch (_err) {}
+      try { this.db.exec("ROLLBACK"); } catch (_err) { /* ignore */ }
       throw e;
     }
   }
@@ -485,7 +485,7 @@ export class SQLiteJobStore implements WorkerJobStore {
       this.db.exec("COMMIT");
       return { type: "updated", job: durableJobToView(resultingJob) };
     } catch (e) {
-      try { this.db.exec("ROLLBACK"); } catch (_err) {}
+      try { this.db.exec("ROLLBACK"); } catch (_err) { /* ignore */ }
       throw e;
     }
   }
@@ -537,7 +537,7 @@ export class SQLiteJobStore implements WorkerJobStore {
       this.db.exec("COMMIT");
       return { type: "updated", job: durableJobToView(resultingJob) };
     } catch (e) {
-      try { this.db.exec("ROLLBACK"); } catch (_err) {}
+      try { this.db.exec("ROLLBACK"); } catch (_err) { /* ignore */ }
       throw e;
     }
   }

@@ -103,9 +103,11 @@ export class JobExecutor {
     }
 
     const analysisRes = this.store.completeAnalysis(jobId, {
-      title: meta.title.substring(0, 1024).replace(/[\x00-\x1F]/g, ""),
+      // eslint-disable-next-line no-control-regex
+      title: meta.title.substring(0, 1024).replace(/[\u0000-\u001F]/g, ""),
       thumbnail: meta.thumbnail || null,
-      source: meta.source.substring(0, 2048).replace(/[\x00-\x1F]/g, ""),
+      // eslint-disable-next-line no-control-regex
+      source: meta.source.substring(0, 2048).replace(/[\u0000-\u001F]/g, ""),
       extractor: "direct",
     });
     if (analysisRes.type !== "updated") return;
@@ -129,10 +131,11 @@ export class JobExecutor {
             totalBytes: p.totalBytes ?? null,
             speed: p.speed ?? null,
             eta: p.eta ?? null,
-            stageLabel: (p.stage || "Downloading").substring(0, 255).replace(/[\x00-\x1F]/g, ""),
+      // eslint-disable-next-line no-control-regex
+            stageLabel: (p.stage || "Downloading").substring(0, 255).replace(/[\u0000-\u001F]/g, ""),
           });
           if (upRes.type !== "updated") {
-            controller.abort();
+            this.activeControllers.get(jobId)?.abort();
           }
         }
       }
@@ -189,6 +192,6 @@ export class JobExecutor {
   private async cleanup(workDir: string) {
     try {
       await removeJobDir(workDir);
-    } catch {}
+    } catch { /* ignore */ }
   }
 }

@@ -33,13 +33,13 @@ describe("Job Executor and Queue Runner", () => {
       async head(key) { return { objectKey: key, contentLength: 8, contentType: "video/mp4", contentDisposition: lastPut?.contentDisposition || "attachment" } as any; },
       async put(opts) {
         lastPut = opts;
-        for await (const chunk of opts.body) {}
+        for await (const _chunk of opts.body) { /* noop */ }
       },
       async delete() {}
     };
 
     setSafeHttpTestHooks({
-      lookup: async (hostname) => [{ address: "93.184.216.34", family: 4 }],
+      lookup: async (_hostname) => [{ address: "93.184.216.34", family: 4 }],
       requestOnce: async (args) => {
         if (args.method === "HEAD") {
           return { status: 200, headers: { "content-length": "8", "content-type": "video/mp4" }, body: null };

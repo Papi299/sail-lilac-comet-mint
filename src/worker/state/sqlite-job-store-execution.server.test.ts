@@ -10,7 +10,7 @@ import { SQLiteJobStore } from "./sqlite-job-store.server.ts";
 describe("SQLiteJobStore Execution Transitions", () => {
   let db: DatabaseSync;
   let store: SQLiteJobStore;
-  let now = 1000000;
+  const now = 1000000;
   let dbPath: string;
   let tempDir: string;
 
