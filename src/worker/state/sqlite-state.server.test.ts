@@ -309,6 +309,141 @@ describe("Worker SQLite State", () => {
     assert.strictEqual(cancelled.type, "not_found");
   });
 
+  // ── Transition pre- and post-commit validation regressions ─────────────────
+
+  it("claimNextQueuedJob corrupted queue rollback", () => {
+    const mockTime = 1000;
+    const store = new SQLiteJobStore({ db, clock: () => mockTime, generateJobId: () => "00000000000000000000000000000010" });
+    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174060");
+    
+    // Corrupt the row using prepared SQL
+    const stmt = db.prepare("UPDATE worker_jobs SET object_key = ? WHERE job_id = ?");
+    stmt.run("videofetch/jobs/00000000000000000000000000000010/12345678901234567890123456789012", "00000000000000000000000000000010");
+
+    assert.throws(() => { store.claimNextQueuedJob(); });
+    
+    const row = db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get("00000000000000000000000000000010") as any;
+    assert.strictEqual(row.status, "queued");
+  });
+
+  it("claimNextQueuedJob second claim corruption regression", () => {
+    const mockTime = 1000;
+    const store = new SQLiteJobStore({ db, clock: () => mockTime, generateJobId: () => "00000000000000000000000000000011" });
+    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174061");
+    
+    // SQLite allows any string without constraints for url unless we add CHECK. But we rely on Zod schema.
+    const stmt = db.prepare("UPDATE worker_jobs SET url = ? WHERE job_id = ?");
+    stmt.run("not-a-valid-http-url", "00000000000000000000000000000011");
+
+    assert.throws(() => { store.claimNextQueuedJob(); });
+    
+    const row = db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get("00000000000000000000000000000011") as any;
+    assert.strictEqual(row.status, "queued");
+  });
+
+  it("claimNextQueuedJob post-transition validation rollback", () => {
+    const mockTime = 1000;
+    const store = new SQLiteJobStore({ db, clock: () => mockTime, generateJobId: () => "00000000000000000000000000000012" });
+    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174062");
+    
+    // Test-only trigger to corrupt the resulting row during transition
+    db.exec(`
+      CREATE TRIGGER test_corrupt_analyzing AFTER UPDATE ON worker_jobs
+      WHEN NEW.status = 'analyzing'
+      BEGIN
+        UPDATE worker_jobs SET object_key = 'videofetch/jobs/00000000000000000000000000000012/12345678901234567890123456789012' WHERE job_id = NEW.job_id;
+      END;
+    `);
+
+    assert.throws(() => { store.claimNextQueuedJob(); });
+    
+    db.exec("DROP TRIGGER test_corrupt_analyzing");
+
+    const row = db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get("00000000000000000000000000000012") as any;
+    assert.strictEqual(row.status, "queued");
+    assert.strictEqual(row.object_key, null);
+  });
+
+  it("cancelJob corruption rollback", () => {
+    const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000013" });
+    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174063");
+    
+    db.exec(`
+      CREATE TRIGGER test_corrupt_cancel AFTER UPDATE ON worker_jobs
+      WHEN NEW.status = 'cancelled'
+      BEGIN
+        UPDATE worker_jobs SET url = 'invalid-url' WHERE job_id = NEW.job_id;
+      END;
+    `);
+
+    assert.throws(() => { store.cancelJob("00000000000000000000000000000013"); });
+    
+    db.exec("DROP TRIGGER test_corrupt_cancel");
+
+    const row = db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get("00000000000000000000000000000013") as any;
+    assert.strictEqual(row.status, "queued"); // original active state
+  });
+
+  it("failJob corruption behavior", () => {
+    const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000014" });
+    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174064");
+    
+    // Corrupt the row before failing
+    const stmt = db.prepare("UPDATE worker_jobs SET url = ? WHERE job_id = ?");
+    stmt.run("not-a-url", "00000000000000000000000000000014");
+
+    assert.throws(() => { store.failJob("00000000000000000000000000000014", "NETWORK_ERROR", "test"); });
+    
+    const row = db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get("00000000000000000000000000000014") as any;
+    assert.strictEqual(row.status, "queued");
+  });
+
+  it("recover atomic-corruption regression", () => {
+    const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000015" });
+    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174065");
+    const store2 = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000016" });
+    store2.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174066");
+    
+    // Advance both to active state
+    db.prepare("UPDATE worker_jobs SET status = 'analyzing' WHERE job_id = '00000000000000000000000000000015'").run();
+    db.prepare("UPDATE worker_jobs SET status = 'processing' WHERE job_id = '00000000000000000000000000000016'").run();
+
+    // Corrupt B only
+    db.prepare("UPDATE worker_jobs SET url = 'invalid' WHERE job_id = '00000000000000000000000000000016'").run();
+
+    assert.throws(() => { store.recover(); });
+
+    // Verify all-or-nothing rollback
+    const a = db.prepare("SELECT * FROM worker_jobs WHERE job_id = '00000000000000000000000000000015'").get() as any;
+    const b = db.prepare("SELECT * FROM worker_jobs WHERE job_id = '00000000000000000000000000000016'").get() as any;
+    
+    assert.strictEqual(a.status, "analyzing");
+    assert.strictEqual(b.status, "processing");
+  });
+
+  it("recover post-update validation regression", () => {
+    const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000017" });
+    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174067");
+    
+    db.prepare("UPDATE worker_jobs SET status = 'analyzing' WHERE job_id = '00000000000000000000000000000017'").run();
+
+    // Test-only trigger to corrupt one recovery result
+    db.exec(`
+      CREATE TRIGGER test_corrupt_recover AFTER UPDATE ON worker_jobs
+      WHEN NEW.status = 'failed'
+      BEGIN
+        UPDATE worker_jobs SET url = 'invalid-url' WHERE job_id = NEW.job_id;
+      END;
+    `);
+
+    assert.throws(() => { store.recover(); });
+    
+    db.exec("DROP TRIGGER test_corrupt_recover");
+
+    const row = db.prepare("SELECT * FROM worker_jobs WHERE job_id = '00000000000000000000000000000017'").get() as any;
+    assert.strictEqual(row.status, "analyzing");
+  });
+
   // ── Restart recovery (§15: prepared statements for test fixtures) ─────────
 
   it("full restart recovery matrix", () => {

@@ -218,6 +218,9 @@ export class SQLiteJobStore implements WorkerJobStore {
   }
 
   listQueuedJobs(limit: number): DurableWorkerJob[] {
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1000) {
+      throw new Error("limit must be a safe integer between 1 and 1000");
+    }
     const now = this.nowMs();
     const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE status = 'queued' AND expires_at_ms > ? ORDER BY created_at_ms ASC, job_id ASC LIMIT ?");
     const rows = stmt.all(now, limit);
@@ -242,20 +245,37 @@ export class SQLiteJobStore implements WorkerJobStore {
         return null;
       }
 
+      // §3.1 validate BEFORE mutation
+      rowToDurableJob(row);
+
+      // §3.2 conditional UPDATE
       const updateStmt = this.db.prepare(`
         UPDATE worker_jobs 
         SET status = 'analyzing', 
             started_at_ms = COALESCE(started_at_ms, ?), 
             updated_at_ms = ? 
-        WHERE job_id = ? AND status = 'queued'
+        WHERE job_id = ? AND status = 'queued' AND expires_at_ms > ?
       `);
-      updateStmt.run(now, now, row.job_id);
+      const result = updateStmt.run(now, now, row.job_id, now);
 
-      this.db.exec("COMMIT");
+      // §3.3 require changes === 1
+      if (result.changes !== 1) {
+        throw new Error("Failed to claim job; changes != 1");
+      }
       
+      // §3.4 SELECT updated row
       const newStmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
       const newRow = newStmt.get(row.job_id);
-      return rowToDurableJob(newRow);
+      
+      // §3.5 validate BEFORE COMMIT
+      const claimedJob = rowToDurableJob(newRow);
+      if (claimedJob.status !== "analyzing") {
+        throw new Error("Claimed job must be in analyzing status");
+      }
+
+      // §3.6 COMMIT
+      this.db.exec("COMMIT");
+      return claimedJob;
     } catch (e) {
       try { this.db.exec("ROLLBACK"); } catch (_rollbackErr) { void _rollbackErr; }
       throw e;
@@ -288,12 +308,18 @@ export class SQLiteJobStore implements WorkerJobStore {
         SET status = 'cancelled', updated_at_ms = ?, finished_at_ms = COALESCE(finished_at_ms, ?)
         WHERE job_id = ? AND status IN ('queued', 'analyzing', 'downloading', 'processing', 'uploading')
       `);
-      updateStmt.run(now, now, jobId);
-      
-      this.db.exec("COMMIT");
+      const result = updateStmt.run(now, now, jobId);
+
+      if (result.changes !== 1) {
+        throw new Error("Failed to cancel job; changes != 1");
+      }
       
       const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(jobId);
-      return { type: "cancelled", job: durableJobToView(rowToDurableJob(newRow)) };
+      const resultingJob = rowToDurableJob(newRow);
+      const view = durableJobToView(resultingJob);
+
+      this.db.exec("COMMIT");
+      return { type: "cancelled", job: view };
     } catch (e) {
       try { this.db.exec("ROLLBACK"); } catch (_rollbackErr) { void _rollbackErr; }
       throw e;
@@ -303,32 +329,97 @@ export class SQLiteJobStore implements WorkerJobStore {
   failJob(jobId: string, errorCode: string, errorMessage: string): boolean {
     const validErrorCode = WorkerErrorCodeSchema.parse(errorCode);
     const now = this.nowMs();
-    const stmt = this.db.prepare(`
-      UPDATE worker_jobs 
-      SET status = 'failed', 
-          error_code = ?, 
-          safe_error_message = ?, 
-          updated_at_ms = ?,
-          finished_at_ms = COALESCE(finished_at_ms, ?)
-      WHERE job_id = ? AND status IN ('queued', 'analyzing', 'downloading', 'processing', 'uploading')
-    `);
-    const result = stmt.run(validErrorCode, errorMessage, now, now, jobId);
-    return result.changes === 1;
+    
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
+      const row = stmt.get(jobId);
+
+      if (!row) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+
+      const durableJob = rowToDurableJob(row);
+      if (['ready', 'failed', 'cancelled'].includes(durableJob.status)) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+
+      const updateStmt = this.db.prepare(`
+        UPDATE worker_jobs 
+        SET status = 'failed', 
+            error_code = ?, 
+            safe_error_message = ?, 
+            updated_at_ms = ?,
+            finished_at_ms = COALESCE(finished_at_ms, ?)
+        WHERE job_id = ? AND status IN ('queued', 'analyzing', 'downloading', 'processing', 'uploading')
+      `);
+      const result = updateStmt.run(validErrorCode, errorMessage, now, now, jobId);
+      
+      if (result.changes !== 1) {
+        throw new Error("Failed to update job status to failed");
+      }
+
+      const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(jobId);
+      const resultingJob = rowToDurableJob(newRow);
+      if (resultingJob.status !== 'failed') {
+        throw new Error("Job must be failed after failJob");
+      }
+
+      this.db.exec("COMMIT");
+      return true;
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch (_rollbackErr) { void _rollbackErr; }
+      throw e;
+    }
   }
 
   recover(): void {
     const now = this.nowMs();
-    const stmt = this.db.prepare(`
-      UPDATE worker_jobs 
-      SET status = 'failed',
-          error_code = 'PROCESSING_FAILED',
-          safe_error_message = 'Worker restarted before the job completed.',
-          stage_label = 'Worker restarted',
-          updated_at_ms = ?,
-          finished_at_ms = COALESCE(finished_at_ms, ?)
-      WHERE status IN ('analyzing', 'downloading', 'processing', 'uploading')
-    `);
-    stmt.run(now, now);
+    
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const selectStmt = this.db.prepare(`
+        SELECT * FROM worker_jobs 
+        WHERE status IN ('analyzing', 'downloading', 'processing', 'uploading')
+      `);
+      const rows = selectStmt.all() as any[];
+
+      // Validate all selected rows before update
+      for (const row of rows) {
+        rowToDurableJob(row);
+      }
+
+      if (rows.length > 0) {
+        const updateStmt = this.db.prepare(`
+          UPDATE worker_jobs 
+          SET status = 'failed',
+              error_code = 'PROCESSING_FAILED',
+              safe_error_message = 'Worker restarted before the job completed.',
+              stage_label = 'Worker restarted',
+              updated_at_ms = ?,
+              finished_at_ms = COALESCE(finished_at_ms, ?)
+          WHERE status IN ('analyzing', 'downloading', 'processing', 'uploading')
+        `);
+        updateStmt.run(now, now);
+
+        const ids = rows.map(r => r.job_id);
+        const placeholders = ids.map(() => '?').join(',');
+        const newRowsStmt = this.db.prepare(`SELECT * FROM worker_jobs WHERE job_id IN (${placeholders})`);
+        const newRows = newRowsStmt.all(...ids) as any[];
+
+        // Validate all rows after update
+        for (const row of newRows) {
+          rowToDurableJob(row);
+        }
+      }
+
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch (_rollbackErr) { void _rollbackErr; }
+      throw e;
+    }
   }
 
   /**
