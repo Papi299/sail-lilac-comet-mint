@@ -1,0 +1,82 @@
+# VideoFetch Worker runtime image (Phase 8A).
+#
+# This image builds the STANDALONE Worker only. The web/control plane runs on
+# Vercel and keeps its own `Dockerfile`; nothing here builds, serves or previews
+# the web application.
+#
+# Deliberately NOT part of this image:
+#   - yt-dlp / python  : direct-media execution does not need it, and Phase 10
+#                        is the only phase authorized to enable yt-dlp network
+#                        execution. Diagnostics honestly reports `ytdlp: false`.
+#   - curl / wget      : the healthcheck uses Node itself.
+#   - ssh / sudo       : no remote administration from inside the container.
+#   - iptables/nftables: the safe-egress policy is an EXTERNAL, host-owned
+#                        boundary. The Worker must never be able to read,
+#                        weaken or mutate it, and must never hold NET_ADMIN.
+#   - docker CLI       : the container never talks to a Docker socket.
+FROM node:22-bookworm-slim
+
+# ffmpeg brings ffprobe with it. ca-certificates provides the TLS trust roots
+# used for outbound media fetches.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Build-toolchain pin only. The npm bundled with node:22 (10.9.x) rejects this
+# repository's committed lockfile over a pre-existing devDependency resolution
+# (nitro -> unstorage wants lru-cache@^11, the lock pins 5.1.1); npm 11 resolves
+# the same lockfile cleanly. This upgrades the BUILDER's npm and changes neither
+# package.json nor package-lock.json, so the repository dependency graph is
+# untouched. None of the affected devDependencies ship in this image.
+RUN npm install -g npm@11.19.1
+
+# Production dependency graph only. `npm ci` (never `npm install`) so the
+# lockfile is authoritative and the build is reproducible.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+# The Worker runs TypeScript directly through Node's native type stripping plus
+# the repository's existing alias loader. No transpiler is added for this image.
+COPY scripts/register-ts-aliases.mjs scripts/ts-alias-hooks.mjs ./scripts/
+COPY src ./src
+
+# Two distinct filesystem roles, both owned by the non-root runtime UID:
+#   /var/lib/videofetch  durable SQLite state. A persistent volume MUST be
+#                        mounted here, and it holds the database plus its
+#                        WAL/SHM sidecars only — never media.
+#   /tmp/videofetch      ephemeral media working files. Never durable state.
+# This layout is compatible with a read-only root filesystem plus a writable
+# state mount and a writable ephemeral /tmp.
+RUN mkdir -p /var/lib/videofetch /tmp/videofetch \
+  && chown -R node:node /var/lib/videofetch /tmp/videofetch
+
+ENV NODE_ENV=production \
+    WORKER_BIND_HOST=0.0.0.0 \
+    WORKER_PORT=8080 \
+    WORKER_DATA_DIRECTORY=/var/lib/videofetch \
+    TEMP_DIRECTORY=/tmp/videofetch \
+    FFMPEG_PATH=/usr/bin/ffmpeg \
+    YTDLP_NETWORK_ISOLATED=false
+
+# No secret is baked into this image. WORKER_CONTROL_KEY_ID,
+# WORKER_CONTROL_SECRET and every R2_WRITER_* value are supplied at RUNTIME from
+# the deployment's secret store. The Vercel-only R2_SIGNER_* identity is never
+# provided to this container.
+
+# The Worker speaks plain HTTP. Phase-8B deployment MUST terminate TLS in front
+# of it before traffic crosses the public internet. There is no second
+# admin/debug port.
+EXPOSE 8080
+
+# Every process from here on runs as the image's non-root `node` user.
+USER node
+
+# Unauthenticated liveness only, over loopback, using Node itself. Never
+# /v1/diagnostics, which is an authenticated surface.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["node", "-e", "const p=process.env.WORKER_PORT||8080;require('node:http').get({host:'127.0.0.1',port:p,path:'/v1/healthz',timeout:4000},r=>{r.resume();process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))"]
+
+# The Worker runtime entry point. Not Vite, not Nitro, not `npm run preview`.
+CMD ["node", "--import", "./scripts/register-ts-aliases.mjs", "--experimental-strip-types", "src/worker/runtime/main.server.ts"]

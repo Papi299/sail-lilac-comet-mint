@@ -299,11 +299,19 @@ describe("Vercel control-plane boundary", () => {
         );
       }
     }
-    // The names themselves may only appear in server-only modules or tests.
+    // The names themselves may only appear in server-only COMPOSITION layers
+    // or tests. There are exactly two such layers, one per runtime: the Vercel
+    // control-plane config and the Worker runtime config. Both are `.server.ts`
+    // and neither is reachable from the browser bundle — the VITE_ scan above
+    // still covers every file, this one included.
     const allowed = [
       "src/web/config/worker-runtime.server.ts",
       "src/web/config/worker-runtime.server.test.ts",
       "src/web/boundary/control-plane-boundary.test.ts",
+      // Worker-side environment boundary (Phase 8A). Reads the SHARED HMAC pair
+      // and the object-store location; it must never consume R2_SIGNER_*, which
+      // it names only to document that exclusion.
+      "src/worker/runtime/config.server.ts",
     ].map((p) => join(ROOT, p));
     for (const file of productionSourceFiles()) {
       if (allowed.includes(file)) continue;

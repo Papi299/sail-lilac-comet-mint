@@ -4,6 +4,7 @@ import {
   WorkerJobViewSchema,
   WorkerCreateJobRequestSchema,
   WorkerJobIdSchema,
+  WorkerObjectKeySchema,
   type WorkerJobView,
   type WorkerCreateJobRequest
 } from "../../shared/worker/contracts.ts";
@@ -659,6 +660,54 @@ export class SQLiteJobStore implements WorkerJobStore {
       objectKey: row.object_key,
       expiresAt: row.expires_at_ms
     }));
+  }
+
+  /**
+   * §20: conditional exact-row metadata cleanup for an expired ready job whose
+   * object has ALREADY been deleted from the object store.
+   *
+   * Every predicate is part of the WHERE clause, so the delete is atomic with
+   * its own precondition check — a concurrent transition out of `ready` simply
+   * matches nothing. `changes` can only ever be 0 or 1 because `job_id` is the
+   * primary key; anything else is treated as corruption and rolls back.
+   *
+   * `worker_idempotency_records` is untouched: no foreign key, no cascade, no
+   * companion DELETE. The tombstone outlives the job metadata by design.
+   */
+  deleteExpiredReadyMetadata(jobId: string, expectedObjectKey: string): boolean {
+    const validJobId = WorkerJobIdSchema.parse(jobId);
+    const validObjectKey = WorkerObjectKeySchema.parse(expectedObjectKey);
+
+    // The object key embeds the job id; a mismatched pair can never identify a
+    // legitimate row and is rejected before any statement runs.
+    if (!validObjectKey.startsWith(`videofetch/jobs/${validJobId}/`)) {
+      throw new Error("objectKey embedded job ID must equal jobId");
+    }
+
+    const now = this.nowMs();
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare(`
+        DELETE FROM worker_jobs
+        WHERE job_id = ?
+          AND status = 'ready'
+          AND object_key = ?
+          AND expires_at_ms <= ?
+      `);
+      const result = stmt.run(validJobId, validObjectKey, now);
+      const changes = Number(result.changes);
+
+      if (changes !== 0 && changes !== 1) {
+        throw new Error("deleteExpiredReadyMetadata matched more than one row");
+      }
+
+      this.db.exec("COMMIT");
+      return changes === 1;
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch (_rollbackErr) { void _rollbackErr; }
+      throw e;
+    }
   }
 
   recover(): void {

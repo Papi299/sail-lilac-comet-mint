@@ -195,6 +195,26 @@ export interface WorkerJobStore {
 
   listExpiredReadyObjects(limit: number): ExpiredReadyObject[];
 
+  /**
+   * Removes the durable job metadata for ONE already-expired ready job whose
+   * stored object has just been deleted from the object store.
+   *
+   * This exists solely so successful expiration cleanup stops re-issuing
+   * DeleteObject for the same key forever. It is deliberately the narrowest
+   * possible operation:
+   *  - the row must currently be `ready`;
+   *  - `objectKey` must match EXACTLY (no prefix, no pattern);
+   *  - `expiresAt` must already have passed;
+   *  - exactly the one `worker_jobs` row is removed, never anything else.
+   *
+   * The retained idempotency record/tombstone is NEVER removed here: a client
+   * replaying the original Idempotency-Key must not be able to mint a second
+   * job merely because the expired job's metadata was cleaned up.
+   *
+   * @returns true when the single row was removed, false when no row matched.
+   */
+  deleteExpiredReadyMetadata(jobId: string, expectedObjectKey: string): boolean;
+
   recover(): void;
 
   cleanupExpiredIdempotencyRecords(): number;

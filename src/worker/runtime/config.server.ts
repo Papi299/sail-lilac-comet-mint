@@ -1,0 +1,471 @@
+/* eslint-disable no-control-regex */
+import { Buffer } from "node:buffer";
+import { z } from "zod";
+import { WorkerKeyIdSchema } from "../../shared/worker/auth.ts";
+
+/**
+ * Strict Worker runtime configuration boundary (Phase 8A §6/§7).
+ *
+ * This module is the ONLY place the production Worker runtime reads its
+ * deployment environment. Nothing below the runtime layer — and in particular
+ * nothing in `src/worker/http/` — may reach for `process.env` itself.
+ *
+ * Two rules govern every error path here:
+ *  1. a malformed REQUIRED production value fails closed before `listen()`;
+ *  2. the rejected VALUE is never rendered. Only the variable NAME travels out,
+ *     so a malformed `WORKER_CONTROL_SECRET` can never be echoed to a log.
+ */
+
+/** Bounded upper limits. None of these are security boundaries on their own. */
+const MAX_HOST_LENGTH = 255;
+const MAX_PATH_LENGTH = 4096;
+const MAX_SECRET_BYTES = 4096;
+const MIN_SECRET_BYTES = 32;
+const MAX_CREDENTIAL_LENGTH = 8192;
+
+export const WORKER_DEFAULT_BIND_HOST = "0.0.0.0";
+export const WORKER_DEFAULT_PORT = 8080;
+
+/** Matches any ASCII control character. Rejected everywhere in this module. */
+const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/;
+
+/**
+ * Hostnames, IPv4 literals and bracketed/bare IPv6 literals only. Whitespace,
+ * control characters and shell metacharacters are structurally impossible.
+ */
+const HostSchema = z
+  .string()
+  .min(1)
+  .max(MAX_HOST_LENGTH)
+  .regex(/^[A-Za-z0-9._:[\]-]+$/, "must be a bare host, IPv4 or IPv6 literal");
+
+const PortSchema = z
+  .string()
+  .regex(/^[0-9]{1,5}$/, "must be a decimal integer")
+  .transform((raw) => Number.parseInt(raw, 10))
+  .refine((n) => Number.isInteger(n) && n >= 1 && n <= 65535, "must be 1..65535");
+
+/**
+ * An absolute POSIX path that is neither empty, nor the filesystem root, nor a
+ * relative/traversal expression, and that carries no control byte.
+ */
+const AbsoluteDirectorySchema = z
+  .string()
+  .min(2)
+  .max(MAX_PATH_LENGTH)
+  .refine((p) => p.startsWith("/"), "must be an absolute path")
+  .refine((p) => !CONTROL_CHARACTERS.test(p), "must not contain control characters")
+  .refine((p) => p.replace(/\/+$/, "") !== "", "must not be the filesystem root")
+  .refine(
+    (p) => !p.split("/").some((seg) => seg === "." || seg === ".."),
+    "must not contain relative path segments",
+  );
+
+const ControlSecretSchema = z
+  .string()
+  .max(MAX_SECRET_BYTES)
+  .refine(
+    (s) => Buffer.byteLength(s, "utf8") >= MIN_SECRET_BYTES,
+    `must be at least ${MIN_SECRET_BYTES} UTF-8 bytes`,
+  );
+
+const CredentialSchema = z
+  .string()
+  .min(1)
+  .max(MAX_CREDENTIAL_LENGTH)
+  .refine((s) => !CONTROL_CHARACTERS.test(s), "must not contain control characters");
+
+/**
+ * Reused verbatim from the authoritative Phase-4 R2 writer so the runtime
+ * cannot drift from the semantics the writer itself enforces.
+ */
+const R2AccountIdSchema = z
+  .string()
+  .regex(/^[a-f0-9]{32}$/, "must be 32 lowercase hex characters");
+const R2BucketSchema = z
+  .string()
+  .regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/, "must be a valid bucket name");
+const R2JurisdictionSchema = z.enum(["default", "eu", "us"]);
+
+function boundedInt(min: number, max: number) {
+  return z
+    .string()
+    .regex(/^[0-9]{1,17}$/, "must be a nonnegative decimal integer")
+    .transform((raw) => Number.parseInt(raw, 10))
+    .refine(
+      (n) => Number.isSafeInteger(n) && n >= min && n <= max,
+      `must be an integer between ${min} and ${max}`,
+    );
+}
+
+const ExecutablePathSchema = z
+  .string()
+  .min(1)
+  .max(MAX_PATH_LENGTH)
+  .refine((s) => !CONTROL_CHARACTERS.test(s), "must not contain control characters");
+
+/** Media-execution bounds this runtime owns. Absent means "use the default". */
+const MEDIA_DEFAULTS = {
+  maxFileSizeBytes: 500 * 1024 * 1024,
+  maxVideoDurationSeconds: 2 * 60 * 60,
+  fileExpirationMinutes: 45,
+  downloadTimeoutSeconds: 600,
+  analysisTimeoutSeconds: 45,
+  maxRedirects: 5,
+} as const;
+
+export type WorkerRuntimeConfig = {
+  readonly bindHost: string;
+  readonly port: number;
+  readonly dataDirectory: string;
+  readonly control: {
+    readonly currentKeyId: string;
+    readonly currentSecret: string;
+    readonly previousKeyId?: string;
+    readonly previousSecret?: string;
+  };
+  readonly r2: {
+    readonly accountId: string;
+    readonly bucket: string;
+    readonly jurisdiction: "default" | "eu" | "us";
+    readonly accessKeyId: string;
+    readonly secretAccessKey: string;
+    readonly sessionToken?: string;
+  };
+  readonly media: {
+    readonly maxFileSizeBytes: number;
+    readonly maxVideoDurationSeconds: number;
+    readonly fileExpirationMinutes: number;
+    readonly downloadTimeoutSeconds: number;
+    readonly analysisTimeoutSeconds: number;
+    readonly maxRedirects: number;
+    readonly tempDirectory: string | null;
+    readonly ffmpegPath: string | null;
+  };
+};
+
+/**
+ * Startup-fatal configuration failure. Carries ONLY the offending variable
+ * names — never a value, never a Zod message that could embed one.
+ */
+export class WorkerRuntimeConfigError extends Error {
+  readonly variables: readonly string[];
+
+  constructor(variables: readonly string[]) {
+    const listed = [...new Set(variables)].sort();
+    super(
+      listed.length > 0
+        ? `Invalid Worker runtime configuration: ${listed.join(", ")}`
+        : "Invalid Worker runtime configuration",
+    );
+    this.name = "WorkerRuntimeConfigError";
+    this.variables = Object.freeze(listed);
+  }
+}
+
+/**
+ * Phase-8A deployment lock (§8).
+ *
+ * Architectural Phases 8 and 9 REQUIRE `YTDLP_NETWORK_ISOLATED=false`. Phase 10
+ * is the only phase authorized to enable it, and only after the safe-egress
+ * acceptance evidence is approved. This lock exists so an operator typo or an
+ * environment drift cannot silently activate yt-dlp early.
+ *
+ * The truthiness test is byte-for-byte the same as the existing attestation
+ * semantics in `src/lib/config.ts#isYtdlpNetworkIsolated` — this module reads a
+ * SUPPLIED environment instead of the ambient one, and does NOT modify the
+ * execution guard itself.
+ */
+export class WorkerYtdlpDeploymentLockError extends Error {
+  constructor() {
+    super(
+      "YTDLP_NETWORK_ISOLATED must not be enabled in Phase 8/9. " +
+        "Phase 10 is the only phase authorized to enable yt-dlp network execution.",
+    );
+    this.name = "WorkerYtdlpDeploymentLockError";
+  }
+}
+
+export function parsesYtdlpIsolationTruthy(raw: string | undefined): boolean {
+  const value = raw?.trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+
+export function assertYtdlpDeploymentLock(env: NodeJS.ProcessEnv): void {
+  if (parsesYtdlpIsolationTruthy(env.YTDLP_NETWORK_ISOLATED)) {
+    throw new WorkerYtdlpDeploymentLockError();
+  }
+}
+
+/** Treats an unset variable and an empty/whitespace string identically. */
+function optional(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+type FieldResult<T> = { ok: true; value: T } | { ok: false };
+
+/**
+ * Runs one schema against one variable, recording only the NAME on failure.
+ * The parsed input never escapes this function on the error path.
+ */
+function readField<S extends z.ZodTypeAny>(
+  name: string,
+  raw: string | undefined,
+  schema: S,
+  invalid: string[],
+): FieldResult<z.output<S>> {
+  if (raw === undefined) {
+    invalid.push(name);
+    return { ok: false };
+  }
+  const parsed = schema.safeParse(raw);
+  if (!parsed.success) {
+    invalid.push(name);
+    return { ok: false };
+  }
+  return { ok: true, value: parsed.data };
+}
+
+function readOptionalField<S extends z.ZodTypeAny, F>(
+  name: string,
+  raw: string | undefined,
+  schema: S,
+  invalid: string[],
+  fallback: F,
+): z.output<S> | F {
+  const present = optional(raw);
+  if (present === undefined) return fallback;
+  const parsed = schema.safeParse(present);
+  if (!parsed.success) {
+    invalid.push(name);
+    return fallback;
+  }
+  return parsed.data;
+}
+
+/**
+ * Loads and strictly validates the production Worker runtime configuration.
+ *
+ * Throws `WorkerRuntimeConfigError` (naming only the offending variables) or
+ * `WorkerYtdlpDeploymentLockError`. Both are startup-fatal by design: the
+ * caller must never reach `listen()` after either.
+ *
+ * The Vercel-only signer identity (`R2_SIGNER_ACCESS_KEY_ID` /
+ * `R2_SIGNER_SECRET_ACCESS_KEY`) is deliberately NOT read here. The Worker
+ * holds write credentials only; signing stays on the control plane.
+ */
+export function loadWorkerRuntimeConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): WorkerRuntimeConfig {
+  // The deployment lock is evaluated FIRST so a premature yt-dlp activation is
+  // reported as itself rather than masked by an unrelated configuration error.
+  assertYtdlpDeploymentLock(env);
+
+  const invalid: string[] = [];
+
+  const bindHost = readOptionalField(
+    "WORKER_BIND_HOST",
+    env.WORKER_BIND_HOST,
+    HostSchema,
+    invalid,
+    WORKER_DEFAULT_BIND_HOST,
+  );
+  const port = readOptionalField(
+    "WORKER_PORT",
+    env.WORKER_PORT,
+    PortSchema,
+    invalid,
+    WORKER_DEFAULT_PORT,
+  );
+
+  const dataDirectory = readField(
+    "WORKER_DATA_DIRECTORY",
+    optional(env.WORKER_DATA_DIRECTORY),
+    AbsoluteDirectorySchema,
+    invalid,
+  );
+
+  const currentKeyId = readField(
+    "WORKER_CONTROL_KEY_ID",
+    optional(env.WORKER_CONTROL_KEY_ID),
+    WorkerKeyIdSchema,
+    invalid,
+  );
+  // Secrets are NOT trimmed: surrounding bytes are part of the key material.
+  const currentSecret = readField(
+    "WORKER_CONTROL_SECRET",
+    env.WORKER_CONTROL_SECRET,
+    ControlSecretSchema,
+    invalid,
+  );
+
+  // Rotation pair: both present or both absent, and distinct from the current
+  // key id. A half-configured rotation is a hard startup failure, never a
+  // silently ignored one.
+  const previousKeyIdRaw = optional(env.WORKER_CONTROL_PREVIOUS_KEY_ID);
+  const previousSecretRaw = env.WORKER_CONTROL_PREVIOUS_SECRET;
+  const hasPreviousSecret = previousSecretRaw !== undefined && previousSecretRaw.length > 0;
+
+  let previousKeyId: string | undefined;
+  let previousSecret: string | undefined;
+
+  if (previousKeyIdRaw !== undefined || hasPreviousSecret) {
+    if (previousKeyIdRaw === undefined) {
+      invalid.push("WORKER_CONTROL_PREVIOUS_KEY_ID");
+    }
+    if (!hasPreviousSecret) {
+      invalid.push("WORKER_CONTROL_PREVIOUS_SECRET");
+    }
+    if (previousKeyIdRaw !== undefined) {
+      const parsedKey = WorkerKeyIdSchema.safeParse(previousKeyIdRaw);
+      if (!parsedKey.success) {
+        invalid.push("WORKER_CONTROL_PREVIOUS_KEY_ID");
+      } else if (currentKeyId.ok && parsedKey.data === currentKeyId.value) {
+        // Rotation requires two DISTINCT identities; reusing the current key id
+        // would make the rotation slot meaningless.
+        invalid.push("WORKER_CONTROL_PREVIOUS_KEY_ID");
+      } else {
+        previousKeyId = parsedKey.data;
+      }
+    }
+    if (hasPreviousSecret) {
+      const parsedSecret = ControlSecretSchema.safeParse(previousSecretRaw);
+      if (!parsedSecret.success) {
+        invalid.push("WORKER_CONTROL_PREVIOUS_SECRET");
+      } else {
+        previousSecret = parsedSecret.data;
+      }
+    }
+  }
+
+  const accountId = readField(
+    "R2_ACCOUNT_ID",
+    optional(env.R2_ACCOUNT_ID),
+    R2AccountIdSchema,
+    invalid,
+  );
+  const bucket = readField("R2_BUCKET", optional(env.R2_BUCKET), R2BucketSchema, invalid);
+  const jurisdiction = readOptionalField(
+    "R2_JURISDICTION",
+    env.R2_JURISDICTION,
+    R2JurisdictionSchema,
+    invalid,
+    "default" as "default" | "eu" | "us",
+  );
+
+  const accessKeyId = readField(
+    "R2_WRITER_ACCESS_KEY_ID",
+    optional(env.R2_WRITER_ACCESS_KEY_ID),
+    CredentialSchema,
+    invalid,
+  );
+  const secretAccessKey = readField(
+    "R2_WRITER_SECRET_ACCESS_KEY",
+    optional(env.R2_WRITER_SECRET_ACCESS_KEY),
+    CredentialSchema,
+    invalid,
+  );
+  const sessionTokenRaw = optional(env.R2_WRITER_SESSION_TOKEN);
+  let sessionToken: string | undefined;
+  if (sessionTokenRaw !== undefined) {
+    const parsed = CredentialSchema.safeParse(sessionTokenRaw);
+    if (!parsed.success) invalid.push("R2_WRITER_SESSION_TOKEN");
+    else sessionToken = parsed.data;
+  }
+
+  const media = {
+    maxFileSizeBytes: readOptionalField(
+      "MAX_FILE_SIZE",
+      env.MAX_FILE_SIZE,
+      boundedInt(1, Number.MAX_SAFE_INTEGER),
+      invalid,
+      MEDIA_DEFAULTS.maxFileSizeBytes,
+    ),
+    maxVideoDurationSeconds: readOptionalField(
+      "MAX_VIDEO_DURATION",
+      env.MAX_VIDEO_DURATION,
+      boundedInt(1, 604800),
+      invalid,
+      MEDIA_DEFAULTS.maxVideoDurationSeconds,
+    ),
+    fileExpirationMinutes: readOptionalField(
+      "FILE_EXPIRATION_MINUTES",
+      env.FILE_EXPIRATION_MINUTES,
+      boundedInt(1, 1440),
+      invalid,
+      MEDIA_DEFAULTS.fileExpirationMinutes,
+    ),
+    downloadTimeoutSeconds: readOptionalField(
+      "DOWNLOAD_TIMEOUT",
+      env.DOWNLOAD_TIMEOUT,
+      boundedInt(1, 86400),
+      invalid,
+      MEDIA_DEFAULTS.downloadTimeoutSeconds,
+    ),
+    analysisTimeoutSeconds: readOptionalField(
+      "ANALYSIS_TIMEOUT",
+      env.ANALYSIS_TIMEOUT,
+      boundedInt(1, 3600),
+      invalid,
+      MEDIA_DEFAULTS.analysisTimeoutSeconds,
+    ),
+    maxRedirects: readOptionalField(
+      "MAX_REDIRECTS",
+      env.MAX_REDIRECTS,
+      boundedInt(0, 20),
+      invalid,
+      MEDIA_DEFAULTS.maxRedirects,
+    ),
+    tempDirectory: readOptionalField(
+      "TEMP_DIRECTORY",
+      env.TEMP_DIRECTORY,
+      AbsoluteDirectorySchema,
+      invalid,
+      null as string | null,
+    ),
+    ffmpegPath: readOptionalField(
+      "FFMPEG_PATH",
+      env.FFMPEG_PATH,
+      ExecutablePathSchema,
+      invalid,
+      null as string | null,
+    ),
+  };
+
+  if (
+    invalid.length > 0 ||
+    !dataDirectory.ok ||
+    !currentKeyId.ok ||
+    !currentSecret.ok ||
+    !accountId.ok ||
+    !bucket.ok ||
+    !accessKeyId.ok ||
+    !secretAccessKey.ok
+  ) {
+    throw new WorkerRuntimeConfigError(invalid);
+  }
+
+  return Object.freeze({
+    bindHost,
+    port,
+    dataDirectory: dataDirectory.value,
+    control: Object.freeze({
+      currentKeyId: currentKeyId.value,
+      currentSecret: currentSecret.value,
+      ...(previousKeyId !== undefined && previousSecret !== undefined
+        ? { previousKeyId, previousSecret }
+        : {}),
+    }),
+    r2: Object.freeze({
+      accountId: accountId.value,
+      bucket: bucket.value,
+      jurisdiction,
+      accessKeyId: accessKeyId.value,
+      secretAccessKey: secretAccessKey.value,
+      ...(sessionToken !== undefined ? { sessionToken } : {}),
+    }),
+    media: Object.freeze(media),
+  });
+}
