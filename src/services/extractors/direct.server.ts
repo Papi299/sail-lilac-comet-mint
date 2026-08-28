@@ -69,11 +69,21 @@ export const directExtractor: MediaExtractor = {
   },
 };
 
+/**
+ * Worker-side probe. Identical to the application probe except that an SSRF
+ * refusal during the optional HEAD is NOT swallowed: for Worker analysis, a
+ * redirect into a private address space is a hard rejection, not a missing
+ * content-length. Ordinary HEAD failures stay optional.
+ */
 export async function probeDirectWorker(url: string, signal?: AbortSignal): Promise<VideoMetadata> {
-  return _probeDirect(url, signal);
+  return _probeDirect(url, signal, { rejectUnsafeHeadRedirects: true });
 }
 
-async function _probeDirect(url: string, signal?: AbortSignal): Promise<VideoMetadata> {
+async function _probeDirect(
+  url: string,
+  signal?: AbortSignal,
+  opts?: { rejectUnsafeHeadRedirects?: boolean },
+): Promise<VideoMetadata> {
   const ext = extensionFromUrl(url) || "mp4";
   let contentLength: number | null = null;
   let contentType: string | null = null;
@@ -81,9 +91,16 @@ async function _probeDirect(url: string, signal?: AbortSignal): Promise<VideoMet
     const head = await safeHead(url, { timeoutMs: Math.min(config.analysisTimeoutMs, 20_000), signal });
     contentLength = parseLen(headerString(head.headers["content-length"]));
     contentType = headerString(head.headers["content-type"]);
-  } catch {
+  } catch (err) {
     if (signal?.aborted) {
       signal.throwIfAborted();
+    }
+    if (
+      opts?.rejectUnsafeHeadRedirects &&
+      err instanceof AppError &&
+      err.code === "INVALID_URL"
+    ) {
+      throw err;
     }
     // HEAD is optional; do not fetch the body during analyze, and never
     // pass a remote URL to FFmpeg.
@@ -123,6 +140,33 @@ async function _probeDirect(url: string, signal?: AbortSignal): Promise<VideoMet
   };
 }
 
+/**
+ * §5: Worker-safe original-media download primitive.
+ *
+ * Downloads the ORIGINAL direct media byte stream over the existing hardened,
+ * SSRF-pinned `safeGet` path and returns the local artifact plus the trusted
+ * source-derived metadata. It deliberately accepts NO formatId and NO
+ * preferredContainer, and it never runs FFmpeg or any conversion: Worker
+ * Phase-6 requires that all local processing happen strictly after the durable
+ * job has transitioned into `processing`.
+ */
+export async function downloadDirectOriginalWorker(
+  url: string,
+  ctx: DownloadContext,
+): Promise<{ filePath: string; container: string; mime: string; fileSize: number }> {
+  const ext = extensionFromUrl(url) || "bin";
+  const dest = join(ctx.workDir, `source.${ext}`);
+  await streamDownload(url, dest, ctx);
+  const st = await stat(dest);
+  if (st.size > config.maxFileSize) throw new AppError("TOO_LARGE");
+  return {
+    filePath: dest,
+    container: ext,
+    mime: mimeForContainer(ext),
+    fileSize: st.size,
+  };
+}
+
 async function downloadDirect(
   url: string,
   format: DownloadFormatRequest,
@@ -146,16 +190,6 @@ async function downloadDirect(
       signal: ctx.signal,
     });
     container = "mp3";
-  } else if (format.formatId === "preset:audio") {
-    ctx.onProgress?.({ progress: null, stage: "converting" });
-    filePath = await convertMedia({
-      inputPath: dest,
-      workDir: ctx.workDir,
-      target: "m4a",
-      timeoutMs: config.downloadTimeoutMs,
-      signal: ctx.signal,
-    });
-    container = "m4a";
   } else if (format.preferredContainer && format.preferredContainer !== ext) {
     const target = format.preferredContainer === "webm" ? "webm" : "mp4";
     ctx.onProgress?.({ progress: null, stage: "converting" });

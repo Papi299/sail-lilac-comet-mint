@@ -24,7 +24,9 @@ import {
   type CommitReadyResult,
   CommitReadyInputSchema,
   type ExpiredReadyObject,
-  ExpiredReadyObjectSchema
+  ExpiredReadyObjectSchema,
+  WorkerExecutionProgressStatusSchema,
+  type WorkerExecutionProgressStatus
 } from "./job-store.ts";
 import { generateIdempotencyFingerprint, WORKER_IDEMPOTENCY_MIN_RETENTION_MS } from "./idempotency.server.ts";
 
@@ -441,8 +443,12 @@ export class SQLiteJobStore implements WorkerJobStore {
     }
   }
 
-  updateExecutionProgress(jobId: string, expectedStatus: import("../../shared/worker/contracts.ts").WorkerJobStatus, input: UpdateProgressInput): ExecutionMutationResult {
+  updateExecutionProgress(jobId: string, expectedStatus: WorkerExecutionProgressStatus, input: UpdateProgressInput): ExecutionMutationResult {
+    // §15: every argument is validated BEFORE any transaction is opened.
+    // `queued` and the terminal states are not members of this enum, so they
+    // can never be used as a same-state progress-mutation target.
     const validJobId = WorkerJobIdSchema.parse(jobId);
+    const validExpectedStatus = WorkerExecutionProgressStatusSchema.parse(expectedStatus);
     const validated = UpdateProgressInputSchema.parse(input);
     const now = this.nowMs();
     this.db.exec("BEGIN IMMEDIATE");
@@ -458,7 +464,7 @@ export class SQLiteJobStore implements WorkerJobStore {
         this.db.exec("COMMIT");
         return { type: "terminal", job: durableJobToView(durableJob) };
       }
-      if (durableJob.status !== expectedStatus) {
+      if (durableJob.status !== validExpectedStatus) {
         this.db.exec("COMMIT");
         return { type: "state_conflict", job: durableJobToView(durableJob) };
       }
@@ -474,17 +480,21 @@ export class SQLiteJobStore implements WorkerJobStore {
             updated_at_ms = ?
         WHERE job_id = ? AND status = ?
       `);
-      const result = updateStmt.run(validated.progress, validated.downloadedBytes, validated.totalBytes, validated.speed, validated.eta, validated.stageLabel, now, validJobId, expectedStatus);
+      const result = updateStmt.run(validated.progress, validated.downloadedBytes, validated.totalBytes, validated.speed, validated.eta, validated.stageLabel, now, validJobId, validExpectedStatus);
       if (result.changes !== 1) {
         throw new Error("Failed to update progress");
       }
       const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(validJobId);
+      // §13: durable validation, then exact expected-status validation, then
+      // PUBLIC WorkerJobView validation — all strictly BEFORE COMMIT. Any
+      // failure here propagates to the catch block and ROLLBACKs.
       const resultingJob = rowToDurableJob(newRow);
-      if (resultingJob.status !== expectedStatus) {
+      if (resultingJob.status !== validExpectedStatus) {
         throw new Error("Job status changed unexpectedly during updateExecutionProgress");
       }
+      const view = durableJobToView(resultingJob);
       this.db.exec("COMMIT");
-      return { type: "updated", job: durableJobToView(resultingJob) };
+      return { type: "updated", job: view };
     } catch (e) {
       try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
       throw e;
@@ -531,12 +541,16 @@ export class SQLiteJobStore implements WorkerJobStore {
         throw new Error(`Failed to transition job to ${toState}`);
       }
       const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(validJobId);
+      // §14: durable validation, exact expected-status validation, and PUBLIC
+      // WorkerJobView validation all happen BEFORE COMMIT. The already-validated
+      // view is returned; it is never constructed for the first time post-commit.
       const resultingJob = rowToDurableJob(newRow);
       if (resultingJob.status !== toState) {
         throw new Error(`Job must be ${toState} after transition`);
       }
+      const view = durableJobToView(resultingJob);
       this.db.exec("COMMIT");
-      return { type: "updated", job: durableJobToView(resultingJob) };
+      return { type: "updated", job: view };
     } catch (e) {
       try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
       throw e;
