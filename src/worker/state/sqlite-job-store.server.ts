@@ -10,6 +10,11 @@ import {
 import { WorkerIdempotencyKeySchema } from "../../shared/worker/auth.ts";
 import { WorkerErrorCodeSchema } from "../../shared/worker/errors.ts";
 import {
+  CompleteAnalysisInputSchema,
+  UpdateProgressInputSchema,
+  type CompleteAnalysisInput,
+  type UpdateProgressInput,
+  type ExecutionMutationResult,
   type CreateJobResult,
   DurableWorkerJobSchema,
   type DurableWorkerJob,
@@ -19,7 +24,9 @@ import {
   type CommitReadyResult,
   CommitReadyInputSchema,
   type ExpiredReadyObject,
-  ExpiredReadyObjectSchema
+  ExpiredReadyObjectSchema,
+  WorkerExecutionProgressStatusSchema,
+  type WorkerExecutionProgressStatus
 } from "./job-store.ts";
 import { generateIdempotencyFingerprint, WORKER_IDEMPOTENCY_MIN_RETENTION_MS } from "./idempotency.server.ts";
 
@@ -381,6 +388,171 @@ export class SQLiteJobStore implements WorkerJobStore {
       return true;
     } catch (e) {
       try { this.db.exec("ROLLBACK"); } catch (_rollbackErr) { void _rollbackErr; }
+      throw e;
+    }
+  }
+
+
+  completeAnalysis(jobId: string, input: CompleteAnalysisInput): ExecutionMutationResult {
+    const validJobId = WorkerJobIdSchema.parse(jobId);
+    const validated = CompleteAnalysisInputSchema.parse(input);
+    const now = this.nowMs();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
+      const row = stmt.get(validJobId);
+      if (!row) {
+        this.db.exec("COMMIT");
+        return { type: "not_found" };
+      }
+      const durableJob = rowToDurableJob(row);
+      if (['ready', 'failed', 'cancelled'].includes(durableJob.status)) {
+        this.db.exec("COMMIT");
+        return { type: "terminal", job: durableJobToView(durableJob) };
+      }
+      if (durableJob.status !== 'analyzing') {
+        this.db.exec("COMMIT");
+        return { type: "state_conflict", job: durableJobToView(durableJob) };
+      }
+      
+      const updateStmt = this.db.prepare(`
+        UPDATE worker_jobs 
+        SET status = 'downloading',
+            title = ?,
+            thumbnail = ?,
+            source = ?,
+            extractor = ?,
+            updated_at_ms = ?
+        WHERE job_id = ? AND status = 'analyzing'
+      `);
+      const result = updateStmt.run(validated.title, validated.thumbnail, validated.source, validated.extractor, now, validJobId);
+      if (result.changes !== 1) {
+        throw new Error("Failed to transition job to downloading");
+      }
+      const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(validJobId);
+      const resultingJob = rowToDurableJob(newRow);
+      if (resultingJob.status !== 'downloading') {
+        throw new Error("Job must be downloading after completeAnalysis");
+      }
+      const view = durableJobToView(resultingJob);
+      this.db.exec("COMMIT");
+      return { type: "updated", job: view };
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
+      throw e;
+    }
+  }
+
+  updateExecutionProgress(jobId: string, expectedStatus: WorkerExecutionProgressStatus, input: UpdateProgressInput): ExecutionMutationResult {
+    // §15: every argument is validated BEFORE any transaction is opened.
+    // `queued` and the terminal states are not members of this enum, so they
+    // can never be used as a same-state progress-mutation target.
+    const validJobId = WorkerJobIdSchema.parse(jobId);
+    const validExpectedStatus = WorkerExecutionProgressStatusSchema.parse(expectedStatus);
+    const validated = UpdateProgressInputSchema.parse(input);
+    const now = this.nowMs();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
+      const row = stmt.get(validJobId);
+      if (!row) {
+        this.db.exec("COMMIT");
+        return { type: "not_found" };
+      }
+      const durableJob = rowToDurableJob(row);
+      if (['ready', 'failed', 'cancelled'].includes(durableJob.status)) {
+        this.db.exec("COMMIT");
+        return { type: "terminal", job: durableJobToView(durableJob) };
+      }
+      if (durableJob.status !== validExpectedStatus) {
+        this.db.exec("COMMIT");
+        return { type: "state_conflict", job: durableJobToView(durableJob) };
+      }
+      
+      const updateStmt = this.db.prepare(`
+        UPDATE worker_jobs 
+        SET progress = ?,
+            downloaded_bytes = ?,
+            total_bytes = ?,
+            speed = ?,
+            eta = ?,
+            stage_label = ?,
+            updated_at_ms = ?
+        WHERE job_id = ? AND status = ?
+      `);
+      const result = updateStmt.run(validated.progress, validated.downloadedBytes, validated.totalBytes, validated.speed, validated.eta, validated.stageLabel, now, validJobId, validExpectedStatus);
+      if (result.changes !== 1) {
+        throw new Error("Failed to update progress");
+      }
+      const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(validJobId);
+      // §13: durable validation, then exact expected-status validation, then
+      // PUBLIC WorkerJobView validation — all strictly BEFORE COMMIT. Any
+      // failure here propagates to the catch block and ROLLBACKs.
+      const resultingJob = rowToDurableJob(newRow);
+      if (resultingJob.status !== validExpectedStatus) {
+        throw new Error("Job status changed unexpectedly during updateExecutionProgress");
+      }
+      const view = durableJobToView(resultingJob);
+      this.db.exec("COMMIT");
+      return { type: "updated", job: view };
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
+      throw e;
+    }
+  }
+
+  beginProcessing(jobId: string): ExecutionMutationResult {
+    return this._transitionExecutionState(jobId, 'downloading', 'processing');
+  }
+
+  beginUploading(jobId: string): ExecutionMutationResult {
+    return this._transitionExecutionState(jobId, 'processing', 'uploading');
+  }
+
+  private _transitionExecutionState(jobId: string, fromState: import("../../shared/worker/contracts.ts").WorkerJobStatus, toState: import("../../shared/worker/contracts.ts").WorkerJobStatus): ExecutionMutationResult {
+    const validJobId = WorkerJobIdSchema.parse(jobId);
+    const now = this.nowMs();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
+      const row = stmt.get(validJobId);
+      if (!row) {
+        this.db.exec("COMMIT");
+        return { type: "not_found" };
+      }
+      const durableJob = rowToDurableJob(row);
+      if (['ready', 'failed', 'cancelled'].includes(durableJob.status)) {
+        this.db.exec("COMMIT");
+        return { type: "terminal", job: durableJobToView(durableJob) };
+      }
+      if (durableJob.status !== fromState) {
+        this.db.exec("COMMIT");
+        return { type: "state_conflict", job: durableJobToView(durableJob) };
+      }
+      
+      const updateStmt = this.db.prepare(`
+        UPDATE worker_jobs 
+        SET status = ?,
+            updated_at_ms = ?
+        WHERE job_id = ? AND status = ?
+      `);
+      const result = updateStmt.run(toState, now, validJobId, fromState);
+      if (result.changes !== 1) {
+        throw new Error(`Failed to transition job to ${toState}`);
+      }
+      const newRow = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(validJobId);
+      // §14: durable validation, exact expected-status validation, and PUBLIC
+      // WorkerJobView validation all happen BEFORE COMMIT. The already-validated
+      // view is returned; it is never constructed for the first time post-commit.
+      const resultingJob = rowToDurableJob(newRow);
+      if (resultingJob.status !== toState) {
+        throw new Error(`Job must be ${toState} after transition`);
+      }
+      const view = durableJobToView(resultingJob);
+      this.db.exec("COMMIT");
+      return { type: "updated", job: view };
+    } catch (e) {
+      try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
       throw e;
     }
   }
