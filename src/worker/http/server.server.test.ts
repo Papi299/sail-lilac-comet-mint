@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { request } from "node:http";
 import net from "node:net";
 import { WorkerAuthenticationError } from "../security/authenticate.server.ts";
+import type { WorkerBusinessService } from "./business-service.server.ts";
 
 class MockReplayStore implements WorkerReplayStore {
   public reserved = new Set<string>();
@@ -25,6 +26,82 @@ class MockReplayStore implements WorkerReplayStore {
 }
 
 const secret = "0123456789abcdef0123456789abcdef";
+
+/**
+ * Counts business dispatches so the security-ordering tests can prove that an
+ * unauthenticated or replayed request never reaches the business boundary.
+ */
+class SpyBusinessService implements WorkerBusinessService {
+  public calls: string[] = [];
+
+  async analyze() {
+    this.calls.push("analyze");
+    return { success: true as const, video: SAMPLE_VIDEO };
+  }
+  async createJob() {
+    this.calls.push("createJob");
+    return { status: 201 as const, body: { success: true as const, job: sampleJob("queued") } };
+  }
+  async getJob() {
+    this.calls.push("getJob");
+    return { success: true as const, job: sampleJob("queued") };
+  }
+  async cancelJob() {
+    this.calls.push("cancelJob");
+    return { success: true as const, job: sampleJob("cancelled") };
+  }
+  async diagnostics() {
+    this.calls.push("diagnostics");
+    return {
+      status: "ok" as const,
+      queueDepth: 0,
+      runningJobs: 0,
+      maxConcurrent: 1,
+      binaries: { ffmpeg: true, ytdlp: false },
+      safeEgress: { attested: false, policyVersion: null },
+    };
+  }
+}
+
+const SAMPLE_VIDEO = {
+  title: "Clip",
+  thumbnail: null,
+  duration: null,
+  source: "cdn.example",
+  extractor: "direct",
+  webpageUrl: "https://cdn.example/a.mp4",
+  formats: [],
+  presets: [],
+  capabilities: { mp3: false, merge: false },
+};
+
+function sampleJob(status: "queued" | "cancelled") {
+  return {
+    jobId: "0123456789abcdef0123456789abcdef",
+    status,
+    progress: null,
+    stageLabel: null,
+    downloadedBytes: null,
+    totalBytes: null,
+    speed: null,
+    eta: null,
+    errorCode: null,
+    safeErrorMessage: null,
+    filename: null,
+    fileSize: null,
+    mime: null,
+    quality: null,
+    container: null,
+    title: null,
+    thumbnail: null,
+    source: null,
+    extractor: null,
+    createdAt: 1,
+    updatedAt: 1,
+    expiresAt: 2,
+    objectKey: null,
+  };
+}
 
 function generateAuthHeaders(method: string, path: string, body: Buffer, requestId: string, timestamp: number, idempotencyKey?: string) {
   const sha256RawBody = createHash("sha256").update(body).digest("hex");
@@ -102,13 +179,17 @@ function makeRawRequest(server: Server, requestString: string): Promise<{ status
 
 test("Worker HTTP Server", async (t) => {
   const replayStore = new MockReplayStore();
+  const businessService = new SpyBusinessService();
   const now = 1700000000;
-  const server = createWorkerServer({
-    currentKeyId: "key-1",
-    currentSecret: secret,
-    replayStore,
-    clock: () => now,
-  });
+  const server = createWorkerServer(
+    {
+      currentKeyId: "key-1",
+      currentSecret: secret,
+      replayStore,
+      clock: () => now,
+    },
+    businessService,
+  );
 
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => server.close());
@@ -116,6 +197,7 @@ test("Worker HTTP Server", async (t) => {
   t.beforeEach(() => {
     replayStore.reserved.clear();
     replayStore.shouldThrow = false;
+    businessService.calls = [];
   });
 
   await t.test("GET /v1/healthz is unauthenticated and 200", async () => {
@@ -126,16 +208,17 @@ test("Worker HTTP Server", async (t) => {
   });
 
   await t.test("Exact method/path regression matrix", async () => {
+    // The authenticated business routes are LIVE: they must never answer 501.
     const tests = [
-      { method: "POST", path: "/v1/analyze", expected: 501, type: "analyze" },
+      { method: "POST", path: "/v1/analyze", expected: 200, type: "analyze" },
       { method: "GET", path: "/v1/analyze", expected: 405, type: "analyze" },
-      { method: "POST", path: "/v1/jobs", expected: 501, type: "jobs_create" },
+      { method: "POST", path: "/v1/jobs", expected: 201, type: "jobs_create" },
       { method: "GET", path: "/v1/jobs", expected: 405, type: "jobs_create" },
-      { method: "GET", path: "/v1/jobs/0123456789abcdef0123456789abcdef", expected: 501, type: "jobs_get" },
+      { method: "GET", path: "/v1/jobs/0123456789abcdef0123456789abcdef", expected: 200, type: "jobs_get" },
       { method: "POST", path: "/v1/jobs/0123456789abcdef0123456789abcdef", expected: 405, type: "jobs_get" },
-      { method: "POST", path: "/v1/jobs/0123456789abcdef0123456789abcdef/cancel", expected: 501, type: "jobs_cancel" },
+      { method: "POST", path: "/v1/jobs/0123456789abcdef0123456789abcdef/cancel", expected: 200, type: "jobs_cancel" },
       { method: "GET", path: "/v1/jobs/0123456789abcdef0123456789abcdef/cancel", expected: 405, type: "jobs_cancel" },
-      { method: "GET", path: "/v1/diagnostics", expected: 501, type: "diagnostics" },
+      { method: "GET", path: "/v1/diagnostics", expected: 200, type: "diagnostics" },
       { method: "POST", path: "/v1/diagnostics", expected: 405, type: "diagnostics" },
       { method: "GET", path: "/v1/healthz", expected: 200, type: "health" },
       { method: "POST", path: "/v1/healthz", expected: 405, type: "health" },
@@ -159,6 +242,7 @@ test("Worker HTTP Server", async (t) => {
         }
         const res = await makeRequest(server, method, path, headers, body);
         assert.strictEqual(res.status, expected, `${method} ${path} failed`);
+        assert.notStrictEqual(res.status, 501, `${method} ${path} still returns a 501 placeholder`);
       }
     }
   });
@@ -273,6 +357,43 @@ test("Worker HTTP Server", async (t) => {
       const res = await makeRawRequest(server, `GET ${target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
       assert.notStrictEqual(res.status, 200, `Expected failure for ${target}`);
     }
+  });
+
+  await t.test("Invalid HMAC never reaches the business service", async () => {
+    const body = Buffer.from(JSON.stringify({ url: "https://cdn.example/a.mp4" }));
+    const headers = generateAuthHeaders("POST", "/v1/analyze", body, "12121212-1212-4121-a121-121212121212", now);
+    headers["content-type"] = "application/json";
+    headers["x-videofetch-signature"] = "0".repeat(64);
+
+    const res = await makeRequest(server, "POST", "/v1/analyze", headers, body);
+    assert.strictEqual(res.status, 401);
+    assert.deepStrictEqual(businessService.calls, []);
+  });
+
+  await t.test("Replayed request never reaches the business service", async () => {
+    const body = Buffer.from(JSON.stringify({ url: "https://cdn.example/a.mp4" }));
+    const reqId = "13131313-1313-4131-a131-131313131313";
+    const headers = generateAuthHeaders("POST", "/v1/analyze", body, reqId, now);
+    headers["content-type"] = "application/json";
+
+    const first = await makeRequest(server, "POST", "/v1/analyze", headers, body);
+    assert.strictEqual(first.status, 200);
+    assert.deepStrictEqual(businessService.calls, ["analyze"]);
+
+    const replay = await makeRequest(server, "POST", "/v1/analyze", headers, body);
+    assert.strictEqual(replay.status, 401);
+    // Still exactly one dispatch: the replay was stopped before business logic.
+    assert.deepStrictEqual(businessService.calls, ["analyze"]);
+  });
+
+  await t.test("Business responses are no-store JSON and never expose 501", async () => {
+    const body = Buffer.from("");
+    const headers = generateAuthHeaders("GET", "/v1/diagnostics", body, "14141414-1414-4141-a141-141414141414", now);
+    const res = await makeRequest(server, "GET", "/v1/diagnostics", headers);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers["cache-control"], "no-store");
+    assert.match(res.headers["content-type"], /application\/json/);
+    assert.strictEqual(JSON.parse(res.body).maxConcurrent, 1);
   });
 
   await t.test("Signed request with mismatched raw target fails", async () => {

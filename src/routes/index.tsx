@@ -70,14 +70,22 @@ function Downloader() {
               completedAt: Date.now(),
             });
             setHistory(loadHistory());
-          } else if (next.status === "failed") {
+          } else if (next.status === "failed" || next.status === "cancelled") {
+            // `cancelled` is terminal: polling stops here and the job renders
+            // through the existing terminal/error card with a canonical
+            // message. No cancellation UI is introduced in this phase.
             setPhase("error");
-            setError(next.error || "We couldn't process this video. Try another format or source.");
+            setError(
+              next.error ||
+                (next.status === "cancelled"
+                  ? "This download was cancelled."
+                  : "We couldn't process this video. Try another format or source."),
+            );
             saveHistoryItem({
               jobId,
               title: next.title || video?.title || "Video",
               thumbnail: next.thumbnail || video?.thumbnail || null,
-              status: "failed",
+              status: next.status,
               format: next.container,
               quality: next.quality,
               completedAt: Date.now(),

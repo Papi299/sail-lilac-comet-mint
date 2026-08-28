@@ -1,9 +1,5 @@
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
-import { Readable } from "node:stream";
 import { config } from "@/lib/config";
-import { AppError, jsonError } from "@/lib/errors";
-import { buildAttachmentContentDisposition } from "@/lib/filenames";
+import { AppError, ERROR_MESSAGES, jsonError, type ErrorCode } from "@/lib/errors";
 import { SITE_CATALOG } from "@/lib/sites-catalog";
 import { consumeRateLimit } from "@/lib/security/rate-limit.server";
 import { assertSafeUrl } from "@/lib/security/ssrf.server";
@@ -19,70 +15,47 @@ import {
   serializeAccessCookie,
   serializeClearedAccessCookie,
 } from "@/lib/security/private-access.server";
+import { WORKER_PRIVATE_PRINCIPAL } from "@/shared/worker/constants";
+import { WorkerAnalyzeRequestSchema, WorkerJobIdSchema } from "@/shared/worker/contracts";
 import {
-  analyzeVideo as analyzeVideoImpl,
-  diagnosticsSnapshot as diagnosticsSnapshotImpl,
-  enqueueDownload as enqueueDownloadImpl,
-  getJobOrThrow as getJobOrThrowImpl,
-  getPublicJob as getPublicJobImpl,
-} from "@/services/downloads/manager.server";
-import { listExtractors } from "@/services/extractors/registry.server";
-import { ytdlpAvailable } from "@/services/extractors/ytdlp.server";
-import { ffmpegAvailable } from "@/services/processing/ffmpeg.server";
+  getObjectStoreSigner,
+  getWorkerClient,
+} from "@/web/config/worker-runtime.server";
+import { toPublicJob } from "@/web/jobs/public-job";
 
-type AnalyzeOp = typeof analyzeVideoImpl;
-type EnqueueOp = typeof enqueueDownloadImpl;
-type PublicJobOp = typeof getPublicJobImpl;
-type JobOrThrowOp = typeof getJobOrThrowImpl;
-type DiagnosticsOp = typeof diagnosticsSnapshotImpl;
+/**
+ * Vercel control plane.
+ *
+ * This module owns browser authentication, browser-facing validation, rate
+ * limiting, initial URL validation, and public DTO adaptation. It performs NO
+ * media work: there is no in-process manager, no extractor registry, no
+ * yt-dlp, no FFmpeg, no temp filesystem, and no local file streaming. Every
+ * media operation crosses the authenticated HMAC boundary to the Worker, and
+ * there is no production fallback to the legacy local path.
+ */
+
 type SitesOp = () => Promise<unknown>;
 
-let analyzeOp: AnalyzeOp = analyzeVideoImpl;
-let enqueueOp: EnqueueOp = enqueueDownloadImpl;
-let publicJobOp: PublicJobOp = getPublicJobImpl;
-let jobOrThrowOp: JobOrThrowOp = getJobOrThrowImpl;
-let diagnosticsOp: DiagnosticsOp = diagnosticsSnapshotImpl;
 let sitesOp: SitesOp = loadSites;
-
-export function setAnalyzeOperationForTests(fn: AnalyzeOp | null): void {
-  analyzeOp = fn ?? analyzeVideoImpl;
-}
-
-export function setEnqueueOperationForTests(fn: EnqueueOp | null): void {
-  enqueueOp = fn ?? enqueueDownloadImpl;
-}
-
-export function setPublicJobOperationForTests(fn: PublicJobOp | null): void {
-  publicJobOp = fn ?? getPublicJobImpl;
-}
-
-export function setJobOrThrowOperationForTests(fn: JobOrThrowOp | null): void {
-  jobOrThrowOp = fn ?? getJobOrThrowImpl;
-}
-
-export function setDiagnosticsOperationForTests(fn: DiagnosticsOp | null): void {
-  diagnosticsOp = fn ?? diagnosticsSnapshotImpl;
-}
 
 export function setSitesOperationForTests(fn: SitesOp | null): void {
   sitesOp = fn ?? loadSites;
 }
 
 export function resetPrivateAccessApiForTests(): void {
-  analyzeOp = analyzeVideoImpl;
-  enqueueOp = enqueueDownloadImpl;
-  publicJobOp = getPublicJobImpl;
-  jobOrThrowOp = getJobOrThrowImpl;
-  diagnosticsOp = diagnosticsSnapshotImpl;
   sitesOp = loadSites;
 }
 
+/**
+ * Capability information comes from authenticated Worker diagnostics plus the
+ * static catalog. The control plane deliberately holds no local extractor
+ * registry or binary probe of its own.
+ */
 async function loadSites() {
-  const [ytdlp, ffmpeg] = await Promise.all([ytdlpAvailable(), ffmpegAvailable()]);
+  const diagnostics = await getWorkerClient().diagnostics();
   return {
-    extractors: listExtractors(),
-    ytdlp,
-    ffmpeg,
+    ytdlp: diagnostics.binaries.ytdlp,
+    ffmpeg: diagnostics.binaries.ffmpeg,
     sites: SITE_CATALOG,
     note: "Support depends on each website’s delivery method and can change without notice. Direct media files and publicly accessible archive sources are the most reliable.",
   };
@@ -90,6 +63,44 @@ async function loadSites() {
 
 function jsonNoStore(body: unknown, status = 200, extra?: Record<string, string>): Response {
   return Response.json(body, { status, headers: noStoreHeaders(extra) });
+}
+
+/**
+ * Browser-facing error responder for every handler that crosses the Worker or
+ * object-store boundary.
+ *
+ * Unlike `jsonError`, this NEVER serializes an AppError's own message: the
+ * response always carries the canonical `ERROR_MESSAGES[code]`. A worker or
+ * signer failure whose message happens to embed an object key, a bucket, a
+ * host, or a stack fragment therefore cannot reach the browser.
+ */
+function safeJsonError(err: unknown, fallback: ErrorCode): Response {
+  const code = err instanceof AppError ? err.code : fallback;
+  const status = err instanceof AppError ? err.status : undefined;
+  return jsonError(new AppError(code, ERROR_MESSAGES[code], status), fallback);
+}
+
+/**
+ * Vercel-side initial URL validation, then a fail-closed check that the URL is
+ * one the Worker contract can even accept. The Worker validates independently
+ * again on its own side.
+ */
+async function validateBrowserUrl(raw: unknown): Promise<string> {
+  const url = typeof raw === "string" ? raw : "";
+  const safe = await assertSafeUrl(url);
+  const parsed = WorkerAnalyzeRequestSchema.safeParse({ url: safe.url });
+  if (!parsed.success) {
+    throw new AppError("INVALID_URL");
+  }
+  return parsed.data.url;
+}
+
+function validateJobId(raw: string): string {
+  const parsed = WorkerJobIdSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new AppError("NOT_FOUND");
+  }
+  return parsed.data;
 }
 
 export async function handleAccessSession(request: Request): Promise<Response> {
@@ -140,12 +151,11 @@ export async function handleAnalyze(request: Request): Promise<Response> {
       throw new AppError("RATE_LIMITED");
     }
     const body = (await request.json().catch(() => null)) as { url?: unknown } | null;
-    const url = typeof body?.url === "string" ? body.url : "";
-    const safe = await assertSafeUrl(url);
-    const video = await analyzeOp(safe.url);
-    return Response.json({ success: true, video });
+    const url = await validateBrowserUrl(body?.url);
+    const result = await getWorkerClient().analyze({ url });
+    return Response.json({ success: true, video: result.video });
   } catch (err) {
-    return jsonError(err instanceof Error ? err : new Error("analyze"), "ANALYSIS_FAILED");
+    return safeJsonError(err, "ANALYSIS_FAILED");
   }
 }
 
@@ -155,61 +165,84 @@ export async function handleDownload(request: Request): Promise<Response> {
     if (!consumeRateLimit(`download:${principal.id}`, Math.max(8, Math.floor(config.rateLimitPerMinute / 2)))) {
       throw new AppError("RATE_LIMITED");
     }
+    // `title`, `thumbnail` and `source` may still be sent by older clients.
+    // They are accepted and ignored: Worker analysis is authoritative for job
+    // metadata, so browser-supplied values are never forwarded.
     const body = (await request.json().catch(() => null)) as {
       url?: unknown;
       formatId?: unknown;
-      title?: unknown;
-      thumbnail?: unknown;
-      source?: unknown;
     } | null;
-    const url = typeof body?.url === "string" ? body.url : "";
     const formatId = typeof body?.formatId === "string" ? body.formatId : "";
     if (!formatId) throw new AppError("FORMAT_UNAVAILABLE");
-    const safe = await assertSafeUrl(url);
-    const job = await enqueueOp({
-      url: safe.url,
+    const url = await validateBrowserUrl(body?.url);
+
+    const created = await getWorkerClient().createJob({
+      url,
       formatId,
-      principalId: principal.id,
-      title: typeof body?.title === "string" ? body.title : null,
-      thumbnail: typeof body?.thumbnail === "string" ? body.thumbnail : null,
-      source: typeof body?.source === "string" ? body.source : null,
+      // Server-derived. The browser can never choose the principal, and the
+      // Idempotency-Key is generated inside WorkerClient, never by the browser.
+      principalId: WORKER_PRIVATE_PRINCIPAL,
     });
-    return Response.json(job);
+
+    return Response.json(toPublicJob(created.job, Date.now()));
   } catch (err) {
-    return jsonError(err instanceof Error ? err : new Error("download"), "PROCESSING_FAILED");
+    return safeJsonError(err, "PROCESSING_FAILED");
   }
 }
 
 export async function handleDownloadStatus(request: Request, jobId: string): Promise<Response> {
   try {
     requirePrivateAccess(request);
-    const job = publicJobOp(jobId);
-    if (!job) throw new AppError("NOT_FOUND");
-    return Response.json(job);
+    const validId = validateJobId(jobId);
+    const result = await getWorkerClient().getJob(validId);
+    return Response.json(toPublicJob(result.job, Date.now()));
   } catch (err) {
-    return jsonError(err instanceof Error ? err : new Error("status"), "NOT_FOUND");
+    return safeJsonError(err, "NOT_FOUND");
   }
 }
 
+/**
+ * Authorized file delivery.
+ *
+ * Vercel never touches the bytes. It authorizes, confirms the job is ready and
+ * unexpired, and redirects to a short-lived object-store GET signature. The
+ * signed URL appears ONLY in the Location header: it is never placed in JSON,
+ * never persisted, and never logged.
+ */
 export async function handleDownloadFile(request: Request, jobId: string): Promise<Response> {
   try {
     requirePrivateAccess(request);
-    const job = jobOrThrowOp(jobId);
-    if (job.status !== "ready" || !job.outputPath) {
+    const validId = validateJobId(jobId);
+    const { job } = await getWorkerClient().getJob(validId);
+
+    if (job.status !== "ready") {
       throw new AppError("NOT_FOUND");
     }
-    const fileStat = await stat(job.outputPath);
-    const stream = Readable.toWeb(createReadStream(job.outputPath)) as ReadableStream<Uint8Array>;
-    return new Response(stream, {
+    if (Date.now() >= job.expiresAt) {
+      throw new AppError("EXPIRED");
+    }
+    // Server-only. Present on this boundary because it is the authenticated
+    // Vercel-to-Worker view; it must not travel any further.
+    const objectKey = job.objectKey;
+    if (!objectKey) {
+      throw new AppError("NOT_FOUND");
+    }
+
+    const signed = await getObjectStoreSigner().signGet({
+      objectKey,
+      expiresAt: job.expiresAt,
+    });
+
+    return new Response(null, {
+      status: 303,
       headers: {
-        "Content-Type": job.outputMime || "application/octet-stream",
-        "Content-Length": String(fileStat.size),
-        "Content-Disposition": buildAttachmentContentDisposition(job.filename || "video.bin"),
+        Location: signed.url,
         "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
       },
     });
   } catch (err) {
-    return jsonError(err instanceof Error ? err : new Error("file"), "NOT_FOUND");
+    return safeJsonError(err, "NOT_FOUND");
   }
 }
 
@@ -218,16 +251,16 @@ export async function handleSites(request: Request): Promise<Response> {
     requirePrivateAccess(request);
     return Response.json(await sitesOp());
   } catch (err) {
-    return jsonError(err instanceof Error ? err : new Error("sites"), "ACCESS_REQUIRED");
+    return safeJsonError(err, "ACCESS_REQUIRED");
   }
 }
 
 export async function handleDiagnostics(request: Request): Promise<Response> {
   try {
     requireConfiguredPrivateAccess(request);
-    const data = await diagnosticsOp();
+    const data = await getWorkerClient().diagnostics();
     return jsonNoStore(data);
   } catch (err) {
-    return jsonError(err instanceof Error ? err : new Error("diagnostics"), "ACCESS_REQUIRED");
+    return safeJsonError(err, "ACCESS_REQUIRED");
   }
 }

@@ -10,6 +10,8 @@ import {
 } from "../../shared/worker/constants.ts";
 import { WorkerAnalyzeRequestSchema, WorkerCreateJobRequestSchema, WorkerJobIdSchema } from "../../shared/worker/contracts.ts";
 import { WorkerIdempotencyKeySchema } from "../../shared/worker/auth.ts";
+import type { WorkerBusinessService } from "./business-service.server.ts";
+import { toWorkerErrorEnvelope } from "./errors.server.ts";
 
 function sendJson(res: ServerResponse, statusCode: number, payload: any) {
   const data = JSON.stringify(payload);
@@ -95,7 +97,10 @@ function parseWorkerRoute(rawTarget: string, method: string): ParsedRoute | { er
   return { error: 404, message: "Not Found" };
 }
 
-export function createWorkerServer(authConfig: WorkerAuthConfig): Server {
+export function createWorkerServer(
+  authConfig: WorkerAuthConfig,
+  service: WorkerBusinessService,
+): Server {
   const authenticator = new WorkerAuthenticator(authConfig);
 
   return createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -187,6 +192,9 @@ export function createWorkerServer(authConfig: WorkerAuthConfig): Server {
       const contentType = req.headers["content-type"]?.split(";")[0]?.trim();
       const requiresJson = routeCategory === "analyze" || routeCategory === "jobs_create";
 
+      let analyzeRequest: ReturnType<typeof WorkerAnalyzeRequestSchema.parse> | null = null;
+      let createRequest: ReturnType<typeof WorkerCreateJobRequestSchema.parse> | null = null;
+
       if (requiresJson) {
         if (contentType !== "application/json") {
           return sendError(res, 415, "Unsupported Media Type");
@@ -203,11 +211,13 @@ export function createWorkerServer(authConfig: WorkerAuthConfig): Server {
           if (!resParse.success) {
             return sendError(res, 400, "Bad Request");
           }
+          analyzeRequest = resParse.data;
         } else if (routeCategory === "jobs_create") {
           const resParse = WorkerCreateJobRequestSchema.safeParse(parsedJson);
           if (!resParse.success) {
             return sendError(res, 400, "Bad Request");
           }
+          createRequest = resParse.data;
         }
       } else {
         if (rawBody.length > 0) {
@@ -215,8 +225,34 @@ export function createWorkerServer(authConfig: WorkerAuthConfig): Server {
         }
       }
 
-      // 6. Temporary Business Placeholders
-      return sendError(res, 501, "Not Implemented");
+      // 6. Business dispatch. Everything above this line is the Phase-2
+      // security boundary and must keep its exact ordering. Business failures
+      // are classified into the shared allowlist and never leak raw text.
+      const routedJobId = routeResult.jobId;
+      try {
+        if (routeCategory === "analyze" && analyzeRequest) {
+          return sendJson(res, 200, await service.analyze(analyzeRequest));
+        }
+        if (routeCategory === "jobs_create" && createRequest && idempotencyKey) {
+          const created = await service.createJob(createRequest, idempotencyKey);
+          return sendJson(res, created.status, created.body);
+        }
+        if (routeCategory === "jobs_get" && routedJobId) {
+          return sendJson(res, 200, await service.getJob(routedJobId));
+        }
+        if (routeCategory === "jobs_cancel" && routedJobId) {
+          return sendJson(res, 200, await service.cancelJob(routedJobId));
+        }
+        if (routeCategory === "diagnostics") {
+          return sendJson(res, 200, await service.diagnostics());
+        }
+      } catch (err: unknown) {
+        const envelope = toWorkerErrorEnvelope(err);
+        return sendJson(res, envelope.status, envelope.body);
+      }
+
+      // Unreachable: every parsed category is dispatched above.
+      return sendError(res, 500, "Internal Server Error");
 
     } catch {
       return sendError(res, 500, "Internal Server Error");

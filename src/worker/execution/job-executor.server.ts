@@ -108,6 +108,11 @@ export class JobExecutor {
     this.processLocally = deps.processLocally ?? convertMedia;
   }
 
+  /** Number of executions currently holding an AbortController (§11 diagnostics). */
+  public get activeJobCount(): number {
+    return this.activeControllers.size;
+  }
+
   public cancel(jobId: string): CancelJobResult {
     const res = this.store.cancelJob(jobId);
     if (res.type === "cancelled") {

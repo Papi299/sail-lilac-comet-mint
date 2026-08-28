@@ -1,12 +1,22 @@
+/**
+ * Browser-facing job status.
+ *
+ * `uploading` and `cancelled` are Worker states and must be handled as
+ * first-class values, not as unknown. `merging` / `converting` remain only
+ * because the legacy in-process stack still declares them; the Worker adapter
+ * never produces either.
+ */
 export type JobStatusName =
   | "queued"
   | "analyzing"
   | "downloading"
   | "processing"
+  | "uploading"
   | "merging"
   | "converting"
   | "ready"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export type JobProgress = {
   status: JobStatusName;
