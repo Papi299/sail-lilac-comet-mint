@@ -56,6 +56,10 @@ describe("CloudflareR2ObjectStoreWriter", () => {
     assert.throws(() => new CloudflareR2ObjectStoreWriter({ ...validConfig, bucket: "abc.def" }), CloudflareR2Error);
   });
 
+  it("bucket with underscore", () => {
+    assert.throws(() => new CloudflareR2ObjectStoreWriter({ ...validConfig, bucket: "abc_def" }), CloudflareR2Error);
+  });
+
   it("leading hyphen bucket", () => {
     assert.throws(() => new CloudflareR2ObjectStoreWriter({ ...validConfig, bucket: "-abc" }), CloudflareR2Error);
   });
@@ -64,11 +68,23 @@ describe("CloudflareR2ObjectStoreWriter", () => {
     assert.throws(() => new CloudflareR2ObjectStoreWriter({ ...validConfig, bucket: "abc-" }), CloudflareR2Error);
   });
 
-  it("too short bucket", () => {
+  it("1-char bucket -> rejected", () => {
+    assert.throws(() => new CloudflareR2ObjectStoreWriter({ ...validConfig, bucket: "a" }), CloudflareR2Error);
+  });
+
+  it("2-char bucket -> rejected", () => {
     assert.throws(() => new CloudflareR2ObjectStoreWriter({ ...validConfig, bucket: "ab" }), CloudflareR2Error);
   });
 
-  it("too long bucket", () => {
+  it("3-char bucket -> accepted", () => {
+    assert.doesNotThrow(() => new CloudflareR2ObjectStoreWriter({ ...validConfig, bucket: "abc" }));
+  });
+
+  it("63-char valid bucket -> accepted", () => {
+    assert.doesNotThrow(() => new CloudflareR2ObjectStoreWriter({ ...validConfig, bucket: "a" + "-".repeat(61) + "b" }));
+  });
+
+  it("64-char bucket -> rejected", () => {
     assert.throws(() => new CloudflareR2ObjectStoreWriter({ ...validConfig, bucket: "a".repeat(64) }), CloudflareR2Error);
   });
 

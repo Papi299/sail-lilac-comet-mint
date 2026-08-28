@@ -6,7 +6,7 @@ import { z } from "zod";
 
 export const CloudflareR2ConfigSchema = z.object({
   accountId: z.string().regex(/^[a-f0-9]{32}$/, "Account ID must be 32 lowercase hex characters"),
-  bucket: z.string().regex(/^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$/, "Invalid bucket name"),
+  bucket: z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/, "Invalid bucket name"),
   jurisdiction: z.enum(["default", "eu", "us"]).optional().default("default"),
   accessKeyId: z.string().min(1).max(8192),
   secretAccessKey: z.string().min(1).max(8192),
