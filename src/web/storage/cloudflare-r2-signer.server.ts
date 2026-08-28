@@ -7,7 +7,7 @@ import type { ObjectStoreSigner } from "./object-store-signer.server.ts";
 
 export const CloudflareR2SignerConfigSchema = z.object({
   accountId: z.string().regex(/^[a-f0-9]{32}$/, "accountId must be 32 hex lowercase chars"),
-  bucket: z.string().regex(/^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$/, "bucket must be 3-63 lowercase alphanumeric or hyphens, no leading/trailing hyphen"),
+  bucket: z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/, "bucket must be 3-63 lowercase alphanumeric or hyphens, no leading/trailing hyphen"),
   jurisdiction: z.enum(["default", "eu", "us"]).default("default"),
   accessKeyId: z.string().min(1).max(8192),
   secretAccessKey: z.string().min(1).max(8192),
@@ -133,6 +133,21 @@ export class CloudflareR2Signer implements ObjectStoreSigner {
     }
 
     const searchParams = url.searchParams;
+    
+    for (const key of searchParams.keys()) {
+      const lowerKey = key.toLowerCase();
+      if (
+        lowerKey === "response-content-disposition" ||
+        lowerKey === "response-content-type" ||
+        lowerKey === "response-cache-control" ||
+        lowerKey === "response-content-language" ||
+        lowerKey === "response-content-encoding" ||
+        lowerKey === "response-expires"
+      ) {
+        throw new AppError("PROCESSING_FAILED");
+      }
+    }
+
     const amzExpires = searchParams.getAll("X-Amz-Expires");
     if (amzExpires.length !== 1) {
       throw new AppError("PROCESSING_FAILED");

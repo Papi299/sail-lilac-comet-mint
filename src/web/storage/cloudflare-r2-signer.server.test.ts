@@ -107,3 +107,223 @@ describe("CloudflareR2Signer", () => {
     assert.ok(res.url.includes("X-Amz-Expires=60"));
   });
 });
+
+describe("R2 config tests", () => {
+  const baseConfig = {
+    accountId: "00000000000000000000000000000000",
+    accessKeyId: "test",
+    secretAccessKey: "test",
+  };
+
+  it("valid 3-char bucket", () => {
+    new CloudflareR2Signer({ ...baseConfig, bucket: "abc" });
+  });
+
+  it("1-char bucket", () => {
+    assert.throws(() => new CloudflareR2Signer({ ...baseConfig, bucket: "a" }));
+  });
+
+  it("2-char bucket", () => {
+    assert.throws(() => new CloudflareR2Signer({ ...baseConfig, bucket: "ab" }));
+  });
+
+  it("leading hyphen", () => {
+    assert.throws(() => new CloudflareR2Signer({ ...baseConfig, bucket: "-abc" }));
+  });
+
+  it("trailing hyphen", () => {
+    assert.throws(() => new CloudflareR2Signer({ ...baseConfig, bucket: "abc-" }));
+  });
+
+  it("uppercase", () => {
+    assert.throws(() => new CloudflareR2Signer({ ...baseConfig, bucket: "ABC" }));
+  });
+
+  it("period", () => {
+    assert.throws(() => new CloudflareR2Signer({ ...baseConfig, bucket: "abc.def" }));
+  });
+
+  it("unknown config property", () => {
+    assert.throws(() => new CloudflareR2Signer({ ...baseConfig, bucket: "abc", unknownProp: 1 } as any));
+  });
+
+  it("invalid jurisdiction", () => {
+    assert.throws(() => new CloudflareR2Signer({ ...baseConfig, bucket: "abc", jurisdiction: "mars" } as any));
+  });
+});
+
+describe("SigV4 query validation tests", () => {
+  const TEST_CONFIG = {
+    accountId: "00000000000000000000000000000000",
+    bucket: "test-bucket",
+    accessKeyId: "test-access-key",
+    secretAccessKey: "test-secret-key",
+    clock: () => 1234567890000,
+  };
+  const VALID_OBJECT_KEY = "videofetch/jobs/00000000000000000000000000000000/11111111111111111111111111111111";
+
+  const d = new Date(1234567890000);
+  const amzDate = d.toISOString().replace(/[:-]/g, "").split(".")[0] + "Z";
+  const sig = "a".repeat(64);
+
+  const getBaseUrl = () => `https://00000000000000000000000000000000.r2.cloudflarestorage.com/test-bucket/${VALID_OBJECT_KEY}`;
+  
+  const validateUrl = async (urlStr: string) => {
+    const signer = new CloudflareR2Signer(TEST_CONFIG, async () => urlStr);
+    await signer.signGet({ objectKey: VALID_OBJECT_KEY as any, expiresAt: 1234567890000 + 10000 });
+  };
+
+  it("X-Amz-Expires: correct exact TTL", async () => {
+    await validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`);
+  });
+
+  it("X-Amz-Expires: wrong TTL", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=20&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Expires: 301", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=301&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Expires: 604800", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=604800&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Expires: missing", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Expires: empty", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Expires: decimal", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10.5&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Expires: duplicate", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Date: exact captured signing date", async () => {
+    await validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`);
+  });
+
+  it("X-Amz-Date: wrong date", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=20230101T000000Z&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Date: missing", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Date: duplicate", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Algorithm: AWS4-HMAC-SHA256", async () => {
+    await validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`);
+  });
+
+  it("X-Amz-Algorithm: wrong algorithm", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA1&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Algorithm: missing", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Algorithm: duplicate", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`));
+  });
+
+  it("X-Amz-Signature: 64 hex", async () => {
+    await validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`);
+  });
+
+  it("X-Amz-Signature: empty", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=`));
+  });
+
+  it("X-Amz-Signature: 63 chars", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig.slice(0, 63)}`));
+  });
+
+  it("X-Amz-Signature: 65 chars", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}a`));
+  });
+
+  it("X-Amz-Signature: nonhex", async () => {
+    const badSig = sig.replace("a", "z");
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${badSig}`));
+  });
+
+  it("X-Amz-Signature: duplicate", async () => {
+    await assert.rejects(validateUrl(`${getBaseUrl()}?X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}&X-Amz-Signature=${sig}`));
+  });
+});
+
+describe("URL/path validation tests", () => {
+  const TEST_CONFIG = {
+    accountId: "00000000000000000000000000000000",
+    bucket: "test-bucket",
+    accessKeyId: "test-access-key",
+    secretAccessKey: "test-secret-key",
+    clock: () => 1234567890000,
+  };
+  const VALID_OBJECT_KEY = "videofetch/jobs/00000000000000000000000000000000/11111111111111111111111111111111";
+
+  const d = new Date(1234567890000);
+  const amzDate = d.toISOString().replace(/[:-]/g, "").split(".")[0] + "Z";
+  const sig = "a".repeat(64);
+  const query = `X-Amz-Expires=10&X-Amz-Date=${amzDate}&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`;
+
+  const validateUrl = async (urlStr: string) => {
+    const signer = new CloudflareR2Signer(TEST_CONFIG, async () => urlStr);
+    await signer.signGet({ objectKey: VALID_OBJECT_KEY as any, expiresAt: 1234567890000 + 10000 });
+  };
+
+  it("https expected hostname", async () => {
+    await validateUrl(`https://00000000000000000000000000000000.r2.cloudflarestorage.com/test-bucket/${VALID_OBJECT_KEY}?${query}`);
+  });
+
+  it("http", async () => {
+    await assert.rejects(validateUrl(`http://00000000000000000000000000000000.r2.cloudflarestorage.com/test-bucket/${VALID_OBJECT_KEY}?${query}`));
+  });
+
+  it("wrong hostname", async () => {
+    await assert.rejects(validateUrl(`https://attacker.com/test-bucket/${VALID_OBJECT_KEY}?${query}`));
+  });
+
+  it("username/password", async () => {
+    await assert.rejects(validateUrl(`https://user:pass@00000000000000000000000000000000.r2.cloudflarestorage.com/test-bucket/${VALID_OBJECT_KEY}?${query}`));
+  });
+
+  it("fragment", async () => {
+    await assert.rejects(validateUrl(`https://00000000000000000000000000000000.r2.cloudflarestorage.com/test-bucket/${VALID_OBJECT_KEY}?${query}#frag`));
+  });
+
+  it("wrong bucket", async () => {
+    await assert.rejects(validateUrl(`https://00000000000000000000000000000000.r2.cloudflarestorage.com/wrong-bucket/${VALID_OBJECT_KEY}?${query}`));
+  });
+
+  it("wrong key", async () => {
+    await assert.rejects(validateUrl(`https://00000000000000000000000000000000.r2.cloudflarestorage.com/test-bucket/wrong/key?${query}`));
+  });
+
+  it("malformed percent encoding", async () => {
+    await assert.rejects(validateUrl(`https://00000000000000000000000000000000.r2.cloudflarestorage.com/test-bucket/videofetch/jobs/00000000000000000000000000000000/%FF?${query}`));
+  });
+
+  it("response-content-disposition present", async () => {
+    await assert.rejects(validateUrl(`https://00000000000000000000000000000000.r2.cloudflarestorage.com/test-bucket/${VALID_OBJECT_KEY}?${query}&response-content-disposition=attachment`));
+  });
+
+  it("response-content-type present", async () => {
+    await assert.rejects(validateUrl(`https://00000000000000000000000000000000.r2.cloudflarestorage.com/test-bucket/${VALID_OBJECT_KEY}?${query}&response-content-type=video/mp4`));
+  });
+
+  it("other supported S3 response override keys", async () => {
+    await assert.rejects(validateUrl(`https://00000000000000000000000000000000.r2.cloudflarestorage.com/test-bucket/${VALID_OBJECT_KEY}?${query}&response-expires=something`));
+  });
+});
