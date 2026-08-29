@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { SignJWT } from "jose";
 import {
-  R2_TEMPORARY_CREDENTIAL_SCOPE,
   R2TemporaryCredentialError,
   buildTemporaryCredentialClaims,
   decodeSessionTokenClaims,
@@ -18,11 +17,56 @@ import {
 } from "../../shared/worker/r2-broker.ts";
 
 /**
- * Local-signing minter (WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001).
+ * Local-signing minter (WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001, corrected by
+ * R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001).
  *
  * Every credential here is derived from FAKE, deterministic material. Nothing
- * in this file contacts Cloudflare, and no real R2 token exists.
+ * in this file contacts Cloudflare, and no real R2 token is referenced.
+ *
+ * The claim shape under test is ACTION-ONLY. A live R2 endpoint rejected
+ * `scope + actions` tokens with `HTTP 400 InvalidArgument` on
+ * `X-Amz-Security-Token` — before authorization — and accepted action-only
+ * tokens. So the assertions below do not merely omit `scope`; they fail if
+ * `scope`, `permission`, or any other unexpected authority-bearing claim
+ * reappears in the signed payload.
+ *
+ * The two exclusions rest on different evidence, and these tests should not be
+ * read as claiming otherwise. `scope` is excluded because the live endpoint
+ * rejects it alongside `actions`. `permission` — the Temporary Credentials API
+ * spelling of the same coarse preset — is excluded on POLICY: a diagnostic live
+ * token carrying `permission` + `actions` passed token parsing, so it was never
+ * measured to be rejected and its authority semantics were never characterized.
+ * VideoFetch refuses it because the delegated JWT should carry only the minimal
+ * vocabulary this design actually understands.
  */
+
+/**
+ * Every claim the signed payload is permitted to contain.
+ *
+ * `bucket` / `actions` / `paths` carry the policy; the rest are the standard
+ * identity and time claims. Asserting the key set EXACTLY — rather than
+ * asserting the absence of a list of known-bad names — is what makes it hard to
+ * add a new authority-bearing claim without a test noticing.
+ */
+const EXPECTED_CLAIM_KEYS = [
+  "bucket",
+  "actions",
+  "paths",
+  "sub",
+  "iss",
+  "aud",
+  "iat",
+  "exp",
+].sort();
+
+/**
+ * Coarse preset claims this design never signs.
+ *
+ * `scope` is known-invalid alongside `actions` at the live endpoint;
+ * `permission` is excluded as an unapproved coarse claim, not as a measured
+ * rejection. Either one appearing would breach the exact claim-set invariant.
+ */
+const FORBIDDEN_COARSE_CLAIMS = ["scope", "permission"] as const;
 
 const ACCOUNT_ID = "0123456789abcdef0123456789abcdef";
 const PARENT_ACCESS_KEY_ID = "fake-parent-access-key-id";
@@ -69,15 +113,19 @@ describe("R2 temporary credential local signing", () => {
   });
 
   it("signs byte-identically to the reference jose implementation", async () => {
-    // Cloudflare's own documented example signs with `jose`. Pinning that
-    // equivalence means our node:crypto implementation cannot silently drift
-    // from the scheme R2 will actually validate.
+    // What this pins: our node:crypto HS256 path serializes and signs the
+    // intended ACTION-ONLY claims exactly as `jose` would, so the broker's
+    // dependency-free signer cannot silently drift from the reference.
+    //
+    // What this does NOT pin: that R2 accepts the claim shape. Provider
+    // acceptance is external evidence — `jose` will happily sign a payload the
+    // endpoint rejects, which is precisely how the `scope + actions` defect
+    // survived this suite. See R2-BROKER-LIVE-MINT-VERIFICATION-001.
     const claims = buildTemporaryCredentialClaims(input());
     const ours = signCompactJwtHs256(claims, PARENT_SECRET);
 
     const reference = await new SignJWT({
       bucket: claims.bucket,
-      scope: claims.scope,
       actions: claims.actions as unknown as string[],
       paths: {
         prefixPaths: claims.paths.prefixPaths as unknown as string[],
@@ -105,9 +153,84 @@ describe("R2 temporary credential local signing", () => {
       assert.deepEqual(claims.paths.objectPaths, [OBJECT_KEY], "exactly one exact object");
       assert.deepEqual(claims.paths.prefixPaths, [], "no prefix authority");
       assert.equal(claims.bucket, BUCKET);
-      assert.equal(claims.scope, R2_TEMPORARY_CREDENTIAL_SCOPE);
       assert.equal(claims.sub, ACCOUNT_ID);
       assert.equal(claims.aud, ENDPOINT_HOST);
+    }
+  });
+
+  it("states its authority with `actions` alone — never a coarse preset", () => {
+    // REGRESSION GUARD (R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001). Reintroducing
+    // `scope` would make R2 refuse the token outright — HTTP 400
+    // InvalidArgument while parsing X-Amz-Security-Token, as measured.
+    // Reintroducing `permission` was NOT measured to be rejected; it is
+    // refused here because it is a coarse claim outside the approved
+    // vocabulary, and an unapproved authority claim has no business in a
+    // credential whose whole point is stating exactly one operation.
+    for (const action of ["PutObject", "HeadObject", "DeleteObject"] as const) {
+      const claims = decodeSessionTokenClaims(
+        mintTemporaryCredential(input({ action })).sessionToken,
+      ) as unknown as Record<string, unknown>;
+
+      for (const coarse of FORBIDDEN_COARSE_CLAIMS) {
+        assert.equal(
+          Object.hasOwn(claims, coarse),
+          false,
+          `${action} credential must not carry a \`${coarse}\` claim`,
+        );
+        assert.equal(claims[coarse], undefined, `\`${coarse}\` must not be present at all`);
+      }
+
+      // `actions` is therefore the SOLE operation-authority claim present.
+      assert.deepEqual(claims.actions, [action]);
+    }
+  });
+
+  it("signs exactly the expected claim vocabulary and nothing else", () => {
+    // An unexpected claim cannot appear silently: this compares the whole key
+    // set, so a new authority-bearing field fails here even if nobody thought
+    // to write an assertion naming it.
+    for (const action of ["PutObject", "HeadObject", "DeleteObject"] as const) {
+      const claims = decodeSessionTokenClaims(
+        mintTemporaryCredential(input({ action })).sessionToken,
+      );
+
+      assert.deepEqual(
+        Object.keys(claims).sort(),
+        EXPECTED_CLAIM_KEYS,
+        `${action} credential must sign exactly the expected claims`,
+      );
+      assert.deepEqual(
+        Object.keys(claims.paths).sort(),
+        ["objectPaths", "prefixPaths"],
+        "paths carries exactly the two path lists",
+      );
+    }
+  });
+
+  it("builds the corrected claim shape before anything is signed", () => {
+    // The decoded-token assertions above prove what R2 would receive. This
+    // proves the same invariants one layer earlier, at the builder, so a
+    // regression is caught at its source rather than only at the token.
+    for (const action of ["PutObject", "HeadObject", "DeleteObject"] as const) {
+      const claims = buildTemporaryCredentialClaims(input({ action }));
+
+      assert.deepEqual(Object.keys(claims).sort(), EXPECTED_CLAIM_KEYS);
+      assert.deepEqual(claims.actions, [action]);
+      assert.deepEqual(claims.paths.objectPaths, [OBJECT_KEY]);
+      assert.deepEqual(claims.paths.prefixPaths, []);
+
+      for (const coarse of FORBIDDEN_COARSE_CLAIMS) {
+        assert.equal(
+          Object.hasOwn(claims, coarse),
+          false,
+          `buildTemporaryCredentialClaims must never emit \`${coarse}\``,
+        );
+      }
+
+      // And the JSON that actually gets signed carries no coarse key either —
+      // serialization is the last place one could slip through.
+      const serialized = JSON.parse(JSON.stringify(claims)) as Record<string, unknown>;
+      assert.deepEqual(Object.keys(serialized).sort(), EXPECTED_CLAIM_KEYS);
     }
   });
 

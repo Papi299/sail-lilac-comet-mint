@@ -269,25 +269,72 @@ signing**, not through the Temporary Credentials API — the API accepts the
 coarse presets above, whereas local signing accepts an explicit `actions` list.
 That is why the broker signs locally rather than calling an API.
 
-Each minted credential additionally carries:
+**The delegated JWT states its authority with `actions` and nothing else.**
+Cloudflare's concept-level contract is that permitted operations are specified
+using `scope` (spelled `permission` in the Temporary Credentials API) **or**
+`actions`, with at least one required — the two are alternatives, not a preset
+that a list then narrows. Each minted credential therefore carries exactly:
 
 - `bucket` — the broker's single configured bucket;
+- `actions` — **exactly one** S3 action, and **no** `scope` or `permission`
+  claim of any kind;
 - `paths.objectPaths` — **exactly one** exact object key;
 - `paths.prefixPaths` — **empty**, so no credential can reach a sibling object
   under the same job prefix;
-- a bounded `exp`.
+- a bounded `exp`;
+- the standard `sub` / `iss` / `aud` / `iat` identity and time claims.
+
+Narrowing is accomplished **entirely** by that explicit one-action list plus the
+exact object path. No coarse preset is present to narrow away from.
 
 The scheme is Cloudflare's documented one: sign a JWT (HS256) with the parent
 secret, reuse the parent access key id, derive the temporary secret as the
 SHA-256 hex digest of the signed JWT, and encode the session token as
 `base64("jwt/" + <jwt>)`. `src/broker/r2/temporary-credentials.test.ts` pins the
 signing output byte-for-byte against the `jose` reference implementation the
-Cloudflare example uses.
+Cloudflare example uses. That pin proves our `node:crypto` signer serializes and
+signs the intended claims identically to `jose` — it is **not** evidence that R2
+accepts the claim shape, which only the live endpoint can establish.
+
+#### Why `actions` alone — measured, not assumed
+
+The first implementation emitted `scope: "object-read-write"` **alongside**
+`actions`, following Cloudflare's runnable local-signing example, which still
+builds a required `scope` with an optional `actions`. The live acceptance
+attempt (`R2-BROKER-LIVE-MINT-VERIFICATION-001`) reached real R2 and found that
+the example does not describe what the endpoint accepts:
+
+| Claim shape | Live R2 result |
+| :--- | :--- |
+| `scope` only | accepted |
+| `scope` + paths | accepted |
+| `scope` + `actions` | **rejected** |
+| `scope` + `actions` + paths | **rejected** |
+| `actions` only | accepted |
+| `actions` only + exact paths | accepted |
+
+The merged `scope + actions` credential was rejected with `HTTP 400
+InvalidArgument` on `X-Amz-Security-Token` — at token **parsing**, before any
+authorization decision. Diagnostic action-only credentials were accepted and
+demonstrated the intended enforcement: `PutObject` on the exact key succeeded
+while Get/Head/Delete/List and a sibling `PutObject` were denied; `HeadObject`
+on the exact key succeeded while cross-action, list and sibling head were
+denied. Expiration was **not** measured.
+
+`R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001` changed the production claim shape to the
+measured-compatible action-only form. The diagnostic run is evidence about the
+*provider contract*, not acceptance of the production implementation — the
+corrected production path has not yet been exercised live, so the gate below
+stays open.
 
 **Still true, and still worth stating plainly:** the broker's own *parent* token
-is a persistent bucket-scoped credential whose provider permissions remain
-broader than `PutObject + HeadObject + DeleteObject`. The change is one of
-**custody**, and it is the change that matters: that token now lives only on the
+is a persistent **bucket-scoped *Object Read & Write*** credential (read + write
++ list on the one bucket, no bucket administration). Its provider permissions
+therefore remain broader than `PutObject + HeadObject + DeleteObject`, and
+broader than every temporary credential derived from it — removing `scope` from
+the delegated JWT changes nothing about the parent, which is not a temporary
+credential and carries no claims. The change is one of **custody**, and it is
+the change that matters: that token now lives only on the
 trusted VM host, outside the media namespace, and nothing the media container
 can do reaches it. The Vercel signer identity is likewise unchanged and remains
 a separate persistent read-only identity — it is **not** part of this work.
@@ -407,8 +454,11 @@ credential in the Worker to keep fresh, and therefore no rotation schedule, no
 refresh timer and no cached credential to invalidate. Rotating the **parent**
 credential is a broker-side restart.
 
-No R2 bucket, token, lifecycle rule or account change has been made. This
-remains an unprovisioned design.
+No **production** R2 bucket, token, lifecycle rule or account change has been
+made, and this remains an unprovisioned design. A disposable bucket and parent
+token were used for the live acceptance attempt recorded under
+`R2-BROKER-LIVE-MINT-VERIFICATION-001`; that was throwaway verification
+material, not provisioning, and no repository change depends on it.
 
 ### 5g. Measured host constraints
 
@@ -693,9 +743,9 @@ authorization.
 
 | Id | Status | Notes |
 | :--- | :--- | :--- |
-| `R2-CREDENTIAL-SCOPE-DECISION-001` | **RESOLVED / CLOSED — Option B** | The Product Owner selected Option B: renewable, action-scoped temporary credentials. Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001` — the media Worker holds no persistent R2 credential, a trusted host broker outside the media namespace retains the single-bucket parent writer credential, and each operation receives a credential scoped to one bucket, one exact `WorkerObjectKey` and one S3 action with a bounded TTL. See §5b–§5f. No R2 bucket, token or lifecycle rule has been created. |
+| `R2-CREDENTIAL-SCOPE-DECISION-001` | **RESOLVED / CLOSED — Option B** | The Product Owner selected Option B: renewable, action-scoped temporary credentials. Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001` — the media Worker holds no persistent R2 credential, a trusted host broker outside the media namespace retains the single-bucket parent writer credential, and each operation receives a credential scoped to one bucket, one exact `WorkerObjectKey` and one S3 action with a bounded TTL, expressed as an action-only JWT claim set (corrected by `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001`; see §5b). No **production** R2 bucket, token or lifecycle rule has been created — only disposable material for the live acceptance attempt. |
 | `R2-BROKER-PARENT-TOKEN-ROTATION-001` | OPEN — non-blocking, provisioning-time | The broker's parent token is still a persistent credential; only its custody changed. Rotating it is a broker-side `EnvironmentFile` update plus a `systemctl restart videofetch-r2-broker`, which `BindsTo=` will propagate as a brief Worker restart. Define the rotation cadence when the token is actually provisioned. No code change is expected. |
-| `R2-BROKER-LIVE-MINT-VERIFICATION-001` | OPEN — BLOCKING before production R2 traffic | Local signing is verified in this repository against the documented scheme and pinned byte-for-byte to the `jose` reference implementation, but it has **never been exercised against a live R2 endpoint** — no bucket or token exists. Before production traffic, confirm against real R2 that (1) a `PutObject`-scoped credential uploads the exact key, (2) the same credential is refused for `GetObject`, `ListObjectsV2` and `DeleteObject`, (3) a `HeadObject`/`DeleteObject` credential is likewise confined, and (4) an expired credential is rejected. Record the evidence without logging any credential value. |
+| `R2-BROKER-LIVE-MINT-VERIFICATION-001` | OPEN — BLOCKING before production R2 traffic | **First live attempt FAILED and the gate stays open.** Real R2 was reached. The then-merged `scope + actions` credential was rejected at token parsing — `HTTP 400 InvalidArgument` on `X-Amz-Security-Token`, before authorization — so the production path failed closed rather than over-granting. Diagnostic **action-only** credentials were then accepted and showed the intended enforcement: exact-key `PutObject` succeeded while Get/Head/Delete/List and a sibling `PutObject` were denied, and exact-key `HeadObject` succeeded while cross-action, list and sibling head were denied. `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001` corrected the production claim shape to that measured-compatible form (see §5b). The gate remains **BLOCKING** because (1) the corrected **production** code has not itself been re-tested live, (2) the full matrix has not passed end to end, and (3) **expiration was never measured**. Before production traffic, re-run against real R2: (1) a `PutObject` credential uploads the exact key, (2) it is refused for `GetObject`, `ListObjectsV2` and `DeleteObject`, (3) `HeadObject`/`DeleteObject` credentials are likewise confined, and (4) an expired credential is rejected. Record the evidence without logging any credential value. |
 | `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **CLOSED — accepted** | Empirically measured and accepted against the real Cloudflare Access Service Auth configuration; the gate is no longer blocking and is not reopened here. Scope note, unchanged: this is an acceptance of the measured INGRESS path, not a source-level property. This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it — that part is still asserted by the control-plane boundary suite. Any change to the ingress topology invalidates the acceptance and requires a re-measurement. |
 | `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001` | OPEN — Phase-9 evidence | The prototype acceptance run was performed with the host VPN client loaded but **not connected**. Repeat the suite with it actively connected (including any DNS-interception or mesh features), since that changes host routing beneath the VM. Requires operator interaction. Not a code blocker. |
 | `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | OPEN — Phase-9 evidence | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Add a route in the acceptance harness so the deny rules actually fire and can be attributed. Every other range was counter-attributed. |
