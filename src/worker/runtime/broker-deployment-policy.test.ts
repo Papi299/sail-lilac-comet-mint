@@ -168,7 +168,62 @@ describe("trusted broker deployment policy", () => {
         /--volume\s+\/run\/videofetch-r2-broker:\/run\/videofetch-r2-broker:ro\b/,
         "a read-only mount is what prevents the container replacing the socket",
       );
-      assert.match(exec, /--group-add\s+videofetch-broker\b/, "group membership permits connect(2)");
+    });
+
+    it("grants the broker group by NUMERIC gid, never by name", () => {
+      const exec = values(workerUnit, "ExecStart").join("\n");
+
+      // Docker resolves a --group-add NAME inside the IMAGE, and the Worker
+      // image defines no videofetch-broker group. A named group here would
+      // fail or silently resolve to something unintended.
+      assert.doesNotMatch(
+        exec,
+        /--group-add\s+videofetch-broker\b/,
+        "a host-only group NAME is not resolvable inside the image",
+      );
+      assert.match(
+        exec,
+        /--group-add\s+\$\{VIDEOFETCH_BROKER_GID\}/,
+        "the supplementary group must be supplied as a numeric gid",
+      );
+
+      // The gid is resolved on the host at install time, not hard-coded.
+      assert.ok(
+        values(workerUnit, "EnvironmentFile").some((f) => f.includes("broker-gid.env")),
+        "the gid arrives from a generated deployment environment file",
+      );
+      assert.doesNotMatch(
+        exec,
+        /--group-add\s+[0-9]+/,
+        "the gid must not be hard-coded to a guessed value",
+      );
+    });
+
+    it("fails closed if the configured gid does not own the socket", () => {
+      const pre = values(workerUnit, "ExecStartPre").join("\n");
+      assert.match(
+        pre,
+        /vf-r2-broker-gid-verify[^\n]*\$\{VIDEOFETCH_BROKER_GID\}/,
+        "a pre-start gate must assert the gid against the socket's real group",
+      );
+      // The gate must NOT be prefixed with '-', which would ignore its failure.
+      assert.ok(
+        values(workerUnit, "ExecStartPre").some(
+          (v) => v.includes("vf-r2-broker-gid-verify") && !v.trimStart().startsWith("-"),
+        ),
+        "the gid gate's failure must be fatal, not ignored",
+      );
+    });
+
+    it("does NOT mount host account databases into the media container", () => {
+      const exec = values(workerUnit, "ExecStart").join("\n");
+      for (const forbidden of ["/etc/passwd", "/etc/group", "/etc/shadow"]) {
+        assert.equal(
+          exec.includes(forbidden),
+          false,
+          `${forbidden} must never be mounted into the media container`,
+        );
+      }
     });
 
     it("passes the Worker a socket PATH and nothing credential-shaped", () => {
@@ -193,6 +248,72 @@ describe("trusted broker deployment policy", () => {
       assert.deepEqual(values(brokerUnit, "RestrictAddressFamilies"), ["AF_UNIX"]);
       assert.deepEqual(values(brokerUnit, "CapabilityBoundingSet"), [""]);
       assert.deepEqual(values(brokerUnit, "NoNewPrivileges"), ["yes"]);
+    });
+
+    it("never combines MemoryDenyWriteExecute with runtime type stripping", () => {
+      // MEASURED on the target VM (Ubuntu 24.04.4, Node 22.23.2, aarch64):
+      //
+      //   W^X + JIT       -> V8 fatal in OS::SetPermissions, status=5/TRAP.
+      //   W^X + --jitless -> ERR_WEBASSEMBLY_NOT_SUPPORTED, because Node's
+      //                      native type stripper is a WASM module and
+      //                      --jitless disables WebAssembly.
+      //
+      // So while the broker runs TypeScript directly, MemoryDenyWriteExecute
+      // is unusable in BOTH configurations. A unit that cannot start is not a
+      // security control, so the pairing must never be shipped.
+      const wx = values(brokerUnit, "MemoryDenyWriteExecute");
+      const exec = values(brokerUnit, "ExecStart").join("\n");
+      const stripsTypes = /--experimental-strip-types/.test(exec);
+      const jitless = /(^|\s)--jitless(\s|$)/.test(exec);
+
+      if (wx.includes("yes")) {
+        assert.equal(
+          stripsTypes,
+          false,
+          "MemoryDenyWriteExecute=yes cannot coexist with --experimental-strip-types: " +
+            "with the JIT the broker SIGTRAPs, and --jitless removes the WebAssembly " +
+            "the type stripper needs",
+        );
+        assert.ok(jitless, "MemoryDenyWriteExecute=yes additionally requires --jitless");
+      }
+    });
+
+    it("documents why MemoryDenyWriteExecute is absent, rather than dropping it silently", () => {
+      // The omission is a measured decision. Losing that reasoning would invite
+      // someone to "harden" the unit back into a state that cannot boot.
+      if (!values(brokerUnit, "MemoryDenyWriteExecute").includes("yes")) {
+        assert.match(
+          brokerSource,
+          /MemoryDenyWriteExecute is deliberately NOT set/,
+          "the unit must explain the omission",
+        );
+        assert.match(brokerSource, /TRAP/, "and cite the measured failure");
+        assert.match(brokerSource, /ERR_WEBASSEMBLY_NOT_SUPPORTED/);
+      }
+    });
+
+    it("retains the confinement that actually contains the broker", () => {
+      // Whatever happens to W^X, these are the directives doing the real work.
+      assert.deepEqual(values(brokerUnit, "PrivateNetwork"), ["yes"]);
+      assert.deepEqual(values(brokerUnit, "RestrictAddressFamilies"), ["AF_UNIX"]);
+      assert.deepEqual(values(brokerUnit, "CapabilityBoundingSet"), [""]);
+      assert.deepEqual(values(brokerUnit, "NoNewPrivileges"), ["yes"]);
+      assert.deepEqual(values(brokerUnit, "ProtectSystem"), ["strict"]);
+      assert.deepEqual(values(brokerUnit, "ProtectHome"), ["yes"]);
+      assert.deepEqual(values(brokerUnit, "RestrictSUIDSGID"), ["yes"]);
+      assert.deepEqual(values(brokerUnit, "RestrictNamespaces"), ["yes"]);
+    });
+
+    it("runs a Node new enough for native type stripping", () => {
+      const exec = values(brokerUnit, "ExecStart").join("\n");
+      assert.match(exec, /--experimental-strip-types/);
+      // The distro's packaged Node 18 cannot strip types; the unit must not
+      // silently depend on whatever /usr/bin/node happens to be.
+      assert.doesNotMatch(
+        exec,
+        /^\/usr\/bin\/node(\s|$)/m,
+        "the broker must name an explicit Node >= 22.6 runtime",
+      );
     });
 
     it("runs the broker as a dedicated non-root user", () => {

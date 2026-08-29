@@ -45,7 +45,14 @@ Environment=R2_BROKER_SOCKET_PATH=/run/videofetch-r2-broker/broker.sock
 # so a secret in ExecStart would be readable by every local account.
 EnvironmentFile=/etc/videofetch/r2-broker.env
 
-ExecStart=/usr/bin/node \
+# NODE RUNTIME REQUIREMENT: Node >= 22.6.
+#
+# The broker runs TypeScript directly through Node's native type stripping, so
+# the distribution's packaged Node is NOT necessarily sufficient — Ubuntu
+# 24.04 ships Node 18, which does not support --experimental-strip-types. Point
+# this at a Node 22 runtime supplied by the deployment.
+#
+ExecStart=/opt/videofetch/node/bin/node \
   --import /opt/videofetch/scripts/register-ts-aliases.mjs \
   --experimental-strip-types \
   /opt/videofetch/src/broker/r2/main.ts
@@ -72,7 +79,6 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 RestrictNamespaces=yes
@@ -81,6 +87,39 @@ AmbientCapabilities=
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @obsolete
+
+# MemoryDenyWriteExecute is deliberately NOT set. This is a measured decision,
+# not an oversight.
+#
+# MEASURED on the target VM (Ubuntu 24.04.4, Node 22.23.2, aarch64), running
+# this exact broker:
+#
+#   1. MemoryDenyWriteExecute=yes, JIT enabled
+#        -> V8 fatal error in v8::base::OS::SetPermissions (errno 12)
+#        -> Result=core-dump, code=dumped/status=5/TRAP. Never starts.
+#
+#   2. MemoryDenyWriteExecute=yes, --jitless
+#        -> ERR_WEBASSEMBLY_NOT_SUPPORTED at stripTypeScriptModuleTypes:
+#           "WebAssembly is not supported in this environment, but is required
+#           for TypeScript". Never starts.
+#
+#        --jitless disables WebAssembly, and Node's native type stripper is a
+#        WASM module. Since the broker runs TypeScript directly, W^X and
+#        --jitless are jointly unusable here. (Confirmed by control: --jitless
+#        runs plain .mjs fine under W^X, and fails only with
+#        --experimental-strip-types.)
+#
+#   3. No MemoryDenyWriteExecute, JIT enabled, every other directive above
+#        -> active, listening, stable.
+#
+# A unit that cannot start is not a security control, so the directive is
+# omitted rather than shipped broken. Every other confinement above is retained
+# and was verified active in the same run — most importantly PrivateNetwork,
+# RestrictAddressFamilies=AF_UNIX and an empty CapabilityBoundingSet, which are
+# what actually contain this process.
+#
+# To reinstate W^X, the broker would have to stop relying on runtime type
+# stripping (precompiled JS), at which point --jitless becomes viable again.
 
 # The broker performs LOCAL signing only — it derives credentials by signing a
 # JWT with the parent secret and makes no API call to Cloudflare. It therefore

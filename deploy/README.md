@@ -38,16 +38,42 @@ short-lived credential: 1 bucket · 1 exact object key · 1 S3 action
 
 The order is not a convenience — it is the fail-closed boundary.
 
-1. **Create the users.**
+0. **Provide a Node >= 22.6 runtime for the broker** at
+   `/opt/videofetch/node/bin/node`.
+
+   The broker runs TypeScript directly through Node's native type stripping.
+   Ubuntu 24.04 packages Node 18, which does **not** support
+   `--experimental-strip-types`, so the unit deliberately does not use
+   `/usr/bin/node`.
+
+1. **Create the group and user.**
 
    ```
-   useradd --system --no-create-home --shell /usr/sbin/nologin videofetch-broker
+   groupadd --system videofetch-broker
+   useradd --system --no-create-home --shell /usr/sbin/nologin \
+           -g videofetch-broker videofetch-broker
    ```
 
-   The Worker container joins the `videofetch-broker` **group** (via
-   `--group-add`) so it may `connect(2)` to the socket. It is never added to
-   the broker's user, and never gains read access to the broker's environment
-   file.
+   The Worker container joins the `videofetch-broker` **group** so it may
+   `connect(2)` to the socket. It is never added to the broker's user, and
+   never gains read access to the broker's environment file.
+
+1b. **Install the GID helpers and resolve the numeric GID.**
+
+   ```
+   install -m 0755 deploy/bin/vf-r2-broker-gid-write  /usr/local/sbin/
+   install -m 0755 deploy/bin/vf-r2-broker-gid-verify /usr/local/sbin/
+   vf-r2-broker-gid-write videofetch-broker /etc/videofetch/broker-gid.env
+   ```
+
+   **Why this exists.** `docker run --group-add <name>` resolves the NAME
+   *inside the image*, and the Worker image defines no `videofetch-broker`
+   group — a named `--group-add` therefore cannot work. The host allocates the
+   GID when the group is created, so it must not be hard-coded to a guessed
+   value either. It is resolved here and expanded into `ExecStart` by systemd.
+
+   The generated file is world-readable on purpose: a group id is not a secret.
+   Neither `/etc/passwd` nor `/etc/group` is mounted into the container.
 
 2. **Install the parent credential — broker host only.**
 
@@ -70,6 +96,11 @@ The order is not a convenience — it is the fail-closed boundary.
    systemctl enable --now videofetch-r2-broker.service
    systemctl enable --now videofetch-worker.service
    ```
+
+   The Worker's `ExecStartPre` runs `vf-r2-broker-gid-verify`, which refuses to
+   start it unless the configured GID numerically equals the group owning the
+   socket and the socket is group-connectable but not world-accessible. A
+   drifted GID stops the Worker rather than starting it unable to mint.
 
 ---
 
@@ -118,22 +149,28 @@ closed instead of silently working.
 
 ## Credential TTL
 
-Minted just in time, bounded twice — once by the Worker's derivation and again
-by the broker, which does not trust the requested value.
+Two different rules, because Put/Head and Delete relate to job expiry in
+opposite ways.
 
-| Operation | S3 action | Ceiling |
-| :--- | :--- | :--- |
-| `put()` | `PutObject` | 900s |
-| `head()` | `HeadObject` | 120s |
-| `delete()` | `DeleteObject` | 120s |
+| Operation | S3 action | Ceiling | Rule |
+| :--- | :--- | :--- | :--- |
+| `put()` | `PutObject` | 900s | **Deadline-bound** |
+| `head()` | `HeadObject` | 120s | **Deadline-bound** |
+| `delete()` | `DeleteObject` | 120s | **Cleanup**, floor 60s |
 
-Floor 60s; absolute hard cap 900s. Where the remaining job lifetime is known it
-shortens the credential further, so a credential never outlives the job it
-serves. The floor is what lets maintenance mint a fresh `DeleteObject`-only
-credential for an **already expired** job rather than relying on a stale upload
-credential.
+**Deadline-bound**: TTL is `min(remaining lifetime, ceiling)`, so a credential
+never outlives its job — a job with 30 seconds left yields a 30-second
+credential. An **already expired** job yields no Put/Head credential at all; the
+operation fails closed and the broker is never contacted.
 
-See `docs/architecture/worker-deployment-runbook.md` §5e for the full policy.
+**Cleanup**: `DeleteObject` keeps a 60-second floor so maintenance can still
+delete an object whose job expired days ago, with delete authority only.
+
+Enforcement is split: the **broker** independently enforces
+`1 <= ttl <= ceiling(action)` (refused, never clamped); the **Worker** enforces
+deadline-boundness, because only it knows the job deadline.
+
+See `docs/architecture/worker-deployment-runbook.md` §5d for the full policy.
 
 ---
 
@@ -143,6 +180,10 @@ See `docs/architecture/worker-deployment-runbook.md` §5e for the full policy.
 # The socket exists, is a socket, and is group-only.
 stat -c '%F %a %U:%G' /run/videofetch-r2-broker/broker.sock
 # expected: socket 660 videofetch-broker:videofetch-broker
+
+# The Worker's supplementary GID numerically matches the socket's group.
+stat -c %g /run/videofetch-r2-broker/broker.sock
+docker exec videofetch-worker id                # 'groups=' must include that GID
 
 # The Worker container cannot read the parent credential.
 docker exec videofetch-worker env | grep -c R2_BROKER_PARENT   # expected: 0

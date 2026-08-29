@@ -56,6 +56,20 @@ TimeoutStopSec=30
 #
 # YTDLP_NETWORK_ISOLATED stays false; Phase 10 is the only phase authorized to
 # enable it, and the runtime refuses to start if it parses truthy.
+# The broker's NUMERIC GID, resolved on this host at install time by
+# vf-r2-broker-gid-write. Not a secret: an integer group id.
+#
+# A NAMED --group-add would be resolved inside the Worker IMAGE, which defines
+# no videofetch-broker group, so the name must never be used here.
+EnvironmentFile=/etc/videofetch/broker-gid.env
+
+# FAIL-CLOSED GATE: the configured GID must numerically equal the group that
+# actually owns the broker socket, and the socket must be group-accessible and
+# not world-accessible. A drifted GID stops the Worker rather than starting it
+# unable to mint.
+ExecStartPre=/usr/local/sbin/vf-r2-broker-gid-verify \
+  /run/videofetch-r2-broker/broker.sock ${VIDEOFETCH_BROKER_GID}
+
 ExecStartPre=-/usr/bin/docker rm -f videofetch-worker
 
 ExecStart=/usr/bin/docker run --rm --name videofetch-worker \
@@ -68,12 +82,20 @@ ExecStart=/usr/bin/docker run --rm --name videofetch-worker \
   --tmpfs /tmp/videofetch:rw,noexec,nosuid,size=2g \
   --volume /var/lib/videofetch:/var/lib/videofetch:rw \
   --volume /run/videofetch-r2-broker:/run/videofetch-r2-broker:ro \
-  --group-add videofetch-broker \
+  --group-add ${VIDEOFETCH_BROKER_GID} \
   videofetch-worker:latest
 
 ExecStop=/usr/bin/docker stop --time 15 videofetch-worker
 
 # ── Boundary notes ─────────────────────────────────────────────────────────
+#
+# --group-add       A NUMERIC GID, never a group name. Docker resolves a NAME
+#                   inside the image, and the Worker image defines no
+#                   videofetch-broker group. The host allocates the id when the
+#                   group is created, so it is resolved at install time rather
+#                   than hard-coded, and asserted against the socket's actual
+#                   owning group by the ExecStartPre gate above. Neither
+#                   /etc/passwd nor /etc/group is mounted into the container.
 #
 # --volume ...:ro   The broker's runtime DIRECTORY is mounted read-only. That
 #                   is what prevents socket hijacking: the container cannot
