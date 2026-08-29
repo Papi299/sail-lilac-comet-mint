@@ -1,0 +1,117 @@
+# VideoFetch media Worker (containerized)
+# (WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001)
+#
+# The Worker container holds NO persistent R2 credential. It reaches object
+# storage exclusively through the trusted broker's Unix socket, which is
+# bind-mounted read-only into the container.
+#
+# Nothing here has been provisioned. Container runtime commands are written for
+# a Docker-compatible CLI; any equivalent runtime satisfying the same
+# invariants is acceptable.
+
+[Unit]
+Description=VideoFetch media Worker
+Documentation=file:/opt/videofetch/docs/architecture/worker-deployment-runbook.md
+
+# ── FAIL-CLOSED ORDERING ───────────────────────────────────────────────────
+#
+# Requires : the Worker will not start unless the broker started successfully.
+# After    : and it starts strictly afterwards, so the socket already exists.
+# BindsTo  : and if the broker later stops, fails or is restarted, the Worker
+#            is stopped too, rather than continuing without a credential source.
+#
+# The intended failure direction is therefore:
+#
+#   broker unavailable  ->  Worker R2 operation unavailable
+#
+# and NEVER:
+#
+#   broker unavailable  ->  fall back to a persistent Worker R2 credential
+#
+# There is no fallback to fall back TO. The container is never given
+# R2_WRITER_* or R2_BROKER_PARENT_*, and the Worker runtime refuses to start if
+# either is present, so a "temporarily re-add the old secret" workaround fails
+# closed instead of silently succeeding.
+Requires=videofetch-r2-broker.service
+After=videofetch-r2-broker.service
+BindsTo=videofetch-r2-broker.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+
+# Termination grace must be at least the Worker's own bounded shutdown grace
+# (WORKER_SHUTDOWN_GRACE_MS, 10s) so a clean SIGTERM is not truncated.
+TimeoutStopSec=30
+
+# The Worker's OWN environment. Contains the HMAC control pair and the
+# object-store LOCATION. It contains no R2 credential of any kind:
+#
+#   WORKER_CONTROL_KEY_ID=
+#   WORKER_CONTROL_SECRET=
+#   R2_ACCOUNT_ID=
+#   R2_BUCKET=
+#   R2_JURISDICTION=
+#
+# YTDLP_NETWORK_ISOLATED stays false; Phase 10 is the only phase authorized to
+# enable it, and the runtime refuses to start if it parses truthy.
+# The broker's NUMERIC GID, resolved on this host at install time by
+# vf-r2-broker-gid-write. Not a secret: an integer group id.
+#
+# A NAMED --group-add would be resolved inside the Worker IMAGE, which defines
+# no videofetch-broker group, so the name must never be used here.
+EnvironmentFile=/etc/videofetch/broker-gid.env
+
+# FAIL-CLOSED GATE: the configured GID must numerically equal the group that
+# actually owns the broker socket, and the socket must be group-accessible and
+# not world-accessible. A drifted GID stops the Worker rather than starting it
+# unable to mint.
+ExecStartPre=/usr/local/sbin/vf-r2-broker-gid-verify \
+  /run/videofetch-r2-broker/broker.sock ${VIDEOFETCH_BROKER_GID}
+
+ExecStartPre=-/usr/bin/docker rm -f videofetch-worker
+
+ExecStart=/usr/bin/docker run --rm --name videofetch-worker \
+  --env-file /etc/videofetch/worker.env \
+  --env R2_BROKER_SOCKET_PATH=/run/videofetch-r2-broker/broker.sock \
+  --network container:videofetch-media-netns \
+  --cap-drop=ALL \
+  --security-opt no-new-privileges \
+  --read-only \
+  --tmpfs /tmp/videofetch:rw,noexec,nosuid,size=2g \
+  --volume /var/lib/videofetch:/var/lib/videofetch:rw \
+  --volume /run/videofetch-r2-broker:/run/videofetch-r2-broker:ro \
+  --group-add ${VIDEOFETCH_BROKER_GID} \
+  videofetch-worker:latest
+
+ExecStop=/usr/bin/docker stop --time 15 videofetch-worker
+
+# ── Boundary notes ─────────────────────────────────────────────────────────
+#
+# --group-add       A NUMERIC GID, never a group name. Docker resolves a NAME
+#                   inside the image, and the Worker image defines no
+#                   videofetch-broker group. The host allocates the id when the
+#                   group is created, so it is resolved at install time rather
+#                   than hard-coded, and asserted against the socket's actual
+#                   owning group by the ExecStartPre gate above. Neither
+#                   /etc/passwd nor /etc/group is mounted into the container.
+#
+# --volume ...:ro   The broker's runtime DIRECTORY is mounted read-only. That
+#                   is what prevents socket hijacking: the container cannot
+#                   unlink, replace or shadow the socket with a listener of its
+#                   own. connect(2) is governed by the socket inode's own 0660
+#                   mode plus --group-add, so an ordinary connect still works.
+#
+# --network         The media network namespace, whose externally-owned
+#                   safe-egress policy is installed and verified by the host
+#                   BEFORE the Worker is allowed to start. Credential
+#                   acquisition does not traverse it: an AF_UNIX socket is not
+#                   the network, so the boundary neither depends on nor widens
+#                   the egress policy.
+#
+# --cap-drop=ALL    No NET_ADMIN, no SYS_ADMIN. No Docker socket is mounted and
+#                   host networking is not used.
+
+[Install]
+WantedBy=multi-user.target

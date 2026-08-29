@@ -25,6 +25,7 @@ const FAKE_KEY_ID = "worker-control-1";
 const FAKE_SECRET = "0123456789abcdef0123456789abcdef";
 const FAKE_PREVIOUS_KEY_ID = "worker-control-0";
 const FAKE_PREVIOUS_SECRET = "fedcba9876543210fedcba9876543210";
+const FAKE_BROKER_SOCKET = "/run/videofetch-r2-broker/broker.sock";
 
 function baseEnv(overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
@@ -33,8 +34,7 @@ function baseEnv(overrides: Record<string, string | undefined> = {}): NodeJS.Pro
     WORKER_CONTROL_SECRET: FAKE_SECRET,
     R2_ACCOUNT_ID: FAKE_ACCOUNT_ID,
     R2_BUCKET: FAKE_BUCKET,
-    R2_WRITER_ACCESS_KEY_ID: "fake-writer-access-key-id",
-    R2_WRITER_SECRET_ACCESS_KEY: "fake-writer-secret-access-key",
+    R2_BROKER_SOCKET_PATH: FAKE_BROKER_SOCKET,
   };
   for (const [key, value] of Object.entries(overrides)) {
     if (value === undefined) delete env[key];
@@ -70,7 +70,12 @@ describe("Worker runtime configuration", () => {
     assert.equal(config.r2.accountId, FAKE_ACCOUNT_ID);
     assert.equal(config.r2.bucket, FAKE_BUCKET);
     assert.equal(config.r2.jurisdiction, "default");
-    assert.equal(config.r2.accessKeyId, "fake-writer-access-key-id");
+    assert.equal(config.r2.brokerSocketPath, FAKE_BROKER_SOCKET);
+
+    // The loaded configuration has no credential surface at all.
+    assert.ok(!("accessKeyId" in config.r2));
+    assert.ok(!("secretAccessKey" in config.r2));
+    assert.ok(!("sessionToken" in config.r2));
   });
 
   describe("bind host and port", () => {
@@ -386,30 +391,15 @@ describe("Worker runtime configuration", () => {
       expectInvalid(baseEnv({ R2_JURISDICTION: "apac" }), "R2_JURISDICTION");
     });
 
-    it("requires non-empty bounded writer credentials", () => {
-      expectInvalid(baseEnv({ R2_WRITER_ACCESS_KEY_ID: undefined }), "R2_WRITER_ACCESS_KEY_ID");
-      expectInvalid(baseEnv({ R2_WRITER_ACCESS_KEY_ID: "" }), "R2_WRITER_ACCESS_KEY_ID");
+    it("requires a bounded absolute broker socket path", () => {
+      expectInvalid(baseEnv({ R2_BROKER_SOCKET_PATH: undefined }), "R2_BROKER_SOCKET_PATH");
+      expectInvalid(baseEnv({ R2_BROKER_SOCKET_PATH: "" }), "R2_BROKER_SOCKET_PATH");
+      expectInvalid(baseEnv({ R2_BROKER_SOCKET_PATH: "relative/broker.sock" }), "R2_BROKER_SOCKET_PATH");
+      expectInvalid(baseEnv({ R2_BROKER_SOCKET_PATH: "/run/../etc/broker.sock" }), "R2_BROKER_SOCKET_PATH");
+      expectInvalid(baseEnv({ R2_BROKER_SOCKET_PATH: "/run/./broker.sock" }), "R2_BROKER_SOCKET_PATH");
       expectInvalid(
-        baseEnv({ R2_WRITER_ACCESS_KEY_ID: "a".repeat(8193) }),
-        "R2_WRITER_ACCESS_KEY_ID",
-      );
-
-      expectInvalid(
-        baseEnv({ R2_WRITER_SECRET_ACCESS_KEY: undefined }),
-        "R2_WRITER_SECRET_ACCESS_KEY",
-      );
-      expectInvalid(baseEnv({ R2_WRITER_SECRET_ACCESS_KEY: "" }), "R2_WRITER_SECRET_ACCESS_KEY");
-    });
-
-    it("treats the writer session token as optional but bounded", () => {
-      assert.equal(loadWorkerRuntimeConfig(baseEnv()).r2.sessionToken, undefined);
-      assert.equal(
-        loadWorkerRuntimeConfig(baseEnv({ R2_WRITER_SESSION_TOKEN: "fake-token" })).r2.sessionToken,
-        "fake-token",
-      );
-      expectInvalid(
-        baseEnv({ R2_WRITER_SESSION_TOKEN: "a".repeat(8193) }),
-        "R2_WRITER_SESSION_TOKEN",
+        baseEnv({ R2_BROKER_SOCKET_PATH: `/run/${"a".repeat(4097)}.sock` }),
+        "R2_BROKER_SOCKET_PATH",
       );
     });
 
@@ -422,10 +412,9 @@ describe("Worker runtime configuration", () => {
 
       const config = loadWorkerRuntimeConfig(env);
 
-      // The writer identity comes exclusively from R2_WRITER_*.
-      assert.equal(config.r2.accessKeyId, "fake-writer-access-key-id");
-      assert.equal(config.r2.secretAccessKey, "fake-writer-secret-access-key");
-      assert.equal(config.r2.sessionToken, undefined);
+      // The Worker reads no object-store credential of any kind, so a signer
+      // identity in the environment is simply not consumed.
+      assert.equal(config.r2.brokerSocketPath, FAKE_BROKER_SOCKET);
 
       const serialized = JSON.stringify(config);
       assert.ok(!serialized.includes("signer-access-key-must-not-be-used"));
@@ -435,13 +424,11 @@ describe("Worker runtime configuration", () => {
 
     it("still fails closed when only signer credentials are supplied", () => {
       const env = baseEnv({
-        R2_WRITER_ACCESS_KEY_ID: undefined,
-        R2_WRITER_SECRET_ACCESS_KEY: undefined,
+        R2_BROKER_SOCKET_PATH: undefined,
         R2_SIGNER_ACCESS_KEY_ID: "signer-access",
         R2_SIGNER_SECRET_ACCESS_KEY: "signer-secret",
       });
-      expectInvalid(env, "R2_WRITER_ACCESS_KEY_ID");
-      expectInvalid(env, "R2_WRITER_SECRET_ACCESS_KEY");
+      expectInvalid(env, "R2_BROKER_SOCKET_PATH");
     });
   });
 

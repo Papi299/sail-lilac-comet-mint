@@ -1,0 +1,63 @@
+#!/bin/sh
+# Fail-closed pre-start gate for the Worker unit
+# (WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001).
+#
+# Asserts that the supplementary GID the Worker container will be given is
+# NUMERICALLY the group that actually owns the broker socket. A drifted or
+# stale GID means the container would start and then be unable to connect —
+# or, worse, be granted membership of some unrelated host group that happens to
+# hold that id. Either way the Worker must not start.
+#
+# Usage:  vf-r2-broker-gid-verify <socket-path> <expected-gid>
+
+set -eu
+
+SOCKET="${1:?usage: vf-r2-broker-gid-verify <socket-path> <expected-gid>}"
+EXPECTED="${2:?usage: vf-r2-broker-gid-verify <socket-path> <expected-gid>}"
+
+case "$EXPECTED" in
+  ''|*[!0-9]*)
+    echo "vf-r2-broker-gid-verify: expected GID '$EXPECTED' is not numeric" >&2
+    echo "run vf-r2-broker-gid-write first" >&2
+    exit 1
+    ;;
+esac
+
+if [ ! -S "$SOCKET" ]; then
+  echo "vf-r2-broker-gid-verify: $SOCKET is not a socket - is the broker running?" >&2
+  exit 1
+fi
+
+ACTUAL_GID="$(stat -c %g "$SOCKET")"
+MODE="$(stat -c %a "$SOCKET")"
+
+if [ "$ACTUAL_GID" != "$EXPECTED" ]; then
+  echo "vf-r2-broker-gid-verify: socket group $ACTUAL_GID != configured $EXPECTED" >&2
+  exit 1
+fi
+
+# The socket must remain group-connectable and not world-accessible.
+#
+# connect(2) on a Unix socket requires WRITE permission, so the group digit
+# must carry the write bit. A world-accessible socket would let any local
+# account mint credentials, so the world digit must be exactly 0.
+#
+# Take the last three octal digits, ignoring any setuid/setgid/sticky prefix.
+PERM="$(printf '%s' "$MODE" | sed 's/.*\(...\)$/\1/')"
+GROUP_DIGIT="$(printf '%s' "$PERM" | cut -c2)"
+WORLD_DIGIT="$(printf '%s' "$PERM" | cut -c3)"
+
+case "$GROUP_DIGIT" in
+  2|3|6|7) : ;;
+  *)
+    echo "vf-r2-broker-gid-verify: $SOCKET mode $MODE denies group connect" >&2
+    exit 1
+    ;;
+esac
+
+if [ "$WORLD_DIGIT" != "0" ]; then
+  echo "vf-r2-broker-gid-verify: $SOCKET mode $MODE is world-accessible" >&2
+  exit 1
+fi
+
+echo "vf-r2-broker-gid-verify: OK - $SOCKET group $ACTUAL_GID mode $MODE"

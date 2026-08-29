@@ -77,12 +77,12 @@ They are deliberately independent:
   never reads them from its environment, and the Worker application does not
   consume, verify, persist or intentionally log them.
 
-  > **Not yet established.** Whether Cloudflare Access *strips* the two request
-  > headers before forwarding through the Tunnel to the origin is provider
-  > behaviour that this repository cannot prove. Do **not** claim the Worker
-  > never receives them on the wire until measured. See
-  > `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` in §11 — **BLOCKING
-  > before production Cloudflare ingress acceptance.**
+  > **Established and accepted.** Whether Cloudflare Access strips the two
+  > request headers before forwarding to the origin was measured externally
+  > against the real Service Auth configuration and accepted. See
+  > `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` in §11 — **CLOSED**.
+  > This remains a statement about the measured ingress path, not a property
+  > this repository can re-derive from source.
 - The Access credentials are **not part of the HMAC canonical request**. The
   signing input remains exactly `version | key id | method | canonical path |
   timestamp | request id | idempotency key | SHA-256(raw body)`. A logically
@@ -215,8 +215,15 @@ startup lock and enable the flag.
 
 ## 5. Object storage (R2)
 
-Two boundaries operate here, and they are **not** the same strength. Conflating
-them overstates the security posture, so they are documented separately.
+Three boundaries operate here and they are documented separately, because
+conflating them would overstate the security posture:
+
+- **5a** — what the application code can express (software-enforced).
+- **5b** — what the provider credential actually permits.
+- **5c** — who holds the persistent credential at all (custody).
+
+`WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001` closed the gap between 5a and 5b for
+the Worker, and moved custody out of the media container entirely.
 
 ### 5a. Application operation boundary (enforced in software)
 
@@ -233,40 +240,146 @@ The Worker's `ObjectStoreWriter` interface exposes exactly `put`, `head` and
 method, so no Worker code path can express those operations. Deletion is always
 by exact object key; there is no prefix, wildcard, list or bucket-clear path.
 
-The Worker never receives `R2_SIGNER_*`; Vercel never receives `R2_WRITER_*`.
+Vercel never receives a Worker credential, and the Worker never receives
+`R2_SIGNER_*`.
 
-### 5b. Provider credential boundary (weaker than 5a)
+### 5b. Provider credential boundary
 
-> **Important, and easy to get wrong.** Cloudflare R2's **persistent** S3 API
-> token permission model is **coarser** than the application operation surface
-> above. Its object-level presets are approximately:
->
-> - **Object Read & Write** — read + write + list
-> - **Object Read only** — read + list
->
-> There is no persistent preset granting exactly `PutObject + HeadObject +
-> DeleteObject` and nothing else. Exact S3 action lists are reachable through
-> **action-scoped temporary credentials / local signing**, which for a
-> long-lived Worker would require a renewal and rotation design.
+> **This section previously documented a weaker boundary than 5a.** Cloudflare
+> R2's **persistent** S3 API token presets are coarse — approximately *Object
+> Read & Write* (read + write + list) and *Object Read only* (read + list) —
+> with no persistent preset granting exactly `PutObject + HeadObject +
+> DeleteObject`. Under the superseded static-credential model the honest
+> statement was: *the application only ever invokes its own narrow operation
+> set, while the underlying token may permit more.*
 
-Therefore, with the current static credential model, **do not claim** that:
+**That gap is now closed for the Worker** by
+`WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001`. The Worker no longer holds a
+persistent credential of any kind. Each operation uses a credential minted just
+in time and scoped to a single S3 action:
 
-- the persistent Worker token lacks `GetObject` or `ListObjects`; or
-- the persistent signer token lacks `ListObjects`.
+| Worker operation | S3 action granted | Actions NOT granted |
+| :--- | :--- | :--- |
+| `put()` | `PutObject` | Get, Head, Delete, List, multipart, admin |
+| `head()` | `HeadObject` | Put, Get, Delete, List, multipart, admin |
+| `delete()` | `DeleteObject` | Put, Get, Head, List, multipart, admin |
 
-Those claims are not true of what the provider actually issues. The honest
-statement is: *the application only ever invokes its own narrow operation set,
-while the underlying token may permit more.*
+Exact action scoping is reachable only through **R2 temporary-credential local
+signing**, not through the Temporary Credentials API — the API accepts the
+coarse presets above, whereas local signing accepts an explicit `actions` list.
+That is why the broker signs locally rather than calling an API.
 
-### 5c. What is still required at provisioning time
+Each minted credential additionally carries:
+
+- `bucket` — the broker's single configured bucket;
+- `paths.objectPaths` — **exactly one** exact object key;
+- `paths.prefixPaths` — **empty**, so no credential can reach a sibling object
+  under the same job prefix;
+- a bounded `exp`.
+
+The scheme is Cloudflare's documented one: sign a JWT (HS256) with the parent
+secret, reuse the parent access key id, derive the temporary secret as the
+SHA-256 hex digest of the signed JWT, and encode the session token as
+`base64("jwt/" + <jwt>)`. `src/broker/r2/temporary-credentials.test.ts` pins the
+signing output byte-for-byte against the `jose` reference implementation the
+Cloudflare example uses.
+
+**Still true, and still worth stating plainly:** the broker's own *parent* token
+is a persistent bucket-scoped credential whose provider permissions remain
+broader than `PutObject + HeadObject + DeleteObject`. The change is one of
+**custody**, and it is the change that matters: that token now lives only on the
+trusted VM host, outside the media namespace, and nothing the media container
+can do reaches it. The Vercel signer identity is likewise unchanged and remains
+a separate persistent read-only identity — it is **not** part of this work.
+
+### 5c. Trusted broker architecture
+
+```
+media container  (NO R2 credential of any kind)
+  │  validated WorkerObjectKey + action + bounded TTL
+  │  AF_UNIX socket, bind-mounted read-only. Not the network.
+  ▼
+trusted broker  (VM host, own user, own systemd unit, own namespace)
+  │  sole holder of the persistent R2 parent credential
+  ▼
+short-lived credential:  1 bucket · 1 exact object key · 1 S3 action
+```
+
+| Invariant | Requirement |
+| :--- | :--- |
+| Parent credential custody | The broker process **only**. Never in the media container, never on Vercel. |
+| Parent credential transport | Root-owned `EnvironmentFile`, mode `0400`. **Never** argv — `/proc` makes argv world-readable. |
+| Worker credential | Minted per operation. No persistent credential exists to fall back to. |
+| Boundary transport | Unix domain socket. Creates **no network egress**, so it neither depends on nor widens the safe-egress policy. |
+| Socket permissions | Mode `0660`, broker user and group. The Worker joins the group to `connect(2)`. |
+| Socket directory | Bind-mounted **read-only** into the container, so the Worker cannot unlink, replace or shadow the socket with a listener of its own. |
+| Broker network | **None.** Local signing makes no API call, so the unit sets `PrivateNetwork=yes` and `RestrictAddressFamilies=AF_UNIX`. Verified active on the VM. |
+| Broker Node runtime | **Node >= 22.6**, supplied by the deployment. The distro's packaged Node 18 cannot run `--experimental-strip-types`. |
+| `MemoryDenyWriteExecute` | **Not set**, by measurement. With the JIT the broker SIGTRAPs; with `--jitless` the type stripper loses the WebAssembly it needs. See §5g. |
+| Worker supplementary group | A **numeric GID**, resolved on the host at install time. A `--group-add` NAME would be resolved inside the image, which defines no such group. |
+| Broker validation | Re-validates the object key against the authoritative `WorkerObjectKeySchema`, the bucket by equality with its single configured bucket, the action against a closed three-entry set, and the TTL against the policy window. |
+| Broker failure mode | Fails closed on any malformed action, key, bucket or TTL. Returns a bare category code, never a value from the request. |
+| Broker logging | Never logs a credential, session token, object key or bucket. The observer hook's type cannot carry one. |
+| Worker privileges | Unchanged: no `NET_ADMIN`, no `SYS_ADMIN`, no Docker socket, no host networking. |
+
+The Worker validates the object key itself *before* contacting the broker, so
+the broker's key check is a second independent gate rather than the only one.
+
+### 5d. Credential TTL policy
+
+Minted just in time. Two DIFFERENT rules apply, because the two kinds of
+operation have opposite relationships to job expiry.
+
+| Operation | S3 action | Ceiling | Rule |
+| :--- | :--- | :--- | :--- |
+| `put()` | `PutObject` | 900s | **Deadline-bound** |
+| `head()` | `HeadObject` | 120s | **Deadline-bound** |
+| `delete()` | `DeleteObject` | 120s | **Cleanup**, floor 60s |
+
+**Deadline-bound (`PutObject` / `HeadObject`).** The credential must never
+outlive the job it serves.
+
+- remaining lifetime known and positive → `min(remaining, ceiling)`. A job with
+  30 seconds left yields a 30-second credential, not a floored 60-second one.
+- remaining lifetime known and **already expired** → **fail closed.** No
+  credential is requested at all, and the broker is never contacted. Writing or
+  inspecting an object whose authorization has lapsed is not something a floor
+  should be allowed to paper over.
+- deadline unknown → the action's conservative ceiling.
+
+**Cleanup (`DeleteObject`).** Must keep working precisely *because* the job
+expired, so it retains a 60-second floor and a 120-second ceiling. Maintenance
+therefore mints a **fresh, bounded, delete-only** credential long after expiry
+rather than relying on a stale upload credential. Deleting an expired object
+grants nothing to anyone, and the credential carries no Put or Head authority.
+
+Global bounds: minimum 1s, absolute hard cap 900s.
+
+#### Where each rule is enforced
+
+The split is deliberate and is not a gap:
+
+| Rule | Enforced by | Why there |
+| :--- | :--- | :--- |
+| Integer TTL within `[1, ceiling(action)]` | **Broker** | Verifiable without a job store. Refused, never clamped — an out-of-policy ask is a bug or an attack. |
+| TTL ≤ remaining job lifetime | **Worker** | Only the Worker knows the job deadline. |
+| Expired job → no Put/Head credential | **Worker** | Same reason. |
+
+A compromised Worker therefore cannot negotiate a credential longer than the
+per-action ceiling; an honest Worker additionally cannot obtain one that
+outlives its job. The broker does not claim to verify deadline-boundness, and
+the code does not pretend otherwise.
+
+### 5e. What is still required at provisioning time
 
 | Invariant | Requirement |
 | :--- | :--- |
 | Bucket | Private, Standard class. Never public-read. |
-| Identities | Two **separate** credentials — one for the Worker, one for Vercel. Never one shared token. |
+| Identities | Two **separate** credentials — one parent for the broker, one for Vercel. Never one shared token. |
 | Scope | Bucket-specific. Never account-wide. |
 | Administration | No bucket administration on either credential. |
-| Separation of use | Enforced in software per 5a, and by never cross-supplying `R2_WRITER_*` / `R2_SIGNER_*`. |
+| Broker parent token custody | VM host only, `0400`, root-owned. Never supplied to the Worker container or to Vercel. |
+| Separation of use | Enforced in software per 5a/5b, and by never cross-supplying the broker parent and `R2_SIGNER_*`. |
 | Provider lifecycle | A TTL backstop, configured only during authorized provisioning. |
 
 Set the provider lifecycle retention slightly **longer** than the application
@@ -278,21 +391,64 @@ Expiration is enforced by `expiresAt` in durable metadata, independently of
 whether cleanup succeeded. A failed object deletion never extends user
 authorization.
 
-### 5d. Open decision — `R2-CREDENTIAL-SCOPE-DECISION-001`
+### 5f. `R2-CREDENTIAL-SCOPE-DECISION-001` — RESOLVED / CLOSED
 
-**Status: OPEN — BLOCKING BEFORE PHASE-8B CREDENTIAL PROVISIONING.**
+**Status: CLOSED. The Product Owner selected Option B.**
 
-No real R2 token may be created until the Product Owner explicitly closes this:
+- ~~Option A — accept bucket-scoped **persistent** R2 credentials whose provider
+  permissions are broader than the application operation surface, relying on the
+  strict software separation in 5a for v1.~~ **Not selected.**
+- **Option B — renewable, action-scoped temporary credentials.** **Selected and
+  implemented** by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001`.
 
-- **Option A** — accept bucket-scoped **persistent** R2 credentials whose
-  provider permissions are broader than the application operation surface,
-  relying on the strict software separation in 5a for v1.
-- **Option B** — design **renewable, action-scoped temporary credentials**
-  before production, accepting the added renewal/rotation complexity for a
-  long-lived Worker.
+The renewal complexity Option B was expected to carry is handled by minting
+per operation rather than by running a renewal loop: there is no long-lived
+credential in the Worker to keep fresh, and therefore no rotation schedule, no
+refresh timer and no cached credential to invalidate. Rotating the **parent**
+credential is a broker-side restart.
 
-This decision is deliberately **not** made in Phase 8A, and no credential broker
-or temporary-credential renewal system is implemented here.
+No R2 bucket, token, lifecycle rule or account change has been made. This
+remains an unprovisioned design.
+
+### 5g. Measured host constraints
+
+Both items below were found by running the real broker on the target VM
+(Ubuntu 24.04.4, Node 22.23.2, aarch64) with fake deterministic credentials and
+no R2 endpoint. They are recorded because both would otherwise ship as units
+that cannot start.
+
+**1. `MemoryDenyWriteExecute` is unusable while the broker runs TypeScript.**
+
+| Configuration | Result |
+| :--- | :--- |
+| `MemoryDenyWriteExecute=yes`, JIT enabled | V8 fatal in `OS::SetPermissions` (errno 12); `Result=core-dump`, `status=5/TRAP`. Never starts. |
+| `MemoryDenyWriteExecute=yes`, `--jitless` | `ERR_WEBASSEMBLY_NOT_SUPPORTED` at `stripTypeScriptModuleTypes`. Never starts. |
+| No `MemoryDenyWriteExecute`, JIT enabled | **Active, listening, stable.** |
+
+V8's tiering compiler needs executable heap pages, which W^X denies. `--jitless`
+removes the JIT but also disables WebAssembly — and Node's native type stripper
+is a WASM module. The two are jointly unusable here, so the directive is
+omitted rather than shipped broken. A unit that cannot start is not a security
+control. Every other confinement directive is retained and was verified active
+in the same run.
+
+To reinstate W^X the broker would have to stop relying on runtime type
+stripping (precompiled JS), at which point `--jitless` becomes viable again.
+
+**2. The Worker's supplementary group must be a numeric GID.**
+
+`docker run --group-add <name>` resolves the NAME inside the container image.
+The Worker image defines no `videofetch-broker` group, so a named `--group-add`
+cannot work. The host allocates the GID when the group is created, so it must
+not be hard-coded either.
+
+`deploy/bin/vf-r2-broker-gid-write` resolves it at install time into
+`/etc/videofetch/broker-gid.env` (world-readable; a group id is not a secret),
+and `deploy/bin/vf-r2-broker-gid-verify` runs as an `ExecStartPre` gate that
+refuses to start the Worker unless the configured GID numerically equals the
+group owning the socket and the socket is group-connectable but not
+world-accessible. Neither `/etc/passwd` nor `/etc/group` is mounted into the
+media container.
 
 ---
 
@@ -303,9 +459,10 @@ or temporary-credential renewal system is implemented here.
 | Baked into image | **Never.** The image contains no secret in any layer, `ENV` or build argument. |
 | Supplied via | The platform's runtime secret store / environment injection. |
 | Build arguments | Never used for credentials. |
-| Logging | The Worker never logs `process.env`, R2 credentials, the HMAC secret, or exception cause chains. A configuration failure names the offending **variable** only, never its value. |
+| Logging | Neither runtime logs `process.env`, R2 credentials, session tokens, the HMAC secret, or exception cause chains. A configuration failure names the offending **variable** only, never its value. The broker additionally never logs an object key or bucket — its observer hook's type cannot carry one. |
+| Parent credential custody | The trusted broker process **only**. See §5c. |
 
-Required at runtime:
+Required on the **Worker** at runtime:
 
 ```
 WORKER_DATA_DIRECTORY          absolute, persistent, not under /tmp
@@ -313,22 +470,48 @@ WORKER_CONTROL_KEY_ID          shared with Vercel
 WORKER_CONTROL_SECRET          shared with Vercel, >= 32 UTF-8 bytes
 R2_ACCOUNT_ID
 R2_BUCKET
-R2_WRITER_ACCESS_KEY_ID
-R2_WRITER_SECRET_ACCESS_KEY
+R2_BROKER_SOCKET_PATH          absolute path to the trusted broker's socket
 ```
 
-Optional:
+Optional on the Worker:
 
 ```
 WORKER_BIND_HOST               default 0.0.0.0
 WORKER_PORT                    default 8080
 R2_JURISDICTION                default | eu | us
-R2_WRITER_SESSION_TOKEN        temporary credentials only
 WORKER_CONTROL_PREVIOUS_KEY_ID \  both or neither; ids must differ
 WORKER_CONTROL_PREVIOUS_SECRET /
 ```
 
-Every malformed **required** value fails startup closed, before `listen()`.
+**FORBIDDEN on the Worker.** These are not ignored — their mere presence is a
+startup failure, unconditionally and without consulting `NODE_ENV`, because
+each one means a long-lived R2 credential is sitting inside the media
+container:
+
+```
+R2_WRITER_ACCESS_KEY_ID             \
+R2_WRITER_SECRET_ACCESS_KEY          |  the superseded persistent contract
+R2_WRITER_SESSION_TOKEN             /
+R2_BROKER_PARENT_ACCESS_KEY_ID      \  the broker's parent credential
+R2_BROKER_PARENT_SECRET_ACCESS_KEY  /
+```
+
+Required on the **trusted broker host only** (root-owned `EnvironmentFile`,
+mode `0400`, never argv):
+
+```
+R2_BROKER_SOCKET_PATH
+R2_ACCOUNT_ID
+R2_BUCKET
+R2_JURISDICTION                optional; default | eu | us
+R2_BROKER_PARENT_ACCESS_KEY_ID
+R2_BROKER_PARENT_SECRET_ACCESS_KEY
+```
+
+Every malformed **required** value fails startup closed, before `listen()`, on
+both runtimes. A broker that cannot configure itself does not bind its socket,
+which is what makes the Worker's dependency on it fail closed at the systemd
+level rather than degrade.
 
 Configured on **Vercel only** (never on the Worker), optional until the access
 layer is deployed, and both-or-neither:
@@ -442,6 +625,7 @@ the HTTP runtime.
 | Situation | Behaviour |
 | :--- | :--- |
 | Worker unavailable | Vercel **fails closed** with `WORKER_UNAVAILABLE`. |
+| **Broker unavailable** | The Worker's R2 operation **fails closed**. `BindsTo=` stops the Worker with the broker. There is never a fallback to a persistent Worker R2 credential — none exists, and supplying one is a startup failure. |
 | Local fallback | **Never.** Production must never fall back to running media processing or yt-dlp inside the Vercel runtime. |
 | Worker down at expiry | Vercel still refuses to sign new URLs; the provider TTL eventually removes the object. |
 | Rolling back the Worker | Deploy the previous image against the **same** persistent volume. Schema V1 is unchanged, so no data migration is involved. |
@@ -465,12 +649,26 @@ authorization.
 - [ ] All capabilities dropped; no privileged mode, host network or Docker socket.
 - [ ] External egress deny policy applied and owned outside the container.
 - [ ] TLS endpoint terminated in front of the Worker and reachable by Vercel.
-- [ ] **`R2-CREDENTIAL-SCOPE-DECISION-001` closed by the Product Owner (Option A or B).**
-      No R2 credential may be created before this. See §5d.
+- [x] **`R2-CREDENTIAL-SCOPE-DECISION-001` closed by the Product Owner —
+      Option B (renewable, action-scoped temporary credentials).** See §5f.
+      Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001`. No credential
+      has been created.
 - [ ] Private R2 bucket created; lifecycle TTL backstop configured.
-- [ ] Worker writer credential created — separate identity, bucket-scoped, no
-      bucket administration. Provider permissions may be broader than the
-      application's Put/Head/Delete surface; see §5b.
+- [ ] Broker **parent** credential created — bucket-scoped, no bucket
+      administration. Provider permissions are necessarily broader than the
+      Put/Head/Delete surface; narrowing happens per operation at mint time via
+      local signing. See §5b.
+- [ ] Dedicated `videofetch-broker` system user created; parent credential
+      installed at `/etc/videofetch/r2-broker.env`, root-owned, mode `0400`,
+      **never** on the Worker and **never** in argv.
+- [ ] `videofetch-r2-broker.service` installed and started **before** the
+      Worker; socket present at `R2_BROKER_SOCKET_PATH`, mode `0660`.
+- [ ] Worker unit declares `Requires=` + `After=` + `BindsTo=` on the broker
+      unit; broker-stop confirmed to stop the Worker rather than degrade it.
+- [ ] Broker socket directory bind-mounted **read-only** into the Worker
+      container; Worker container added to the broker group.
+- [ ] Confirmed the Worker container environment and argv contain no
+      `R2_WRITER_*` and no `R2_BROKER_PARENT_*`. See `deploy/README.md`.
 - [ ] Vercel signer credential created **separately** — bucket-scoped, no bucket
       administration. Provider permissions may be broader than signed GET; see §5b.
 - [ ] `WORKER_CONTROL_*` generated and configured on both runtimes.
@@ -481,10 +679,9 @@ authorization.
 - [ ] Access application + **Service Auth** policy created; service token issued.
 - [ ] `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET` set on
       **Vercel only** — both or neither — and never on the Worker.
-- [ ] **`CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` resolved.** Measure
-      whether the Access service-token headers reach the origin, and scrub them
-      ahead of the media Worker if they do. See §11. **BLOCKING before ingress
-      acceptance.**
+- [x] **`CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` resolved and
+      accepted.** Measured externally against the real Service Auth
+      configuration. See §11.
 - [ ] External liveness probe wired in the deployment layer, from **outside**
       the restricted media namespace. The image ships no `HEALTHCHECK`.
 - [ ] `GET /v1/healthz` returns 200 through the TLS endpoint.
@@ -496,8 +693,10 @@ authorization.
 
 | Id | Status | Notes |
 | :--- | :--- | :--- |
-| `R2-CREDENTIAL-SCOPE-DECISION-001` | **OPEN — BLOCKING before any Phase-8B R2 credential provisioning** | Option A (accept broader persistent bucket-scoped credentials, rely on software separation) vs Option B (renewable action-scoped temporary credentials). See §5d. Product Owner decision; not made in Phase 8A. |
-| `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **OPEN — BLOCKING before production Cloudflare ingress acceptance** | This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it. It does **not** prove that Access removes `CF-Access-Client-Id` / `CF-Access-Client-Secret` before forwarding to the origin — that is provider behaviour. **Contract:** during the real Tunnel + Access prototype, (1) send a request through the exact Service Auth configuration, (2) observe the request at the trusted ingress/origin boundary *without logging the real secret value* (presence/absence and length only), and (3) determine whether either header reaches the media Worker. **Desired result:** `CF-Access-Client-Secret` does not reach the media Worker. If Cloudflare strips it, record the evidence. If Cloudflare forwards it, the final topology **must** remove or scrub it **before** the media Worker namespace using an externally controlled ingress mechanism — for example an edge/header transform or a VM-owned ingress proxy outside that namespace — subject to review; the mechanism is deliberately **not** chosen here. If no reliable mechanism is available, **stop the Cloudflare production rollout and return to architecture review.** |
+| `R2-CREDENTIAL-SCOPE-DECISION-001` | **RESOLVED / CLOSED — Option B** | The Product Owner selected Option B: renewable, action-scoped temporary credentials. Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001` — the media Worker holds no persistent R2 credential, a trusted host broker outside the media namespace retains the single-bucket parent writer credential, and each operation receives a credential scoped to one bucket, one exact `WorkerObjectKey` and one S3 action with a bounded TTL. See §5b–§5f. No R2 bucket, token or lifecycle rule has been created. |
+| `R2-BROKER-PARENT-TOKEN-ROTATION-001` | OPEN — non-blocking, provisioning-time | The broker's parent token is still a persistent credential; only its custody changed. Rotating it is a broker-side `EnvironmentFile` update plus a `systemctl restart videofetch-r2-broker`, which `BindsTo=` will propagate as a brief Worker restart. Define the rotation cadence when the token is actually provisioned. No code change is expected. |
+| `R2-BROKER-LIVE-MINT-VERIFICATION-001` | OPEN — BLOCKING before production R2 traffic | Local signing is verified in this repository against the documented scheme and pinned byte-for-byte to the `jose` reference implementation, but it has **never been exercised against a live R2 endpoint** — no bucket or token exists. Before production traffic, confirm against real R2 that (1) a `PutObject`-scoped credential uploads the exact key, (2) the same credential is refused for `GetObject`, `ListObjectsV2` and `DeleteObject`, (3) a `HeadObject`/`DeleteObject` credential is likewise confined, and (4) an expired credential is rejected. Record the evidence without logging any credential value. |
+| `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **CLOSED — accepted** | Empirically measured and accepted against the real Cloudflare Access Service Auth configuration; the gate is no longer blocking and is not reopened here. Scope note, unchanged: this is an acceptance of the measured INGRESS path, not a source-level property. This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it — that part is still asserted by the control-plane boundary suite. Any change to the ingress topology invalidates the acceptance and requires a re-measurement. |
 | `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001` | OPEN — Phase-9 evidence | The prototype acceptance run was performed with the host VPN client loaded but **not connected**. Repeat the suite with it actively connected (including any DNS-interception or mesh features), since that changes host routing beneath the VM. Requires operator interaction. Not a code blocker. |
 | `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | OPEN — Phase-9 evidence | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Add a route in the acceptance harness so the deny rules actually fire and can be attributed. Every other range was counter-attributed. |
 | `SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001` | OPEN — Phase-9 evidence, non-blocking | The prototype verifier fingerprints the `nftables` ruleset but not the namespace **route table**. Non-blocking because destination denial was proven to survive route injection — a route cannot defeat a destination-address deny. Consider pinning the route table in the final deployment supervisor for defence in depth. |
