@@ -77,12 +77,12 @@ They are deliberately independent:
   never reads them from its environment, and the Worker application does not
   consume, verify, persist or intentionally log them.
 
-  > **Not yet established.** Whether Cloudflare Access *strips* the two request
-  > headers before forwarding through the Tunnel to the origin is provider
-  > behaviour that this repository cannot prove. Do **not** claim the Worker
-  > never receives them on the wire until measured. See
-  > `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` in §11 — **BLOCKING
-  > before production Cloudflare ingress acceptance.**
+  > **Established and accepted.** Whether Cloudflare Access strips the two
+  > request headers before forwarding to the origin was measured externally
+  > against the real Service Auth configuration and accepted. See
+  > `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` in §11 — **CLOSED**.
+  > This remains a statement about the measured ingress path, not a property
+  > this repository can re-derive from source.
 - The Access credentials are **not part of the HMAC canonical request**. The
   signing input remains exactly `version | key id | method | canonical path |
   timestamp | request id | idempotency key | SHA-256(raw body)`. A logically
@@ -313,7 +313,10 @@ short-lived credential:  1 bucket · 1 exact object key · 1 S3 action
 | Boundary transport | Unix domain socket. Creates **no network egress**, so it neither depends on nor widens the safe-egress policy. |
 | Socket permissions | Mode `0660`, broker user and group. The Worker joins the group to `connect(2)`. |
 | Socket directory | Bind-mounted **read-only** into the container, so the Worker cannot unlink, replace or shadow the socket with a listener of its own. |
-| Broker network | **None.** Local signing makes no API call, so the unit sets `PrivateNetwork=yes` and `RestrictAddressFamilies=AF_UNIX`. |
+| Broker network | **None.** Local signing makes no API call, so the unit sets `PrivateNetwork=yes` and `RestrictAddressFamilies=AF_UNIX`. Verified active on the VM. |
+| Broker Node runtime | **Node >= 22.6**, supplied by the deployment. The distro's packaged Node 18 cannot run `--experimental-strip-types`. |
+| `MemoryDenyWriteExecute` | **Not set**, by measurement. With the JIT the broker SIGTRAPs; with `--jitless` the type stripper loses the WebAssembly it needs. See §5g. |
+| Worker supplementary group | A **numeric GID**, resolved on the host at install time. A `--group-add` NAME would be resolved inside the image, which defines no such group. |
 | Broker validation | Re-validates the object key against the authoritative `WorkerObjectKeySchema`, the bucket by equality with its single configured bucket, the action against a closed three-entry set, and the TTL against the policy window. |
 | Broker failure mode | Fails closed on any malformed action, key, bucket or TTL. Returns a bare category code, never a value from the request. |
 | Broker logging | Never logs a credential, session token, object key or bucket. The observer hook's type cannot carry one. |
@@ -324,31 +327,48 @@ the broker's key check is a second independent gate rather than the only one.
 
 ### 5d. Credential TTL policy
 
-Minted just in time and bounded twice — once by the Worker's derivation, and
-again by the broker, which does not trust the requested value and refuses
-anything out of policy rather than clamping it.
+Minted just in time. Two DIFFERENT rules apply, because the two kinds of
+operation have opposite relationships to job expiry.
 
-| Operation | S3 action | Ceiling |
+| Operation | S3 action | Ceiling | Rule |
+| :--- | :--- | :--- | :--- |
+| `put()` | `PutObject` | 900s | **Deadline-bound** |
+| `head()` | `HeadObject` | 120s | **Deadline-bound** |
+| `delete()` | `DeleteObject` | 120s | **Cleanup**, floor 60s |
+
+**Deadline-bound (`PutObject` / `HeadObject`).** The credential must never
+outlive the job it serves.
+
+- remaining lifetime known and positive → `min(remaining, ceiling)`. A job with
+  30 seconds left yields a 30-second credential, not a floored 60-second one.
+- remaining lifetime known and **already expired** → **fail closed.** No
+  credential is requested at all, and the broker is never contacted. Writing or
+  inspecting an object whose authorization has lapsed is not something a floor
+  should be allowed to paper over.
+- deadline unknown → the action's conservative ceiling.
+
+**Cleanup (`DeleteObject`).** Must keep working precisely *because* the job
+expired, so it retains a 60-second floor and a 120-second ceiling. Maintenance
+therefore mints a **fresh, bounded, delete-only** credential long after expiry
+rather than relying on a stale upload credential. Deleting an expired object
+grants nothing to anyone, and the credential carries no Put or Head authority.
+
+Global bounds: minimum 1s, absolute hard cap 900s.
+
+#### Where each rule is enforced
+
+The split is deliberate and is not a gap:
+
+| Rule | Enforced by | Why there |
 | :--- | :--- | :--- |
-| `put()` | `PutObject` | 900s |
-| `head()` | `HeadObject` | 120s |
-| `delete()` | `DeleteObject` | 120s |
+| Integer TTL within `[1, ceiling(action)]` | **Broker** | Verifiable without a job store. Refused, never clamped — an out-of-policy ask is a bug or an attack. |
+| TTL ≤ remaining job lifetime | **Worker** | Only the Worker knows the job deadline. |
+| Expired job → no Put/Head credential | **Worker** | Same reason. |
 
-- **Floor:** 60s. **Absolute hard cap:** 900s (15 minutes).
-- Where the remaining job lifetime is known it shortens the credential further,
-  so a credential never outlives the job it serves. An upload is bounded by
-  `MAX_FILE_SIZE` and may legitimately take minutes, which is why `PutObject`
-  gets the larger ceiling; a head or a delete is one fast call.
-- Where the job row is gone the action's ceiling applies — still bounded, never
-  unbounded.
-- The floor is deliberate: an **already expired** job must remain cleanable.
-  Maintenance therefore mints a **fresh `DeleteObject`-only credential** rather
-  than relying on a stale upload credential, which is exactly what a
-  per-operation model makes possible.
-
-No derivation — including one from a corrupted deadline — can produce a
-credential outside `[floor, ceiling]`, so nothing minted here can become
-quasi-persistent.
+A compromised Worker therefore cannot negotiate a credential longer than the
+per-action ceiling; an honest Worker additionally cannot obtain one that
+outlives its job. The broker does not claim to verify deadline-boundness, and
+the code does not pretend otherwise.
 
 ### 5e. What is still required at provisioning time
 
@@ -389,6 +409,46 @@ credential is a broker-side restart.
 
 No R2 bucket, token, lifecycle rule or account change has been made. This
 remains an unprovisioned design.
+
+### 5g. Measured host constraints
+
+Both items below were found by running the real broker on the target VM
+(Ubuntu 24.04.4, Node 22.23.2, aarch64) with fake deterministic credentials and
+no R2 endpoint. They are recorded because both would otherwise ship as units
+that cannot start.
+
+**1. `MemoryDenyWriteExecute` is unusable while the broker runs TypeScript.**
+
+| Configuration | Result |
+| :--- | :--- |
+| `MemoryDenyWriteExecute=yes`, JIT enabled | V8 fatal in `OS::SetPermissions` (errno 12); `Result=core-dump`, `status=5/TRAP`. Never starts. |
+| `MemoryDenyWriteExecute=yes`, `--jitless` | `ERR_WEBASSEMBLY_NOT_SUPPORTED` at `stripTypeScriptModuleTypes`. Never starts. |
+| No `MemoryDenyWriteExecute`, JIT enabled | **Active, listening, stable.** |
+
+V8's tiering compiler needs executable heap pages, which W^X denies. `--jitless`
+removes the JIT but also disables WebAssembly — and Node's native type stripper
+is a WASM module. The two are jointly unusable here, so the directive is
+omitted rather than shipped broken. A unit that cannot start is not a security
+control. Every other confinement directive is retained and was verified active
+in the same run.
+
+To reinstate W^X the broker would have to stop relying on runtime type
+stripping (precompiled JS), at which point `--jitless` becomes viable again.
+
+**2. The Worker's supplementary group must be a numeric GID.**
+
+`docker run --group-add <name>` resolves the NAME inside the container image.
+The Worker image defines no `videofetch-broker` group, so a named `--group-add`
+cannot work. The host allocates the GID when the group is created, so it must
+not be hard-coded either.
+
+`deploy/bin/vf-r2-broker-gid-write` resolves it at install time into
+`/etc/videofetch/broker-gid.env` (world-readable; a group id is not a secret),
+and `deploy/bin/vf-r2-broker-gid-verify` runs as an `ExecStartPre` gate that
+refuses to start the Worker unless the configured GID numerically equals the
+group owning the socket and the socket is group-connectable but not
+world-accessible. Neither `/etc/passwd` nor `/etc/group` is mounted into the
+media container.
 
 ---
 
@@ -619,10 +679,9 @@ authorization.
 - [ ] Access application + **Service Auth** policy created; service token issued.
 - [ ] `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET` set on
       **Vercel only** — both or neither — and never on the Worker.
-- [ ] **`CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` resolved.** Measure
-      whether the Access service-token headers reach the origin, and scrub them
-      ahead of the media Worker if they do. See §11. **BLOCKING before ingress
-      acceptance.**
+- [x] **`CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` resolved and
+      accepted.** Measured externally against the real Service Auth
+      configuration. See §11.
 - [ ] External liveness probe wired in the deployment layer, from **outside**
       the restricted media namespace. The image ships no `HEALTHCHECK`.
 - [ ] `GET /v1/healthz` returns 200 through the TLS endpoint.
@@ -637,7 +696,7 @@ authorization.
 | `R2-CREDENTIAL-SCOPE-DECISION-001` | **RESOLVED / CLOSED — Option B** | The Product Owner selected Option B: renewable, action-scoped temporary credentials. Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001` — the media Worker holds no persistent R2 credential, a trusted host broker outside the media namespace retains the single-bucket parent writer credential, and each operation receives a credential scoped to one bucket, one exact `WorkerObjectKey` and one S3 action with a bounded TTL. See §5b–§5f. No R2 bucket, token or lifecycle rule has been created. |
 | `R2-BROKER-PARENT-TOKEN-ROTATION-001` | OPEN — non-blocking, provisioning-time | The broker's parent token is still a persistent credential; only its custody changed. Rotating it is a broker-side `EnvironmentFile` update plus a `systemctl restart videofetch-r2-broker`, which `BindsTo=` will propagate as a brief Worker restart. Define the rotation cadence when the token is actually provisioned. No code change is expected. |
 | `R2-BROKER-LIVE-MINT-VERIFICATION-001` | OPEN — BLOCKING before production R2 traffic | Local signing is verified in this repository against the documented scheme and pinned byte-for-byte to the `jose` reference implementation, but it has **never been exercised against a live R2 endpoint** — no bucket or token exists. Before production traffic, confirm against real R2 that (1) a `PutObject`-scoped credential uploads the exact key, (2) the same credential is refused for `GetObject`, `ListObjectsV2` and `DeleteObject`, (3) a `HeadObject`/`DeleteObject` credential is likewise confined, and (4) an expired credential is rejected. Record the evidence without logging any credential value. |
-| `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **OPEN — BLOCKING before production Cloudflare ingress acceptance** | This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it. It does **not** prove that Access removes `CF-Access-Client-Id` / `CF-Access-Client-Secret` before forwarding to the origin — that is provider behaviour. **Contract:** during the real Tunnel + Access prototype, (1) send a request through the exact Service Auth configuration, (2) observe the request at the trusted ingress/origin boundary *without logging the real secret value* (presence/absence and length only), and (3) determine whether either header reaches the media Worker. **Desired result:** `CF-Access-Client-Secret` does not reach the media Worker. If Cloudflare strips it, record the evidence. If Cloudflare forwards it, the final topology **must** remove or scrub it **before** the media Worker namespace using an externally controlled ingress mechanism — for example an edge/header transform or a VM-owned ingress proxy outside that namespace — subject to review; the mechanism is deliberately **not** chosen here. If no reliable mechanism is available, **stop the Cloudflare production rollout and return to architecture review.** |
+| `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **CLOSED — accepted** | Empirically measured and accepted against the real Cloudflare Access Service Auth configuration; the gate is no longer blocking and is not reopened here. Scope note, unchanged: this is an acceptance of the measured INGRESS path, not a source-level property. This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it — that part is still asserted by the control-plane boundary suite. Any change to the ingress topology invalidates the acceptance and requires a re-measurement. |
 | `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001` | OPEN — Phase-9 evidence | The prototype acceptance run was performed with the host VPN client loaded but **not connected**. Repeat the suite with it actively connected (including any DNS-interception or mesh features), since that changes host routing beneath the VM. Requires operator interaction. Not a code blocker. |
 | `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | OPEN — Phase-9 evidence | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Add a route in the acceptance harness so the deny rules actually fire and can be attributed. Every other range was counter-attributed. |
 | `SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001` | OPEN — Phase-9 evidence, non-blocking | The prototype verifier fingerprints the `nftables` ruleset but not the namespace **route table**. Non-blocking because destination denial was proven to survive route injection — a route cannot defeat a destination-address deny. Consider pinning the route table in the final deployment supervisor for defence in depth. |
