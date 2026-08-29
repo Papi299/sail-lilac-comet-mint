@@ -319,10 +319,16 @@ authorization decision. Diagnostic action-only credentials were accepted and
 demonstrated the intended enforcement: `PutObject` on the exact key succeeded
 while Get/Head/Delete/List and a sibling `PutObject` were denied; `HeadObject`
 on the exact key succeeded while cross-action, list and sibling head were
-denied. That first attempt measured nothing about expiration. Cloudflare's
-documentation and example were not corrected by any of this and still present
-`scope` as required — what changed is our claim shape, which now matches what
-the endpoint actually accepts.
+denied. That first attempt measured nothing about expiration.
+
+Nothing here corrected Cloudflare's own material, and none of it should be read
+as Cloudflare requiring `scope` in general. Its **concept** documentation
+describes `scope` and `actions` as alternatives — at least one required, with
+`actions` currently supported through local signing — while it is the
+**runnable local-signing example** above that constructs a required `scope`
+with an optional `actions`. The live endpoint matched the concept-level
+`scope OR actions` contract rather than that example. What changed is our claim
+shape, which now matches what the endpoint actually accepts.
 
 `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001` changed the production claim shape to the
 measured-compatible action-only form, and **the corrected production path has
@@ -347,14 +353,16 @@ longer blocks production R2 traffic.
 
 **Expiration, finally measured.** A production `PutObject` credential was minted
 at the merged contract minimum of `TTL = 1s` (§5d) and replayed at `exp + 30s`
-against real R2 on real wall-clock time, with no clock manipulation. R2 rejected
-it provider-side with `403 SignatureDoesNotMatch`, and the expired operation did
-not create its target object. R2 surfaces expired-token denial under that code
-rather than a dedicated expiry code, so the result was isolated by confirming
-that equivalent 1-second production credentials were accepted **before** expiry
-and rejected **after** it, for both `HeadObject` and `PutObject`. The
-requirement is accepted on that before/after evidence; the observed code was
-`SignatureDoesNotMatch`, not `ExpiredToken`.
+against real R2 on real wall-clock time, with no clock manipulation. In this
+acceptance R2 surfaced the expired credential provider-side as
+`403 SignatureDoesNotMatch` rather than a dedicated expiry code, and the expired
+operation did not create its target object. Because that response is not
+expiry-specific, the result was isolated by confirming that equivalent 1-second
+production credentials were accepted **before** expiry and rejected **after**
+it, for both `HeadObject` and `PutObject`. The requirement is accepted on that
+before/after evidence and on the response actually observed —
+`SignatureDoesNotMatch`, not `ExpiredToken`. That records what this measurement
+returned; it is not a general claim about how R2 reports expiry.
 
 **Still true, and still worth stating plainly:** the broker's own *parent* token
 is a persistent **bucket-scoped *Object Read & Write*** credential (read + write
@@ -725,7 +733,9 @@ failed deterministically and may be retried by the user.
 
 ## 10. Phase-8B pre-flight checklist
 
-Nothing below has been performed. Each item requires explicit Product Owner
+Except for the explicitly checked decision and acceptance-evidence items below,
+none of the production provisioning or deployment actions has been performed.
+Each unchecked provisioning/deployment item requires explicit Product Owner
 authorization.
 
 - [ ] Host/provider and region selected.
@@ -737,8 +747,10 @@ authorization.
 - [ ] TLS endpoint terminated in front of the Worker and reachable by Vercel.
 - [x] **`R2-CREDENTIAL-SCOPE-DECISION-001` closed by the Product Owner —
       Option B (renewable, action-scoped temporary credentials).** See §5f.
-      Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001`. No credential
-      has been created.
+      Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001`. No
+      **production** credential has been created. A disposable parent
+      credential did exist for live acceptance and has since been revoked
+      (§5f); that was never production provisioning.
 - [x] **`R2-BROKER-LIVE-MINT-VERIFICATION-001` closed — accepted.** The merged
       action-only temporary-credential path passed live-provider acceptance
       against a **disposable** bucket, which was torn down afterwards. See §11.
@@ -786,7 +798,7 @@ authorization.
 | :--- | :--- | :--- |
 | `R2-CREDENTIAL-SCOPE-DECISION-001` | **RESOLVED / CLOSED — Option B** | The Product Owner selected Option B: renewable, action-scoped temporary credentials. Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001` — the media Worker holds no persistent R2 credential, a trusted host broker outside the media namespace retains the single-bucket parent writer credential, and each operation receives a credential scoped to one bucket, one exact `WorkerObjectKey` and one S3 action with a bounded TTL, expressed as an action-only JWT claim set (corrected by `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001`; see §5b). No **production** R2 bucket, token or lifecycle rule has been created — only disposable material for the live acceptance, which was torn down once that acceptance passed (§5f). |
 | `R2-BROKER-PARENT-TOKEN-ROTATION-001` | OPEN — non-blocking, provisioning-time | The broker's parent token is still a persistent credential; only its custody changed. Rotating it is a broker-side `EnvironmentFile` update plus a `systemctl restart videofetch-r2-broker`, which `BindsTo=` will propagate as a brief Worker restart. Define the rotation cadence when the token is actually provisioned. No code change is expected. |
-| `R2-BROKER-LIVE-MINT-VERIFICATION-001` | **CLOSED — accepted** | **Initial failure → correction → definitive acceptance → teardown.** *First attempt, FAILED:* real R2 was reached and rejected the then-merged `scope + actions` credential at token **parsing** — `HTTP 400 InvalidArgument` on `X-Amz-Security-Token`, before any authorization decision — so the production path failed closed rather than over-granting; diagnostic action-only credentials were accepted and showed the intended enforcement, and expiration went unmeasured. *Correction:* `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001` (PR #21) changed **production** credentials to action-only claims (see §5b). *Definitive rerun, PASSED:* run against this repository's merged production implementation — the merged `mintTemporaryCredential` signer, the merged `CloudflareR2ObjectStoreWriter` for Put/Head/Delete, repository-generated `WorkerObjectKey` values, all three temporary-credential fields on every delegated request, **no parent-credential fallback** (a raw AWS SDK client was used only for `GetObject`/`ListObjectsV2`, which the production writer deliberately omits). The **full matrix passed**: under its own credential, exact-key `PutObject`, `HeadObject` and `DeleteObject` each **succeeded**, while every **cross-action** attempt, every **sibling-object** attempt and **`ListObjectsV2`** were **denied by R2** — provider-side authorization denials, not local or network failures. Denied sibling writes and deletes left the sibling untouched, the sibling genuinely existed during the head and delete sibling tests (no missing-object ambiguity), the delete negatives ran while the exact object still existed, and no post-delete 404 was used as denial evidence. **Natural expiration was enforced** on real wall-clock time (§5b) — a 1-second production credential replayed at `exp + 30s` was rejected `403 SignatureDoesNotMatch`, isolated by before/after acceptance of equivalent 1-second credentials for both `HeadObject` and `PutObject`; R2 does not surface a dedicated expiry code here. *Cleanup:* all task-owned objects were removed with fresh exact-key `DeleteObject` credentials and a read-only parent check reported 0 objects at the job prefix, 0 at the `videofetch` prefix and 0 bucket-wide. *Teardown (operator-attested, not independently re-verified):* disposable parent token revoked, disposable bucket confirmed empty and deleted, local acceptance credential file removed (§5f). **This gate therefore no longer blocks production R2 traffic.** Closure means only that the merged temporary-credential model passed live-provider acceptance — it does **not** mean production R2 is provisioned (§5e/§10 remain unchecked), that `R2-BROKER-PARENT-TOKEN-ROTATION-001` is resolved, that Phase 9 or Phase 10 progressed, or that yt-dlp may be enabled. |
+| `R2-BROKER-LIVE-MINT-VERIFICATION-001` | **CLOSED — accepted** | **Initial failure → correction → definitive acceptance → teardown.** *First attempt, FAILED:* real R2 was reached and rejected the then-merged `scope + actions` credential at token **parsing** — `HTTP 400 InvalidArgument` on `X-Amz-Security-Token`, before any authorization decision — so the production path failed closed rather than over-granting; diagnostic action-only credentials were accepted and showed the intended enforcement, and expiration went unmeasured. *Correction:* `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001` (PR #21) changed **production** credentials to action-only claims (see §5b). *Definitive rerun, PASSED:* run against this repository's merged production implementation — the merged `mintTemporaryCredential` signer, the merged `CloudflareR2ObjectStoreWriter` for Put/Head/Delete, repository-generated `WorkerObjectKey` values, all three temporary-credential fields on every delegated request, **no parent-credential fallback** (a raw AWS SDK client was used only for `GetObject`/`ListObjectsV2`, which the production writer deliberately omits). The **full matrix passed**: under its own credential, exact-key `PutObject`, `HeadObject` and `DeleteObject` each **succeeded**, while every **cross-action** attempt, every **sibling-object** attempt and **`ListObjectsV2`** were **denied by R2** — provider-side authorization denials, not local or network failures. Denied sibling writes and deletes left the sibling untouched, the sibling genuinely existed during the head and delete sibling tests (no missing-object ambiguity), the delete negatives ran while the exact object still existed, and no post-delete 404 was used as denial evidence. **Natural expiration was enforced** on real wall-clock time (§5b) — a 1-second production credential replayed at `exp + 30s` was denied and created nothing, the observed expired-credential response in this acceptance being `403 SignatureDoesNotMatch` rather than a dedicated expiry code; because that response is not expiry-specific, the result was isolated by before/after acceptance of equivalent 1-second credentials for both `HeadObject` and `PutObject`. *Cleanup:* all task-owned objects were removed with fresh exact-key `DeleteObject` credentials and a read-only parent check reported 0 objects at the job prefix, 0 at the `videofetch` prefix and 0 bucket-wide. *Teardown (operator-attested, not independently re-verified):* disposable parent token revoked, disposable bucket confirmed empty and deleted, local acceptance credential file removed (§5f). **This gate therefore no longer blocks production R2 traffic.** Closure means only that the merged temporary-credential model passed live-provider acceptance — it does **not** mean production R2 is provisioned (§5e/§10 remain unchecked), that `R2-BROKER-PARENT-TOKEN-ROTATION-001` is resolved, that Phase 9 or Phase 10 progressed, or that yt-dlp may be enabled. |
 | `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **CLOSED — accepted** | Empirically measured and accepted against the real Cloudflare Access Service Auth configuration; the gate is no longer blocking and is not reopened here. Scope note, unchanged: this is an acceptance of the measured INGRESS path, not a source-level property. This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it — that part is still asserted by the control-plane boundary suite. Any change to the ingress topology invalidates the acceptance and requires a re-measurement. |
 | `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001` | OPEN — Phase-9 evidence | The prototype acceptance run was performed with the host VPN client loaded but **not connected**. Repeat the suite with it actively connected (including any DNS-interception or mesh features), since that changes host routing beneath the VM. Requires operator interaction. Not a code blocker. |
 | `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | OPEN — Phase-9 evidence | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Add a route in the acceptance harness so the deny rules actually fire and can be attributed. Every other range was counter-attributed. |
