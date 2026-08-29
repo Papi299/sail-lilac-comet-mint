@@ -181,7 +181,17 @@ export class WorkerClient {
    * are deliberately absent from the HMAC canonical request built by
    * `buildWorkerSigningInput`, so an identical logical request produces a
    * byte-identical signature whether or not the access layer is in the path.
-   * The Worker itself neither receives nor verifies them.
+   *
+   * What this code establishes: the credentials are configured and stored on
+   * the control plane only, and the Worker application never consumes,
+   * verifies, persists or intentionally logs them.
+   *
+   * What it does NOT establish: whether the access layer strips these headers
+   * before forwarding to the origin. That is provider/deployment behaviour and
+   * must be measured against the real ingress. Tracked as
+   * CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001 (BLOCKING before
+   * production Cloudflare ingress acceptance). Until that evidence exists, do
+   * not assume the Worker never receives them on the wire.
    */
   private applyAccessHeaders(headers: Headers): void {
     const clientId = this.config.cloudflareAccessClientId;
@@ -196,12 +206,15 @@ export class WorkerClient {
   /**
    * Statuses that mean the request never reached the Worker protocol.
    *
-   * 401/503 are pre-existing. 403 is added because the authoritative Worker
-   * never emits it — it is absent from WORKER_ERROR_HTTP_STATUS and from every
-   * Worker code path — so a 403 on this endpoint is always the upstream access
-   * layer refusing the service token. It must be classified BEFORE any
-   * content-type or JSON validation, because that response is HTML from the
-   * proxy rather than a Worker error envelope.
+   * 401/503 are pre-existing. 403 is added because it cannot originate from the
+   * current Worker protocol — it is absent from WORKER_ERROR_HTTP_STATUS and
+   * from every Worker code path — so a 403 on this endpoint is a non-Worker,
+   * upstream refusal. A refused Access service token is the expected cause, but
+   * other upstream controls (WAF, rate limiting, a bot rule) could produce one
+   * too; the classification deliberately does not depend on knowing which.
+   *
+   * It must be decided BEFORE any content-type or JSON validation, because such
+   * a response is an upstream page rather than a Worker error envelope.
    */
   private isUpstreamUnavailableStatus(status: number): boolean {
     return status === 401 || status === 403 || status === 503;

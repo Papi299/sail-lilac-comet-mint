@@ -332,9 +332,13 @@ describe("Vercel control-plane boundary", () => {
 
   it("never lets the Worker runtime read the Cloudflare Access service token", () => {
     // The generic scan above exempts the Worker's own environment boundary,
-    // so the exclusion is asserted directly here. Access credentials belong to
-    // the VERCEL control plane only: the Worker sits BEHIND Access and never
-    // presents or verifies the token.
+    // so the exclusion is asserted directly here. Access credentials are
+    // configured on the VERCEL control plane only; no Worker module reads,
+    // consumes or verifies them.
+    //
+    // Scope note: this is a source-level guarantee. Whether the access layer
+    // strips the headers before the origin is provider behaviour and is NOT
+    // asserted here — see CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001.
     const workerConfig = join(ROOT, "src/worker/runtime/config.server.ts");
     assert.ok(existsSync(workerConfig), "the Worker environment boundary must exist");
     const source = readSource(workerConfig);

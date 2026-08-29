@@ -72,9 +72,17 @@ pass:
 
 They are deliberately independent:
 
-- The Access service token is **Vercel-only**. It is configured as
-  `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET` on the
-  control plane. **The Worker never receives, presents or verifies it.**
+- The Access service token is **configured and stored on Vercel only**, as
+  `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET`. The Worker
+  never reads them from its environment, and the Worker application does not
+  consume, verify, persist or intentionally log them.
+
+  > **Not yet established.** Whether Cloudflare Access *strips* the two request
+  > headers before forwarding through the Tunnel to the origin is provider
+  > behaviour that this repository cannot prove. Do **not** claim the Worker
+  > never receives them on the wire until measured. See
+  > `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` in §11 — **BLOCKING
+  > before production Cloudflare ingress acceptance.**
 - The Access credentials are **not part of the HMAC canonical request**. The
   signing input remains exactly `version | key id | method | canonical path |
   timestamp | request id | idempotency key | SHA-256(raw body)`. A logically
@@ -85,12 +93,14 @@ They are deliberately independent:
   closed with `WORKER_UNAVAILABLE`, without disclosing which half was wrong.
 - Rotating the service token rotates independently of the HMAC pair.
 
-**Denial classification.** The Worker protocol never emits HTTP 403 — it is
-absent from `WORKER_ERROR_HTTP_STATUS` and from every Worker code path — so a
-403 on this endpoint always means the access layer refused the token. The
-control plane classifies it as `WORKER_UNAVAILABLE` *before* Worker
-response validation, because that body is an access-layer page rather than a
-Worker error envelope. An Access login **redirect** is likewise rejected by
+**Denial classification.** HTTP 403 cannot originate from the current Worker
+protocol — it is absent from `WORKER_ERROR_HTTP_STATUS` and from every Worker
+code path — so a 403 on this endpoint is a **non-Worker, upstream refusal**. A
+refused Access service token is the expected cause, but other upstream controls
+(WAF, rate limiting, a bot rule) could also produce one; the classification
+deliberately does not depend on distinguishing them. The control plane maps it
+to `WORKER_UNAVAILABLE` *before* Worker response validation, because such a body
+is an upstream page rather than a Worker error envelope. An Access login **redirect** is likewise rejected by
 `redirect: "error"` and becomes `WORKER_UNAVAILABLE`. Genuine Worker business
 responses (404, 409, 410, 413, 422, 429, 500, 502, 504 …) keep their existing
 error-envelope mapping and are never collapsed into unavailability.
@@ -471,6 +481,10 @@ authorization.
 - [ ] Access application + **Service Auth** policy created; service token issued.
 - [ ] `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET` set on
       **Vercel only** — both or neither — and never on the Worker.
+- [ ] **`CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` resolved.** Measure
+      whether the Access service-token headers reach the origin, and scrub them
+      ahead of the media Worker if they do. See §11. **BLOCKING before ingress
+      acceptance.**
 - [ ] External liveness probe wired in the deployment layer, from **outside**
       the restricted media namespace. The image ships no `HEALTHCHECK`.
 - [ ] `GET /v1/healthz` returns 200 through the TLS endpoint.
@@ -483,6 +497,7 @@ authorization.
 | Id | Status | Notes |
 | :--- | :--- | :--- |
 | `R2-CREDENTIAL-SCOPE-DECISION-001` | **OPEN — BLOCKING before any Phase-8B R2 credential provisioning** | Option A (accept broader persistent bucket-scoped credentials, rely on software separation) vs Option B (renewable action-scoped temporary credentials). See §5d. Product Owner decision; not made in Phase 8A. |
+| `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **OPEN — BLOCKING before production Cloudflare ingress acceptance** | This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it. It does **not** prove that Access removes `CF-Access-Client-Id` / `CF-Access-Client-Secret` before forwarding to the origin — that is provider behaviour. **Contract:** during the real Tunnel + Access prototype, (1) send a request through the exact Service Auth configuration, (2) observe the request at the trusted ingress/origin boundary *without logging the real secret value* (presence/absence and length only), and (3) determine whether either header reaches the media Worker. **Desired result:** `CF-Access-Client-Secret` does not reach the media Worker. If Cloudflare strips it, record the evidence. If Cloudflare forwards it, the final topology **must** remove or scrub it **before** the media Worker namespace using an externally controlled ingress mechanism — for example an edge/header transform or a VM-owned ingress proxy outside that namespace — subject to review; the mechanism is deliberately **not** chosen here. If no reliable mechanism is available, **stop the Cloudflare production rollout and return to architecture review.** |
 | `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001` | OPEN — Phase-9 evidence | The prototype acceptance run was performed with the host VPN client loaded but **not connected**. Repeat the suite with it actively connected (including any DNS-interception or mesh features), since that changes host routing beneath the VM. Requires operator interaction. Not a code blocker. |
 | `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | OPEN — Phase-9 evidence | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Add a route in the acceptance harness so the deny rules actually fire and can be attributed. Every other range was counter-attributed. |
 | `SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001` | OPEN — Phase-9 evidence, non-blocking | The prototype verifier fingerprints the `nftables` ruleset but not the namespace **route table**. Non-blocking because destination denial was proven to survive route injection — a route cannot defeat a destination-address deny. Consider pinning the route table in the final deployment supervisor for defence in depth. |
