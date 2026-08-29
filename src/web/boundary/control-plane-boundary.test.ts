@@ -288,6 +288,10 @@ describe("Vercel control-plane boundary", () => {
       "R2_SIGNER_SESSION_TOKEN",
       "R2_ACCOUNT_ID",
       "R2_BUCKET",
+      // Cloudflare Access service token. Vercel-only, like the signer identity:
+      // the Worker runtime must never read it and the browser must never see it.
+      "CLOUDFLARE_ACCESS_CLIENT_ID",
+      "CLOUDFLARE_ACCESS_CLIENT_SECRET",
     ];
     for (const file of allSourceFiles()) {
       const source = readSource(file);
@@ -323,6 +327,33 @@ describe("Vercel control-plane boundary", () => {
           `${rel(file)} reads ${name} outside the server-only composition layer`,
         );
       }
+    }
+  });
+
+  it("never lets the Worker runtime read the Cloudflare Access service token", () => {
+    // The generic scan above exempts the Worker's own environment boundary,
+    // so the exclusion is asserted directly here. Access credentials belong to
+    // the VERCEL control plane only: the Worker sits BEHIND Access and never
+    // presents or verifies the token.
+    const workerConfig = join(ROOT, "src/worker/runtime/config.server.ts");
+    assert.ok(existsSync(workerConfig), "the Worker environment boundary must exist");
+    const source = readSource(workerConfig);
+    for (const name of ["CLOUDFLARE_ACCESS_CLIENT_ID", "CLOUDFLARE_ACCESS_CLIENT_SECRET"]) {
+      assert.equal(
+        source.includes(name),
+        false,
+        `the Worker runtime must never reference ${name}`,
+      );
+    }
+    // And no Worker-side file may reach for them at all.
+    for (const file of productionSourceFiles()) {
+      if (!rel(file).startsWith("src/worker/")) continue;
+      const workerSource = readSource(file);
+      assert.equal(
+        /CLOUDFLARE_ACCESS/i.test(workerSource),
+        false,
+        `${rel(file)} must not reference the Cloudflare Access service token`,
+      );
     }
   });
 });

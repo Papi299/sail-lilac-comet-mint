@@ -8,7 +8,9 @@
 #   - yt-dlp / python  : direct-media execution does not need it, and Phase 10
 #                        is the only phase authorized to enable yt-dlp network
 #                        execution. Diagnostics honestly reports `ytdlp: false`.
-#   - curl / wget      : the healthcheck uses Node itself.
+#   - curl / wget      : nothing inside this image probes over HTTP. Liveness is
+#                        probed by the deployment layer from OUTSIDE the
+#                        restricted media namespace.
 #   - ssh / sudo       : no remote administration from inside the container.
 #   - iptables/nftables: the safe-egress policy is an EXTERNAL, host-owned
 #                        boundary. The Worker must never be able to read,
@@ -77,10 +79,21 @@ EXPOSE 8080
 # Every process from here on runs as the image's non-root `node` user.
 USER node
 
-# Unauthenticated liveness only, over loopback, using Node itself. Never
-# /v1/diagnostics, which is an authenticated surface.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD ["node", "-e", "const p=process.env.WORKER_PORT||8080;require('node:http').get({host:'127.0.0.1',port:p,path:'/v1/healthz',timeout:4000},r=>{r.resume();process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))"]
+# There is deliberately NO HEALTHCHECK in this image.
+#
+# The accepted Phase-8B deployment runs the Worker inside a media network
+# namespace whose externally-owned safe-egress policy DENIES loopback and
+# private destinations outright, including the Worker's own listener address.
+# Any in-container probe would therefore have to target a destination the
+# security boundary exists to block, and the only ways to make such a probe
+# succeed are to punch a hole in the egress policy or to weaken the deny set.
+# Neither is acceptable: the boundary outranks the convenience of a built-in
+# healthcheck.
+#
+# Liveness is unchanged at the application level — `GET /v1/healthz` remains the
+# minimal unauthenticated endpoint — but the PROBE is owned by the deployment
+# layer and runs from OUTSIDE the restricted namespace. See
+# docs/architecture/worker-deployment-runbook.md ("Health and maintenance").
 
 # The Worker runtime entry point. Not Vite, not Nitro, not `npm run preview`.
 CMD ["node", "--import", "./scripts/register-ts-aliases.mjs", "--experimental-strip-types", "src/worker/runtime/main.server.ts"]

@@ -92,6 +92,142 @@ describe("worker runtime configuration", () => {
     );
   });
 
+  // ── Cloudflare Access service token (Phase 8B) ────────────────────────────
+  //
+  // Vercel-only, optional until Access actually fronts the Worker, and
+  // both-or-neither. It is part of WORKER_ENV_KEYS so a rotation invalidates
+  // the memoized client the same way a rotated HMAC key does.
+  describe("Cloudflare Access credentials", () => {
+    const ACCESS_ID = "cf-access-client-id.access";
+    const ACCESS_SECRET = "cf-access-client-secret-value-0123456789";
+
+    function configureWorker() {
+      clearEnv();
+      resetWorkerRuntimeForTests();
+      process.env.WORKER_BASE_URL = "https://worker.example";
+      process.env.WORKER_CONTROL_KEY_ID = "control-key";
+      process.env.WORKER_CONTROL_SECRET = "0123456789abcdef0123456789abcdef";
+    }
+
+    it("is optional: the client still builds when neither value is set", () => {
+      configureWorker();
+      const client = getWorkerClient();
+      assert.equal(typeof client.analyze, "function");
+      assert.equal(typeof client.createJob, "function");
+    });
+
+    it("builds a client when both values are set", () => {
+      configureWorker();
+      process.env.CLOUDFLARE_ACCESS_CLIENT_ID = ACCESS_ID;
+      process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET = ACCESS_SECRET;
+      const client = getWorkerClient();
+      assert.equal(typeof client.diagnostics, "function");
+      assert.equal(getWorkerClient(), client, "the client is memoized");
+    });
+
+    it("fails closed when only the client id is set", () => {
+      configureWorker();
+      process.env.CLOUDFLARE_ACCESS_CLIENT_ID = ACCESS_ID;
+      assert.throws(
+        () => getWorkerClient(),
+        (err: unknown) => err instanceof AppError && err.code === "WORKER_UNAVAILABLE",
+      );
+    });
+
+    it("fails closed when only the client secret is set", () => {
+      configureWorker();
+      process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET = ACCESS_SECRET;
+      assert.throws(
+        () => getWorkerClient(),
+        (err: unknown) => err instanceof AppError && err.code === "WORKER_UNAVAILABLE",
+      );
+    });
+
+    it("treats a blank Access value as absent, not as a half-configured pair", () => {
+      configureWorker();
+      process.env.CLOUDFLARE_ACCESS_CLIENT_ID = "   ";
+      process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET = "\t\n ";
+      const client = getWorkerClient();
+      assert.equal(typeof client.analyze, "function");
+    });
+
+    it("a blank id with a real secret is still a half-configured pair", () => {
+      configureWorker();
+      process.env.CLOUDFLARE_ACCESS_CLIENT_ID = "   ";
+      process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET = ACCESS_SECRET;
+      assert.throws(
+        () => getWorkerClient(),
+        (err: unknown) => err instanceof AppError && err.code === "WORKER_UNAVAILABLE",
+      );
+    });
+
+    it("rotating the Access client id rebuilds the cached client", () => {
+      configureWorker();
+      process.env.CLOUDFLARE_ACCESS_CLIENT_ID = ACCESS_ID;
+      process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET = ACCESS_SECRET;
+      const first = getWorkerClient();
+      assert.equal(getWorkerClient(), first);
+
+      process.env.CLOUDFLARE_ACCESS_CLIENT_ID = "rotated-access-id";
+      assert.notEqual(getWorkerClient(), first, "a rotated Access id must rebuild the client");
+    });
+
+    it("rotating the Access client secret rebuilds the cached client", () => {
+      configureWorker();
+      process.env.CLOUDFLARE_ACCESS_CLIENT_ID = ACCESS_ID;
+      process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET = ACCESS_SECRET;
+      const first = getWorkerClient();
+
+      process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET = "rotated-access-secret-value";
+      assert.notEqual(getWorkerClient(), first, "a rotated Access secret must rebuild the client");
+    });
+
+    it("removing the Access pair rebuilds the cached client", () => {
+      configureWorker();
+      process.env.CLOUDFLARE_ACCESS_CLIENT_ID = ACCESS_ID;
+      process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET = ACCESS_SECRET;
+      const first = getWorkerClient();
+
+      delete process.env.CLOUDFLARE_ACCESS_CLIENT_ID;
+      delete process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET;
+      assert.notEqual(getWorkerClient(), first, "removing Access must rebuild the client");
+    });
+
+    it("never renders the Access secret or variable name on the failure path", () => {
+      const SENTINEL = "SENTINEL_ACCESS_SECRET_MUST_NOT_LEAK";
+      configureWorker();
+      process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET = SENTINEL;
+      try {
+        getWorkerClient();
+        assert.fail("expected a fail-closed error");
+      } catch (err) {
+        assert.ok(err instanceof AppError);
+        assert.equal(err.code, "WORKER_UNAVAILABLE");
+        const rendered = `${String(err)}\n${err.message}\n${err.stack ?? ""}`;
+        assert.equal(rendered.includes(SENTINEL), false, "the secret must never surface");
+        assert.equal(
+          rendered.includes("CLOUDFLARE_ACCESS"),
+          false,
+          "the failing variable must not be named to the caller",
+        );
+      }
+    });
+
+    it("is part of the Vercel worker environment contract", () => {
+      assert.ok(
+        (WORKER_ENV_KEYS as readonly string[]).includes("CLOUDFLARE_ACCESS_CLIENT_ID"),
+      );
+      assert.ok(
+        (WORKER_ENV_KEYS as readonly string[]).includes("CLOUDFLARE_ACCESS_CLIENT_SECRET"),
+      );
+      assert.equal(
+        (R2_SIGNER_ENV_KEYS as readonly string[]).includes("CLOUDFLARE_ACCESS_CLIENT_ID"),
+        false,
+        "Access credentials are not part of the object-store signer identity",
+      );
+    });
+  });
+
   it("fails closed when signer configuration is missing", () => {
     clearEnv();
     resetWorkerRuntimeForTests();

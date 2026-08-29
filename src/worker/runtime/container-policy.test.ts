@@ -127,6 +127,36 @@ describe("Dockerfile.worker container policy", () => {
       assert.doesNotMatch(executable, /\bchmod\s+[ug]?\+s\b/i, "no setuid helper");
     });
 
+    it("declare an in-container HEALTHCHECK", () => {
+      // Phase-8B architectural invariant. The deployed Worker runs inside a
+      // media network namespace whose externally-owned safe-egress policy
+      // denies loopback and private destinations, so an in-container liveness
+      // probe could only pass by weakening that policy. Liveness is probed by
+      // the deployment layer from OUTSIDE the namespace instead.
+      assert.equal(
+        directives("HEALTHCHECK").length,
+        0,
+        "the Worker image must not declare a HEALTHCHECK",
+      );
+      assert.doesNotMatch(
+        executable,
+        /\bHEALTHCHECK\b/i,
+        "no executable instruction may reintroduce a healthcheck",
+      );
+    });
+
+    it("probe any loopback or private destination from inside the image", () => {
+      // Closes the obvious workaround: swapping the healthcheck for some other
+      // in-namespace probe against a destination the egress policy forbids.
+      for (const forbidden of [/127\.0\.0\.1/, /\blocalhost\b/i, /\[::1\]/, /::1\b/]) {
+        assert.doesNotMatch(
+          executable,
+          forbidden,
+          `the image must not target ${forbidden} from inside the media namespace`,
+        );
+      }
+    });
+
     it("enable YTDLP_NETWORK_ISOLATED", () => {
       // Phase 10 is the only phase authorized to enable it.
       for (const truthy of ["true", "1", "yes"]) {
@@ -248,21 +278,6 @@ describe("Dockerfile.worker container policy", () => {
       assert.ok(userIndex >= 0, "a USER directive is required");
       assert.ok(cmdIndex >= 0, "a CMD directive is required");
       assert.ok(userIndex < cmdIndex, "USER must precede the final CMD");
-    });
-
-    it("provide an unauthenticated Worker healthcheck using Node itself", () => {
-      const healthchecks = directives("HEALTHCHECK");
-      assert.equal(healthchecks.length, 1, "exactly one HEALTHCHECK");
-
-      const check = healthchecks[0].args;
-      assert.match(check, /\/v1\/healthz/, "healthcheck must probe /v1/healthz");
-      assert.match(check, /\bnode\b/, "healthcheck must use Node, not curl");
-      assert.doesNotMatch(check, /\bcurl\b|\bwget\b/, "healthcheck must not shell out to curl/wget");
-      assert.doesNotMatch(
-        check,
-        /\/v1\/diagnostics/,
-        "diagnostics is authenticated and must not gate container health",
-      );
     });
 
     it("declare the persistent state and ephemeral temp directory contract", () => {
