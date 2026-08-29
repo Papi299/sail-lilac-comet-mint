@@ -113,6 +113,30 @@ export class JobExecutor {
     return this.activeControllers.size;
   }
 
+  /**
+   * §22/§23: aborts every in-flight execution for an operator shutdown.
+   *
+   * This deliberately does NOT call `store.cancelJob()`. A restart is not a
+   * user cancellation, so no `cancelled` state is written and first-terminal-
+   * wins is untouched: whatever the aborted execution commits (a `failed` row
+   * via the existing classification) or leaves behind (an interrupted active
+   * row, classified by `store.recover()` on the next boot) remains authoritative.
+   *
+   * Aborting is also what prevents descendant leakage: the hardened process
+   * runner spawns media children detached into their own POSIX process group
+   * and SIGKILLs the whole group on abort, so no FFmpeg descendant can outlive
+   * the shutting-down Worker.
+   *
+   * @returns the number of executions signalled.
+   */
+  public abortActiveForShutdown(): number {
+    const controllers = [...this.activeControllers.values()];
+    for (const controller of controllers) {
+      controller.abort(new AppError("PROCESSING_FAILED", "Worker shutting down"));
+    }
+    return controllers.length;
+  }
+
   public cancel(jobId: string): CancelJobResult {
     const res = this.store.cancelJob(jobId);
     if (res.type === "cancelled") {
