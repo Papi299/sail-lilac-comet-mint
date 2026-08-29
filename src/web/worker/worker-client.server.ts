@@ -34,6 +34,29 @@ import {
   WORKER_HEALTH_PATH,
 } from "../../shared/worker/constants.ts";
 
+/**
+ * Rejects any byte that cannot legally appear in an HTTP header value, without
+ * a control-character regex. A credential carrying CR/LF would otherwise be a
+ * header-injection primitive.
+ */
+function hasControlCharacter(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
+/**
+ * One half of an upstream access-layer service token. Bounded, single-line, and
+ * never rendered back out on any error path.
+ */
+const AccessCredentialSchema = z
+  .string()
+  .min(1, "must not be empty")
+  .max(4096, "must be at most 4096 characters")
+  .refine((value) => !hasControlCharacter(value), "must not contain control characters");
+
 export const WorkerClientConfigSchema = z.object({
   baseUrl: z.string().superRefine((val, ctx) => {
     let url: URL;
@@ -72,7 +95,27 @@ export const WorkerClientConfigSchema = z.object({
   idempotencyKeyFactory: z.custom<() => string>((val) => typeof val === "function").optional(),
   fetchImplementation: z.custom<typeof fetch>((val) => typeof val === "function").optional(),
   clock: z.custom<() => number>((val) => typeof val === "function").optional(),
-}).strict();
+  /**
+   * Optional service-token credentials for the access layer that fronts the
+   * Worker endpoint. They authenticate Vercel to that upstream proxy and are
+   * NOT part of the VideoFetch protocol: see `applyAccessHeaders`.
+   */
+  cloudflareAccessClientId: AccessCredentialSchema.optional(),
+  cloudflareAccessClientSecret: AccessCredentialSchema.optional(),
+}).strict().superRefine((cfg, ctx) => {
+  // Both or neither. A half-configured service token would silently produce
+  // requests the upstream proxy rejects, which is worse than failing closed at
+  // construction time. The offending VALUE is never echoed — only a field name.
+  const hasId = cfg.cloudflareAccessClientId !== undefined;
+  const hasSecret = cfg.cloudflareAccessClientSecret !== undefined;
+  if (hasId !== hasSecret) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Access client id and client secret must be supplied together, or not at all",
+      path: [hasId ? "cloudflareAccessClientSecret" : "cloudflareAccessClientId"],
+    });
+  }
+});
 
 export type WorkerClientConfig = z.input<typeof WorkerClientConfigSchema>;
 
@@ -130,6 +173,53 @@ export class WorkerClient {
     }
   }
 
+  /**
+   * Attaches the upstream access-layer service token, when configured.
+   *
+   * These headers belong to the proxy in front of the Worker, not to the
+   * VideoFetch protocol. They are applied AFTER the signature is computed and
+   * are deliberately absent from the HMAC canonical request built by
+   * `buildWorkerSigningInput`, so an identical logical request produces a
+   * byte-identical signature whether or not the access layer is in the path.
+   *
+   * What this code establishes: the credentials are configured and stored on
+   * the control plane only, and the Worker application never consumes,
+   * verifies, persists or intentionally logs them.
+   *
+   * What it does NOT establish: whether the access layer strips these headers
+   * before forwarding to the origin. That is provider/deployment behaviour and
+   * must be measured against the real ingress. Tracked as
+   * CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001 (BLOCKING before
+   * production Cloudflare ingress acceptance). Until that evidence exists, do
+   * not assume the Worker never receives them on the wire.
+   */
+  private applyAccessHeaders(headers: Headers): void {
+    const clientId = this.config.cloudflareAccessClientId;
+    const clientSecret = this.config.cloudflareAccessClientSecret;
+    // The schema guarantees both-or-neither; this reads both anyway so a future
+    // schema regression cannot emit a lone header.
+    if (clientId === undefined || clientSecret === undefined) return;
+    headers.set("CF-Access-Client-Id", clientId);
+    headers.set("CF-Access-Client-Secret", clientSecret);
+  }
+
+  /**
+   * Statuses that mean the request never reached the Worker protocol.
+   *
+   * 401/503 are pre-existing. 403 is added because it cannot originate from the
+   * current Worker protocol — it is absent from WORKER_ERROR_HTTP_STATUS and
+   * from every Worker code path — so a 403 on this endpoint is a non-Worker,
+   * upstream refusal. A refused Access service token is the expected cause, but
+   * other upstream controls (WAF, rate limiting, a bot rule) could produce one
+   * too; the classification deliberately does not depend on knowing which.
+   *
+   * It must be decided BEFORE any content-type or JSON validation, because such
+   * a response is an upstream page rather than a Worker error envelope.
+   */
+  private isUpstreamUnavailableStatus(status: number): boolean {
+    return status === 401 || status === 403 || status === 503;
+  }
+
   private async makeRequest<T>(
     method: "GET" | "POST",
     canonicalPath: string,
@@ -172,6 +262,8 @@ export class WorkerClient {
     if (body !== null) {
       headers.set("Content-Type", "application/json");
     }
+    // Applied last, and never fed back into the signature above.
+    this.applyAccessHeaders(headers);
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
@@ -191,7 +283,9 @@ export class WorkerClient {
       clearTimeout(timeoutId);
     }
 
-    if (response.status === 401 || response.status === 503) {
+    // Upstream refusal is classified BEFORE Worker response validation: the
+    // body belongs to the proxy, not to the Worker protocol.
+    if (this.isUpstreamUnavailableStatus(response.status)) {
       throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
     }
 
@@ -298,10 +392,16 @@ export class WorkerClient {
   public async health(): Promise<WorkerHealthSuccess> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+    // The Worker's own health route stays unauthenticated by VideoFetch HMAC.
+    // Only the upstream access-layer token is attached, so the probe can cross
+    // the same proxy as every other request.
+    const headers = new Headers();
+    this.applyAccessHeaders(headers);
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.origin}${WORKER_HEALTH_PATH}`, {
         method: "GET",
+        headers,
         redirect: "error",
         signal: controller.signal,
       });
@@ -311,7 +411,7 @@ export class WorkerClient {
       clearTimeout(timeoutId);
     }
 
-    if (response.status === 401 || response.status === 503) {
+    if (this.isUpstreamUnavailableStatus(response.status)) {
       throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
     }
 

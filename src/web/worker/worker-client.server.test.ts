@@ -421,4 +421,413 @@ describe("WorkerClient", () => {
       await assert.rejects(testHealth(200, '{"success":true,"status":"bad"}'), (e: any) => e.code === "PROCESSING_FAILED");
     });
   });
+
+  // ── Cloudflare Access readiness (Phase 8B) ────────────────────────────────
+  //
+  // Access is an UPSTREAM layer: it authenticates Vercel to the proxy in front
+  // of the Worker. It must add exactly two headers, must never enter the
+  // VideoFetch HMAC canonical request, and its refusals must be classified as
+  // WORKER_UNAVAILABLE rather than as a malformed Worker response.
+  describe("Cloudflare Access", () => {
+    const ACCESS_ID = "cf-access-client-id.access";
+    const ACCESS_SECRET = "cf-access-client-secret-value-0123456789";
+    const ID_HEADER = "cf-access-client-id";
+    const SECRET_HEADER = "cf-access-client-secret";
+
+    const captureClient = (
+      access: { cloudflareAccessClientId?: string; cloudflareAccessClientSecret?: string },
+      sink: { options?: any },
+    ) => new WorkerClient({
+      baseUrl: BASE_URL,
+      currentKeyId: TEST_KEY_ID,
+      currentSecret: TEST_SECRET,
+      ...access,
+      fetchImplementation: (async (_url: any, opts: any) => {
+        sink.options = opts;
+        throw new Error("stop");
+      }) as unknown as typeof fetch,
+      requestIdFactory: () => "00000000-0000-4000-8000-000000000000",
+      idempotencyKeyFactory: () => "11111111-1111-4111-8111-111111111111",
+      clock: () => 1234567890000,
+    });
+
+    const sortedHeaderNames = (headers: Headers): string[] =>
+      [...headers.keys()].map((k) => k.toLowerCase()).sort();
+
+    describe("configuration", () => {
+      it("accepts both credentials together", () => {
+        new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: ACCESS_SECRET,
+        });
+      });
+
+      it("accepts neither credential", () => {
+        new WorkerClient({ baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET });
+      });
+
+      it("rejects a client id without a client secret", () => {
+        assert.throws(() => new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          cloudflareAccessClientId: ACCESS_ID,
+        }));
+      });
+
+      it("rejects a client secret without a client id", () => {
+        assert.throws(() => new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          cloudflareAccessClientSecret: ACCESS_SECRET,
+        }));
+      });
+
+      it("rejects an empty credential", () => {
+        assert.throws(() => new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: "",
+        }));
+      });
+
+      it("rejects a credential carrying a header-injection newline", () => {
+        assert.throws(() => new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          cloudflareAccessClientId: ACCESS_ID,
+          cloudflareAccessClientSecret: "abc\r\nX-Injected: 1",
+        }));
+      });
+
+      it("never renders the Access secret on any rejection path", () => {
+        const SENTINEL = "SENTINEL_ACCESS_SECRET_MUST_NOT_LEAK";
+        const attempts: Array<() => WorkerClient> = [
+          // half-configured
+          () => new WorkerClient({
+            baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+            cloudflareAccessClientSecret: SENTINEL,
+          }),
+          // malformed value
+          () => new WorkerClient({
+            baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+            cloudflareAccessClientId: ACCESS_ID,
+            cloudflareAccessClientSecret: `${SENTINEL}\n`,
+          }),
+          // over-long value
+          () => new WorkerClient({
+            baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+            cloudflareAccessClientId: ACCESS_ID,
+            cloudflareAccessClientSecret: SENTINEL + "x".repeat(4097),
+          }),
+        ];
+        for (const attempt of attempts) {
+          try {
+            attempt();
+            assert.fail("expected the configuration to be rejected");
+          } catch (err) {
+            const rendered = `${String(err)}\n${(err as Error).message}\n${JSON.stringify(err)}\n${(err as Error).stack ?? ""}`;
+            assert.equal(
+              rendered.includes(SENTINEL),
+              false,
+              "the Access secret must never appear in an exception",
+            );
+          }
+        }
+      });
+    });
+
+    describe("request headers", () => {
+      it("sends both Access headers on every signed Worker request", async () => {
+        const jobId = "00000000000000000000000000000000";
+        const calls: Array<[string, () => Promise<unknown>]> = [];
+        const sink: { options?: any } = {};
+        const client = captureClient(
+          { cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: ACCESS_SECRET },
+          sink,
+        );
+        calls.push(["analyze", () => client.analyze({ url: "https://example.com" } as any)]);
+        calls.push(["createJob", () => client.createJob({ url: "https://example.com", formatId: "best", principalId: "private-access-user" } as any)]);
+        calls.push(["getJob", () => client.getJob(jobId)]);
+        calls.push(["cancelJob", () => client.cancelJob(jobId)]);
+        calls.push(["diagnostics", () => client.diagnostics()]);
+
+        for (const [name, call] of calls) {
+          sink.options = undefined;
+          await call().catch(() => {});
+          const headers = sink.options.headers as Headers;
+          assert.strictEqual(headers.get(ID_HEADER), ACCESS_ID, `${name} must send the Access client id`);
+          assert.strictEqual(headers.get(SECRET_HEADER), ACCESS_SECRET, `${name} must send the Access client secret`);
+        }
+      });
+
+      it("sends neither Access header when unconfigured", async () => {
+        const jobId = "00000000000000000000000000000000";
+        const sink: { options?: any } = {};
+        const client = captureClient({}, sink);
+        for (const call of [
+          () => client.analyze({ url: "https://example.com" } as any),
+          () => client.createJob({ url: "https://example.com", formatId: "best", principalId: "private-access-user" } as any),
+          () => client.getJob(jobId),
+          () => client.cancelJob(jobId),
+          () => client.diagnostics(),
+        ]) {
+          sink.options = undefined;
+          await call().catch(() => {});
+          const headers = sink.options.headers as Headers;
+          assert.strictEqual(headers.has(ID_HEADER), false);
+          assert.strictEqual(headers.has(SECRET_HEADER), false);
+        }
+      });
+
+      it("changes the request ONLY by the two Access headers", async () => {
+        const withSink: { options?: any } = {};
+        const withoutSink: { options?: any } = {};
+        await captureClient(
+          { cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: ACCESS_SECRET },
+          withSink,
+        ).createJob({ url: "https://example.com", formatId: "best", principalId: "private-access-user" } as any).catch(() => {});
+        await captureClient({}, withoutSink)
+          .createJob({ url: "https://example.com", formatId: "best", principalId: "private-access-user" } as any).catch(() => {});
+
+        const withHeaders = withSink.options.headers as Headers;
+        const withoutHeaders = withoutSink.options.headers as Headers;
+
+        assert.deepStrictEqual(
+          sortedHeaderNames(withHeaders).filter((n) => n !== ID_HEADER && n !== SECRET_HEADER),
+          sortedHeaderNames(withoutHeaders),
+          "no header other than the Access pair may be added or removed",
+        );
+        for (const name of sortedHeaderNames(withoutHeaders)) {
+          assert.strictEqual(
+            withHeaders.get(name),
+            withoutHeaders.get(name),
+            `header ${name} must be unchanged`,
+          );
+        }
+        assert.strictEqual(withSink.options.method, withoutSink.options.method);
+        assert.strictEqual(withSink.options.redirect, withoutSink.options.redirect);
+        assert.strictEqual(
+          withSink.options.body.toString("utf8"),
+          withoutSink.options.body.toString("utf8"),
+          "the signed body must be byte-identical",
+        );
+      });
+    });
+
+    describe("HMAC invariant", () => {
+      // The canonical signing input is version|keyId|method|path|timestamp|
+      // requestId|idempotencyKey|sha256(body). Access credentials are NOT in it.
+      const jobId = "00000000000000000000000000000000";
+
+      const signatureFor = async (
+        access: { cloudflareAccessClientId?: string; cloudflareAccessClientSecret?: string },
+        call: (c: WorkerClient) => Promise<unknown>,
+      ): Promise<string> => {
+        const sink: { options?: any } = {};
+        await call(captureClient(access, sink)).catch(() => {});
+        return (sink.options.headers as Headers).get("x-videofetch-signature")!;
+      };
+
+      const cases: Array<[string, (c: WorkerClient) => Promise<unknown>]> = [
+        ["analyze", (c) => c.analyze({ url: "https://example.com" } as any)],
+        ["createJob", (c) => c.createJob({ url: "https://example.com", formatId: "best", principalId: "private-access-user" } as any)],
+        ["getJob", (c) => c.getJob(jobId)],
+        ["cancelJob", (c) => c.cancelJob(jobId)],
+        ["diagnostics", (c) => c.diagnostics()],
+      ];
+
+      for (const [name, call] of cases) {
+        it(`${name}: signature is byte-identical with and without Access credentials`, async () => {
+          const withAccess = await signatureFor(
+            { cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: ACCESS_SECRET },
+            call,
+          );
+          const withoutAccess = await signatureFor({}, call);
+          assert.match(withoutAccess, /^[0-9a-f]{64}$/);
+          assert.strictEqual(
+            withAccess,
+            withoutAccess,
+            "Access credentials must not enter the HMAC canonical request",
+          );
+        });
+      }
+
+      it("a different Access secret does not change the signature", async () => {
+        const call = (c: WorkerClient) => c.getJob(jobId);
+        const a = await signatureFor(
+          { cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: ACCESS_SECRET },
+          call,
+        );
+        const b = await signatureFor(
+          { cloudflareAccessClientId: "other-id", cloudflareAccessClientSecret: "a-totally-different-secret" },
+          call,
+        );
+        assert.strictEqual(a, b);
+      });
+
+      it("matches the independently computed canonical signature", async () => {
+        const sink: { options?: any } = {};
+        await captureClient(
+          { cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: ACCESS_SECRET },
+          sink,
+        ).getJob(jobId).catch(() => {});
+        const expected = createWorkerSignatureHex(TEST_SECRET, {
+          keyId: TEST_KEY_ID, method: "GET", canonicalPath: workerJobPath(jobId),
+          timestampSeconds: "1234567890", requestId: "00000000-0000-4000-8000-000000000000",
+          idempotencyKey: undefined, sha256RawBody: sha256WorkerBody(Buffer.alloc(0)),
+        });
+        assert.strictEqual((sink.options.headers as Headers).get("x-videofetch-signature"), expected);
+      });
+    });
+
+    describe("denial classification", () => {
+      const respondWith = (status: number, body: string, contentType: string) => new WorkerClient({
+        baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+        cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: ACCESS_SECRET,
+        fetchImplementation: (async () => new Response(body, {
+          status, headers: { "Content-Type": contentType, "Content-Length": String(body.length) },
+        })) as unknown as typeof fetch,
+      });
+      const runGetJob = (c: WorkerClient) => c.getJob("00000000000000000000000000000000");
+
+      const ACCESS_HTML = "<!DOCTYPE html><html><body>Access denied</body></html>";
+
+      it("403 with an HTML Access page -> WORKER_UNAVAILABLE", async () => {
+        await assert.rejects(
+          runGetJob(respondWith(403, ACCESS_HTML, "text/html; charset=utf-8")),
+          (e: any) => e.code === "WORKER_UNAVAILABLE",
+        );
+      });
+
+      it("403 with a JSON Access body -> WORKER_UNAVAILABLE", async () => {
+        await assert.rejects(
+          runGetJob(respondWith(403, '{"error":"access denied"}', "application/json")),
+          (e: any) => e.code === "WORKER_UNAVAILABLE",
+        );
+      });
+
+      it("403 with no body or content-type -> WORKER_UNAVAILABLE", async () => {
+        const client = new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          fetchImplementation: (async () => new Response(null, { status: 403 })) as unknown as typeof fetch,
+        });
+        await assert.rejects(runGetJob(client), (e: any) => e.code === "WORKER_UNAVAILABLE");
+      });
+
+      it("403 never leaks the upstream body into the error message", async () => {
+        await assert.rejects(
+          runGetJob(respondWith(403, "<html>TEAM_NAME_LEAK</html>", "text/html")),
+          (e: any) => e.code === "WORKER_UNAVAILABLE" && !e.message.includes("TEAM_NAME_LEAK"),
+        );
+      });
+
+      it("401 and 503 remain WORKER_UNAVAILABLE", async () => {
+        for (const status of [401, 503]) {
+          await assert.rejects(
+            runGetJob(respondWith(status, '{"success":false}', "application/json")),
+            (e: any) => e.code === "WORKER_UNAVAILABLE",
+          );
+        }
+      });
+
+      it("an Access redirect rejected by redirect:error -> WORKER_UNAVAILABLE", async () => {
+        const client = new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: ACCESS_SECRET,
+          // Mirrors what fetch does for a 302 under redirect: "error".
+          fetchImplementation: (async () => { throw new TypeError("unexpected redirect"); }) as unknown as typeof fetch,
+        });
+        await assert.rejects(runGetJob(client), (e: any) => e.code === "WORKER_UNAVAILABLE");
+      });
+
+      // The reclassification is narrow: only statuses the Worker protocol never
+      // emits. Every genuine Worker business envelope keeps its own mapping.
+      const businessCases: Array<[number, string, string]> = [
+        [422, "UNSUPPORTED_SITE", "UNSUPPORTED_SITE"],
+        [404, "NOT_FOUND", "NOT_FOUND"],
+        [409, "FORMAT_UNAVAILABLE", "FORMAT_UNAVAILABLE"],
+        [413, "TOO_LARGE", "TOO_LARGE"],
+        [429, "RATE_LIMITED", "RATE_LIMITED"],
+        [500, "PROCESSING_FAILED", "PROCESSING_FAILED"],
+        [502, "ANALYSIS_FAILED", "ANALYSIS_FAILED"],
+        [504, "TIMEOUT", "TIMEOUT"],
+      ];
+      for (const [status, code, expected] of businessCases) {
+        it(`${status} ${code} Worker envelope is NOT collapsed into WORKER_UNAVAILABLE`, async () => {
+          await assert.rejects(
+            runGetJob(respondWith(status, `{"success":false,"error":{"code":"${code}","message":"x"}}`, "application/json")),
+            (e: any) => e.code === expected,
+          );
+        });
+      }
+
+      it("a successful Worker response is unaffected by Access credentials", async () => {
+        const payload = '{"success":true,"job":{"id":"1"}}';
+        const client = respondWith(200, payload, "application/json");
+        // Reaches schema validation (the fake job is not a valid DTO), which
+        // proves the response passed the upstream gate and the trust boundary.
+        await assert.rejects(runGetJob(client), (e: any) => e.code === "PROCESSING_FAILED");
+      });
+    });
+
+    describe("health()", () => {
+      it("sends both Access headers when configured", async () => {
+        let captured: any;
+        const client = new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: ACCESS_SECRET,
+          fetchImplementation: (async (_url: any, opts: any) => {
+            captured = opts;
+            return new Response('{"status":"ok"}', { status: 200, headers: { "Content-Type": "application/json", "Content-Length": "15" } });
+          }) as unknown as typeof fetch,
+        });
+        await client.health();
+        const headers = captured.headers as Headers;
+        assert.strictEqual(headers.get(ID_HEADER), ACCESS_ID);
+        assert.strictEqual(headers.get(SECRET_HEADER), ACCESS_SECRET);
+        // Health stays unauthenticated by VideoFetch HMAC.
+        assert.strictEqual(headers.has("x-videofetch-signature"), false);
+      });
+
+      it("sends neither Access header when unconfigured", async () => {
+        let captured: any;
+        const client = new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          fetchImplementation: (async (_url: any, opts: any) => {
+            captured = opts;
+            return new Response('{"status":"ok"}', { status: 200, headers: { "Content-Type": "application/json", "Content-Length": "15" } });
+          }) as unknown as typeof fetch,
+        });
+        await client.health();
+        const headers = captured.headers as Headers;
+        assert.strictEqual(headers.has(ID_HEADER), false);
+        assert.strictEqual(headers.has(SECRET_HEADER), false);
+      });
+
+      it("403 HTML -> WORKER_UNAVAILABLE", async () => {
+        const client = new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: ACCESS_SECRET,
+          fetchImplementation: (async () => new Response("<html>denied</html>", {
+            status: 403, headers: { "Content-Type": "text/html", "Content-Length": "19" },
+          })) as unknown as typeof fetch,
+        });
+        await assert.rejects(client.health(), (e: any) => e.code === "WORKER_UNAVAILABLE");
+      });
+
+      it("401 -> WORKER_UNAVAILABLE", async () => {
+        const client = new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          fetchImplementation: (async () => new Response('{"success":false}', {
+            status: 401, headers: { "Content-Type": "application/json", "Content-Length": "17" },
+          })) as unknown as typeof fetch,
+        });
+        await assert.rejects(client.health(), (e: any) => e.code === "WORKER_UNAVAILABLE");
+      });
+
+      it("a redirect rejection -> WORKER_UNAVAILABLE", async () => {
+        const client = new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          fetchImplementation: (async () => { throw new TypeError("unexpected redirect"); }) as unknown as typeof fetch,
+        });
+        await assert.rejects(client.health(), (e: any) => e.code === "WORKER_UNAVAILABLE");
+      });
+    });
+  });
 });

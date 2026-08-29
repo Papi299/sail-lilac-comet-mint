@@ -39,6 +39,12 @@ export const WORKER_ENV_KEYS = [
   "WORKER_BASE_URL",
   "WORKER_CONTROL_KEY_ID",
   "WORKER_CONTROL_SECRET",
+  // Cloudflare Access service token. VERCEL-ONLY: it authenticates the control
+  // plane to the access layer in front of the Worker. The Worker runtime never
+  // reads these, and they are independent of the VideoFetch HMAC pair above.
+  // Listing them here is what makes a rotation invalidate the cached client.
+  "CLOUDFLARE_ACCESS_CLIENT_ID",
+  "CLOUDFLARE_ACCESS_CLIENT_SECRET",
 ] as const;
 
 export const R2_SIGNER_ENV_KEYS = [
@@ -92,11 +98,26 @@ export function getWorkerClient(): WorkerControlClient {
     throw new AppError("WORKER_UNAVAILABLE");
   }
 
+  // Optional until Cloudflare Access fronts the Worker. `readEnv` already maps
+  // unset and whitespace-only alike to undefined, so a blank value is ABSENT
+  // here rather than a malformed credential. Supplying exactly one of the pair
+  // is rejected by the WorkerClient schema below and fails closed.
+  const accessClientId = readEnv("CLOUDFLARE_ACCESS_CLIENT_ID");
+  const accessClientSecret = readEnv("CLOUDFLARE_ACCESS_CLIENT_SECRET");
+
   let client: WorkerControlClient;
   try {
-    client = new WorkerClient({ baseUrl, currentKeyId, currentSecret });
+    client = new WorkerClient({
+      baseUrl,
+      currentKeyId,
+      currentSecret,
+      ...(accessClientId !== undefined ? { cloudflareAccessClientId: accessClientId } : {}),
+      ...(accessClientSecret !== undefined
+        ? { cloudflareAccessClientSecret: accessClientSecret }
+        : {}),
+    });
   } catch {
-    // Never surface which field was malformed.
+    // Never surface which field was malformed, and never the value.
     throw new AppError("WORKER_UNAVAILABLE");
   }
 

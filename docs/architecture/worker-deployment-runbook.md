@@ -24,11 +24,86 @@ been touched.
 | Durable state | One persistent volume mounted at `WORKER_DATA_DIRECTORY`. |
 | Volume sharing | The SQLite volume MUST NOT be mounted read/write by a second replica. |
 | Ephemeral storage | Writable scratch at `TEMP_DIRECTORY`, discarded freely. |
-| Ingress | A TLS endpoint reachable by Vercel. |
+| Ingress | A TLS endpoint reachable by Vercel. See §1a. |
 
 The single-worker invariant is architectural, not incidental: durable job state
 is worker-local SQLite, and the cancellation/idempotency contracts assume one
 writer. A second replica sharing the volume corrupts both.
+
+### 1a. Ingress
+
+The provider-neutral requirement is unchanged: **a TLS endpoint reachable by
+Vercel, with the Worker never exposed directly to the Internet.** The selected
+realization is a Cloudflare Access + Tunnel path onto a dedicated Linux VM:
+
+```
+Browser
+  → Vercel (private access, WorkerClient, HMAC signing, R2 GET signing)
+  → HTTPS
+  → Cloudflare Access            (Service Auth policy + service token)
+  → named Cloudflare Tunnel
+  → cloudflared inside a dedicated Linux VM
+  → http://127.0.0.1:<WORKER_PORT>  (VM-local only)
+  → Worker container
+```
+
+| Invariant | Requirement |
+| :--- | :--- |
+| Router port forwarding | **None.** `cloudflared` makes only outbound connections. |
+| Direct Worker Internet exposure | **None.** The listener is published on VM loopback only. |
+| LAN exposure | **None.** No host or LAN interface binding. |
+| Hostname | **Stable.** `WORKER_BASE_URL` is a static control-plane value, so an ephemeral `*.trycloudflare.com` quick tunnel is not usable — a named tunnel on a zone the operator controls is required. |
+| Inbound to Vercel | **None.** The Worker never initiates a connection to the control plane. |
+| Transport | Ordinary HTTPS request/response. No WebSocket is required: job creation is fire-and-forget and progress is polled. |
+
+Any equivalent topology satisfying the invariants above is acceptable. The
+provider names describe the selected deployment, not a hard dependency of the
+Worker image.
+
+### 1b. Authentication layers
+
+Two independent layers guard the authenticated Worker routes, and **both** must
+pass:
+
+| Layer | Owner | Credential | Verified by |
+| :--- | :--- | :--- | :--- |
+| 1 — transport admission | Access proxy | `CF-Access-Client-Id` / `CF-Access-Client-Secret` | The access layer, before traffic reaches the tunnel |
+| 2 — request authenticity | VideoFetch | `WORKER_CONTROL_KEY_ID` / `WORKER_CONTROL_SECRET` HMAC | The Worker itself |
+
+They are deliberately independent:
+
+- The Access service token is **configured and stored on Vercel only**, as
+  `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET`. The Worker
+  never reads them from its environment, and the Worker application does not
+  consume, verify, persist or intentionally log them.
+
+  > **Not yet established.** Whether Cloudflare Access *strips* the two request
+  > headers before forwarding through the Tunnel to the origin is provider
+  > behaviour that this repository cannot prove. Do **not** claim the Worker
+  > never receives them on the wire until measured. See
+  > `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` in §11 — **BLOCKING
+  > before production Cloudflare ingress acceptance.**
+- The Access credentials are **not part of the HMAC canonical request**. The
+  signing input remains exactly `version | key id | method | canonical path |
+  timestamp | request id | idempotency key | SHA-256(raw body)`. A logically
+  identical request therefore produces a byte-identical signature whether or
+  not Access is in the path, and enabling Access requires **no** shared-auth
+  protocol version change.
+- Configure **both or neither**. Exactly one half makes the control plane fail
+  closed with `WORKER_UNAVAILABLE`, without disclosing which half was wrong.
+- Rotating the service token rotates independently of the HMAC pair.
+
+**Denial classification.** HTTP 403 cannot originate from the current Worker
+protocol — it is absent from `WORKER_ERROR_HTTP_STATUS` and from every Worker
+code path — so a 403 on this endpoint is a **non-Worker, upstream refusal**. A
+refused Access service token is the expected cause, but other upstream controls
+(WAF, rate limiting, a bot rule) could also produce one; the classification
+deliberately does not depend on distinguishing them. The control plane maps it
+to `WORKER_UNAVAILABLE` *before* Worker response validation, because such a body
+is an upstream page rather than a Worker error envelope. An Access login **redirect** is likewise rejected by
+`redirect: "error"` and becomes `WORKER_UNAVAILABLE`. Genuine Worker business
+responses (404, 409, 410, 413, 422, 429, 500, 502, 504 …) keep their existing
+error-envelope mapping and are never collapsed into unavailability.
 
 ### Filesystem roles
 
@@ -95,6 +170,28 @@ deployed Worker boundary** — direct-address, redirect, DNS, rebinding,
 descendant, firewall-mutation and public-success cases. A deployment is not
 accepted until that suite passes in situ. Phase 8A provides no egress evidence
 and claims none.
+
+### Prototype status and what it does NOT authorize
+
+A local prototype has demonstrated that this enforcement model is achievable on
+a dedicated Linux VM: VM root/systemd installs and verifies an `nftables`
+policy inside the media namespace *before* the Worker is allowed to start, the
+Worker holds no network-administration capability and cannot alter the policy,
+and a missing or mutated policy makes the Worker unavailable rather than
+silently unconfined.
+
+That result is **evidence about the enforcement model, not an acceptance**:
+
+- `YTDLP_NETWORK_ISOLATED` remains **`false`**, and the runtime still refuses to
+  start if it parses truthy. §4 is unchanged.
+- Formal Phase 9 must be **re-run against the exact final topology**, including
+  the ingress path in §1a. A prototype passing does not transfer.
+- Phase 10 remains the only phase authorized to enable yt-dlp.
+
+Residual evidence items carried into Phase 9, tracked in §11:
+`SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001`,
+`SAFE-EGRESS-MULTICAST-ATTRIBUTION-001`,
+`SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001`.
 
 ---
 
@@ -233,6 +330,17 @@ WORKER_CONTROL_PREVIOUS_SECRET /
 
 Every malformed **required** value fails startup closed, before `listen()`.
 
+Configured on **Vercel only** (never on the Worker), optional until the access
+layer is deployed, and both-or-neither:
+
+```
+CLOUDFLARE_ACCESS_CLIENT_ID        \  supply BOTH or NEITHER; exactly one half
+CLOUDFLARE_ACCESS_CLIENT_SECRET    /  fails closed as WORKER_UNAVAILABLE
+```
+
+Whitespace-only counts as absent. Neither value is ever logged, echoed in an
+error, exposed to the browser, or prefixed with `VITE_`. See §1b.
+
 ### HMAC rotation procedure
 
 1. Set `WORKER_CONTROL_PREVIOUS_*` on the Worker to the **current** pair.
@@ -289,11 +397,37 @@ shutdown grace so a clean SIGTERM is not truncated by an immediate SIGKILL.
 
 | Endpoint | Use |
 | :--- | :--- |
-| `GET /v1/healthz` | Unauthenticated liveness/readiness. Container healthcheck uses this. |
+| `GET /v1/healthz` | Unauthenticated liveness/readiness. **Unchanged.** |
 | `GET /v1/diagnostics` | **Authenticated.** Never use it to gate container health. |
 
-The image ships a Node-based healthcheck against `/v1/healthz`; no `curl` is
-installed for it.
+### Liveness ownership — the image ships NO healthcheck
+
+`Dockerfile.worker` deliberately declares **no `HEALTHCHECK`**, and the
+container-policy suite fails the build if one is reintroduced.
+
+The reason is architectural, not cosmetic. §3 requires an externally-owned
+egress policy that denies loopback, private, link-local and reserved
+destinations *from inside the media namespace* — including the Worker's own
+listener address. An in-container probe would therefore have to target exactly
+what the boundary exists to block. The only ways to make such a probe succeed
+are to add an allow exception for `127.0.0.1`/`::1`/the container's own private
+address, or to weaken the deny set. **Both are forbidden.** The security
+boundary outranks the convenience of a built-in healthcheck.
+
+| Concern | Owner |
+| :--- | :--- |
+| Health endpoint | The Worker application — `/v1/healthz`, unchanged |
+| Health **probe** | The deployment layer / VM supervisor, **from outside the restricted media namespace** |
+| Restart-on-unhealthy | The deployment layer |
+
+The probe reaches the Worker the same way the tunnel does — over the published
+loopback address on the VM host, outside the media namespace — so it never
+traverses the denied path. This is a deployment-layer responsibility and is
+deliberately **not** implemented in application code.
+
+Do not "fix" an unhealthy-looking container by punching a hole in the egress
+policy. A Worker that cannot be probed from outside its namespace is a
+deployment wiring problem, not a policy problem.
 
 Bounded maintenance runs on a modest interval (60s) and never overlaps: expired
 replay reservations, expired idempotency records, and exact-key deletion of
@@ -342,6 +476,17 @@ authorization.
 - [ ] `WORKER_CONTROL_*` generated and configured on both runtimes.
 - [ ] `YTDLP_NETWORK_ISOLATED` confirmed false/unset.
 - [ ] Termination grace period >= Worker shutdown grace.
+- [ ] Named tunnel created against a stable hostname; no router port forwarding;
+      Worker not bound to any LAN or public interface.
+- [ ] Access application + **Service Auth** policy created; service token issued.
+- [ ] `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET` set on
+      **Vercel only** — both or neither — and never on the Worker.
+- [ ] **`CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` resolved.** Measure
+      whether the Access service-token headers reach the origin, and scrub them
+      ahead of the media Worker if they do. See §11. **BLOCKING before ingress
+      acceptance.**
+- [ ] External liveness probe wired in the deployment layer, from **outside**
+      the restricted media namespace. The image ships no `HEALTHCHECK`.
 - [ ] `GET /v1/healthz` returns 200 through the TLS endpoint.
 - [ ] Phase-9 safe-egress acceptance suite executed from inside the deployed boundary.
 
@@ -352,4 +497,8 @@ authorization.
 | Id | Status | Notes |
 | :--- | :--- | :--- |
 | `R2-CREDENTIAL-SCOPE-DECISION-001` | **OPEN — BLOCKING before any Phase-8B R2 credential provisioning** | Option A (accept broader persistent bucket-scoped credentials, rely on software separation) vs Option B (renewable action-scoped temporary credentials). See §5d. Product Owner decision; not made in Phase 8A. |
+| `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **OPEN — BLOCKING before production Cloudflare ingress acceptance** | This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it. It does **not** prove that Access removes `CF-Access-Client-Id` / `CF-Access-Client-Secret` before forwarding to the origin — that is provider behaviour. **Contract:** during the real Tunnel + Access prototype, (1) send a request through the exact Service Auth configuration, (2) observe the request at the trusted ingress/origin boundary *without logging the real secret value* (presence/absence and length only), and (3) determine whether either header reaches the media Worker. **Desired result:** `CF-Access-Client-Secret` does not reach the media Worker. If Cloudflare strips it, record the evidence. If Cloudflare forwards it, the final topology **must** remove or scrub it **before** the media Worker namespace using an externally controlled ingress mechanism — for example an edge/header transform or a VM-owned ingress proxy outside that namespace — subject to review; the mechanism is deliberately **not** chosen here. If no reliable mechanism is available, **stop the Cloudflare production rollout and return to architecture review.** |
+| `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001` | OPEN — Phase-9 evidence | The prototype acceptance run was performed with the host VPN client loaded but **not connected**. Repeat the suite with it actively connected (including any DNS-interception or mesh features), since that changes host routing beneath the VM. Requires operator interaction. Not a code blocker. |
+| `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | OPEN — Phase-9 evidence | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Add a route in the acceptance harness so the deny rules actually fire and can be attributed. Every other range was counter-attributed. |
+| `SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001` | OPEN — Phase-9 evidence, non-blocking | The prototype verifier fingerprints the `nftables` ruleset but not the namespace **route table**. Non-blocking because destination denial was proven to survive route injection — a route cannot defeat a destination-address deny. Consider pinning the route table in the final deployment supervisor for defence in depth. |
 | `NPM-LOCKFILE-RECONCILIATION-001` | OPEN — non-blocking for Phase 8A | `package-lock.json` carries a pre-existing devDependency resolution (`nitro` → `unstorage` requires `lru-cache@^11`, the lock pins `5.1.1`) that npm 10 rejects and npm 11 accepts. The Worker image works around it with an exact-pinned ephemeral npm 11 running `ci`; no `npm install` is used and the lockfile is unmodified. Repository maintenance should reconcile it separately. |
