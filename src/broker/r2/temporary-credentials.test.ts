@@ -29,6 +29,15 @@ import {
  * tokens. So the assertions below do not merely omit `scope`; they fail if
  * `scope`, `permission`, or any other unexpected authority-bearing claim
  * reappears in the signed payload.
+ *
+ * The two exclusions rest on different evidence, and these tests should not be
+ * read as claiming otherwise. `scope` is excluded because the live endpoint
+ * rejects it alongside `actions`. `permission` — the Temporary Credentials API
+ * spelling of the same coarse preset — is excluded on POLICY: a diagnostic live
+ * token carrying `permission` + `actions` passed token parsing, so it was never
+ * measured to be rejected and its authority semantics were never characterized.
+ * VideoFetch refuses it because the delegated JWT should carry only the minimal
+ * vocabulary this design actually understands.
  */
 
 /**
@@ -50,7 +59,13 @@ const EXPECTED_CLAIM_KEYS = [
   "exp",
 ].sort();
 
-/** Claims that would re-broaden the credential, and that R2 rejects alongside `actions`. */
+/**
+ * Coarse preset claims this design never signs.
+ *
+ * `scope` is known-invalid alongside `actions` at the live endpoint;
+ * `permission` is excluded as an unapproved coarse claim, not as a measured
+ * rejection. Either one appearing would breach the exact claim-set invariant.
+ */
 const FORBIDDEN_COARSE_CLAIMS = ["scope", "permission"] as const;
 
 const ACCOUNT_ID = "0123456789abcdef0123456789abcdef";
@@ -144,10 +159,13 @@ describe("R2 temporary credential local signing", () => {
   });
 
   it("states its authority with `actions` alone — never a coarse preset", () => {
-    // REGRESSION GUARD (R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001). Reintroducing a
-    // coarse claim would both re-broaden the credential on paper and, per the
-    // measured live endpoint, make R2 refuse the token outright with
-    // HTTP 400 InvalidArgument while parsing X-Amz-Security-Token.
+    // REGRESSION GUARD (R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001). Reintroducing
+    // `scope` would make R2 refuse the token outright — HTTP 400
+    // InvalidArgument while parsing X-Amz-Security-Token, as measured.
+    // Reintroducing `permission` was NOT measured to be rejected; it is
+    // refused here because it is a coarse claim outside the approved
+    // vocabulary, and an unapproved authority claim has no business in a
+    // credential whose whole point is stating exactly one operation.
     for (const action of ["PutObject", "HeadObject", "DeleteObject"] as const) {
       const claims = decodeSessionTokenClaims(
         mintTemporaryCredential(input({ action })).sessionToken,

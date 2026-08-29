@@ -29,9 +29,19 @@ import {
  * The live endpoint contradicts that example: it rejected every `scope +
  * actions` token while parsing `X-Amz-Security-Token`, before authorization,
  * with `HTTP 400 InvalidArgument`. Action-only tokens were accepted and
- * enforced exactly as intended. So: do not reintroduce `scope` (or its API
- * spelling, `permission`) to match the stale example — the example does not
- * describe what the endpoint accepts.
+ * enforced exactly as intended. So do not reintroduce `scope` alongside
+ * `actions` to match the stale example — the example does not describe what the
+ * endpoint accepts.
+ *
+ * `permission` — the Temporary Credentials API spelling of the same coarse
+ * preset — is refused here for a DIFFERENT and weaker reason, and the two must
+ * not be conflated. A diagnostic live token carrying `permission` + `actions`
+ * PASSED token parsing; it did not share the `scope + actions` rejection, and
+ * nothing was measured about how R2 then resolves its authority. `permission`
+ * is simply not part of this design's approved local-JWT vocabulary: it is
+ * unnecessary, its interaction with `actions` is uncharacterized, and its
+ * presence would violate the exact claim-set invariant below. We do not need
+ * it, so we do not depend on whatever semantics the endpoint gives it.
  *
  * The scheme (Cloudflare R2 docs, "Temporary credentials" / "Authenticate
  * against R2 with temporary credentials"):
@@ -91,9 +101,10 @@ export class R2TemporaryCredentialError extends Error {
  * The exact claim set signed into the token. Shaped for assertions.
  *
  * `actions` is the ONLY authority-bearing operation claim. There is
- * deliberately no `scope` and no `permission` member: adding one would both
- * re-broaden the credential's stated authority and, per the measured live
- * behavior, make R2 reject the token outright.
+ * deliberately no `scope` member — the live endpoint rejects `scope` alongside
+ * `actions` outright — and no `permission` member, which is excluded as an
+ * unapproved coarse claim rather than as a measured provider rejection. See the
+ * module header for why those two rationales differ.
  */
 export type R2TemporaryCredentialClaims = {
   readonly bucket: string;
@@ -238,6 +249,12 @@ export function mintTemporaryCredential(
  * The coarse-claim check is a regression guard rather than a live possibility:
  * `buildTemporaryCredentialClaims` cannot produce `scope` or `permission`, and
  * this refuses to sign if some future edit makes it able to.
+ *
+ * Both names are refused, but not on the same evidence. `scope` alongside
+ * `actions` is known-invalid at the live endpoint. `permission` is refused on
+ * policy — it is an unapproved coarse claim outside the minimal vocabulary this
+ * design signs — and a diagnostic token containing it did pass token parsing.
+ * Keeping it refused costs nothing and keeps the signed claim set exact.
  */
 function assertActionsNarrowed(claims: R2TemporaryCredentialClaims): void {
   if (!Array.isArray(claims.actions) || claims.actions.length !== 1) {
