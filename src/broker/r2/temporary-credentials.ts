@@ -17,10 +17,26 @@ import {
  * scoping this design requires. That is why this module exists rather than an
  * API client.
  *
+ * The claims carry `actions` and NOTHING coarser. Cloudflare's concept-level
+ * contract is "specify permitted operations using `scope` (passed as
+ * `permission` to the API) OR `actions`; you must provide at least one" — the
+ * two are ALTERNATIVES, not a preset that a list then narrows.
+ *
+ * This is a corrected premise, and it was corrected by measurement rather than
+ * by reading (R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001). An earlier revision emitted
+ * `scope` and `actions` together, following Cloudflare's runnable local-signing
+ * example, which still builds a required `scope` with an optional `actions`.
+ * The live endpoint contradicts that example: it rejected every `scope +
+ * actions` token while parsing `X-Amz-Security-Token`, before authorization,
+ * with `HTTP 400 InvalidArgument`. Action-only tokens were accepted and
+ * enforced exactly as intended. So: do not reintroduce `scope` (or its API
+ * spelling, `permission`) to match the stale example — the example does not
+ * describe what the endpoint accepts.
+ *
  * The scheme (Cloudflare R2 docs, "Temporary credentials" / "Authenticate
  * against R2 with temporary credentials"):
  *
- *   1. build a JWT whose claims carry `bucket`, `scope`, `actions` and `paths`;
+ *   1. build a JWT whose claims carry `bucket`, `actions` and `paths`;
  *   2. sign it HS256 with the PARENT secret access key;
  *   3. accessKeyId    = the parent ACCESS KEY ID (an identifier, not a secret);
  *   4. secretAccessKey = SHA-256 hex digest of the signed JWT;
@@ -34,16 +50,6 @@ import {
  * This module performs no I/O and opens no socket. It is pure, which is what
  * makes the scoping assertions in the security suite meaningful.
  */
-
-/**
- * The coarse preset that R2 requires alongside the fine-grained `actions` list.
- *
- * `object-read-write` is the narrowest preset that CONTAINS our three write-side
- * actions; `actions` is what actually narrows the credential from that preset
- * down to a single operation. The preset alone would permit read and list, so
- * `actions` is never omitted by this module — see `assertActionsNarrowed`.
- */
-export const R2_TEMPORARY_CREDENTIAL_SCOPE = "object-read-write" as const;
 
 export type R2TemporaryCredential = {
   readonly accessKeyId: string;
@@ -81,10 +87,16 @@ export class R2TemporaryCredentialError extends Error {
   }
 }
 
-/** The exact claim set signed into the token. Shaped for assertions. */
+/**
+ * The exact claim set signed into the token. Shaped for assertions.
+ *
+ * `actions` is the ONLY authority-bearing operation claim. There is
+ * deliberately no `scope` and no `permission` member: adding one would both
+ * re-broaden the credential's stated authority and, per the measured live
+ * behavior, make R2 reject the token outright.
+ */
 export type R2TemporaryCredentialClaims = {
   readonly bucket: string;
-  readonly scope: typeof R2_TEMPORARY_CREDENTIAL_SCOPE;
   readonly actions: readonly R2DelegatedAction[];
   readonly paths: {
     readonly prefixPaths: readonly string[];
@@ -104,12 +116,15 @@ function base64Url(input: string | Buffer): string {
 /**
  * Builds the claim set for exactly one action against exactly one object.
  *
- * Two invariants are structural rather than conventional:
+ * Three invariants are structural rather than conventional:
  *  - `actions` has exactly ONE entry, so no credential can carry a second
  *    authority even by accident;
  *  - `prefixPaths` is ALWAYS empty and `objectPaths` holds exactly one exact
  *    key, so no credential can ever address a sibling object under the same
- *    job prefix.
+ *    job prefix;
+ *  - no coarse claim is emitted at all — the returned object literal is the
+ *    complete claim set, so `actions` is the sole statement of what the
+ *    credential may do.
  */
 export function buildTemporaryCredentialClaims(
   input: MintTemporaryCredentialInput,
@@ -117,7 +132,6 @@ export function buildTemporaryCredentialClaims(
   const issuedAtSeconds = Math.floor(input.nowMs / 1000);
   return Object.freeze({
     bucket: input.bucket,
-    scope: R2_TEMPORARY_CREDENTIAL_SCOPE,
     actions: Object.freeze([input.action]),
     paths: Object.freeze({
       // An empty prefix list is the point: prefix authority would let one
@@ -139,6 +153,9 @@ export function buildTemporaryCredentialClaims(
  * Byte-identical to the `jose` reference implementation Cloudflare's own
  * example uses — `temporary-credentials.test.ts` pins that equivalence against
  * the installed `jose` so a divergence in either direction fails the suite.
+ * That pin proves our serialization and HS256 signing agree with `jose` for the
+ * claims we intend to send; it says nothing about whether R2 ACCEPTS those
+ * claims, which only the live endpoint can establish.
  * Implemented on `node:crypto` here so the trusted broker's signing path has no
  * dependency beyond the Node runtime itself.
  */
@@ -213,11 +230,14 @@ export function mintTemporaryCredential(
 }
 
 /**
- * Refuses to sign a token whose `actions` list is missing, empty or plural.
+ * Refuses to sign a token whose authority is anything but one action, one
+ * object, and no prefix.
  *
- * Without an `actions` list R2 falls back to the coarse `scope` preset, which
- * grants read and list. A silent fallback to a broader credential is exactly
- * the failure this design exists to prevent, so it is a hard error.
+ * `actions` is the credential's ONLY grant of operation authority, so an empty
+ * or plural list is not a lesser defect than a coarse preset — it IS the defect.
+ * The coarse-claim check is a regression guard rather than a live possibility:
+ * `buildTemporaryCredentialClaims` cannot produce `scope` or `permission`, and
+ * this refuses to sign if some future edit makes it able to.
  */
 function assertActionsNarrowed(claims: R2TemporaryCredentialClaims): void {
   if (!Array.isArray(claims.actions) || claims.actions.length !== 1) {
@@ -229,6 +249,13 @@ function assertActionsNarrowed(claims: R2TemporaryCredentialClaims): void {
     throw new R2TemporaryCredentialError(
       "a delegated credential must carry exactly one object path and no prefix",
     );
+  }
+  for (const coarse of ["scope", "permission"] as const) {
+    if (Object.hasOwn(claims, coarse)) {
+      throw new R2TemporaryCredentialError(
+        "a delegated credential must not carry a coarse permission claim",
+      );
+    }
   }
 }
 
