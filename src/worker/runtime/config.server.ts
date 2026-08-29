@@ -21,7 +21,6 @@ const MAX_HOST_LENGTH = 255;
 const MAX_PATH_LENGTH = 4096;
 const MAX_SECRET_BYTES = 4096;
 const MIN_SECRET_BYTES = 32;
-const MAX_CREDENTIAL_LENGTH = 8192;
 
 export const WORKER_DEFAULT_BIND_HOST = "0.0.0.0";
 export const WORKER_DEFAULT_PORT = 8080;
@@ -104,11 +103,14 @@ const ControlSecretSchema = z
     `must be at least ${MIN_SECRET_BYTES} UTF-8 bytes`,
   );
 
-const CredentialSchema = z
-  .string()
-  .min(1)
-  .max(MAX_CREDENTIAL_LENGTH)
-  .refine((s) => !CONTROL_CHARACTERS.test(s), "must not contain control characters");
+/*
+ * There is deliberately NO credential schema in this module.
+ *
+ * The media Worker reads exactly one HMAC control secret (shared with the
+ * control plane, above) and no object-store credential of any kind. The R2
+ * parent credential is read only by the trusted broker, in
+ * `src/broker/r2/config.ts`, in a process outside this container.
+ */
 
 /**
  * Reused verbatim from the authoritative Phase-4 R2 writer so the runtime
@@ -121,6 +123,48 @@ const R2BucketSchema = z
   .string()
   .regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/, "must be a valid bucket name");
 const R2JurisdictionSchema = z.enum(["default", "eu", "us"]);
+
+/**
+ * The trusted broker's Unix socket. An absolute path with no relative segment
+ * and no control byte — the same discipline as every other path this module
+ * accepts. It is a rendezvous point, never a secret.
+ */
+const BrokerSocketPathSchema = z
+  .string()
+  .min(2)
+  .max(MAX_PATH_LENGTH)
+  .refine((p) => p.startsWith("/"), "must be an absolute path")
+  .refine((p) => !CONTROL_CHARACTERS.test(p), "must not contain control characters")
+  .refine(
+    (p) => !p.split("/").some((seg) => seg === "." || seg === ".."),
+    "must not contain relative path segments",
+  );
+
+/**
+ * Variables whose mere PRESENCE is a startup failure
+ * (WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001).
+ *
+ * Two families are forbidden in the media container:
+ *
+ *  - `R2_WRITER_*` — the superseded persistent writer contract. Supplying it
+ *    would put a long-lived R2 credential inside the media namespace, which is
+ *    exactly what this design removes. It is rejected rather than ignored so a
+ *    stale deployment cannot quietly keep shipping the old secret.
+ *  - `R2_BROKER_PARENT_*` — the parent credential. It belongs to the trusted
+ *    host broker alone and must never be readable from this container.
+ *
+ * This check is unconditional. It does not consult `NODE_ENV`, so there is no
+ * deployment mode — Production or otherwise — in which a static R2 credential
+ * can be supplied to the Worker, and therefore no static-credential fallback
+ * that could silently activate.
+ */
+export const WORKER_FORBIDDEN_R2_VARIABLES = Object.freeze([
+  "R2_WRITER_ACCESS_KEY_ID",
+  "R2_WRITER_SECRET_ACCESS_KEY",
+  "R2_WRITER_SESSION_TOKEN",
+  "R2_BROKER_PARENT_ACCESS_KEY_ID",
+  "R2_BROKER_PARENT_SECRET_ACCESS_KEY",
+] as const);
 
 function boundedInt(min: number, max: number) {
   return z
@@ -163,9 +207,16 @@ export type WorkerRuntimeConfig = {
     readonly accountId: string;
     readonly bucket: string;
     readonly jurisdiction: "default" | "eu" | "us";
-    readonly accessKeyId: string;
-    readonly secretAccessKey: string;
-    readonly sessionToken?: string;
+    /**
+     * Path to the trusted broker's Unix socket, bind-mounted into this
+     * container. This is a LOCATION, not a credential.
+     *
+     * There is deliberately no `accessKeyId`/`secretAccessKey`/`sessionToken`
+     * on this type. The media Worker holds no persistent R2 credential, and
+     * the runtime configuration cannot express one — see
+     * `WORKER_FORBIDDEN_R2_VARIABLES`.
+     */
+    readonly brokerSocketPath: string;
   };
   readonly media: {
     readonly maxFileSizeBytes: number;
@@ -288,8 +339,15 @@ function readOptionalField<S extends z.ZodTypeAny, F>(
  * caller must never reach `listen()` after either.
  *
  * The Vercel-only signer identity (`R2_SIGNER_ACCESS_KEY_ID` /
- * `R2_SIGNER_SECRET_ACCESS_KEY`) is deliberately NOT read here. The Worker
- * holds write credentials only; signing stays on the control plane.
+ * `R2_SIGNER_SECRET_ACCESS_KEY`) is deliberately NOT read here. Signing stays
+ * on the control plane.
+ *
+ * Neither is any R2 WRITE credential read here any more
+ * (WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001). The Worker receives a broker
+ * socket path and obtains a short-lived, action-scoped, single-object
+ * credential per operation. Supplying the superseded `R2_WRITER_*` contract, or
+ * the broker's own `R2_BROKER_PARENT_*` credential, is a startup failure rather
+ * than a fallback — see `WORKER_FORBIDDEN_R2_VARIABLES`.
  */
 export function loadWorkerRuntimeConfig(
   env: NodeJS.ProcessEnv = process.env,
@@ -390,24 +448,21 @@ export function loadWorkerRuntimeConfig(
     "default" as "default" | "eu" | "us",
   );
 
-  const accessKeyId = readField(
-    "R2_WRITER_ACCESS_KEY_ID",
-    optional(env.R2_WRITER_ACCESS_KEY_ID),
-    CredentialSchema,
+  // The Worker addresses R2 exclusively through the trusted broker. This is the
+  // ONLY R2 access parameter it reads, and it is a socket path, not a secret.
+  const brokerSocketPath = readField(
+    "R2_BROKER_SOCKET_PATH",
+    optional(env.R2_BROKER_SOCKET_PATH),
+    BrokerSocketPathSchema,
     invalid,
   );
-  const secretAccessKey = readField(
-    "R2_WRITER_SECRET_ACCESS_KEY",
-    optional(env.R2_WRITER_SECRET_ACCESS_KEY),
-    CredentialSchema,
-    invalid,
-  );
-  const sessionTokenRaw = optional(env.R2_WRITER_SESSION_TOKEN);
-  let sessionToken: string | undefined;
-  if (sessionTokenRaw !== undefined) {
-    const parsed = CredentialSchema.safeParse(sessionTokenRaw);
-    if (!parsed.success) invalid.push("R2_WRITER_SESSION_TOKEN");
-    else sessionToken = parsed.data;
+
+  // Fail closed on a superseded or parent credential being present at all.
+  // Checked untrimmed: any non-empty value means real material is sitting in
+  // the media container's environment, which is the condition being forbidden.
+  for (const name of WORKER_FORBIDDEN_R2_VARIABLES) {
+    const raw = env[name];
+    if (raw !== undefined && raw.length > 0) invalid.push(name);
   }
 
   const media = {
@@ -494,8 +549,7 @@ export function loadWorkerRuntimeConfig(
     !currentSecret.ok ||
     !accountId.ok ||
     !bucket.ok ||
-    !accessKeyId.ok ||
-    !secretAccessKey.ok
+    !brokerSocketPath.ok
   ) {
     throw new WorkerRuntimeConfigError(invalid);
   }
@@ -515,9 +569,7 @@ export function loadWorkerRuntimeConfig(
       accountId: accountId.value,
       bucket: bucket.value,
       jurisdiction,
-      accessKeyId: accessKeyId.value,
-      secretAccessKey: secretAccessKey.value,
-      ...(sessionToken !== undefined ? { sessionToken } : {}),
+      brokerSocketPath: brokerSocketPath.value,
     }),
     media: Object.freeze(media),
   });

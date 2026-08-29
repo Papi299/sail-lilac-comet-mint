@@ -11,7 +11,10 @@ import { SQLiteWorkerReplayStore } from "../security/sqlite-replay-store.server.
 import { openWorkerDatabase } from "../state/database.server.ts";
 import { applyMigrations } from "../state/migrations.server.ts";
 import { SQLiteJobStore } from "../state/sqlite-job-store.server.ts";
-import { CloudflareR2ObjectStoreWriter } from "../storage/cloudflare-r2-writer.server.ts";
+import type { CloudflareR2Config } from "../storage/cloudflare-r2-writer.server.ts";
+import { BrokerR2CredentialProvider } from "../storage/broker-credential-client.server.ts";
+import type { R2CredentialProvider } from "../storage/credential-provider.ts";
+import { DelegatedR2ObjectStoreWriter } from "../storage/delegated-r2-writer.server.ts";
 import type { ObjectStoreWriter } from "../storage/writer.ts";
 import type { WorkerRuntimeConfig } from "./config.server.ts";
 import {
@@ -59,12 +62,20 @@ class ShutdownAwareQueueRunner extends QueueRunner {
 
 export type WorkerRuntimeOverrides = {
   /**
-   * Replaces the production Cloudflare R2 writer. Tests inject a fake here so
-   * no live object-store request can occur.
+   * Replaces the production R2 writer entirely. Tests inject a fake here so no
+   * live object-store request and no broker connection can occur.
    */
   objectStoreWriter?: ObjectStoreWriter;
-  /** Injected S3 send-client for the real R2 writer (no network at construction). */
-  r2Client?: ConstructorParameters<typeof CloudflareR2ObjectStoreWriter>[1];
+  /**
+   * Replaces the broker credential provider. Tests inject a deterministic
+   * minter so no Unix socket is opened.
+   */
+  r2Credentials?: R2CredentialProvider;
+  /**
+   * Replaces the per-operation writer factory used by the delegated writer, so
+   * a test can observe the credential each operation is actually handed.
+   */
+  r2CreateWriter?: (config: CloudflareR2Config) => ObjectStoreWriter;
   clock?: () => number;
   analyze?: AnalyzeFn;
   probeBinaries?: WorkerBinaryProbe;
@@ -157,24 +168,38 @@ export async function createWorkerRuntime(
         : undefined,
     );
 
-    // Worker-side WRITE credentials only. The Vercel signer identity is never
-    // read by this process, and constructing the client performs no request:
-    // the first R2 call happens during media execution or maintenance.
+    // Object storage is reached through DELEGATED, per-operation credentials
+    // (WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001). This process holds no R2
+    // parent credential and no persistent writer credential: it holds a socket
+    // path. Constructing this performs no request and opens no connection —
+    // the first broker call happens at the first real R2 operation.
+    //
+    // The TTL of every minted credential is shortened to the remaining job
+    // lifetime where that is known, which is why the durable store is consulted
+    // here. An unknown deadline falls back to the action's conservative
+    // ceiling, and an EXPIRED job still yields the floor so maintenance can
+    // mint a fresh DeleteObject-only credential.
+    const credentials =
+      overrides.r2Credentials ??
+      new BrokerR2CredentialProvider({
+        socketPath: config.r2.brokerSocketPath,
+        bucket: config.r2.bucket,
+        ...(overrides.clock ? { clock: overrides.clock } : {}),
+      });
+
     const writer: ObjectStoreWriter =
       overrides.objectStoreWriter ??
-      new CloudflareR2ObjectStoreWriter(
-        {
+      new DelegatedR2ObjectStoreWriter({
+        location: {
           accountId: config.r2.accountId,
           bucket: config.r2.bucket,
           jurisdiction: config.r2.jurisdiction,
-          accessKeyId: config.r2.accessKeyId,
-          secretAccessKey: config.r2.secretAccessKey,
-          ...(config.r2.sessionToken !== undefined
-            ? { sessionToken: config.r2.sessionToken }
-            : {}),
         },
-        overrides.r2Client,
-      );
+        credentials,
+        jobDeadlineAt: (jobId) => store.getJob(jobId)?.expiresAt ?? null,
+        ...(overrides.clock ? { clock: overrides.clock } : {}),
+        ...(overrides.r2CreateWriter ? { createWriter: overrides.r2CreateWriter } : {}),
+      });
 
     const executor = new JobExecutor(
       store,

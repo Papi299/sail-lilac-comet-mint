@@ -14,6 +14,12 @@ import type {
   ObjectStorePutInput,
   ObjectStoreWriter,
 } from "../storage/writer.ts";
+import {
+  CloudflareR2ObjectStoreWriter,
+  type CloudflareR2Config,
+  type S3SendClient,
+} from "../storage/cloudflare-r2-writer.server.ts";
+import type { R2CredentialProvider } from "../storage/credential-provider.ts";
 import type { WorkerRuntimeConfig } from "./config.server.ts";
 import { createWorkerRuntime, type WorkerRuntime } from "./runtime.server.ts";
 import { WORKER_DATABASE_FILENAME } from "./state-directory.server.ts";
@@ -101,6 +107,43 @@ async function reservePort(): Promise<number> {
   });
 }
 
+/**
+ * A deterministic stand-in for the trusted broker.
+ *
+ * It opens no socket and holds no parent secret — it only proves that the
+ * runtime asks for a credential per operation and uses what it is handed.
+ */
+function fakeCredentials(
+  record?: Array<{ action: string; objectKey: string; ttlSeconds: number }>,
+): R2CredentialProvider {
+  return {
+    async mint(request) {
+      record?.push({
+        action: request.action,
+        objectKey: request.objectKey,
+        ttlSeconds: request.ttlSeconds,
+      });
+      return {
+        accessKeyId: "fake-delegated-access-key-id",
+        secretAccessKey: "fake-delegated-secret-access-key",
+        sessionToken: "fake-delegated-session-token",
+        expiresAt: Date.now() + 120_000,
+      };
+    },
+  };
+}
+
+/**
+ * Builds the REAL `CloudflareR2ObjectStoreWriter` for each delegated
+ * operation, with only its S3 send-client replaced. Every command therefore
+ * travels the real writer's code path and is counted rather than dispatched.
+ */
+function delegatedWriterFactory(
+  client: S3SendClient,
+): (config: CloudflareR2Config) => ObjectStoreWriter {
+  return (config) => new CloudflareR2ObjectStoreWriter(config, client);
+}
+
 function makeConfig(
   dataDirectory: string,
   port: number,
@@ -115,8 +158,9 @@ function makeConfig(
       accountId: "0123456789abcdef0123456789abcdef",
       bucket: "videofetch-temp",
       jurisdiction: "default",
-      accessKeyId: "fake-writer-access-key-id",
-      secretAccessKey: "fake-writer-secret-access-key",
+      // A socket path, never a credential. The Worker cannot be configured
+      // with an R2 parent secret at all.
+      brokerSocketPath: "/run/videofetch-r2-broker/broker.sock",
     },
     media: {
       maxFileSizeBytes: 500 * 1024 * 1024,
@@ -861,7 +905,8 @@ describe("R2 startup network isolation", () => {
 
     const port = await reservePort();
     const runtime = await createWorkerRuntime(makeConfig(join(root, "state"), port), {
-      r2Client: countingClient,
+      r2Credentials: fakeCredentials(),
+      r2CreateWriter: delegatedWriterFactory(countingClient),
       probeBinaries: async () => ({ ffmpeg: true, ytdlp: false }),
       analyze: async () => metadata(),
       executorDeps: mediaDeps(),
@@ -892,14 +937,16 @@ describe("R2 startup network isolation", () => {
     assert.deepEqual(sends, [], "no R2 request during shutdown");
   });
 
-  it("starts and serves health even though the R2 credentials have never been used", async () => {
+  it("starts and serves health without ever minting an R2 credential", async () => {
+    const mints: Array<{ action: string; objectKey: string; ttlSeconds: number }> = [];
     const port = await reservePort();
     const runtime = await createWorkerRuntime(makeConfig(join(root, "state"), port), {
-      r2Client: {
+      r2Credentials: fakeCredentials(mints),
+      r2CreateWriter: delegatedWriterFactory({
         send: async () => {
           throw new Error("credentials were never validated against a live endpoint");
         },
-      },
+      }),
       executorDeps: mediaDeps(),
     });
 
@@ -907,6 +954,10 @@ describe("R2 startup network isolation", () => {
       const address = await runtime.listen();
       const res = await fetch(`http://127.0.0.1:${address.port}/v1/healthz`);
       assert.equal(res.status, 200);
+
+      // Credentials are minted just-in-time, so an idle Worker has asked the
+      // broker for nothing at all.
+      assert.deepEqual(mints, [], "startup and health mint no credential");
     } finally {
       await runtime.shutdown();
     }
@@ -914,14 +965,16 @@ describe("R2 startup network isolation", () => {
 
   it("issues the first DeleteObject only when maintenance finds an expired object", async () => {
     const sends: string[] = [];
+    const mints: Array<{ action: string; objectKey: string; ttlSeconds: number }> = [];
     const port = await reservePort();
     const runtime = await createWorkerRuntime(makeConfig(join(root, "state"), port), {
-      r2Client: {
+      r2Credentials: fakeCredentials(mints),
+      r2CreateWriter: delegatedWriterFactory({
         send: async (command: unknown) => {
           sends.push(command?.constructor?.name ?? "Unknown");
           return {};
         },
-      },
+      }),
       executorDeps: mediaDeps(),
     });
 
@@ -944,6 +997,12 @@ describe("R2 startup network isolation", () => {
       await runtime.maintenance.runOnce();
 
       assert.deepEqual(sends, ["DeleteObjectCommand"], "exactly one exact-key delete");
+
+      // Maintenance minted a FRESH DeleteObject-only credential for exactly
+      // that key rather than reusing an upload credential.
+      assert.equal(mints.length, 1, "exactly one credential minted");
+      assert.equal(mints[0].action, "DeleteObject");
+      assert.equal(mints[0].objectKey, objectKey);
     } finally {
       await runtime.shutdown();
     }
