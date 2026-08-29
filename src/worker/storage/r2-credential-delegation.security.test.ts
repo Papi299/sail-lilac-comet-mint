@@ -30,8 +30,8 @@ import {
  * WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001 — consolidated security evidence.
  *
  * Every credential in this file is FAKE and deterministic. No Cloudflare
- * endpoint is contacted, no R2 bucket or token exists, and the only socket
- * opened is a local AF_UNIX socket in a temporary directory.
+ * endpoint is contacted, no real R2 bucket or token is referenced, and the only
+ * socket opened is a local AF_UNIX socket in a temporary directory.
  *
  * The assertions here are deliberately made against REAL production objects —
  * the real broker, the real Unix-socket transport, the real client, the real
