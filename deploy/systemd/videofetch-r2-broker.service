@@ -1,0 +1,96 @@
+# VideoFetch trusted R2 credential broker
+# (WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001)
+#
+# Runs on the VM HOST, as its own unprivileged user, OUTSIDE the media network
+# namespace. This unit is the single holder of the persistent R2 parent
+# credential in the entire system.
+#
+# Nothing here has been provisioned. This file is the deployment contract; the
+# referenced environment file contains no secret in this repository.
+
+[Unit]
+Description=VideoFetch trusted R2 credential broker
+Documentation=file:/opt/videofetch/docs/architecture/worker-deployment-runbook.md
+After=local-fs.target
+
+# Deliberately NOT bound to the Worker unit. The broker may run while the
+# Worker is down; the Worker must never run while the broker is down. That
+# asymmetry is the fail-closed direction — see videofetch-worker.service.
+
+[Service]
+Type=simple
+User=videofetch-broker
+Group=videofetch-broker
+
+# The socket lives in a broker-owned runtime directory. 0750 lets the Worker's
+# supplementary group traverse the directory; the socket inode itself is
+# chmod'ed to 0660 by the broker immediately after bind, so only the broker's
+# group may connect(2).
+RuntimeDirectory=videofetch-r2-broker
+RuntimeDirectoryMode=0750
+
+Environment=NODE_ENV=production
+Environment=R2_BROKER_SOCKET_PATH=/run/videofetch-r2-broker/broker.sock
+
+# The PARENT R2 credential is supplied ONLY here, via a root-owned file with
+# mode 0400:
+#
+#   R2_ACCOUNT_ID=
+#   R2_BUCKET=
+#   R2_JURISDICTION=
+#   R2_BROKER_PARENT_ACCESS_KEY_ID=
+#   R2_BROKER_PARENT_SECRET_ACCESS_KEY=
+#
+# It is NEVER passed on the command line: argv is world-readable through /proc,
+# so a secret in ExecStart would be readable by every local account.
+EnvironmentFile=/etc/videofetch/r2-broker.env
+
+ExecStart=/usr/bin/node \
+  --import /opt/videofetch/scripts/register-ts-aliases.mjs \
+  --experimental-strip-types \
+  /opt/videofetch/src/broker/r2/main.ts
+
+Restart=on-failure
+RestartSec=2
+
+# A malformed configuration is startup-fatal by design. Restarting forever on a
+# configuration error would hide it, so give up and stay down — which makes the
+# Worker stay down too.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# ── Hardening ──────────────────────────────────────────────────────────────
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+
+# The broker performs LOCAL signing only — it derives credentials by signing a
+# JWT with the parent secret and makes no API call to Cloudflare. It therefore
+# needs no network whatsoever, and is denied one outright.
+#
+# NOTE: this is only correct while local signing is used. Switching to the
+# Cloudflare Temporary Credentials API would require network access here — and
+# would also lose the explicit per-action scoping that API cannot express.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

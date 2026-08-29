@@ -48,6 +48,16 @@ RUN npx --yes npm@11.19.1 ci --omit=dev \
 COPY scripts/register-ts-aliases.mjs scripts/ts-alias-hooks.mjs ./scripts/
 COPY src ./src
 
+# The trusted R2 credential broker is NOT part of the media container.
+#
+# It runs on the VM host, as its own user, in its own systemd unit, outside
+# this network namespace, and it is the sole holder of the persistent R2 parent
+# credential. Its source is removed here so the media image contains no code
+# that knows how to mint from a parent secret. This is defence in depth, not
+# the boundary itself: the container is never given R2_BROKER_PARENT_* either,
+# and the Worker runtime refuses to start if it is.
+RUN rm -rf ./src/broker
+
 # Two distinct filesystem roles, both owned by the non-root runtime UID:
 #   /var/lib/videofetch  durable SQLite state. A persistent volume MUST be
 #                        mounted here, and it holds the database plus its
@@ -66,10 +76,23 @@ ENV NODE_ENV=production \
     FFMPEG_PATH=/usr/bin/ffmpeg \
     YTDLP_NETWORK_ISOLATED=false
 
-# No secret is baked into this image. WORKER_CONTROL_KEY_ID,
-# WORKER_CONTROL_SECRET and every R2_WRITER_* value are supplied at RUNTIME from
-# the deployment's secret store. The Vercel-only R2_SIGNER_* identity is never
-# provided to this container.
+# No secret is baked into this image, and this container holds NO persistent R2
+# credential at all (WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001).
+#
+# WORKER_CONTROL_KEY_ID / WORKER_CONTROL_SECRET are supplied at RUNTIME from the
+# deployment's secret store. Object storage is reached through the trusted host
+# broker over a Unix socket bind-mounted at R2_BROKER_SOCKET_PATH, which yields
+# a short-lived credential scoped to one action and one exact object key.
+#
+# Never provided to this container:
+#   - R2_BROKER_PARENT_ACCESS_KEY_ID / R2_BROKER_PARENT_SECRET_ACCESS_KEY
+#     (the parent credential; the broker's alone)
+#   - R2_WRITER_*   (the superseded persistent writer contract)
+#   - R2_SIGNER_*   (the Vercel-only read identity)
+#
+# The Worker runtime does not merely ignore those variables — it refuses to
+# start if any of them is present, so a stale deployment fails closed instead of
+# quietly reintroducing a long-lived credential into the media namespace.
 
 # The Worker speaks plain HTTP. Phase-8B deployment MUST terminate TLS in front
 # of it before traffic crosses the public internet. There is no second
