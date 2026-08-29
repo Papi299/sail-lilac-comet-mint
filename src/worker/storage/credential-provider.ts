@@ -1,7 +1,10 @@
 import {
+  R2_CREDENTIAL_DELETE_TTL_FLOOR_SECONDS,
   R2_CREDENTIAL_TTL_CEILING_SECONDS,
-  R2_CREDENTIAL_TTL_FLOOR_SECONDS,
-  clampCredentialTtlSeconds,
+  R2_CREDENTIAL_TTL_MIN_SECONDS,
+  clampDeleteCredentialTtlSeconds,
+  credentialTtlCeilingSeconds,
+  isDeadlineBoundAction,
   type R2DelegatedAction,
 } from "../../shared/worker/r2-broker.ts";
 import type { WorkerObjectKey } from "../../shared/worker/contracts.ts";
@@ -55,36 +58,68 @@ export interface R2CredentialProvider {
 export type JobDeadlineSource = (jobId: string) => number | null;
 
 /**
+ * The outcome of a TTL derivation.
+ *
+ * A refusal is a first-class result rather than a clamped number, because the
+ * only honest answer for an expired job is "no credential", and a caller must
+ * be forced to handle that rather than receive a plausible-looking TTL.
+ */
+export type CredentialTtlDecision =
+  | { readonly ok: true; readonly ttlSeconds: number }
+  | { readonly ok: false; readonly reason: "job_expired" };
+
+/**
  * Derives the TTL for one operation.
  *
- * Policy (documented in the deployment runbook §5e):
+ * Policy (documented in the deployment runbook §5d):
  *
- *  - the per-action CEILING is the conservative hard upper bound, and is the
- *    value used when the remaining job lifetime is unknown;
- *  - when the remaining lifetime IS known, it shortens the credential further,
- *    so a credential never outlives the job it serves;
- *  - the FLOOR keeps an already-expired job cleanable. Maintenance deletion
- *    after expiry therefore mints a fresh, short DeleteObject-only credential
- *    instead of reaching for a stale upload credential.
+ * **PutObject / HeadObject — deadline-bound.**
+ *   - remaining lifetime known and positive: `min(remaining, ceiling)`. The
+ *     credential can never outlive the job it serves, even when the remaining
+ *     lifetime is only a few seconds.
+ *   - remaining lifetime known and expired: **fail closed.** No credential is
+ *     requested at all. Writing or inspecting an object whose authorization has
+ *     already lapsed is not something a floor should paper over.
+ *   - deadline unknown: the action's conservative ceiling.
  *
- * The result is always inside `[floor, ceiling]`, so no derivation — including
- * one from a corrupted deadline — can produce a quasi-persistent credential.
+ * **DeleteObject — cleanup.**
+ *   Always yields a bounded credential, including long after expiry, because
+ *   maintenance must be able to delete the object precisely BECAUSE the job
+ *   expired. A small floor guarantees the credential is usable; the ceiling
+ *   guarantees it stays short. It never carries Put or Head authority.
+ *
+ * Every successful result is inside `[MIN, ceiling(action)]`, so no derivation
+ * — including one from a corrupted deadline — can produce a quasi-persistent
+ * credential.
  */
 export function deriveCredentialTtlSeconds(input: {
   action: R2DelegatedAction;
   nowMs: number;
   jobDeadlineMs: number | null;
-}): number {
-  const ceiling = R2_CREDENTIAL_TTL_CEILING_SECONDS[input.action];
+}): CredentialTtlDecision {
+  const ceiling = credentialTtlCeilingSeconds(input.action);
+  const deadlineKnown =
+    input.jobDeadlineMs !== null && Number.isSafeInteger(input.jobDeadlineMs);
 
-  if (input.jobDeadlineMs === null || !Number.isSafeInteger(input.jobDeadlineMs)) {
-    return clampCredentialTtlSeconds(ceiling, input.action);
+  if (!isDeadlineBoundAction(input.action)) {
+    // DeleteObject: cleanup survives expiry, bounded either way.
+    if (!deadlineKnown) return { ok: true, ttlSeconds: ceiling };
+    const remaining = Math.floor((input.jobDeadlineMs! - input.nowMs) / 1000);
+    return { ok: true, ttlSeconds: clampDeleteCredentialTtlSeconds(remaining) };
   }
 
-  const remainingMs = input.jobDeadlineMs - input.nowMs;
-  const remainingSeconds = Math.floor(remainingMs / 1000);
-  return clampCredentialTtlSeconds(remainingSeconds, input.action);
+  // PutObject / HeadObject.
+  if (!deadlineKnown) return { ok: true, ttlSeconds: ceiling };
+
+  const remaining = Math.floor((input.jobDeadlineMs! - input.nowMs) / 1000);
+  if (remaining < R2_CREDENTIAL_TTL_MIN_SECONDS) return { ok: false, reason: "job_expired" };
+
+  return { ok: true, ttlSeconds: Math.min(remaining, ceiling) };
 }
 
-export { R2_CREDENTIAL_TTL_FLOOR_SECONDS, R2_CREDENTIAL_TTL_CEILING_SECONDS };
+export {
+  R2_CREDENTIAL_DELETE_TTL_FLOOR_SECONDS,
+  R2_CREDENTIAL_TTL_MIN_SECONDS,
+  R2_CREDENTIAL_TTL_CEILING_SECONDS,
+};
 export type { R2DelegatedAction };

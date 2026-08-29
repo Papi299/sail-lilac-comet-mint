@@ -66,19 +66,48 @@ export const R2_FORBIDDEN_ACTIONS = [
 ] as const;
 
 /**
- * TTL policy (documented in docs/architecture/worker-deployment-runbook.md §5e).
+ * TTL policy (documented in docs/architecture/worker-deployment-runbook.md §5d).
  *
  * A minted credential must live long enough to complete ONE authorized
- * operation and no longer. The floor exists so a job that is already expired
- * can still be cleaned up; the per-action ceilings exist so nothing minted here
- * can become a quasi-persistent credential.
+ * operation and no longer.
  *
- * `R2_CREDENTIAL_TTL_HARD_CAP_SECONDS` is the absolute ceiling. The broker
- * enforces it independently of whatever the Worker asks for, so a compromised
- * Worker cannot negotiate a longer-lived credential.
+ * Two DIFFERENT rules apply, because the two kinds of operation have opposite
+ * relationships to job expiry:
+ *
+ *  - `PutObject` / `HeadObject` are **deadline-bound**. A credential must never
+ *    outlive the job it serves, so its TTL is capped by the REMAINING job
+ *    lifetime, and an already-expired job yields no credential at all. Writing
+ *    or inspecting an object the user is no longer authorized to receive is not
+ *    something a shorter floor should be allowed to paper over.
+ *
+ *  - `DeleteObject` is **cleanup**, and must keep working precisely BECAUSE the
+ *    job expired. It therefore keeps a small floor so maintenance can always
+ *    mint a fresh, bounded, delete-only credential. Deleting an expired object
+ *    grants nothing to anyone.
+ *
+ * Enforcement is split, and the split is deliberate:
+ *
+ *  - the WORKER derives the TTL, because only it knows the job deadline;
+ *  - the BROKER independently enforces the bounds it CAN verify without a job
+ *    store — an integer TTL within `[MIN, ceiling(action)]`. It cannot verify
+ *    deadline-boundness and does not pretend to.
+ *
+ * A compromised Worker therefore cannot negotiate a credential longer than the
+ * per-action ceiling, and an honest Worker additionally cannot obtain one that
+ * outlives its job.
  */
 export const R2_CREDENTIAL_TTL_HARD_CAP_SECONDS = 900;
-export const R2_CREDENTIAL_TTL_FLOOR_SECONDS = 60;
+
+/** Global minimum. A zero or negative TTL is never a valid credential. */
+export const R2_CREDENTIAL_TTL_MIN_SECONDS = 1;
+
+/**
+ * DeleteObject-only floor. Applies to cleanup, and to cleanup alone — it is
+ * what lets maintenance delete an object whose job expired days ago. It is
+ * deliberately NOT applied to PutObject or HeadObject, where raising a
+ * nearly-expired TTL up to a floor would mint a credential outliving its job.
+ */
+export const R2_CREDENTIAL_DELETE_TTL_FLOOR_SECONDS = 60;
 
 /**
  * Per-action ceilings, all at or below the hard cap.
@@ -94,11 +123,26 @@ export const R2_CREDENTIAL_TTL_CEILING_SECONDS: Readonly<
   DeleteObject: 120,
 });
 
+/**
+ * The bounds the BROKER can verify on its own. Per-action ceilings are applied
+ * on top of this by the broker; deadline-boundness is a Worker-side rule.
+ */
 export const R2CredentialTtlSchema = z
   .number()
   .int()
-  .min(R2_CREDENTIAL_TTL_FLOOR_SECONDS)
+  .min(R2_CREDENTIAL_TTL_MIN_SECONDS)
   .max(R2_CREDENTIAL_TTL_HARD_CAP_SECONDS);
+
+/**
+ * Actions whose credential must never outlive the job it serves.
+ *
+ * Kept as data so both the derivation and its tests read the same list.
+ */
+export const R2_DEADLINE_BOUND_ACTIONS = ["PutObject", "HeadObject"] as const;
+
+export function isDeadlineBoundAction(action: R2DelegatedAction): boolean {
+  return (R2_DEADLINE_BOUND_ACTIONS as readonly string[]).includes(action);
+}
 
 /**
  * Bucket names are re-validated on the broker side against its OWN single
@@ -197,25 +241,29 @@ export function actionForOperation(operation: "put" | "head" | "delete"): R2Dele
   }
 }
 
-/**
- * Clamps a desired TTL into the policy window for one action.
- *
- * Applied on the Worker side when deriving a TTL from remaining job lifetime,
- * and again on the broker side as the authoritative bound. An already-expired
- * job still yields the floor, which is what lets maintenance mint a fresh
- * DeleteObject credential long after the upload credential is gone.
- */
-export function clampCredentialTtlSeconds(
-  desiredSeconds: number,
-  action: R2DelegatedAction,
-): number {
-  const ceiling = Math.min(
+/** The effective upper bound for one action, never above the hard cap. */
+export function credentialTtlCeilingSeconds(action: R2DelegatedAction): number {
+  return Math.min(
     R2_CREDENTIAL_TTL_CEILING_SECONDS[action],
     R2_CREDENTIAL_TTL_HARD_CAP_SECONDS,
   );
-  if (!Number.isFinite(desiredSeconds)) return R2_CREDENTIAL_TTL_FLOOR_SECONDS;
+}
+
+/**
+ * Clamps a DeleteObject TTL into `[delete floor, delete ceiling]`.
+ *
+ * DELETE ONLY. A negative or zero remaining lifetime is raised to the floor,
+ * which is exactly the post-expiry cleanup case. Applying this to PutObject or
+ * HeadObject would defeat their deadline-bound rule, so it does not accept
+ * them — see `deriveCredentialTtlSeconds`.
+ */
+export function clampDeleteCredentialTtlSeconds(desiredSeconds: number): number {
+  const ceiling = credentialTtlCeilingSeconds("DeleteObject");
+  if (!Number.isFinite(desiredSeconds)) return R2_CREDENTIAL_DELETE_TTL_FLOOR_SECONDS;
   const floored = Math.floor(desiredSeconds);
-  if (floored < R2_CREDENTIAL_TTL_FLOOR_SECONDS) return R2_CREDENTIAL_TTL_FLOOR_SECONDS;
+  if (floored < R2_CREDENTIAL_DELETE_TTL_FLOOR_SECONDS) {
+    return R2_CREDENTIAL_DELETE_TTL_FLOOR_SECONDS;
+  }
   if (floored > ceiling) return ceiling;
   return floored;
 }

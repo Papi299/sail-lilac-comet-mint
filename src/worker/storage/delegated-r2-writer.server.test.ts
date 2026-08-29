@@ -11,8 +11,9 @@ import { deriveCredentialTtlSeconds } from "./credential-provider.ts";
 import type { ObjectStoreHead, ObjectStorePutInput, ObjectStoreWriter } from "./writer.ts";
 import type { WorkerObjectKey } from "../../shared/worker/contracts.ts";
 import {
+  R2_CREDENTIAL_DELETE_TTL_FLOOR_SECONDS,
   R2_CREDENTIAL_TTL_CEILING_SECONDS,
-  R2_CREDENTIAL_TTL_FLOOR_SECONDS,
+  R2_CREDENTIAL_TTL_MIN_SECONDS,
 } from "../../shared/worker/r2-broker.ts";
 
 /**
@@ -282,7 +283,107 @@ describe("DelegatedR2ObjectStoreWriter", () => {
 
     assert.equal(mints.length, 1);
     assert.equal(mints[0].action, "DeleteObject");
-    assert.equal(mints[0].ttlSeconds, R2_CREDENTIAL_TTL_FLOOR_SECONDS);
+    assert.equal(mints[0].ttlSeconds, R2_CREDENTIAL_DELETE_TTL_FLOOR_SECONDS);
+  });
+
+  it("never mints a Put credential that outlives a nearly-expired job", async () => {
+    // 30 seconds of job life left — BELOW the old 60s floor, which would have
+    // minted a credential valid 30s past the job's own expiry.
+    for (const remainingSeconds of [1, 5, 30, 59]) {
+      const mints: Mint[] = [];
+      const writer = makeWriter(
+        recordingProvider(mints),
+        recordingWriterFactory([], []),
+        () => NOW + remainingSeconds * 1000,
+      );
+
+      await writer.put(putInput());
+
+      assert.equal(mints[0].action, "PutObject");
+      assert.equal(
+        mints[0].ttlSeconds,
+        remainingSeconds,
+        `a Put credential must expire with the job, not ${mints[0].ttlSeconds}s later`,
+      );
+      assert.ok(mints[0].ttlSeconds <= remainingSeconds);
+    }
+  });
+
+  it("never mints a Head credential that outlives a nearly-expired job", async () => {
+    for (const remainingSeconds of [1, 5, 30, 59]) {
+      const mints: Mint[] = [];
+      const writer = makeWriter(
+        recordingProvider(mints),
+        recordingWriterFactory([], []),
+        () => NOW + remainingSeconds * 1000,
+      );
+
+      await writer.head(KEY);
+
+      assert.equal(mints[0].action, "HeadObject");
+      assert.equal(mints[0].ttlSeconds, remainingSeconds);
+      assert.ok(mints[0].ttlSeconds <= remainingSeconds);
+    }
+  });
+
+  it("refuses a Put on an ALREADY EXPIRED job, without contacting the broker", async () => {
+    const mints: Mint[] = [];
+    const configs: CloudflareR2Config[] = [];
+    const writer = makeWriter(
+      recordingProvider(mints),
+      recordingWriterFactory(configs, []),
+      () => NOW - 1,
+    );
+
+    await assert.rejects(() => writer.put(putInput()), (err: unknown) => {
+      assert.ok(err instanceof DelegatedR2Error);
+      assert.equal(err.failure, "job_expired");
+      return true;
+    });
+
+    assert.deepEqual(mints, [], "an expired job never reaches the broker");
+    assert.deepEqual(configs, [], "and never builds an S3 client");
+  });
+
+  it("refuses a Head on an ALREADY EXPIRED job, without contacting the broker", async () => {
+    const mints: Mint[] = [];
+    const configs: CloudflareR2Config[] = [];
+    const writer = makeWriter(
+      recordingProvider(mints),
+      recordingWriterFactory(configs, []),
+      () => NOW - 86_400_000,
+    );
+
+    await assert.rejects(() => writer.head(KEY), (err: unknown) => {
+      assert.ok(err instanceof DelegatedR2Error);
+      assert.equal(err.failure, "job_expired");
+      return true;
+    });
+
+    assert.deepEqual(mints, []);
+    assert.deepEqual(configs, []);
+  });
+
+  it("still lets maintenance delete an expired object, with DELETE authority only", async () => {
+    const mints: Mint[] = [];
+    const calls: Call[] = [];
+    const writer = makeWriter(
+      recordingProvider(mints),
+      recordingWriterFactory([], calls),
+      () => NOW - 86_400_000,
+    );
+
+    await writer.delete(KEY);
+
+    assert.equal(mints.length, 1, "cleanup remains possible after expiry");
+    assert.equal(mints[0].action, "DeleteObject", "and asks for delete authority only");
+    assert.equal(mints[0].objectKey, KEY, "for exactly the expired object");
+    assert.equal(mints[0].ttlSeconds, R2_CREDENTIAL_DELETE_TTL_FLOOR_SECONDS);
+    assert.ok(
+      mints[0].ttlSeconds <= R2_CREDENTIAL_TTL_CEILING_SECONDS.DeleteObject,
+      "and stays bounded",
+    );
+    assert.deepEqual(calls, [{ op: "delete", key: KEY }]);
   });
 
   it("falls back to the action ceiling when the job row is gone", async () => {
@@ -305,10 +406,75 @@ describe("DelegatedR2ObjectStoreWriter", () => {
 });
 
 describe("credential TTL derivation", () => {
-  it("always lands inside the policy window", () => {
-    const cases = [
+  it("never lets a deadline-bound credential outlive its job", () => {
+    for (const action of ["PutObject", "HeadObject"] as const) {
+      for (const remainingSeconds of [1, 2, 30, 59, 60, 61, 119, 121, 899, 901, 100_000]) {
+        const decision = deriveCredentialTtlSeconds({
+          action,
+          nowMs: NOW,
+          jobDeadlineMs: NOW + remainingSeconds * 1000,
+        });
+        assert.equal(decision.ok, true, `${action} with ${remainingSeconds}s must mint`);
+        if (!decision.ok) continue;
+
+        assert.ok(
+          decision.ttlSeconds <= remainingSeconds,
+          `${action} ttl ${decision.ttlSeconds} outlives ${remainingSeconds}s of job life`,
+        );
+        assert.ok(decision.ttlSeconds <= R2_CREDENTIAL_TTL_CEILING_SECONDS[action]);
+        assert.ok(decision.ttlSeconds >= R2_CREDENTIAL_TTL_MIN_SECONDS);
+      }
+    }
+  });
+
+  it("fails closed for a deadline-bound action once the job has expired", () => {
+    for (const action of ["PutObject", "HeadObject"] as const) {
+      for (const remainingMs of [0, -1, -1_000, -86_400_000]) {
+        const decision = deriveCredentialTtlSeconds({
+          action,
+          nowMs: NOW,
+          jobDeadlineMs: NOW + remainingMs,
+        });
+        assert.equal(decision.ok, false, `${action} must refuse an expired job`);
+        if (!decision.ok) assert.equal(decision.reason, "job_expired");
+      }
+    }
+  });
+
+  it("keeps DeleteObject usable after expiry, and always bounded", () => {
+    for (const jobDeadlineMs of [
+      NOW - 86_400_000,
+      NOW - 1,
+      NOW,
+      NOW + 1_000,
+      NOW + 100_000_000,
+      null,
+    ]) {
+      const decision = deriveCredentialTtlSeconds({
+        action: "DeleteObject",
+        nowMs: NOW,
+        jobDeadlineMs,
+      });
+      assert.equal(decision.ok, true, "cleanup must always be possible");
+      if (!decision.ok) continue;
+      assert.ok(decision.ttlSeconds >= R2_CREDENTIAL_DELETE_TTL_FLOOR_SECONDS);
+      assert.ok(decision.ttlSeconds <= R2_CREDENTIAL_TTL_CEILING_SECONDS.DeleteObject);
+    }
+  });
+
+  it("falls back to the action ceiling only when the deadline is unknown", () => {
+    for (const action of ["PutObject", "HeadObject", "DeleteObject"] as const) {
+      const decision = deriveCredentialTtlSeconds({ action, nowMs: NOW, jobDeadlineMs: null });
+      assert.equal(decision.ok, true);
+      if (decision.ok) {
+        assert.equal(decision.ttlSeconds, R2_CREDENTIAL_TTL_CEILING_SECONDS[action]);
+      }
+    }
+  });
+
+  it("always lands inside the policy window when it mints at all", () => {
+    const deadlines = [
       -Number.MAX_SAFE_INTEGER,
-      -1,
       0,
       NOW - 10_000,
       NOW + 1,
@@ -316,16 +482,18 @@ describe("credential TTL derivation", () => {
       NOW + 500_000,
       NOW + 10_000_000,
       Number.MAX_SAFE_INTEGER,
+      null,
     ];
     for (const action of ["PutObject", "HeadObject", "DeleteObject"] as const) {
-      for (const jobDeadlineMs of [...cases, null]) {
-        const ttl = deriveCredentialTtlSeconds({ action, nowMs: NOW, jobDeadlineMs });
+      for (const jobDeadlineMs of deadlines) {
+        const decision = deriveCredentialTtlSeconds({ action, nowMs: NOW, jobDeadlineMs });
+        if (!decision.ok) continue;
         assert.ok(
-          ttl >= R2_CREDENTIAL_TTL_FLOOR_SECONDS &&
-            ttl <= R2_CREDENTIAL_TTL_CEILING_SECONDS[action],
-          `${action} ttl ${ttl} escaped the window for deadline ${jobDeadlineMs}`,
+          decision.ttlSeconds >= R2_CREDENTIAL_TTL_MIN_SECONDS &&
+            decision.ttlSeconds <= R2_CREDENTIAL_TTL_CEILING_SECONDS[action],
+          `${action} ttl ${decision.ttlSeconds} escaped the window for ${jobDeadlineMs}`,
         );
-        assert.ok(Number.isSafeInteger(ttl));
+        assert.ok(Number.isSafeInteger(decision.ttlSeconds));
       }
     }
   });

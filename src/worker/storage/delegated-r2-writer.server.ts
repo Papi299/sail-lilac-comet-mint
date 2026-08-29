@@ -50,6 +50,13 @@ export type DelegatedR2Failure =
   | "invalid_object_key"
   | "invalid_input"
   | "credential_unavailable"
+  /**
+   * The job's authorization window has already closed, so no PutObject or
+   * HeadObject credential may be minted for it. Distinct from
+   * `credential_unavailable`: nothing failed, the operation is simply no longer
+   * authorized.
+   */
+  | "job_expired"
   | "operation_failed";
 
 /** Bounded, value-free failure. Mirrors `CloudflareR2Error`'s discipline. */
@@ -197,7 +204,14 @@ export class DelegatedR2ObjectStoreWriter implements ObjectStoreWriter {
       jobDeadlineMs = null;
     }
 
-    const ttlSeconds = deriveCredentialTtlSeconds({ action, nowMs, jobDeadlineMs });
+    const ttl = deriveCredentialTtlSeconds({ action, nowMs, jobDeadlineMs });
+    if (!ttl.ok) {
+      // A deadline-bound operation on an expired job. The broker is never
+      // contacted: there is no TTL that would be both usable and inside the
+      // job's authorization window.
+      throw new DelegatedR2Error("job_expired");
+    }
+    const ttlSeconds = ttl.ttlSeconds;
 
     let credential: R2TemporaryCredential;
     try {

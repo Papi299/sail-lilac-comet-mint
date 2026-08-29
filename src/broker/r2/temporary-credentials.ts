@@ -1,8 +1,8 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Buffer } from "node:buffer";
 import {
-  R2_CREDENTIAL_TTL_FLOOR_SECONDS,
   R2_CREDENTIAL_TTL_HARD_CAP_SECONDS,
+  R2_CREDENTIAL_TTL_MIN_SECONDS,
   type R2DelegatedAction,
 } from "../../shared/worker/r2-broker.ts";
 
@@ -182,7 +182,7 @@ export function mintTemporaryCredential(
   }
   if (
     !Number.isSafeInteger(input.ttlSeconds) ||
-    input.ttlSeconds < R2_CREDENTIAL_TTL_FLOOR_SECONDS ||
+    input.ttlSeconds < R2_CREDENTIAL_TTL_MIN_SECONDS ||
     input.ttlSeconds > R2_CREDENTIAL_TTL_HARD_CAP_SECONDS
   ) {
     throw new R2TemporaryCredentialError("ttlSeconds outside the permitted window");

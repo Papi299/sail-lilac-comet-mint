@@ -12,7 +12,7 @@ import {
   type MintTemporaryCredentialInput,
 } from "./temporary-credentials.ts";
 import {
-  R2_CREDENTIAL_TTL_FLOOR_SECONDS,
+  R2_CREDENTIAL_TTL_MIN_SECONDS,
   R2_CREDENTIAL_TTL_HARD_CAP_SECONDS,
   R2_FORBIDDEN_ACTIONS,
 } from "../../shared/worker/r2-broker.ts";
@@ -171,7 +171,7 @@ describe("R2 temporary credential local signing", () => {
 
   it("refuses a TTL outside the policy window", () => {
     assert.throws(
-      () => mintTemporaryCredential(input({ ttlSeconds: R2_CREDENTIAL_TTL_FLOOR_SECONDS - 1 })),
+      () => mintTemporaryCredential(input({ ttlSeconds: R2_CREDENTIAL_TTL_MIN_SECONDS - 1 })),
       R2TemporaryCredentialError,
     );
     assert.throws(
@@ -184,7 +184,7 @@ describe("R2 temporary credential local signing", () => {
 
     // The boundaries themselves are accepted.
     assert.doesNotThrow(() =>
-      mintTemporaryCredential(input({ ttlSeconds: R2_CREDENTIAL_TTL_FLOOR_SECONDS })),
+      mintTemporaryCredential(input({ ttlSeconds: R2_CREDENTIAL_TTL_MIN_SECONDS })),
     );
     assert.doesNotThrow(() =>
       mintTemporaryCredential(input({ ttlSeconds: R2_CREDENTIAL_TTL_HARD_CAP_SECONDS })),

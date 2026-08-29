@@ -4,7 +4,7 @@ import { R2CredentialBroker, r2EndpointHost, type R2BrokerConfig } from "./broke
 import { decodeSessionTokenClaims } from "./temporary-credentials.ts";
 import {
   R2_CREDENTIAL_TTL_CEILING_SECONDS,
-  R2_CREDENTIAL_TTL_FLOOR_SECONDS,
+  R2_CREDENTIAL_TTL_MIN_SECONDS,
   R2_CREDENTIAL_TTL_HARD_CAP_SECONDS,
   R2_FORBIDDEN_ACTIONS,
 } from "../../shared/worker/r2-broker.ts";
@@ -113,7 +113,7 @@ describe("R2 credential broker", () => {
         0,
         -1,
         1.5,
-        R2_CREDENTIAL_TTL_FLOOR_SECONDS - 1,
+        R2_CREDENTIAL_TTL_MIN_SECONDS - 1,
         R2_CREDENTIAL_TTL_HARD_CAP_SECONDS + 1,
         Number.MAX_SAFE_INTEGER,
         "300",
@@ -156,6 +156,38 @@ describe("R2 credential broker", () => {
         if (!decision.ok) assert.equal(decision.code, "malformed_request");
       }
     });
+  });
+
+  it("independently enforces the per-action TTL contract at its exact boundaries", () => {
+    // The broker cannot verify deadline-boundness — it has no job store — but
+    // it CAN verify the bounds, and it does so without trusting the request.
+    for (const action of ["PutObject", "HeadObject", "DeleteObject"] as const) {
+      const ceiling = R2_CREDENTIAL_TTL_CEILING_SECONDS[action];
+
+      // The exact boundaries are accepted.
+      for (const ttlSeconds of [R2_CREDENTIAL_TTL_MIN_SECONDS, ceiling]) {
+        const decision = makeBroker().handle(validRequest({ action, ttlSeconds }));
+        assert.equal(decision.ok, true, `${action} must accept ttl ${ttlSeconds}`);
+      }
+
+      // One second past either boundary is refused, never clamped into range.
+      for (const ttlSeconds of [R2_CREDENTIAL_TTL_MIN_SECONDS - 1, ceiling + 1]) {
+        const decision = makeBroker({
+          mintImpl: () => assert.fail("an out-of-contract TTL must never be minted"),
+        }).handle(validRequest({ action, ttlSeconds }));
+        assert.equal(decision.ok, false, `${action} must refuse ttl ${ttlSeconds}`);
+        if (!decision.ok) assert.equal(decision.code, "invalid_ttl");
+      }
+    }
+
+    // A Head or Delete may not borrow the larger PutObject window.
+    for (const action of ["HeadObject", "DeleteObject"] as const) {
+      const decision = makeBroker().handle(
+        validRequest({ action, ttlSeconds: R2_CREDENTIAL_TTL_CEILING_SECONDS.PutObject }),
+      );
+      assert.equal(decision.ok, false, `${action} must not reach the Put ceiling`);
+      if (!decision.ok) assert.equal(decision.code, "invalid_ttl");
+    }
   });
 
   it("fails closed when the minter itself throws", () => {
