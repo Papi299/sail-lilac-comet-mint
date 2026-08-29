@@ -177,6 +177,11 @@ describe("Dockerfile.worker container policy", () => {
         "R2_WRITER_SESSION_TOKEN",
         "R2_SIGNER_ACCESS_KEY_ID",
         "R2_SIGNER_SECRET_ACCESS_KEY",
+        // The R2 parent credential belongs to the trusted host broker alone
+        // (WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001). It must never be baked
+        // into, or declared by, the media image.
+        "R2_BROKER_PARENT_ACCESS_KEY_ID",
+        "R2_BROKER_PARENT_SECRET_ACCESS_KEY",
         "VIDEOFETCH_ACCESS_SECRET",
       ];
 
@@ -189,6 +194,36 @@ describe("Dockerfile.worker container policy", () => {
           assignments,
           new RegExp(`\\b${name}\\s*=`, "i"),
           `${name} must never be assigned in the image`,
+        );
+      }
+    });
+
+    it("ship the trusted credential broker's source", () => {
+      // The broker runs on the VM host, outside this network namespace, and is
+      // the sole holder of the parent R2 credential. The media image must not
+      // contain code that knows how to mint from a parent secret.
+      assert.match(
+        executable,
+        /rm\s+-rf[^\n]*\.\/src\/broker/,
+        "the broker source must be removed from the Worker image",
+      );
+    });
+
+    it("declare any R2 credential of any generation", () => {
+      const assignments = [...directives("ENV"), ...directives("ARG")]
+        .map((i) => i.args)
+        .join("\n");
+
+      // A location and a socket path are fine; key material is not.
+      for (const forbidden of [
+        /R2_WRITER_[A-Z_]*\s*=/,
+        /R2_SIGNER_[A-Z_]*\s*=/,
+        /R2_BROKER_PARENT_[A-Z_]*\s*=/,
+      ]) {
+        assert.doesNotMatch(
+          assignments,
+          forbidden,
+          `the Worker image must not declare ${forbidden}`,
         );
       }
     });
