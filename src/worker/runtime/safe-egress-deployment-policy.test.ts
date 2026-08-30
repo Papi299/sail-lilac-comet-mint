@@ -101,6 +101,23 @@ function tokens(directives: string[], key: string): string[] {
   return values(directives, key).flatMap((v) => v.split(/\s+/).filter(Boolean));
 }
 
+/**
+ * The option list of a `--tmpfs <target>:<options>` flag, split into its
+ * individual options.
+ *
+ * Order-insensitive by construction: callers assert over the SET, so
+ * re-ordering the mount options cannot fail a test, while dropping one of them
+ * must. The previous single-regex assertion could only compare one exact
+ * spelling, which is how it came to certify a mount the Worker could not write
+ * (WORKER-TEMP-TMPFS-OWNERSHIP-001).
+ */
+function tmpfsOptions(exec: string, target: string): string[] {
+  const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const found = [...exec.matchAll(new RegExp(`--tmpfs\\s+${escaped}:(\\S+)`, "g"))];
+  assert.equal(found.length, 1, `expected exactly one --tmpfs mount of ${target}`);
+  return found[0]![1]!.split(",").filter(Boolean);
+}
+
 // ── Required deny classes, from docs/architecture/safe-egress.md ────────────
 
 const REQUIRED_V4 = [
@@ -487,12 +504,80 @@ describe("safe-egress deployment policy", () => {
     it("retains every current container invariant", () => {
       const exec = values(workerUnit, "ExecStart").join("\n");
       assert.match(exec, /--read-only\b/);
-      assert.match(exec, /--tmpfs\s+\/tmp\/videofetch:rw,noexec,nosuid,size=2g\b/);
+      // Presence only. The full /tmp/videofetch option contract — including the
+      // uid/gid ownership grant this assertion used to certify away — is
+      // asserted semantically in the two tests below.
+      assert.match(exec, /--tmpfs\s+\/tmp\/videofetch:/);
       assert.match(exec, /--volume\s+\/var\/lib\/videofetch:\/var\/lib\/videofetch:rw\b/);
       assert.match(exec, /--volume\s+\/run\/videofetch-r2-broker:\/run\/videofetch-r2-broker:ro\b/);
       assert.match(exec, /--group-add\s+\$\{VIDEOFETCH_BROKER_GID\}/);
       assert.match(exec, /--cap-drop=ALL\b/);
       assert.match(exec, /--security-opt\s+no-new-privileges\b/);
+    });
+
+    // ── WORKER-TEMP-TMPFS-OWNERSHIP-001 ──────────────────────────────────
+    //
+    // The first production direct-media job failed PROCESSING_FAILED ~13ms in,
+    // on `mkdir /tmp/videofetch/jobs` -> EACCES.
+    //
+    // The cause was mount semantics, not application code: a tmpfs is a fresh
+    // filesystem mounted OVER /tmp/videofetch, so it SHADOWS the directory
+    // Dockerfile.worker creates and chowns to node:node, and the kernel had
+    // given that new mount root:root while the Worker runs as uid 1000. Image
+    // ownership can never satisfy a path something else is mounted over, so
+    // the MOUNT must carry the runtime identity.
+    //
+    // The old form of this suite asserted one exact option string and so
+    // actively protected the broken declaration. These assert over the option
+    // SET instead.
+    it("mounts the media temp tmpfs writable by the Worker's own uid/gid", () => {
+      const exec = values(workerUnit, "ExecStart").join("\n");
+      const options = tmpfsOptions(exec, "/tmp/videofetch");
+
+      // uid/gid are the fix; rw/noexec/nosuid/size are what the fix must not
+      // cost. 1000:1000 is the `node` user of the node:22-bookworm-slim base
+      // that Dockerfile.worker switches to, written numerically because a
+      // kernel mount option takes ids, not names.
+      for (const required of ["rw", "noexec", "nosuid", "size=2g", "uid=1000", "gid=1000"]) {
+        assert.ok(
+          options.includes(required),
+          `the /tmp/videofetch tmpfs must be mounted ${required} (got ${options.join(",")})`,
+        );
+      }
+    });
+
+    it("buys that writability with no loss of temp-filesystem hardening", () => {
+      const exec = values(workerUnit, "ExecStart").join("\n");
+      const options = tmpfsOptions(exec, "/tmp/videofetch");
+
+      // Exact-token comparison, which is precisely what splitting on ',' buys:
+      // `noexec` must never be relaxed to `exec`, and a substring check could
+      // not tell those two apart.
+      for (const forbidden of ["exec", "suid", "ro"]) {
+        assert.equal(
+          options.includes(forbidden),
+          false,
+          `the /tmp/videofetch tmpfs must never be mounted ${forbidden}`,
+        );
+      }
+
+      // Writable by the WORKER is the fix. Writable by anyone is not: the
+      // correction is an ownership grant, never a permission broadening.
+      for (const option of options) {
+        const mode = /^mode=([0-7]+)$/.exec(option)?.[1];
+        if (mode === undefined) continue;
+        assert.equal(
+          Number.parseInt(mode.slice(-1), 8) & 0o2,
+          0,
+          `the /tmp/videofetch tmpfs must not be world-writable (${option})`,
+        );
+      }
+
+      // And it must stay an ephemeral tmpfs. Swapping it for a host bind mount
+      // would also "fix" the EACCES, by putting media working files on the VM
+      // disk, outside the size bound and outside the container's lifetime.
+      assert.doesNotMatch(exec, /--volume\s+\S*:\/tmp\/videofetch\b/);
+      assert.doesNotMatch(exec, /--mount\s+\S*\/tmp\/videofetch\b/);
     });
 
     it("acquires no privilege from the safe-egress merge", () => {
