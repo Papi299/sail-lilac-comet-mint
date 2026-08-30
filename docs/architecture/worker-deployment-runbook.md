@@ -730,64 +730,6 @@ Expiration is enforced by `expiresAt` in durable metadata, independently of
 whether cleanup succeeded. A failed object deletion never extends user
 authorization.
 
-### 5g. `R2-PROVIDER-LIFECYCLE-BACKSTOP-001` — CLOSED
-
-**Status: CLOSED.** The provider lifecycle backstop is configured on the
-production bucket and verified by API readback.
-
-| | |
-| :--- | :--- |
-| Rule name | `videofetch-expired-job-backstop` |
-| Scope | prefix `videofetch/jobs/` — the exact object-key namespace |
-| Action | delete objects after an age of **3600 seconds (60 minutes)** |
-| Enabled | yes |
-| Storage-class transition | none |
-
-**It is a backstop, not the cleanup path.** Ordinary expiry remains the
-application's job: `FILE_EXPIRATION_MINUTES` is **45 minutes** and the Worker
-deletes each object by exact key through a delegated `DeleteObject` credential.
-The provider rule exists only to collect what that path misses — a Worker killed
-mid-job, a delete that failed and was never retried. 60 minutes is deliberately
-*longer* than 45 so the application always gets its attempt first, and bounded
-enough that an escaped object is measured in minutes rather than days.
-
-Two properties worth stating precisely:
-
-- **Provider deletion is asynchronous.** Cloudflare removes objects on its own
-  schedule after the age threshold; the rule guarantees eventual deletion, not
-  deletion at a particular instant. Nothing in this system depends on the
-  timing — user authorization is governed by `expiresAt` in durable metadata,
-  independently of whether any object still exists.
-- **The rule does not weaken application cleanup**, and application cleanup is
-  not relaxed because the rule exists. Both run.
-
-**Verification.** The rule was written by API and then read back independently —
-a dashboard success message is not evidence. The readback confirmed the rule
-enabled with the exact prefix, a delete-objects transition at age 3600, no
-storage-class transition, and a pre-existing default multipart-abort rule
-preserved unchanged alongside it (it was appended to, never replaced).
-
-A single throwaway object was then created under `videofetch/jobs/` through the
-real delegated `PutObject` path. The provider returned:
-
-```
-x-amz-expiration: expiry-date="…20:40:12 GMT", rule-id="videofetch-expired-job-backstop"
-```
-
-naming this rule and an expiry exactly 3600 seconds after the object was
-written, on both the `PUT` and a subsequent `HEAD`. The object was then removed
-immediately through the normal exact-key delegated `DeleteObject` path,
-confirmed absent (HTTP 404), and the bucket confirmed to hold zero objects at
-`videofetch/jobs/`, at `videofetch/` and bucket-wide. Nothing was left for the
-backstop to collect — the header is evidence that the rule *applies*, not a
-measurement of deletion timing.
-
-Authorization for this change was a temporary, narrowly scoped R2 token used
-only for lifecycle `GET`/`PUT` and then destroyed; the broker's parent
-credential was never used for it and, as §5b requires, cannot be — it is refused
-`AccessDenied` on lifecycle operations. No account identifier, bucket name,
-token or secret value is recorded here.
-
 ### 5f. `R2-CREDENTIAL-SCOPE-DECISION-001` — RESOLVED / CLOSED
 
 **Status: CLOSED. The Product Owner selected Option B.**
@@ -808,7 +750,7 @@ credential is a broker-side restart.
 rule or account change had been made, and it was an unprovisioned design.*
 **Production R2 and its credential plane have since been provisioned** — before
 Phase 9 — and the provider lifecycle backstop was configured afterwards under
-`R2-PROVIDER-LIFECYCLE-BACKSTOP-001` (§5g). None of that changed the decision
+`R2-PROVIDER-LIFECYCLE-BACKSTOP-001` (§5h). None of that changed the decision
 itself: Option B, action-scoped temporary credentials minted per operation,
 still stands exactly as described above.
 
@@ -908,6 +850,64 @@ refuses to start the Worker unless the configured GID numerically equals the
 group owning the socket and the socket is group-connectable but not
 world-accessible. Neither `/etc/passwd` nor `/etc/group` is mounted into the
 media container.
+
+### 5h. `R2-PROVIDER-LIFECYCLE-BACKSTOP-001` — CLOSED
+
+**Status: CLOSED.** The provider lifecycle backstop is configured on the
+production bucket and verified by API readback.
+
+| | |
+| :--- | :--- |
+| Rule name | `videofetch-expired-job-backstop` |
+| Scope | prefix `videofetch/jobs/` — the exact object-key namespace |
+| Action | delete objects after an age of **3600 seconds (60 minutes)** |
+| Enabled | yes |
+| Storage-class transition | none |
+
+**It is a backstop, not the cleanup path.** Ordinary expiry remains the
+application's job: `FILE_EXPIRATION_MINUTES` is **45 minutes** and the Worker
+deletes each object by exact key through a delegated `DeleteObject` credential.
+The provider rule exists only to collect what that path misses — a Worker killed
+mid-job, a delete that failed and was never retried. 60 minutes is deliberately
+*longer* than 45 so the application always gets its attempt first, and bounded
+enough that an escaped object is measured in minutes rather than days.
+
+Two properties worth stating precisely:
+
+- **Provider deletion is asynchronous.** Cloudflare removes objects on its own
+  schedule after the age threshold; the rule guarantees eventual deletion, not
+  deletion at a particular instant. Nothing in this system depends on the
+  timing — user authorization is governed by `expiresAt` in durable metadata,
+  independently of whether any object still exists.
+- **The rule does not weaken application cleanup**, and application cleanup is
+  not relaxed because the rule exists. Both run.
+
+**Verification.** The rule was written by API and then read back independently —
+a dashboard success message is not evidence. The readback confirmed the rule
+enabled with the exact prefix, a delete-objects transition at age 3600, no
+storage-class transition, and a pre-existing default multipart-abort rule
+preserved unchanged alongside it (it was appended to, never replaced).
+
+A single throwaway object was then created under `videofetch/jobs/` through the
+real delegated `PutObject` path. The provider returned:
+
+```
+x-amz-expiration: expiry-date="…20:40:12 GMT", rule-id="videofetch-expired-job-backstop"
+```
+
+naming this rule and an expiry exactly 3600 seconds after the object was
+written, on both the `PUT` and a subsequent `HEAD`. The object was then removed
+immediately through the normal exact-key delegated `DeleteObject` path,
+confirmed absent (HTTP 404), and the bucket confirmed to hold zero objects at
+`videofetch/jobs/`, at `videofetch/` and bucket-wide. Nothing was left for the
+backstop to collect — the header is evidence that the rule *applies*, not a
+measurement of deletion timing.
+
+Authorization for this change was a temporary, narrowly scoped R2 token used
+only for lifecycle `GET`/`PUT` and then destroyed; the broker's parent
+credential was never used for it and, as §5b requires, cannot be — it is refused
+`AccessDenied` on lifecycle operations. No account identifier, bucket name,
+token or secret value is recorded here.
 
 ---
 
@@ -1140,7 +1140,7 @@ authorization.
 - [x] **Provider lifecycle TTL backstop configured**
       (`R2-PROVIDER-LIFECYCLE-BACKSTOP-001`). Rule
       `videofetch-expired-job-backstop`, prefix `videofetch/jobs/`, delete at
-      age 3600s, verified by API readback. See §5g.
+      age 3600s, verified by API readback. See §5h.
 - [x] **Broker parent credential created — bucket-scoped, no bucket
       administration.** Provider permissions are necessarily broader than the
       Put/Head/Delete surface; narrowing happens per operation at mint time via
@@ -1195,7 +1195,7 @@ authorization.
 
 | Id | Status | Notes |
 | :--- | :--- | :--- |
-| `R2-CREDENTIAL-SCOPE-DECISION-001` | **RESOLVED / CLOSED — Option B** | The Product Owner selected Option B: renewable, action-scoped temporary credentials. Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001` — the media Worker holds no persistent R2 credential, a trusted host broker outside the media namespace retains the single-bucket parent writer credential, and each operation receives a credential scoped to one bucket, one exact `WorkerObjectKey` and one S3 action with a bounded TTL, expressed as an action-only JWT claim set (corrected by `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001`; see §5b). The decision was **initially accepted using disposable live-provider material** — a throwaway bucket and parent token, torn down once that acceptance passed (§5f). **Production R2 and its credential plane were provisioned later, before Phase 9**, and the provider lifecycle backstop was added afterwards (§5g). The selected Option-B architecture is unchanged by either: minting stays renewable, action-scoped and per-operation. No account identifier, bucket name, token or secret value is recorded here. |
+| `R2-CREDENTIAL-SCOPE-DECISION-001` | **RESOLVED / CLOSED — Option B** | The Product Owner selected Option B: renewable, action-scoped temporary credentials. Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001` — the media Worker holds no persistent R2 credential, a trusted host broker outside the media namespace retains the single-bucket parent writer credential, and each operation receives a credential scoped to one bucket, one exact `WorkerObjectKey` and one S3 action with a bounded TTL, expressed as an action-only JWT claim set (corrected by `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001`; see §5b). The decision was **initially accepted using disposable live-provider material** — a throwaway bucket and parent token, torn down once that acceptance passed (§5f). **Production R2 and its credential plane were provisioned later, before Phase 9**, and the provider lifecycle backstop was added afterwards (§5h). The selected Option-B architecture is unchanged by either: minting stays renewable, action-scoped and per-operation. No account identifier, bucket name, token or secret value is recorded here. |
 | `R2-BROKER-PARENT-TOKEN-ROTATION-001` | **CLOSED** | Production R2 and its credential plane were provisioned **before** Phase 9, and the parent token was provisioned and verified with them. Custody is unchanged: the token remains a persistent broker-side credential held in the broker's `EnvironmentFile`, and rotation remains an `EnvironmentFile` update plus `systemctl restart videofetch-r2-broker`, which `BindsTo=` propagates as a brief Worker restart. No code change was required. Phase 9 did not exercise or modify R2 in any way; the broker ran untouched throughout with `NRestarts=0`. No account identifier, bucket name, token or secret value is recorded here. |
 | `R2-BROKER-LIVE-MINT-VERIFICATION-001` | **CLOSED — accepted** | **Initial failure → correction → definitive acceptance → teardown.** *First attempt, FAILED:* real R2 was reached and rejected the then-merged `scope + actions` credential at token **parsing** — `HTTP 400 InvalidArgument` on `X-Amz-Security-Token`, before any authorization decision — so the production path failed closed rather than over-granting; diagnostic action-only credentials were accepted and showed the intended enforcement, and expiration went unmeasured. *Correction:* `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001` (PR #21) changed **production** credentials to action-only claims (see §5b). *Definitive rerun, PASSED:* run against this repository's merged production implementation — the merged `mintTemporaryCredential` signer, the merged `CloudflareR2ObjectStoreWriter` for Put/Head/Delete, repository-generated `WorkerObjectKey` values, all three temporary-credential fields on every delegated request, **no parent-credential fallback** (a raw AWS SDK client was used only for `GetObject`/`ListObjectsV2`, which the production writer deliberately omits). The **full matrix passed**: under its own credential, exact-key `PutObject`, `HeadObject` and `DeleteObject` each **succeeded**, while every **cross-action** attempt, every **sibling-object** attempt and **`ListObjectsV2`** were **denied by R2** — provider-side authorization denials, not local or network failures. Denied sibling writes and deletes left the sibling untouched, the sibling genuinely existed during the head and delete sibling tests (no missing-object ambiguity), the delete negatives ran while the exact object still existed, and no post-delete 404 was used as denial evidence. **Natural expiration was enforced** on real wall-clock time (§5b) — a 1-second production credential replayed at `exp + 30s` was denied and created nothing, the observed expired-credential response in this acceptance being `403 SignatureDoesNotMatch` rather than a dedicated expiry code; because that response is not expiry-specific, the result was isolated by before/after acceptance of equivalent 1-second credentials for both `HeadObject` and `PutObject`. *Cleanup:* all task-owned objects were removed with fresh exact-key `DeleteObject` credentials and a read-only parent check reported 0 objects at the job prefix, 0 at the `videofetch` prefix and 0 bucket-wide. *Teardown (operator-attested, not independently re-verified):* disposable parent token revoked, disposable bucket confirmed empty and deleted, local acceptance credential file removed (§5f). **This gate therefore no longer blocks production R2 traffic.** Closure means only that the merged temporary-credential model passed live-provider acceptance — *at the time of closure* it did not mean production R2 was provisioned, that `R2-BROKER-PARENT-TOKEN-ROTATION-001` was resolved, or that Phase 9 or Phase 10 had progressed. **Those particular caveats have since been overtaken:** production R2 and its parent credential were provisioned before Phase 9, `R2-BROKER-PARENT-TOKEN-ROTATION-001` is CLOSED, and Phase 9 is COMPLETE / ACCEPTED. What this gate itself proved — that the merged mint path is action-scoped, exact-key and expiry-enforced against the live provider — is unaffected by any of that. It still does not mean Phase 10 progressed or that yt-dlp may be enabled; both remain closed off. |
 | `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **CLOSED — accepted** | Empirically measured and accepted against the real Cloudflare Access Service Auth configuration; the gate is no longer blocking and is not reopened here. Scope note, unchanged: this is an acceptance of the measured INGRESS path, not a source-level property. This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it — that part is still asserted by the control-plane boundary suite. Any change to the ingress topology invalidates the acceptance and requires a re-measurement. |
@@ -1204,7 +1204,7 @@ authorization.
 | `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | **CLOSED — accepted 2026-08-30** | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Every other range was counter-attributed. `deploy/bin/vf-egress-multicast-route-test` now installs a minimal temporary route so those destinations reach the enforcement point and the denial can be attributed to the rule's own counter. It is acceptance-only: no unit references it, it refuses to run without `--phase9-acceptance` and root, it refuses to run outside a namespace carrying the `inet videofetch_egress` table, and it never touches nftables. **Corrected in Correction 01:** the first implementation mutated routes and only then re-baselined the route fingerprint, while the watchdog was still subscribed to route events — a race whose outcome depended on scheduling. The helper now *quiesces* the boundary instead (stop Worker → stop watchdog → assert both stopped → mutate → measure → unwind → re-verify → restart), re-baselines nothing, and bounds the permitted route delta to exactly the intended multicast destinations. No bypass was added to the verifier or watchdog. See §3d. **Executed against the live VM in Phase 9**, disconnected and again under NordVPN. The helper behaved exactly as designed — quiesce, install only the intended narrow routes, probe, unwind, restore byte-for-byte, re-verify — but its TCP probe left `deny-v4`/`deny-v6` flat in every run, and it correctly refused to call that attribution. The cause was isolated with a control experiment in a throwaway namespace carrying a valid route to the same destinations and **no firewall whatsoever**: TCP `connect()` to a multicast address still returned `ENETUNREACH` there, so the Linux socket layer rejects multicast TCP before netfilter's output hook is consulted, and no TCP probe can ever attribute it. UDP to the same destinations does emit a packet. Repeating the helper's exact discipline with a UDP probe moved **`deny-v4` +1 and `deny-v6` +1**, with the route delta bounded to the intended destinations, the policy fingerprint unchanged during the window, the route table restored exactly and the boundary re-verified. Multicast is therefore denied **by the rule**, and the flat TCP counter is a kernel property rather than a gap in this boundary. No bypass was added to the verifier or the watchdog. |
 | `SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001` | **CLOSED — accepted 2026-08-30** | The prototype verifier fingerprinted the `nftables` ruleset but not the namespace **route table**. Non-blocking, as before: destination denial was proven to survive route injection, and a route cannot defeat a destination-address deny. Source hardening is now merged — see §3b — combining a baseline-free semantic invariant over policy-routing rules with a runtime route/rule fingerprint captured by the trusted install path and stored under `/run`. The watchdog additionally subscribes to route and link netlink events. **Verified in situ during Phase 9 on 2026-08-30.** The installed verifier hash-matches the `origin/main` blob exactly, and it ran against the real namespace on the real VM throughout acceptance — including 50 consecutive executions under NordVPN, all passing, and repeated runs across the multicast quiesce/mutate/restore windows. It reported identical policy and route fingerprints on every invocation, correctly refused nothing that was intact, and the deliberate route mutations it is meant to catch were caught by the helper's own comparison before the verifier was consulted. The gate is closed. |
 | `PRODUCTION-DNS-RESOLVER-001` | **CLOSED — deployed and fresh-boot verified** | The media namespace was configured to use the designated resolver `172.17.0.1:53` — holder `--dns` flag, namespace `resolv.conf` and the rendered policy's exact UDP/TCP 53 exception all agreeing — while **nothing listened there**. The resolver that satisfied the Phase-9 DNS cases belonged to the acceptance and was removed by its cleanup, so ordinary hostname resolution failed (`EAI_AGAIN`) while direct connections to public IP addresses kept working. Confirmed on a fresh boot with every unit active, the Worker reporting healthy and the verifier passing — which was the defect itself. **Closed by PR #28, merge commit `4d4f90c60dd9feba8c423022aa34f467fd093691`.** `systemd-resolved` now carries an extra stub listener at the designated address (`DNSStubListenerExtra`), chosen over a new daemon because resolved is already the VM's resolver and already follows its upstream configuration. `vf-media-dns-check` probes that address — read from `media-egress.env`, never from the drop-in — on both transports, and `videofetch-media-dns.service` runs it as a `Type=notify` readiness gate ordered in front of the namespace holder. The Worker declares `Requires=`/`After=`/`BindsTo=` on it; the holder deliberately takes only the first two, so a DNS fault stops the Worker without tearing down the boundary. **The designated address was not changed and the nftables policy was not touched**: the policy and route fingerprints are byte-identical to the Phase-9 baseline, so this is a functional addition, not a boundary change. Verified post-deployment and again after a controlled reboot: exact UDP and TCP listeners with no wildcard or LAN exposure, readiness probe passing on both transports, Worker hostname resolution and HTTPS-by-hostname succeeding, non-designated resolvers still denied, and `172.17.0.1` still reachable on port 53 alone. Phase 9 was neither rerun nor reopened. |
-| `R2-PROVIDER-LIFECYCLE-BACKSTOP-001` | **CLOSED** | The production bucket had no object-expiration rule: its only lifecycle entry was a default multipart-abort rule, which deletes nothing by age. A backstop named `videofetch-expired-job-backstop` was added — enabled, scoped to the `videofetch/jobs/` prefix, deleting objects at an age of **3600 seconds**, with no storage-class transition — and the pre-existing multipart rule was preserved by appending rather than replacing the configuration. 3600s is deliberately longer than the application's 45-minute `FILE_EXPIRATION_MINUTES` so ordinary exact-key cleanup always attempts deletion first; the provider rule only collects what that path misses. Verified by independent API readback, not by a dashboard message, and further evidenced by a throwaway object whose `x-amz-expiration` header named this rule with an expiry exactly 3600s after write; that object was then deleted through the normal delegated exact-key path and the bucket confirmed empty. Provider deletion is asynchronous, so this guarantees eventual collection rather than deletion at a specific instant. Authorization was a temporary narrowly scoped R2 token, destroyed afterwards; the broker parent credential is refused lifecycle access by design. See §5g. |
+| `R2-PROVIDER-LIFECYCLE-BACKSTOP-001` | **CLOSED** | The production bucket had no object-expiration rule: its only lifecycle entry was a default multipart-abort rule, which deletes nothing by age. A backstop named `videofetch-expired-job-backstop` was added — enabled, scoped to the `videofetch/jobs/` prefix, deleting objects at an age of **3600 seconds**, with no storage-class transition — and the pre-existing multipart rule was preserved by appending rather than replacing the configuration. 3600s is deliberately longer than the application's 45-minute `FILE_EXPIRATION_MINUTES` so ordinary exact-key cleanup always attempts deletion first; the provider rule only collects what that path misses. Verified by independent API readback, not by a dashboard message, and further evidenced by a throwaway object whose `x-amz-expiration` header named this rule with an expiry exactly 3600s after write; that object was then deleted through the normal delegated exact-key path and the bucket confirmed empty. Provider deletion is asynchronous, so this guarantees eventual collection rather than deletion at a specific instant. Authorization was a temporary narrowly scoped R2 token, destroyed afterwards; the broker parent credential is refused lifecycle access by design. See §5h. |
 | `NPM-LOCKFILE-RECONCILIATION-001` | **CLOSED** | `package-lock.json` carries a pre-existing devDependency resolution (`nitro` → `unstorage` requires `lru-cache@^11`, the lock pins `5.1.1`) that npm 10 rejects and npm 11 accepts. The Worker image works around it with an exact-pinned ephemeral npm 11 running `ci`; no `npm install` is used and the lockfile is unmodified. **Resolved and merged** in PR #24 (merge commit `7009550d5573dc5b7d3b7eda7efaf20120a1c22f`), with npm `11.19.1` pinned and the lockfile intentionally unchanged. |
 
 ---
