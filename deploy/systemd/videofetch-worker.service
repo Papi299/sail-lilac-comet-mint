@@ -36,6 +36,37 @@ Requires=videofetch-r2-broker.service
 After=videofetch-r2-broker.service
 BindsTo=videofetch-r2-broker.service
 
+# ── THE SECOND BOUNDARY: SAFE EGRESS ───────────────────────────────────────
+# (PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001)
+#
+# The Worker may run ONLY when BOTH security boundaries are present.
+# The broker governs what it can WRITE; these three units govern where it can
+# CONNECT. They are independent — an AF_UNIX socket is not the network, so the
+# broker path neither depends on nor widens the egress policy — and the Worker
+# is denied if either one is missing.
+#
+#   videofetch-media-netns.service      owns the namespace the Worker joins
+#   videofetch-egress-policy.service    installs + verifies the nftables policy
+#   videofetch-egress-watchdog.service  keeps verifying it, and stops the
+#                                       Worker the moment it stops being true
+#
+# Requires : none of the three may have failed to start.
+# After    : all of them are up first, so the policy is already enforced in the
+#            namespace before the Worker has a chance to emit a packet.
+# BindsTo  : if any of them later stops, fails or is restarted, the Worker is
+#            stopped with it.
+#
+# BindsTo on the WATCHDOG is what makes watchdog failure safe: a watchdog that
+# crashes, hangs (WatchdogSec) or exits after detecting a breach takes the
+# Worker down, so the Worker can never keep running unmonitored. The prototype
+# lacked this edge entirely.
+#
+# The dependency graph is acyclic: the Worker depends on all four units and
+# nothing depends on the Worker.
+Requires=videofetch-media-netns.service videofetch-egress-policy.service videofetch-egress-watchdog.service
+After=videofetch-media-netns.service videofetch-egress-policy.service videofetch-egress-watchdog.service
+BindsTo=videofetch-media-netns.service videofetch-egress-policy.service videofetch-egress-watchdog.service
+
 [Service]
 Type=simple
 Restart=on-failure
@@ -69,6 +100,21 @@ EnvironmentFile=/etc/videofetch/broker-gid.env
 # unable to mint.
 ExecStartPre=/usr/local/sbin/vf-r2-broker-gid-verify \
   /run/videofetch-r2-broker/broker.sock ${VIDEOFETCH_BROKER_GID}
+
+# FAIL-CLOSED GATE: the safe-egress boundary must be verifiably live in the
+# media namespace at this instant, not merely "a unit reported success once".
+#
+# The verifier is read-only and never repairs: it re-reads the live ruleset,
+# asserts every required deny class, asserts the allow set is EXACTLY the
+# intended shape, and compares both the ruleset and the namespace route table
+# against the fingerprints the policy unit recorded under /run. Any mismatch —
+# including a policy unit that is no longer active, whose RuntimeDirectory has
+# therefore been removed — stops the Worker from starting.
+#
+# It is deliberately NOT prefixed with '-': its failure must be fatal. This
+# also serves as the post-breach latch, because a Worker cannot be started
+# again by hand while the boundary is still invalid.
+ExecStartPre=/usr/local/sbin/vf-egress-policy-verify
 
 ExecStartPre=-/usr/bin/docker rm -f videofetch-worker
 
@@ -109,6 +155,18 @@ ExecStop=/usr/bin/docker stop --time 15 videofetch-worker
 #                   acquisition does not traverse it: an AF_UNIX socket is not
 #                   the network, so the boundary neither depends on nor widens
 #                   the egress policy.
+#
+#                   The namespace is owned by videofetch-media-netns.service,
+#                   which also publishes the Worker's only listening port, on
+#                   VM loopback. There is NO fallback network: if that
+#                   container is absent this flag fails outright rather than
+#                   quietly placing the Worker on the default bridge, where no
+#                   egress policy exists at all.
+#
+#                   DNS is inherited from that container. The Worker cannot
+#                   pass --dns of its own — docker rejects it alongside
+#                   `--network container:` — so the resolver it uses is exactly
+#                   the one the firewall admits.
 #
 # --cap-drop=ALL    No NET_ADMIN, no SYS_ADMIN. No Docker socket is mounted and
 #                   host networking is not used.

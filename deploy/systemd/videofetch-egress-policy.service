@@ -1,0 +1,47 @@
+# VideoFetch safe-egress policy installation.
+# (PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001)
+#
+# Recovered from the Lima prototype's vf-policy.service.
+#
+# Installs the committed nftables policy INTO the media network namespace as VM
+# root, records the runtime verification material under /run, and verifies
+# immediately. Nothing here has been provisioned or deployed.
+
+[Unit]
+Description=VideoFetch safe-egress policy (installed into the media netns by VM root)
+Documentation=file:/opt/videofetch/docs/architecture/safe-egress.md
+After=videofetch-media-netns.service
+Requires=videofetch-media-netns.service
+
+# If the namespace goes away, the policy that lived inside it went with it.
+# Staying "active" would leave a stale fingerprint on disk describing a
+# namespace that no longer exists.
+BindsTo=videofetch-media-netns.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# The fingerprints live HERE, and only for as long as this unit is active.
+#
+# systemd removes a RuntimeDirectory when its unit stops, so stopping the
+# policy unit deletes the verification material — and the Worker's pre-start
+# verifier then fails because the expected fingerprint is missing. That is the
+# intended coupling: no live policy, no evidence, no Worker.
+#
+# They are deliberately NOT in /etc: they describe one running namespace, not a
+# configuration, and an /etc copy would outlive what it describes. They are
+# deliberately not in Git for the same reason.
+RuntimeDirectory=videofetch-egress
+RuntimeDirectoryMode=0750
+
+ExecStart=/usr/local/sbin/vf-egress-policy-install
+
+# Nothing to undo. The policy lives in the namespace, and the namespace's own
+# unit owns its lifetime — tearing rules down here would race the holder's
+# removal and could leave a Worker briefly running against a flushed ruleset.
+# Stopping this unit removes the RuntimeDirectory, which is what actually
+# blocks the Worker.
+
+[Install]
+WantedBy=multi-user.target

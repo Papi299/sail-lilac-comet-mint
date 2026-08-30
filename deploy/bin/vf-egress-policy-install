@@ -1,0 +1,169 @@
+#!/bin/bash
+# Installs the VideoFetch safe-egress policy INTO the media network namespace.
+# (PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001)
+#
+# Recovered from the Lima prototype's /usr/local/sbin/vf-policy-install and
+# reconciled with the current repository's deployment conventions.
+#
+# Runs as VM root under systemd. The Worker never executes this, and holds no
+# capability that would let it. Responsibilities, in order:
+#
+#   1. resolve the namespace holder safely;
+#   2. render the committed policy template with the designated resolver(s);
+#   3. install it into the namespace;
+#   4. record runtime verification material under /run;
+#   5. verify immediately, and exit nonzero on ANY inconsistency.
+#
+# Step 5 is not decoration. An installer that reports success without
+# verifying teaches an operator to trust a boundary nobody checked.
+#
+# There is deliberately NO "re-baseline the routes only" mode. Correction-01
+# removed it: the only legitimate reason for the route baseline to change is
+# that the namespace was re-established, and that goes through this script in
+# full. A narrower re-baseline entry point would be a way to bless a route
+# change without re-installing the policy it is supposed to accompany.
+#
+# Usage:
+#   vf-egress-policy-install
+
+set -euo pipefail
+VF_PROG=vf-egress-policy-install
+
+LIB="${VF_EGRESS_LIB:-/usr/local/lib/videofetch/vf-egress-lib.sh}"
+# shellcheck source=vf-egress-lib.sh
+. "$LIB"
+
+VERIFY="${VF_EGRESS_VERIFY:-/usr/local/sbin/vf-egress-policy-verify}"
+
+case "${1-}" in
+  '') ;;
+  *) vf_die "unknown argument '$1'" ;;
+esac
+
+[ "$(id -u)" -eq 0 ] || vf_die "must run as root: the policy is installed into the
+namespace from OUTSIDE it, which is the whole point of the ownership model."
+
+vf_config_load
+
+# ── 1. Resolve the namespace holder ────────────────────────────────────────
+#
+# No holder, no namespace, no policy, no Worker. Never create one here: this
+# script installs policy, it does not manufacture the thing it constrains.
+PID="$(vf_netns_pid)" || vf_die "the media namespace holder is not running.
+Start videofetch-media-netns.service first; this script never creates it."
+
+mkdir -p "$VF_RUNDIR"
+chmod 0750 "$VF_RUNDIR"
+
+# ── Route baseline ─────────────────────────────────────────────────────────
+#
+# Captured AFTER the namespace exists so it reflects the addresses the runtime
+# actually assigned. Nothing about the container's address, the bridge subnet
+# or the interface name is hard-coded anywhere; the baseline is whatever the
+# controlled start path produced, and drift from it is what gets detected.
+capture_routes() {
+  local tmp
+  tmp="$(mktemp "$VF_RUNDIR/.routes.XXXXXX")"
+  vf_canonical_routes "$PID" > "$tmp"
+  [ -s "$tmp" ] || { rm -f "$tmp"; vf_die "namespace route table read back EMPTY.
+Refusing to baseline nothing: an empty baseline would match a namespace that
+had lost its routing entirely."; }
+  vf_sha256 < "$tmp" > "$VF_ROUTES_FINGERPRINT"
+  chmod 0400 "$VF_ROUTES_FINGERPRINT"
+  rm -f "$tmp"
+}
+
+# ── 2. Render the committed template ───────────────────────────────────────
+[ -r "$VF_POLICY_TEMPLATE" ] || vf_die "policy template $VF_POLICY_TEMPLATE is unreadable"
+
+# The resolver declaration is validated here as well as in the unit's
+# ExecStartPre, because this script must be safe to run by hand.
+RESOLVERS="$(vf_dns_resolvers)" || vf_die "designated DNS resolver configuration is invalid;
+refusing to install a policy whose DNS exception is unknown."
+
+# One accept per resolver per transport. Nothing else is generated: no port
+# range, no address range, no "any UDP to the resolver".
+#
+# The block is built in a file rather than a shell variable because awk's -v
+# cannot carry embedded newlines portably (mawk, the Ubuntu default, rejects
+# them outright), and a rendering step that works on one awk and silently
+# mangles another is exactly the kind of failure this boundary cannot afford.
+umask 077
+DNS_FILE="$(mktemp "$VF_RUNDIR/.dns.XXXXXX")"
+TMP="$(mktemp "$VF_RUNDIR/.policy.XXXXXX")"
+trap 'rm -f "$DNS_FILE" "$TMP"' EXIT
+
+RULE_COUNT=0
+while IFS= read -r addr; do
+  [ -n "$addr" ] || continue
+  case "$addr" in
+    *:*) fam=ip6 ;;
+    *)   fam=ip  ;;
+  esac
+  printf '    %s daddr %s udp dport 53 counter accept comment "designated-dns-udp"\n' \
+    "$fam" "$addr" >> "$DNS_FILE"
+  printf '    %s daddr %s tcp dport 53 counter accept comment "designated-dns-tcp"\n' \
+    "$fam" "$addr" >> "$DNS_FILE"
+  RULE_COUNT=$((RULE_COUNT + 2))
+done <<< "$RESOLVERS"
+
+[ "$RULE_COUNT" -ge 2 ] \
+  || vf_die "rendered zero DNS rules from a validated resolver list"
+
+awk -v rulefile="$DNS_FILE" '
+  $0 == "@@VIDEOFETCH_DESIGNATED_DNS@@" {
+    while ((getline line < rulefile) > 0) print line
+    close(rulefile)
+    found = 1
+    next
+  }
+  { print }
+  END { if (!found) exit 3 }
+' "$VF_POLICY_TEMPLATE" > "$TMP" || vf_die "policy template contains no
+@@VIDEOFETCH_DESIGNATED_DNS@@ marker. Refusing to install: the DNS exception
+would be missing and name resolution would fail in a way that looks like a
+network fault rather than a configuration error."
+
+# Belt and braces: the marker LINE must not survive into the rendered file. If
+# it did, nft would reject the file anyway (the marker is not valid syntax),
+# but saying so here names the actual problem.
+#
+# Anchored to a whole line on purpose: the template's own header discusses the
+# marker in prose, and an unanchored match would report a false breach on a
+# correctly rendered policy.
+! grep -q '^@@VIDEOFETCH_DESIGNATED_DNS@@$' "$TMP" \
+  || vf_die "the designated-DNS marker survived rendering"
+
+# The rendered policy must carry exactly the rules we generated and no more.
+RENDERED_ACCEPTS="$(grep -c 'dport 53 counter accept' "$TMP" || true)"
+[ "$RENDERED_ACCEPTS" -eq "$RULE_COUNT" ] \
+  || vf_die "rendered policy has $RENDERED_ACCEPTS DNS accepts, expected $RULE_COUNT"
+
+mv "$TMP" "$VF_POLICY_RENDERED"
+rm -f "$DNS_FILE"
+trap - EXIT
+chmod 0400 "$VF_POLICY_RENDERED"
+
+# ── 3. Install into the namespace ──────────────────────────────────────────
+#
+# VM root reaches INTO the namespace. The namespace's own occupants hold no
+# NET_ADMIN and cannot reach back out.
+vf_in_ns "$PID" "$VF_NFT" -f "$VF_POLICY_RENDERED" \
+  || vf_die "nft refused the rendered policy; NOTHING was installed"
+
+# ── 4. Record runtime verification material ────────────────────────────────
+#
+# Under /run, never under /etc and never in Git. These are facts about one
+# running namespace, regenerated by this trusted path on every start; a
+# committed fingerprint would be a stale claim about a machine that no longer
+# exists, and an /etc copy would outlive the namespace it describes.
+vf_canonical_ruleset "$PID" | vf_sha256 > "$VF_POLICY_FINGERPRINT"
+chmod 0400 "$VF_POLICY_FINGERPRINT"
+
+capture_routes
+
+# ── 5. Verify, or fail ─────────────────────────────────────────────────────
+"$VERIFY" || vf_die "policy verification FAILED immediately after install.
+The namespace is left as-is for inspection; the Worker will not start."
+
+echo "$VF_PROG: policy installed and verified (netns pid=$PID, $(printf '%s' "$RESOLVERS" | grep -c .) designated resolver(s))"

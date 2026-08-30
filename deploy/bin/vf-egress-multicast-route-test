@@ -1,0 +1,420 @@
+#!/bin/bash
+# ACCEPTANCE TOOLING ONLY — multicast deny attribution.
+# (SAFE-EGRESS-MULTICAST-ATTRIBUTION-001)
+#
+# ############################################################################
+# #                                                                          #
+# #  THIS SCRIPT IS NOT PART OF THE PRODUCTION STARTUP PATH.                  #
+# #                                                                          #
+# #  No systemd unit references it, nothing execs it, and it refuses to run   #
+# #  without an explicit acknowledgement flag. It STOPS the Worker, mutates   #
+# #  namespace routing, and must only ever be run by a human performing       #
+# #  Phase-9 acceptance.                                                      #
+# #                                                                          #
+# ############################################################################
+#
+# THE PROBLEM IT SOLVES
+#
+# In the prototype acceptance run, IPv4 224.0.0.0/4 and IPv6 ff00::/8 were
+# unreachable because the namespace had NO ROUTE to them. The connection failed
+# before netfilter's output hook was consulted, and the deny counters did not
+# move. "It failed" is not evidence: a destination denied by absence of a route
+# looks exactly like one denied by policy, and only one of those survives a
+# routing change.
+#
+# ── CORRECTION 01: WHY THIS QUIESCES INSTEAD OF RE-BASELINING ──────────────
+#
+# The first implementation added routes and THEN re-baselined the route
+# fingerprint, while the production watchdog was still running. That was a
+# race, not a design:
+#
+#     helper                         watchdog
+#     ip route add ...
+#             ── route event ──────>
+#                                    verify -> routes != fingerprint
+#                                    BREACH: stop Worker, exit nonzero
+#     re-baseline routes             (too late)
+#
+# Whether acceptance worked depended on process scheduling. Worse, the fix
+# direction it implied — teaching the watchdog or verifier to tolerate an
+# "expected" route delta — would have put a bypass inside the production
+# boundary, where it would be live every second of every day for the sake of a
+# measurement taken once.
+#
+# So there is NO BYPASS. The verifier and the watchdog are completely unchanged
+# and have no acceptance mode, no allowance and no exemption. Instead the
+# production Worker and watchdog are deliberately STOPPED through systemd for
+# the duration of the measurement, and restarted only after the boundary has
+# been verified intact again. Nothing observes the route table while it is
+# knowingly modified, because nothing is running that should.
+#
+# Two consequences worth stating plainly:
+#
+#   * The route fingerprint is NEVER re-baselined here. It keeps describing the
+#     clean namespace throughout, so the final verification is a real check
+#     against the original recorded state rather than against something this
+#     script wrote. `vf-egress-policy-install --routes-baseline-only` was
+#     removed outright.
+#
+#   * The Worker is not running during the window, so it cannot be "running
+#     unmonitored". The failure direction is an outage, never an unenforced
+#     boundary.
+#
+# Usage:
+#   vf-egress-multicast-route-test --phase9-acceptance [--full-range] [--no-probe]
+#
+# Exit 0 means: routes installed, probes run, counters reported, routes removed,
+# route state proven byte-identical to before, boundary re-verified, and the
+# Worker/watchdog returned to the state they were found in.
+
+set -uo pipefail
+VF_PROG=vf-egress-multicast-route-test
+
+LIB="${VF_EGRESS_LIB:-/usr/local/lib/videofetch/vf-egress-lib.sh}"
+# shellcheck source=vf-egress-lib.sh
+. "$LIB"
+
+VERIFY="${VF_EGRESS_VERIFY:-/usr/local/sbin/vf-egress-policy-verify}"
+SYSTEMCTL="${VF_SYSTEMCTL:-systemctl}"
+WORKER_UNIT="${VF_WORKER_UNIT:-videofetch-worker.service}"
+WATCHDOG_UNIT="${VF_WATCHDOG_UNIT:-videofetch-egress-watchdog.service}"
+
+# The probe runs in a DISPOSABLE container joined to the same network
+# namespace. The Worker image is the default because it is the runtime whose
+# behaviour is actually being characterised; any image with node works.
+PROBE_IMAGE="${VF_MULTICAST_PROBE_IMAGE:-videofetch-worker:latest}"
+
+# Narrow single-host test destinations INSIDE the denied ranges, not the whole
+# ranges. A /32 and a /128 are enough to make one packet reach the rule.
+V4_TEST="${VF_MULTICAST_V4_TEST:-224.0.2.1/32}"
+V6_TEST="${VF_MULTICAST_V6_TEST:-ff0e::1/128}"
+PROBE_PORT="${VF_MULTICAST_PROBE_PORT:-80}"
+
+ACK=0
+FULL_RANGE=0
+RUN_PROBE=1
+for arg in "$@"; do
+  case "$arg" in
+    --phase9-acceptance) ACK=1 ;;
+    --full-range) FULL_RANGE=1 ;;
+    --no-probe) RUN_PROBE=0 ;;
+    *) vf_die "unknown argument '$arg'" ;;
+  esac
+done
+
+if [ "$FULL_RANGE" -eq 1 ]; then
+  V4_TEST=224.0.0.0/4
+  V6_TEST=ff00::/8
+fi
+
+# ── Refuse to run implicitly ───────────────────────────────────────────────
+if [ "$ACK" -ne 1 ]; then
+  cat >&2 <<'USAGE'
+vf-egress-multicast-route-test: refusing to run.
+
+This is Phase-9 ACCEPTANCE tooling. It STOPS the production Worker and the
+egress watchdog, temporarily mutates the media namespace's route table, and
+restarts them only after the boundary verifies again. It must never run as
+part of normal operation.
+
+Re-run with --phase9-acceptance if that is genuinely what you are doing.
+USAGE
+  exit 2
+fi
+
+[ "$(id -u)" -eq 0 ] || vf_die "must run as root: this stops systemd units and
+installs routes into the media namespace"
+
+vf_config_load
+
+# ── Refuse to run outside the expected media namespace ─────────────────────
+#
+# Two independent checks. The container name alone is not enough: a namespace
+# that happens to carry that name but is NOT the enforced media namespace must
+# not be mutated, so the presence of the production policy is required too.
+PID="$(vf_netns_pid)" || vf_die "media namespace holder '$VF_NETNS_CONTAINER' is not running"
+
+vf_in_ns "$PID" "$VF_NFT" list table inet videofetch_egress >/dev/null 2>&1 \
+  || vf_die "namespace pid=$PID carries no 'inet videofetch_egress' table.
+This is not the enforced media namespace; refusing to touch its routes."
+
+"$VERIFY" >/dev/null 2>&1 \
+  || vf_die "the safe-egress boundary does not currently verify.
+Refusing to measure a namespace whose policy is already in an unknown state —
+fix the boundary first, then measure it."
+
+# ── State machine ──────────────────────────────────────────────────────────
+#
+# cleanup() keys off this, so an interrupt at ANY point unwinds exactly what
+# has actually happened so far and nothing else.
+#
+#   pristine  nothing changed
+#   quiesced  Worker and watchdog stopped; route state recorded
+#   mutated   test routes installed
+STATE=pristine
+INTERRUPTED=0
+WORKER_WAS=inactive
+WATCHDOG_WAS=inactive
+ADDED_V4=0
+ADDED_V6=0
+BEFORE=""
+AFTER=""
+
+unit_is_active() { "$SYSTEMCTL" is-active --quiet "$1" 2>/dev/null; }
+
+snapshot_routes() {
+  {
+    echo "### ipv4"; vf_in_ns "$PID" "$VF_IP" -4 route show 2>/dev/null | sort
+    echo "### ipv6"; vf_in_ns "$PID" "$VF_IP" -6 route show 2>/dev/null | sort
+  } | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | grep -v '^$'
+}
+
+# SIGINT/SIGTERM handler, deliberately SEPARATE from cleanup().
+#
+# A trap does not see 130 in $?; it sees the status of whatever command was
+# running when the signal arrived, which for an interrupted probe is 0. Running
+# cleanup() directly from the signal trap would therefore treat a Ctrl-C as a
+# clean finish — restarting production and exiting 0, while the operator who
+# pressed Ctrl-C believes they stopped it. Recording the interrupt and exiting
+# non-zero hands cleanup() an honest status.
+#
+# (bash still defers the trap until the running foreground command returns, so
+# an interrupt lands after the in-flight probe completes. That is a bash
+# property, not a choice; the delay is bounded by the probe timeout.)
+on_signal() {
+  INTERRUPTED=1
+  echo "$VF_PROG: interrupted - unwinding" >&2
+  exit 130
+}
+
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+  [ "$INTERRUPTED" -eq 1 ] && [ "$rc" -eq 0 ] && rc=130
+
+  if [ "$STATE" = pristine ]; then
+    # Nothing was stopped and nothing was mutated.
+    exit "$rc"
+  fi
+
+  echo "$VF_PROG: --- cleanup ---"
+
+  if [ "$STATE" = mutated ]; then
+    [ "$ADDED_V4" -eq 1 ] && vf_in_ns "$PID" "$VF_IP" -4 route del "$V4_TEST" dev "$DEV" 2>/dev/null
+    [ "$ADDED_V6" -eq 1 ] && vf_in_ns "$PID" "$VF_IP" -6 route del "$V6_TEST" dev "$DEV" 2>/dev/null
+  fi
+
+  # The route table must be EXACTLY what it was. Not "close enough": the
+  # fingerprint the verifier is about to check was never re-baselined, so any
+  # residue fails verification anyway — this just names the cause.
+  local now
+  now="$(snapshot_routes)"
+  if [ "$now" != "$BEFORE" ]; then
+    echo "$VF_PROG: ERROR: route table did NOT return to its original state." >&2
+    diff <(printf '%s\n' "$BEFORE") <(printf '%s\n' "$now") >&2 || true
+    rc=1
+  else
+    echo "$VF_PROG: route table restored exactly"
+  fi
+
+  # Verify the WHOLE boundary against the untouched fingerprints.
+  local boundary_ok=1
+  if "$VERIFY"; then
+    echo "$VF_PROG: boundary verified after cleanup"
+  else
+    echo "$VF_PROG: ERROR: boundary does NOT verify after cleanup." >&2
+    boundary_ok=0
+    rc=1
+  fi
+
+  # FAIL CLOSED: restart nothing unless the run completed AND the boundary is
+  # provably intact. Restarting a Worker into an unverified boundary is the one
+  # outcome this whole design exists to prevent, and an acceptance script is not
+  # an exception to it. An INTERRUPTED run also leaves them stopped: the
+  # operator asked it to stop, and resuming production is their call, not this
+  # script's.
+  if [ "$rc" -eq 0 ]; then
+    if [ "$WATCHDOG_WAS" = active ]; then
+      echo "$VF_PROG: restarting $WATCHDOG_UNIT"
+      "$SYSTEMCTL" start "$WATCHDOG_UNIT" || { echo "$VF_PROG: ERROR: watchdog did not restart" >&2; rc=1; }
+    fi
+    if [ "$rc" -eq 0 ] && [ "$WORKER_WAS" = active ]; then
+      echo "$VF_PROG: restarting $WORKER_UNIT"
+      "$SYSTEMCTL" start "$WORKER_UNIT" || { echo "$VF_PROG: ERROR: Worker did not restart" >&2; rc=1; }
+    fi
+  elif [ "$boundary_ok" -eq 1 ]; then
+    cat >&2 <<WARN
+
+$VF_PROG: run did not complete cleanly (exit $rc), so $WORKER_UNIT and
+$WATCHDOG_UNIT are LEFT STOPPED.
+
+The boundary itself verifies and the route table was restored — nothing is
+broken. Resuming production is a deliberate operator action:
+
+  systemctl start $WATCHDOG_UNIT
+  systemctl start $WORKER_UNIT
+WARN
+  else
+    cat >&2 <<WARN
+
+$VF_PROG: LEAVING $WORKER_UNIT AND $WATCHDOG_UNIT STOPPED.
+
+Cleanup did not end in a verified boundary, so nothing is restarted. Inspect
+with vf-egress-policy-verify, re-establish the namespace through its units,
+and start the Worker only once verification passes.
+WARN
+  fi
+
+  [ "$rc" -eq 0 ] && echo "$VF_PROG: OK - nothing left behind"
+  exit "$rc"
+}
+
+# Installed BEFORE anything is stopped or mutated, so every path unwinds.
+trap cleanup EXIT
+trap on_signal INT TERM
+
+# ── 1. Quiesce the production boundary ─────────────────────────────────────
+#
+# The Worker first, then the watchdog. Stopping the watchdog would stop the
+# Worker anyway through BindsTo=, but doing it explicitly makes the intent
+# auditable and does not rely on propagation ordering.
+unit_is_active "$WORKER_UNIT"   && WORKER_WAS=active
+unit_is_active "$WATCHDOG_UNIT" && WATCHDOG_WAS=active
+STATE=quiesced
+
+echo "$VF_PROG: found $WORKER_UNIT=$WORKER_WAS $WATCHDOG_UNIT=$WATCHDOG_WAS"
+
+if [ "$WORKER_WAS" = active ]; then
+  echo "$VF_PROG: stopping $WORKER_UNIT for the measurement window"
+  "$SYSTEMCTL" stop "$WORKER_UNIT" || vf_die "could not stop $WORKER_UNIT"
+fi
+if [ "$WATCHDOG_WAS" = active ]; then
+  echo "$VF_PROG: stopping $WATCHDOG_UNIT for the measurement window"
+  "$SYSTEMCTL" stop "$WATCHDOG_UNIT" || vf_die "could not stop $WATCHDOG_UNIT"
+fi
+
+# Assert, do not assume. If either is somehow still up, the race we are
+# eliminating is still live, so stop here rather than mutate anything.
+unit_is_active "$WORKER_UNIT" \
+  && vf_die "$WORKER_UNIT is still active; refusing to mutate routes beneath a running Worker"
+unit_is_active "$WATCHDOG_UNIT" \
+  && vf_die "$WATCHDOG_UNIT is still active; refusing to mutate routes beneath a running watchdog"
+
+BEFORE="$(snapshot_routes)"
+[ -n "$BEFORE" ] || vf_die "namespace route table read back empty"
+echo "$VF_PROG: recorded pre-test route state ($(printf '%s\n' "$BEFORE" | grep -c .) lines)"
+
+# The egress interface is DERIVED, never hard-coded: neither the Lima-assigned
+# container address, nor Docker's bridge subnet, nor an interface name that can
+# change between reboots may be baked in.
+DEV="$(vf_in_ns "$PID" "$VF_IP" -4 route show default 2>/dev/null \
+  | awk '/ dev /{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')"
+[ -n "$DEV" ] || vf_die "cannot derive the namespace's egress interface from its default route"
+
+# ── 2. Install the minimal temporary routes ────────────────────────────────
+echo "$VF_PROG: adding temporary test route $V4_TEST dev $DEV"
+if vf_in_ns "$PID" "$VF_IP" -4 route add "$V4_TEST" dev "$DEV" 2>/dev/null; then
+  ADDED_V4=1
+  STATE=mutated
+else
+  echo "$VF_PROG: WARNING: could not add the IPv4 test route" >&2
+fi
+
+echo "$VF_PROG: adding temporary test route $V6_TEST dev $DEV"
+if vf_in_ns "$PID" "$VF_IP" -6 route add "$V6_TEST" dev "$DEV" 2>/dev/null; then
+  ADDED_V6=1
+  STATE=mutated
+else
+  echo "$VF_PROG: WARNING: could not add the IPv6 test route (IPv6 disabled here?)" >&2
+fi
+
+[ "$STATE" = mutated ] || vf_die "no test route could be installed; there is nothing to attribute"
+
+# ── 3. Prove the delta is EXACTLY the intended multicast routes ────────────
+#
+# Even with nothing watching, this script does not get to make arbitrary
+# changes. If anything else moved — a route we did not add, or one that
+# vanished — that is not our measurement window any more, so abort and unwind.
+AFTER="$(snapshot_routes)"
+
+REMOVED="$(comm -23 <(printf '%s\n' "$BEFORE" | sort) <(printf '%s\n' "$AFTER" | sort))"
+[ -z "$REMOVED" ] || vf_die "routes DISAPPEARED during the measurement window:
+$REMOVED"
+
+ADDED_LINES="$(comm -13 <(printf '%s\n' "$BEFORE" | sort) <(printf '%s\n' "$AFTER" | sort))"
+
+v4_bare="$(vf_strip_host_prefix "$V4_TEST")"
+v6_bare="$(vf_strip_host_prefix "$V6_TEST")"
+while IFS= read -r added; do
+  [ -n "$added" ] || continue
+  dest="${added%% *}"
+  case "$dest" in
+    "$V4_TEST"|"$v4_bare"|"$V6_TEST"|"$v6_bare") ;;
+    *) vf_die "UNEXPECTED route appeared during the measurement window: $added
+Only the intended multicast test destinations are permitted here." ;;
+  esac
+done <<< "$ADDED_LINES"
+
+echo "$VF_PROG: route delta is exactly the intended multicast test route(s)"
+
+# The firewall itself must be untouched. Belt and braces: nothing in this
+# script writes nftables, and this proves it rather than asserting it.
+NFT_NOW="$(vf_canonical_ruleset "$PID" | vf_sha256)"
+NFT_WANT="$(cat "$VF_POLICY_FINGERPRINT" 2>/dev/null || echo missing)"
+[ "$NFT_NOW" = "$NFT_WANT" ] \
+  || vf_die "the nftables ruleset changed during the measurement window; aborting"
+
+# ── 4. Measure ─────────────────────────────────────────────────────────────
+#
+# A disposable, unprivileged container joined to the SAME namespace. No
+# NET_ADMIN, no SYS_ADMIN, no privileged mode, no host networking, no Docker
+# socket, no volume, read-only, non-root — it can emit a packet and nothing
+# else.
+PROBE_JS='const net=require("node:net");const s=new net.Socket();s.setTimeout(4000);
+const d=v=>{try{s.destroy()}catch(e){};console.log(v);process.exit(0)};
+s.once("connect",()=>d("*** CONNECTED ***"));
+s.once("timeout",()=>d("DENIED(timeout)"));
+s.once("error",e=>d("DENIED("+(e.code||e.message)+")"));
+s.connect({host:process.argv[1],port:Number(process.argv[2])});'
+
+probe() {
+  "$VF_DOCKER" run --rm \
+    --network "container:$VF_NETNS_CONTAINER" \
+    --cap-drop=ALL \
+    --security-opt no-new-privileges \
+    --read-only \
+    --user 65534:65534 \
+    "$PROBE_IMAGE" node -e "$PROBE_JS" "$1" "$2" 2>&1 | tail -1
+}
+
+report_probe() {
+  local label="$1" dest="$2" rule="$3" before after verdict
+  before="$(vf_rule_counter "$PID" "$rule")"
+  verdict="$(probe "$dest" "$PROBE_PORT")"
+  after="$(vf_rule_counter "$PID" "$rule")"
+  : "${before:=0}" "${after:=0}"
+  printf '%s  %-22s -> %-24s %s +%s\n' "$label" "$dest:$PROBE_PORT" "$verdict" "$rule" "$((after - before))"
+  if [ "$((after - before))" -le 0 ]; then
+    echo "$VF_PROG: NOTE: $rule did not increment - the denial is NOT yet attributable" >&2
+    return 1
+  fi
+  return 0
+}
+
+PROBE_RC=0
+if [ "$RUN_PROBE" -eq 1 ]; then
+  echo
+  echo "$VF_PROG: probing from a disposable container in netns pid=$PID"
+  [ "$ADDED_V4" -eq 1 ] && { report_probe "v4" "$v4_bare" deny-v4 || PROBE_RC=1; }
+  [ "$ADDED_V6" -eq 1 ] && { report_probe "v6" "$v6_bare" deny-v6 || PROBE_RC=1; }
+  echo
+  echo "$VF_PROG: a denial with a FLAT counter still means 'no route', not 'policy'."
+  echo "$VF_PROG: this run is evidence for Phase 9; it does not close the gate."
+else
+  echo "$VF_PROG: --no-probe: routes installed, no probe run"
+fi
+
+# cleanup() runs from the EXIT trap: it removes the routes, proves the route
+# table is byte-identical to BEFORE, re-verifies the whole boundary, and only
+# then restarts the watchdog and Worker.
+exit "$PROBE_RC"

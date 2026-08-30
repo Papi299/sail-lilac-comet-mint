@@ -1,0 +1,70 @@
+#!/bin/bash
+# Fail-closed validator for the non-secret safe-egress deployment
+# configuration (PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001).
+#
+# Run as ExecStartPre of videofetch-media-netns.service, and again by the
+# policy installer. Its whole job is to make a missing, empty or ambiguous
+# resolver declaration STOP the deployment, rather than let it start with the
+# host's default resolver and an egress policy that does not admit it.
+#
+# The recovered prototype hard-coded 172.17.0.1 — the Docker bridge address on
+# one particular VM at one particular moment. That address is not a universal
+# constant and is not committed here; it is deployment configuration.
+#
+# Usage:  vf-egress-config-check [--quiet]
+#
+# Exit 0 only if every value is present and valid.
+
+set -euo pipefail
+VF_PROG=vf-egress-config-check
+
+LIB="${VF_EGRESS_LIB:-/usr/local/lib/videofetch/vf-egress-lib.sh}"
+# shellcheck source=vf-egress-lib.sh
+. "$LIB"
+
+QUIET=0
+[ "${1-}" = "--quiet" ] && QUIET=1
+
+say() { [ "$QUIET" -eq 1 ] || echo "$VF_PROG: $*"; }
+
+vf_config_load
+
+# ── Worker loopback ingress port ───────────────────────────────────────────
+if ! vf_validate_port "${VIDEOFETCH_WORKER_PORT-}"; then
+  vf_die "VIDEOFETCH_WORKER_PORT='${VIDEOFETCH_WORKER_PORT-}' is not a port in 1-65535.
+The namespace holder publishes this port on VM loopback ONLY. There is no
+default: guessing one would publish an unintended port."
+fi
+
+# ── Designated DNS resolver(s) ─────────────────────────────────────────────
+#
+# vf_dns_resolvers rejects prefixes, zone ids and anything that is not an
+# exact address, so a broad private-range exception cannot be smuggled in as
+# a "resolver".
+RESOLVERS="$(vf_dns_resolvers)" || vf_die "designated DNS resolver configuration is invalid.
+Set VIDEOFETCH_MEDIA_DNS_FLAGS to one or more '--dns <exact-address>' pairs in
+$VF_CONFIG_FILE. Broad ranges are refused by design: safe-egress.md permits an
+exception for an exact resolver address, never for a private network."
+
+COUNT="$(printf '%s\n' "$RESOLVERS" | grep -c .)"
+
+say "port                : $VIDEOFETCH_WORKER_PORT (published on VM loopback only)"
+say "designated resolvers: $COUNT"
+printf '%s\n' "$RESOLVERS" | while IFS= read -r r; do
+  say "  - $r  (exact address; UDP/TCP 53 only)"
+done
+
+# A resolver inside a denied class is legitimate and expected — the Lima
+# prototype's resolver was the 172.17.0.0/16 bridge gateway. It is admitted by
+# its own exact-address rule, which sits ABOVE the deny rules; the surrounding
+# class stays denied. Say so out loud rather than let it look like an oversight.
+printf '%s\n' "$RESOLVERS" | while IFS= read -r r; do
+  case "$r" in
+    10.*|127.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|100.6[4-9].*|100.[7-9][0-9].*|100.1[0-2][0-9].*)
+      say "note: $r is inside a denied class; it is admitted at that EXACT address"
+      say "      and port 53 only. The class itself remains denied."
+      ;;
+  esac
+done
+
+say "OK"
