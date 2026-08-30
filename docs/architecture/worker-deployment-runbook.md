@@ -30,9 +30,16 @@ Precisely:
 - The safe-egress boundary was accepted **in situ**: every forbidden destination
   class was denied, denials were attributed to named nftables rule counters, and
   permitted public traffic succeeded. See §11a.
-- Phase 9 acceptance is a **local-deployment** result. It does not by itself
-  assert anything about production R2 placement, Vercel environments or DNS,
-  which are tracked by their own gates in §11 and were deliberately untouched.
+- Phase 9 acceptance is a **local-deployment** result covering the safe-egress
+  boundary. It does not by itself assert anything about the ingress path, Vercel
+  environments or DNS operability, which are tracked by their own gates in §11.
+- **Production name resolution is currently unavailable.** The Phase-9 DNS cases
+  passed against an acceptance-owned resolver that was removed during cleanup,
+  and nothing listens at the configured designated resolver in normal operation.
+  This is a functional readiness gap, **not** a safe-egress bypass — the boundary
+  is intact and still admits exactly that one address on port 53. Tracked as
+  `PRODUCTION-DNS-RESOLVER-001`; it blocks end-to-end media validation and
+  Phase 10 until resolved. See §11b.
 - **Phase 10 is NOT BEGUN.** `YTDLP_NETWORK_ISOLATED` remains `false` and yt-dlp
   remains absent. Phase 9 passing is a prerequisite for Phase 10, not entry to
   it.
@@ -207,8 +214,9 @@ That result is **evidence about the enforcement model, not an acceptance**:
 
 - `YTDLP_NETWORK_ISOLATED` remains **`false`**, and the runtime still refuses to
   start if it parses truthy. §4 is unchanged.
-- Formal Phase 9 **was re-run against the exact final topology** on 2026-08-30,
-  including the ingress path in §1a, and PASSED. See §11a.
+- Formal Phase 9 **was re-run against the exact final topology** on 2026-08-30
+  and PASSED. See §11a. Its scope was the Worker **safe-egress** boundary; it did
+  not remeasure the ingress path (§1a), which was left unchanged throughout.
 - Phase 10 remains the only phase authorized to enable yt-dlp, and it has not
   begun.
 
@@ -1056,14 +1064,15 @@ authorization.
 | Id | Status | Notes |
 | :--- | :--- | :--- |
 | `R2-CREDENTIAL-SCOPE-DECISION-001` | **RESOLVED / CLOSED — Option B** | The Product Owner selected Option B: renewable, action-scoped temporary credentials. Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001` — the media Worker holds no persistent R2 credential, a trusted host broker outside the media namespace retains the single-bucket parent writer credential, and each operation receives a credential scoped to one bucket, one exact `WorkerObjectKey` and one S3 action with a bounded TTL, expressed as an action-only JWT claim set (corrected by `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001`; see §5b). No **production** R2 bucket, token or lifecycle rule has been created — only disposable material for the live acceptance, which was torn down once that acceptance passed (§5f). |
-| `R2-BROKER-PARENT-TOKEN-ROTATION-001` | OPEN — non-blocking, provisioning-time | The broker's parent token is still a persistent credential; only its custody changed. Rotating it is a broker-side `EnvironmentFile` update plus a `systemctl restart videofetch-r2-broker`, which `BindsTo=` will propagate as a brief Worker restart. Define the rotation cadence when the token is actually provisioned. No code change is expected. |
+| `R2-BROKER-PARENT-TOKEN-ROTATION-001` | **CLOSED** | Production R2 and its credential plane were provisioned **before** Phase 9, and the parent token was provisioned and verified with them. Custody is unchanged: the token remains a persistent broker-side credential held in the broker's `EnvironmentFile`, and rotation remains an `EnvironmentFile` update plus `systemctl restart videofetch-r2-broker`, which `BindsTo=` propagates as a brief Worker restart. No code change was required. Phase 9 did not exercise or modify R2 in any way; the broker ran untouched throughout with `NRestarts=0`. No account identifier, bucket name, token or secret value is recorded here. |
 | `R2-BROKER-LIVE-MINT-VERIFICATION-001` | **CLOSED — accepted** | **Initial failure → correction → definitive acceptance → teardown.** *First attempt, FAILED:* real R2 was reached and rejected the then-merged `scope + actions` credential at token **parsing** — `HTTP 400 InvalidArgument` on `X-Amz-Security-Token`, before any authorization decision — so the production path failed closed rather than over-granting; diagnostic action-only credentials were accepted and showed the intended enforcement, and expiration went unmeasured. *Correction:* `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001` (PR #21) changed **production** credentials to action-only claims (see §5b). *Definitive rerun, PASSED:* run against this repository's merged production implementation — the merged `mintTemporaryCredential` signer, the merged `CloudflareR2ObjectStoreWriter` for Put/Head/Delete, repository-generated `WorkerObjectKey` values, all three temporary-credential fields on every delegated request, **no parent-credential fallback** (a raw AWS SDK client was used only for `GetObject`/`ListObjectsV2`, which the production writer deliberately omits). The **full matrix passed**: under its own credential, exact-key `PutObject`, `HeadObject` and `DeleteObject` each **succeeded**, while every **cross-action** attempt, every **sibling-object** attempt and **`ListObjectsV2`** were **denied by R2** — provider-side authorization denials, not local or network failures. Denied sibling writes and deletes left the sibling untouched, the sibling genuinely existed during the head and delete sibling tests (no missing-object ambiguity), the delete negatives ran while the exact object still existed, and no post-delete 404 was used as denial evidence. **Natural expiration was enforced** on real wall-clock time (§5b) — a 1-second production credential replayed at `exp + 30s` was denied and created nothing, the observed expired-credential response in this acceptance being `403 SignatureDoesNotMatch` rather than a dedicated expiry code; because that response is not expiry-specific, the result was isolated by before/after acceptance of equivalent 1-second credentials for both `HeadObject` and `PutObject`. *Cleanup:* all task-owned objects were removed with fresh exact-key `DeleteObject` credentials and a read-only parent check reported 0 objects at the job prefix, 0 at the `videofetch` prefix and 0 bucket-wide. *Teardown (operator-attested, not independently re-verified):* disposable parent token revoked, disposable bucket confirmed empty and deleted, local acceptance credential file removed (§5f). **This gate therefore no longer blocks production R2 traffic.** Closure means only that the merged temporary-credential model passed live-provider acceptance — it does **not** mean production R2 is provisioned (§5e/§10 remain unchecked), that `R2-BROKER-PARENT-TOKEN-ROTATION-001` is resolved, that Phase 9 or Phase 10 progressed, or that yt-dlp may be enabled. |
 | `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **CLOSED — accepted** | Empirically measured and accepted against the real Cloudflare Access Service Auth configuration; the gate is no longer blocking and is not reopened here. Scope note, unchanged: this is an acceptance of the measured INGRESS path, not a source-level property. This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it — that part is still asserted by the control-plane boundary suite. Any change to the ingress topology invalidates the acceptance and requires a re-measurement. |
 | `PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001` | **Source recovery complete; NOT a deployment or an acceptance** | The prototype's enforcement model was recovered from the Lima VM into reviewed source under `deploy/` and reconciled with the trusted-broker architecture (§3a). At the time of recovery the live VM was **not modified**, so prototype and reconciled source stayed comparable. No secret was copied: the only credential-shaped material encountered was clearly-labelled `FAKE_PROTOTYPE_*` placeholders in the stale prototype Worker unit, which is intentionally not recovered. **Superseded by deployment:** the reconciled artefacts have since been installed as the Phase-8B final stack, the prototype units are present but disabled and inactive, and Phase 9 acceptance PASSED against that live topology on 2026-08-30 — see §11a. |
 | `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001` | **CLOSED — accepted 2026-08-30** | The COMPLETE acceptance suite was re-run against the live final topology with the operator's NordVPN client **actively connected** using their normal configuration (features left exactly as configured; none were enabled or disabled for the test). Connection was confirmed independently: the macOS default route moved to the NordLynx `utun` interface and the primary resolver changed with it. The VM's own routing was unaffected — Lima's `vz` NAT insulates the guest, so the media namespace's route fingerprint was byte-identical throughout and the watchdog recorded no breach. Under VPN the verifier passed **50/50** consecutive runs, and the whole matrix reproduced the disconnected-state result: every forbidden destination denied, counters attributed, designated DNS working, non-designated DNS dropped, rebinding and the controlled redirect contained, public HTTP/HTTPS succeeding, descendants confined, mutation refused, and the multicast measurement repeated. The operator's original (disconnected) state was restored and re-verified afterwards. See §11a. |
 | `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | **CLOSED — accepted 2026-08-30** | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Every other range was counter-attributed. `deploy/bin/vf-egress-multicast-route-test` now installs a minimal temporary route so those destinations reach the enforcement point and the denial can be attributed to the rule's own counter. It is acceptance-only: no unit references it, it refuses to run without `--phase9-acceptance` and root, it refuses to run outside a namespace carrying the `inet videofetch_egress` table, and it never touches nftables. **Corrected in Correction 01:** the first implementation mutated routes and only then re-baselined the route fingerprint, while the watchdog was still subscribed to route events — a race whose outcome depended on scheduling. The helper now *quiesces* the boundary instead (stop Worker → stop watchdog → assert both stopped → mutate → measure → unwind → re-verify → restart), re-baselines nothing, and bounds the permitted route delta to exactly the intended multicast destinations. No bypass was added to the verifier or watchdog. See §3d. **Executed against the live VM in Phase 9**, disconnected and again under NordVPN. The helper behaved exactly as designed — quiesce, install only the intended narrow routes, probe, unwind, restore byte-for-byte, re-verify — but its TCP probe left `deny-v4`/`deny-v6` flat in every run, and it correctly refused to call that attribution. The cause was isolated with a control experiment in a throwaway namespace carrying a valid route to the same destinations and **no firewall whatsoever**: TCP `connect()` to a multicast address still returned `ENETUNREACH` there, so the Linux socket layer rejects multicast TCP before netfilter's output hook is consulted, and no TCP probe can ever attribute it. UDP to the same destinations does emit a packet. Repeating the helper's exact discipline with a UDP probe moved **`deny-v4` +1 and `deny-v6` +1**, with the route delta bounded to the intended destinations, the policy fingerprint unchanged during the window, the route table restored exactly and the boundary re-verified. Multicast is therefore denied **by the rule**, and the flat TCP counter is a kernel property rather than a gap in this boundary. No bypass was added to the verifier or the watchdog. |
 | `SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001` | **CLOSED — accepted 2026-08-30** | The prototype verifier fingerprinted the `nftables` ruleset but not the namespace **route table**. Non-blocking, as before: destination denial was proven to survive route injection, and a route cannot defeat a destination-address deny. Source hardening is now merged — see §3b — combining a baseline-free semantic invariant over policy-routing rules with a runtime route/rule fingerprint captured by the trusted install path and stored under `/run`. The watchdog additionally subscribes to route and link netlink events. **Verified in situ during Phase 9 on 2026-08-30.** The installed verifier hash-matches the `origin/main` blob exactly, and it ran against the real namespace on the real VM throughout acceptance — including 50 consecutive executions under NordVPN, all passing, and repeated runs across the multicast quiesce/mutate/restore windows. It reported identical policy and route fingerprints on every invocation, correctly refused nothing that was intact, and the deliberate route mutations it is meant to catch were caught by the helper's own comparison before the verifier was consulted. The gate is closed. |
-| `NPM-LOCKFILE-RECONCILIATION-001` | OPEN — non-blocking for Phase 8A | `package-lock.json` carries a pre-existing devDependency resolution (`nitro` → `unstorage` requires `lru-cache@^11`, the lock pins `5.1.1`) that npm 10 rejects and npm 11 accepts. The Worker image works around it with an exact-pinned ephemeral npm 11 running `ci`; no `npm install` is used and the lockfile is unmodified. Repository maintenance should reconcile it separately. |
+| `PRODUCTION-DNS-RESOLVER-001` | **OPEN — production readiness** | The media namespace is configured to use the designated resolver `172.17.0.1:53`, the holder is created with that `--dns` flag, the namespace `resolv.conf` names it and the rendered policy admits exactly it on UDP and TCP 53 — but **no process listens there in normal operation**. The resolver that satisfied the Phase-9 DNS cases was owned by the acceptance and removed during its cleanup, as intended. Consequently ordinary Worker hostname resolution fails (`getaddrinfo` → `EAI_AGAIN`, direct queries → `ECONNREFUSED`) while direct connections to public IP addresses continue to work, so the fault is isolated to name resolution. Confirmed on a fresh VM boot with all six units active, the Worker reporting healthy and the verifier passing — which is itself the defect: the stack reports operational while its configured resolver is absent. **This is not a safe-egress bypass**; the boundary is intact and no rule is broadened by it. It blocks end-to-end media validation and Phase 10 until a durable resolver and an explicit readiness relationship exist. |
+| `NPM-LOCKFILE-RECONCILIATION-001` | **CLOSED** | `package-lock.json` carries a pre-existing devDependency resolution (`nitro` → `unstorage` requires `lru-cache@^11`, the lock pins `5.1.1`) that npm 10 rejects and npm 11 accepts. The Worker image works around it with an exact-pinned ephemeral npm 11 running `ci`; no `npm install` is used and the lockfile is unmodified. Repository maintenance should reconcile it separately. **Resolved and merged** in PR #24 (merge commit `7009550d5573dc5b7d3b7eda7efaf20120a1c22f`). |
 
 ---
 
@@ -1135,7 +1144,7 @@ non-designated DNS probe `deny-v4` stayed **flat** while `fallthrough-drop`
 moved, confirming the counters discriminate between rules rather than simply
 tracking activity.
 
-DNS policy behaved as specified. The designated resolver resolved; a real,
+DNS **policy** behaved as specified. The designated resolver resolved; a real,
 working public resolver (`9.9.9.9`, verified functional from the VM host) was
 denied from inside the namespace. A public name answered with a private address
 resolved but could not be connected to; the same held for a loopback answer. In
@@ -1143,16 +1152,31 @@ the rebinding case the first answer was public and behaved as public, and the
 subsequent forbidden answer was denied — at TTL 0, so no cache masked the
 change.
 
+**What the designated-DNS result does and does not say.** Those cases passed
+against a resolver the acceptance itself supplied at `172.17.0.1:53`, which was
+**intentionally removed during cleanup**. They demonstrate that the *policy*
+admits exactly that address on port 53 and denies every other resolver — which
+is what Phase 9 set out to prove. They do **not** demonstrate that production
+name resolution works, and it currently does not: see §11b.
+
 ### Multicast
 
 Recorded in full in the `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` row above. In
-short: the committed helper works correctly, but its TCP probe can never
-attribute multicast, because the Linux socket layer rejects TCP `connect()` to a
-multicast address before netfilter is consulted — demonstrated by a control
-experiment in a namespace with a valid route and **no firewall at all**, where
-the same `ENETUNREACH` appeared. A UDP probe under the helper's identical
-discipline moved `deny-v4` and `deny-v6`, establishing that multicast is denied
-by the rule.
+short: the committed helper's lifecycle works correctly, but its TCP probe can
+never attribute multicast, because the Linux socket layer rejects TCP
+`connect()` to a multicast address before netfilter is consulted — demonstrated
+by a control experiment in a namespace with a valid route and **no firewall at
+all**, where the same `ENETUNREACH` appeared.
+
+To be precise about provenance: **the committed helper did not produce the
+successful measurement.** In every run of the shipped helper the counters stayed
+flat and it correctly declined to call that attribution. The accepted evidence
+came from a separate UDP probe run under the helper's identical
+quiesce/mutate/restore discipline, which moved `deny-v4` and `deny-v6` and
+established that multicast is denied by the rule. Correcting the committed
+helper to emit UDP — so that this measurement becomes reproducible from
+repository tooling rather than from a one-off probe — is tracked separately and
+is **not** part of this acceptance record.
 
 ### Containment and mutation incapability
 
@@ -1196,9 +1220,20 @@ independently corroborated the operator's report of Connected and Disconnected.
 
 Resting on operator action, not on independent verification: that NordVPN was
 connected using the operator's normal configuration with no feature changed for
-the test. Out of scope and untested here: production R2 provisioning, Vercel
-environments, Cloudflare Access and DNS — none of which were modified. Their
-gates are unchanged by this run.
+the test.
+
+**Ingress was not remeasured.** Phase 9 ran against the final Worker
+**safe-egress** topology. The existing named Tunnel and its configuration were
+unchanged throughout — `vf-cloudflared` kept `NRestarts=0`, was never restarted,
+and both files under `/etc/cloudflared` were byte-identical before and after. The
+previously accepted `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` evidence
+**remains valid and was not remeasured**; Phase 9 neither re-accepted it nor
+depended on re-accepting it.
+
+Out of scope and untouched here: R2 (provisioned before Phase 9 — the broker ran
+untouched with `NRestarts=0` and no R2 request was made by this acceptance),
+Vercel environments, Cloudflare Access and DNS records. Their gates are unchanged
+by this run.
 
 ### Cleanup
 
@@ -1209,3 +1244,44 @@ scratch directory. No temporary route, host alias or test nftables table
 remains, the Worker tmpfs is empty, and the only `cloudflared` process is the
 original production one. The boundary verified and health returned 200 after
 cleanup.
+
+---
+
+## 11b. Production name resolution is currently unavailable
+
+**`PRODUCTION-DNS-RESOLVER-001` — OPEN.** Recorded here so the Phase-9 result is
+not read as evidence that DNS works in production.
+
+Phase 9 proved a property of the **policy**: the boundary admits exactly
+`172.17.0.1` on UDP and TCP port 53 and denies every other resolver, including a
+real working public one. It proved that with a resolver the acceptance itself
+started at that address, and that resolver was **intentionally removed during
+cleanup** along with every other acceptance-owned artefact.
+
+Nothing else ever listened there. The configuration is internally consistent and
+agrees across all four sources — `media-egress.env` (`--dns 172.17.0.1`), the
+holder's `HostConfig.Dns`, the namespace `resolv.conf`, and the rendered
+`designated-dns-udp`/`designated-dns-tcp` rules — but on a fresh boot the VM's
+`systemd-resolved` binds only `127.0.0.53` and `127.0.0.54`, so the designated
+address has no listener.
+
+The observable consequences, confirmed on a fresh boot:
+
+- ordinary Worker hostname resolution fails — `getaddrinfo` returns `EAI_AGAIN`
+  and a direct query to the designated resolver returns `ECONNREFUSED`;
+- direct connections to public **IP addresses** still succeed, including a real
+  HTTPS GET, so the fault is isolated to name resolution rather than egress;
+- all six units report active, the Worker reports healthy and
+  `vf-egress-policy-verify` passes.
+
+That last point is the substance of the gap: **the stack reports fully
+operational while its configured resolver is absent.** No unit expresses a
+dependency on the resolver existing, so a fresh boot cannot distinguish "DNS
+ready" from "DNS never existed".
+
+This is a **functional production-readiness defect, not a safe-egress bypass.**
+The boundary is intact, no rule is broadened, and the Phase-9 acceptance is not
+reopened by it. Any Worker behaviour that depends on resolving a hostname —
+which is to say end-to-end media validation, and therefore Phase 10 — is blocked
+until a durable resolver exists at the designated address and the deployment
+expresses that dependency explicitly.
