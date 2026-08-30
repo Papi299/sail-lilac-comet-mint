@@ -595,7 +595,9 @@ short-lived credential:  1 bucket · 1 exact object key · 1 S3 action
 | Socket permissions | Mode `0660`, broker user and group. The Worker joins the group to `connect(2)`. |
 | Socket directory | Bind-mounted **read-only** into the container, so the Worker cannot unlink, replace or shadow the socket with a listener of its own. |
 | Broker network | **None.** Local signing makes no API call, so the unit sets `PrivateNetwork=yes` and `RestrictAddressFamilies=AF_UNIX`. Verified active on the VM. |
-| Broker Node runtime | **Node >= 22.6**, supplied by the deployment. The distro's packaged Node 18 cannot run `--experimental-strip-types`. |
+| Broker Node runtime | **Node `v22.23.2`**, supplied by the deployment. The distro's packaged Node 18 cannot run `--experimental-strip-types`. |
+| Broker package manager | **npm `11.19.1`**, pinned by `packageManager` in `package.json` and installed explicitly. The npm bundled with Node v22.23.2 is 10.9.8 and **cannot** install this lockfile. See §5g. |
+| Broker install command | `npm ci --omit=dev --ignore-scripts --no-audit --no-fund`. Never `npm install`, never `--legacy-peer-deps`, never `--force`. |
 | `MemoryDenyWriteExecute` | **Not set**, by measurement. With the JIT the broker SIGTRAPs; with `--jitless` the type stripper loses the WebAssembly it needs. See §5g. |
 | Worker supplementary group | A **numeric GID**, resolved on the host at install time. A `--group-add` NAME would be resolved inside the image, which defines no such group. |
 | Broker validation | Re-validates the object key against the authoritative `WorkerObjectKeySchema`, the bucket by equality with its single configured bucket, the action against a closed three-entry set, and the TTL against the policy window. |
@@ -725,6 +727,51 @@ in the same run.
 
 To reinstate W^X the broker would have to stop relying on runtime type
 stripping (precompiled JS), at which point `--jitless` becomes viable again.
+
+**3. The npm bundled with Node v22.23.2 cannot install this repository.**
+
+Measured on the target VM with Node `v22.23.2`, whose bundled npm is `10.9.8`:
+
+```
+npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+
+npm error `npm ci` can only install packages when your package.json and
+npm error package-lock.json are in sync.
+npm error Missing: lru-cache@11.5.2 from lock file
+```
+
+`lru-cache@^11.2.6` is an **optional peer dependency** of
+`unstorage@2.0.0-alpha.7`, which is reached only through the **dev-only**
+`nitro` devDependency. Nothing requires it, so it is correctly absent from the
+committed lockfile. npm 10 resolves and installs it anyway — writing an entry
+explicitly flagged `"dev": true, "optional": true, "peer": true` — and then
+fails `npm ci` because the committed lockfile does not contain the entry npm
+itself invented.
+
+| npm | clean `npm ci` | prod-only `npm ci` | lockfile mutated |
+| :--- | :--- | :--- | :--- |
+| 10.9.8 (bundled) | **fails** `EUSAGE` | **fails** `EUSAGE` | — |
+| 10.9.9 | **fails** `EUSAGE` | **fails** `EUSAGE` | — |
+| **11.19.1 (pinned)** | **passes** | **passes** | **none** |
+| 12.0.2 | passes | passes | none |
+
+The committed lockfile is the fixed point of npm >= 11: `npm install` under
+npm 11 reproduces it byte-for-byte. Adding the entry npm 10 wants is **not** a
+fix — npm 11 deletes it again on the next `npm install`, so the lockfile would
+flap with whichever npm last touched it. The repository therefore pins the
+package manager instead of editing the lockfile, and `package.json` carries an
+exact `"packageManager": "npm@11.19.1"`.
+
+Install it explicitly on the broker host; do not rely on the bundled npm:
+
+```
+/opt/videofetch/node/bin/npm install -g npm@11.19.1
+/opt/videofetch/node/bin/node -v   # v22.23.2
+/opt/videofetch/node/bin/npm -v    # 11.19.1
+```
+
+`src/worker/runtime/toolchain-policy.test.ts` fails the build if the pin is
+removed, loosened to a range, or drifts from the documented versions.
 
 **2. The Worker's supplementary group must be a numeric GID.**
 

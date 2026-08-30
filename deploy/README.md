@@ -253,13 +253,46 @@ else.
 
 The order is not a convenience — it is the fail-closed boundary.
 
-0. **Provide a Node >= 22.6 runtime for the broker** at
+0. **Provide the pinned broker toolchain** at
    `/opt/videofetch/node/bin/node`.
+
+   | Component | Pinned value |
+   | --------- | ------------ |
+   | Node | `v22.23.2` |
+   | npm | `11.19.1` (`packageManager` in `package.json`) |
+   | Lockfile | committed `package-lock.json`, `lockfileVersion` 3 |
+   | Production install | `npm ci --omit=dev --ignore-scripts --no-audit --no-fund` |
 
    The broker runs TypeScript directly through Node's native type stripping.
    Ubuntu 24.04 packages Node 18, which does **not** support
    `--experimental-strip-types`, so the unit deliberately does not use
    `/usr/bin/node`.
+
+   **npm must be installed explicitly — do not use the bundled npm.** Node
+   v22.23.2 bundles npm 10.9.8, and npm 10 cannot install this repository:
+
+   ```
+   npm error `npm ci` can only install packages when your package.json and
+   npm error package-lock.json are in sync.
+   npm error Missing: lru-cache@11.5.2 from lock file
+   ```
+
+   `lru-cache@^11` is an **optional peer dependency** of `unstorage`, which is
+   reached only through the dev-only `nitro`. npm 10 materialises that optional
+   peer anyway and then rejects the committed lockfile for not listing the entry
+   it invented; npm >= 11 leaves unrequested optional peers alone and accepts the
+   lockfile unmodified. The lockfile is correct — npm 10 is not.
+
+   Install the pinned npm over the bundled one, then verify both:
+
+   ```
+   /opt/videofetch/node/bin/npm install -g npm@11.19.1
+   /opt/videofetch/node/bin/node -v   # must print v22.23.2
+   /opt/videofetch/node/bin/npm -v    # must print 11.19.1
+   ```
+
+   Pin the exact patch version. `npm@11`, `npm@^11` and `npm@latest` all
+   reintroduce the drift this step exists to remove.
 
 1. **Create the group and user.**
 
