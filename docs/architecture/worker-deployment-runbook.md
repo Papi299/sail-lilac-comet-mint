@@ -9,10 +9,25 @@ made by the Product Owner, because it determines persistent-volume semantics,
 TLS termination, external egress enforcement, network-namespace ownership and
 R2 placement/jurisdiction.
 
-**Status: nothing in this document has been provisioned or deployed.** Phase 8A
-produced the artefact only — `Dockerfile.worker` plus the Worker runtime. No
-bucket exists, no credential exists, no host exists, and no DNS or firewall has
-been touched.
+**Status: no accepted Phase-8B production deployment has been completed.**
+
+An existing local Lima/Ubuntu **prototype** deployment is present and has
+supplied measured safe-egress evidence, but it is **not** the reconciled
+production deployment and **Phase 9 has not been executed**. The earlier
+wording "no host exists" is no longer literally accurate and has been corrected
+here: a host exists, it is a prototype, and its existence is not acceptance.
+
+Precisely:
+
+- No **production** bucket, credential, tunnel or DNS record exists.
+- A local Lima VM (`videofetch`, Ubuntu 24.04 ARM64 on Apple silicon) runs the
+  **older prototype units** — `vf-anchor`, `vf-policy`, `vf-worker`,
+  `vf-watchdog` — and is the source of the measured evidence in §3 and §11.
+- The reconciled deployment artefacts in `deploy/` have been **recovered into
+  source and reviewed, but never installed**. The VM still runs the prototype,
+  deliberately, so the two remain comparable.
+- Recovering source is not deploying it, and deploying it would not be
+  acceptance either. Acceptance is Phase 9, against the exact final topology.
 
 ---
 
@@ -192,6 +207,145 @@ Residual evidence items carried into Phase 9, tracked in §11:
 `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001`,
 `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001`,
 `SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001`.
+
+### 3a. The recovered safe-egress deployment layer
+
+`PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001` moved the prototype's enforcement
+model out of a single VM's filesystem and into reviewed source under `deploy/`,
+reconciled with the trusted-broker architecture in §5. **Source only: nothing
+has been installed, and the VM still runs the older prototype units.**
+
+| Concern | Artefact |
+| :--- | :--- |
+| Namespace ownership | `deploy/systemd/videofetch-media-netns.service` |
+| Namespace holder image | `deploy/media-netns/` (Dockerfile + `holder.c`) |
+| Policy source | `deploy/nftables/videofetch-egress.nft.template` |
+| Non-secret configuration | `deploy/systemd/media-egress.env.example` |
+| Configuration gate | `deploy/bin/vf-egress-config-check` |
+| Install | `deploy/bin/vf-egress-policy-install`, `deploy/systemd/videofetch-egress-policy.service` |
+| Verify | `deploy/bin/vf-egress-policy-verify` |
+| Watch | `deploy/bin/vf-egress-watchdog`, `deploy/systemd/videofetch-egress-watchdog.service` |
+| Shared canonicalization | `deploy/bin/vf-egress-lib.sh` |
+| Phase-9 multicast helper | `deploy/bin/vf-egress-multicast-route-test` |
+| Phase-9 probe harness | `deploy/acceptance/safe-egress/` |
+| Static + behavioural tests | `src/worker/runtime/safe-egress-deployment-policy.test.ts` |
+
+**Dependency order.** The Worker requires **both** boundaries and may run
+without neither:
+
+```
+docker.service
+  └─ videofetch-media-netns.service      owns the namespace, publishes 127.0.0.1 only
+       └─ videofetch-egress-policy.service     installs + verifies, fingerprints to /run
+            └─ videofetch-egress-watchdog.service  re-verifies continuously
+                 └─ videofetch-worker.service
+videofetch-r2-broker.service
+  └─ videofetch-worker.service
+```
+
+The Worker declares `Requires=` + `After=` + `BindsTo=` on all four, so:
+
+| Event | Consequence |
+| :--- | :--- |
+| Namespace absent | Worker cannot start |
+| Policy install or verification fails | Worker cannot start |
+| Watchdog unavailable, crashed or hung | Worker stops — it is never left unmonitored |
+| Namespace disappears later | Worker stops |
+| Broker disappears later | Worker stops |
+| Boundary invalid after a breach | Worker cannot be restarted; the pre-start verifier is the latch |
+
+**What changed relative to the prototype.**
+
+- **The namespace holder is reproducible.** The prototype ran `alpine:vf`, an
+  image that existed on one VM and could not be rebuilt from source. It is
+  replaced by a two-stage build whose shipped stage is `FROM scratch` and
+  contains one static binary — no shell, no libc, no package manager.
+- **The DNS resolver is configuration, not a constant.** The prototype baked
+  `172.17.0.1` — one host's Docker bridge address — into its firewall source.
+  The resolver is now declared once, in `/etc/videofetch/media-egress.env`, and
+  that single declaration feeds both the container runtime's `--dns` and the
+  firewall's exception, so the resolver actually queried and the resolver
+  admitted cannot drift apart. Each address must be **exact**; a prefix is
+  refused, so no broad private-range exception can be introduced as a
+  "resolver". Absent or malformed configuration fails closed.
+- **The verifier detects added allow rules without a baseline.** It enumerates
+  every `accept` verdict in the namespace and requires the set to be exactly
+  the intended shape, in addition to the whole-ruleset fingerprint. It also
+  asserts exactly one table exists, because a second `nat` table's output hook
+  runs at priority `dstnat` — before `filter` — and could DNAT a forbidden
+  destination into a permitted one.
+- **Routes are verified** (`SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001`). See §3b.
+- **The watchdog's breach path exists.** The prototype invoked
+  `vf-policy-breach.target`, which was never defined, so the call silently did
+  nothing. No such target is reproduced; the Worker's `BindsTo=` on the
+  watchdog unit is the stop path, and it is exercised by tests.
+- **The IPv6 deny set is strictly larger.** `::/96` replaces the prototype's
+  separate `::/128` and `::1/128`, adding IPv4-**compatible** coverage that
+  `safe-egress.md` requires. The three classes cannot be listed separately
+  because nftables interval sets reject overlapping elements.
+
+**Not recovered, deliberately.** `cf-api`, `vf-observer.py`, the real
+`cloudflared` configuration and credentials, the Lima YAML, macOS launch
+wrappers, VM sizing and any VPN tooling are out of scope here and belong to
+separate bounded tasks. No macOS LaunchAgent is created and Lima does not start
+automatically — see §3c.
+
+### 3b. Route verification (`SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001`)
+
+The prototype fingerprinted the `nftables` ruleset but not the namespace route
+table. That gap is now closed **in source**; it is **not** closed as evidence.
+
+Why it matters even though a route cannot defeat a destination-address deny:
+the deny set enumerates address **classes**, not reachability. A new interface
+or route appearing inside the media namespace can expose destinations whose
+addresses are perfectly public but whose hosts are local — a LAN segment on
+public address space, a VPN tunnel, a second bridge. Nothing in the nftables
+policy denies those, because by address they are exactly what the Worker is
+supposed to reach.
+
+Two independent checks:
+
+1. **A semantic invariant, needing no baseline.** Every policy-routing rule
+   must sit at a kernel-default priority and look up a built-in table
+   (`local`/`main`/`default`, by name or id). Any injected rule fails,
+   whatever it points at. The namespace must also have at least one IPv4
+   route — an empty table would make every destination unreachable for reasons
+   unrelated to the firewall, which is precisely the ambiguity
+   `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` is about.
+2. **A runtime fingerprint**, covering IPv4 routes, IPv6 routes and both rule
+   tables, captured after controlled namespace creation and policy install,
+   stored under `/run` and regenerated **only** by the trusted install path.
+
+Nothing dynamic is hard-coded: not the Lima-assigned container address, not
+Docker's current bridge subnet, not a link-local address, not an interface
+name. The baseline is whatever the controlled start path produced, so it
+survives an ordinary VM reboot and namespace recreation. Normalization strips
+only `expires <n>sec` (a router-advertised lifetime that ticks down every
+second), collapses whitespace and sorts; every destination, gateway, device,
+metric, scope, table and preference is hashed.
+
+**Status: IMPLEMENTED, PENDING IN-SITU VERIFICATION.** Source-level tests prove
+the detection logic against recorded fixtures. They do not prove behaviour
+against a real namespace on the real VM, and the gate stays open until Phase 9
+measures it there.
+
+### 3c. Operating model — on demand
+
+The VM is started **manually**, when the application is wanted. There is no
+macOS LaunchAgent, Lima does not start at login, and neither the Mac nor the VM
+needs to run 24/7.
+
+```
+limactl start videofetch
+  → guest systemd starts the VideoFetch units
+  → safe-egress boundary becomes ready   (namespace, policy, watchdog)
+  → broker becomes ready
+  → Worker becomes ready
+  → cloudflared provides ingress
+```
+
+The user-facing start/stop wrapper is deliberately **not** part of this work; it
+follows once the deployment artefacts have been reviewed and installed.
 
 ---
 
@@ -744,6 +898,8 @@ authorization.
 - [ ] Read-only root filesystem, writable state mount, writable ephemeral `/tmp`.
 - [ ] All capabilities dropped; no privileged mode, host network or Docker socket.
 - [ ] External egress deny policy applied and owned outside the container.
+      *Source artefacts exist and are tested (§3a); none is installed. The Lima
+      VM still runs the older prototype units.*
 - [ ] TLS endpoint terminated in front of the Worker and reachable by Vercel.
 - [x] **`R2-CREDENTIAL-SCOPE-DECISION-001` closed by the Product Owner —
       Option B (renewable, action-scoped temporary credentials).** See §5f.
@@ -800,7 +956,8 @@ authorization.
 | `R2-BROKER-PARENT-TOKEN-ROTATION-001` | OPEN — non-blocking, provisioning-time | The broker's parent token is still a persistent credential; only its custody changed. Rotating it is a broker-side `EnvironmentFile` update plus a `systemctl restart videofetch-r2-broker`, which `BindsTo=` will propagate as a brief Worker restart. Define the rotation cadence when the token is actually provisioned. No code change is expected. |
 | `R2-BROKER-LIVE-MINT-VERIFICATION-001` | **CLOSED — accepted** | **Initial failure → correction → definitive acceptance → teardown.** *First attempt, FAILED:* real R2 was reached and rejected the then-merged `scope + actions` credential at token **parsing** — `HTTP 400 InvalidArgument` on `X-Amz-Security-Token`, before any authorization decision — so the production path failed closed rather than over-granting; diagnostic action-only credentials were accepted and showed the intended enforcement, and expiration went unmeasured. *Correction:* `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001` (PR #21) changed **production** credentials to action-only claims (see §5b). *Definitive rerun, PASSED:* run against this repository's merged production implementation — the merged `mintTemporaryCredential` signer, the merged `CloudflareR2ObjectStoreWriter` for Put/Head/Delete, repository-generated `WorkerObjectKey` values, all three temporary-credential fields on every delegated request, **no parent-credential fallback** (a raw AWS SDK client was used only for `GetObject`/`ListObjectsV2`, which the production writer deliberately omits). The **full matrix passed**: under its own credential, exact-key `PutObject`, `HeadObject` and `DeleteObject` each **succeeded**, while every **cross-action** attempt, every **sibling-object** attempt and **`ListObjectsV2`** were **denied by R2** — provider-side authorization denials, not local or network failures. Denied sibling writes and deletes left the sibling untouched, the sibling genuinely existed during the head and delete sibling tests (no missing-object ambiguity), the delete negatives ran while the exact object still existed, and no post-delete 404 was used as denial evidence. **Natural expiration was enforced** on real wall-clock time (§5b) — a 1-second production credential replayed at `exp + 30s` was denied and created nothing, the observed expired-credential response in this acceptance being `403 SignatureDoesNotMatch` rather than a dedicated expiry code; because that response is not expiry-specific, the result was isolated by before/after acceptance of equivalent 1-second credentials for both `HeadObject` and `PutObject`. *Cleanup:* all task-owned objects were removed with fresh exact-key `DeleteObject` credentials and a read-only parent check reported 0 objects at the job prefix, 0 at the `videofetch` prefix and 0 bucket-wide. *Teardown (operator-attested, not independently re-verified):* disposable parent token revoked, disposable bucket confirmed empty and deleted, local acceptance credential file removed (§5f). **This gate therefore no longer blocks production R2 traffic.** Closure means only that the merged temporary-credential model passed live-provider acceptance — it does **not** mean production R2 is provisioned (§5e/§10 remain unchecked), that `R2-BROKER-PARENT-TOKEN-ROTATION-001` is resolved, that Phase 9 or Phase 10 progressed, or that yt-dlp may be enabled. |
 | `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **CLOSED — accepted** | Empirically measured and accepted against the real Cloudflare Access Service Auth configuration; the gate is no longer blocking and is not reopened here. Scope note, unchanged: this is an acceptance of the measured INGRESS path, not a source-level property. This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it — that part is still asserted by the control-plane boundary suite. Any change to the ingress topology invalidates the acceptance and requires a re-measurement. |
+| `PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001` | **Source recovery complete; NOT a deployment or an acceptance** | The prototype's enforcement model was recovered from the Lima VM into reviewed source under `deploy/` and reconciled with the trusted-broker architecture (§3a). The live VM was **not modified** — it still runs `vf-anchor`/`vf-policy`/`vf-worker`/`vf-watchdog`, deliberately, so prototype and reconciled source stay comparable. No secret was copied: the only credential-shaped material encountered was clearly-labelled `FAKE_PROTOTYPE_*` placeholders in the stale prototype Worker unit, which is intentionally not recovered. Installing these artefacts is a separate explicit task; acceptance is Phase 9. |
 | `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001` | OPEN — Phase-9 evidence | The prototype acceptance run was performed with the host VPN client loaded but **not connected**. Repeat the suite with it actively connected (including any DNS-interception or mesh features), since that changes host routing beneath the VM. Requires operator interaction. Not a code blocker. |
-| `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | OPEN — Phase-9 evidence | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Add a route in the acceptance harness so the deny rules actually fire and can be attributed. Every other range was counter-attributed. |
-| `SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001` | OPEN — Phase-9 evidence, non-blocking | The prototype verifier fingerprints the `nftables` ruleset but not the namespace **route table**. Non-blocking because destination denial was proven to survive route injection — a route cannot defeat a destination-address deny. Consider pinning the route table in the final deployment supervisor for defence in depth. |
+| `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | **OPEN — Phase-9 evidence. Tooling added; not executed.** | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Every other range was counter-attributed. `deploy/bin/vf-egress-multicast-route-test` now installs a minimal temporary route so those destinations reach the enforcement point and the denial can be attributed to the rule's own counter. It is acceptance-only: no unit references it, it refuses to run without `--phase9-acceptance` and root, it refuses to run outside a namespace carrying the `inet videofetch_egress` table, it never touches nftables, and an `EXIT`/`INT`/`TERM` trap installed **before** the first route removes everything and re-verifies. **The helper has NOT been run against the live VM**, by instruction. The gate closes only when Phase 9 executes it and records moving counters — a denial with a flat counter is still not evidence. |
+| `SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001` | **IMPLEMENTED — PENDING IN-SITU VERIFICATION** (still open) | The prototype verifier fingerprinted the `nftables` ruleset but not the namespace **route table**. Non-blocking, as before: destination denial was proven to survive route injection, and a route cannot defeat a destination-address deny. Source hardening is now merged — see §3b — combining a baseline-free semantic invariant over policy-routing rules with a runtime route/rule fingerprint captured by the trusted install path and stored under `/run`. The watchdog additionally subscribes to route and link netlink events. **This is source-level implementation validated against recorded fixtures only.** It has never run against the real namespace on the real VM, so it is NOT Phase-9 acceptance and the gate is not closed. |
 | `NPM-LOCKFILE-RECONCILIATION-001` | OPEN — non-blocking for Phase 8A | `package-lock.json` carries a pre-existing devDependency resolution (`nitro` → `unstorage` requires `lru-cache@^11`, the lock pins `5.1.1`) that npm 10 rejects and npm 11 accepts. The Worker image works around it with an exact-pinned ephemeral npm 11 running `ci`; no `npm install` is used and the lockfile is unmodified. Repository maintenance should reconcile it separately. |

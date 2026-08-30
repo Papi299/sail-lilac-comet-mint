@@ -1,0 +1,173 @@
+#!/bin/bash
+# Runtime safe-egress boundary watchdog.
+# (PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001)
+#
+# Recovered from the Lima prototype's /usr/local/sbin/vf-watchdog, with route
+# monitoring added and the prototype's dangling `vf-policy-breach.target`
+# reference removed.
+#
+# WHAT IT WATCHES
+#
+#   1. nftables netlink events in the media namespace  (immediate)
+#   2. route/rule netlink events in the same namespace (immediate, NEW)
+#   3. a bounded periodic re-verification                (backstop)
+#
+# Any of them failing verification is a BREACH. On breach the Worker is
+# STOPPED. It is not logged and left running: an unenforced boundary that
+# nobody is blocked by is worse than an outage, because the deployment goes on
+# looking healthy.
+#
+# HOW THE WORKER ACTUALLY STOPS
+#
+# Two independent paths, deliberately:
+#
+#   a. this script asks systemd to stop videofetch-worker.service, and
+#   b. this script then EXITS NONZERO, and the Worker unit declares
+#      BindsTo=videofetch-egress-watchdog.service, so systemd stops the Worker
+#      even if (a) never ran.
+#
+# (b) is what makes a watchdog CRASH safe. If this process dies for any reason
+# at all — a bug here, an OOM kill, a lost namespace — the Worker cannot keep
+# running unmonitored, because its binding to this unit is gone. The prototype
+# had no such link: its watchdog was ordered `After=vf-worker.service` and
+# nothing stopped the Worker if the watchdog itself died.
+#
+# A hang is covered too: the unit is Type=notify with WatchdogSec, so a main
+# loop that stops pinging systemd is killed, which lands back on (b).
+#
+# THERE IS NO REPAIR PATH. This script never reinstalls, reloads or corrects a
+# policy. Recovery is an explicit operator action through the units, so a
+# breach stays visible instead of being silently papered over in a loop.
+
+set -uo pipefail
+VF_PROG=vf-egress-watchdog
+
+LIB="${VF_EGRESS_LIB:-/usr/local/lib/videofetch/vf-egress-lib.sh}"
+# shellcheck source=vf-egress-lib.sh
+. "$LIB"
+
+VERIFY="${VF_EGRESS_VERIFY:-/usr/local/sbin/vf-egress-policy-verify}"
+WORKER_UNIT="${VF_WORKER_UNIT:-videofetch-worker.service}"
+BACKSTOP_SECONDS="${VF_EGRESS_BACKSTOP_SECONDS:-5}"
+SYSTEMCTL="${VF_SYSTEMCTL:-systemctl}"
+SYSTEMD_NOTIFY="${VF_SYSTEMD_NOTIFY:-systemd-notify}"
+
+WORKDIR=""
+CHILDREN=()
+
+# Kills a watcher AND its descendants. Each watcher is a subshell running a
+# `<monitor> | while read` pipeline, so killing the subshell alone orphans the
+# long-lived monitor process, which then keeps inherited descriptors open and
+# survives this unit.
+#
+# Under systemd the default KillMode=control-group would eventually clean the
+# cgroup up regardless, but a script that leaks processes when run by hand is a
+# script an operator cannot safely run by hand.
+kill_tree() {
+  local pid="$1" child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    kill_tree "$child"
+  done
+  kill "$pid" 2>/dev/null || true
+}
+
+cleanup() {
+  for pid in ${CHILDREN[@]+"${CHILDREN[@]}"}; do
+    kill_tree "$pid"
+  done
+  [ -n "$WORKDIR" ] && rm -rf "$WORKDIR"
+  return 0
+}
+trap cleanup EXIT
+
+breach() {
+  echo "$VF_PROG: BREACH: $* -> stopping $WORKER_UNIT" >&2
+  # --no-block so a systemd job queue that is busy cannot wedge this process
+  # before it reaches the nonzero exit, which is the second, independent stop
+  # path. Failure to run systemctl at all is survivable for the same reason.
+  "$SYSTEMCTL" --no-block stop "$WORKER_UNIT" 2>/dev/null || true
+  echo "$VF_PROG: exiting nonzero; BindsTo= propagates the stop even if the above failed" >&2
+  exit 1
+}
+
+verify_now() { "$VERIFY" >/dev/null 2>&1; }
+
+# ── Establish the boundary before claiming readiness ───────────────────────
+#
+# Reporting ready first and checking later would leave a window in which the
+# Worker starts against an unverified boundary.
+PID="$(vf_netns_pid 2>/dev/null)" || breach "media namespace holder absent at startup"
+verify_now || breach "boundary already invalid at watchdog startup"
+
+WORKDIR="$(mktemp -d)"
+FIFO="$WORKDIR/breach"
+mkfifo "$FIFO"
+
+# Opened read-WRITE on purpose: a read-only open of a FIFO blocks until some
+# writer appears, and that block is not interruptible by `read -t`. With a
+# writer end held here, the main loop can poll with a timeout and stay
+# responsive even while every watcher is silent.
+exec 9<>"$FIFO"
+
+# ── 1. nftables events ─────────────────────────────────────────────────────
+(
+  vf_in_ns "$PID" "$VF_NFT" monitor 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      *rule*|*chain*|*table*|*set*)
+        verify_now || { echo "nftables event: $line" >&9; exit 0; }
+        ;;
+    esac
+  done
+  # The stream ended. In this namespace that means the namespace itself is
+  # gone, which is a breach, not a quiet shutdown.
+  echo "nft monitor exited (namespace destroyed?)" >&9
+) &
+CHILDREN+=($!)
+# Drop the job-table entry so bash does not print a "Terminated" notice for it
+# during cleanup. The PID is retained above, so the liveness check below and
+# kill_tree() are unaffected.
+disown %% 2>/dev/null || true
+
+# ── 2. route and link events (SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001) ────
+#
+# The prototype watched nftables only, so a route or interface appearing in the
+# media namespace after start went unnoticed until the next backstop poll — and
+# was never verified at all, because the prototype's verifier did not look at
+# routes.
+(
+  vf_in_ns "$PID" "$VF_IP" monitor route link 2>/dev/null | while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    verify_now || { echo "route/link event: $line" >&9; exit 0; }
+  done
+  echo "ip monitor exited (namespace destroyed?)" >&9
+) &
+CHILDREN+=($!)
+# Drop the job-table entry so bash does not print a "Terminated" notice for it
+# during cleanup. The PID is retained above, so the liveness check below and
+# kill_tree() are unaffected.
+disown %% 2>/dev/null || true
+
+# ── Ready ──────────────────────────────────────────────────────────────────
+"$SYSTEMD_NOTIFY" --ready --status="watching media egress boundary" 2>/dev/null || true
+
+echo "$VF_PROG: watching netns pid=$PID (nftables events, route events, ${BACKSTOP_SECONDS}s backstop)"
+
+# ── 3. Backstop poll + watcher liveness ────────────────────────────────────
+#
+# The backstop covers anything an event stream could miss. The liveness check
+# covers the subtler failure: a watcher dying WITHOUT writing to the FIFO — a
+# kill, an OOM, a broken pipe — which would otherwise leave this process
+# waiting forever on an event that can no longer arrive.
+while :; do
+  if read -r -t "$BACKSTOP_SECONDS" reason <&9; then
+    breach "$reason"
+  fi
+
+  for pid in ${CHILDREN[@]+"${CHILDREN[@]}"}; do
+    kill -0 "$pid" 2>/dev/null || breach "watcher process $pid is gone; the boundary is no longer monitored"
+  done
+
+  verify_now || breach "backstop verification failed"
+
+  "$SYSTEMD_NOTIFY" WATCHDOG=1 2>/dev/null || true
+done

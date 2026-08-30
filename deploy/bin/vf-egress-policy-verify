@@ -1,0 +1,214 @@
+#!/bin/bash
+# Fail-closed safe-egress verifier.
+# (PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001)
+#
+# Recovered from the Lima prototype's /usr/local/sbin/vf-policy-verify, with
+# two capabilities the prototype did not have: an exact allow-shape check that
+# does not depend on the fingerprint, and route-table verification
+# (SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001).
+#
+# Exit 0 ONLY if the exact expected boundary is live in the media namespace.
+# Used as the Worker's hard pre-start gate AND by the runtime watchdog.
+#
+# THIS SCRIPT IS READ-ONLY. It inspects and reports. It never installs,
+# reloads, repairs, re-baselines or "fixes" anything — a verifier that repairs
+# is not a verifier, because after it runs, nobody can say whether the boundary
+# was ever intact.
+
+set -uo pipefail
+VF_PROG=vf-egress-policy-verify
+
+LIB="${VF_EGRESS_LIB:-/usr/local/lib/videofetch/vf-egress-lib.sh}"
+# shellcheck source=vf-egress-lib.sh
+. "$LIB"
+
+fail() { echo "$VF_PROG: FAIL: $*" >&2; exit 1; }
+
+vf_config_load 2>/dev/null || fail "configuration $VF_CONFIG_FILE is unreadable"
+
+# ── Namespace ──────────────────────────────────────────────────────────────
+PID="$(vf_netns_pid 2>/dev/null)" || fail "media namespace holder absent"
+
+# Entering another namespace needs host root. A non-root caller therefore
+# fails here, closed, with an explanation rather than a bare permission error.
+RS="$(vf_canonical_ruleset "$PID")" \
+  || fail "cannot read the namespace ruleset (host root is required to enter it)"
+[ -n "$RS" ] || fail "ruleset is EMPTY (policy disappeared)"
+
+# ── Structure ──────────────────────────────────────────────────────────────
+
+grep -q 'table inet videofetch_egress' <<<"$RS" || fail "table inet videofetch_egress missing"
+
+# EXACTLY ONE table. A second table matters even though ours is default-drop:
+# a nat table's output hook runs at priority -100, BEFORE filter, so a DNAT
+# rule there could rewrite a forbidden destination into a permitted one and the
+# deny set would never see the original address. The prototype caught this only
+# through the whole-ruleset fingerprint; it is asserted structurally here so a
+# first run with no baseline is covered too.
+TABLE_COUNT="$(grep -cE '^[[:space:]]*table[[:space:]]' <<<"$RS")"
+[ "$TABLE_COUNT" -eq 1 ] \
+  || fail "expected exactly 1 nftables table, found $TABLE_COUNT (a second table can DNAT around the deny set)"
+
+grep -qE 'type filter hook output priority filter; *policy drop;' <<<"$RS" \
+  || fail "output chain is not default-drop"
+
+grep -qE 'ip +daddr +@forbidden_v4 +counter .*reject'  <<<"$RS" || fail "IPv4 deny rule missing"
+grep -qE 'ip6 +daddr +@forbidden_v6 +counter .*reject' <<<"$RS" || fail "IPv6 deny rule missing"
+grep -qE 'ip +daddr +255\.255\.255\.255 +counter .*reject' <<<"$RS" \
+  || fail "broadcast (255.255.255.255) deny rule missing"
+
+# ── Denied destination classes ─────────────────────────────────────────────
+#
+# Asserted against the LIVE ruleset, independently of any stored fingerprint,
+# so a namespace that was never configured correctly fails on its first run
+# rather than baselining its own hole.
+
+V4_SET="$(sed -n '/set forbidden_v4/,/}/p' <<<"$RS" | tr ',' '\n')"
+for cidr in $VF_REQUIRED_V4; do
+  grep -qF "$cidr" <<<"$V4_SET" || fail "IPv4 deny class $cidr missing from forbidden_v4"
+done
+
+V6_SET="$(sed -n '/set forbidden_v6/,/}/p' <<<"$RS" | tr ',' '\n')"
+while IFS='|' read -r label pattern; do
+  [ -n "${label:-}" ] || continue
+  grep -qE "$pattern" <<<"$V6_SET" || fail "IPv6 deny class $label ($pattern) missing from forbidden_v6"
+done <<< "$VF_REQUIRED_V6"
+
+# Element counts. Removal is caught above; this additionally catches a
+# removal PAIRED with an addition, which would otherwise keep the count of
+# "required classes found" intact.
+V4_N="$(grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<<"$V4_SET")"
+V6_N="$(grep -cE '::|:[0-9a-fA-F]' <<<"$V6_SET")"
+V4_EXPECTED="$(printf '%s\n' $VF_REQUIRED_V4 | grep -c .)"
+V6_EXPECTED="$(printf '%s\n' "$VF_REQUIRED_V6" | grep -c '|')"
+[ "$V4_N" -eq "$V4_EXPECTED" ] || fail "forbidden_v4 has $V4_N elements, expected $V4_EXPECTED"
+[ "$V6_N" -eq "$V6_EXPECTED" ] || fail "forbidden_v6 has $V6_N elements, expected $V6_EXPECTED"
+
+# ── Exact allow shape ──────────────────────────────────────────────────────
+#
+# The prototype relied on the whole-ruleset fingerprint to notice an ADDED
+# allow rule. That works, but only against a baseline. This check is
+# independent: it enumerates every accept verdict actually present and refuses
+# anything that is not one of the three permitted shapes.
+#
+# Whitespace is squeezed out of both sides before comparison, so nft's own
+# column padding and brace spacing cannot cause a false breach; addresses,
+# ports, verdicts and comments are all still compared exactly.
+
+# Line-wise: strips whitespace WITHIN each line and keeps the line structure,
+# then sorts so rule order in the chain does not affect set comparison.
+# (Order is separately pinned by the ruleset fingerprint below, which is what
+# guarantees the DNS accepts still sit ABOVE the deny rules.)
+squeeze_lines() { sed 's/[[:space:]]//g' | grep -v '^$' | sort; }
+
+RESOLVERS="$(vf_dns_resolvers 2>/dev/null)" \
+  || fail "designated DNS resolver configuration is invalid; cannot determine the intended allow shape"
+
+EXPECTED_ACCEPTS="$(
+  printf 'ct state established,related counter accept comment "established"\n'
+  while IFS= read -r addr; do
+    [ -n "$addr" ] || continue
+    # An `if` rather than a one-line `case`: bash 3.2 mis-parses a `case`
+    # inside a command substitution, and this suite runs on developer machines
+    # as well as on the Linux target.
+    if [ "${addr#*:}" != "$addr" ]; then fam=ip6; else fam=ip; fi
+    printf '%s daddr %s udp dport 53 counter accept comment "designated-dns-udp"\n' "$fam" "$addr"
+    printf '%s daddr %s tcp dport 53 counter accept comment "designated-dns-tcp"\n' "$fam" "$addr"
+  done <<< "$RESOLVERS"
+  printf 'tcp dport { 80, 443 } counter accept comment "public-http"\n'
+)"
+
+EXPECTED_SET="$(printf '%s\n' "$EXPECTED_ACCEPTS" | squeeze_lines)"
+
+# Every rule line in the ruleset that reaches an accept verdict.
+OBSERVED_SET="$(grep -E '(^|[[:space:]])accept([[:space:]]|$)' <<<"$RS" | squeeze_lines)"
+
+if [ "$OBSERVED_SET" != "$EXPECTED_SET" ]; then
+  echo "$VF_PROG: allow shape mismatch." >&2
+  echo "--- expected accepts ---" >&2; printf '%s\n' "$EXPECTED_SET" >&2
+  echo "--- observed accepts ---" >&2; printf '%s\n' "$OBSERVED_SET" >&2
+  fail "the set of accept rules is not exactly the intended allow shape (an added, broadened or removed allow)"
+fi
+
+# No address translation anywhere. Belt and braces alongside the single-table
+# assertion above.
+grep -qE '(^|[[:space:]])(masquerade|snat|dnat|redirect)([[:space:]]|$)' <<<"$RS" \
+  && fail "address translation present in the media namespace"
+
+# ── Ruleset fingerprint ────────────────────────────────────────────────────
+#
+# Catches ANY mutation the structural assertions above did not think of.
+[ -r "$VF_POLICY_FINGERPRINT" ] || fail "expected policy fingerprint missing ($VF_POLICY_FINGERPRINT).
+The policy unit has not run, or its runtime directory was removed."
+
+NOW_FP="$(printf '%s\n' "$RS" | vf_sha256)"
+WANT_FP="$(cat "$VF_POLICY_FINGERPRINT")"
+[ "$NOW_FP" = "$WANT_FP" ] \
+  || fail "ruleset fingerprint MUTATED (expected ${WANT_FP:0:16}..., got ${NOW_FP:0:16}...)"
+
+# ── Route table (SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001) ─────────────────
+#
+# Why this matters even though a route cannot defeat a destination-address
+# deny: the deny set enumerates ADDRESS CLASSES, not reachability. A new
+# interface or route appearing in this namespace can expose destinations whose
+# addresses are perfectly public but whose hosts are local — a LAN segment
+# using public address space, a VPN tunnel, a second bridge. Nothing in the
+# nftables policy denies those, because by address they are exactly what the
+# Worker is supposed to be able to reach.
+#
+# Two independent checks: a semantic invariant that needs no baseline, and a
+# fingerprint captured by the trusted install path.
+
+# 1. SEMANTIC — policy-routing rules must be the kernel defaults only.
+#
+# Expressed as an invariant rather than a literal expected list, because the
+# literal list differs across kernels while the invariant does not: a rule may
+# only sit at a default priority and may only look up a built-in table. Any
+# injected rule — a `from <src> lookup 100`, a `to <dst> lookup vpn` — is
+# rejected regardless of what it points at.
+check_rules() {
+  local family="$1" line prio action
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    # `ip rule show` prints "<prio>:<TAB><selector> lookup <table>".
+    prio="${line%%:*}"
+    action="$(printf '%s' "${line#*:}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    case "$prio" in
+      ''|*[!0-9]*) fail "$family policy rule has no numeric priority: $line" ;;
+    esac
+    case "$prio" in
+      0|32765|32766|32767) ;;
+      *) fail "$family policy rule at non-default priority $prio: $line" ;;
+    esac
+    # Built-in tables only, by name or by id: iproute2 prints the name when
+    # /etc/iproute2/rt_tables maps it and the number when it does not, and both
+    # spellings mean the same table.
+    case "$action" in
+      *"lookup local"|*"lookup main"|*"lookup default") ;;
+      *"lookup 255"|*"lookup 254"|*"lookup 253") ;;
+      *) fail "$family policy rule does not look up a built-in table: $line" ;;
+    esac
+  done < <(vf_in_ns "$PID" "$VF_IP" "$family" rule show 2>/dev/null)
+}
+check_rules -4
+check_rules -6
+
+# 2. The namespace must actually have routing. An empty table would make every
+#    destination unreachable for reasons unrelated to the firewall, which is
+#    exactly the ambiguity SAFE-EGRESS-MULTICAST-ATTRIBUTION-001 is about.
+vf_in_ns "$PID" "$VF_IP" -4 route show 2>/dev/null | grep -q . \
+  || fail "namespace has NO IPv4 routes; denial could not be attributed to policy"
+
+# 3. FINGERPRINT — captured after controlled namespace creation and policy
+#    install, regenerated only by the trusted install path, stored under /run.
+[ -r "$VF_ROUTES_FINGERPRINT" ] || fail "expected route fingerprint missing ($VF_ROUTES_FINGERPRINT)"
+
+NOW_RT="$(vf_canonical_routes "$PID" | vf_sha256)"
+WANT_RT="$(cat "$VF_ROUTES_FINGERPRINT")"
+[ "$NOW_RT" = "$WANT_RT" ] \
+  || fail "namespace ROUTE TABLE mutated since install (expected ${WANT_RT:0:16}..., got ${NOW_RT:0:16}...).
+A route or policy rule changed after the boundary was established. This is not
+repaired here: re-establish the namespace through its units."
+
+echo "$VF_PROG: OK (netns pid=$PID, policy ${NOW_FP:0:16}..., routes ${NOW_RT:0:16}...)"
+exit 0

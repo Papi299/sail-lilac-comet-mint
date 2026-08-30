@@ -2,9 +2,26 @@
 
 Host-side units for the VideoFetch VM deployment.
 
-**Nothing in this directory has been provisioned or deployed.** No R2 bucket,
-token or account exists; no unit is installed; no secret is present. Every
-value in `systemd/r2-broker.env.example` is intentionally empty.
+**Nothing in this directory has been installed.** No R2 bucket, token or
+account exists; no unit is installed; no secret is present. Every value in
+`systemd/r2-broker.env.example` and `systemd/media-egress.env.example` is
+intentionally empty.
+
+A local Lima/Ubuntu **prototype** VM does exist and supplied the measured
+safe-egress evidence these artefacts were recovered from. It still runs the
+**older prototype units**, untouched, so the two remain comparable. Recovering
+this source is not deploying it, and deploying it would not be acceptance —
+that is Phase 9. See `docs/architecture/worker-deployment-runbook.md` §3a.
+
+The Worker requires **two independent boundaries** and runs without neither:
+
+| Boundary | Governs | Artefacts |
+| :--- | :--- | :--- |
+| Trusted R2 broker | what the Worker may **write** | `videofetch-r2-broker.service`, `bin/vf-r2-broker-gid-*` |
+| Safe egress | where the Worker may **connect** | `videofetch-media-netns.service`, `videofetch-egress-policy.service`, `videofetch-egress-watchdog.service`, `bin/vf-egress-*` |
+
+They are independent: an `AF_UNIX` socket is not the network, so credential
+acquisition neither depends on nor widens the egress policy.
 
 ---
 
@@ -31,6 +48,129 @@ short-lived credential: 1 bucket · 1 exact object key · 1 S3 action
 | :--- | :--- | :--- |
 | Broker | `systemd/videofetch-r2-broker.service` | **Yes — exclusively.** |
 | Worker | `systemd/videofetch-worker.service` | **No. Never.** |
+
+---
+
+## The safe-egress boundary
+
+`PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001` recovered the proven Lima
+prototype's enforcement model into reviewed source.
+
+```
+cloudflared (VM)
+  │  http://127.0.0.1:<WORKER_PORT>   loopback only, never a LAN interface
+  ▼
+videofetch-media-netns          owns the network namespace, publishes the port
+  │                             holds NO NET_ADMIN and no credential
+  │  VM root installs policy INTO the namespace with nsenter
+  ▼
+inet videofetch_egress          default-drop; public TCP 80/443; DNS to the
+                                designated resolver(s) at their EXACT address
+  ▲
+  │  --network container:videofetch-media-netns
+videofetch-worker               cannot read, weaken, mutate or bypass any of it
+```
+
+| File | Role |
+| :--- | :--- |
+| `media-netns/Dockerfile`, `media-netns/holder.c` | The namespace holder image. Two stages; the shipped stage is `FROM scratch` and contains one static binary. |
+| `nftables/videofetch-egress.nft.template` | The policy. Deny classes verbatim from `docs/architecture/safe-egress.md`. |
+| `systemd/media-egress.env.example` | Non-secret configuration: the loopback port and the designated resolver(s). |
+| `bin/vf-egress-lib.sh` | Shared config parsing and canonicalization. |
+| `bin/vf-egress-config-check` | Fail-closed configuration gate. |
+| `bin/vf-egress-policy-install` | Renders, installs, fingerprints, verifies. |
+| `bin/vf-egress-policy-verify` | Read-only verifier. Never repairs. |
+| `bin/vf-egress-watchdog` | Continuous re-verification; stops the Worker on breach. |
+| `bin/vf-egress-multicast-route-test` | **Phase-9 acceptance only.** Not in any unit. |
+| `acceptance/safe-egress/` | **Phase-9 probe harness.** Not in any unit. |
+
+### Why the namespace holder is not `sleep infinity` in a borrowed image
+
+The prototype used `alpine:vf` — an image built by an unrecorded command that
+existed on exactly one VM. It could not be rebuilt, audited or reproduced.
+
+The replacement compiles `holder.c` into a static binary and ships it `FROM
+scratch`. The base image is therefore a **build-time** dependency only: the
+running image has no shell, no libc, no package manager and no `/etc`. A
+compromised Worker sharing this namespace gains nothing by reaching the holder,
+because there is nothing there to execute. The base is pinned to an explicit
+patch version and can be pinned to a manifest-list digest with
+`--build-arg HOLDER_BUILD_BASE=alpine@sha256:...` at provisioning time.
+
+```
+docker build --platform linux/arm64 -t videofetch-media-netns:latest deploy/media-netns
+```
+
+`linux/arm64` because the target is a Lima VM on Apple silicon. Nothing in the
+build is architecture-specific.
+
+### The designated resolver is configuration, not a constant
+
+The prototype hard-coded `172.17.0.1` into its firewall source — one host's
+Docker bridge address at one moment. `VIDEOFETCH_MEDIA_DNS_FLAGS` in
+`/etc/videofetch/media-egress.env` replaces it, and is the **single**
+declaration feeding two consumers:
+
+- `videofetch-media-netns.service` passes it to `docker run`, which is what
+  puts the resolver in the namespace's `resolv.conf`. The Worker inherits that
+  file and **cannot** override it — Docker rejects `--dns` alongside
+  `--network container:`.
+- `vf-egress-policy-install` renders the firewall's DNS exception from the same
+  string.
+
+Two separate settings would eventually drift, and the failure would be either a
+DNS outage that looks like a network fault or a firewall hole for a resolver
+nothing uses.
+
+Every address must be **exact**. `--dns 172.17.0.0/16` is refused: `safe-egress.md`
+permits an exception for one resolver address, never for a private network. A
+resolver inside a denied class is fine and expected — it is admitted at that
+exact address on port 53 only, and the surrounding class stays denied. Absent,
+empty or malformed configuration stops the boundary rather than defaulting.
+
+### Fingerprints live in /run, never in Git
+
+`vf-egress-policy-install` records a canonical `nftables` fingerprint and a
+canonical route/rule fingerprint under `/run/videofetch-egress/`. They describe
+one running namespace, are regenerated by the trusted install path on every
+start, and are **never committed** — a fingerprint in Git would be a stale
+claim about a machine that no longer exists. `systemd` removes the directory
+when `videofetch-egress-policy.service` stops, which is what makes the Worker's
+pre-start verifier fail.
+
+### What the verifier catches
+
+Read-only. It inspects and reports; it never installs, reloads or repairs,
+because after a repair nobody can say whether the boundary was ever intact.
+
+- The namespace exists, and carries exactly **one** table — a second `nat`
+  table's output hook runs before `filter` and could DNAT a forbidden
+  destination into a permitted one.
+- The output chain is default-drop.
+- Every required IPv4 and IPv6 deny class is present, checked against the live
+  ruleset without reference to any baseline, so a namespace that was never
+  configured correctly fails on its first run.
+- The set of `accept` rules is **exactly** the intended shape — this is what
+  catches an added or broadened allow without needing the fingerprint.
+- The whole-ruleset fingerprint matches, which additionally catches reordering.
+- IPv4 routes, IPv6 routes and both policy-routing rule tables match, by
+  semantic invariant and by fingerprint
+  (`SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001`).
+
+### The breach path
+
+The prototype called `vf-policy-breach.target`, which was never defined, so the
+call silently did nothing. No such target is reproduced. Instead:
+
+1. the watchdog asks systemd to stop `videofetch-worker.service`, **and**
+2. exits nonzero, and the Worker's `BindsTo=` on the watchdog stops it anyway.
+
+(2) is what makes a watchdog **crash** safe — a watchdog that dies for any
+reason takes the Worker with it, so the Worker is never left unmonitored. A
+**hang** is covered too: the unit is `Type=notify` with `WatchdogSec`, so a main
+loop that stops pinging systemd is killed, which lands back on (2). The
+watchdog is `Restart=no` on purpose, and the Worker's pre-start verifier is the
+latch that stops anyone restarting it into a still-broken boundary.
 
 ---
 
@@ -90,9 +230,43 @@ The order is not a convenience — it is the fail-closed boundary.
    `R2_WRITER_*`, no `R2_BROKER_PARENT_*` and no `R2_SIGNER_*`. The Worker
    runtime refuses to start if any of them is present.
 
-4. **Start the broker, then the Worker.** systemd enforces this:
+4. **Install the safe-egress layer.**
 
    ```
+   # The namespace holder image, built from committed source.
+   docker build --platform linux/arm64 \
+     -t videofetch-media-netns:latest deploy/media-netns
+
+   install -m 0755 -d /usr/local/lib/videofetch
+   install -m 0644 deploy/bin/vf-egress-lib.sh /usr/local/lib/videofetch/
+   install -m 0755 deploy/bin/vf-egress-config-check          /usr/local/sbin/
+   install -m 0755 deploy/bin/vf-egress-policy-install         /usr/local/sbin/
+   install -m 0755 deploy/bin/vf-egress-policy-verify          /usr/local/sbin/
+   install -m 0755 deploy/bin/vf-egress-watchdog               /usr/local/sbin/
+   # Phase-9 acceptance only; not required to run the Worker.
+   install -m 0755 deploy/bin/vf-egress-multicast-route-test   /usr/local/sbin/
+
+   install -m 0644 deploy/nftables/videofetch-egress.nft.template \
+     /etc/videofetch/videofetch-egress.nft.template
+
+   # Non-secret configuration. Both values MUST be filled in; empty is not a
+   # default, and vf-egress-config-check refuses to start the boundary without
+   # them.
+   install -m 0644 deploy/systemd/media-egress.env.example \
+     /etc/videofetch/media-egress.env
+   ```
+
+   `VIDEOFETCH_WORKER_PORT` must equal `WORKER_PORT` in the Worker's own
+   environment file — the holder publishes the port, the Worker binds it, and
+   nothing cross-checks the two.
+
+5. **Start the boundary, the broker, then the Worker.** systemd enforces the
+   order; starting the Worker pulls the rest in.
+
+   ```
+   systemctl enable --now videofetch-media-netns.service
+   systemctl enable --now videofetch-egress-policy.service
+   systemctl enable --now videofetch-egress-watchdog.service
    systemctl enable --now videofetch-r2-broker.service
    systemctl enable --now videofetch-worker.service
    ```
@@ -106,13 +280,31 @@ The order is not a convenience — it is the fail-closed boundary.
 
 ## Fail-closed dependency
 
-`videofetch-worker.service` declares all three of:
+`videofetch-worker.service` declares all three of `Requires=`, `After=` and
+`BindsTo=` on **each** of its four preconditions:
 
 ```
 Requires=videofetch-r2-broker.service
 After=videofetch-r2-broker.service
 BindsTo=videofetch-r2-broker.service
+
+Requires=videofetch-media-netns.service videofetch-egress-policy.service videofetch-egress-watchdog.service
+After=videofetch-media-netns.service videofetch-egress-policy.service videofetch-egress-watchdog.service
+BindsTo=videofetch-media-netns.service videofetch-egress-policy.service videofetch-egress-watchdog.service
 ```
+
+plus two pre-start gates whose failure is fatal — `vf-r2-broker-gid-verify` and
+`vf-egress-policy-verify`. Neither is prefixed with `-`, so neither can fail
+quietly.
+
+| Event | Consequence |
+| :--- | :--- |
+| Namespace absent | Worker cannot start |
+| Policy install or verification fails | Worker cannot start |
+| Watchdog unavailable, crashed or hung | Worker stops — never left unmonitored |
+| Namespace disappears later | Worker stops |
+| Broker disappears later | Worker stops |
+| Boundary invalid after a breach | Worker cannot be restarted |
 
 - `Requires` — the Worker will not start if the broker failed to start.
 - `After` — the Worker starts strictly afterwards, so the socket already exists.
@@ -200,3 +392,47 @@ systemctl is-active videofetch-worker.service                  # expected: inact
 Do **not** "fix" a Worker that cannot reach the broker by reintroducing a
 persistent R2 credential. That is the failure mode this design exists to
 remove.
+
+### Safe egress
+
+```
+# The boundary verifies, right now, in the live namespace.
+vf-egress-policy-verify
+
+# The Worker's ingress is on VM loopback and nowhere else.
+ss -ltnp | grep ":$VIDEOFETCH_WORKER_PORT"      # expect 127.0.0.1, never 0.0.0.0
+
+# The namespace holder is unprivileged and owns no credential.
+docker inspect videofetch-media-netns --format '{{.HostConfig.Privileged}}'   # false
+docker inspect videofetch-media-netns --format '{{.Config.Env}}'
+docker inspect videofetch-media-netns --format '{{.HostConfig.CapAdd}}'       # []
+
+# The Worker cannot alter the policy that contains it.
+docker exec videofetch-worker sh -c 'command -v nft iptables; echo rc=$?'     # not found
+
+# Stopping the boundary stops the Worker, rather than degrading it.
+systemctl stop videofetch-egress-watchdog.service
+systemctl is-active videofetch-worker.service                                 # expect inactive
+```
+
+Do **not** "fix" a Worker that will not start by disabling the verifier,
+loosening a deny class or adding a private-range DNS exception. A Worker that
+cannot start is the boundary working.
+
+---
+
+## Deliberately NOT recovered
+
+These exist on the prototype VM and are **out of scope** for the safe-egress
+boundary. Each belongs to its own bounded task:
+
+`cf-api` · `vf-observer.py` · the real `cloudflared` configuration and tunnel
+credentials · a `cloudflared` service migration · the Lima YAML · macOS launch
+or start wrappers · VM resource sizing · VPN tooling.
+
+The prototype's `vf-worker.service` is **intentionally obsolete** and is not
+recovered: it predates credential delegation, mounts
+`/var/lib/videofetch-proto`, and passes `R2_WRITER_*` placeholders and
+`R2_BUCKET=videofetch-proto-fake` directly to the container. The current
+`videofetch-worker.service` — broker-mediated, holding no R2 credential — is
+authoritative, and the safe-egress dependency was added *to it*.

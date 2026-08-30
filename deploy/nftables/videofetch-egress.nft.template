@@ -1,0 +1,138 @@
+#!/usr/sbin/nft -f
+# VideoFetch media-namespace egress policy — SOURCE TEMPLATE.
+# (PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001)
+#
+# Recovered from the Lima prototype's /etc/videofetch/videofetch-egress.nft and
+# reconciled with docs/architecture/safe-egress.md, which is authoritative for
+# the denied destination classes.
+#
+# THIS FILE IS NOT LOADED DIRECTLY. vf-egress-policy-install renders it into
+# /run/videofetch-egress/policy.rendered.nft, substituting the designated-DNS
+# marker below, and loads THAT into the media network namespace with
+#
+#   nsenter -t <holder-pid> -n nft -f /run/videofetch-egress/policy.rendered.nft
+#
+# run by VM root. The Worker never executes it, never sees it, and holds no
+# capability that could alter it.
+#
+# THE MARKER IS NOT A COMMENT, DELIBERATELY.
+#
+# `@@VIDEOFETCH_DESIGNATED_DNS@@` is invalid nft syntax. If substitution is
+# ever skipped, `nft -f` fails to parse the file and NO policy is installed,
+# rather than quietly installing a policy whose DNS exception silently
+# vanished. A commented-out marker would have failed open-ish and silent; this
+# fails closed and loud.
+
+flush ruleset
+
+table inet videofetch_egress {
+
+  # ── Denied IPv4 destination classes ──────────────────────────────────────
+  #
+  # Verbatim from docs/architecture/safe-egress.md. This set must never be
+  # narrowed for deployment convenience; a resolver that happens to live in
+  # one of these ranges is admitted by its own EXACT-address rule below, never
+  # by widening a class.
+  #
+  # 255.255.255.255/32 is numerically inside 240.0.0.0/4, and nftables interval
+  # sets reject overlapping elements. It is therefore carried as its own
+  # explicit rule with its own counter, so the documented range stays auditable
+  # and independently observable rather than being silently dropped.
+  set forbidden_v4 {
+    type ipv4_addr
+    flags interval
+    elements = {
+      0.0.0.0/8,           # current network
+      10.0.0.0/8,          # RFC1918
+      100.64.0.0/10,       # carrier-grade NAT
+      127.0.0.0/8,         # loopback
+      169.254.0.0/16,      # link-local / cloud metadata
+      172.16.0.0/12,       # RFC1918
+      192.0.0.0/24,        # IETF protocol assignments
+      192.0.2.0/24,        # TEST-NET-1
+      192.168.0.0/16,      # RFC1918
+      198.18.0.0/15,       # benchmark testing
+      198.51.100.0/24,     # TEST-NET-2
+      203.0.113.0/24,      # TEST-NET-3
+      224.0.0.0/4,         # multicast
+      240.0.0.0/4          # reserved (contains 255.255.255.255)
+    }
+  }
+
+  # ── Denied IPv6 destination classes ──────────────────────────────────────
+  #
+  # STRICTLY MORE RESTRICTIVE than the recovered prototype, which denied
+  # ::/128 and ::1/128 separately and covered IPv4-MAPPED but not
+  # IPv4-COMPATIBLE addresses. safe-egress.md requires "IPv4-mapped/compatible
+  # addresses", so the three overlapping classes
+  #
+  #   ::/128        unspecified
+  #   ::1/128       loopback
+  #   ::a.b.c.d     IPv4-compatible (deprecated, but still routed by stacks)
+  #
+  # are expressed as the single interval ::/96, which contains all three.
+  # They cannot be listed separately alongside it: nftables interval sets
+  # reject overlapping elements, and ::/96 contains ::/128 and ::1/128.
+  # Coverage is a superset of the prototype's, never a subset.
+  set forbidden_v6 {
+    type ipv6_addr
+    flags interval
+    elements = {
+      ::/96,               # unspecified + loopback + IPv4-compatible
+      ::ffff:0.0.0.0/96,   # IPv4-mapped
+      64:ff9b::/32,        # NAT64 well-known prefix
+      2001::/32,           # Teredo
+      2002::/16,           # 6to4
+      fc00::/7,            # unique-local (ULA)
+      fe80::/10,           # link-local
+      ff00::/8             # multicast
+    }
+  }
+
+  chain output {
+    # Default-drop. Everything not explicitly accepted below — including any
+    # protocol nobody thought about — is dropped, so the failure direction of
+    # an incomplete rule set is denial, not exposure.
+    type filter hook output priority filter; policy drop;
+
+    # 1. Replies to connections accepted INBOUND.
+    #
+    # Worker ingress arrives from the runtime's published-port proxy on VM
+    # loopback. The response packets are output packets, so without this the
+    # Worker could accept a request and never answer it.
+    ct state established,related counter accept comment "established"
+
+    # 2. The designated resolver(s), by EXACT address and port 53 only.
+    #
+    # Rendered from VIDEOFETCH_MEDIA_DNS_FLAGS by vf-egress-policy-install —
+    # the same single declaration the container runtime is given as `--dns`,
+    # so the resolver the media namespace actually queries and the resolver
+    # the firewall admits cannot drift apart.
+    #
+    # This is the ONLY exception permitted to sit above the deny rules, and it
+    # is what makes a private resolver usable without a private-range hole:
+    # one host, one port, both transports. A resolver inside a denied class is
+    # reachable at its exact address and at nothing else in that class.
+@@VIDEOFETCH_DESIGNATED_DNS@@
+
+    # 3. Forbidden destination classes.
+    #
+    # These sit BELOW the DNS exception and ABOVE the public-media accepts, so
+    # a forbidden destination on port 80 or 443 is rejected rather than
+    # accepted by rule 4. Their counters are the Phase-9 attribution evidence:
+    # a `reject` that increments a named counter proves the firewall denied the
+    # connection, where a bare timeout only proves nothing answered.
+    ip  daddr 255.255.255.255 counter reject with icmp   type admin-prohibited comment "deny-v4-broadcast"
+    ip  daddr @forbidden_v4   counter reject with icmp   type admin-prohibited comment "deny-v4"
+    ip6 daddr @forbidden_v6   counter reject with icmpv6 type admin-prohibited comment "deny-v6"
+
+    # 4. Ordinary public media egress. Object storage is ordinary public
+    #    HTTPS and needs no exception of its own.
+    tcp dport { 80, 443 } counter accept comment "public-http"
+
+    # 5. Everything else — including DNS to any NON-designated resolver, and
+    #    all other UDP — falls through to the chain's drop policy. The counter
+    #    exists so "nothing else happened" is observable rather than assumed.
+    counter comment "fallthrough-drop"
+  }
+}

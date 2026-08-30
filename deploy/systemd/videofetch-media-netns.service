@@ -1,0 +1,98 @@
+# VideoFetch media network-namespace holder.
+# (PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001)
+#
+# Recovered from the Lima prototype's vf-anchor.service. Owns the network
+# namespace that the safe-egress policy is installed INTO and that the Worker
+# later joins with `--network container:videofetch-media-netns`.
+#
+# Nothing here has been provisioned or deployed. The unit is the deployment
+# contract; the referenced configuration file contains no secret in this
+# repository, and no value in it is a credential of any kind.
+#
+# WHAT THIS CONTAINER IS
+#
+# A single statically linked process that waits for SIGTERM, built from
+# deploy/media-netns/. It exists to make the namespace outlive any individual
+# Worker container, so the policy is installed and verified ONCE, before the
+# Worker starts, by something the Worker cannot influence.
+#
+# It replaces the prototype's `alpine:vf` — an image that existed only on one
+# VM and could not be rebuilt from source. See deploy/media-netns/Dockerfile
+# for the supply-chain reasoning.
+
+[Unit]
+Description=VideoFetch media network-namespace holder (owns the netns, holds NO NET_ADMIN)
+Documentation=file:/opt/videofetch/docs/architecture/worker-deployment-runbook.md
+After=docker.service
+Requires=docker.service
+BindsTo=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Non-secret deployment configuration: the loopback ingress port and the
+# designated DNS resolver declaration. See media-egress.env.example.
+EnvironmentFile=/etc/videofetch/media-egress.env
+
+# FAIL-CLOSED GATE. An absent, empty or malformed resolver declaration stops
+# the deployment here.
+#
+# Without it, an empty $VIDEOFETCH_MEDIA_DNS_FLAGS would expand to nothing and
+# the container would silently inherit the host's resolvers — resolvers the
+# egress policy does not admit. The result would be a namespace whose name
+# resolution fails for reasons that look like a network fault. Refuse to start
+# instead.
+ExecStartPre=/usr/local/sbin/vf-egress-config-check
+
+ExecStartPre=-/usr/bin/docker rm -f videofetch-media-netns
+
+# ── Boundary notes ─────────────────────────────────────────────────────────
+#
+# -p 127.0.0.1:...  LOOPBACK ONLY. The Worker is reached by cloudflared running
+#                   on this VM and by nothing else: not the LAN, not the
+#                   Internet, and never through a router forward. A bare
+#                   `-p 8080:8080` would publish on 0.0.0.0 and is forbidden.
+#
+# $VIDEOFETCH_MEDIA_DNS_FLAGS
+#                   Unbraced on purpose: systemd splits `$VAR` at whitespace
+#                   into separate arguments, which is what turns
+#                   `--dns A --dns B` into real repeated flags. `${VAR}` would
+#                   pass the whole string as ONE argument and docker would
+#                   reject it. This is the SAME declaration the firewall
+#                   policy's DNS exception is rendered from, so the resolver
+#                   this namespace queries and the resolver the policy admits
+#                   cannot drift apart.
+#
+#                   The Worker container cannot set --dns itself: docker
+#                   rejects --dns together with `--network container:`. It
+#                   inherits this container's resolv.conf instead, which is
+#                   precisely why the resolver is declared here.
+#
+# --cap-drop=ALL    No NET_ADMIN. The holder owns the namespace but has no
+#                   authority over its policy: VM root installs that from
+#                   outside, via nsenter. A namespace owner that could rewrite
+#                   its own firewall would defeat the ownership model.
+#
+# --read-only       The image has no writable content and needs none.
+#
+# --user 65534      Nothing here needs root. Numeric because the scratch image
+#                   has no /etc/passwd to resolve a name against.
+#
+# No --privileged, no --network host, no Docker socket, no volume, and no
+# environment: this container holds no application, R2 or Cloudflare
+# credential, and has nothing to leak.
+ExecStart=/usr/bin/docker run -d --name videofetch-media-netns \
+  $VIDEOFETCH_MEDIA_DNS_FLAGS \
+  -p 127.0.0.1:${VIDEOFETCH_WORKER_PORT}:${VIDEOFETCH_WORKER_PORT} \
+  --cap-drop=ALL \
+  --security-opt no-new-privileges \
+  --read-only \
+  --user 65534:65534 \
+  --restart no \
+  videofetch-media-netns:latest
+
+ExecStop=-/usr/bin/docker rm -f videofetch-media-netns
+
+[Install]
+WantedBy=multi-user.target
