@@ -17,9 +17,14 @@
 # Step 5 is not decoration. An installer that reports success without
 # verifying teaches an operator to trust a boundary nobody checked.
 #
+# There is deliberately NO "re-baseline the routes only" mode. Correction-01
+# removed it: the only legitimate reason for the route baseline to change is
+# that the namespace was re-established, and that goes through this script in
+# full. A narrower re-baseline entry point would be a way to bless a route
+# change without re-installing the policy it is supposed to accompany.
+#
 # Usage:
 #   vf-egress-policy-install
-#   vf-egress-policy-install --routes-baseline-only   (acceptance tooling only)
 
 set -euo pipefail
 VF_PROG=vf-egress-policy-install
@@ -30,10 +35,8 @@ LIB="${VF_EGRESS_LIB:-/usr/local/lib/videofetch/vf-egress-lib.sh}"
 
 VERIFY="${VF_EGRESS_VERIFY:-/usr/local/sbin/vf-egress-policy-verify}"
 
-MODE=full
 case "${1-}" in
   '') ;;
-  --routes-baseline-only) MODE=routes ;;
   *) vf_die "unknown argument '$1'" ;;
 esac
 
@@ -69,19 +72,6 @@ had lost its routing entirely."; }
   chmod 0400 "$VF_ROUTES_FINGERPRINT"
   rm -f "$tmp"
 }
-
-if [ "$MODE" = routes ]; then
-  # ACCEPTANCE PATH ONLY. vf-egress-multicast-route-test re-baselines the route
-  # fingerprint around the temporary multicast routes it installs, so the
-  # watchdog does not tear the Worker down in the middle of a Phase-9
-  # measurement. It never touches the nftables fingerprint, so the firewall
-  # policy itself is still held to the baseline taken at install.
-  [ -r "$VF_POLICY_FINGERPRINT" ] || vf_die "no policy is installed; there is nothing
-to re-baseline routes against."
-  capture_routes
-  echo "$VF_PROG: route baseline re-captured (netns pid=$PID) - ACCEPTANCE PATH"
-  exit 0
-fi
 
 # ── 2. Render the committed template ───────────────────────────────────────
 [ -r "$VF_POLICY_TEMPLATE" ] || vf_die "policy template $VF_POLICY_TEMPLATE is unreadable"

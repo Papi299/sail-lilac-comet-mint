@@ -230,8 +230,8 @@ has been installed, and the VM still runs the older prototype units.**
 | Phase-9 probe harness | `deploy/acceptance/safe-egress/` |
 | Static + behavioural tests | `src/worker/runtime/safe-egress-deployment-policy.test.ts` |
 
-**Dependency order.** The Worker requires **both** boundaries and may run
-without neither:
+**Dependency order.** The Worker may run **only when both** boundaries are
+present:
 
 ```
 docker.service
@@ -283,6 +283,49 @@ The Worker declares `Requires=` + `After=` + `BindsTo=` on all four, so:
   separate `::/128` and `::1/128`, adding IPv4-**compatible** coverage that
   `safe-egress.md` requires. The three classes cannot be listed separately
   because nftables interval sets reject overlapping elements.
+- **The namespace holder builder is pinned immutably** — an exact Alpine patch
+  tag *and* the manifest-list digest it resolved to, verified against the
+  official registry and confirmed to carry a `linux/arm64` entry. A tag alone,
+  even a patch tag, is mutable and cannot support a reproducibility claim.
+- **Phase-9 multicast acceptance quiesces the boundary rather than racing it.**
+  See §3d.
+
+### 3d. Phase-9 multicast acceptance lifecycle
+
+`deploy/bin/vf-egress-multicast-route-test` must create routes for destinations
+the policy denies, so a denial can be attributed to the rule's counter instead
+of to a missing route. That means mutating the very route table the watchdog
+verifies.
+
+**The production boundary has no acceptance mode.** The verifier and watchdog
+contain no allowance, exemption or bypass for "expected" route deltas, and must
+not acquire one: such an allowance would be live every second of every day for
+the sake of a measurement taken once. The helper instead stops the Worker and
+the watchdog for the measurement window, asserts they really stopped, and
+restarts them only after the boundary verifies again.
+
+| Phase | Action |
+| :--- | :--- |
+| Pre-flight | Full verification must already pass; refuse otherwise. |
+| Quiesce | Stop the Worker, then the watchdog; **assert** both inactive or abort. |
+| Mutate | Record routes, add the minimal test route(s) (`224.0.2.1/32`, `ff0e::1/128`). |
+| Bound | Assert the route delta is *exactly* those routes and the nftables fingerprint is unchanged; abort on anything else. |
+| Measure | Probe from a disposable, unprivileged container joined to the same namespace; read `deny-v4` / `deny-v6`. |
+| Unwind | `EXIT`/signal trap removes the routes, asserts byte-identical restoration, re-verifies the whole boundary. |
+| Resume | Start the watchdog, then the Worker — **only** if everything above succeeded. |
+
+No fingerprint is re-baselined at any point: the recorded route baseline keeps
+describing the clean namespace throughout, so the closing check is a genuine
+comparison against the original state. The installer's `--routes-baseline-only`
+mode was removed outright.
+
+Any failure — unexpected route, altered ruleset, failed probe, interrupt —
+leaves the Worker and watchdog **stopped**. The failure direction is an outage,
+never an unenforced boundary, and the Worker is never running unmonitored
+against a knowingly modified route table.
+
+**Phase 9 is NOT BEGUN and no multicast acceptance has been executed.** This
+helper has never been run against the live VM.
 
 **Not recovered, deliberately.** `cf-api`, `vf-observer.py`, the real
 `cloudflared` configuration and credentials, the Lima YAML, macOS launch
@@ -958,6 +1001,6 @@ authorization.
 | `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **CLOSED — accepted** | Empirically measured and accepted against the real Cloudflare Access Service Auth configuration; the gate is no longer blocking and is not reopened here. Scope note, unchanged: this is an acceptance of the measured INGRESS path, not a source-level property. This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it — that part is still asserted by the control-plane boundary suite. Any change to the ingress topology invalidates the acceptance and requires a re-measurement. |
 | `PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001` | **Source recovery complete; NOT a deployment or an acceptance** | The prototype's enforcement model was recovered from the Lima VM into reviewed source under `deploy/` and reconciled with the trusted-broker architecture (§3a). The live VM was **not modified** — it still runs `vf-anchor`/`vf-policy`/`vf-worker`/`vf-watchdog`, deliberately, so prototype and reconciled source stay comparable. No secret was copied: the only credential-shaped material encountered was clearly-labelled `FAKE_PROTOTYPE_*` placeholders in the stale prototype Worker unit, which is intentionally not recovered. Installing these artefacts is a separate explicit task; acceptance is Phase 9. |
 | `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001` | OPEN — Phase-9 evidence | The prototype acceptance run was performed with the host VPN client loaded but **not connected**. Repeat the suite with it actively connected (including any DNS-interception or mesh features), since that changes host routing beneath the VM. Requires operator interaction. Not a code blocker. |
-| `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | **OPEN — Phase-9 evidence. Tooling added; not executed.** | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Every other range was counter-attributed. `deploy/bin/vf-egress-multicast-route-test` now installs a minimal temporary route so those destinations reach the enforcement point and the denial can be attributed to the rule's own counter. It is acceptance-only: no unit references it, it refuses to run without `--phase9-acceptance` and root, it refuses to run outside a namespace carrying the `inet videofetch_egress` table, it never touches nftables, and an `EXIT`/`INT`/`TERM` trap installed **before** the first route removes everything and re-verifies. **The helper has NOT been run against the live VM**, by instruction. The gate closes only when Phase 9 executes it and records moving counters — a denial with a flat counter is still not evidence. |
+| `SAFE-EGRESS-MULTICAST-ATTRIBUTION-001` | **OPEN — Phase-9 evidence. Tooling added; not executed.** | IPv4 `224.0.0.0/4` and IPv6 `ff00::/8` were denied by absence of a route rather than by an exercised rule, so their counters never incremented. Every other range was counter-attributed. `deploy/bin/vf-egress-multicast-route-test` now installs a minimal temporary route so those destinations reach the enforcement point and the denial can be attributed to the rule's own counter. It is acceptance-only: no unit references it, it refuses to run without `--phase9-acceptance` and root, it refuses to run outside a namespace carrying the `inet videofetch_egress` table, and it never touches nftables. **Corrected in Correction 01:** the first implementation mutated routes and only then re-baselined the route fingerprint, while the watchdog was still subscribed to route events — a race whose outcome depended on scheduling. The helper now *quiesces* the boundary instead (stop Worker → stop watchdog → assert both stopped → mutate → measure → unwind → re-verify → restart), re-baselines nothing, and bounds the permitted route delta to exactly the intended multicast destinations. No bypass was added to the verifier or watchdog. See §3d. **The helper has NOT been run against the live VM**, by instruction. The gate closes only when Phase 9 executes it and records moving counters — a denial with a flat counter is still not evidence. |
 | `SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001` | **IMPLEMENTED — PENDING IN-SITU VERIFICATION** (still open) | The prototype verifier fingerprinted the `nftables` ruleset but not the namespace **route table**. Non-blocking, as before: destination denial was proven to survive route injection, and a route cannot defeat a destination-address deny. Source hardening is now merged — see §3b — combining a baseline-free semantic invariant over policy-routing rules with a runtime route/rule fingerprint captured by the trusted install path and stored under `/run`. The watchdog additionally subscribes to route and link netlink events. **This is source-level implementation validated against recorded fixtures only.** It has never run against the real namespace on the real VM, so it is NOT Phase-9 acceptance and the gate is not closed. |
 | `NPM-LOCKFILE-RECONCILIATION-001` | OPEN — non-blocking for Phase 8A | `package-lock.json` carries a pre-existing devDependency resolution (`nitro` → `unstorage` requires `lru-cache@^11`, the lock pins `5.1.1`) that npm 10 rejects and npm 11 accepts. The Worker image works around it with an exact-pinned ephemeral npm 11 running `ci`; no `npm install` is used and the lockfile is unmodified. Repository maintenance should reconcile it separately. |

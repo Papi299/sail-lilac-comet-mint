@@ -22,18 +22,43 @@
 #
 # PINNING
 #
-# HOLDER_BUILD_BASE names an explicit Alpine PATCH version rather than a
-# floating `alpine:latest` or a bare `alpine:3`. To pin harder, override it
-# with a manifest-list digest at build time:
+# HOLDER_BUILD_BASE is IMMUTABLE by default: an exact patch tag AND the
+# manifest-list (OCI image index) digest that tag resolved to.
+#
+#   alpine:3.22.5@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+#
+# The digest is what actually pins the build. `alpine:3.22.5` alone is a TAG,
+# and a tag is mutable even when it looks specific — Alpine republishes patch
+# tags when a base package is rebuilt. `alpine:3.22` would be worse still: it
+# floats across every patch release. Neither can support a claim that this
+# image is reproducible, so neither is the committed default. The patch tag is
+# retained alongside the digest purely so a human can read which release this
+# is; the digest is the part the runtime honours.
+#
+# VERIFICATION PERFORMED before committing this reference:
+#
+#   1. `alpine:3.22.5` was resolved against the official Docker Hub registry
+#      (`library/alpine`), which reported this manifest-list digest.
+#   2. The digest was confirmed to be the SHA-256 of the returned index
+#      document — i.e. genuinely content-addressed, not merely quoted.
+#   3. Fetching the manifest BY that digest returned byte-identical content.
+#   4. The index was confirmed to contain a `linux/arm64` (v8) entry, which is
+#      the platform the real target actually builds on.
+#
+# NOT verified: this exact digest has never been built or run on the Lima VM.
+# No build was performed as part of that check, and none is claimed.
+#
+# A multi-platform index digest is used deliberately rather than the arm64
+# sub-manifest digest, so the same committed reference stays correct if the
+# image is ever built on a different architecture.
 #
 #   docker build --platform linux/arm64 \
-#     --build-arg HOLDER_BUILD_BASE=alpine@sha256:<manifest-list-digest> \
 #     -t videofetch-media-netns:latest deploy/media-netns
 #
-# A digest is deliberately NOT hard-coded here: this repository has never
-# performed a deployment, so a digest committed now could not have been
-# verified against the registry by anyone who will actually run the build. The
-# operator pins it at provisioning time and records it in the runbook.
+# To move to a newer Alpine, replace BOTH the tag and the digest together, and
+# repeat the verification above. An override is still possible for a private
+# mirror, but the committed default no longer depends on anyone remembering to
+# supply one.
 #
 # ARCHITECTURE
 #
@@ -43,7 +68,7 @@
 # compiled for whatever platform the build runs on. Pass `--platform
 # linux/arm64` explicitly when building from a non-arm64 builder.
 
-ARG HOLDER_BUILD_BASE=alpine:3.22
+ARG HOLDER_BUILD_BASE=alpine:3.22.5@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 
 FROM ${HOLDER_BUILD_BASE} AS build
 

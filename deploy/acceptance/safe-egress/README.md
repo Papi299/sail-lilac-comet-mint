@@ -92,6 +92,13 @@ moved and the result could not be attributed. Use
 `deploy/bin/vf-egress-multicast-route-test` to make those destinations reach
 the enforcement point.
 
+That helper **stops the Worker and the egress watchdog** for the duration of
+the measurement and restarts them only after the boundary verifies again. It
+does not ask the watchdog to tolerate its routes, because the production
+boundary has no tolerance to grant — see `deploy/README.md`. Expect a brief
+deliberate outage while it runs, and expect it to leave the Worker stopped if
+anything about the run was not clean.
+
 ---
 
 ## Getting the probes into the container

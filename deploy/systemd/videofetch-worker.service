@@ -39,7 +39,7 @@ BindsTo=videofetch-r2-broker.service
 # ── THE SECOND BOUNDARY: SAFE EGRESS ───────────────────────────────────────
 # (PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001)
 #
-# The Worker requires BOTH security boundaries and may run without neither.
+# The Worker may run ONLY when BOTH security boundaries are present.
 # The broker governs what it can WRITE; these three units govern where it can
 # CONNECT. They are independent — an AF_UNIX socket is not the network, so the
 # broker path neither depends on nor widens the egress policy — and the Worker

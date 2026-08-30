@@ -13,7 +13,7 @@ safe-egress evidence these artefacts were recovered from. It still runs the
 this source is not deploying it, and deploying it would not be acceptance —
 that is Phase 9. See `docs/architecture/worker-deployment-runbook.md` §3a.
 
-The Worker requires **two independent boundaries** and runs without neither:
+The Worker may run **only when both** of two independent boundaries are present:
 
 | Boundary | Governs | Artefacts |
 | :--- | :--- | :--- |
@@ -93,9 +93,24 @@ The replacement compiles `holder.c` into a static binary and ships it `FROM
 scratch`. The base image is therefore a **build-time** dependency only: the
 running image has no shell, no libc, no package manager and no `/etc`. A
 compromised Worker sharing this namespace gains nothing by reaching the holder,
-because there is nothing there to execute. The base is pinned to an explicit
-patch version and can be pinned to a manifest-list digest with
-`--build-arg HOLDER_BUILD_BASE=alpine@sha256:...` at provisioning time.
+because there is nothing there to execute.
+
+The committed builder default is **immutable on its own** — an exact patch tag
+*and* the manifest-list digest it resolved to:
+
+```
+alpine:3.22.5@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+```
+
+The digest is the part that pins the build. A tag is mutable even when it looks
+specific: Alpine republishes patch tags when a base package is rebuilt, and
+`alpine:3.22` floats across every patch release. Neither can support a claim of
+reproducibility, so the default does not rely on the operator remembering to
+supply a digest override. Before committing this reference the digest was
+resolved against the official `library/alpine` registry, confirmed to be the
+SHA-256 of the returned index document, re-fetched *by digest* and compared
+byte-for-byte, and confirmed to contain a `linux/arm64` (v8) entry. **It has
+never been built or run on the Lima VM**, and no such claim is made.
 
 ```
 docker build --platform linux/arm64 -t videofetch-media-netns:latest deploy/media-netns
@@ -171,6 +186,66 @@ reason takes the Worker with it, so the Worker is never left unmonitored. A
 loop that stops pinging systemd is killed, which lands back on (2). The
 watchdog is `Restart=no` on purpose, and the Worker's pre-start verifier is the
 latch that stops anyone restarting it into a still-broken boundary.
+
+### The Phase-9 multicast acceptance lifecycle
+
+`vf-egress-multicast-route-test` needs routes to exist for destinations the
+policy denies, so the denial can be attributed to the rule's counter rather
+than to a missing route. That means mutating the route table the watchdog is
+watching.
+
+**It quiesces the boundary; it does not negotiate with it.** There is no
+acceptance mode, allowance or exemption anywhere in the verifier or the
+watchdog — teaching the production boundary to tolerate an "expected" route
+delta would put a bypass in the live path every second of every day for the
+sake of a measurement taken once. Instead:
+
+```
+verify the boundary                       must already be intact
+  ↓
+stop videofetch-worker.service            explicitly, first
+stop videofetch-egress-watchdog.service   nothing is watching now
+  ↓  (assert BOTH are really stopped, or abort)
+record the route table
+add the minimal test route(s)             224.0.2.1/32 and ff0e::1/128
+  ↓
+assert the delta is EXACTLY those routes  anything else aborts
+assert the nftables fingerprint is unchanged
+  ↓
+probe from a disposable container joined to the same namespace
+read the deny-v4 / deny-v6 counters
+  ↓  (EXIT trap from here on, and from well before here)
+remove the test routes
+assert the route table is byte-identical to before
+verify the WHOLE boundary
+  ↓  only now
+start videofetch-egress-watchdog.service
+start videofetch-worker.service
+```
+
+Two properties follow, and both matter more than they look:
+
+- **No fingerprint is ever re-baselined.** The recorded route baseline keeps
+  describing the *clean* namespace for the whole run, so the final check is a
+  real comparison against the original recorded state rather than against
+  something the acceptance script wrote moments earlier. The installer's
+  narrow `--routes-baseline-only` mode was removed outright.
+- **The Worker is not running during the window,** so it cannot be running
+  unmonitored. The failure direction is an outage, never an unenforced
+  boundary.
+
+If anything goes wrong — an unexpected route, a changed ruleset, a failed
+probe, a Ctrl-C — the trap still removes the test routes, but the Worker and
+watchdog are **left stopped** and restarting them is a deliberate operator
+action. Nothing is restarted into a boundary that did not verify.
+
+The probe container is disposable and joined to the same network namespace with
+`--cap-drop=ALL`, `--security-opt no-new-privileges`, `--read-only`, non-root
+and no Docker socket, host network or volume. It can emit a packet and nothing
+else.
+
+> A denial with a **flat** counter still means "no route", not "policy". This
+> tooling produces evidence for Phase 9; running it does not close the gate.
 
 ---
 

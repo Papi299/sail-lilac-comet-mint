@@ -1,7 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFile, mkdtemp, mkdir, writeFile, rm, chmod } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -279,14 +279,63 @@ describe("safe-egress deployment policy", () => {
         assert.doesNotMatch(from, /^FROM\s+[\w./-]+\s*$/i, `an unversioned base is a floating tag: ${from}`);
       }
 
-      // The base is an explicit version (or a digest), and is overridable so a
-      // deployment can pin harder.
-      assert.match(holderDockerfile, /ARG\s+HOLDER_BUILD_BASE=\S+:\d+\.\d+/, "explicit base version");
-      assert.match(holderDockerfile, /--build-arg\s+HOLDER_BUILD_BASE=\S*@sha256:/, "documents digest pinning");
+      // CORRECTION 01. The COMMITTED DEFAULT must be immutable on its own,
+      // without the operator remembering to override anything. A tag — even
+      // `alpine:3.22.5` — is mutable: Alpine republishes patch tags when a
+      // base package is rebuilt, so only the digest actually pins the build.
+      const baseArg = /ARG\s+HOLDER_BUILD_BASE=(\S+)/.exec(holderDockerfile)?.[1];
+      assert.ok(baseArg, "HOLDER_BUILD_BASE must have a committed default");
+      assert.match(baseArg!, /@sha256:[0-9a-f]{64}$/, "the default must be pinned by digest");
+      assert.doesNotMatch(baseArg!, /:latest/, "never latest");
+      // And not a bare floating major/minor tag with no digest attached.
+      assert.doesNotMatch(baseArg!, /^[\w./-]+:\d+(\.\d+)?$/, "a bare major/minor tag is not immutable");
+      // The human-readable half should still name an exact patch release.
+      assert.match(baseArg!, /:\d+\.\d+\.\d+@sha256:/, "keep the exact patch tag beside the digest");
 
       // The shipped stage carries nothing but the binary.
       assert.match(fromLines[fromLines.length - 1], /^FROM\s+scratch\b/i, "final stage is FROM scratch");
       assert.match(holderDockerfile, /COPY\s+--from=build\s+\/holder\s+\/holder/);
+    });
+
+    it("ships a runtime stage containing only the holder binary", () => {
+      // Everything after the final FROM is what actually ships. It must be one
+      // COPY and nothing else that adds content: no package install, no shell,
+      // no CA bundle, no credential, no second artefact.
+      const lines = holderDockerfile.split("\n").map((l) => l.trim());
+      const finalFrom = lines.findIndex((l) => /^FROM\s+scratch\b/i.test(l));
+      assert.ok(finalFrom >= 0);
+      const runtime = lines
+        .slice(finalFrom + 1)
+        .filter((l) => l.length > 0 && !l.startsWith("#"));
+
+      const copies = runtime.filter((l) => /^COPY\s/i.test(l));
+      assert.deepEqual(
+        copies,
+        ["COPY --from=build /holder /holder"],
+        "exactly one artefact may be copied into the runtime image",
+      );
+
+      for (const line of runtime) {
+        assert.doesNotMatch(line, /^(RUN|ADD)\s/i, `the runtime stage must not ${line}`);
+        assert.doesNotMatch(line, /\b(apk|apt-get|yum|dnf|pip)\b/i, "no package manager in the runtime stage");
+        assert.doesNotMatch(line, /\b(sh|bash|busybox)\b/, "no shell in the runtime stage");
+      }
+
+      // No credential-shaped declaration anywhere in the image.
+      for (const forbidden of ["R2_", "WORKER_CONTROL", "CLOUDFLARE", "TOKEN", "SECRET"]) {
+        const declarations = holderDockerfile
+          .split("\n")
+          .filter((l) => /^\s*(ENV|ARG)\s/i.test(l))
+          .join("\n");
+        assert.equal(declarations.includes(forbidden), false, `no ${forbidden} in the holder image`);
+      }
+    });
+
+    it("runs the holder as a numeric non-root identity in the image too", () => {
+      const user = /^\s*USER\s+(\S+)/im.exec(holderDockerfile)?.[1];
+      assert.ok(user, "the image must declare USER");
+      assert.match(user!, /^\d+(:\d+)?$/, "numeric: a scratch image has no /etc/passwd to resolve a name");
+      assert.doesNotMatch(user!, /^0(:|$)/, "not uid 0");
     });
 
     it("makes no x86-only assumption, because the target is an M1 Lima VM", () => {
@@ -641,21 +690,77 @@ describe("safe-egress deployment policy", () => {
     });
 
     it("cleans up from a trap that also runs on failure", () => {
-      assert.match(multicastScript, /trap cleanup EXIT INT TERM/);
-      // The trap must be installed BEFORE the first route is added.
-      const trapIndex = multicastScript.indexOf("trap cleanup EXIT");
-      const addIndex = multicastScript.indexOf("route add");
+      assert.match(multicastScript, /trap cleanup EXIT\b/, "an EXIT trap must unwind every path");
+      assert.match(multicastScript, /trap on_signal INT TERM/, "signals need their own handler");
+      // Running cleanup() straight from the signal trap would misread $? as the
+      // status of the interrupted command — usually 0 — and report success.
+      assert.match(multicastScript, /INTERRUPTED=1/);
+      // The trap must be installed BEFORE the first route is added. Compared on
+      // EXECUTABLE lines only: the header comment draws the original race,
+      // `ip route add` included, and prose must not decide this.
+      const executable = executableLines(multicastScript);
+      const trapIndex = executable.indexOf("trap cleanup EXIT");
+      const addIndex = executable.indexOf("route add");
       assert.ok(trapIndex > 0 && addIndex > trapIndex, "the trap must precede any route mutation");
-      assert.match(multicastScript, /route del/, "cleanup must remove what it added");
+      assert.match(executable, /route del/, "cleanup must remove what it added");
     });
 
     it("adds narrow test routes inside the denied ranges, and never weakens policy", () => {
       assert.match(multicastScript, /VF_MULTICAST_V4_TEST:-224\.0\.2\.1\/32/, "a narrow IPv4 test destination");
       assert.match(multicastScript, /VF_MULTICAST_V6_TEST:-ff0e::1\/128/, "a narrow IPv6 test destination");
       assert.doesNotMatch(multicastScript, /nft\s+-f\b/, "it must never load a ruleset");
-      assert.doesNotMatch(multicastScript, /forbidden_v4|forbidden_v6/, "it must never touch the deny sets");
-      // It re-baselines ROUTES only, never the policy fingerprint.
-      assert.match(multicastScript, /--routes-baseline-only/);
+      assert.doesNotMatch(
+        executableLines(multicastScript),
+        /\bnft\b[^\n]*\b(add|delete|flush|insert|replace)\b/,
+        "it must never mutate nftables",
+      );
+    });
+
+    it("NEVER re-baselines a fingerprint (CORRECTION 01)", () => {
+      // The original implementation re-baselined the ROUTE fingerprint while
+      // its test routes were installed, so the stored baseline briefly
+      // described a namespace with acceptance routes in it. The corrected
+      // lifecycle quiesces instead, and the baseline keeps describing the clean
+      // namespace throughout — which is what makes the final verification a
+      // real check rather than a comparison against something this script
+      // wrote moments earlier.
+      const executable = executableLines(multicastScript);
+      assert.doesNotMatch(executable, /--routes-baseline-only/, "no route re-baseline");
+      assert.doesNotMatch(executable, /VF_EGRESS_INSTALL|vf-egress-policy-install/, "the helper must not invoke the installer");
+      assert.doesNotMatch(executable, /expected\.sha256/, "the helper must not write any fingerprint");
+
+      // And the entry point it used is gone from the installer entirely.
+      assert.doesNotMatch(
+        executableLines(installScript),
+        /--routes-baseline-only/,
+        "the narrow re-baseline mode must be removed, not merely unused",
+      );
+    });
+
+    it("quiesces the production boundary instead of racing it (CORRECTION 01)", () => {
+      const executable = executableLines(multicastScript);
+      assert.match(executable, /stop"?\s+"\$WORKER_UNIT"/, "the Worker is stopped for the window");
+      assert.match(executable, /stop"?\s+"\$WATCHDOG_UNIT"/, "the watchdog is stopped for the window");
+      // And it asserts they really stopped rather than assuming.
+      assert.match(executable, /refusing to mutate routes beneath a running Worker/);
+      assert.match(executable, /refusing to mutate routes beneath a running watchdog/);
+    });
+
+    it("introduces no bypass into the production verifier or watchdog", () => {
+      // The alternative fix — teaching the boundary to tolerate an "expected"
+      // route delta — would put an exemption inside the production path, live
+      // every second, for the sake of a measurement taken once.
+      const production = executableLines(verifySource) + "\n" + executableLines(watchdogScript);
+      for (const bypass of [
+        /VF_ACCEPT_ROUTE_CHANGES/,
+        /ACCEPTANCE_MODE/i,
+        /MAINTENANCE/i,
+        /\bbypass\b/i,
+        /\bskip_route/i,
+        /allow_route_delta/i,
+      ]) {
+        assert.doesNotMatch(production, bypass, `no ${bypass} escape hatch may exist in the boundary`);
+      }
     });
 
     it("refuses to run outside the enforced media namespace", () => {
@@ -989,5 +1094,397 @@ vf_canonical_routes  4242 | vf_sha256 > "$VF_RUNDIR/routes.expected.sha256"`;
   it("multicast helper rejects unknown arguments rather than guessing", () => {
     const result = spawnSync("bash", [MULTICAST_SCRIPT, "--yolo"], { env, encoding: "utf8" });
     assert.notEqual(result.status, 0);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// CORRECTION 01 — the multicast acceptance lifecycle must not race the
+// production watchdog.
+//
+// The original implementation mutated routes and only THEN re-baselined the
+// route fingerprint, while the watchdog was still subscribed to route events:
+//
+//     helper                         watchdog
+//     ip route add ...
+//             ── route event ──────>
+//                                    verify -> routes != fingerprint
+//                                    BREACH: stop Worker, exit nonzero
+//     re-baseline routes             (too late)
+//
+// Whether acceptance worked depended on scheduling. These tests pin the
+// corrected ordering deterministically. The FIRST of them fails against the
+// reviewed head 7fd5227, which never stopped anything.
+// ──────────────────────────────────────────────────────────────────────────
+
+const MC_CHAIN = `table inet videofetch_egress {
+\tchain output {
+\t\ttype filter hook output priority filter; policy drop;
+\t\tip daddr @forbidden_v4 counter packets DENYV4 bytes 300 reject with icmp type admin-prohibited comment "deny-v4"
+\t\tip6 daddr @forbidden_v6 counter packets DENYV6 bytes 80 reject with icmpv6 type admin-prohibited comment "deny-v6"
+\t}
+}
+`;
+
+const MC_V4_ROUTES = "default via 10.11.12.1 dev vfnet0 \n10.11.12.0/24 dev vfnet0 proto kernel scope link src 10.11.12.9 \n";
+const MC_V6_ROUTES = "fe80::/64 dev vfnet0 proto kernel metric 256 pref medium\n";
+
+describe("multicast acceptance lifecycle (SAFE-EGRESS-MULTICAST-ATTRIBUTION-001)", () => {
+  let sandbox: string;
+  let helper: string;
+  let env: NodeJS.ProcessEnv;
+
+  const p = (name: string) => join(sandbox, name);
+  const write = (name: string, body: string) => writeFile(p(name), body);
+  const read = async (name: string) => {
+    try {
+      return await readFile(p(name), "utf8");
+    } catch {
+      return "";
+    }
+  };
+
+  /** Unit state as written by the systemctl stub, newline trimmed. */
+  const readUnit = async (unit: string) => (await read(`unit-${unit}`)).trim();
+
+  /** Restores the sandbox to a clean, verified, fully-running boundary. */
+  async function reset(): Promise<void> {
+    await write("v4route", MC_V4_ROUTES);
+    await write("v6route", MC_V6_ROUTES);
+    await write("ruleset", CANONICAL_RULESET);
+    await write("chain", MC_CHAIN);
+    await write("ctr-v4", "0");
+    await write("ctr-v6", "0");
+    await write("pid", "4242\n");
+    await write("unit-videofetch-worker.service", "active");
+    await write("unit-videofetch-egress-watchdog.service", "active");
+    await rm(p("events.log"), { force: true });
+    // Clear every stub flag, so a failing test cannot cascade into the next.
+    for (const flag of ["inject", "probe-hang", "probe-flat", "probing"]) {
+      await rm(p(flag), { force: true });
+    }
+    const result = spawnSync("bash", [VERIFY_SCRIPT], { env, encoding: "utf8" });
+    assert.equal(result.status, 0, `sandbox precondition failed: ${result.stderr}`);
+  }
+
+  function runHelper(args: string[] = ["--phase9-acceptance"]) {
+    return spawnSync("bash", [helper, ...args], { env, encoding: "utf8", timeout: 60_000 });
+  }
+
+  /** The ordered log every stub appends to, as a list of event lines. */
+  async function events(): Promise<string[]> {
+    return (await read("events.log")).split("\n").filter(Boolean);
+  }
+
+  before(async () => {
+    sandbox = await mkdtemp(join(tmpdir(), "vf-multicast-"));
+    const bin = join(sandbox, "bin");
+    await mkdir(bin);
+    await mkdir(join(sandbox, "run"));
+
+    const stubs: Record<string, string> = {
+      // `inject` lets a test simulate something happening concurrently with the
+      // first route mutation — a foreign route, or the policy being altered.
+      ip: `#!/bin/bash
+echo "ip $*" >> "$VT/events.log"
+fam=$1; shift
+case "$fam" in -4) rf="$VT/v4route" ;; -6) rf="$VT/v6route" ;; esac
+case "$1 $2" in
+  "route show") if [ "$3" = default ]; then grep '^default' "$rf"; else cat "$rf"; fi; exit 0 ;;
+  "rule show")  if [ "$fam" = -4 ]; then printf '0:\\tfrom all lookup local\\n32766:\\tfrom all lookup main\\n32767:\\tfrom all lookup default\\n'; else printf '0:\\tfrom all lookup local\\n32766:\\tfrom all lookup main\\n'; fi; exit 0 ;;
+  "route add")
+      if [ -f "$VT/inject" ] && [ "$fam" = -4 ]; then bash "$VT/inject"; fi
+      b=$(printf '%s' "$3" | sed -e 's|/32$||' -e 's|/128$||')
+      echo "$b dev $5 scope link " >> "$rf"; exit 0 ;;
+  "route del")
+      b=$(printf '%s' "$3" | sed -e 's|/32$||' -e 's|/128$||')
+      grep -v "^$b dev " "$rf" > "$rf.t" && mv "$rf.t" "$rf"; exit 0 ;;
+esac
+exit 1
+`,
+      systemctl: `#!/bin/bash
+echo "systemctl $*" >> "$VT/events.log"
+case "$1" in
+  is-active) u="\${3:-$2}"; [ "$(cat "$VT/unit-$u" 2>/dev/null)" = active ] && exit 0 || exit 3 ;;
+  stop)  echo inactive > "$VT/unit-$2"; exit 0 ;;
+  start) echo active   > "$VT/unit-$2"; exit 0 ;;
+esac
+exit 0
+`,
+      docker: `#!/bin/bash
+echo "docker $*" >> "$VT/events.log"
+[ "$1" = inspect ] && { cat "$VT/pid"; exit 0; }
+if [ "$1" = run ]; then
+  touch "$VT/probing"
+  [ -f "$VT/probe-hang" ] && sleep 3
+  eval "host=\\\${$(($#-1))}"
+  if [ -f "$VT/probe-flat" ]; then echo "DENIED(timeout)"; exit 0; fi
+  if [ "\${host#*:}" != "$host" ]; then f=v6; else f=v4; fi
+  n=$(cat "$VT/ctr-$f" 2>/dev/null || echo 0); echo $((n+1)) > "$VT/ctr-$f"
+  echo "DENIED(EHOSTUNREACH)"; exit 0
+fi
+exit 1
+`,
+      nft: `#!/bin/bash
+echo "nft $*" >> "$VT/events.log"
+if [ "$1" = list ] && [ "$2" = ruleset ]; then cat "$VT/ruleset"; exit 0; fi
+if [ "$1" = list ] && [ "$2" = table ]; then exit 0; fi
+if [ "$1" = list ] && [ "$2" = chain ]; then
+  sed -e "s/DENYV4/$(cat "$VT/ctr-v4")/" -e "s/DENYV6/$(cat "$VT/ctr-v6")/" "$VT/chain"; exit 0
+fi
+exit 1
+`,
+      nsenter: `#!/bin/bash\nshift 3\nexec "$@"\n`,
+      sha256sum: `#!/bin/sh\nif command -v shasum >/dev/null 2>&1; then exec shasum -a 256; fi\nexec /usr/bin/sha256sum\n`,
+    };
+    for (const [name, body] of Object.entries(stubs)) {
+      await writeFile(join(bin, name), body);
+      await chmod(join(bin, name), 0o755);
+    }
+
+    await write(
+      "media-egress.env",
+      'VIDEOFETCH_WORKER_PORT=8080\nVIDEOFETCH_MEDIA_DNS_FLAGS="--dns 10.11.12.13"\n',
+    );
+
+    // The shipped helper refuses to run as non-root, and that gate is asserted
+    // separately in the static suite. Here it is neutralized — and ONLY it — so
+    // the lifecycle itself can be exercised without root.
+    const shipped = await readFile(MULTICAST_SCRIPT, "utf8");
+    assert.match(shipped, /\[ "\$\(id -u\)" -eq 0 \] \|\| vf_die/, "the shipped script must gate on root");
+    helper = join(sandbox, "helper-noroot");
+    await writeFile(helper, shipped.replace('[ "$(id -u)" -eq 0 ] || vf_die', "[ 1 -eq 0 ] && vf_die"));
+
+    env = {
+      ...process.env,
+      VT: sandbox,
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      VF_EGRESS_LIB: LIB_SCRIPT,
+      VF_CONFIG_FILE: p("media-egress.env"),
+      VF_RUNDIR: join(sandbox, "run"),
+      VF_NFT: join(bin, "nft"),
+      VF_IP: join(bin, "ip"),
+      VF_DOCKER: join(bin, "docker"),
+      VF_NSENTER: join(bin, "nsenter"),
+      VF_SYSTEMCTL: join(bin, "systemctl"),
+      VF_EGRESS_VERIFY: VERIFY_SCRIPT,
+    };
+
+    // Baseline the fingerprints the way the installer would.
+    await write("v4route", MC_V4_ROUTES);
+    await write("v6route", MC_V6_ROUTES);
+    await write("ruleset", CANONICAL_RULESET);
+    await write("pid", "4242\n");
+    const baseline = spawnSync(
+      "bash",
+      [
+        "-c",
+        `. "$VF_EGRESS_LIB"
+vf_canonical_ruleset 4242 | vf_sha256 > "$VF_RUNDIR/policy.expected.sha256"
+vf_canonical_routes  4242 | vf_sha256 > "$VF_RUNDIR/routes.expected.sha256"`,
+      ],
+      { env, encoding: "utf8" },
+    );
+    assert.equal(baseline.status, 0, baseline.stderr);
+  });
+
+  after(async () => {
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  it("REGRESSION: stops the watchdog BEFORE mutating any route", async () => {
+    // This is the correction. At the reviewed head 7fd5227 the helper issued no
+    // `systemctl stop` at all, so this assertion fails there — the route event
+    // reached a live watchdog and the outcome depended on scheduling.
+    await reset();
+    const result = runHelper();
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+
+    const log = await events();
+    const firstRouteMutation = log.findIndex((line) => /^ip .* route (add|del)\b/.test(line));
+    const watchdogStop = log.findIndex((line) => line === "systemctl stop videofetch-egress-watchdog.service");
+    const workerStop = log.findIndex((line) => line === "systemctl stop videofetch-worker.service");
+
+    assert.ok(watchdogStop >= 0, "the watchdog must be stopped");
+    assert.ok(workerStop >= 0, "the Worker must be stopped");
+    assert.ok(firstRouteMutation >= 0, "a route must have been mutated");
+    assert.ok(
+      watchdogStop < firstRouteMutation,
+      "the watchdog must be stopped BEFORE the first route mutation, not after it",
+    );
+    assert.ok(workerStop < firstRouteMutation, "the Worker must be stopped before the first route mutation");
+    // The Worker goes down first, so it is never the thing BindsTo= drags down.
+    assert.ok(workerStop < watchdogStop, "stop the Worker before the watchdog, explicitly");
+  });
+
+  it("REGRESSION: restarts the watchdog only AFTER the final verification", async () => {
+    await reset();
+    const result = runHelper();
+    assert.equal(result.status, 0, result.stderr);
+
+    const log = await events();
+    const lastRouteDel = log.map((l) => /^ip .* route del\b/.test(l)).lastIndexOf(true);
+    const watchdogStart = log.findIndex((l) => l === "systemctl start videofetch-egress-watchdog.service");
+    const workerStart = log.findIndex((l) => l === "systemctl start videofetch-worker.service");
+
+    assert.ok(lastRouteDel >= 0 && watchdogStart > lastRouteDel, "routes are removed before the watchdog returns");
+    assert.ok(watchdogStart < workerStart, "the watchdog must be watching before the Worker runs again");
+
+    assert.equal(await readUnit("videofetch-worker.service"), "active");
+    assert.equal(await readUnit("videofetch-egress-watchdog.service"), "active");
+  });
+
+  it("never re-baselines either fingerprint across the whole lifecycle", async () => {
+    await reset();
+    const policyBefore = await read("run/policy.expected.sha256");
+    const routesBefore = await read("run/routes.expected.sha256");
+
+    assert.equal(runHelper().status, 0);
+
+    assert.equal(await read("run/policy.expected.sha256"), policyBefore, "nftables baseline untouched");
+    assert.equal(
+      await read("run/routes.expected.sha256"),
+      routesBefore,
+      "the route baseline must keep describing the CLEAN namespace throughout",
+    );
+  });
+
+  it("installs the intended multicast routes and attributes the denial to the rule", async () => {
+    await reset();
+    const result = runHelper();
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /route delta is exactly the intended multicast test route\(s\)/);
+    assert.match(result.stdout, /deny-v4 \+1/, "the IPv4 deny counter must move");
+    assert.match(result.stdout, /deny-v6 \+1/, "the IPv6 deny counter must move");
+    // It reports evidence; it does not claim the gate.
+    assert.match(result.stdout, /does not close the gate/);
+  });
+
+  it("restores the route table exactly, and re-verifies before returning", async () => {
+    await reset();
+    const result = runHelper();
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /route table restored exactly/);
+    assert.match(result.stdout, /boundary verified after cleanup/);
+    assert.equal(await read("v4route"), MC_V4_ROUTES, "IPv4 routes byte-identical");
+    assert.equal(await read("v6route"), MC_V6_ROUTES, "IPv6 routes byte-identical");
+  });
+
+  it("REFUSES an unrelated route change that appears during the window", async () => {
+    // Acceptance mode is bounded to the multicast delta. It is not a licence
+    // for arbitrary route mutation.
+    await reset();
+    await write("inject", `printf '10.66.0.0/16 via 10.11.12.9 dev vfnet0 \\n' >> "$VT/v4route"\n`);
+
+    const result = runHelper();
+    assert.notEqual(result.status, 0, "an unexpected route must abort the run");
+    assert.match(result.stderr, /UNEXPECTED route appeared during the measurement window/);
+
+    // Its own routes are still cleaned up, and production stays DOWN because
+    // the boundary no longer verifies.
+    assert.equal((await read("v4route")).includes("224.0.2.1"), false, "acceptance routes removed anyway");
+    assert.equal(await readUnit("videofetch-worker.service"), "inactive");
+    assert.equal(await readUnit("videofetch-egress-watchdog.service"), "inactive");
+    assert.match(result.stderr, /LEAVING/);
+  });
+
+  it("leaves production STOPPED if the boundary does not verify after cleanup", async () => {
+    await reset();
+    // Something alters the firewall during the window.
+    await write("inject", `sed -i.b 's/{ 80, 443 }/{ 80, 443, 9999 }/' "$VT/ruleset"\n`);
+
+    const result = runHelper();
+    assert.notEqual(result.status, 0);
+    assert.equal(await readUnit("videofetch-worker.service"), "inactive", "never restart into an unverified boundary");
+    assert.equal(await readUnit("videofetch-egress-watchdog.service"), "inactive");
+    await write("ruleset", CANONICAL_RULESET);
+  });
+
+  it("aborts if the nftables ruleset changes during the window", async () => {
+    await reset();
+    await write("inject", `sed -i.b 's/{ 80, 443 }/{ 80, 443, 4444 }/' "$VT/ruleset"\n`);
+    const result = runHelper();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /nftables ruleset changed during the measurement window|allow shape mismatch/);
+    await write("ruleset", CANONICAL_RULESET);
+  });
+
+  it("cleans up on a SIGNAL, and says accurately why it stopped", async () => {
+    await reset();
+    await write("probe-hang", "1");
+    await rm(p("probing"), { force: true });
+
+    const child = spawn("bash", [helper, "--phase9-acceptance"], { env });
+    let output = "";
+    child.stdout.on("data", (c) => (output += c));
+    child.stderr.on("data", (c) => (output += c));
+
+    // Wait until it is genuinely inside the measurement window.
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      try {
+        await readFile(p("probing"));
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+    child.kill("SIGINT");
+    const code: number | null = await new Promise((resolve) => child.on("close", resolve));
+
+    assert.notEqual(code, 0, "an interrupted acceptance run must not report success");
+    assert.match(output, /route table restored exactly/, "the trap must fire on a signal");
+    assert.equal((await read("v4route")).includes("224.0.2.1"), false, "no acceptance route left behind");
+    assert.equal((await read("v6route")).includes("ff0e::1"), false);
+    // The boundary is fine; production is left down deliberately, and the
+    // message must not claim a verification failure that did not happen.
+    assert.match(output, /boundary verified after cleanup/);
+    assert.match(output, /run did not complete cleanly/);
+    assert.doesNotMatch(output, /does NOT verify after cleanup/);
+
+    await rm(p("probe-hang"), { force: true });
+  });
+
+  it("reports a flat counter as NOT attributable rather than as a pass", async () => {
+    await reset();
+    await write("probe-flat", "1");
+    const result = runHelper();
+    assert.notEqual(result.status, 0, "a flat counter is not a pass");
+    assert.match(result.stderr, /did not increment - the denial is NOT yet attributable/);
+    // Cleanup still happened.
+    assert.equal(await read("v4route"), MC_V4_ROUTES);
+    await rm(p("probe-flat"), { force: true });
+  });
+
+  it("restores normal verifier and watchdog behaviour afterwards", async () => {
+    await reset();
+    assert.equal(runHelper().status, 0);
+
+    // The verifier passes on the restored boundary...
+    assert.equal(spawnSync("bash", [VERIFY_SCRIPT], { env, encoding: "utf8" }).status, 0);
+
+    // ...and an UNAUTHORIZED route change is once again a breach, with no
+    // lingering acceptance allowance.
+    await write("v4route", `${MC_V4_ROUTES}10.77.0.0/16 via 10.11.12.9 dev vfnet0 \n`);
+    const after = spawnSync("bash", [VERIFY_SCRIPT], { env, encoding: "utf8" });
+    assert.equal(after.status, 1);
+    assert.match(after.stderr, /ROUTE TABLE mutated/);
+    await write("v4route", MC_V4_ROUTES);
+  });
+
+  it("refuses to mutate anything if the boundary does not verify up front", async () => {
+    await reset();
+    await write("v4route", `${MC_V4_ROUTES}10.88.0.0/16 via 10.11.12.9 dev vfnet0 \n`);
+    await rm(p("events.log"), { force: true });
+
+    const result = runHelper();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /does not currently verify/);
+
+    // Nothing was stopped and nothing was mutated.
+    const log = await events();
+    assert.equal(log.some((l) => /^systemctl stop/.test(l)), false, "must not stop units before deciding to run");
+    assert.equal(log.some((l) => /route (add|del)/.test(l)), false, "must not touch routes");
+    assert.equal(await readUnit("videofetch-worker.service"), "active", "production untouched");
+    await write("v4route", MC_V4_ROUTES);
   });
 });

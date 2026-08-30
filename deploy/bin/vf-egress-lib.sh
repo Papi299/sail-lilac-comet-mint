@@ -264,6 +264,33 @@ vf_sha256() {
   sha256sum | awk '{print $1}'
 }
 
+# Packet count of the rule carrying an exact comment, e.g. `deny-v4`.
+#
+# Counter attribution is what separates "the firewall denied this" from "there
+# was no route", which is the whole content of
+# SAFE-EGRESS-MULTICAST-ATTRIBUTION-001.
+#
+# The comment is matched WITH its closing quote so `deny-v4` cannot also match
+# `deny-v4-broadcast`.
+vf_rule_counter() {
+  local pid="$1" comment="$2"
+  vf_in_ns "$pid" "$VF_NFT" list chain inet videofetch_egress output 2>/dev/null \
+    | grep -F "comment \"$comment\"" \
+    | sed -nE 's/.*counter packets ([0-9]+).*/\1/p' \
+    | head -n 1
+}
+
+# `ip route show` prints a host route without its prefix length: a route added
+# as `224.0.2.1/32` reads back as `224.0.2.1`. Both spellings name the same
+# route, so comparisons must accept either.
+vf_strip_host_prefix() {
+  case "$1" in
+    */32)  printf '%s' "${1%/32}" ;;
+    */128) printf '%s' "${1%/128}" ;;
+    *)     printf '%s' "$1" ;;
+  esac
+}
+
 # ── Required deny classes ──────────────────────────────────────────────────
 #
 # Authoritative source: docs/architecture/safe-egress.md. The verifier asserts
