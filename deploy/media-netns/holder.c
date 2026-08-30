@@ -36,6 +36,12 @@
  * there are no zombies to reap.
  */
 
+/* <stddef.h> for NULL, which sigprocmask(2) takes as its third argument.
+ * It is included explicitly because the C standard defines NULL there, not
+ * in <signal.h>. glibc happens to expose it transitively; musl does not, so
+ * relying on that made the build succeed on some libcs and fail on the
+ * pinned Alpine builder under -Wall -Wextra -Werror. */
+#include <stddef.h>
 #include <signal.h>
 
 int main(void) {
