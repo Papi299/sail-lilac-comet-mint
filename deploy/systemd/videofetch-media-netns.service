@@ -27,6 +27,15 @@ After=docker.service
 Requires=docker.service
 BindsTo=docker.service
 
+# The namespace is created with --dns <designated resolver>, so the resolver has
+# to exist before the namespace does. Ordering and a start-time requirement, but
+# deliberately NOT BindsTo=: a transient DNS fault must not tear down the
+# namespace and force the whole policy to be reinstalled. Losing the resolver is
+# a functional fault, and it is the Worker that stops for it, not the boundary.
+# (PRODUCTION-DNS-RESOLVER-001)
+After=videofetch-media-dns.service
+Requires=videofetch-media-dns.service
+
 [Service]
 Type=oneshot
 RemainAfterExit=yes

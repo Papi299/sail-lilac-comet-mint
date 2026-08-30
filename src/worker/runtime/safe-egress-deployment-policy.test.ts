@@ -2,6 +2,8 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFile, mkdtemp, mkdir, writeFile, rm, chmod } from "node:fs/promises";
 import { spawnSync, spawn } from "node:child_process";
+import dgram from "node:dgram";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -42,6 +44,10 @@ const EGRESS_ENV_TEMPLATE = join(SYSTEMD, "media-egress.env.example");
 const NFT_TEMPLATE = join(DEPLOY, "nftables", "videofetch-egress.nft.template");
 const HOLDER_DOCKERFILE = join(DEPLOY, "media-netns", "Dockerfile");
 const HOLDER_SOURCE = join(DEPLOY, "media-netns", "holder.c");
+
+const DNS_UNIT = join(SYSTEMD, "videofetch-media-dns.service");
+const RESOLVED_DROPIN = join(SYSTEMD, "resolved.conf.d", "10-videofetch-media-dns.conf.example");
+const DNS_CHECK_SCRIPT = join(BIN, "vf-media-dns-check");
 
 const VERIFY_SCRIPT = join(BIN, "vf-egress-policy-verify");
 const WATCHDOG_SCRIPT = join(BIN, "vf-egress-watchdog");
@@ -535,6 +541,35 @@ describe("safe-egress deployment policy", () => {
   });
 
   // ────────────────────────────────────────────────────────────────────────
+  describe("DNS firewall exception is unchanged by the resolver work", () => {
+    it("still renders exactly one host on port 53, both transports, no range", () => {
+      // The exception is RENDERED by the installer from the validated resolver
+      // list; the template only carries the marker. Making the resolver durable
+      // must not have widened either half.
+      assert.match(nftTemplate, /^@@VIDEOFETCH_DESIGNATED_DNS@@$/m, "the template still substitutes, never hard-codes");
+      const executable = executableLines(installScript);
+      assert.match(executable, /daddr %s udp dport 53 counter accept comment "designated-dns-udp"/);
+      assert.match(executable, /daddr %s tcp dport 53 counter accept comment "designated-dns-tcp"/);
+      // Rendered from vf_dns_resolvers, which rejects anything that is not an
+      // exact address, so no prefix can reach the ruleset.
+      assert.match(executable, /vf_dns_resolvers/);
+      assert.doesNotMatch(executable, /dport\s+\{[^}]*53/, "53 must never be folded into a port set");
+    });
+
+    it("adds no broad private-range allowance anywhere in the policy", () => {
+      const executable = executableLines(nftTemplate);
+      for (const broad of [/10\.0\.0\.0\/8[^\n]*accept/, /172\.16\.0\.0\/12[^\n]*accept/, /192\.168\.0\.0\/16[^\n]*accept/]) {
+        assert.doesNotMatch(executable, broad, "no broad private range may be accepted");
+      }
+      const acceptedPorts = [...executable.matchAll(/dport\s+\{?\s*([0-9,\s]+)\}?/g)]
+        .flatMap((m) => m[1].split(",").map((p) => p.trim()))
+        .filter(Boolean);
+      for (const port of acceptedPorts) {
+        assert.ok(["80", "443"].includes(port), `unexpected accepted port ${port} in the template`);
+      }
+    });
+  });
+
   describe("nftables policy template", () => {
     it("denies every required IPv4 class", () => {
       const set = /set\s+forbidden_v4\s*\{([\s\S]*?)\}/.exec(nftTemplate)?.[1];
@@ -703,6 +738,138 @@ describe("safe-egress deployment policy", () => {
   });
 
   // ────────────────────────────────────────────────────────────────────────
+  // ────────────────────────────────────────────────────────────────────────
+  describe("designated DNS resolver readiness (PRODUCTION-DNS-RESOLVER-001)", () => {
+    let dnsUnit: string[];
+    let dnsUnitSource: string;
+    let dropIn: string;
+    let dnsCheck: string;
+
+    before(async () => {
+      dnsUnitSource = await readFile(DNS_UNIT, "utf8");
+      dnsUnit = parseUnit(dnsUnitSource);
+      dropIn = await readFile(RESOLVED_DROPIN, "utf8");
+      dnsCheck = await readFile(DNS_CHECK_SCRIPT, "utf8");
+    });
+
+    it("declares exactly one extra stub listener, and commits no address", () => {
+      // Same convention as media-egress.env.example and the nftables template:
+      // no deployment address is committed, because a committed address is one
+      // that can silently disagree with the host it is installed on.
+      const listeners = dropIn
+        .split("\n")
+        .filter((l) => !/^\s*#/.test(l))
+        .filter((l) => /^\s*DNSStubListenerExtra\s*=/.test(l))
+        .map((l) => l.slice(l.indexOf("=") + 1).trim());
+
+      assert.equal(listeners.length, 1, "exactly one extra stub listener is declared");
+      assert.equal(listeners[0], "", "the example must ship with no value filled in");
+    });
+
+    it("commits no wildcard listener, which would expose a resolver to the LAN", () => {
+      const executable = dropIn.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+      for (const wildcard of [/DNSStubListenerExtra\s*=\s*0\.0\.0\.0/, /DNSStubListenerExtra\s*=\s*::\s*$/, /DNSStubListenerExtra\s*=\s*\*/]) {
+        assert.doesNotMatch(executable, wildcard, "the resolver must never bind a wildcard address");
+      }
+      assert.doesNotMatch(executable, /DNSStubListenerExtra\s*=\s*\S+\//, "a prefix is not an address");
+      // DNSStubListener= (the loopback stub) must not be disturbed: turning it
+      // off would break the VM's own resolution.
+      assert.doesNotMatch(executable, /^\s*DNSStubListener\s*=/m, "the loopback stub must be left alone");
+    });
+
+    it("derives the probed address from config, never from the drop-in", () => {
+      // Agreement between the two files is proved at RUNTIME rather than
+      // asserted textually: the probe reads media-egress.env, so a drop-in
+      // binding anything else fails readiness instead of passing quietly.
+      const executable = executableLines(dnsCheck);
+      assert.match(executable, /vf_config_load/, "config is the source of truth");
+      assert.match(executable, /vf_dns_resolvers/, "addresses come from the shared parser");
+      assert.doesNotMatch(executable, /resolved\.conf|DNSStubListenerExtra/, "the probe must not read the drop-in");
+    });
+
+    it("orders the resolver in FRONT of the namespace holder and the Worker", () => {
+      // The defect this closes: a fresh boot reported six active units, a
+      // healthy Worker and a passing verifier with no resolver in existence.
+      assert.ok(
+        tokens(netnsUnit, "After").includes("videofetch-media-dns.service"),
+        "the holder must be ordered after resolver readiness",
+      );
+      assert.ok(
+        tokens(netnsUnit, "Requires").includes("videofetch-media-dns.service"),
+        "and must require it, so a boot cannot silently omit it",
+      );
+      for (const directive of ["After", "Requires", "BindsTo"]) {
+        assert.ok(
+          tokens(workerUnit, directive).includes("videofetch-media-dns.service"),
+          `the Worker must declare ${directive}= on resolver readiness`,
+        );
+      }
+    });
+
+    it("does not weaken any existing security dependency", () => {
+      for (const unit of ["videofetch-media-netns.service", "videofetch-egress-policy.service", "videofetch-egress-watchdog.service"]) {
+        for (const directive of ["Requires", "After", "BindsTo"]) {
+          assert.ok(
+            tokens(workerUnit, directive).includes(unit),
+            `${directive}=${unit} must survive the DNS change`,
+          );
+        }
+      }
+      // The holder must NOT bind to DNS: a transient resolver fault must not
+      // tear down the namespace and force the policy to be reinstalled.
+      assert.equal(
+        tokens(netnsUnit, "BindsTo").includes("videofetch-media-dns.service"),
+        false,
+        "a DNS blip must not destroy the enforced namespace",
+      );
+    });
+
+    it("runs the readiness probe as the unit's own work, with no capabilities", () => {
+      assert.ok(
+        values(dnsUnit, "ExecStart").some((v) => v.includes("vf-media-dns-check")),
+        "the unit must run the readiness probe",
+      );
+      assert.ok(values(dnsUnit, "Type").includes("notify"), "readiness must be announced, not assumed");
+      assert.ok(values(dnsUnit, "Restart").includes("no"), "fail closed like the egress watchdog");
+      assert.deepEqual(values(dnsUnit, "CapabilityBoundingSet"), [""], "emitting a DNS query needs no capability");
+      assert.ok(values(dnsUnit, "NoNewPrivileges").includes("yes"));
+    });
+
+    it("keeps FUNCTIONAL readiness separate from SECURITY verification", () => {
+      // A DNS outage must not be reportable as a boundary breach, and a breach
+      // must not be maskable by DNS being fine.
+      assert.doesNotMatch(
+        executableLines(dnsCheck),
+        /vf-egress-policy-verify/,
+        "the readiness probe must not invoke the security verifier",
+      );
+      assert.doesNotMatch(
+        executableLines(verifySource),
+        /vf-media-dns-check|dns.*readiness/i,
+        "the security verifier must not depend on DNS working",
+      );
+      assert.doesNotMatch(
+        executableLines(watchdogScript),
+        /vf-media-dns-check/,
+        "the egress watchdog must not depend on DNS working",
+      );
+    });
+
+    it("probes only the configured resolver and never falls back to a public one", () => {
+      const executable = executableLines(dnsCheck);
+      assert.match(executable, /vf_dns_resolvers/, "addresses come from the shared config parser");
+      for (const public_ of [/\b8\.8\.8\.8\b/, /\b1\.1\.1\.1\b/, /\b9\.9\.9\.9\b/, /\b208\.67\./]) {
+        assert.doesNotMatch(executable, public_, "no public resolver may be baked in as a fallback");
+      }
+      assert.match(executable, /VF_DNS_PROBE_PORT:-53/, "port 53 is the only port the policy admits");
+    });
+
+    it("checks BOTH transports, because the policy admits both", () => {
+      const executable = executableLines(dnsCheck);
+      assert.match(executable, /for proto in udp tcp/, "UDP and TCP are both admitted and both must answer");
+    });
+  });
+
   describe("multicast attribution helper (SAFE-EGRESS-MULTICAST-ATTRIBUTION-001)", () => {
     it("is unreachable from the production startup path", () => {
       for (const [name, unit] of [
@@ -804,6 +971,71 @@ describe("safe-egress deployment policy", () => {
 
     it("refuses to run outside the enforced media namespace", () => {
       assert.match(multicastScript, /list table inet videofetch_egress/);
+    });
+
+    // ── CORRECTION 02 ────────────────────────────────────────────────────
+    //
+    // Phase 9 ran the TCP version against the live boundary and the deny
+    // counters stayed flat, because Linux rejects TCP to a multicast
+    // destination in the socket layer before netfilter sees a packet. A probe
+    // that cannot reach the rule cannot attribute anything to it.
+    it("probes multicast with UDP, never TCP", () => {
+      const executable = executableLines(multicastScript);
+      assert.match(executable, /require\("node:dgram"\)/, "the probe must use UDP datagrams");
+      assert.match(executable, /createSocket\(/, "a dgram socket is how the datagram is emitted");
+      assert.doesNotMatch(
+        executable,
+        /require\("node:net"\)|new net\.Socket|\.connect\(\{/,
+        "no TCP socket may remain: TCP to a multicast address never reaches the output hook",
+      );
+    });
+
+    it("emits one bounded datagram for each family", () => {
+      const executable = executableLines(multicastScript);
+      // udp4/udp6 chosen from the destination, so both families are exercised
+      // by the same probe rather than only IPv4 working.
+      assert.match(executable, /udp6.*udp4|udp4.*udp6/s, "both IPv6 and IPv4 sockets must be reachable");
+      assert.match(executable, /\.send\(/, "exactly one send() is the probe");
+      assert.match(executable, /setTimeout\(/, "the probe must be bounded, never able to wedge the run");
+      assert.match(executable, /deny-v4/, "IPv4 attribution rule");
+      assert.match(executable, /deny-v6/, "IPv6 attribution rule");
+    });
+
+    it("still treats a flat counter as failure after the protocol change", () => {
+      const executable = executableLines(multicastScript);
+      // The dangerous "fix" would have been to accept the flat TCP result.
+      assert.match(
+        executable,
+        /if \[ "\$\(\(after - before\)\)" -le 0 \]; then/,
+        "no counter movement must still be a failure",
+      );
+      assert.match(executable, /NOT yet attributable/, "and must say so");
+      assert.doesNotMatch(
+        executable,
+        /ENETUNREACH\)?\s*\)?\s*&&\s*(return 0|PROBE_RC=0)|treat.*flat.*as.*(pass|success)/i,
+        "a flat counter may never be converted into success",
+      );
+    });
+
+    it("keeps the disposable probe container unprivileged after the change", () => {
+      const executable = executableLines(multicastScript);
+      assert.match(executable, /--cap-drop=ALL/);
+      assert.match(executable, /--security-opt no-new-privileges/);
+      assert.match(executable, /--read-only/);
+      assert.match(executable, /--user 65534:65534/);
+      assert.match(executable, /--network "container:\$VF_NETNS_CONTAINER"/);
+      for (const forbidden of [/--privileged/, /--cap-add/, /NET_ADMIN/, /SYS_ADMIN/, /--network host/, /docker\.sock/]) {
+        assert.doesNotMatch(executable, forbidden, `the probe container must never use ${forbidden}`);
+      }
+    });
+
+    it("leaves the quiesce/restore state machine and fingerprint handling untouched", () => {
+      const executable = executableLines(multicastScript);
+      assert.match(executable, /STATE=quiesced/);
+      assert.match(executable, /STATE=mutated/);
+      assert.match(executable, /route table did NOT return to its original state/);
+      assert.doesNotMatch(executable, /expected\.sha256/, "still never writes a fingerprint");
+      assert.match(executable, /trap cleanup EXIT\b/);
     });
   });
 });
@@ -1501,8 +1733,9 @@ vf_canonical_routes  4242 | vf_sha256 > "$VF_RUNDIR/routes.expected.sha256"`,
     assert.match(result.stdout, /route delta is exactly the intended multicast test route\(s\)/);
     assert.match(result.stdout, /deny-v4 \+1/, "the IPv4 deny counter must move");
     assert.match(result.stdout, /deny-v6 \+1/, "the IPv6 deny counter must move");
-    // It reports evidence; it does not claim the gate.
-    assert.match(result.stdout, /does not close the gate/);
+    // A moving counter is the attribution. A flat one is still a failure, and
+    // that is asserted separately.
+    assert.match(result.stdout, /a moving counter attributes the denial to the rule itself/);
   });
 
   it("restores the route table exactly, and re-verifies before returning", async () => {
@@ -1632,5 +1865,245 @@ vf_canonical_routes  4242 | vf_sha256 > "$VF_RUNDIR/routes.expected.sha256"`,
     assert.equal(log.some((l) => /route (add|del)/.test(l)), false, "must not touch routes");
     assert.equal(await readUnit("videofetch-worker.service"), "active", "production untouched");
     await write("v4route", MC_V4_ROUTES);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// BEHAVIOURAL: run the readiness probe against a real resolver, and against
+// its absence. (PRODUCTION-DNS-RESOLVER-001)
+//
+// Static assertions cannot tell a probe that reports readiness correctly from
+// one that reports it unconditionally — which is precisely the failure mode
+// this whole gate exists to catch, since the stack already once reported six
+// healthy units with no resolver in existence.
+// ──────────────────────────────────────────────────────────────────────────
+describe("designated DNS readiness behaviour (PRODUCTION-DNS-RESOLVER-001)", () => {
+  let sandbox: string;
+  let configFile: string;
+
+  /**
+   * Minimal DNS responder: echoes the transaction id, sets the response bit and
+   * answers NXDOMAIN. Deliberately the *least* a real resolver would do, so the
+   * probe cannot be passing because of something richer.
+   */
+  function reply(query: Buffer): Buffer {
+    const header = Buffer.alloc(12);
+    query.copy(header, 0, 0, 12);
+    header.writeUInt16BE(0x8183, 2); // QR=1, RD=1, RA=1, rcode=NXDOMAIN
+    header.writeUInt16BE(1, 4);
+    header.writeUInt16BE(0, 6);
+    header.writeUInt16BE(0, 8);
+    header.writeUInt16BE(0, 10);
+    return Buffer.concat([header, query.subarray(12)]);
+  }
+
+  /**
+   * Starts the requested transports on `port`; returns a stop function.
+   *
+   * Cleans up partially-opened transports if the second one fails to bind.
+   * Leaking a bound socket here would keep the test runner's event loop alive
+   * forever after an unrelated failure.
+   */
+  async function serve(port: number, opts: { udp: boolean; tcp: boolean }): Promise<() => Promise<void>> {
+    let udp: dgram.Socket | null = null;
+    let tcp: net.Server | null = null;
+
+    const stop = async () => {
+      if (udp) await new Promise<void>((resolve) => udp!.close(() => resolve()));
+      if (tcp) await new Promise<void>((resolve) => tcp!.close(() => resolve()));
+      udp = null;
+      tcp = null;
+    };
+
+    try {
+      if (opts.udp) {
+        const socket = dgram.createSocket("udp4");
+        socket.on("message", (msg, rinfo) => socket.send(reply(msg), rinfo.port, rinfo.address));
+        await new Promise<void>((resolve, reject) => {
+          socket.once("error", reject);
+          socket.bind(port, "127.0.0.1", () => {
+            socket.removeAllListeners("error");
+            socket.on("error", () => {});
+            resolve();
+          });
+        });
+        udp = socket;
+      }
+
+      if (opts.tcp) {
+        const server = net.createServer((socket) => {
+          const chunks: Buffer[] = [];
+          socket.on("data", (d) => {
+            chunks.push(d);
+            const all = Buffer.concat(chunks);
+            if (all.length < 2) return;
+            const want = all.readUInt16BE(0);
+            if (all.length < 2 + want) return;
+            const body = reply(all.subarray(2, 2 + want));
+            const framed = Buffer.alloc(2 + body.length);
+            framed.writeUInt16BE(body.length, 0);
+            body.copy(framed, 2);
+            socket.end(framed);
+          });
+          socket.on("error", () => socket.destroy());
+        });
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(port, "127.0.0.1", () => {
+            server.removeAllListeners("error");
+            server.on("error", () => {});
+            resolve();
+          });
+        });
+        tcp = server;
+      }
+    } catch (error) {
+      await stop();
+      throw error;
+    }
+
+    return stop;
+  }
+
+  /**
+   * Binds the requested transports on a port that is free for BOTH protocols.
+   *
+   * A free UDP port does not imply a free TCP port — they are separate spaces —
+   * so the port is chosen by actually binding what the test needs, retrying on
+   * a collision with anything else running on the machine.
+   */
+  async function serveOnFreePort(opts: { udp: boolean; tcp: boolean }): Promise<{ port: number; stop: () => Promise<void> }> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const port = await freePort();
+      try {
+        // Always claim both protocols while choosing, so a later test that
+        // needs the other transport on this number cannot collide either.
+        const stop = await serve(port, opts);
+        return { port, stop };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError ?? new Error("could not find a port free on both protocols");
+  }
+
+  /** A candidate ephemeral port, free for TCP at the moment it is chosen. */
+  async function freePort(): Promise<number> {
+    const probe = net.createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const { port } = probe.address() as net.AddressInfo;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    return port;
+  }
+
+  /**
+   * ASYNC on purpose. The DNS responder above lives in this very process, so a
+   * spawnSync() here would block the event loop for the whole run and the
+   * responder could never answer — every probe would time out and the
+   * "not ready" cases would pass for entirely the wrong reason.
+   */
+  function run(
+    port: number,
+    extraEnv: NodeJS.ProcessEnv = {},
+  ): Promise<{ status: number | null; stdout: string; stderr: string }> {
+    return new Promise((resolve) => {
+      const child = spawn("bash", [DNS_CHECK_SCRIPT], {
+        env: {
+          ...process.env,
+          VF_CONFIG_FILE: configFile,
+          VF_EGRESS_LIB: LIB_SCRIPT,
+          VF_DNS_PROBE_PORT: String(port),
+          VF_DNS_PROBE_TIMEOUT: "2",
+          ...extraEnv,
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => (stdout += d));
+      child.stderr.on("data", (d) => (stderr += d));
+      const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+      child.on("close", (status) => {
+        clearTimeout(timer);
+        resolve({ status, stdout, stderr });
+      });
+    });
+  }
+
+  before(async () => {
+    sandbox = await mkdtemp(join(tmpdir(), "vf-dns-"));
+    configFile = join(sandbox, "media-egress.env");
+    await writeFile(
+      configFile,
+      'VIDEOFETCH_WORKER_PORT=8080\nVIDEOFETCH_MEDIA_DNS_FLAGS="--dns 127.0.0.1"\n',
+    );
+  });
+
+  after(async () => {
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  it("reports NOT ready when nothing is listening", async () => {
+    const result = await run(await freePort());
+    assert.notEqual(result.status, 0, "an absent resolver must fail the gate");
+    assert.match(result.stderr, /NO ANSWER/, "and must say the resolver did not answer");
+    // The wording must not let a reader mistake this for a boundary breach.
+    assert.match(result.stderr, /FUNCTIONAL fault, not a boundary breach/);
+  });
+
+  it("reports ready when a resolver answers on BOTH transports", async () => {
+    const { port, stop } = await serveOnFreePort({ udp: true, tcp: true });
+    try {
+      const result = await run(port);
+      assert.equal(result.status, 0, `expected readiness, got: ${result.stderr}`);
+      assert.match(result.stdout, /OK \(every designated resolver answers\)/);
+    } finally {
+      await stop();
+    }
+  });
+
+  it("reports NOT ready when only UDP answers", async () => {
+    const { port, stop } = await serveOnFreePort({ udp: true, tcp: false });
+    try {
+      const result = await run(port);
+      assert.notEqual(result.status, 0, "the policy admits TCP 53 too; half a resolver is not ready");
+      assert.match(result.stderr, /tcp\/\d+ -> NO ANSWER/);
+    } finally {
+      await stop();
+    }
+  });
+
+  it("reports NOT ready when only TCP answers", async () => {
+    const { port, stop } = await serveOnFreePort({ udp: false, tcp: true });
+    try {
+      const result = await run(port);
+      assert.notEqual(result.status, 0, "UDP is the primary transport and must answer");
+      assert.match(result.stderr, /udp\/\d+ -> NO ANSWER/);
+    } finally {
+      await stop();
+    }
+  });
+
+  it("refuses a configuration whose resolver is not an exact address", async () => {
+    const bad = join(sandbox, "bad.env");
+    await writeFile(bad, 'VIDEOFETCH_WORKER_PORT=8080\nVIDEOFETCH_MEDIA_DNS_FLAGS="--dns 172.17.0.0/16"\n');
+    const result = await run(await freePort(), { VF_CONFIG_FILE: bad });
+    assert.notEqual(result.status, 0, "a prefix is not a resolver address");
+    assert.match(result.stderr, /not an exact IP address|configuration is invalid/);
+  });
+
+  it("never reports ready by falling back to some other resolver", async () => {
+    // A perfectly good resolver exists on 127.0.0.1 while the config names
+    // 127.0.0.9. A probe that "helpfully" fell back would pass here, and would
+    // mask exactly the production defect this gate exists to catch.
+    const { port, stop } = await serveOnFreePort({ udp: true, tcp: true });
+    const elsewhere = join(sandbox, "elsewhere.env");
+    await writeFile(elsewhere, 'VIDEOFETCH_WORKER_PORT=8080\nVIDEOFETCH_MEDIA_DNS_FLAGS="--dns 127.0.0.9"\n');
+    try {
+      const result = await run(port, { VF_CONFIG_FILE: elsewhere });
+      assert.notEqual(result.status, 0, "readiness is about the configured address and no other");
+    } finally {
+      await stop();
+    }
   });
 });

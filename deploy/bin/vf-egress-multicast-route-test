@@ -63,9 +63,10 @@
 # Usage:
 #   vf-egress-multicast-route-test --phase9-acceptance [--full-range] [--no-probe]
 #
-# Exit 0 means: routes installed, probes run, counters reported, routes removed,
-# route state proven byte-identical to before, boundary re-verified, and the
-# Worker/watchdog returned to the state they were found in.
+# Exit 0 means: routes installed, ONE UDP datagram emitted per family, the deny
+# counters observed to MOVE, routes removed, route state proven byte-identical
+# to before, boundary re-verified, and the Worker/watchdog returned to the state
+# they were found in. A flat counter is a failure and leaves them stopped.
 
 set -uo pipefail
 VF_PROG=vf-egress-multicast-route-test
@@ -88,7 +89,10 @@ PROBE_IMAGE="${VF_MULTICAST_PROBE_IMAGE:-videofetch-worker:latest}"
 # ranges. A /32 and a /128 are enough to make one packet reach the rule.
 V4_TEST="${VF_MULTICAST_V4_TEST:-224.0.2.1/32}"
 V6_TEST="${VF_MULTICAST_V6_TEST:-ff0e::1/128}"
-PROBE_PORT="${VF_MULTICAST_PROBE_PORT:-80}"
+# The UDP destination port. Nothing listens there and nothing is expected to:
+# the deny rule matches on destination ADDRESS, and the port only has to be a
+# legal one for the datagram to carry.
+PROBE_PORT="${VF_MULTICAST_PROBE_PORT:-9}"
 
 ACK=0
 FULL_RANGE=0
@@ -366,16 +370,52 @@ NFT_WANT="$(cat "$VF_POLICY_FINGERPRINT" 2>/dev/null || echo missing)"
 
 # ── 4. Measure ─────────────────────────────────────────────────────────────
 #
+# ── CORRECTION 02: UDP, BECAUSE TCP CANNOT REACH THE RULE ──────────────────
+#
+# The first implementation probed with a TCP connect(). Phase 9 ran it against
+# the live boundary and the deny counters stayed FLAT — with the test routes
+# correctly installed — so it reported, correctly, that the denial was not
+# attributable. The cause is not this boundary:
+#
+#   Linux refuses TCP to a multicast destination in the SOCKET layer, before a
+#   packet is ever generated. tcp_v4_connect() rejects a route flagged
+#   RTCF_MULTICAST and tcp_v6_connect() rejects ipv6_addr_is_multicast(), both
+#   with ENETUNREACH. netfilter's output hook is never consulted, so no rule can
+#   count what was never emitted.
+#
+# This was isolated rather than assumed: in a throwaway namespace holding a
+# valid route to the same destinations and NO nftables ruleset at all, TCP
+# connect() still returned ENETUNREACH while a UDP sendto() to the same address
+# emitted a packet normally. A firewall that is not there cannot be what denied
+# it.
+#
+# So the probe emits ONE bounded UDP datagram instead. That reaches the output
+# hook, matches the deny rule by destination address exactly as any other
+# forbidden destination does, and increments the counter — which is the whole
+# point of the exercise. The nftables `reject` returns the error to the sending
+# socket, so the datagram is refused rather than silently absorbed.
+#
+# A flat counter remains a FAILURE. Nothing here converts "no counter movement"
+# into success; the fix is that the packet now reaches the rule, not that the
+# verdict became lenient.
+#
 # A disposable, unprivileged container joined to the SAME namespace. No
 # NET_ADMIN, no SYS_ADMIN, no privileged mode, no host networking, no Docker
 # socket, no volume, read-only, non-root — it can emit a packet and nothing
 # else.
-PROBE_JS='const net=require("node:net");const s=new net.Socket();s.setTimeout(4000);
-const d=v=>{try{s.destroy()}catch(e){};console.log(v);process.exit(0)};
-s.once("connect",()=>d("*** CONNECTED ***"));
-s.once("timeout",()=>d("DENIED(timeout)"));
+PROBE_JS='const dgram=require("node:dgram");
+const host=process.argv[1],port=Number(process.argv[2]);
+const s=dgram.createSocket(host.includes(":")?"udp6":"udp4");
+let done=false;
+const d=v=>{if(done)return;done=true;try{s.close()}catch(e){};console.log(v);process.exit(0)};
+// Bounded: one datagram, one verdict, and a hard ceiling so a probe can never
+// wedge the acceptance run.
+const timer=setTimeout(()=>d("NO ERROR RETURNED(timeout)"),4000);
+timer.unref&&timer.unref();
 s.once("error",e=>d("DENIED("+(e.code||e.message)+")"));
-s.connect({host:process.argv[1],port:Number(process.argv[2])});'
+s.send(Buffer.from("vf-multicast-probe"),port,host,(e)=>{
+  d(e?"DENIED("+(e.code||e.message)+")":"*** DATAGRAM EMITTED ***");
+});'
 
 probe() {
   "$VF_DOCKER" run --rm \
@@ -409,7 +449,7 @@ if [ "$RUN_PROBE" -eq 1 ]; then
   [ "$ADDED_V6" -eq 1 ] && { report_probe "v6" "$v6_bare" deny-v6 || PROBE_RC=1; }
   echo
   echo "$VF_PROG: a denial with a FLAT counter still means 'no route', not 'policy'."
-  echo "$VF_PROG: this run is evidence for Phase 9; it does not close the gate."
+  echo "$VF_PROG: a moving counter attributes the denial to the rule itself."
 else
   echo "$VF_PROG: --no-probe: routes installed, no probe run"
 fi
