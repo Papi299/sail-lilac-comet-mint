@@ -1,0 +1,236 @@
+#!/bin/bash
+# Designated-resolver readiness probe for the media namespace.
+# (PRODUCTION-DNS-RESOLVER-001)
+#
+# WHY THIS EXISTS
+#
+# The media namespace is created with `--dns <exact address>`, its resolv.conf
+# names that address, and the safe-egress policy admits exactly it on UDP and
+# TCP port 53. Nothing, however, guaranteed that anything was LISTENING there.
+# Phase 9 proved the policy: the boundary admits that one address and denies
+# every other resolver. It proved it against a resolver the acceptance itself
+# supplied, which was removed with the rest of the acceptance material — and on
+# the next boot the whole stack came up "healthy" with no resolver at all,
+# reporting operational while every hostname lookup failed.
+#
+# This script closes that gap by making resolver readiness an explicit,
+# checkable condition that the deployment can order against.
+#
+# WHAT IT DELIBERATELY DOES NOT DO
+#
+# It does NOT test whether the Internet resolves. A readiness gate that depends
+# on a public name resolving would turn every upstream DNS blip, captive portal
+# and cold boot into a Worker outage, and it would conflate "our resolver is
+# present" with "the Internet is reachable".
+#
+# So the success condition is: a DNS server at the EXACT configured address
+# answers on BOTH UDP and TCP 53 with a well-formed reply to our query. Any
+# rcode counts — NOERROR, SERVFAIL, REFUSED, NXDOMAIN — because all of them
+# prove a resolver is listening and speaking DNS. Only silence, a refused
+# connection or a malformed reply is a failure.
+#
+# This is FUNCTIONAL readiness and is kept strictly separate from the SECURITY
+# verification in vf-egress-policy-verify, which must never depend on DNS
+# working. Neither script calls the other.
+#
+# Usage:
+#   vf-media-dns-check              one-shot; exit 0 if every resolver answers
+#   vf-media-dns-check --watch      long-running; sd_notify READY, then re-probe
+#   vf-media-dns-check --quiet      suppress per-resolver progress output
+
+set -uo pipefail
+VF_PROG=vf-media-dns-check
+
+LIB="${VF_EGRESS_LIB:-/usr/local/lib/videofetch/vf-egress-lib.sh}"
+# shellcheck source=vf-egress-lib.sh
+. "$LIB"
+
+PYTHON="${VF_PYTHON:-python3}"
+SYSTEMD_NOTIFY="${VF_SYSTEMD_NOTIFY:-systemd-notify}"
+
+# Probe tuning. Deliberately short: this runs at boot in front of the Worker.
+TIMEOUT_SECONDS="${VF_DNS_PROBE_TIMEOUT:-2}"
+PROBE_NAME="${VF_DNS_PROBE_NAME:-videofetch-dns-readiness.invalid}"
+
+# ALWAYS 53 in production: 53 is the only port the safe-egress policy admits to
+# the designated resolver, so probing anything else would report readiness for a
+# port the Worker is not allowed to use. Overridable solely so the test suite can
+# exercise this logic without binding a privileged port, in the same way VF_NFT,
+# VF_IP and VF_DOCKER are overridable elsewhere in this deployment layer.
+PROBE_PORT="${VF_DNS_PROBE_PORT:-53}"
+
+# --watch tuning. GRACE_SECONDS is how long the resolver may stay unreachable
+# before this unit gives up and exits non-zero; the Worker BindsTo= this unit,
+# so that exit is what stops the Worker rather than letting it keep pretending
+# media networking works.
+INTERVAL_SECONDS="${VF_DNS_WATCH_INTERVAL:-15}"
+GRACE_SECONDS="${VF_DNS_WATCH_GRACE:-90}"
+
+WATCH=0
+QUIET=0
+for arg in "$@"; do
+  case "$arg" in
+    --watch) WATCH=1 ;;
+    --quiet) QUIET=1 ;;
+    *) vf_die "unknown argument '$arg' (expected --watch or --quiet)" ;;
+  esac
+done
+
+say() { [ "$QUIET" -eq 1 ] || echo "$VF_PROG: $*"; }
+warn() { echo "$VF_PROG: $*" >&2; }
+
+vf_config_load
+RESOLVERS="$(vf_dns_resolvers)" || vf_die "designated DNS resolver configuration is invalid.
+Set VIDEOFETCH_MEDIA_DNS_FLAGS to one or more '--dns <exact-address>' pairs in
+$VF_CONFIG_FILE. This script probes exactly those addresses and no others: it
+never falls back to a public resolver, because a fallback would report the
+boundary healthy while the address the policy actually admits stayed dead."
+
+# ── One probe ──────────────────────────────────────────────────────────────
+#
+# Kept in Python because bash cannot frame a DNS query and validate the reply
+# header, and because shelling out to dig would add a package dependency to a
+# boot-critical unit. python3 is part of the Ubuntu base system.
+#
+# The query is deliberately for a name under .invalid (RFC 6761): it can never
+# resolve, so a conforming resolver answers NXDOMAIN without any upstream
+# traffic. That keeps the probe cheap, cache-free and independent of the
+# Internet, while still exercising a full query/response round trip.
+probe_one() {
+  local address="$1" proto="$2"
+  "$PYTHON" - "$address" "$proto" "$TIMEOUT_SECONDS" "$PROBE_NAME" "$PROBE_PORT" <<'PY'
+import os, random, socket, struct, sys
+
+address, proto, timeout, name = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
+port = int(sys.argv[5])
+
+txid = random.randrange(0, 0xFFFF)
+qname = b"".join(bytes([len(p)]) + p.encode("ascii") for p in name.split(".") if p) + b"\x00"
+query = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", 1, 1)
+
+family = socket.AF_INET6 if ":" in address else socket.AF_INET
+
+
+def fail(reason):
+    print(reason, file=sys.stderr)
+    sys.exit(1)
+
+
+try:
+    if proto == "udp":
+        s = socket.socket(family, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(query, (address, port))
+        reply, _ = s.recvfrom(4096)
+    else:
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((address, port))
+        s.sendall(struct.pack("!H", len(query)) + query)
+        header = b""
+        while len(header) < 2:
+            chunk = s.recv(2 - len(header))
+            if not chunk:
+                fail("connection closed before length prefix")
+            header += chunk
+        want = struct.unpack("!H", header)[0]
+        reply = b""
+        while len(reply) < want:
+            chunk = s.recv(want - len(reply))
+            if not chunk:
+                fail("connection closed mid-reply")
+            reply += chunk
+    s.close()
+except OSError as error:
+    fail(f"{error.__class__.__name__}: {error}")
+
+if len(reply) < 12:
+    fail(f"reply too short ({len(reply)} bytes)")
+
+got_id, flags = struct.unpack("!HH", reply[:4])
+if got_id != txid:
+    fail(f"transaction id mismatch (sent {txid}, got {got_id})")
+if not flags & 0x8000:
+    fail("reply does not have the response bit set")
+
+# ANY rcode is success. NXDOMAIN, SERVFAIL and REFUSED all prove a resolver is
+# listening and speaking DNS, which is exactly and only what readiness means.
+print(f"rcode={flags & 0x000F}")
+PY
+}
+
+# ── One full sweep across every configured resolver ────────────────────────
+probe_all() {
+  local failed=0 address detail
+  while IFS= read -r address; do
+    [ -n "$address" ] || continue
+    for proto in udp tcp; do
+      if detail="$(probe_one "$address" "$proto" 2>&1)"; then
+        say "  $address $proto/$PROBE_PORT -> answered ($detail)"
+      else
+        warn "  $address $proto/$PROBE_PORT -> NO ANSWER ($detail)"
+        failed=1
+      fi
+    done
+  done <<< "$RESOLVERS"
+  return "$failed"
+}
+
+# ── One-shot ───────────────────────────────────────────────────────────────
+if [ "$WATCH" -eq 0 ]; then
+  say "probing designated resolver(s) on UDP and TCP 53"
+  if probe_all; then
+    say "OK (every designated resolver answers)"
+    exit 0
+  fi
+  vf_die "the designated DNS resolver is not answering.
+
+The media namespace is configured to use it, its resolv.conf names it and the
+egress policy admits exactly it on port 53 — but nothing is listening there, so
+every hostname lookup inside the Worker will fail.
+
+This is a FUNCTIONAL fault, not a boundary breach: the safe-egress policy is
+unaffected and no rule is broadened by it. Start the designated resolver, then
+start this unit."
+fi
+
+# ── Watch ──────────────────────────────────────────────────────────────────
+#
+# Fail-closed in the functional sense: once the resolver has been seen, its
+# sustained disappearance ends this unit, and the Worker's BindsTo= stops the
+# Worker with it. A Worker that keeps running against a resolver that no longer
+# exists reports healthy while every media fetch by hostname fails, which is the
+# exact condition PRODUCTION-DNS-RESOLVER-001 exists to prevent.
+say "probing designated resolver(s) before declaring readiness"
+if ! probe_all; then
+  vf_die "the designated DNS resolver did not answer at startup; refusing to declare readiness"
+fi
+say "ready (designated resolver answering on UDP and TCP 53)"
+"$SYSTEMD_NOTIFY" --ready 2>/dev/null || true
+
+DEGRADED_SINCE=0
+while :; do
+  sleep "$INTERVAL_SECONDS"
+  "$SYSTEMD_NOTIFY" WATCHDOG=1 2>/dev/null || true
+
+  if probe_all >/dev/null 2>&1; then
+    if [ "$DEGRADED_SINCE" -ne 0 ]; then
+      say "designated resolver recovered"
+      DEGRADED_SINCE=0
+    fi
+    continue
+  fi
+
+  now="$(date +%s)"
+  if [ "$DEGRADED_SINCE" -eq 0 ]; then
+    DEGRADED_SINCE="$now"
+    warn "designated resolver stopped answering; ${GRACE_SECONDS}s grace before failing"
+    continue
+  fi
+
+  if [ "$((now - DEGRADED_SINCE))" -ge "$GRACE_SECONDS" ]; then
+    warn "designated resolver has not answered for ${GRACE_SECONDS}s"
+    warn "exiting non-zero so the Worker stops rather than run without name resolution"
+    exit 1
+  fi
+done

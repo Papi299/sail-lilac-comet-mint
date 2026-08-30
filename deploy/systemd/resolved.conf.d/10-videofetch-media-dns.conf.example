@@ -1,0 +1,62 @@
+# Durable resolver for the media namespace, as an extra systemd-resolved stub
+# listener. (PRODUCTION-DNS-RESOLVER-001)
+#
+# Install to /etc/systemd/resolved.conf.d/10-videofetch-media-dns.conf and
+# `systemctl restart systemd-resolved`.
+#
+# ── Why systemd-resolved rather than a new daemon ─────────────────────────
+#
+# It is already installed, already running, already the VM's resolver, and it
+# already follows the host's upstream configuration — so the namespace inherits
+# whatever the VM legitimately uses instead of a public resolver baked in here.
+# A second resolver process would duplicate all of that and add a component to
+# keep patched.
+#
+# ── The address is NOT arbitrary ──────────────────────────────────────────
+#
+# It must be character-for-character the address declared as
+# `--dns <address>` in VIDEOFETCH_MEDIA_DNS_FLAGS (media-egress.env), because
+# that same string is what the namespace holder is created with, what the
+# namespace resolv.conf names, and what the rendered nftables policy admits on
+# UDP and TCP 53. Changing it here alone produces a resolver nothing is allowed
+# to talk to; changing it in media-egress.env changes the rendered ruleset and
+# therefore the policy fingerprint, which is a safe-egress topology change
+# requiring re-acceptance, not a configuration tweak.
+#
+# vf-media-dns-check probes the address from media-egress.env, so a mismatch
+# between these two files fails the readiness unit rather than passing quietly.
+#
+# ── Ordering is a non-issue, and that was verified, not assumed ───────────
+#
+# systemd-resolved starts several seconds BEFORE docker.service, so docker0 —
+# and therefore this address — does not exist yet when the stub listener binds.
+# It binds anyway: systemd sets IP_FREEBIND on stub listener sockets. This was
+# confirmed empirically on the target VM, and the listener was observed to
+# survive a systemd-resolved restart, a docker restart that destroys and
+# recreates docker0, docker0 being taken administratively down and back up, and
+# a full VM reboot.
+#
+# ── Exposure ──────────────────────────────────────────────────────────────
+#
+# DNSStubListenerExtra binds ONLY the address given. It does not listen on
+# 0.0.0.0, on the VM's LAN address, or on any other interface, so this does not
+# expose a resolver to the network the VM sits on. Verify after installing:
+#
+#   ss -lnup | grep ':53'      # expect the exact address, never 0.0.0.0:53
+#   ss -lnt  | grep ':53'
+#
+# ── Ships UNFILLED, like media-egress.env.example ─────────────────────────
+#
+# No deployment address is committed to this repository, for the same reason
+# the nftables template carries a @@VIDEOFETCH_DESIGNATED_DNS@@ marker rather
+# than a resolver: a committed address is one that can silently disagree with
+# the host it is installed on. Fill in the value below with the SAME address
+# declared in VIDEOFETCH_MEDIA_DNS_FLAGS, then restart systemd-resolved.
+#
+# Agreement between the two files is not asserted textually — it is proved at
+# runtime. vf-media-dns-check reads the address from media-egress.env and
+# probes THAT address, so a drop-in that binds anything else fails the
+# readiness unit and, through it, refuses to start the Worker.
+
+[Resolve]
+DNSStubListenerExtra=
