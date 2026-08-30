@@ -17,6 +17,17 @@ After=local-fs.target
 # Worker is down; the Worker must never run while the broker is down. That
 # asymmetry is the fail-closed direction — see videofetch-worker.service.
 
+# A malformed configuration is startup-fatal by design. Restarting forever on a
+# configuration error would hide it, so give up and stay down — which makes the
+# Worker stay down too.
+#
+# These bound the Restart=on-failure policy declared in [Service]. They are
+# UNIT-level directives: systemd parses the start rate limit from [Unit], and
+# ignores both keys with a warning if they appear in [Service], which silently
+# removes the limit they exist to impose.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
 [Service]
 Type=simple
 User=videofetch-broker
@@ -60,11 +71,8 @@ ExecStart=/opt/videofetch/node/bin/node \
 Restart=on-failure
 RestartSec=2
 
-# A malformed configuration is startup-fatal by design. Restarting forever on a
-# configuration error would hide it, so give up and stay down — which makes the
-# Worker stay down too.
-StartLimitIntervalSec=60
-StartLimitBurst=3
+# The start rate limit that backs this Restart= policy is declared in [Unit],
+# which is the section systemd parses it from.
 
 # ── Hardening ──────────────────────────────────────────────────────────────
 NoNewPrivileges=yes

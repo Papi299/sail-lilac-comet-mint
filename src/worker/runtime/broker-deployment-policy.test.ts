@@ -48,8 +48,32 @@ function values(directives: string[], key: string): string[] {
     .map((d) => d.slice(key.length + 1).trim());
 }
 
+/**
+ * Logical directives grouped by the [Section] they appear under.
+ *
+ * systemd resolves several directives by section, and silently ignores a key
+ * placed in the wrong one. Presence alone is therefore not evidence a
+ * directive is in force (PHASE-8B-FIRST-DEPLOYMENT-DEFECTS-001).
+ */
+function parseSections(source: string): Map<string, string[]> {
+  const sections = new Map<string, string[]>();
+  let current = "";
+  for (const directive of parseUnit(source)) {
+    const header = /^\[(.+)\]$/.exec(directive);
+    if (header) {
+      current = header[1];
+      if (!sections.has(current)) sections.set(current, []);
+      continue;
+    }
+    if (current === "") continue;
+    sections.get(current)!.push(directive);
+  }
+  return sections;
+}
+
 describe("trusted broker deployment policy", () => {
   let brokerUnit: string[];
+  let brokerSections: Map<string, string[]>;
   let workerUnit: string[];
   let brokerSource: string;
   let workerSource: string;
@@ -60,6 +84,7 @@ describe("trusted broker deployment policy", () => {
     workerSource = await readFile(WORKER_UNIT, "utf8");
     envTemplate = await readFile(BROKER_ENV_TEMPLATE, "utf8");
     brokerUnit = parseUnit(brokerSource);
+    brokerSections = parseSections(brokerSource);
     workerUnit = parseUnit(workerSource);
   });
 
@@ -100,8 +125,27 @@ describe("trusted broker deployment policy", () => {
     it("gives up rather than restart-looping past a configuration failure", () => {
       // A malformed configuration is startup-fatal. Restarting forever would
       // hide it AND leave the Worker flapping alongside.
-      assert.ok(values(brokerUnit, "StartLimitBurst").length > 0, "a start limit is declared");
       assert.deepEqual(values(brokerUnit, "Restart"), ["on-failure"]);
+
+      // The rate limit must be declared in [Unit], and asserting mere presence
+      // is not enough. systemd 255 parses StartLimitIntervalSec and
+      // StartLimitBurst from [Unit] ONLY; in [Service] it logs "Unknown key
+      // name ... ignoring" and applies no limit at all — leaving exactly the
+      // restart loop this test exists to prevent, while a presence-only
+      // assertion still passed (PHASE-8B-FIRST-DEPLOYMENT-DEFECTS-001).
+      const unitSection = brokerSections.get("Unit") ?? [];
+      const serviceSection = brokerSections.get("Service") ?? [];
+      for (const key of ["StartLimitIntervalSec", "StartLimitBurst"]) {
+        assert.ok(
+          values(unitSection, key).length > 0,
+          `${key} must be declared in [Unit], where systemd reads it`,
+        );
+        assert.equal(
+          values(serviceSection, key).length,
+          0,
+          `${key} in [Service] is ignored by systemd, so the limit would not apply`,
+        );
+      }
     });
   });
 

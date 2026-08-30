@@ -41,6 +41,7 @@ const WATCHDOG_UNIT = join(SYSTEMD, "videofetch-egress-watchdog.service");
 const EGRESS_ENV_TEMPLATE = join(SYSTEMD, "media-egress.env.example");
 const NFT_TEMPLATE = join(DEPLOY, "nftables", "videofetch-egress.nft.template");
 const HOLDER_DOCKERFILE = join(DEPLOY, "media-netns", "Dockerfile");
+const HOLDER_SOURCE = join(DEPLOY, "media-netns", "holder.c");
 
 const VERIFY_SCRIPT = join(BIN, "vf-egress-policy-verify");
 const WATCHDOG_SCRIPT = join(BIN, "vf-egress-watchdog");
@@ -143,6 +144,7 @@ describe("safe-egress deployment policy", () => {
   let watchdogSource: string;
   let nftTemplate: string;
   let holderDockerfile: string;
+  let holderSource: string;
   let envTemplate: string;
   let verifySource: string;
   let watchdogScript: string;
@@ -155,6 +157,7 @@ describe("safe-egress deployment policy", () => {
     watchdogSource = await readFile(WATCHDOG_UNIT, "utf8");
     nftTemplate = await readFile(NFT_TEMPLATE, "utf8");
     holderDockerfile = await readFile(HOLDER_DOCKERFILE, "utf8");
+    holderSource = await readFile(HOLDER_SOURCE, "utf8");
     envTemplate = await readFile(EGRESS_ENV_TEMPLATE, "utf8");
     verifySource = await readFile(VERIFY_SCRIPT, "utf8");
     watchdogScript = await readFile(WATCHDOG_SCRIPT, "utf8");
@@ -336,6 +339,42 @@ describe("safe-egress deployment policy", () => {
       assert.ok(user, "the image must declare USER");
       assert.match(user!, /^\d+(:\d+)?$/, "numeric: a scratch image has no /etc/passwd to resolve a name");
       assert.doesNotMatch(user!, /^0(:|$)/, "not uid 0");
+    });
+
+    it("declares a standard header for every standard symbol it uses", () => {
+      // PHASE-8B-FIRST-DEPLOYMENT-DEFECTS-001. The first real build of this
+      // image failed at `gcc -Wall -Wextra -Werror` with "'NULL' undeclared":
+      // holder.c used NULL while including only <signal.h>. The C standard
+      // defines NULL in <stddef.h> and a handful of headers that include it;
+      // glibc leaks it through <signal.h>, musl does not, so the omission was
+      // invisible until it met the pinned Alpine builder.
+      //
+      // Deliberately NOT an assertion about include ORDER or a specific
+      // header — only that a symbol the source uses has a header that defines
+      // it. The real `docker build` remains the primary proof.
+      const includes = [...holderSource.matchAll(/^\s*#\s*include\s+<([^>]+)>/gm)].map(
+        (m) => m[1],
+      );
+
+      // Headers the C standard specifies as defining NULL.
+      const NULL_HEADERS = [
+        "stddef.h",
+        "stdio.h",
+        "stdlib.h",
+        "string.h",
+        "time.h",
+        "locale.h",
+        "wchar.h",
+      ];
+
+      const usesNull = /\bNULL\b/.test(holderSource.replace(/\/\*[\s\S]*?\*\//g, ""));
+      if (usesNull) {
+        assert.ok(
+          includes.some((h) => NULL_HEADERS.includes(h)),
+          `holder.c uses NULL but includes none of ${NULL_HEADERS.join(", ")} ` +
+            `(includes: ${includes.join(", ") || "none"})`,
+        );
+      }
     });
 
     it("makes no x86-only assumption, because the target is an M1 Lima VM", () => {
