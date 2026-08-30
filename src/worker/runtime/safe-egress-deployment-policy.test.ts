@@ -897,7 +897,10 @@ vf_canonical_routes  4242 | vf_sha256 > "$VF_RUNDIR/routes.expected.sha256"`;
       // Drops `-t <pid> -n` and execs the rest, standing in for namespace entry.
       nsenter: `#!/bin/bash\nshift 3\nexec "$@"\n`,
       nft: `#!/bin/bash\n[ "$1" = list ] && [ "$2" = ruleset ] && { cat "$VT/ruleset"; exit 0; }\n[ "$1" = monitor ] && { while :; do sleep 1; done; }\nexit 1\n`,
-      ip: `#!/bin/bash\ncase "$1 $2 $3" in\n  "-4 route show") cat "$VT/v4route" ;;\n  "-6 route show") cat "$VT/v6route" ;;\n  "-4 rule show") cat "$VT/v4rule" ;;\n  "-6 rule show") cat "$VT/v6rule" ;;\n  "monitor route link") while :; do sleep 1; done ;;\n  *) exit 1 ;;\nesac\n`,
+      // `v4route.fail` makes ONLY `ip -4 route show` exit nonzero, so a test
+      // can tell "the route table could not be read" apart from "the route
+      // table is empty" without touching any other subcommand.
+      ip: `#!/bin/bash\nif [ "$1 $2 $3" = "-4 route show" ] && [ -e "$VT/v4route.fail" ]; then exit 9; fi\ncase "$1 $2 $3" in\n  "-4 route show") cat "$VT/v4route" ;;\n  "-6 route show") cat "$VT/v6route" ;;\n  "-4 rule show") cat "$VT/v4rule" ;;\n  "-6 rule show") cat "$VT/v6rule" ;;\n  "monitor route link") while :; do sleep 1; done ;;\n  *) exit 1 ;;\nesac\n`,
       // macOS has no sha256sum; both install and verify use this same stub, so
       // the two sides stay consistent whichever tool exists.
       sha256sum: `#!/bin/sh\nif command -v shasum >/dev/null 2>&1; then exec shasum -a 256; fi\nexec /usr/bin/sha256sum\n`,
@@ -1053,6 +1056,110 @@ vf_canonical_routes  4242 | vf_sha256 > "$VF_RUNDIR/routes.expected.sha256"`;
     assert.equal(status, 1);
     assert.match(stderr, /ROUTE TABLE mutated/);
     await write("v4route", V4_ROUTES);
+  });
+
+  // ── SIGPIPE false-fail (SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001-CORRECTION-01)
+  //
+  // Production symptom, seen during the Phase-8B final-stack cutover: the
+  // verifier intermittently reported "namespace has NO IPv4 routes" against a
+  // fully populated route table. The cause was shell-level, not policy-level:
+  //
+  //     ip -4 route show | grep -q .        # under `set -o pipefail`
+  //
+  // `grep -q` exits the moment it matches the first line and closes the pipe;
+  // `ip` is still writing, takes SIGPIPE, exits 141; pipefail promotes that to
+  // a failed pipeline and the verifier takes the `|| fail` branch.
+  //
+  // The direction is fail-CLOSED — it can only invent a FAILURE, never a
+  // false PASS — but the verifier is the Worker's ExecStartPre and the
+  // watchdog's 5s probe, so a false failure stops a healthy Worker.
+  //
+  // These tests pin the SEMANTICS, not the spelling: a reverted fix fails
+  // them deterministically.
+  describe("route existence check is not SIGPIPE-fragile", () => {
+    /**
+     * A producer that emits a first line and then far more than one pipe
+     * buffer (64 KiB) of further output, so it is guaranteed to still be
+     * writing when an early-exiting consumer closes the pipe. This is what
+     * makes the reproduction deterministic rather than a 1-in-100 flake.
+     */
+    const PRODUCER = "printf 'default via 10.11.12.1 dev vfnet0\\n'; seq 1 200000";
+
+    const runShell = (script: string) =>
+      spawnSync("bash", ["-c", script], { env, encoding: "utf8" }).status;
+
+    it("REPRODUCES the old form: a populated table reports as empty under pipefail", () => {
+      // The bug itself, in isolation. If Bash ever stopped behaving this way
+      // the correction would be unnecessary — so this asserts the hazard is
+      // real on the machine running the suite.
+      const status = runShell(`set -uo pipefail; { ${PRODUCER}; } | grep -q .`);
+      assert.notEqual(
+        status,
+        0,
+        "expected the old `producer | grep -q .` form to fail under pipefail despite non-empty output",
+      );
+    });
+
+    it("the corrected capture form survives the same producer", () => {
+      const status = runShell(
+        `set -uo pipefail; OUT="$( { ${PRODUCER}; } )" || exit 1; [ -n "$OUT" ]`,
+      );
+      assert.equal(status, 0, "the capture form must not be affected by consumer close");
+    });
+
+    it("the shipped verifier does not pipe a namespace producer into an early-exiting consumer", async () => {
+      // Spelling guard only — the behavioural tests below are the substance.
+      const source = await readFile(VERIFY_SCRIPT, "utf8");
+      assert.doesNotMatch(
+        executableLines(source),
+        /route\s+show[^\n]*\|\s*grep\s+-[a-zA-Z]*q/,
+        "route existence must be established by capture, never by piping into `grep -q`",
+      );
+    });
+
+    it("PASSES on a route table large enough to SIGPIPE the old form", async () => {
+      // The real verifier, through the real fixture harness, against a route
+      // table that the old form could not have survived. This is the
+      // regression test proper: revert the fix and this goes red every run.
+      const many = Array.from(
+        { length: 5000 },
+        (_, i) => `10.${(i >> 8) & 255}.${i & 255}.0/24 via 10.11.12.9 dev vfnet0 `,
+      ).join("\n");
+      await write("v4route", `${V4_ROUTES}${many}\n`);
+      baseline();
+
+      const { status, stderr } = verify();
+      assert.equal(status, 0, stderr);
+
+      await write("v4route", V4_ROUTES);
+      baseline();
+    });
+
+    it("still FAILS when the IPv4 route table is genuinely empty", async () => {
+      await write("v4route", "");
+      baseline();
+
+      const { status, stderr } = verify();
+      assert.equal(status, 1);
+      assert.match(stderr, /NO IPv4 routes/);
+
+      await write("v4route", V4_ROUTES);
+      baseline();
+    });
+
+    it("FAILS DISTINCTLY when the route command itself errors", async () => {
+      // An unreadable route table is a different fault from an empty one, and
+      // the old single `grep -q` could not tell them apart — both arrived as
+      // "NO IPv4 routes". Neither may pass, and they must not be conflated.
+      await write("v4route.fail", "");
+
+      const { status, stderr } = verify();
+      assert.equal(status, 1);
+      assert.match(stderr, /cannot read the namespace IPv4 route table/);
+      assert.doesNotMatch(stderr, /NO IPv4 routes/);
+
+      await rm(join(sandbox, "v4route.fail"), { force: true });
+    });
   });
 
   it("fails when a policy-routing rule is injected", async () => {

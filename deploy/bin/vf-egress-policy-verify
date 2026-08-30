@@ -196,7 +196,24 @@ check_rules -6
 # 2. The namespace must actually have routing. An empty table would make every
 #    destination unreachable for reasons unrelated to the firewall, which is
 #    exactly the ambiguity SAFE-EGRESS-MULTICAST-ATTRIBUTION-001 is about.
-vf_in_ns "$PID" "$VF_IP" -4 route show 2>/dev/null | grep -q . \
+#
+# The output is CAPTURED rather than piped into an early-exiting consumer.
+# `ip route show | grep -q .` looks equivalent but is not: `grep -q` exits the
+# moment it sees the first line and closes the pipe, `ip` is then killed by
+# SIGPIPE (141) while still writing, and `set -o pipefail` promotes that to a
+# failed pipeline. The result was an intermittent "NO IPv4 routes" against a
+# fully populated route table — observed in production during the Phase-8B
+# final-stack cutover, and fail-closed, so a false failure stops a healthy
+# Worker (this script is the Worker's ExecStartPre and the watchdog's probe).
+# Command substitution reads the producer to EOF, so there is no early close.
+#
+# Capturing also lets the two failure modes be told apart, which the single
+# `grep -q` could not do: a route table that could not be READ is a different
+# fault from one that is genuinely EMPTY, and neither may pass.
+ROUTES_V4="$(vf_in_ns "$PID" "$VF_IP" -4 route show 2>/dev/null)" \
+  || fail "cannot read the namespace IPv4 route table (host root is required to enter it)"
+
+[ -n "$ROUTES_V4" ] \
   || fail "namespace has NO IPv4 routes; denial could not be attributed to policy"
 
 # 3. FINGERPRINT — captured after controlled namespace creation and policy
