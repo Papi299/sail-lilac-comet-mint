@@ -134,7 +134,7 @@ ExecStart=/usr/bin/docker run --rm --name videofetch-worker \
   --cap-drop=ALL \
   --security-opt no-new-privileges \
   --read-only \
-  --tmpfs /tmp/videofetch:rw,noexec,nosuid,size=2g \
+  --tmpfs /tmp/videofetch:rw,noexec,nosuid,size=2g,uid=1000,gid=1000 \
   --volume /var/lib/videofetch:/var/lib/videofetch:rw \
   --volume /run/videofetch-r2-broker:/run/videofetch-r2-broker:ro \
   --group-add ${VIDEOFETCH_BROKER_GID} \
@@ -151,6 +151,29 @@ ExecStop=/usr/bin/docker stop --time 15 videofetch-worker
 #                   than hard-coded, and asserted against the socket's actual
 #                   owning group by the ExecStartPre gate above. Neither
 #                   /etc/passwd nor /etc/group is mounted into the container.
+#
+# --tmpfs           uid=/gid= are REQUIRED, not cosmetic. A tmpfs is a fresh
+#                   filesystem mounted OVER /tmp/videofetch, so it SHADOWS the
+#                   image directory Dockerfile.worker prepares and chowns to
+#                   node:node. Without these options the kernel gives the new
+#                   mount root:root 0755, the Worker runs as the image's
+#                   non-root `node` user, and its first
+#                   `mkdir /tmp/videofetch/jobs` fails EACCES — which is
+#                   exactly how the first production direct-media job failed
+#                   (WORKER-TEMP-TMPFS-OWNERSHIP-001). Image-layer ownership
+#                   cannot fix this; only the mount can.
+#
+#                   1000:1000 is the `node` user of the node:22-bookworm-slim
+#                   base, which is this image's runtime identity. It is written
+#                   NUMERICALLY for the same reason --group-add is: the kernel
+#                   mount option takes ids, not names, and the container's
+#                   /etc/passwd is not consulted.
+#
+#                   The grant is exactly the Worker's own uid/gid and nothing
+#                   wider — the mount is NOT world-writable — and rw,noexec,
+#                   nosuid,size=2g are retained unchanged, so media working
+#                   files still cannot be executed, cannot gain setuid and
+#                   cannot exhaust host memory.
 #
 # --volume ...:ro   The broker's runtime DIRECTORY is mounted read-only. That
 #                   is what prevents socket hijacking: the container cannot
