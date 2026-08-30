@@ -44,6 +44,13 @@ Precisely:
   were deployed, and hostname resolution was verified in the live Worker after a
   fresh boot. The designated address and the nftables policy are unchanged. See
   §11b.
+- **The production direct-media end-to-end path is PROVEN.** On 2026-08-30 a
+  real job submitted through authenticated Vercel Production reached the Worker
+  over Cloudflare Access and the named Tunnel, executed the `direct` extractor,
+  uploaded to R2 through the trusted broker, and was served back by Vercel's
+  separate signed-GET identity byte-identically. It was blocked until that day
+  by `WORKER-TEMP-TMPFS-OWNERSHIP-001`, a runtime mount-ownership defect that is
+  now fixed and deployed. See §11c.
 - **Phase 10 is NOT BEGUN.** `YTDLP_NETWORK_ISOLATED` remains `false` and yt-dlp
   remains absent. Phase 9 passing is a prerequisite for Phase 10, not entry to
   it.
@@ -1210,6 +1217,8 @@ authorization.
 | `SAFE-EGRESS-ROUTE-VERIFIER-HARDENING-001` | **CLOSED — accepted 2026-08-30** | The prototype verifier fingerprinted the `nftables` ruleset but not the namespace **route table**. Non-blocking, as before: destination denial was proven to survive route injection, and a route cannot defeat a destination-address deny. Source hardening is now merged — see §3b — combining a baseline-free semantic invariant over policy-routing rules with a runtime route/rule fingerprint captured by the trusted install path and stored under `/run`. The watchdog additionally subscribes to route and link netlink events. **Verified in situ during Phase 9 on 2026-08-30.** The installed verifier hash-matches the `origin/main` blob exactly, and it ran against the real namespace on the real VM throughout acceptance — including 50 consecutive executions under NordVPN, all passing, and repeated runs across the multicast quiesce/mutate/restore windows. It reported identical policy and route fingerprints on every invocation, correctly refused nothing that was intact, and the deliberate route mutations it is meant to catch were caught by the helper's own comparison before the verifier was consulted. The gate is closed. |
 | `PRODUCTION-DNS-RESOLVER-001` | **CLOSED — deployed and fresh-boot verified** | The media namespace was configured to use the designated resolver `172.17.0.1:53` — holder `--dns` flag, namespace `resolv.conf` and the rendered policy's exact UDP/TCP 53 exception all agreeing — while **nothing listened there**. The resolver that satisfied the Phase-9 DNS cases belonged to the acceptance and was removed by its cleanup, so ordinary hostname resolution failed (`EAI_AGAIN`) while direct connections to public IP addresses kept working. Confirmed on a fresh boot with every unit active, the Worker reporting healthy and the verifier passing — which was the defect itself. **Closed by PR #28, merge commit `4d4f90c60dd9feba8c423022aa34f467fd093691`.** `systemd-resolved` now carries an extra stub listener at the designated address (`DNSStubListenerExtra`), chosen over a new daemon because resolved is already the VM's resolver and already follows its upstream configuration. `vf-media-dns-check` probes that address — read from `media-egress.env`, never from the drop-in — on both transports, and `videofetch-media-dns.service` runs it as a `Type=notify` readiness gate ordered in front of the namespace holder. The Worker declares `Requires=`/`After=`/`BindsTo=` on it; the holder deliberately takes only the first two, so a DNS fault stops the Worker without tearing down the boundary. **The designated address was not changed and the nftables policy was not touched**: the policy and route fingerprints are byte-identical to the Phase-9 baseline, so this is a functional addition, not a boundary change. Verified post-deployment and again after a controlled reboot: exact UDP and TCP listeners with no wildcard or LAN exposure, readiness probe passing on both transports, Worker hostname resolution and HTTPS-by-hostname succeeding, non-designated resolvers still denied, and `172.17.0.1` still reachable on port 53 alone. Phase 9 was neither rerun nor reopened. |
 | `R2-PROVIDER-LIFECYCLE-BACKSTOP-001` | **CLOSED** | The production bucket had no object-expiration rule: its only lifecycle entry was a default multipart-abort rule, which deletes nothing by age. A backstop named `videofetch-expired-job-backstop` was added — enabled, scoped to the `videofetch/jobs/` prefix, deleting objects at an age of **3600 seconds**, with no storage-class transition — and the pre-existing multipart rule was preserved by appending rather than replacing the configuration. 3600s is deliberately longer than the application's 45-minute `FILE_EXPIRATION_MINUTES` so ordinary exact-key cleanup always attempts deletion first; the provider rule only collects what that path misses. Verified by independent API readback, not by a dashboard message, and further evidenced by a throwaway object whose `x-amz-expiration` header named this rule with an expiry exactly 3600s after write; that object was then deleted through the normal delegated exact-key path and the bucket confirmed empty. Provider deletion is asynchronous, so this guarantees eventual collection rather than deletion at a specific instant. Authorization was a temporary narrowly scoped R2 token: its local copy was securely deleted immediately after use and the operator has since revoked the token at the provider (operator-attested). The broker parent credential is refused lifecycle access by design. See §5h. |
+| `WORKER-TEMP-TMPFS-OWNERSHIP-001` | **CLOSED — merged, deployed and proven by a real job** | The Worker unit mounted its media temp filesystem as `--tmpfs /tmp/videofetch:rw,noexec,nosuid,size=2g`, with no ownership options. A tmpfs is a fresh filesystem mounted **over** the mountpoint, so it shadowed the directory `Dockerfile.worker` creates and `chown`s to `node:node`, and the kernel gave the new mount `root:root 0755` while the Worker runs as uid/gid **1000**. The first production direct-media job therefore failed `PROCESSING_FAILED` about 13 ms in, on `mkdir /tmp/videofetch/jobs` → `EACCES`, with `object_key = null` and nothing written to R2. Image-layer ownership cannot satisfy a path a tmpfs is mounted over; only the mount can. Fixed by appending `uid=1000,gid=1000` — **PR #29, merge commit `a5eba777d7b169f83836f045fcf43bab8578c6f6`**. `rw`, `noexec`, `nosuid`, `size=2g`, `--read-only`, `--cap-drop=ALL` and `no-new-privileges` are all retained, the Worker still runs non-root, the mount is not world-writable and is still a tmpfs rather than a host bind, and no application code changed. The suite's previous single order-sensitive regex had actively certified the broken declaration; it is replaced by an option-set parser plus guards against relaxing `noexec`/`nosuid` or substituting a bind mount. Verified live and then proven by a real production job. See §11c. |
+| `VERCEL-DIRECT-MEDIA-E2E-001` | **CLOSED — complete production chain accepted 2026-08-30** | The full path — private-access authentication on Vercel Production, Vercel → Cloudflare Access → named Tunnel → Worker HMAC, `direct` extraction of a controlled public MP4, real job execution on the Worker, `PutObject` + `HeadObject` through the trusted broker, `ready` commit with a durable `object_key`, and a byte-identical download through Vercel's **separate** R2 signer — was executed end to end and passed. yt-dlp was neither present nor invoked. See §11c. |
 | `NPM-LOCKFILE-RECONCILIATION-001` | **CLOSED** | `package-lock.json` carries a pre-existing devDependency resolution (`nitro` → `unstorage` requires `lru-cache@^11`, the lock pins `5.1.1`) that npm 10 rejects and npm 11 accepts. The Worker image works around it with an exact-pinned ephemeral npm 11 running `ci`; no `npm install` is used and the lockfile is unmodified. **Resolved and merged** in PR #24 (merge commit `7009550d5573dc5b7d3b7eda7efaf20120a1c22f`), with npm `11.19.1` pinned and the lockfile intentionally unchanged. |
 
 ---
@@ -1526,3 +1535,280 @@ record:
 
 This was **tooling reconciliation, not a second Phase-9 acceptance.** The
 multicast gate was already closed on the Phase-9 evidence and is unchanged by it.
+
+
+---
+
+## 11c. Production direct-media end-to-end record
+
+**`WORKER-TEMP-TMPFS-OWNERSHIP-001` — CLOSED.
+`VERCEL-DIRECT-MEDIA-E2E-001` — CLOSED. Both on 2026-08-30.**
+
+This section records the first successful production media job, and the
+deployment defect that had to be fixed to obtain it. Evidence is attributed
+throughout: **GitHub-verifiable**, **Lima runtime measurement**, **Vercel
+measurement**, **provider evidence**, or **operator-attested**.
+
+### The tmpfs ownership defect
+
+The first production direct-media attempt proved the whole upstream chain and
+then failed at execution. Job `ab7ee139…` went `queued → failed` with
+`PROCESSING_FAILED` roughly 13 ms after start, `object_key = null`, nothing in
+R2, and yt-dlp never invoked. The failing syscall was:
+
+```
+mkdir /tmp/videofetch/jobs  ->  EACCES
+```
+
+The cause was **runtime mount semantics, not application code.**
+`Dockerfile.worker` does prepare the directory correctly:
+
+```dockerfile
+RUN mkdir -p /var/lib/videofetch /tmp/videofetch \
+  && chown -R node:node /var/lib/videofetch /tmp/videofetch
+USER node
+```
+
+but the unit then mounted a tmpfs **over** that path. A tmpfs is a fresh, empty
+filesystem placed on the mountpoint; it does not inherit the ownership of the
+directory beneath, which is merely covered. With no `uid=`/`gid=` options the
+kernel created the mount root as `root:root 0755`, while the Worker runs as the
+image's non-root `node` user, uid/gid **1000**. The `chown` in the image was
+real but unreachable.
+
+`createJobDir()` needs `/tmp/videofetch/jobs` and then
+`/tmp/videofetch/jobs/<32hex>`. Its `ensureJobsRoot()` wraps the `mkdir` failure
+as `UnsafePathError`, which the executor surfaces as `PROCESSING_FAILED` — which
+is exactly the observed symptom.
+
+**Measured on the live VM before the fix** (Lima runtime measurement):
+
+```
+runtime uid/gid : 1000 / 1000
+/tmp/videofetch : owner=0:0 mode=755
+mount           : tmpfs rw,nosuid,nodev,noexec,relatime,size=2097152k,mode=755,inode64
+contents        : empty — no jobs/ directory had ever been created
+```
+
+### The mount correction, as deployed
+
+One line of `deploy/systemd/videofetch-worker.service`:
+
+```diff
+-  --tmpfs /tmp/videofetch:rw,noexec,nosuid,size=2g \
++  --tmpfs /tmp/videofetch:rw,noexec,nosuid,size=2g,uid=1000,gid=1000 \
+```
+
+`1000:1000` is the `node` user of the `node:22-bookworm-slim` base — the image's
+established runtime identity, measured rather than assumed. It is written
+numerically for the same reason `--group-add` is: a kernel mount option takes
+ids, not names, and the container's `/etc/passwd` is not consulted.
+
+**Nothing was traded away for it.** `rw`, `noexec`, `nosuid` and `size=2g` are
+retained; `--read-only`, `--cap-drop=ALL` and `--security-opt no-new-privileges`
+are retained; the Worker still runs non-root; the mount is **not**
+world-writable — the grant is exactly the Worker's own uid/gid and nothing
+wider; and it remains a tmpfs rather than becoming a host bind mount, which
+would have put media working files on the VM disk and outside the size bound.
+No application-runtime source changed.
+
+**GitHub-verifiable.** PR #29, one commit `38dfc4da25066b8bdcdd2b46160642e5d0e27fa1`,
++110/−2 across exactly two files — the unit and
+`src/worker/runtime/safe-egress-deployment-policy.test.ts`. Merged as a regular
+merge commit `a5eba777d7b169f83836f045fcf43bab8578c6f6`, whose parents are
+`2dc235145fc91ce20d12790495373de52befc695` and the approved head, and whose tree
+`efd6e0cf1947cf9812e4f7591d0c3b5b2a6d5a32` equals the approved head tree exactly.
+This repository has no CI: there were no workflow runs, statuses or check runs on
+that head, and none is claimed.
+
+### Why the regression test had to change too
+
+The suite previously asserted one exact option string:
+
+```ts
+assert.match(exec, /--tmpfs\s+\/tmp\/videofetch:rw,noexec,nosuid,size=2g\b/);
+```
+
+That assertion **actively certified the broken declaration** — it described as
+correct a mount the Worker could not write. It is replaced by a small semantic
+parser that extracts the option list and asserts over the **set**: the required
+options must all be present, `exec`/`suid`/`ro` must not appear, any `mode=`
+must not be world-writable, and `/tmp/videofetch` may not be served by a
+`--volume` or `--mount` bind. Re-ordering the options is therefore free, while
+dropping one fails. Against the pre-fix unit the corrected suite fails with
+`the /tmp/videofetch tmpfs must be mounted uid=1000`.
+
+### Deployment
+
+The merged tracked source was reconciled into `/opt/videofetch` — all 405
+tracked files hash-matched merged main afterwards, with `node/` and
+`node_modules/` untouched — and the unit was installed atomically to
+`/etc/systemd/system/videofetch-worker.service`, hash-matching the merged blob
+(`35d99f03…`). `systemd-analyze verify` passed over the complete seven-unit set,
+followed by `daemon-reload`.
+
+**Only the Worker was restarted.** The other six services were not touched: all
+kept `NRestarts=0` and their original start timestamps, the namespace holder
+container kept the same id `d7aec670…`, and `vf-cloudflared` kept PID 703 and an
+unchanged config hash. Both fail-closed `ExecStartPre` gates passed on the new
+start — the broker GID verifier and the safe-egress policy verifier — and the
+policy and route fingerprints were byte-identical before and after:
+
+```
+policy: 7cb95aaee72c91c27a16293c014edfbd7f5b843f21384982714eb33c2a26b21e
+routes: 97960e25cd6925e2d00cdf2e65012e233398ab9a60257f34ea45a35789aa27b2
+```
+
+No safe-egress reacceptance was required or performed: the network topology and
+policy did not change. **Phase 9 was neither rerun nor reopened.**
+
+### The live mount, after the fix
+
+**Lima runtime measurement**, inside the new production Worker container:
+
+```
+runtime uid/gid : 1000 / 1000
+/tmp/videofetch : owner=1000:1000 mode=755 (tmpfs)
+mount           : rw,nosuid,nodev,noexec,relatime,size=2097152k,mode=755,uid=1000,gid=1000,inode64
+size            : 524288 x 4096 = 2 GiB exactly
+```
+
+`nodev` and `inode64` are added by the container runtime and are recorded here
+as **measured**, not claimed from the unit — the unit specifies neither. A
+minimal acceptance-only write as uid 1000 (create, write, read back, delete)
+succeeded and left the filesystem empty. `jobs/` was deliberately **not**
+created by hand; the real job was left to prove it.
+
+### The end-to-end run
+
+Executed against Vercel Production **without redeploying it**. PR #29 changed
+only a Lima systemd artefact and a test file — zero files under any Vercel
+runtime path — so deployment `dpl_3C5V47oLmBSGsDdUxxUqEF8G5pbc`
+(`https://videofetcher.vercel.app`) remained authoritative and application-
+equivalent. The Worker's deployment source advanced; Vercel's did not need to.
+
+**The fixture.** A 3-second H.264 + AAC MP4, 83089 bytes, SHA-256
+`c6f57ea73acfe17b7bd3759334ba2c180a0ddeefe47b80a4c1e47994d42c7f1c`, generated in
+a disposable container and served by a temporary local server exposed through a
+**separate temporary Cloudflare Quick Tunnel**. The named production Tunnel,
+`/etc/cloudflared/config.yml`, Cloudflare Access and DNS were **not** touched.
+Verified externally before use: `HEAD` 200, `GET` 200, `video/mp4`,
+`Content-Length: 83089`, hash exact.
+
+**The chain** (Vercel measurement unless noted):
+
+| Step | Result |
+| :--- | :--- |
+| Private-access login on the production alias | authenticated |
+| `/api/sites` → Worker diagnostics over Access + Tunnel + HMAC | `ffmpeg: true`, **`ytdlp: false`** |
+| `POST /api/analyze` | `extractor: "direct"`, `fileSize: 83089` — exactly the fixture — and a `direct-original` format |
+| `POST /api/download` (`formatId: direct-original`) | job `fb63f3170c2342717c7dd8af11d09418`, `queued` |
+| Status polling | reached **`ready`** in ~1.2 s (`started` → `finished` = 1170 ms), so the transient states were legitimately missed by polling rather than skipped |
+| Final job document | `status: ready`, `extractor: direct`, `fileSize: 83089`, `container: mp4`, `quality: original` |
+
+**The defect is closed by the job itself** (Lima runtime measurement). After the
+run, `/tmp/videofetch/jobs` **existed**, owned `1000:1000` — created by the
+runtime through the exact code path that previously returned `EACCES` — and
+contained **zero** job directories, the per-job working directory having been
+removed by normal cleanup.
+
+### Real application `PutObject` + `HeadObject`
+
+The merged upload lifecycle is strictly ordered: `writer.put(...)` →
+`writer.head(objectKey)` → reject if `null` → schema-validate the head →
+compare `objectKey`, `contentLength`, `contentType` and `contentDisposition` →
+**only then** `commitReadyFromUploading`. A `ready` job is therefore itself
+application-level proof that both operations succeeded and that the stored
+metadata matched.
+
+Durable Worker state for the job (Lima runtime measurement, read from a copy of
+the SQLite state):
+
+```
+status      ready
+object_key  videofetch/jobs/fb63f3170c2342717c7dd8af11d09418/50c0808b4c18d763e758a046c598a9b2
+file_size   83089
+mime        video/mp4
+filename    videofetch-e2e-fixture-original.mp4
+extractor   direct
+```
+
+The key matches the required `videofetch/jobs/<32hex>/<32hex>` shape exactly.
+
+The broker does **not** log per-mint action/key metadata to journald, so no
+corroborating broker record exists. Broker logging was deliberately **not**
+changed for acceptance, and no synthetic broker `Head` was performed and passed
+off as application evidence: the `ready` transition already requires the
+application's own `Head`.
+
+### The separate Vercel signed GET
+
+`GET /api/download/<jobId>/file` returned **303** with `Cache-Control: no-store`
+to a presigned R2 URL — `AWS4-HMAC-SHA256`, `X-Amz-Expires=300` — whose path is
+the exact object key above. Following it (provider evidence):
+
+```
+HTTP 200
+Content-Type        : video/mp4
+Content-Length      : 83089
+Content-Disposition : attachment; filename="videofetch-e2e-fixture-original.mp4"
+x-amz-expiration    : expiry-date="Sun, 30 Aug 2026 21:59:18 GMT",
+                      rule-id="videofetch-expired-job-backstop"
+```
+
+**SHA-256 of the downloaded object equals the source fixture byte for byte**,
+which `direct-original` makes meaningful: no FFmpeg transformation was involved,
+so byte identity is the correct assertion. `ffprobe` on the downloaded artefact
+confirms H.264 320x240 plus AAC mono, duration 3.000000 s, and a full decode
+pass reports no errors.
+
+The `x-amz-expiration` header is independent confirmation that
+`R2-PROVIDER-LIFECYCLE-BACKSTOP-001` is live and applies to this object, with an
+expiry exactly 3600 s after write. The lifecycle rule was not modified.
+
+### Credential separation, re-proven
+
+Names only; no value was printed, pulled or compared.
+
+- **Worker** carries `R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_JURISDICTION`,
+  `R2_BROKER_SOCKET_PATH` and the `WORKER_CONTROL_*` HMAC pair. It has **no**
+  `R2_SIGNER_*`, **no** `R2_WRITER_*` and **no** `R2_BROKER_PARENT_*`.
+- **Vercel Production** holds `R2_SIGNER_ACCESS_KEY_ID` and
+  `R2_SIGNER_SECRET_ACCESS_KEY` — the sole persistent GET signer — and **no**
+  `R2_WRITER_*` or `R2_BROKER_PARENT_*`.
+- **The broker** remains the sole holder of
+  `R2_BROKER_PARENT_ACCESS_KEY_ID` / `R2_BROKER_PARENT_SECRET_ACCESS_KEY`.
+
+So the write path and the read path used genuinely different identities: the
+Worker never held a signer key, and Vercel never held a writer or parent key.
+
+### yt-dlp remains disabled
+
+`YTDLP_NETWORK_ISOLATED=false` in the live container, no `yt-dlp`, `youtube-dl`
+or `python3` binary present in the image, Worker diagnostics reporting
+`ytdlp: false` through the real Vercel path, and the successful job using
+`extractor: direct`. **Phase 10 is NOT BEGUN.**
+
+### Cleanup and residual state
+
+The fixture server and the temporary Quick Tunnel were terminated — the Quick
+Tunnel hostname now returns `530` — and the fixture, cookie jar and scratch
+artefacts were deleted. The named Tunnel kept running throughout (PID 703,
+unchanged config hash).
+
+Two jobs remain in durable Worker state, both left to the application's normal
+expiry model rather than deleted by hand:
+
+- `ab7ee139…` — the original **failed** attempt, `object_key = null`, no object;
+- `fb63f317…` — this **successful** job, whose object is covered both by the
+  45-minute application retention and by the 3600-second provider backstop.
+
+No object was manually deleted, so no durable `ready` row points at a missing
+object.
+
+### Operator-attested
+
+The private-access secret used to authenticate the session is held in the
+operator's local environment file. Its custody, and the fact that it was neither
+rotated nor re-staged for this run, rest on operator attestation; this record
+contains no secret value.
