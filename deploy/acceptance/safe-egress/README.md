@@ -4,10 +4,11 @@ Recovered from the Lima prototype's `/opt/vf-test`, reviewed and sanitized.
 **Test tooling only.** Nothing here runs during normal Worker startup, and no
 systemd unit references any of it.
 
-**Phase 9 has NOT been executed.** These files are the instrument, not the
-measurement. Running them is not acceptance; acceptance is a Phase-9 activity
-performed against the exact deployed boundary and recorded in
-`docs/architecture/worker-deployment-runbook.md` §11.
+**Phase 9 was executed on 2026-08-30** against the live final topology at `a68243868bafeb88125eccca9344ea6751a76cf5`
+and PASSED — see `docs/architecture/worker-deployment-runbook.md` §11a. These
+files remain the instrument, not the measurement: running them is not by itself
+acceptance, which is a Phase-9 activity performed against the exact deployed
+boundary and recorded in the runbook.
 
 ---
 
