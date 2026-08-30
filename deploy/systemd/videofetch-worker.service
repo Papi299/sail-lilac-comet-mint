@@ -67,6 +67,15 @@ Requires=videofetch-media-netns.service videofetch-egress-policy.service videofe
 After=videofetch-media-netns.service videofetch-egress-policy.service videofetch-egress-watchdog.service
 BindsTo=videofetch-media-netns.service videofetch-egress-policy.service videofetch-egress-watchdog.service
 
+# FUNCTIONAL readiness, separate from the security chain above and additional to
+# it: the designated resolver must be answering before the Worker starts, and a
+# resolver that stays gone stops the Worker through BindsTo= rather than leaving
+# it reporting healthy while every hostname lookup fails.
+# (PRODUCTION-DNS-RESOLVER-001)
+Requires=videofetch-media-dns.service
+After=videofetch-media-dns.service
+BindsTo=videofetch-media-dns.service
+
 [Service]
 Type=simple
 Restart=on-failure

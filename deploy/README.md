@@ -143,6 +143,81 @@ resolver inside a denied class is fine and expected — it is admitted at that
 exact address on port 53 only, and the surrounding class stays denied. Absent,
 empty or malformed configuration stops the boundary rather than defaulting.
 
+### A configured resolver is not a running resolver
+
+`VIDEOFETCH_MEDIA_DNS_FLAGS` says which resolver the namespace is *pointed at*
+and which address the firewall *admits*. Neither statement puts a resolver
+there, and for a while nothing did.
+
+Phase 9 measured the policy — the boundary admits exactly the designated
+address on UDP and TCP 53 and denies every other resolver — using a resolver
+the acceptance itself started, which its cleanup then removed. The next boot
+came up with all six units active, the Worker reporting healthy and
+`vf-egress-policy-verify` passing, while every hostname lookup inside the
+Worker failed with `EAI_AGAIN`. Connections to public IP addresses still
+worked, so nothing looked broken from the outside: only name resolution was
+gone. That is `PRODUCTION-DNS-RESOLVER-001`.
+
+Two artefacts close it.
+
+**A durable listener.** `resolved.conf.d/10-videofetch-media-dns.conf.example`
+adds the designated address as an extra `systemd-resolved` stub listener.
+`systemd-resolved` is already the VM's resolver and already follows its
+upstream configuration, so the namespace inherits whatever the VM legitimately
+uses rather than a public resolver baked into this repository. The drop-in
+ships **unfilled**, like `media-egress.env.example`: fill it with the same
+address `VIDEOFETCH_MEDIA_DNS_FLAGS` declares.
+
+Ordering looks like it should be a problem and is not — which was verified
+rather than assumed. `systemd-resolved` starts several seconds *before*
+`docker.service`, so `docker0` and its address do not exist yet when the stub
+listener binds. It binds anyway, because systemd sets `IP_FREEBIND` on stub
+listener sockets. On the target VM the listener was observed to survive a
+`systemd-resolved` restart, a `docker` restart that destroys and recreates
+`docker0`, `docker0` being taken administratively down and back up, and a full
+VM reboot. `DNSStubListenerExtra` binds only the address given: never
+`0.0.0.0`, never the VM's LAN address.
+
+**A readiness gate.** `vf-media-dns-check` probes the address from
+`media-egress.env` — never from the drop-in, so a disagreement between the two
+files fails the unit instead of passing quietly — on **both** transports, and
+`videofetch-media-dns.service` runs it.
+
+It does **not** test whether the Internet resolves. A gate that depended on a
+public name resolving would turn every upstream blip into a Worker outage and
+would conflate "our resolver is present" with "the Internet is reachable". The
+success condition is a well-formed DNS reply from the exact configured address
+on UDP and TCP 53. Any rcode counts — `NXDOMAIN`, `SERVFAIL` and `REFUSED` all
+prove a resolver is listening and speaking DNS. The query is for a name under
+`.invalid`, which can never resolve, so a conforming resolver answers without
+any upstream traffic at all.
+
+This is **functional** readiness and is kept strictly apart from the
+**security** verification in `vf-egress-policy-verify`. Neither script calls
+the other. A DNS outage must not be reportable as a boundary breach, and a
+boundary breach must not be maskable by DNS being fine.
+
+The lifecycle it creates:
+
+```
+videofetch-media-dns.service      resolver answering on UDP+TCP 53
+        ↓
+videofetch-media-netns.service    namespace created with --dns <that address>
+        ↓
+videofetch-egress-policy.service
+        ↓
+videofetch-egress-watchdog.service
+        ↓
+videofetch-worker.service
+```
+
+The holder takes `After=` and `Requires=` but deliberately **not** `BindsTo=`:
+a transient DNS fault must not tear down the namespace and force the whole
+policy to be reinstalled. The Worker takes all three, so a resolver that stays
+gone stops the Worker rather than leaving it reporting healthy while every
+media fetch by hostname fails. Losing the resolver is a functional fault, and
+it is the Worker that stops for it — never the boundary.
+
 ### Fingerprints live in /run, never in Git
 
 `vf-egress-policy-install` records a canonical `nftables` fingerprint and a
@@ -193,6 +268,28 @@ latch that stops anyone restarting it into a still-broken boundary.
 policy denies, so the denial can be attributed to the rule's counter rather
 than to a missing route. That means mutating the route table the watchdog is
 watching.
+
+**It probes with UDP, and that is not a detail.** The first implementation used
+a TCP `connect()`. Phase 9 ran it against the live boundary with the test
+routes correctly installed and the deny counters stayed flat, so it reported —
+correctly — that the denial was not attributable. The cause was not this
+boundary: Linux refuses TCP to a multicast destination in the **socket layer**,
+before a packet is generated. `tcp_v4_connect()` rejects a route flagged
+`RTCF_MULTICAST` and `tcp_v6_connect()` rejects `ipv6_addr_is_multicast()`,
+both with `ENETUNREACH`, so netfilter's output hook is never consulted and no
+rule can count what was never emitted.
+
+That was isolated rather than assumed: in a throwaway namespace holding a valid
+route to the same destinations and **no nftables ruleset at all**, TCP
+`connect()` still returned `ENETUNREACH` while a UDP `sendto()` to the same
+address emitted a packet normally. A firewall that is not there cannot be what
+denied it.
+
+So the probe emits one bounded UDP datagram per family. That reaches the output
+hook, matches the deny rule by destination address like any other forbidden
+destination, and moves the counter. A flat counter remains a **failure** — the
+fix is that the packet now reaches the rule, not that the verdict became
+lenient.
 
 **It quiesces the boundary; it does not negotiate with it.** There is no
 acceptance mode, allowance or exemption anywhere in the verifier or the
@@ -351,6 +448,7 @@ The order is not a convenience — it is the fail-closed boundary.
    install -m 0755 deploy/bin/vf-egress-policy-install         /usr/local/sbin/
    install -m 0755 deploy/bin/vf-egress-policy-verify          /usr/local/sbin/
    install -m 0755 deploy/bin/vf-egress-watchdog               /usr/local/sbin/
+   install -m 0755 deploy/bin/vf-media-dns-check               /usr/local/sbin/
    # Phase-9 acceptance only; not required to run the Worker.
    install -m 0755 deploy/bin/vf-egress-multicast-route-test   /usr/local/sbin/
 
@@ -362,6 +460,18 @@ The order is not a convenience — it is the fail-closed boundary.
    # them.
    install -m 0644 deploy/systemd/media-egress.env.example \
      /etc/videofetch/media-egress.env
+
+   # The durable resolver at the designated address. Ships UNFILLED: put the
+   # SAME address VIDEOFETCH_MEDIA_DNS_FLAGS declares into
+   # DNSStubListenerExtra, or the readiness unit will refuse to start.
+   install -m 0755 -d /etc/systemd/resolved.conf.d
+   install -m 0644 deploy/systemd/resolved.conf.d/10-videofetch-media-dns.conf.example \
+     /etc/systemd/resolved.conf.d/10-videofetch-media-dns.conf
+   systemctl restart systemd-resolved
+
+   # Confirm it bound the EXACT address and nothing wider.
+   ss -lnup | grep ':53'   # expect the designated address, never 0.0.0.0:53
+   ss -lnt  | grep ':53'
    ```
 
    `VIDEOFETCH_WORKER_PORT` must equal `WORKER_PORT` in the Worker's own
@@ -372,6 +482,7 @@ The order is not a convenience — it is the fail-closed boundary.
    order; starting the Worker pulls the rest in.
 
    ```
+   systemctl enable --now videofetch-media-dns.service
    systemctl enable --now videofetch-media-netns.service
    systemctl enable --now videofetch-egress-policy.service
    systemctl enable --now videofetch-egress-watchdog.service
