@@ -17,7 +17,11 @@ import {
 } from "@/lib/security/private-access.server";
 import { GENERIC_YTDLP_EXECUTION_IMPLEMENTED } from "@/shared/capabilities";
 import { WORKER_PRIVATE_PRINCIPAL } from "@/shared/worker/constants";
-import { WorkerAnalyzeRequestSchema, WorkerJobIdSchema } from "@/shared/worker/contracts";
+import {
+  WorkerAnalyzeRequestSchema,
+  WorkerJobIdSchema,
+  WorkerRequestedFormatIdSchema,
+} from "@/shared/worker/contracts";
 import {
   getObjectStoreSigner,
   getWorkerClient,
@@ -203,8 +207,14 @@ export async function handleDownload(request: Request): Promise<Response> {
       url?: unknown;
       formatId?: unknown;
     } | null;
-    const formatId = typeof body?.formatId === "string" ? body.formatId : "";
-    if (!formatId) throw new AppError("FORMAT_UNAVAILABLE");
+    // §6: the browser's format vocabulary is CLOSED. Anything outside it —
+    // including a raw yt-dlp `format_id`, a strategy name, a downloader or a
+    // yt-dlp argument — is rejected here, before a job is created and before
+    // the Worker is contacted. The Worker validates independently again on its
+    // own side; this is the early, cheap half of that pair.
+    const requestedFormat = WorkerRequestedFormatIdSchema.safeParse(body?.formatId);
+    if (!requestedFormat.success) throw new AppError("FORMAT_UNAVAILABLE");
+    const formatId = requestedFormat.data;
     const url = await validateBrowserUrl(body?.url);
 
     const created = await getWorkerClient().createJob({
