@@ -227,6 +227,20 @@ export type WorkerRuntimeConfig = {
     readonly maxRedirects: number;
     readonly tempDirectory: string | null;
     readonly ffmpegPath: string | null;
+    /**
+     * Generic yt-dlp APPLICATION feature state.
+     *
+     * This is not "is the runtime installed" — that is probed separately and
+     * reported separately. It is the operator's explicit intent to allow
+     * generic extraction, and it is fail-closed: absent means disabled.
+     *
+     * As of Phase 10C1 this flag gates nothing yet, because no user-URL yt-dlp
+     * execution path exists in the Worker at all. It is the foundation the
+     * later, separately authorized integration phase will gate on.
+     */
+    readonly ytdlp: {
+      readonly enabled: boolean;
+    };
   };
 };
 
@@ -250,38 +264,52 @@ export class WorkerRuntimeConfigError extends Error {
 }
 
 /**
- * Phase-8A deployment lock (§8).
+ * Retired yt-dlp variables (PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001).
  *
- * Architectural Phases 8 and 9 REQUIRE `YTDLP_NETWORK_ISOLATED=false`. Phase 10
- * is the only phase authorized to enable it, and only after the safe-egress
- * acceptance evidence is approved. This lock exists so an operator typo or an
- * environment drift cannot silently activate yt-dlp early.
+ * Both are refused by PRESENCE, not by value, and the refusal is unconditional:
  *
- * The truthiness test is byte-for-byte the same as the existing attestation
- * semantics in `src/lib/config.ts#isYtdlpNetworkIsolated` — this module reads a
- * SUPPLIED environment instead of the ambient one, and does NOT modify the
- * execution guard itself.
+ *  - `YTDLP_NETWORK_ISOLATED` was a Phase-8/9 operator ASSERTION that yt-dlp
+ *    ran behind an isolated network. It was never the boundary. The real
+ *    boundary is the externally owned media network namespace, its nftables
+ *    policy, the policy verifier and the watchdog — none of which this
+ *    container can read, weaken or mutate. Keeping a boolean that *looks* like
+ *    a security control invites exactly the mistake of trusting it, so the
+ *    contract is retired outright rather than repurposed. `false` is refused
+ *    alongside `true`: a deployment still setting it is a stale deployment,
+ *    and it should fail closed and loudly rather than appear correct.
+ *
+ *  - `YTDLP_PATH` let a single environment variable choose the yt-dlp
+ *    executable AND prepend arbitrary leading arguments to every invocation
+ *    (it was split on spaces). No repository path lets user input reach it, so
+ *    this is not a user-input vulnerability — it is an unnecessarily loose
+ *    operator execution surface, and the Production Worker has no need of it
+ *    at all. The runtime identity is a reviewed constant in
+ *    `ytdlp-runtime.server.ts`, not deployment configuration.
+ *
+ * Enabling generic yt-dlp execution is now a separate, explicit concern:
+ * `YTDLP_ENABLED`. Installing the runtime does not enable it.
  */
-export class WorkerYtdlpDeploymentLockError extends Error {
-  constructor() {
-    super(
-      "YTDLP_NETWORK_ISOLATED must not be enabled in Phase 8/9. " +
-        "Phase 10 is the only phase authorized to enable yt-dlp network execution.",
-    );
-    this.name = "WorkerYtdlpDeploymentLockError";
-  }
-}
+export const WORKER_FORBIDDEN_YTDLP_VARIABLES = Object.freeze([
+  "YTDLP_NETWORK_ISOLATED",
+  "YTDLP_PATH",
+] as const);
 
-export function parsesYtdlpIsolationTruthy(raw: string | undefined): boolean {
-  const value = raw?.trim().toLowerCase();
-  return value === "1" || value === "true" || value === "yes";
-}
-
-export function assertYtdlpDeploymentLock(env: NodeJS.ProcessEnv): void {
-  if (parsesYtdlpIsolationTruthy(env.YTDLP_NETWORK_ISOLATED)) {
-    throw new WorkerYtdlpDeploymentLockError();
-  }
-}
+/**
+ * Strict boolean grammar for `YTDLP_ENABLED`.
+ *
+ * Deliberately NOT the retired `1`/`true`/`yes` truthiness rule: a feature
+ * switch that decides whether a media extractor may run at all should have
+ * exactly two spellings and reject everything else, so a typo becomes a
+ * startup failure rather than a silent state. Surrounding whitespace is
+ * tolerated because environment files routinely introduce it; case is not,
+ * because `True` and `TRUE` are guesses about the grammar rather than uses of
+ * it. Every rejection fails closed: the Worker does not start.
+ */
+const YtdlpEnabledSchema = z
+  .string()
+  .transform((raw) => raw.trim())
+  .refine((v) => v === "true" || v === "false", 'must be exactly "true" or "false"')
+  .transform((v) => v === "true");
 
 /** Treats an unset variable and an empty/whitespace string identically. */
 function optional(raw: string | undefined): string | undefined {
@@ -334,9 +362,11 @@ function readOptionalField<S extends z.ZodTypeAny, F>(
 /**
  * Loads and strictly validates the production Worker runtime configuration.
  *
- * Throws `WorkerRuntimeConfigError` (naming only the offending variables) or
- * `WorkerYtdlpDeploymentLockError`. Both are startup-fatal by design: the
- * caller must never reach `listen()` after either.
+ * Throws `WorkerRuntimeConfigError`, naming only the offending variables. It
+ * is startup-fatal by design: the caller must never reach `listen()` after it.
+ * A retired yt-dlp variable (`WORKER_FORBIDDEN_YTDLP_VARIABLES`) is reported
+ * through the same error, so a stale deployment is named precisely without a
+ * dedicated error class.
  *
  * The Vercel-only signer identity (`R2_SIGNER_ACCESS_KEY_ID` /
  * `R2_SIGNER_SECRET_ACCESS_KEY`) is deliberately NOT read here. Signing stays
@@ -352,11 +382,16 @@ function readOptionalField<S extends z.ZodTypeAny, F>(
 export function loadWorkerRuntimeConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): WorkerRuntimeConfig {
-  // The deployment lock is evaluated FIRST so a premature yt-dlp activation is
-  // reported as itself rather than masked by an unrelated configuration error.
-  assertYtdlpDeploymentLock(env);
-
   const invalid: string[] = [];
+
+  // Retired yt-dlp contracts are refused by PRESENCE, before anything else, so
+  // a stale deployment is reported as itself rather than masked by an
+  // unrelated configuration error. Unlike the R2 family below, an empty value
+  // still counts: the objection is to the variable existing at all, not to the
+  // material it carries.
+  for (const name of WORKER_FORBIDDEN_YTDLP_VARIABLES) {
+    if (env[name] !== undefined) invalid.push(name);
+  }
 
   const bindHost = readOptionalField(
     "WORKER_BIND_HOST",
@@ -522,6 +557,17 @@ export function loadWorkerRuntimeConfig(
       invalid,
       null as string | null,
     ),
+    // Absent => disabled. A malformed value is a startup failure, never a
+    // silent fallback to either state.
+    ytdlp: Object.freeze({
+      enabled: readOptionalField(
+        "YTDLP_ENABLED",
+        env.YTDLP_ENABLED,
+        YtdlpEnabledSchema,
+        invalid,
+        false,
+      ),
+    }),
   };
 
   // Cross-field: the durable state volume and the ephemeral media scratch are

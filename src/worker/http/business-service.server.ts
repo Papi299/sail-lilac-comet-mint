@@ -1,4 +1,3 @@
-import { isYtdlpNetworkIsolated } from "../../lib/config.ts";
 import {
   WorkerAnalyzeSuccessSchema,
   WorkerCancelJobSuccessSchema,
@@ -51,6 +50,14 @@ export type WorkerServiceDeps = {
   analyze?: AnalyzeFn;
   probeBinaries?: WorkerBinaryProbe;
   clock?: () => number;
+  /**
+   * The validated `YTDLP_ENABLED` application feature state, supplied by the
+   * composition root. This service never reads `process.env` itself — the
+   * runtime configuration boundary owns that — and it defaults to disabled so
+   * a caller that forgets to pass it cannot report a capability the deployment
+   * did not grant.
+   */
+  ytdlpEnabled?: boolean;
 };
 
 export class WorkerService implements WorkerBusinessService {
@@ -60,6 +67,7 @@ export class WorkerService implements WorkerBusinessService {
   private readonly analyzeFn: AnalyzeFn;
   private readonly probeBinaries: WorkerBinaryProbe;
   private readonly clock: () => number;
+  private readonly ytdlpEnabled: boolean;
 
   constructor(deps: WorkerServiceDeps) {
     this.store = deps.store;
@@ -70,6 +78,9 @@ export class WorkerService implements WorkerBusinessService {
     this.analyzeFn = deps.analyze ?? analyzeDirectMedia;
     this.probeBinaries = deps.probeBinaries ?? probeWorkerBinaries;
     this.clock = deps.clock ?? (() => Date.now());
+    // Fail-closed default: absent means disabled, exactly as YTDLP_ENABLED
+    // itself behaves at the configuration boundary.
+    this.ytdlpEnabled = deps.ytdlpEnabled ?? false;
   }
 
   public async analyze(request: WorkerAnalyzeRequest): Promise<WorkerAnalyzeSuccess> {
@@ -140,13 +151,21 @@ export class WorkerService implements WorkerBusinessService {
       queueDepth,
       runningJobs,
       maxConcurrent: WORKER_MAX_CONCURRENT_JOBS,
+      // "The pinned runtime executes", nothing more.
       binaries: { ffmpeg: binaries.ffmpeg, ytdlp: binaries.ytdlp },
+      runtime: { ytdlpVersion: binaries.ytdlpVersion },
+      // "The operator enabled the feature", which is independent of the above.
+      // Both being true still does not mean a user URL can reach yt-dlp: no
+      // such path exists in this phase.
+      features: { ytdlpEnabled: this.ytdlpEnabled },
       safeEgress: {
-        // Read-only view of the operator attestation. Nothing here sets it, and
-        // the absence of the environment variable stays fail-closed (false).
-        attested: isYtdlpNetworkIsolated(),
-        // Phase 9 owns safe-egress policy attestation; no policy state exists
-        // yet, so this is reported honestly as absent rather than fabricated.
+        // Enforcement is external and this container cannot inspect it, so the
+        // honest report is WHO enforces — not a boolean asserting that it
+        // holds. The retired `attested` flag was an operator-set environment
+        // variable that could only ever restate its own configuration.
+        enforcement: "external",
+        // Nothing that owns the policy publishes a version to the Worker, so
+        // this stays null rather than fabricated.
         policyVersion: null,
       },
     });

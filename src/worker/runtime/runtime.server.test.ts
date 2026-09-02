@@ -169,6 +169,7 @@ function makeConfig(
       downloadTimeoutSeconds: 600,
       analysisTimeoutSeconds: 45,
       maxRedirects: 5,
+      ytdlp: { enabled: false },
       tempDirectory: null,
       ffmpegPath: null,
       ...mediaOverrides,
@@ -230,7 +231,7 @@ describe("Worker runtime composition", () => {
       writer = new MemoryWriter();
       runtime = await createWorkerRuntime(makeConfig(join(root, "state"), port), {
         objectStoreWriter: writer,
-        probeBinaries: async () => ({ ffmpeg: true, ytdlp: false }),
+        probeBinaries: async () => ({ ffmpeg: true, ytdlp: false, ytdlpVersion: null }),
         analyze: async () => metadata(),
         executorDeps: mediaDeps(),
       });
@@ -907,7 +908,7 @@ describe("R2 startup network isolation", () => {
     const runtime = await createWorkerRuntime(makeConfig(join(root, "state"), port), {
       r2Credentials: fakeCredentials(),
       r2CreateWriter: delegatedWriterFactory(countingClient),
-      probeBinaries: async () => ({ ffmpeg: true, ytdlp: false }),
+      probeBinaries: async () => ({ ffmpeg: true, ytdlp: false, ytdlpVersion: null }),
       analyze: async () => metadata(),
       executorDeps: mediaDeps(),
     });
@@ -1026,9 +1027,7 @@ describe("import-time purity", () => {
 
   it("describes a startup failure without disclosing values", async () => {
     const { describeStartupFailure } = await import("./main.server.ts");
-    const { WorkerRuntimeConfigError, WorkerYtdlpDeploymentLockError } = await import(
-      "./config.server.ts"
-    );
+    const { WorkerRuntimeConfigError } = await import("./config.server.ts");
 
     const configLine = describeStartupFailure(
       new WorkerRuntimeConfigError(["WORKER_CONTROL_SECRET", "R2_BUCKET"]),
@@ -1036,8 +1035,15 @@ describe("import-time purity", () => {
     assert.ok(configLine.includes("WORKER_CONTROL_SECRET"));
     assert.ok(configLine.includes("R2_BUCKET"));
 
-    const lockLine = describeStartupFailure(new WorkerYtdlpDeploymentLockError());
-    assert.ok(lockLine.includes("YTDLP_NETWORK_ISOLATED"));
+    // The retired Phase-8A lock had its own error class and its own message.
+    // It is now reported through the ordinary configuration error, which still
+    // names the offending variable precisely — so a stale deployment carrying
+    // the retired contract is diagnosed just as clearly, with one fewer
+    // bespoke failure mode.
+    const retiredLine = describeStartupFailure(
+      new WorkerRuntimeConfigError(["YTDLP_NETWORK_ISOLATED"]),
+    );
+    assert.ok(retiredLine.includes("YTDLP_NETWORK_ISOLATED"));
 
     // An arbitrary error contributes only its class name, never its message.
     const opaque = describeStartupFailure(

@@ -1,9 +1,5 @@
 import { pathToFileURL } from "node:url";
-import {
-  loadWorkerRuntimeConfig,
-  WorkerRuntimeConfigError,
-  WorkerYtdlpDeploymentLockError,
-} from "./config.server.ts";
+import { loadWorkerRuntimeConfig, WorkerRuntimeConfigError } from "./config.server.ts";
 import { createWorkerRuntime, type WorkerRuntime } from "./runtime.server.ts";
 
 /**
@@ -32,9 +28,6 @@ const SIGNALS = ["SIGTERM", "SIGINT"] as const;
  * offending variables; anything else is reported by error class alone.
  */
 export function describeStartupFailure(err: unknown): string {
-  if (err instanceof WorkerYtdlpDeploymentLockError) {
-    return "startup blocked: YTDLP_NETWORK_ISOLATED must not be enabled before Phase 10";
-  }
   if (err instanceof WorkerRuntimeConfigError) {
     return err.variables.length > 0
       ? `startup blocked: invalid configuration for ${err.variables.join(", ")}`

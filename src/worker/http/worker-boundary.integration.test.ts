@@ -178,7 +178,7 @@ describe("Worker boundary integration (loopback)", () => {
         analyzeCalls.push(url);
         return metadata();
       },
-      probeBinaries: async () => ({ ffmpeg: true, ytdlp: false }),
+      probeBinaries: async () => ({ ffmpeg: true, ytdlp: false, ytdlpVersion: null }),
     });
 
     server = createWorkerServer(
@@ -369,7 +369,9 @@ describe("Worker boundary integration (loopback)", () => {
     assert.equal(diag.maxConcurrent, 1);
     assert.equal(diag.binaries.ffmpeg, true);
     assert.equal(diag.binaries.ytdlp, false);
-    assert.equal(diag.safeEgress.attested, false);
+    assert.equal(diag.safeEgress.enforcement, "external");
+    assert.equal(diag.features.ytdlpEnabled, false);
+    assert.equal(diag.runtime.ytdlpVersion, null);
   });
 
   it("health stays unauthenticated and minimal", async () => {

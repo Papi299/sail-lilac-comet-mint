@@ -51,10 +51,43 @@ export function resetPrivateAccessApiForTests(): void {
  * static catalog. The control plane deliberately holds no local extractor
  * registry or binary probe of its own.
  */
+/**
+ * Whether THIS BUILD contains a generic yt-dlp execution path at all.
+ *
+ * This is a compile-time fact about the source, not deployment configuration,
+ * and it is deliberately a constant rather than an environment variable: an
+ * operator setting must never be able to claim that code exists. As of
+ * `PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001` the Worker has no generic analyze
+ * or download path — `WorkerService.analyze()` resolves only to the
+ * direct-media analyzer and `JobExecutor` has no generic branch — so no
+ * combination of "runtime installed" and "operator enabled" can make generic
+ * extraction usable.
+ *
+ * The later integration phase that actually adds the execution path flips this
+ * in the same commit. Until then it fails closed in the safe direction: if the
+ * Worker somehow gained the capability first, `/api/sites` would under-report
+ * rather than over-promise.
+ */
+export const GENERIC_YTDLP_EXECUTION_IMPLEMENTED = false;
+
 async function loadSites() {
   const diagnostics = await getWorkerClient().diagnostics();
+  // `ytdlp` answers one question only: can this build actually extract from a
+  // generic site right now? Three things must hold — the code path must exist,
+  // the pinned runtime must execute, and the operator must have enabled it.
+  //
+  // `installed && enabled` is NOT sufficient and must not be used here. Both
+  // can be true in Phase 10C1 while no execution path exists, and reporting
+  // that as capability would tell the browser that every catalog site works.
+  const ytdlpInstalled = diagnostics.binaries.ytdlp;
+  const ytdlpEnabled = diagnostics.features.ytdlpEnabled;
   return {
-    ytdlp: diagnostics.binaries.ytdlp,
+    ytdlp: GENERIC_YTDLP_EXECUTION_IMPLEMENTED && ytdlpInstalled && ytdlpEnabled,
+    // The two underlying facts stay independently observable, so an operator
+    // can distinguish "runtime absent" from "runtime present but switched off"
+    // without inferring it from a single collapsed boolean.
+    ytdlpInstalled,
+    ytdlpEnabled,
     ffmpeg: diagnostics.binaries.ffmpeg,
     sites: SITE_CATALOG,
     note: "Support depends on each website’s delivery method and can change without notice. Direct media files and publicly accessible archive sources are the most reliable.",

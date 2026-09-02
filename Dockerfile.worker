@@ -4,10 +4,22 @@
 # Vercel and keeps its own `Dockerfile`; nothing here builds, serves or previews
 # the web application.
 #
+# Since PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001 this image DOES ship a pinned
+# yt-dlp runtime plus the Python interpreter it needs. That is a runtime
+# foundation and nothing more:
+#
+#   installing the yt-dlp runtime  !=  enabling generic yt-dlp execution
+#
+# No user-supplied URL is executable by yt-dlp in this image. The only yt-dlp
+# operation any Production Worker code performs is a non-network version probe
+# (src/worker/runtime/ytdlp-runtime.server.ts). Generic user-URL execution is a
+# later, separately authorized phase, gated by YTDLP_ENABLED, which is
+# deliberately NOT set here.
+#
 # Deliberately NOT part of this image:
-#   - yt-dlp / python  : direct-media execution does not need it, and Phase 10
-#                        is the only phase authorized to enable yt-dlp network
-#                        execution. Diagnostics honestly reports `ytdlp: false`.
+#   - pip / venv       : the yt-dlp artifact is a single pinned zipimport file
+#                        fetched by exact digest at build time. Nothing in this
+#                        image can install, upgrade or replace a Python package.
 #   - curl / wget      : nothing inside this image probes over HTTP. Liveness is
 #                        probed by the deployment layer from OUTSIDE the
 #                        restricted media namespace.
@@ -20,9 +32,43 @@ FROM node:22-bookworm-slim
 
 # ffmpeg brings ffprobe with it. ca-certificates provides the TLS trust roots
 # used for outbound media fetches.
+#
+# python3 is Debian Bookworm's system interpreter (3.11). yt-dlp 2026.08.19
+# refuses to import on Python < 3.10, so the base image satisfies it directly:
+# no virtual environment, no pip, and no third-party Python package is
+# installed anywhere in this build.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates python3 \
   && rm -rf /var/lib/apt/lists/*
+
+# The pinned yt-dlp runtime.
+#
+# This is the official PLATFORM-INDEPENDENT UNIX ZIPIMPORT executable from an
+# exact upstream release — a single ~3 MB file with a `#!/usr/bin/env python3`
+# shebang and a zip payload. It is deliberately NOT `yt-dlp_linux_aarch64`: the
+# PyInstaller builds unpack themselves into a temporary directory on every run,
+# which this container's read-only root and `noexec` media tmpfs would break.
+#
+# `ADD --checksum` verifies the digest published in the release's own
+# SHA2-256SUMS at BUILD time, so the build fails closed if the asset ever
+# differs. It also needs no download tooling in the final image, which is what
+# keeps curl and wget out.
+#
+# The URL is an immutable release URL. There is no `latest`, no nightly, no
+# mirror, and no runtime `pip install`. Upgrading yt-dlp means changing this
+# version and this digest — together, in a reviewed commit, alongside
+# YTDLP_RUNTIME in src/worker/runtime/ytdlp-runtime.server.ts, which
+# container-policy.test.ts asserts must agree with these exact values.
+ADD --checksum=sha256:1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6 \
+    https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp \
+    /usr/local/lib/videofetch/yt-dlp
+
+# Root-owned and read-only, on the read-only root filesystem. The Worker runs
+# as `node` and therefore cannot rewrite, replace or self-update its own media
+# runtime — the property that makes `--no-update` a statement of intent rather
+# than the actual control.
+RUN chown root:root /usr/local/lib/videofetch/yt-dlp \
+  && chmod 0555 /usr/local/lib/videofetch/yt-dlp
 
 WORKDIR /app
 
@@ -68,13 +114,23 @@ RUN rm -rf ./src/broker
 RUN mkdir -p /var/lib/videofetch /tmp/videofetch \
   && chown -R node:node /var/lib/videofetch /tmp/videofetch
 
+# YTDLP_NETWORK_ISOLATED is deliberately ABSENT and must stay absent.
+#
+# It was a Phase-8/9 operator assertion, never a security boundary — the real
+# boundary is the externally owned media network namespace and nftables policy,
+# which this container can neither read nor alter. The Worker runtime now
+# REFUSES TO START if the variable is present at all, even as `false`, so a
+# stale deployment fails closed instead of silently carrying a retired
+# contract. YTDLP_PATH is refused for the same reason.
+#
+# YTDLP_ENABLED is also deliberately absent: absent means disabled, and no
+# image may enable generic yt-dlp execution by itself.
 ENV NODE_ENV=production \
     WORKER_BIND_HOST=0.0.0.0 \
     WORKER_PORT=8080 \
     WORKER_DATA_DIRECTORY=/var/lib/videofetch \
     TEMP_DIRECTORY=/tmp/videofetch \
-    FFMPEG_PATH=/usr/bin/ffmpeg \
-    YTDLP_NETWORK_ISOLATED=false
+    FFMPEG_PATH=/usr/bin/ffmpeg
 
 # No secret is baked into this image, and this container holds NO persistent R2
 # credential at all (WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001).

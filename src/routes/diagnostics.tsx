@@ -17,7 +17,9 @@ type WorkerDiagnostics = {
   runningJobs: number;
   maxConcurrent: number;
   binaries: { ffmpeg: boolean; ytdlp: boolean };
-  safeEgress: { attested: boolean; policyVersion: string | null };
+  runtime: { ytdlpVersion: string | null };
+  features: { ytdlpEnabled: boolean };
+  safeEgress: { enforcement: "external"; policyVersion: string | null };
 };
 
 function DiagnosticsPage() {
@@ -56,16 +58,46 @@ function DiagnosticsPage() {
             </CardHeader>
             <CardContent className="grid gap-3 text-sm sm:grid-cols-2">
               <p>FFmpeg: {data.binaries.ffmpeg ? "available" : "missing"}</p>
-              <p>yt-dlp: {data.binaries.ytdlp ? "available" : "missing"}</p>
+              <p>
+                yt-dlp runtime: {data.binaries.ytdlp ? "available" : "missing"}
+                {data.runtime.ytdlpVersion ? ` (${data.runtime.ytdlpVersion})` : ""}
+              </p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Generic extraction</CardTitle>
+            </CardHeader>
+            <CardContent className="grid gap-3 text-sm">
+              {/* Deliberately "configuration", not "feature enabled". The
+                  setting records operator intent; it does not make generic
+                  extraction operational, because this build contains no
+                  execution path for it. Calling it "enabled" would imply a
+                  capability that does not exist. */}
+              <p>
+                yt-dlp configuration: {data.features.ytdlpEnabled ? "enabled" : "disabled"}
+              </p>
+              <p>Generic yt-dlp execution: not implemented in this build</p>
+              <p className="text-muted-foreground">
+                Neither an available runtime nor an enabled setting makes generic extraction
+                usable. This build has no generic analyze or download path, so only direct media
+                files are extractable.
+              </p>
             </CardContent>
           </Card>
           <Card>
             <CardHeader>
               <CardTitle className="text-base">Safe egress</CardTitle>
             </CardHeader>
-            <CardContent className="grid gap-3 text-sm sm:grid-cols-2">
-              <p>Attested: {data.safeEgress.attested ? "yes" : "no"}</p>
+            <CardContent className="grid gap-3 text-sm">
+              <p>Enforcement: {data.safeEgress.enforcement}</p>
               <p>Policy version: {data.safeEgress.policyVersion ?? "—"}</p>
+              {/* The Worker holds no NET_ADMIN and cannot read the ruleset, so
+                  it must not imply it has verified anything. */}
+              <p className="text-muted-foreground">
+                Egress is enforced outside this container by the media network namespace and its
+                host-owned policy. The worker cannot inspect or attest that boundary.
+              </p>
             </CardContent>
           </Card>
         </div>

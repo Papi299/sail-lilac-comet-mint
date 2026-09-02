@@ -177,8 +177,14 @@ test("Worker Contracts - Diagnostics", async (t) => {
       ffmpeg: true,
       ytdlp: true,
     },
+    runtime: {
+      ytdlpVersion: "2026.08.19",
+    },
+    features: {
+      ytdlpEnabled: false,
+    },
     safeEgress: {
-      attested: false,
+      enforcement: "external",
       policyVersion: "not-enabled",
     },
   };

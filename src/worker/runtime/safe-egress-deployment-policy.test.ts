@@ -614,14 +614,25 @@ describe("safe-egress deployment policy", () => {
       }
     });
 
-    it("keeps yt-dlp disabled", () => {
-      for (const truthy of ["true", "1", "yes"]) {
+    it("carries no retired yt-dlp contract and does not enable the feature", () => {
+      // STRENGTHENED in Phase 10C1. The old assertion only rejected TRUTHY
+      // values of the retired attestation, so a unit still shipping `=false`
+      // passed while carrying a dead contract the runtime now refuses to boot
+      // with. The unit must not declare either retired variable at all, and
+      // must not enable the replacement feature flag.
+      const executable = workerUnit.join("\n");
+      for (const retired of ["YTDLP_NETWORK_ISOLATED", "YTDLP_PATH"]) {
         assert.doesNotMatch(
-          workerUnit.join("\n"),
-          new RegExp(`YTDLP_NETWORK_ISOLATED\\s*=\\s*["']?${truthy}["']?(\\s|$)`, "i"),
-          `YTDLP_NETWORK_ISOLATED must never be set to ${truthy}`,
+          executable,
+          new RegExp(`^\\s*(Environment=)?${retired}=`, "m"),
+          `${retired} is retired and must not be declared by the Worker unit`,
         );
       }
+      assert.doesNotMatch(
+        executable,
+        /^\s*(Environment=)?YTDLP_ENABLED=/m,
+        "the Worker unit must not enable generic yt-dlp execution",
+      );
     });
   });
 

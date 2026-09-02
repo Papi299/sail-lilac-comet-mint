@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { YTDLP_RUNTIME } from "./ytdlp-runtime.server.ts";
 
 /**
  * Static container policy guard (§43).
@@ -97,11 +98,19 @@ describe("Dockerfile.worker container policy", () => {
     });
 
     it("install firewall, remote-administration or container-control tooling", () => {
+      // PHASE-10C1: `yt-dlp` was removed from this list, and ONLY `yt-dlp`.
+      //
+      // The image now ships a pinned yt-dlp runtime, but it must never arrive
+      // through a PACKAGE MANAGER: apt would track a distribution's moving
+      // version and pip would pull an unpinned dependency graph and leave an
+      // installer in the image. The artifact is fetched by exact digest
+      // instead, which the "pinned yt-dlp runtime" suite below asserts.
+      // `youtube-dl` remains banned outright — it is not the approved runtime.
       const forbidden = [
         "nftables", "iptables", "ip6tables", "ufw", "firewalld",
         "curl", "wget", "openssh-server", "openssh-client", "ssh", "sudo",
         "docker.io", "docker-ce", "containerd",
-        "yt-dlp", "youtube-dl",
+        "youtube-dl",
       ];
 
       const installCommands = directives("RUN")
@@ -157,13 +166,51 @@ describe("Dockerfile.worker container policy", () => {
       }
     });
 
-    it("enable YTDLP_NETWORK_ISOLATED", () => {
-      // Phase 10 is the only phase authorized to enable it.
-      for (const truthy of ["true", "1", "yes"]) {
+    it("carry the retired YTDLP_NETWORK_ISOLATED or YTDLP_PATH contracts at all", () => {
+      // STRENGTHENED in Phase 10C1. The old assertion only forbade TRUTHY
+      // values, so an image shipping `=false` passed while still carrying a
+      // dead contract. Both variables are now retired and the Worker runtime
+      // refuses to start if either is present at any value, so the image must
+      // not declare them at all.
+      for (const retired of ["YTDLP_NETWORK_ISOLATED", "YTDLP_PATH"]) {
         assert.doesNotMatch(
           executable,
-          new RegExp(`YTDLP_NETWORK_ISOLATED\\s*=\\s*["']?${truthy}["']?(\\s|$)`, "i"),
-          `YTDLP_NETWORK_ISOLATED must never be set to ${truthy}`,
+          new RegExp(`\\b${retired}\\s*=`),
+          `${retired} is retired and must not be declared in the image`,
+        );
+      }
+    });
+
+    it("enable the generic yt-dlp feature", () => {
+      // Shipping the runtime must never be the same act as enabling it. An
+      // image that switched the feature on by itself would make every
+      // deployment of that image generically capable without a decision.
+      assert.doesNotMatch(
+        executable,
+        /\bYTDLP_ENABLED\s*=/,
+        "the image must not set YTDLP_ENABLED; absent means disabled",
+      );
+    });
+
+    it("install or retain a Python package installer", () => {
+      // No pip, no venv, no runtime installer: the artifact is a single
+      // digest-pinned file, so nothing in this image can add, upgrade or
+      // replace a Python package.
+      for (const forbidden of [/\bpip3?\b/, /\bpipx\b/, /\bensurepip\b/, /\bvenv\b/, /virtualenv/]) {
+        assert.doesNotMatch(
+          executable,
+          forbidden,
+          `the Worker image must not reference ${forbidden}`,
+        );
+      }
+    });
+
+    it("permit yt-dlp to update itself", () => {
+      for (const forbidden of [/--update-to/, /--update\b/, /\s-U\s/]) {
+        assert.doesNotMatch(
+          executable,
+          forbidden,
+          `the image must not contain a yt-dlp self-update invocation (${forbidden})`,
         );
       }
     });
@@ -262,6 +309,16 @@ describe("Dockerfile.worker container policy", () => {
       assert.match(cmds[0].args, /"node"/, "CMD must invoke Node directly");
     });
 
+    it("install the Python interpreter the pinned yt-dlp release requires", () => {
+      const installs = directives("RUN")
+        .map((i) => i.args)
+        .filter((args) => /apt-get\s+install/.test(args))
+        .join("\n");
+      // Debian Bookworm's system python3 is 3.11, satisfying the pinned
+      // release's >= 3.10 requirement with no venv and no pip.
+      assert.match(installs, /(^|\s)python3(\s|$)/, "python3 must be installed");
+    });
+
     it("install ffmpeg and CA certificates", () => {
       const installs = directives("RUN")
         .map((i) => i.args)
@@ -341,4 +398,94 @@ describe("Dockerfile.worker container policy", () => {
       assert.match(runs, /chown[^\n]*node/, "ownership handed to the non-root runtime user");
     });
   });
+
+  // ── pinned yt-dlp runtime (PHASE-10C1) ────────────────────────────────────
+  //
+  // The image and `ytdlp-runtime.server.ts` must describe the SAME runtime.
+  // Asserting them against each other — rather than against a literal repeated
+  // in the test — means a version bump that touches only one of the two fails
+  // here instead of shipping a Worker whose probe can never match its image.
+  describe("pinned yt-dlp runtime", () => {
+    function addDirectives(): string[] {
+      return directives("ADD").map((i) => i.args);
+    }
+
+    it("fetches exactly one yt-dlp artifact, by ADD, with no download tooling", () => {
+      const adds = addDirectives().filter((args) => args.includes("yt-dlp"));
+      assert.equal(adds.length, 1, "exactly one yt-dlp artifact may be added");
+      // ADD --checksum verifies at build time and needs no curl or wget in the
+      // final image, which is what keeps both out of the runtime.
+      assert.doesNotMatch(executable, /\bcurl\b/, "no curl anywhere in the image");
+      assert.doesNotMatch(executable, /\bwget\b/, "no wget anywhere in the image");
+    });
+
+    it("pins the exact version the runtime module expects", () => {
+      const add = addDirectives().find((args) => args.includes("yt-dlp"))!;
+      assert.ok(
+        add.includes(YTDLP_RUNTIME.releaseUrl),
+        "the image must fetch the exact release URL the runtime module pins",
+      );
+      assert.ok(
+        add.includes(`/${YTDLP_RUNTIME.expectedVersion}/`),
+        "the fetched URL must carry the expected version",
+      );
+    });
+
+    it("pins the exact SHA-256 the runtime module expects", () => {
+      const add = addDirectives().find((args) => args.includes("yt-dlp"))!;
+      assert.match(add, /--checksum=sha256:[0-9a-f]{64}/, "a sha256 digest must be pinned");
+      assert.ok(
+        add.includes(`--checksum=sha256:${YTDLP_RUNTIME.sha256}`),
+        "the image digest must equal the runtime module's pinned digest",
+      );
+    });
+
+    it("installs the artifact at the exact path the runtime module executes", () => {
+      const add = addDirectives().find((args) => args.includes("yt-dlp"))!;
+      assert.ok(
+        add.includes(YTDLP_RUNTIME.artifactPath),
+        "the install destination must equal the executed path",
+      );
+    });
+
+    it("never fetches a mutable or self-extracting artifact", () => {
+      const add = addDirectives().find((args) => args.includes("yt-dlp"))!;
+      for (const mutable of ["latest", "nightly", "master"]) {
+        assert.equal(add.includes(mutable), false, `the URL must not be ${mutable}`);
+      }
+      // The PyInstaller builds unpack to a temp dir at runtime, which the
+      // read-only root and noexec media tmpfs would break.
+      for (const variant of ["yt-dlp_linux", "yt-dlp_musllinux", "yt-dlp_macos", ".exe", ".zip"]) {
+        assert.equal(add.includes(variant), false, `the artifact must not be ${variant}`);
+      }
+    });
+
+    it("leaves the artifact root-owned and unwritable by the runtime user", () => {
+      const runs = directives("RUN").map((i) => i.args).join("\n");
+      assert.match(
+        runs,
+        new RegExp(`chown\\s+root:root[^\\n]*${YTDLP_RUNTIME.artifactPath}`),
+        "the artifact must be root-owned",
+      );
+      assert.match(
+        runs,
+        new RegExp(`chmod\\s+0?555[^\\n]*${YTDLP_RUNTIME.artifactPath}`),
+        "the artifact must be read-only and not writable by the runtime user",
+      );
+    });
+
+    it("does not put the artifact on a writable mount", () => {
+      // /tmp/videofetch is the media tmpfs (writable, noexec) and
+      // /var/lib/videofetch is the durable state volume. The runtime belongs on
+      // the read-only root, where the Worker cannot rewrite it.
+      for (const writable of ["/tmp/", "/var/lib/videofetch"]) {
+        assert.equal(
+          YTDLP_RUNTIME.artifactPath.startsWith(writable),
+          false,
+          `the artifact must not live under ${writable}`,
+        );
+      }
+    });
+  });
+
 });

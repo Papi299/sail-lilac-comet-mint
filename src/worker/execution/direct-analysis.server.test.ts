@@ -224,10 +224,14 @@ describe("worker direct-media analysis", () => {
   });
 
   it("never imports or reaches yt-dlp during analysis", async () => {
-    let spawned = false;
+    // STRENGTHENED in Phase 10C1. This previously asserted
+    // `spawned === false || spawned === true`, which is a tautology and proved
+    // nothing. It now records every command the analyzer actually spawns and
+    // asserts that none of them is the yt-dlp runtime.
+    const commands: string[] = [];
     setProcessRunnerTestHooks({
-      spawn: () => {
-        spawned = true;
+      spawn: (command) => {
+        commands.push(command);
         throw new Error("no subprocess expected");
       },
     });
@@ -235,9 +239,50 @@ describe("worker direct-media analysis", () => {
 
     const meta = await analyzeDirectMedia("https://cdn.example.com/clip.mp4");
     assert.equal(meta.extractor, "direct");
-    // ffmpegAvailable() may probe the binary, but nothing yt-dlp-shaped runs;
-    // when it does probe, it goes through runProcess, never a direct spawn.
-    assert.ok(spawned === false || spawned === true);
     assert.equal(meta.capabilities.mp3, meta.capabilities.merge);
+
+    // ffmpegAvailable() legitimately probes the FFmpeg binary through
+    // runProcess. Nothing yt-dlp-shaped may be spawned at all.
+    for (const command of commands) {
+      assert.equal(
+        /yt-dlp|yt_dlp|python/.test(command),
+        false,
+        `analysis spawned '${command}', which is yt-dlp-shaped`,
+      );
+    }
+  });
+
+  it("refuses a non-direct URL without spawning anything at all", async () => {
+    // The decisive no-execution proof for Phase 10C1: a URL that is NOT direct
+    // media is exactly the input a generic yt-dlp path would claim. The Worker
+    // must reject it outright, and must do so before any process starts —
+    // there is no generic analyzer to fall through to, and no fallback.
+    const commands: string[] = [];
+    setProcessRunnerTestHooks({
+      spawn: (command) => {
+        commands.push(command);
+        throw new Error("no subprocess expected");
+      },
+    });
+    installHooks({
+      requestOnce: async () => {
+        throw new Error("analysis must not issue any request for a non-direct URL");
+      },
+    });
+
+    for (const url of [
+      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "https://vimeo.com/123456789",
+      "https://example.com/page.html",
+      "https://example.com/",
+    ]) {
+      await expectAppError(
+        () => analyzeDirectMedia(url),
+        "EXTRACTOR_UNAVAILABLE",
+        `non-direct URL ${url}`,
+      );
+    }
+
+    assert.deepEqual(commands, [], "no subprocess may start for a non-direct URL");
   });
 });

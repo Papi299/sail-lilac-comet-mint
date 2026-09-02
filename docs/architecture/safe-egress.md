@@ -2,7 +2,10 @@
 
 ## Threat Model
 
-The worker executes `yt-dlp` against user-supplied URLs. Attackers may supply URLs designed to cause:
+The worker is *intended* to execute `yt-dlp` against user-supplied URLs. It does
+not do so yet — no such execution path exists as of Phase 10C1 — but the
+boundary below is designed for the point at which it will. Attackers may supply
+URLs designed to cause:
 - DNS resolution to internal IP addresses.
 - HTTP redirects to internal services.
 - Extractor-specific subrequests (e.g., manifest parsing) pointing to private networks.
@@ -85,7 +88,7 @@ The object-storage endpoint MUST be a public HTTPS endpoint compatible with the 
 
 ## Acceptance Tests
 
-Before `YTDLP_NETWORK_ISOLATED=true` can be enabled, deployment integration tests MUST pass *from inside the exact deployed worker network boundary*. A bare "connection refused" to an address with no listener is NOT strong proof. Use targets known to be listening or verify firewall-policy counters.
+Before generic yt-dlp execution can be enabled (`YTDLP_ENABLED=true`; formerly the retired `YTDLP_NETWORK_ISOLATED=true`), deployment integration tests MUST pass *from inside the exact deployed worker network boundary*. A bare "connection refused" to an address with no listener is NOT strong proof. Use targets known to be listening or verify firewall-policy counters.
 
 1. **Direct-address denial:** Prove loopback IPv4, RFC1918, metadata/link-local IPv4, CGNAT, `::1`, IPv6 ULA, and IPv6 link-local are unreachable.
 2. **Redirect test:** Request a controlled PUBLIC HTTP endpoint that responds with a redirect to a controlled forbidden target. Prove the worker cannot establish the forbidden connection.
@@ -95,18 +98,40 @@ Before `YTDLP_NETWORK_ISOLATED=true` can be enabled, deployment integration test
 6. **Firewall-mutation test:** Prove the worker process lacks privileges to alter the firewall/network policy.
 7. **Controlled public success:** Prove a controlled public HTTPS endpoint succeeds.
 
-## The Meaning of `YTDLP_NETWORK_ISOLATED`
+## Enablement Gating (supersedes `YTDLP_NETWORK_ISOLATED`)
 
-The environment variable `YTDLP_NETWORK_ISOLATED=true`:
-- Is configured **ONLY** in the worker deployment. Vercel does not use this value.
-- Remains `false` (fail-closed) by default.
-- Serves as the exact enablement gate allowing `yt-dlp` to execute.
-- **Becomes `true` ONLY WHEN:**
-  - The production worker deployment exists.
-  - Externally controlled egress enforcement is active.
-  - The worker lacks privileges to modify it.
-  - Both IPv4 and IPv6 policies are installed.
-  - The DNS policy is installed.
-  - The entire acceptance suite (redirect, DNS, rebinding, direct-address, descendant) passes from within that EXACT deployed network boundary.
+`YTDLP_NETWORK_ISOLATED` is **RETIRED** as of
+`PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001`. The Worker runtime refuses to start
+if it is present at any value, including `false`.
+
+*Historically it was the Phase-8/9 enablement gate: an operator assertion that
+`yt-dlp` ran behind an independently enforced boundary, fail-closed by default.
+Phases 8 and 9 were conducted under that contract and their acceptance records
+stand.* It was retired because of what it actually was: **an operator-set
+environment variable, not a boundary.** A `true` value only ever restated its
+own configuration. The Worker holds no `CAP_NET_ADMIN`, cannot read the
+ruleset, and cannot verify any of the conditions the flag claimed to represent —
+so a control that *looked* like proof of egress enforcement invited exactly the
+mistake of trusting it.
+
+The replacement separates the concerns that flag had conflated:
+
+| Concern | Owner | How it is known |
+| :--- | :--- | :--- |
+| Egress enforcement | The **host**: media network namespace, nftables policy, policy verifier, watchdog, systemd ordering | Not knowable to the Worker. Diagnostics reports `safeEgress.enforcement: "external"` and makes no claim about whether the boundary holds |
+| yt-dlp runtime present | The **image**: a digest-pinned artifact | Probed by the Worker itself and reported as `binaries.ytdlp` |
+| Generic execution allowed | The **operator**: `YTDLP_ENABLED` | Reported as `features.ytdlpEnabled`, fail-closed, absent means disabled |
+
+Diagnostics must never report a boolean asserting the firewall is intact. It
+cannot know that.
+
+The conditions the old flag enumerated remain **preconditions for enabling
+generic extraction** — a production deployment, active externally controlled
+egress enforcement, a Worker without privileges to modify it, IPv4 and IPv6
+policies installed, DNS policy installed, and the full acceptance suite passing
+from inside that exact deployed network boundary. They are now what a human
+must establish before setting `YTDLP_ENABLED=true`, rather than something a
+single environment variable is trusted to summarize.
 
 Docker alone is never sufficient. `assertSafeUrl()` alone is never sufficient.
+`YTDLP_ENABLED=true` alone is never sufficient either.
