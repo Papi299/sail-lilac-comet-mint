@@ -1,31 +1,48 @@
-// The check -> producer registry (§8 and §36 of CORRECTION-01).
+// The check -> producer registry (§8 and §36 of CORRECTION-01; §8 of CORRECTION-02).
 //
-// The original harness could prove anything once a test injected a perfect
-// observation, but a Phase-10D operator had no committed way to OBTAIN most of
-// those observations. This registry is the standing answer to "who actually
-// goes and looks?", and `scripts/ytdlp-acceptance.test.mjs` walks it against the
-// live evaluators so the same incompleteness cannot come back when a check is
-// added: a new check with no entry here fails the suite.
+// The standing answer to "who actually goes and looks?", walked by
+// `scripts/ytdlp-acceptance.test.mjs` against the live evaluators so a check
+// with no concrete producer fails the suite.
 //
-// `producer` names the concrete module/function that measures the property.
-// `command` names the reviewed CLI invocation an operator actually types.
-// Neither may be a test seam — that is the whole point.
+// ── Why this file no longer holds free-form strings ────────────────────────
+//
+// It used to. `producer: "cases byte-limit producer (operator fixture)"` counted
+// as concrete because it was a non-empty string — while no such producer
+// existed. A description is not an implementation, so case-backed checks now
+// resolve THROUGH `CASE_PRODUCERS`, and a name with no callable `run` cannot be
+// claimed as concrete no matter what is written here.
+
+import { CASE_PRODUCERS, hasExecutableProducer } from "./cases.mjs";
 
 /** Producer kinds. `test-seam` exists ONLY so the test can assert nothing uses it. */
 export const PRODUCER_KINDS = Object.freeze(["system", "control-plane", "case", "test-seam"]);
 
 const entry = (kind, producer, command) => Object.freeze({ kind, producer, command });
 
-const SYSTEM = (fn, command = "--stage A") => entry("system", `observers.makeSystemObservers().${fn}`, command);
-const CONTROL = (fn, command = "--stage A") => entry("control-plane", `control-plane.makeControlPlaneSession().${fn}`, command);
-const CASE = (name, producer) => entry("case", producer, `--stage B --case ${name}`);
+const SYSTEM = (fn, command = "--stage A") =>
+  entry("system", `observers.makeSystemObservers().${fn}`, command);
+const CONTROL = (fn, command = "--stage A") =>
+  entry("control-plane", `control-plane.makeControlPlaneSession().${fn}`, command);
 
 /**
- * Every check id either evaluator can emit, and how Phase 10D obtains it.
+ * A case-backed check.
  *
- * Service checks are generated rather than listed, so adding a required unit to
- * `REQUIRED_SERVICES` cannot silently create an uncovered check.
+ * Resolves through the real registry: the `producer` string is derived from the
+ * registry entry, and `executable` reflects whether a callable `run` exists.
  */
+function CASE(name, detail) {
+  const registered = CASE_PRODUCERS[name];
+  return Object.freeze({
+    kind: "case",
+    case: name,
+    producer: registered ? `cases.CASE_PRODUCERS['${name}'].run — ${detail}` : `MISSING PRODUCER: ${name}`,
+    command: `--stage B --case ${name}`,
+    executable: hasExecutableProducer(name),
+    optional: registered?.live === false,
+  });
+}
+
+/** Every check id either evaluator can emit, and how Phase 10D obtains it. */
 export const CHECK_PRODUCERS = Object.freeze({
   // ── Stage A ────────────────────────────────────────────────────────────
   "image.identity": SYSTEM("runningImageId"),
@@ -57,70 +74,84 @@ export const CHECK_PRODUCERS = Object.freeze({
   // ── Stage B ────────────────────────────────────────────────────────────
   "stage-b.authorized-by-stage-a": entry(
     "case",
-    "stage-b.stageBAuthorization over the loaded Stage A record",
+    "acceptance.loadStageA + provenance.verifyRecord + stage-b.stageBAuthorization",
     "--stage B --aggregate",
   ),
   "capability.generic-usable": CONTROL("sites", "--stage B --aggregate"),
   "config.ytdlp-enabled": SYSTEM("ytdlpEnabledRaw", "--stage B --aggregate"),
 
-  "analysis.routed-to-generic": CASE("success", "cases.runSuccessCase"),
-  "analysis.no-raw-formats": CASE("success", "cases.runSuccessCase"),
-  "analysis.presets-application-owned": CASE("success", "cases.runSuccessCase"),
-  "analysis.no-generic-thumbnail": CASE("success", "cases.runSuccessCase"),
+  "analysis.generic-selected": CASE("success", "the generic source's analysis result"),
+  "analysis.direct-still-selected": CASE("success", "a direct control source's analysis result"),
+  "analysis.no-raw-formats": CASE("success", "the generic metadata's format list"),
+  "analysis.presets-application-owned": CASE("success", "the advertised preset objects"),
+  "analysis.no-generic-thumbnail": CASE("success", "the generic metadata's thumbnail field"),
 
-  "job.lifecycle-complete": CASE("success", "cases.runSuccessCase -> control-plane.pollTrace"),
-  "job.requested-preset-owned": CASE("success", "cases.runSuccessCase"),
+  "job.lifecycle-complete": CASE("success", "control-plane.pollTrace, seeded from the create response"),
+  "job.requested-preset-owned": CASE("success", "the preset the job was created with"),
 
   "durable.extractor-is-ytdlp": CASE("success", "observers.durableJobRow"),
   "durable.application-format-id": CASE("success", "observers.durableJobRow"),
   "durable.no-raw-selector-fields": CASE("success", "observers.durableJobRow"),
-  "selector.constraints-satisfied": CASE("success", "cases.runSuccessCase"),
+  "delivery.matches-advertised-preset": CASE("success", "the delivered container vs the accepted preset"),
 
-  "process.sample-available": CASE("success", "process-sampler.makeProcessSampler().sampleWhile"),
-  "process.sample-shape": CASE("success", "process-sampler.makeProcessSampler().sampleWhile"),
-  "process.ytdlp-identified": CASE("success", "process-sampler.establishYtdlpPid"),
-  "process.no-ffmpeg-during-downloading": CASE("success", "process-sampler.makeProcessSampler().sampleWhile"),
-  "process.no-unknown-descendants": CASE("success", "process-sampler.makeProcessSampler().sampleWhile"),
-  "process.namespace-identity": CASE("success", "process-sampler netnsOf() per pid"),
-  "process.node-ejs-containment": CASE("success", "process-sampler.makeProcessSampler().sampleWhile"),
+  "process.window-observed": CASE("success", "download-window collector, scoped to durable downloading"),
+  "process.sample-shape": CASE("success", "process-tree.validateSampleShape over every window sample"),
+  "process.ytdlp-identified": CASE("success", "process-sampler.establishYtdlpPid + evaluateYtdlpIdentity"),
+  "process.no-ffmpeg-during-downloading": CASE("success", "aggregateDownloadWindow over every window sample"),
+  "process.no-unknown-descendants": CASE("success", "aggregateDownloadWindow over every window sample"),
+  "process.namespace-identity": CASE("success", "per-PID readlink /proc/<pid>/ns/net"),
+  "process.node-ejs-containment": CASE("success", "per-sample containment anchored to the owned PID"),
 
-  "safe-egress.forbidden-destination-denied": CASE("safe-egress", "deploy/acceptance/safe-egress composition"),
-  "safe-egress.policy-unchanged": CASE("safe-egress", "observers.egressVerifier fingerprint comparison"),
+  "safe-egress.forbidden-destination-denied": CASE("safe-egress", "Phase-9 fixture adapter + watchdog attribution"),
+  "safe-egress.policy-unchanged": CASE("safe-egress", "observers.egressPolicyState before/after"),
 
-  "r2.delegated-write": CASE("success", "cases.runSuccessCase -> r2Evidence"),
+  "r2.delegated-write": CASE("success", "the authenticated Worker job view's objectKey"),
   "r2.worker-holds-no-credential": SYSTEM("environmentNames", "--stage B --aggregate"),
 
   "vercel.signed-get": CASE("success", "control-plane.signedDownload"),
-  "vercel.byte-integrity": CASE("success", "control-plane.fetchDigest"),
+  "vercel.byte-integrity": CASE("success", "control-plane.fetchDigest + durable/provider lengths"),
 
-  "privacy.sentinel-not-leaked": CASE("success", "evidence.sweepForSentinel over observer log capture"),
+  "privacy.sentinel-not-leaked": CASE("success", "evidence.sweepForSentinel over six measured surfaces"),
 
   "cancel.durable-cancelled": CASE("cancellation", "cases.runCancellationCase"),
   "cancel.no-late-ready": CASE("cancellation", "cases.runCancellationCase"),
-  "cancel.processes-gone": CASE("cancellation", "cases.runCancellationCase -> sampler.sample"),
-  "cancel.no-upload-no-workdir": CASE("cancellation", "cases.runCancellationCase"),
+  "cancel.processes-gone": CASE("cancellation", "post-cancellation sampler.sample"),
+  "cancel.no-upload-no-workdir": CASE("cancellation", "observers.workDirPresent"),
 
-  "limit.actual-byte-guard": CASE("byte-limit", "cases byte-limit producer (operator fixture)"),
-  "shutdown.group-terminated": CASE("shutdown", "cases shutdown producer (operator transition)"),
+  "limit.actual-byte-guard": CASE("byte-limit", "cases.runByteLimitCase with a measured unknown length"),
+  "shutdown.group-terminated": CASE("shutdown", "cases.runShutdownCase + observers.containerPid"),
 
+  "direct.process-sampling-available": CASE("direct-regression", "cases.runDirectRegressionCase"),
   "direct.after-enable": CASE("direct-regression", "cases.runDirectRegressionCase"),
   "direct.no-ytdlp-spawned": CASE("direct-regression", "cases.runDirectRegressionCase"),
 
-  "runtime.fail-closed": CASE("fail-closed-runtime", "disposable-container negative test producer"),
+  "runtime.fail-closed": CASE("fail-closed-runtime", "separately executed disposable-container negative test"),
   "killswitch.rollback": CASE("kill-switch", "cases.runKillSwitchCase"),
   "catalog.unchanged": CASE("kill-switch", "cases.runKillSwitchCase"),
 });
 
 /** Service checks are derived from the required-service list. */
 export function producerFor(checkId) {
-  if (checkId.startsWith("service.")) {
-    return SYSTEM("serviceState");
-  }
+  if (checkId.startsWith("service.")) return SYSTEM("serviceState");
   return CHECK_PRODUCERS[checkId] ?? null;
 }
 
-/** True when the check has a concrete, non-test producer. */
+/**
+ * True when the check has a concrete, executable producer.
+ *
+ * A case-backed check is concrete only if its case actually resolves to a
+ * callable producer — the registry, not the description, decides.
+ */
 export function hasConcreteProducer(checkId) {
   const found = producerFor(checkId);
-  return found != null && found.kind !== "test-seam";
+  if (found == null || found.kind === "test-seam") return false;
+  if (found.kind === "case" && found.case !== undefined) return found.executable === true;
+  return true;
+}
+
+/** Checks whose producer is declared non-live, and which must therefore be optional. */
+export function nonLiveCheckIds() {
+  return Object.entries(CHECK_PRODUCERS)
+    .filter(([, found]) => found.kind === "case" && found.case !== undefined && found.optional === true)
+    .map(([id]) => id);
 }

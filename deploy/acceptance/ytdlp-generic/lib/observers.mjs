@@ -395,21 +395,71 @@ export function makeSystemObservers(deps = {}) {
       });
     },
 
+    /**
+     * The container's main PID, used to detect a Worker restart (§6 of
+     * CORRECTION-02). A different PID means the container was recreated.
+     */
+    async containerPid() {
+      return observe("docker inspect container pid", async () => {
+        const raw = await inspectContainer("{{.State.Pid}}");
+        const pid = Number(raw);
+        if (!Number.isInteger(pid) || pid <= 0) throw new Error("the container is not running");
+        return pid;
+      });
+    },
+
+    /**
+     * The accepted safe-egress policy state, from the EXISTING read-only
+     * verifier plus the fingerprints the policy unit records under /run.
+     *
+     * This is an adapter over the Phase-9 instrument, not a second firewall
+     * framework: the harness reads what that tooling already publishes and
+     * never mutates the ruleset.
+     */
+    async egressPolicyState() {
+      return observe("safe-egress policy state", async () => {
+        const verify = await run("/usr/local/sbin/vf-egress-policy-verify", []);
+        const show = await run("systemctl", ["show", "videofetch-egress-policy"]);
+        // The verifier's own exit status plus the policy unit's invocation
+        // identity form the comparable fingerprint. Neither is a secret.
+        const props = String(show.stdout ?? "");
+        const invocation = /^InvocationID=(\S+)$/m.exec(props)?.[1] ?? "";
+        const activeEnter = /^ActiveEnterTimestampMonotonic=(\d+)$/m.exec(props)?.[1] ?? "";
+        return {
+          capturedAt: new Date().toISOString(),
+          verifierExit: verify.exitCode,
+          fingerprint: `${verify.exitCode}:${invocation}:${activeEnter}`,
+        };
+      });
+    },
+
     /** Read-only log capture for the sentinel sweep. Logging config is never changed (§47). */
     async workerLogs(sinceIso) {
       return observe("docker logs", async () => {
         const args = ["logs", container];
         if (sinceIso) args.push("--since", sinceIso);
         const result = await run("docker", args);
+        if (result.exitCode !== 0) throw new Error(`docker logs exited ${result.exitCode}`);
         return `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
       });
     },
 
     async workerJournal(sinceIso) {
-      return observe("journalctl videofetch-worker", async () => {
-        const args = ["-u", "videofetch-worker", "--no-pager"];
+      return observers.unitJournal("videofetch-worker", sinceIso);
+    },
+
+    /**
+     * Any unit's journal, read-only.
+     *
+     * §19 of CORRECTION-02 requires the cloudflared-relevant surface to have a
+     * real observer rather than being quietly omitted from the sentinel sweep.
+     */
+    async unitJournal(unit, sinceIso) {
+      return observe(`journalctl ${unit}`, async () => {
+        const args = ["-u", unit, "--no-pager"];
         if (sinceIso) args.push("--since", sinceIso);
         const result = await run("journalctl", args);
+        if (result.exitCode !== 0) throw new Error(`journalctl exited ${result.exitCode}`);
         return String(result.stdout ?? "");
       });
     },

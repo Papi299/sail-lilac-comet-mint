@@ -63,14 +63,22 @@ import { makeSystemObservers, notMeasured, observe, runReadOnly } from "./lib/ob
 import { makeControlPlaneSession, makeWorkerControlClient } from "./lib/control-plane.mjs";
 import { makeProcessSampler } from "./lib/process-sampler.mjs";
 import {
-  CASE_NAMES,
+  CASE_PRODUCERS,
   buildCaseRecord,
+  caseNames,
+  hasExecutableProducer,
+  liveCaseNames,
   validateCaseRecord,
-  runSuccessCase,
-  runCancellationCase,
-  runDirectRegressionCase,
-  runKillSwitchCase,
 } from "./lib/cases.mjs";
+import {
+  EVIDENCE_SCHEMA_VERSION,
+  loadOrCreateRun,
+  loadRun,
+  runFingerprint,
+  sealRecord,
+  validateDeploymentBinding,
+  verifyRecord,
+} from "./lib/provenance.mjs";
 
 const EXIT = Object.freeze({ PASS: 0, FAIL: 1, BLOCKED: 2, USAGE: 3 });
 
@@ -113,8 +121,18 @@ export async function main(argv, env, deps = {}) {
     errorLog("usage error: --stage B requires either --case <name> or --aggregate");
     return EXIT.USAGE;
   }
-  if (caseName && !CASE_NAMES.includes(caseName)) {
-    errorLog(`usage error: --case must be one of ${CASE_NAMES.join(", ")}`);
+  if (caseName && !caseNames().includes(caseName)) {
+    errorLog(`usage error: --case must be one of ${liveCaseNames().join(", ")}`);
+    return EXIT.USAGE;
+  }
+  // §4 of CORRECTION-02: a declared-but-non-live case is refused at PARSE time
+  // with what it actually is, rather than being advertised as runnable and then
+  // failing at dispatch.
+  if (caseName && !hasExecutableProducer(caseName)) {
+    errorLog(
+      `usage error: '${caseName}' is not a live case command — ${CASE_PRODUCERS[caseName].summary}. ` +
+        `Runnable cases: ${liveCaseNames().join(", ")}`,
+    );
     return EXIT.USAGE;
   }
 
@@ -201,8 +219,35 @@ export async function main(argv, env, deps = {}) {
   }
   log("private-access session established (cookie held in memory only)");
 
+  // ── The acceptance run identity (§23-§24) ──────────────────────────────
+  //
+  // Stage A begins a run; Stage B cases and the aggregation JOIN it. The key is
+  // acceptance-only, never an application credential, lives in a 0600 local
+  // file, and is never printed or recorded — only the non-secret runId travels
+  // with the artifacts.
+  const runKeyPath = readOption(argv, "--run-key") ?? "./.vf-acceptance-run.json";
+  let acceptanceRun;
+  if (stage === "A") {
+    acceptanceRun = await loadOrCreateRun(runKeyPath, deps);
+    log(
+      `acceptance run ${runFingerprint(acceptanceRun.runId)} ${acceptanceRun.created ? "created" : "resumed"} ` +
+        `(key file ${runKeyPath}, mode 0600 — delete it when acceptance is complete)`,
+    );
+  } else {
+    acceptanceRun = await loadRun(runKeyPath, deps);
+    if (!acceptanceRun) {
+      errorLog(
+        `BLOCKED: no acceptance run key at ${runKeyPath}. Stage B artifacts must join the run ` +
+          "Stage A began; minting a new key here would make every prior artifact unverifiable.",
+      );
+      return EXIT.BLOCKED;
+    }
+    log(`acceptance run ${runFingerprint(acceptanceRun.runId)} joined`);
+  }
+
   // ── Dispatch ───────────────────────────────────────────────────────────
   const ctx = {
+    run: acceptanceRun,
     argv,
     env,
     log,
@@ -212,7 +257,10 @@ export async function main(argv, env, deps = {}) {
     system,
     session,
     sampler,
-    run,
+    // The read-only command runner. Named distinctly from `run` (the acceptance
+    // run identity) — an earlier draft had both under `run`, and the shorthand
+    // silently shadowed the run key.
+    runReadOnly: run,
     container,
     baseUrl,
     expectedSha,
@@ -254,9 +302,21 @@ async function runStageA(ctx) {
   );
   log("The harness does NOT perform that change (§10).");
 
+  // §27: the Stage A binding must be complete and self-consistent, or the
+  // record must not be able to authorize anything. A `runningImageId: null`
+  // binding proves nothing about which image was graded.
+  const bindingCheck = validateDeploymentBinding(result.binding, ctx.expectedSha);
+  if (!bindingCheck.ok) {
+    log("");
+    log(`NOTE: this Stage A record cannot authorize Stage B — ${bindingCheck.reason}`);
+  }
+
   const record = buildEvidence({
     stage: "A",
     mode: "live",
+    schemaVersion: EVIDENCE_SCHEMA_VERSION,
+    runId: ctx.run.runId,
+    runningImageIdBinding: result.binding?.runningImageId ?? null,
     startedAt: ctx.startedAt,
     finishedAt: new Date().toISOString(),
     expectedSha: ctx.expectedSha,
@@ -280,7 +340,16 @@ async function runStageA(ctx) {
 
   const evidencePath = readOption(argv, "--evidence");
   if (evidencePath) {
-    await write(evidencePath, renderEvidence(record, secrets), "utf8");
+    const sealed = sealRecord(record, ctx.run.key);
+    const rendered = renderEvidence(sealed, secrets);
+    if (rendered.includes("<scrubbed>")) {
+      errorLog(
+        "BLOCKED: secret material reached the pre-scrub Stage A record. The scrubber removed it, " +
+          "but that is a disclosure backstop, not evidence that upstream handling was clean.",
+      );
+      return EXIT.BLOCKED;
+    }
+    await write(evidencePath, rendered, "utf8");
     log(`\nevidence written: ${evidencePath}`);
   }
   log(`\nVERDICT: ${result.summary.verdict}`);
@@ -389,7 +458,7 @@ export async function runDirectRegression(ctx, directUrl, declaredDigest) {
 // ── Stage B: one case ──────────────────────────────────────────────────────
 
 async function runStageBCase(ctx, caseName) {
-  const { argv, log, errorLog, write, secrets, env, system, session, sampler, expectedSha } = ctx;
+  const { argv, log, errorLog, write, secrets, env, system, expectedSha, run: acceptanceRun } = ctx;
 
   const ytdlpEnabledRaw = await system.ytdlpEnabledRaw();
   if (ytdlpEnabledRaw.measured === true && ytdlpEnabledRaw.value !== "true") {
@@ -401,79 +470,91 @@ async function runStageBCase(ctx, caseName) {
   }
 
   const runningImageId = await system.runningImageId();
-  const binding = {
-    expectedSha,
-    runningImageId: runningImageId.measured === true ? runningImageId.value : null,
-  };
+  if (runningImageId.measured !== true) {
+    errorLog("BLOCKED: the running image could not be identified; a case record cannot be bound to it.");
+    return EXIT.BLOCKED;
+  }
+  const binding = { expectedSha, runningImageId: runningImageId.value };
 
-  const genericUrl = env.VIDEOFETCH_ACCEPT_GENERIC_URL ?? null;
-  const directUrl = env.VIDEOFETCH_ACCEPT_DIRECT_URL ?? null;
-
+  const producer = CASE_PRODUCERS[caseName];
   const caseCtx = {
     ...ctx,
-    genericUrl,
-    directUrl,
+    genericUrl: env.VIDEOFETCH_ACCEPT_GENERIC_URL ?? null,
+    directUrl: env.VIDEOFETCH_ACCEPT_DIRECT_URL ?? null,
+    byteLimitUrl: env.VIDEOFETCH_ACCEPT_BYTELIMIT_URL ?? null,
+    egressRedirectUrl: env.VIDEOFETCH_ACCEPT_EGRESS_REDIRECT_URL ?? null,
+    cloudflaredUnit: readOption(argv, "--cloudflared-unit") ?? "vf-cloudflared",
     sleep: ctx.deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     worker: makeWorkerControl(ctx),
     r2Evidence: makeR2EvidenceProducer(ctx),
     workDirPresent: makeWorkDirProbe(ctx),
     catalogPromoted: makeCatalogComparator(ctx),
     sweepSurfaces: makeSentinelSweeper(ctx),
+    probeDeclaredLength: makeDeclaredLengthProbe(ctx),
+    awaitWorkerRestart: makeRestartWatcher(ctx),
+    egressPolicyState: () => ctx.system.egressPolicyState(),
+    egressDenialAttribution: makeEgressAttribution(ctx),
   };
 
-  const producer = CASE_PRODUCERS[caseName];
-  if (!producer) {
-    errorLog(
-      `BLOCKED: case '${caseName}' has no automated producer. It is an operator-transition case; ` +
-        "see README.md for the reviewed procedure and the evidence it must emit.",
-    );
-    return EXIT.BLOCKED;
-  }
-  if (producer.needsGenericUrl && !genericUrl) {
-    errorLog("usage error: VIDEOFETCH_ACCEPT_GENERIC_URL is required for this case");
-    return EXIT.USAGE;
-  }
-  if (producer.needsDirectUrl && !directUrl) {
-    errorLog("usage error: VIDEOFETCH_ACCEPT_DIRECT_URL is required for this case");
+  // Every input a case declares is required before anything is submitted.
+  const missing = (producer.needs ?? []).filter((need) => {
+    if (need === "workerControl") {
+      return !env.VF_WORKER_ORIGIN || !env.VF_CONTROL_KEY_ID || !env.VF_CONTROL_SECRET;
+    }
+    return !caseCtx[need];
+  });
+  if (missing.length > 0) {
+    errorLog(`usage error: case '${caseName}' requires ${missing.join(", ")}; see README.md`);
     return EXIT.USAGE;
   }
 
+  if (producer.operatorTransition) {
+    log(`case '${caseName}' involves an operator transition the harness will NOT perform.`);
+  }
   log(`running case '${caseName}'…`);
+
   let payload;
   try {
     payload = await producer.run(caseCtx);
   } catch (error) {
+    // Every producer throws rather than emitting a favourable value, so a
+    // failure here is BLOCKED and no record is written.
     errorLog(`BLOCKED: case '${caseName}' did not complete: ${String(error?.message ?? error)}`);
     return EXIT.BLOCKED;
   }
 
-  const record = buildCaseRecord({
-    caseName,
-    binding,
-    payload,
-    startedAt: ctx.startedAt,
-    finishedAt: new Date().toISOString(),
-  });
+  const record = sealRecord(
+    buildCaseRecord({
+      caseName,
+      binding,
+      payload,
+      runId: acceptanceRun.runId,
+      startedAt: ctx.startedAt,
+      finishedAt: new Date().toISOString(),
+    }),
+    acceptanceRun.key,
+  );
 
   const evidencePath = readOption(argv, "--evidence");
   if (!evidencePath) {
     errorLog("usage error: --evidence <path> is required for a case run; the record is its output");
     return EXIT.USAGE;
   }
-  await write(evidencePath, renderEvidence(record, secrets), "utf8");
+  const rendered = renderEvidence(record, secrets);
+  // §20: the scrubber is a disclosure BACKSTOP, not evidence of clean handling.
+  // If it had to act, that is itself a privacy finding and the run stops.
+  if (rendered.includes("<scrubbed>")) {
+    errorLog(
+      "BLOCKED: secret material reached the pre-scrub case record. The scrubber removed it, " +
+        "but that is a disclosure backstop, not evidence that upstream handling was clean.",
+    );
+    return EXIT.BLOCKED;
+  }
+  await write(evidencePath, rendered, "utf8");
   log(`case evidence written: ${evidencePath}`);
   log("Run `--stage B --aggregate` with every case record to obtain the Stage B verdict.");
-  void session;
-  void sampler;
   return EXIT.PASS;
 }
-
-const CASE_PRODUCERS = Object.freeze({
-  success: { run: runSuccessCase, needsGenericUrl: true, needsDirectUrl: true },
-  cancellation: { run: runCancellationCase, needsGenericUrl: true },
-  "direct-regression": { run: runDirectRegressionCase, needsDirectUrl: true },
-  "kill-switch": { run: runKillSwitchCase, needsDirectUrl: true },
-});
 
 // ── Stage B: aggregation ───────────────────────────────────────────────────
 
@@ -481,9 +562,12 @@ async function runStageBAggregate(ctx) {
   const { argv, log, errorLog, write, read, secrets, system, session, expectedSha } = ctx;
 
   const stageAPath = readOption(argv, "--stage-a");
-  const stageA = await loadStageA(stageAPath, read);
-  if (!stageA) {
-    errorLog("BLOCKED: --stage-a must name a Stage A record whose verdict is PASS.");
+  const stageA = await loadStageA(stageAPath, read, {
+    run: ctx.run,
+    expectedSha,
+  });
+  if (!stageA.ok) {
+    errorLog(`BLOCKED: the Stage A record is not usable — ${stageA.reason}`);
     return EXIT.BLOCKED;
   }
 
@@ -518,6 +602,17 @@ async function runStageBAggregate(ctx) {
       rejected.push(`${path}: unreadable or not JSON`);
       continue;
     }
+    // §25: AUTHENTICITY FIRST. Reading binding fields out of an unverified
+    // record and comparing them would be trusting the very thing under test.
+    const authentic = verifyRecord(parsed, ctx.run.key, {
+      runId: ctx.run.runId,
+      expectedSha,
+      runningImageId: binding.runningImageId,
+    });
+    if (!authentic.ok) {
+      rejected.push(`${path}: ${authentic.reason}`);
+      continue;
+    }
     const validated = validateCaseRecord(parsed, binding);
     if (!validated.ok) {
       rejected.push(`${path}: ${validated.reason}`);
@@ -542,7 +637,7 @@ async function runStageBAggregate(ctx) {
     genericJob: caseObservations.genericJob ?? notMeasured("no accepted `success` case evidence"),
     durableJobRow: caseObservations.durableJobRow ?? notMeasured("no accepted `success` case evidence"),
     selectorConstraints: caseObservations.selectorConstraints ?? notMeasured("no accepted `success` case evidence"),
-    downloadingSample: caseObservations.downloadingSample ?? notMeasured("no accepted `success` case evidence"),
+    downloadingWindow: caseObservations.downloadingWindow ?? notMeasured("no accepted `success` case evidence"),
     r2Evidence: caseObservations.r2Evidence ?? notMeasured("no accepted `success` case evidence"),
     vercelDelivery: caseObservations.vercelDelivery ?? notMeasured("no accepted `success` case evidence"),
     sentinelSweep: caseObservations.sentinelSweep ?? notMeasured("no accepted `success` case evidence"),
@@ -567,6 +662,8 @@ async function runStageBAggregate(ctx) {
   const record = buildEvidence({
     stage: "B",
     mode: "live",
+    schemaVersion: EVIDENCE_SCHEMA_VERSION,
+    runId: ctx.run.runId,
     startedAt: ctx.startedAt,
     finishedAt: new Date().toISOString(),
     expectedSha,
@@ -575,7 +672,7 @@ async function runStageBAggregate(ctx) {
     capabilities: capabilities.value ?? null,
     workerEnvironment: summarizeEnvironment(workerEnvironmentNames),
     job: obs.genericJob?.value ?? null,
-    processEvidence: summarizeProcess(obs.downloadingSample),
+    processEvidence: summarizeProcess(obs.downloadingWindow),
     negativeCases: {
       egress: obs.egressNegative?.value ?? null,
       cancellation: obs.cancellation?.value ?? null,
@@ -593,7 +690,16 @@ async function runStageBAggregate(ctx) {
 
   const evidencePath = readOption(argv, "--evidence");
   if (evidencePath) {
-    await write(evidencePath, renderEvidence(record, secrets), "utf8");
+    const sealed = sealRecord(record, ctx.run.key);
+    const rendered = renderEvidence(sealed, secrets);
+    if (rendered.includes("<scrubbed>")) {
+      errorLog(
+        "BLOCKED: secret material reached the pre-scrub Stage B record. The scrubber removed it, " +
+          "but that is a disclosure backstop, not evidence that upstream handling was clean.",
+      );
+      return EXIT.BLOCKED;
+    }
+    await write(evidencePath, rendered, "utf8");
     log(`\nevidence written: ${evidencePath}`);
   }
   log(`\nVERDICT: ${result.summary.verdict}`);
@@ -601,25 +707,52 @@ async function runStageBAggregate(ctx) {
 }
 
 /**
- * Loads a prior Stage A record and admits it ONLY if it genuinely passed AND
- * still binds to this deployment (§30 of CORRECTION-01).
+ * Loads a prior Stage A record and admits it ONLY if it is AUTHENTIC, genuinely
+ * passed, and carries a COMPLETE deployment binding (§25-§28 of CORRECTION-02).
+ *
+ * Returns a reason on refusal rather than a bare null, because "the Stage A
+ * record was rejected" is only actionable if the operator learns which of the
+ * five conditions failed.
  */
-export async function loadStageA(path, read) {
-  if (!path) return null;
+export async function loadStageA(path, read, { run, expectedSha } = {}) {
+  if (!path) return { ok: false, reason: "--stage-a was not supplied" };
+  let parsed;
   try {
-    const parsed = JSON.parse(await read(path, "utf8"));
-    if (parsed?.harness !== "deploy/acceptance/ytdlp-generic/acceptance.mjs") return null;
-    if (parsed?.stage !== "A" || parsed?.verdict !== OUTCOMES.PASS) return null;
-    const binding = parsed?.binding;
-    if (!binding || typeof binding !== "object") return null;
-    if (typeof binding.expectedSha !== "string" || binding.expectedSha.length === 0) return null;
-    return { summary: { verdict: parsed.verdict }, binding };
+    parsed = JSON.parse(await read(path, "utf8"));
   } catch {
-    return null;
+    return { ok: false, reason: "the file is unreadable or not JSON" };
   }
+
+  // 1. AUTHENTICITY first — before any field is believed.
+  const authentic = verifyRecord(parsed, run?.key, {
+    runId: run?.runId,
+    expectedSha,
+    // The Stage A record's own binding is checked below; the record-level
+    // `runningImageId` is compared against it there.
+    runningImageId: null,
+  });
+  if (!authentic.ok) return { ok: false, reason: authentic.reason };
+
+  // 2. It must be a Stage A record that actually passed.
+  if (parsed.stage !== "A") return { ok: false, reason: "the record is not a Stage A record" };
+  if (parsed.verdict !== OUTCOMES.PASS) {
+    return { ok: false, reason: `the record's verdict is ${String(parsed.verdict)}, not PASS` };
+  }
+
+  // 3. The deployment binding must be complete and self-consistent. A
+  //    `runningImageId: null` binding must never authorize Stage B.
+  const bindingCheck = validateDeploymentBinding(parsed.binding, expectedSha);
+  if (!bindingCheck.ok) return { ok: false, reason: bindingCheck.reason };
+
+  return { ok: true, summary: { verdict: parsed.verdict }, binding: parsed.binding };
 }
 
 // ── Case collaborators ─────────────────────────────────────────────────────
+//
+// Every one of these returns a MEASUREMENT — `{ measured, value }` or a throw —
+// and none of them invents a favourable value on failure (§15/§21 of
+// CORRECTION-02). "We could not look" and "we looked and it was clean" are
+// different findings, and only the second is evidence.
 
 function makeWorkerControl(ctx) {
   const { env, deps } = ctx;
@@ -645,88 +778,215 @@ function makeWorkerControl(ctx) {
 }
 
 /**
- * R2 evidence from the Worker's own authenticated job view.
+ * R2 evidence, MEASURED (§16 of CORRECTION-02).
  *
- * A `ready` job is already application-level proof that PutObject AND
- * HeadObject succeeded — the upload lifecycle rejects the job otherwise — so
- * the object key's existence and the durable size are the evidence, and no
- * credential material is inspected.
+ * The previous implementation caught a failed Worker job-view read and returned
+ * `objectExists: true` on the grounds that the job was `ready`. That is an
+ * inference from another check, not a measurement of the object — and it made
+ * `r2.delegated-write` unable to fail for the reason it exists to catch.
+ *
+ * The authenticated Worker job view is the authoritative source: it carries
+ * `objectKey`, which the browser DTO strips. A read failure now throws, the
+ * case aborts, and the CLI reports BLOCKED. The Worker is never granted
+ * GetObject, and no credential material is inspected.
  */
 function makeR2EvidenceProducer(ctx) {
   return async (finalJob) => {
-    if (!finalJob || finalJob.status !== "ready") return { objectExists: false, contentLength: 0 };
-    const worker = makeWorkerControl(ctx);
-    try {
-      const view = await worker.getJob(finalJob.jobId);
-      const job = view?.job ?? null;
-      return {
-        objectExists: typeof job?.objectKey === "string" && job.objectKey.length > 0,
-        contentLength: job?.fileSize ?? finalJob.fileSize ?? 0,
-      };
-    } catch {
-      // Without the Worker view the browser DTO still carries the size, and
-      // `ready` already implies the head succeeded.
-      return { objectExists: true, contentLength: finalJob.fileSize ?? 0 };
+    if (!finalJob || finalJob.status !== "ready") {
+      throw new Error(`the job did not reach ready (status ${finalJob?.status ?? "unknown"}), so no R2 object exists to evidence`);
     }
+    const worker = makeWorkerControl(ctx);
+    const view = await worker.getJob(finalJob.jobId);
+    const job = view?.job ?? null;
+    if (!job) throw new Error("the authenticated Worker job view returned no job");
+    const objectKey = typeof job.objectKey === "string" ? job.objectKey : null;
+    if (!objectKey) {
+      throw new Error("the Worker job view carries no object key, so the delegated write is unproven");
+    }
+    return {
+      // The key SHAPE is evidence; the key itself is server-to-server data and
+      // is not recorded.
+      objectExists: /^videofetch\/jobs\/[0-9a-f]{32}\/[0-9a-f]{32}$/.test(objectKey),
+      contentLength: Number.isInteger(job.fileSize) ? job.fileSize : 0,
+    };
   };
 }
 
 /**
- * Whether a per-job working directory survived. Read-only.
+ * Whether a per-job working directory survived — TRI-STATE (§17 of CORRECTION-02).
  *
- * An unreadable answer returns `true` (present), NOT `false`: the assertion is
- * that cleanup happened, so an unproven cleanup must fail rather than satisfy
- * it. Reporting absence the harness could not observe is the SKIPPED->PASS edge
- * §49 exists to forbid.
+ * Returns the observation itself, so the caller can distinguish "measured
+ * absent" (a pass candidate), "measured present" (a fail candidate) and "could
+ * not measure" (BLOCKED). The previous version collapsed the third into the
+ * second to avoid a false pass, which reported a cleanup FAILURE where there was
+ * only a measurement failure.
  */
 function makeWorkDirProbe(ctx) {
-  return async (jobId) => {
-    const observed = await ctx.system.workDirPresent(jobId);
-    return observed.measured === true ? observed.value : true;
-  };
+  return async (jobId) => ctx.system.workDirPresent(jobId);
 }
 
 /** The catalog is a source constant; promotion is a SOURCE change, not a runtime one. */
 function makeCatalogComparator() {
   return async (sites) => {
     const entries = Array.isArray(sites?.sites) ? sites.sites : [];
-    // A `limited` entry that has become `full` would show here. The harness
-    // compares the deployed catalog against its own advertised support levels.
     return entries.some((entry) => entry?.promotedByAcceptance === true);
   };
 }
 
 /**
- * §12 of CORRECTION-01 — the sentinel sweep, over surfaces the harness can
- * actually read without changing logging configuration (§47).
+ * The byte-limit fixture's declared length, MEASURED (§5 of CORRECTION-02).
+ *
+ * The unknown-length property is the whole point of the case, so it is probed
+ * rather than asserted by the operator. A fixture that declares a usable
+ * `Content-Length` would be caught by `--max-filesize`, and a pass from it would
+ * be evidence for the wrong gate entirely.
+ */
+function makeDeclaredLengthProbe(ctx) {
+  return async (url) =>
+    observe("byte-limit fixture declared length", async () => {
+      const fetchImpl = ctx.deps.fetch ?? globalThis.fetch;
+      const response = await fetchImpl(url, { method: "HEAD", redirect: "follow" });
+      const length = response.headers.get("content-length");
+      const encoding = response.headers.get("content-encoding");
+      const chunked = (response.headers.get("transfer-encoding") ?? "").includes("chunked");
+      // "Unknown" means yt-dlp's `data_len` will be None or untrustworthy:
+      // absent Content-Length, chunked transfer, or a compressed body whose
+      // declared length describes the encoded stream rather than the media.
+      const declaredLengthUnknown =
+        length === null || chunked || (encoding !== null && encoding !== "identity");
+      return {
+        declaredLengthUnknown,
+        summary: {
+          contentLength: length,
+          contentEncoding: encoding,
+          chunked,
+        },
+      };
+    });
+}
+
+/**
+ * Waits for the operator's Worker stop/restart (§6 of CORRECTION-02).
+ *
+ * The harness observes; it never performs the transition. A restart is detected
+ * as the container's main PID changing — `systemctl stop`/`start` are not on the
+ * read-only allowlist and are never called from here.
+ */
+function makeRestartWatcher(ctx) {
+  return async ({ timeoutMs }) =>
+    observe("operator Worker restart", async () => {
+      const before = await ctx.system.containerPid();
+      if (before.measured !== true) throw new Error("the container PID could not be read before the transition");
+      const previousPid = before.value;
+
+      const deadline = Date.now() + timeoutMs;
+      let sawDown = false;
+      while (Date.now() < deadline) {
+        const now = await ctx.system.containerPid();
+        if (now.measured !== true) {
+          sawDown = true; // the container is gone — the stop half happened
+        } else if (sawDown && now.value !== previousPid) {
+          return { previousPid, currentPid: now.value };
+        } else if (now.value !== previousPid) {
+          // Recreated between polls; still a genuine restart.
+          return { previousPid, currentPid: now.value };
+        }
+        await (ctx.deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))))(1000);
+      }
+      throw new Error("no Worker restart was observed before the window expired");
+    });
+}
+
+/**
+ * Attributes an egress denial to the EXTERNAL boundary (§7 of CORRECTION-02).
+ *
+ * Composes with the accepted Phase-9 instrument rather than re-deriving it: the
+ * read-only verifier plus the watchdog's journal are what already own this
+ * question. A denial the harness cannot attribute is a measurement failure, not
+ * a pass — "the connection failed" alone could mean "no route".
+ */
+function makeEgressAttribution(ctx) {
+  return async ({ since }) =>
+    observe("safe-egress denial attribution", async () => {
+      const journal = await ctx.system.unitJournal("videofetch-egress-watchdog", since);
+      if (journal.measured !== true) {
+        throw new Error("the watchdog journal could not be read");
+      }
+      const verifier = await ctx.system.egressPolicyState();
+      if (verifier.measured !== true) throw new Error("the policy verifier could not be run");
+      // The boundary is intact AND the watchdog did not report a breach: the
+      // denial came from the policy rather than from the policy being gone.
+      return {
+        attributedToBoundary: verifier.value.verifierExit === 0,
+        summary: { verifierExit: verifier.value.verifierExit },
+      };
+    });
+}
+
+/**
+ * The sentinel sweep (§18/§19 of CORRECTION-02).
+ *
+ * Every REQUIRED surface must be genuinely measured. The previous version
+ * substituted `""` for an unreadable surface, which turned "could not read the
+ * logs" into "the sentinel is absent from the logs" — an invalid inference, and
+ * precisely the SKIPPED->PASS edge the harness forbids elsewhere.
+ *
+ * A surface that cannot be read makes the sweep unmeasured, which lands
+ * `privacy.sentinel-not-leaked` as BLOCKED.
  */
 function makeSentinelSweeper(ctx) {
   const { system, session } = ctx;
   return async (sentinel, { since, jobId, finalJob }) => {
     const surfaces = {};
+    const unreadable = [];
 
-    const logs = await system.workerLogs(since);
-    surfaces["docker-logs"] = logs.measured === true ? logs.value : "";
+    const require = (name, observation) => {
+      if (observation?.measured !== true) {
+        unreadable.push(`${name}: ${observation?.reason ?? "unavailable"}`);
+        return;
+      }
+      surfaces[name] =
+        typeof observation.value === "string" ? observation.value : JSON.stringify(observation.value);
+    };
 
-    const journal = await system.workerJournal(since);
-    surfaces.journal = journal.measured === true ? journal.value : "";
+    require("worker-journal", await system.workerJournal(since));
+    require("container-output", await system.workerLogs(since));
+    // §19: the cloudflared-relevant surface needs a real observer, or the sweep
+    // is incomplete. The unit name is configurable because the ingress unit is
+    // deployment-named.
+    require("cloudflared-journal", await system.unitJournal(ctx.cloudflaredUnit, since));
+    require("durable-row", await system.durableJobRow(jobId));
 
-    const durable = await system.durableJobRow(jobId);
-    surfaces["durable-row"] = durable.measured === true ? JSON.stringify(durable.value) : "";
-
+    // Job metadata as the API actually returns it.
     surfaces["job-metadata"] = JSON.stringify(finalJob ?? null);
 
-    surfaces["api-error"] = await (async () => {
-      try {
-        const status = await session.jobStatus(jobId);
-        return JSON.stringify(status);
-      } catch (error) {
-        return String(error?.message ?? "");
-      }
-    })();
+    // §19: a successful status response is NOT an error surface. A real error
+    // body is obtained by asking for a job id that cannot exist, which exercises
+    // the browser-facing error path without creating anything.
+    const errorSurface = await observe("api error body", async () => {
+      const response = await session.rawGet(`/api/download/${"0".repeat(32)}/status`);
+      return `${response.status} ${await response.text()}`;
+    });
+    require("api-error", errorSurface);
+
+    // Object metadata, from the authenticated Worker job view. The object key
+    // and size are the metadata the application controls.
+    const objectMetadata = await observe("object metadata", async () => {
+      const worker = makeWorkerControl(ctx);
+      const view = await worker.getJob(jobId);
+      return JSON.stringify(view?.job ?? null);
+    });
+    require("object-metadata", objectMetadata);
+
+    if (unreadable.length > 0) {
+      return {
+        measured: false,
+        reason: `required sentinel surfaces could not be read: ${unreadable.join("; ")}`,
+      };
+    }
 
     const sweep = sweepForSentinel(surfaces, sentinel);
-    return sweep.value;
+    return { measured: true, value: sweep.value };
   };
 }
 

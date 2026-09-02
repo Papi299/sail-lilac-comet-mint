@@ -86,15 +86,36 @@ import {
   buildCaseRecord,
   validateCaseRecord,
   pickPreset,
-  CASE_NAMES,
+  caseNames,
+  liveCaseNames,
+  hasExecutableProducer,
+  CASE_PRODUCERS,
   CASE_SCHEMA_VERSION,
   HARNESS_ID,
 } from "../deploy/acceptance/ytdlp-generic/lib/cases.mjs";
 import {
   producerFor,
   hasConcreteProducer,
+  nonLiveCheckIds,
 } from "../deploy/acceptance/ytdlp-generic/lib/coverage.mjs";
-import { main } from "../deploy/acceptance/ytdlp-generic/acceptance.mjs";
+import {
+  aggregateDownloadWindow,
+  createDownloadWindowCollector,
+  nodeContained,
+  nodeExercised,
+  ytdlpIdentified,
+} from "../deploy/acceptance/ytdlp-generic/lib/download-window.mjs";
+import {
+  canonicalize,
+  sealRecord,
+  verifySeal,
+  verifyRecord,
+  validateDeploymentBinding,
+  loadOrCreateRun,
+  loadRun,
+  EVIDENCE_SCHEMA_VERSION,
+} from "../deploy/acceptance/ytdlp-generic/lib/provenance.mjs";
+import { main, loadStageA } from "../deploy/acceptance/ytdlp-generic/acceptance.mjs";
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -158,6 +179,36 @@ function acquisitionSample(extra = []) {
   ];
 }
 
+/** A downloading-window observation built from a list of process samples. */
+function windowOf(samples, opts = {}) {
+  return {
+    samples: samples.map((sample) => ({
+      sample,
+      ytdlpPid: opts.ytdlpPid === undefined ? 200 : opts.ytdlpPid,
+      at: "2026-09-02T00:00:00.000Z",
+    })),
+    workerPid: opts.workerPid ?? 100,
+    expectedNetns: opts.expectedNetns ?? "net:[4026532001]",
+    observedDownloading: opts.observedDownloading ?? true,
+  };
+}
+
+function cancellationEvidence(overrides = {}) {
+  return {
+    transitions: ["queued", "analyzing", "downloading", "cancelled"],
+    lateReady: false,
+    postSample: [{ pid: 100, ppid: 1, pgid: 100, comm: "node", netns: "net:[4026532001]" }],
+    postSampleMeasured: true,
+    postSampleReason: null,
+    workerPid: 100,
+    beganProcessing: false,
+    uploaded: false,
+    workDirMeasured: true,
+    workDirPresent: false,
+    ...overrides,
+  };
+}
+
 const APP_PRESETS = [
   { id: "preset:720", formatId: "preset:720", container: "mp4", label: "720p", resolution: "720p" },
   { id: "preset:audio", formatId: "preset:audio", container: "m4a", label: "Audio", resolution: null },
@@ -171,7 +222,7 @@ function passingStageBObservations(overrides = {}) {
     ytdlpEnabledRaw: measured("true"),
     genericAnalysis: measured({
       extractor: "yt-dlp",
-      directAttempted: true,
+      directControlExtractor: "direct",
       formats: [],
       presets: APP_PRESETS,
       thumbnail: null,
@@ -187,13 +238,8 @@ function passingStageBObservations(overrides = {}) {
       formatId: "preset:720",
       extractor: "yt-dlp",
     }),
-    selectorConstraints: measured({ satisfied: true }),
-    downloadingSample: measured({
-      sample: acquisitionSample(),
-      workerPid: 100,
-      ytdlpPid: 200,
-      expectedNetns: "net:[4026532001]",
-    }),
+    selectorConstraints: measured({ containerMatches: true }),
+    downloadingWindow: measured(windowOf([acquisitionSample()])),
     egressNegative: measured({ denied: true, attributedToBoundary: true }),
     egressPolicyFingerprint: measured({ beforeMatchesAfter: true }),
     r2Evidence: measured({ objectExists: true, contentLength: 83089 }),
@@ -212,15 +258,7 @@ function passingStageBObservations(overrides = {}) {
       leakedSurfaces: [],
       surfacesChecked: ["journal", "docker-logs", "durable-row", "job-metadata", "api-error"],
     }),
-    cancellation: measured({
-      transitions: ["queued", "analyzing", "downloading", "cancelled"],
-      lateReady: false,
-      postSample: [{ pid: 100, ppid: 1, pgid: 100, comm: "node", netns: "net:[4026532001]" }],
-      workerPid: 100,
-      beganProcessing: false,
-      uploaded: false,
-      workDirPresent: false,
-    }),
+    cancellation: measured(cancellationEvidence()),
     byteLimitCase: measured({
       declaredLengthUnknown: true,
       outcome: "TOO_LARGE",
@@ -229,7 +267,13 @@ function passingStageBObservations(overrides = {}) {
       workDirPresent: false,
     }),
     shutdownCase: measured({ descendantsGone: true, recoveredStatus: "failed" }),
-    directAfterEnable: measured({ status: "ready", extractor: "direct", sampledBasenames: ["node"] }),
+    directAfterEnable: measured({
+      status: "ready",
+      extractor: "direct",
+      processSamplingMeasured: true,
+      samplesTaken: 5,
+      sampledBasenames: ["node"],
+    }),
     failClosedRuntime: measured({ genericUsable: false, fellBackToPath: false, directStillWorks: true }),
     killSwitch: measured({ genericUsableAfterDisable: false, directWorks: true }),
     siteCatalog: measured({ limitedEntriesPromoted: false }),
@@ -343,6 +387,7 @@ function makeFakeWorld(options = {}) {
       status,
       headers: new Headers(headers),
       json: async () => body,
+      text: async () => JSON.stringify(body),
       arrayBuffer: async () => new TextEncoder().encode(JSON.stringify(body)).buffer,
     });
 
@@ -381,7 +426,24 @@ function makeFakeWorld(options = {}) {
     }
     if (url.pathname.endsWith("/status")) {
       const jobId = url.pathname.split("/")[3];
+      // An unknown job is a genuine 404 error body — which is what the sentinel
+      // sweep's `api-error` surface deliberately exercises.
+      if (!jobs.has(jobId)) return json({ error: "Not found", code: "NOT_FOUND" }, 404);
       return json(nextJob(jobId, jobs.get(jobId).extractor));
+    }
+    // The Worker's own authenticated routes (cancel + job view).
+    if (url.pathname.startsWith("/v1/jobs/")) {
+      const jobId = url.pathname.split("/")[3];
+      if (url.pathname.endsWith("/cancel")) return json({ success: true, job: { jobId, status: "cancelled" } });
+      return json({
+        success: true,
+        job: {
+          jobId,
+          status: "ready",
+          fileSize: FIXTURE_BODY.length,
+          objectKey: `videofetch/jobs/${jobId}/${"9".repeat(32)}`,
+        },
+      });
     }
     if (url.pathname.endsWith("/file")) {
       return {
@@ -411,20 +473,27 @@ function makeFakeWorld(options = {}) {
 async function runCli(argv, env, deps = {}) {
   const lines = [];
   const errors = [];
-  const files = new Map();
+  const files = deps.files ?? new Map();
+  const modes = new Map();
   const code = await main(argv, env, {
     log: (line) => lines.push(String(line)),
     errorLog: (line) => errors.push(String(line)),
-    writeFile: async (path, contents) => files.set(path, contents),
+    // The filesystem is a SUBSTITUTED EXTERNAL SYSTEM, like the command runner
+    // and fetch. The CLI's own provenance logic still runs for real against it.
+    writeFile: async (path, contents, options) => {
+      files.set(path, contents);
+      if (options?.mode) modes.set(path, options.mode);
+    },
     readFile: async (path) => {
       if (files.has(path)) return files.get(path);
-      if (deps.files?.has(path)) return deps.files.get(path);
       throw new Error(`no such file ${path}`);
     },
+    mkdir: async () => {},
+    chmod: async (path, mode) => modes.set(path, mode),
     sleep: async () => {},
     ...deps,
   });
-  return { code, out: lines.join("\n"), err: errors.join("\n"), files };
+  return { code, out: lines.join("\n"), err: errors.join("\n"), files, modes };
 }
 
 const LIVE_ENV = (extra = {}) => ({
@@ -433,7 +502,26 @@ const LIVE_ENV = (extra = {}) => ({
   ...extra,
 });
 
+/** The Worker control credential, for cases that use the Worker's own routes. */
+const WORKER_ENV = {
+  VF_WORKER_ORIGIN: "http://127.0.0.1:8080",
+  VF_CONTROL_KEY_ID: "acceptance-key",
+  VF_CONTROL_SECRET: "an-acceptance-worker-control-secret",
+};
+
 const LIVE_ARGS = ["--live", "--base-url", "https://control.invalid", "--expected-sha", SHA];
+
+/**
+ * A pre-existing acceptance run, as Stage A would have created.
+ *
+ * Stage B cases and the aggregation JOIN a run rather than minting one, so the
+ * tests seed the key file exactly as a real operator's Stage A run leaves it.
+ */
+const RUN_KEY_PATH = "./.vf-acceptance-run.json";
+function seedRun(files = new Map()) {
+  files.set(RUN_KEY_PATH, JSON.stringify({ runId: "a1b2c3d4e5f60718", key: "c".repeat(64) }));
+  return files;
+}
 
 // ── 1-3. Accidental-live prevention (§9, §27) ──────────────────────────────
 
@@ -562,7 +650,7 @@ describe("real CLI orchestration", () => {
     assert.equal(record.harness, HARNESS_ID);
   });
 
-  it("35c. a Stage B success case produces a real case record", async () => {
+  it("35c. a Stage B success case produces a real, sealed case record", async () => {
     const world = makeFakeWorld({
       ytdlpEnabled: "true",
       sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
@@ -572,8 +660,9 @@ describe("real CLI orchestration", () => {
       LIVE_ENV({
         VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
         VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+        ...WORKER_ENV,
       }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
 
@@ -587,41 +676,42 @@ describe("real CLI orchestration", () => {
     assert.equal(record.payload.genericJob.requestedFormatId, "preset:720");
     assert.equal(record.payload.durableJobRow.formatId, "preset:720");
     assert.match(record.payload.vercelDelivery.clientDigest, /^[0-9a-f]{64}$/);
-    assert.equal(record.payload.downloadingSample.ytdlpPid, 200);
+    assert.equal(record.payload.downloadingWindow.observedDownloading, true);
+    assert.ok(record.payload.downloadingWindow.samples.length > 0);
     assert.equal(record.payload.sentinelSweep.leaked, false);
   });
 
   it("35d. Stage B aggregation turns real case records into a verdict", async () => {
+    // ONE acceptance run, as on the VM: Stage A creates the run key, then every
+    // Stage B case joins it, then the aggregation verifies against it.
+    const files = new Map();
+
+    const stageAWorld = makeFakeWorld();
+    const stageA = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/stage-a.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: stageAWorld.runReadOnly, fetch: stageAWorld.fetch, files },
+    );
+    assert.equal(stageA.code, 0, `${stageA.out}\n${stageA.err}`);
+    assert.ok(files.has(RUN_KEY_PATH), "Stage A must create the acceptance run key");
+
     const world = makeFakeWorld({
       ytdlpEnabled: "true",
       sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
     });
-    const shared = { runReadOnly: world.runReadOnly, fetch: world.fetch };
     const liveEnv = LIVE_ENV({
       VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
       VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+      ...WORKER_ENV,
     });
+    const shared = { runReadOnly: world.runReadOnly, fetch: world.fetch, files };
 
     const success = await runCli(
       ["--stage", "B", "--case", "success", ...LIVE_ARGS, "--evidence", "/tmp/c-success.json"],
       liveEnv,
       shared,
     );
-    assert.equal(success.code, 0);
-
-    // A Stage A PASS record, produced by the real Stage A run.
-    const stageAWorld = makeFakeWorld();
-    const stageA = await runCli(
-      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/stage-a.json"],
-      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: stageAWorld.runReadOnly, fetch: stageAWorld.fetch },
-    );
-    assert.equal(stageA.code, 0);
-
-    const files = new Map([
-      ["/tmp/stage-a.json", stageA.files.get("/tmp/stage-a.json")],
-      ["/tmp/c-success.json", success.files.get("/tmp/c-success.json")],
-    ]);
+    assert.equal(success.code, 0, `${success.out}\n${success.err}`);
 
     const aggregate = await runCli(
       [
@@ -631,27 +721,71 @@ describe("real CLI orchestration", () => {
         "--evidence", "/tmp/stage-b.json",
       ],
       liveEnv,
-      { ...shared, files },
+      shared,
     );
 
-    assert.match(aggregate.out, /accepted case evidence: success/);
+    assert.match(aggregate.out, /accepted case evidence: success/, `${aggregate.out}\n${aggregate.err}`);
     // The success case's own checks passed…
     for (const id of [
-      "analysis.routed-to-generic",
+      "analysis.generic-selected",
+      "analysis.direct-still-selected",
       "analysis.presets-application-owned",
       "job.lifecycle-complete",
       "durable.application-format-id",
+      "process.window-observed",
       "process.ytdlp-identified",
       "process.no-ffmpeg-during-downloading",
       "vercel.byte-integrity",
       "privacy.sentinel-not-leaked",
+      "r2.delegated-write",
     ]) {
-      assert.match(aggregate.out, new RegExp(`\\[ok  \\] ${id.replace(/\./g, "\\.")}`), `${id}`);
+      assert.match(aggregate.out, new RegExp(`\\[ok  \\] ${id.replace(/\./g, "\\.")}`), id);
     }
     // …while the cases that were NOT run are BLOCKED, never skipped to PASS.
     assert.match(aggregate.out, /\[BLKD\] cancel\.durable-cancelled/);
     assert.match(aggregate.out, /\[BLKD\] limit\.actual-byte-guard/);
+    assert.match(aggregate.out, /\[BLKD\] shutdown\.group-terminated/);
+    assert.match(aggregate.out, /\[BLKD\] safe-egress\.forbidden-destination-denied/);
     assert.equal(aggregate.code, 2, "an incomplete Stage B is BLOCKED");
+  });
+
+  it("35e. a case record from ANOTHER acceptance run is rejected", async () => {
+    const files = new Map();
+    const stageAWorld = makeFakeWorld();
+    const stageA = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/stage-a.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: stageAWorld.runReadOnly, fetch: stageAWorld.fetch, files },
+    );
+    assert.equal(stageA.code, 0);
+
+    // A case record sealed by a DIFFERENT run's key.
+    const foreign = sealRecord(
+      buildCaseRecord({
+        caseName: "cancellation",
+        binding: { expectedSha: SHA, runningImageId: IMAGE_ID },
+        payload: { cancellation: cancellationEvidence({ postSample: [] }) },
+        runId: "ffffffffffffffff",
+      }),
+      "d".repeat(64),
+    );
+    files.set("/tmp/foreign.json", JSON.stringify(foreign));
+
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const aggregate = await runCli(
+      [
+        "--stage", "B", "--aggregate", ...LIVE_ARGS,
+        "--stage-a", "/tmp/stage-a.json",
+        "--case-evidence", "/tmp/foreign.json",
+      ],
+      LIVE_ENV(),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+    assert.match(aggregate.err, /rejected case evidence/);
+    assert.match(aggregate.out, /accepted case evidence: none/);
   });
 });
 
@@ -765,12 +899,67 @@ describe("check coverage", () => {
     return [...ids];
   }
 
-  it("36. every emitted check has a concrete, non-test producer", () => {
+  /** Check ids the evaluators emit as NOT required (optional coverage). */
+  function optionalCheckIds() {
+    const ids = new Set();
+    for (const result of [
+      evaluateStageB(passingStageBObservations(), passingStageA()),
+      evaluateStageB(
+        passingStageBObservations({ failClosedRuntime: unmeasured("not performed") }),
+        passingStageA(),
+      ),
+    ]) {
+      for (const entry of result.checks) if (entry.required === false) ids.add(entry.id);
+    }
+    return ids;
+  }
+
+  it("36. every REQUIRED check has a concrete, executable producer", () => {
+    const optional = optionalCheckIds();
     const missing = [];
     for (const id of allEmittedCheckIds()) {
+      if (optional.has(id)) continue;
       if (!hasConcreteProducer(id)) missing.push(id);
     }
-    assert.deepEqual(missing, [], `these checks have no concrete live producer: ${missing.join(", ")}`);
+    assert.deepEqual(missing, [], `these required checks have no concrete live producer: ${missing.join(", ")}`);
+  });
+
+  it("36d. a check with a non-live producer MUST be optional (§4)", () => {
+    // The one declared non-live case is `fail-closed-runtime`. It is allowed to
+    // exist only because the evaluator can never let it satisfy a required
+    // assertion — so that relationship is asserted rather than assumed.
+    const optional = optionalCheckIds();
+    for (const id of nonLiveCheckIds()) {
+      assert.ok(
+        optional.has(id),
+        `${id} has no live producer, so it must be emitted as an optional check`,
+      );
+    }
+    assert.ok(nonLiveCheckIds().includes("runtime.fail-closed"));
+  });
+
+  it("36e. every advertised case name resolves to a real callable producer (§37)", () => {
+    for (const name of liveCaseNames()) {
+      assert.equal(hasExecutableProducer(name), true, `${name} must be executable`);
+      assert.equal(typeof CASE_PRODUCERS[name].run, "function", `${name}.run must be a function`);
+    }
+    // And a declared-but-non-live case is honestly marked, not silently absent.
+    for (const name of caseNames()) {
+      const entry = CASE_PRODUCERS[name];
+      if (entry.live === false) {
+        assert.equal(entry.run, null);
+        assert.match(entry.summary, /not a live case command/);
+      }
+    }
+  });
+
+  it("36f. the four previously-missing cases are now executable", () => {
+    // CORRECTION-02 §3: these were advertised in CASE_NAMES and counted as
+    // concrete producers in coverage.mjs while no dispatch entry existed.
+    for (const name of ["byte-limit", "shutdown", "safe-egress"]) {
+      assert.equal(hasExecutableProducer(name), true, `${name} must now be executable`);
+    }
+    assert.equal(hasExecutableProducer("fail-closed-runtime"), false, "declared non-live");
   });
 
   it("36b. every producer names a real CLI command", () => {
@@ -787,7 +976,7 @@ describe("check coverage", () => {
     for (const id of allEmittedCheckIds()) {
       const producer = producerFor(id);
       const match = /--case ([\w-]+)/.exec(producer.command);
-      if (match) assert.ok(CASE_NAMES.includes(match[1]), `${id} names unknown case ${match[1]}`);
+      if (match) assert.ok(caseNames().includes(match[1]), `${id} names unknown case ${match[1]}`);
     }
   });
 });
@@ -1011,8 +1200,6 @@ describe("process identity", () => {
   });
 
   it("22b. an arbitrary Python descendant cannot satisfy yt-dlp presence", () => {
-    // Same basename, but NOT its own process-group leader: it inherited the
-    // Worker's group, so it is not the detached acquisition process.
     const sample = [
       { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: NS },
       { pid: 300, ppid: 100, pgid: 100, comm: "python3", netns: NS },
@@ -1020,17 +1207,12 @@ describe("process identity", () => {
     const identity = evaluateYtdlpIdentity(sample, 100, 300, NS);
     assert.equal(identity.identified, false);
     assert.match(identity.reason, /process-group leader/);
-
-    // And the sampler refuses to establish it in the first place.
     assert.equal(establishYtdlpPid(sample, 100).established, false);
   });
 
-  it("22c. a missing, absent or non-descendant PID is BLOCKED", () => {
+  it("22c. a missing, absent or non-descendant PID is not identified", () => {
     assert.equal(evaluateYtdlpIdentity(acquisitionSample(), 100, null, NS).identified, false);
-    assert.match(
-      evaluateYtdlpIdentity(acquisitionSample(), 100, 999, NS).reason,
-      /absent from the sample/,
-    );
+    assert.match(evaluateYtdlpIdentity(acquisitionSample(), 100, 999, NS).reason, /absent from the sample/);
     const detached = [
       { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: NS },
       { pid: 400, ppid: 1, pgid: 400, comm: "python3", netns: NS },
@@ -1044,7 +1226,6 @@ describe("process identity", () => {
       { pid: 200, ppid: 100, pgid: 200, comm: "perl", netns: NS },
     ];
     assert.match(evaluateYtdlpIdentity(wrongComm, 100, 200, NS).reason, /not an approved yt-dlp runtime/);
-
     const wrongNs = [
       { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: NS },
       { pid: 200, ppid: 100, pgid: 200, comm: "python3", netns: "net:[4026599999]" },
@@ -1052,15 +1233,10 @@ describe("process identity", () => {
     assert.match(evaluateYtdlpIdentity(wrongNs, 100, 200, NS).reason, /media network namespace/);
   });
 
-  it("22e. an unidentified owned process BLOCKS Stage B", () => {
+  it("22e. a window that never identified the owned process BLOCKS Stage B", () => {
     const result = evaluateStageB(
       passingStageBObservations({
-        downloadingSample: measured({
-          sample: acquisitionSample(),
-          workerPid: 100,
-          ytdlpPid: null,
-          expectedNetns: NS,
-        }),
+        downloadingWindow: measured(windowOf([acquisitionSample()], { ytdlpPid: null })),
       }),
       passingStageA(),
     );
@@ -1069,18 +1245,13 @@ describe("process identity", () => {
   });
 
   it("23. Node containment is anchored to the verified owned PID", () => {
-    const sample = acquisitionSample([
-      { pid: 300, ppid: 200, pgid: 200, comm: "node", netns: NS },
-    ]);
+    const sample = acquisitionSample([{ pid: 300, ppid: 200, pgid: 200, comm: "node", netns: NS }]);
     const identity = evaluateYtdlpIdentity(sample, 100, 200, NS);
     const contained = evaluateNodeContainment(classifyAcquisitionTree(sample, 100), identity, NS);
     assert.equal(contained.anchored, true);
     assert.equal(contained.contained, true);
 
-    // Node parented by the WORKER rather than the owned yt-dlp process.
-    const detached = acquisitionSample([
-      { pid: 300, ppid: 100, pgid: 200, comm: "node", netns: NS },
-    ]);
+    const detached = acquisitionSample([{ pid: 300, ppid: 100, pgid: 200, comm: "node", netns: NS }]);
     const detachedResult = evaluateNodeContainment(
       classifyAcquisitionTree(detached, 100),
       evaluateYtdlpIdentity(detached, 100, 200, NS),
@@ -1095,28 +1266,13 @@ describe("process identity", () => {
       { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: NS },
       { pid: 300, ppid: 100, pgid: 100, comm: "node", netns: NS },
     ];
-    const identity = evaluateYtdlpIdentity(sample, 100, null, NS);
-    const result = evaluateNodeContainment(classifyAcquisitionTree(sample, 100), identity, NS);
+    const result = evaluateNodeContainment(
+      classifyAcquisitionTree(sample, 100),
+      evaluateYtdlpIdentity(sample, 100, null, NS),
+      NS,
+    );
     assert.equal(result.anchored, false);
     assert.equal(result.contained, false);
-
-    const stageB = evaluateStageB(
-      passingStageBObservations({
-        downloadingSample: measured({ sample, workerPid: 100, ytdlpPid: null, expectedNetns: NS }),
-      }),
-      passingStageA(),
-    );
-    const entry = stageB.checks.find((c) => c.id === "process.node-ejs-containment");
-    assert.equal(entry.outcome, OUTCOMES.BLOCKED, "unanchored containment is BLOCKED, not contained");
-  });
-
-  it("23c. a source that never invokes Node reports NOT_EXERCISED", () => {
-    const result = evaluateStageB(passingStageBObservations(), passingStageA());
-    const node = result.checks.find((c) => c.id === "process.node-ejs-containment");
-    assert.equal(node.outcome, OUTCOMES.NOT_EXERCISED);
-    assert.match(node.detail, /NODE\/EJS DESCENDANT NOT EXERCISED BY THIS SOURCE/);
-    assert.equal(result.summary.verdict, OUTCOMES.PASS);
-    assert.ok(result.summary.notExercised.includes("process.node-ejs-containment"));
   });
 });
 
@@ -1154,7 +1310,6 @@ describe("process sample schema", () => {
       assert.equal(shape.ok, false, JSON.stringify(row));
       assert.match(shape.violations.join(" "), pattern);
     }
-    // An explicit null netns IS allowed — it means "measurement failed".
     assert.equal(validateSampleShape([{ ...validRow, netns: null }]).ok, true);
   });
 
@@ -1167,15 +1322,14 @@ describe("process sample schema", () => {
   it("25d. a schema violation FAILS Stage B", () => {
     const result = evaluateStageB(
       passingStageBObservations({
-        downloadingSample: measured({
-          sample: [
-            { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: "net:[1]" },
-            { pid: 200, ppid: 100, pgid: 200, comm: "python3", netns: "net:[1]", cmdline: "yt-dlp https://x" },
-          ],
-          workerPid: 100,
-          ytdlpPid: 200,
-          expectedNetns: "net:[1]",
-        }),
+        downloadingWindow: measured(
+          windowOf([
+            [
+              { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: "net:[4026532001]" },
+              { pid: 200, ppid: 100, pgid: 200, comm: "python3", netns: "net:[4026532001]", cmdline: "yt-dlp https://x" },
+            ],
+          ]),
+        ),
       }),
       passingStageA(),
     );
@@ -1189,7 +1343,6 @@ describe("process sample schema", () => {
       { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: null },
       { pid: 200, ppid: 100, pgid: 200, comm: "python3", netns: null },
     ]);
-    assert.equal(validateSampleShape(rows.map((r) => ({ ...r, netns: "net:[1]" }))).ok, true);
     assert.equal(establishYtdlpPid(rows, 100).pid, 200);
   });
 
@@ -1205,87 +1358,10 @@ describe("process sample schema", () => {
   });
 });
 
-// ── Process rules that survive from the original suite ─────────────────────
-
-describe("process-tree rules", () => {
+describe("process-tree primitives", () => {
   const NS = "net:[4026532001]";
-  const withDescendant = (comm) =>
-    measured({
-      sample: acquisitionSample([{ pid: 300, ppid: 200, pgid: 200, comm, netns: NS }]),
-      workerPid: 100,
-      ytdlpPid: 200,
-      expectedNetns: NS,
-    });
 
-  it("11/12. ffmpeg and ffprobe during downloading FAIL", () => {
-    for (const comm of ["ffmpeg", "ffprobe"]) {
-      const result = evaluateStageB(
-        passingStageBObservations({ downloadingSample: withDescendant(comm) }),
-        passingStageA(),
-      );
-      assert.equal(result.summary.verdict, OUTCOMES.FAIL, comm);
-      assert.ok(result.summary.blocking.includes("process.no-ffmpeg-during-downloading"));
-    }
-  });
-
-  it("12b. every other forbidden acquisition helper also FAILS", () => {
-    for (const comm of ["curl", "wget", "aria2c", "axel", "sh", "bash", "rtmpdump"]) {
-      const result = evaluateStageB(
-        passingStageBObservations({ downloadingSample: withDescendant(comm) }),
-        passingStageA(),
-      );
-      assert.equal(result.summary.verdict, OUTCOMES.FAIL, comm);
-    }
-  });
-
-  it("13. an allowed Node descendant is accepted structurally", () => {
-    const result = evaluateStageB(
-      passingStageBObservations({ downloadingSample: withDescendant("node") }),
-      passingStageA(),
-    );
-    assert.equal(result.summary.verdict, OUTCOMES.PASS);
-  });
-
-  it("13b. an UNKNOWN descendant is not quietly tolerated", () => {
-    const result = evaluateStageB(
-      passingStageBObservations({ downloadingSample: withDescendant("perl") }),
-      passingStageA(),
-    );
-    assert.equal(result.summary.verdict, OUTCOMES.FAIL);
-    assert.ok(result.summary.blocking.includes("process.no-unknown-descendants"));
-  });
-
-  it("14. inability to inspect descendants is BLOCKED, not PASS", () => {
-    const result = evaluateStageB(
-      passingStageBObservations({ downloadingSample: unmeasured("ps unavailable") }),
-      passingStageA(),
-    );
-    assert.equal(result.summary.verdict, OUTCOMES.BLOCKED);
-    assert.ok(result.summary.blocking.includes("process.sample-available"));
-    for (const id of ["process.no-ffmpeg-during-downloading", "process.namespace-identity"]) {
-      assert.equal(result.checks.find((c) => c.id === id), undefined);
-    }
-  });
-
-  it("15. an unexpected network namespace FAILS", () => {
-    const result = evaluateStageB(
-      passingStageBObservations({
-        downloadingSample: measured({
-          sample: acquisitionSample([
-            { pid: 300, ppid: 200, pgid: 200, comm: "node", netns: "net:[4026599999]" },
-          ]),
-          workerPid: 100,
-          ytdlpPid: 200,
-          expectedNetns: NS,
-        }),
-      }),
-      passingStageA(),
-    );
-    assert.equal(result.summary.verdict, OUTCOMES.FAIL);
-    assert.ok(result.summary.blocking.includes("process.namespace-identity"));
-  });
-
-  it("15b. an unreadable namespace is a mismatch, never agreement", () => {
+  it("an unreadable namespace is a mismatch, never agreement", () => {
     const classified = classifyAcquisitionTree(
       acquisitionSample([{ pid: 300, ppid: 200, pgid: 200, comm: "node", netns: null }]),
       100,
@@ -1295,7 +1371,12 @@ describe("process-tree rules", () => {
     assert.deepEqual(evaluation.offenders.map((o) => o.pid), [300]);
   });
 
-  it("15d. descendant walking survives a malformed (cyclic) sample", () => {
+  it("an unknown expected namespace is not measurable", () => {
+    const evaluation = evaluateNamespaceIdentity(classifyAcquisitionTree(acquisitionSample(), 100), null);
+    assert.equal(evaluation.measured, false);
+  });
+
+  it("descendant walking survives a malformed (cyclic) sample", () => {
     const cyclic = [
       { pid: 1, ppid: 2, pgid: 1, comm: "a" },
       { pid: 2, ppid: 1, pgid: 1, comm: "b" },
@@ -1303,76 +1384,175 @@ describe("process-tree rules", () => {
     assert.deepEqual(descendantsOf(cyclic, 1).map((r) => r.pid), [2]);
   });
 
-  it("17b. a surviving descendant after cancellation FAILS", () => {
-    assert.equal(
-      evaluateTerminationCleanliness(
-        [
-          { pid: 100, ppid: 1, pgid: 100, comm: "node" },
-          { pid: 200, ppid: 100, pgid: 200, comm: "python3" },
-        ],
-        100,
-      ).clean,
-      false,
+  it("termination cleanliness reports every survivor", () => {
+    assert.equal(evaluateTerminationCleanliness([{ pid: 100, ppid: 1, pgid: 100, comm: "node" }], 100).clean, true);
+    const dirty = evaluateTerminationCleanliness(
+      [
+        { pid: 100, ppid: 1, pgid: 100, comm: "node" },
+        { pid: 200, ppid: 100, pgid: 200, comm: "python3" },
+      ],
+      100,
     );
+    assert.equal(dirty.clean, false);
+    assert.deepEqual(dirty.survivors.map((r) => r.comm), ["python3"]);
+  });
+});
+
+// ── CORRECTION-02 §9-§12: the downloading window ───────────────────────────
+
+describe("downloading-window process evidence", () => {
+  const NS = "net:[4026532001]";
+  const clean = acquisitionSample();
+  const withComm = (comm, ppid = 200, pgid = 200) =>
+    acquisitionSample([{ pid: 300, ppid, pgid, comm, netns: NS }]);
+
+  it("39. a transient forbidden executable in ONE sample FAILS", () => {
+    // The middle sample is not the largest and would have been discarded by a
+    // "keep the best sample" collector.
+    const window = windowOf([clean, withComm("ffmpeg"), clean]);
     const result = evaluateStageB(
-      passingStageBObservations({
-        cancellation: measured({
-          transitions: ["queued", "analyzing", "downloading", "cancelled"],
-          lateReady: false,
-          postSample: [
-            { pid: 100, ppid: 1, pgid: 100, comm: "node" },
-            { pid: 200, ppid: 100, pgid: 200, comm: "python3" },
-          ],
-          workerPid: 100,
-          beganProcessing: false,
-          uploaded: false,
-          workDirPresent: false,
-        }),
-      }),
+      passingStageBObservations({ downloadingWindow: measured(window) }),
       passingStageA(),
     );
     assert.equal(result.summary.verdict, OUTCOMES.FAIL);
-    assert.ok(result.summary.blocking.includes("cancel.processes-gone"));
+    assert.ok(result.summary.blocking.includes("process.no-ffmpeg-during-downloading"));
+
+    const aggregate = aggregateDownloadWindow(window);
+    assert.equal(aggregate.forbiddenSeen.length, 1);
+    assert.equal(aggregate.forbiddenSeen[0].sampleIndex, 1);
   });
 
-  it("17. a late ready after cancellation FAILS", () => {
-    const result = evaluateStageB(
-      passingStageBObservations({
-        cancellation: measured({
-          transitions: ["queued", "analyzing", "downloading", "cancelled"],
-          lateReady: true,
-          postSample: [],
-          workerPid: 100,
-          beganProcessing: false,
-          uploaded: false,
-          workDirPresent: false,
-        }),
-      }),
-      passingStageA(),
-    );
-    assert.equal(result.summary.verdict, OUTCOMES.FAIL);
-    assert.ok(result.summary.blocking.includes("cancel.no-late-ready"));
-  });
-
-  it("17c. an upload or leftover workDir after cancellation FAILS", () => {
-    for (const patch of [{ uploaded: true }, { workDirPresent: true }, { beganProcessing: true }]) {
+  it("39b. a transient ffprobe or other helper in one sample FAILS", () => {
+    for (const comm of ["ffprobe", "curl", "wget", "aria2c", "sh"]) {
       const result = evaluateStageB(
         passingStageBObservations({
-          cancellation: measured({
-            transitions: ["queued", "analyzing", "downloading", "cancelled"],
-            lateReady: false,
-            postSample: [{ pid: 100, ppid: 1, pgid: 100, comm: "node" }],
-            workerPid: 100,
-            beganProcessing: false,
-            uploaded: false,
-            workDirPresent: false,
-            ...patch,
-          }),
+          downloadingWindow: measured(windowOf([clean, withComm(comm), clean])),
         }),
         passingStageA(),
       );
-      assert.equal(result.summary.verdict, OUTCOMES.FAIL, JSON.stringify(patch));
+      assert.equal(result.summary.verdict, OUTCOMES.FAIL, comm);
     }
+  });
+
+  it("39c. a transient UNKNOWN executable in one sample FAILS", () => {
+    const result = evaluateStageB(
+      passingStageBObservations({
+        downloadingWindow: measured(windowOf([clean, withComm("perl"), clean])),
+      }),
+      passingStageA(),
+    );
+    assert.equal(result.summary.verdict, OUTCOMES.FAIL);
+    assert.ok(result.summary.blocking.includes("process.no-unknown-descendants"));
+  });
+
+  it("39d. Node appearing in only ONE sample is EXERCISED, not NOT_EXERCISED", () => {
+    const window = windowOf([clean, withComm("node"), clean]);
+    assert.equal(nodeExercised(aggregateDownloadWindow(window)), true);
+
+    const result = evaluateStageB(
+      passingStageBObservations({ downloadingWindow: measured(window) }),
+      passingStageA(),
+    );
+    const node = result.checks.find((c) => c.id === "process.node-ejs-containment");
+    assert.equal(node.outcome, OUTCOMES.PASS, "a transient Node must be judged, not skipped");
+    assert.ok(!result.summary.notExercised.includes("process.node-ejs-containment"));
+  });
+
+  it("39e. a transient UNCONTAINED Node in one sample FAILS", () => {
+    // Escaped the owned process group in the middle sample only.
+    const window = windowOf([clean, withComm("node", 200, 999), clean]);
+    assert.equal(nodeContained(aggregateDownloadWindow(window)), false);
+    const result = evaluateStageB(
+      passingStageBObservations({ downloadingWindow: measured(window) }),
+      passingStageA(),
+    );
+    assert.equal(result.summary.verdict, OUTCOMES.FAIL);
+    assert.ok(result.summary.blocking.includes("process.node-ejs-containment"));
+  });
+
+  it("39f. a transient namespace mismatch in one sample FAILS", () => {
+    const window = windowOf([
+      clean,
+      acquisitionSample([{ pid: 300, ppid: 200, pgid: 200, comm: "node", netns: "net:[4026599999]" }]),
+      clean,
+    ]);
+    const result = evaluateStageB(
+      passingStageBObservations({ downloadingWindow: measured(window) }),
+      passingStageA(),
+    );
+    assert.equal(result.summary.verdict, OUTCOMES.FAIL);
+    assert.ok(result.summary.blocking.includes("process.namespace-identity"));
+  });
+
+  it("39g. a source with no Node anywhere in the window is NOT_EXERCISED", () => {
+    const result = evaluateStageB(passingStageBObservations(), passingStageA());
+    const node = result.checks.find((c) => c.id === "process.node-ejs-containment");
+    assert.equal(node.outcome, OUTCOMES.NOT_EXERCISED);
+    assert.match(node.detail, /NODE\/EJS DESCENDANT NOT EXERCISED BY THIS SOURCE/);
+    assert.equal(result.summary.verdict, OUTCOMES.PASS);
+  });
+
+  it("39h. no downloading sample at all is BLOCKED", () => {
+    for (const window of [
+      windowOf([]),
+      { samples: [], workerPid: 100, expectedNetns: NS, observedDownloading: false },
+    ]) {
+      const result = evaluateStageB(
+        passingStageBObservations({ downloadingWindow: measured(window) }),
+        passingStageA(),
+      );
+      assert.equal(result.summary.verdict, OUTCOMES.BLOCKED);
+      assert.ok(result.summary.blocking.includes("process.window-observed"));
+    }
+    const unmeasured2 = evaluateStageB(
+      passingStageBObservations({ downloadingWindow: unmeasured("sampler failed") }),
+      passingStageA(),
+    );
+    assert.equal(unmeasured2.summary.verdict, OUTCOMES.BLOCKED);
+  });
+
+  it("12. FFmpeg during PROCESSING does not fail the downloading boundary", () => {
+    // This is the lifecycle boundary the acceptance exists to prove. Worker
+    // FFmpeg is legitimate in `processing` — preset:mp3 and preset:audio from a
+    // muxed source are Worker-side operations after beginProcessing() commits.
+    const collector = createDownloadWindowCollector({});
+    collector.noteState("queued");
+    collector.addSample({ sample: withComm("ffmpeg"), workerPid: 100, expectedNetns: NS });
+    assert.equal(collector.result().samples.length, 0, "pre-downloading samples are not admitted");
+
+    collector.noteState("downloading");
+    collector.addSample({ sample: clean, workerPid: 100, ytdlpPid: 200, expectedNetns: NS });
+
+    collector.noteState("processing");
+    collector.addSample({ sample: withComm("ffmpeg"), workerPid: 100, expectedNetns: NS });
+    assert.equal(collector.result().samples.length, 1, "processing samples are not admitted");
+
+    const result = evaluateStageB(
+      passingStageBObservations({ downloadingWindow: measured(collector.result()) }),
+      passingStageA(),
+    );
+    assert.equal(result.summary.verdict, OUTCOMES.PASS, "processing FFmpeg must not fail acquisition");
+  });
+
+  it("12b. the window closes permanently once the job leaves downloading", () => {
+    const collector = createDownloadWindowCollector({});
+    collector.noteState("downloading");
+    assert.equal(collector.open, true);
+    collector.noteState("processing");
+    assert.equal(collector.open, false);
+    // A late `downloading` report cannot reopen it.
+    collector.noteState("downloading");
+    assert.equal(collector.open, false);
+    assert.equal(collector.observedDownloading, true);
+  });
+
+  it("aggregation reports every sample, not just the widest", () => {
+    const aggregate = aggregateDownloadWindow(windowOf([clean, withComm("node"), clean]));
+    assert.equal(aggregate.samplesTaken, 3);
+    assert.equal(aggregate.usableSamples, 3);
+    assert.equal(ytdlpIdentified(aggregate), true);
+    assert.equal(aggregate.ytdlpIdentities.length, 3);
+    assert.deepEqual(aggregate.basenamesSeen, ["node", "python3"]);
   });
 });
 
@@ -1560,14 +1740,14 @@ describe("Stage A record binding", () => {
       JSON.stringify({ harness: HARNESS_ID, stage: "A", verdict: "PASS" }), // no binding
       "not json",
     ]) {
-      const files = new Map([["/tmp/sa.json", body]]);
+      const files = seedRun(new Map([["/tmp/sa.json", body]]));
       const run = await runCli(
         ["--stage", "B", "--aggregate", ...LIVE_ARGS, "--stage-a", "/tmp/sa.json"],
         LIVE_ENV(),
         { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
       );
       assert.equal(run.code, 2, body.slice(0, 40));
-      assert.match(run.err, /must name a Stage A record whose verdict is PASS/);
+      assert.match(run.err, /the Stage A record is not usable/);
     }
   });
 });
@@ -1576,17 +1756,7 @@ describe("Stage A record binding", () => {
 
 describe("case evidence validation", () => {
   const binding = { expectedSha: SHA, runningImageId: IMAGE_ID };
-  const goodPayload = {
-    cancellation: {
-      transitions: ["queued", "analyzing", "downloading", "cancelled"],
-      lateReady: false,
-      postSample: [],
-      workerPid: 100,
-      beganProcessing: false,
-      uploaded: false,
-      workDirPresent: false,
-    },
-  };
+  const goodPayload = { cancellation: cancellationEvidence({ postSample: [] }) };
 
   it("accepts a record this harness produced for this deployment", () => {
     const record = buildCaseRecord({ caseName: "cancellation", binding, payload: goodPayload });
@@ -1649,7 +1819,7 @@ describe("case evidence validation", () => {
   });
 
   it("9e. every case name has a payload validator", () => {
-    for (const name of CASE_NAMES) {
+    for (const name of caseNames()) {
       const validated = validateCaseRecord(
         buildCaseRecord({ caseName: name, binding, payload: {} }),
         binding,
@@ -1732,10 +1902,11 @@ describe("sentinel", () => {
       LIVE_ENV({
         VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
         VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+        ...WORKER_ENV,
       }),
-      { runReadOnly: world.runReadOnly, fetch: spyFetch },
+      { runReadOnly: world.runReadOnly, fetch: spyFetch, files: seedRun() },
     );
-    assert.equal(run.code, 0);
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
 
     // The sentinel genuinely travelled through the application path…
     const carrier = submitted.find((s) => s.includes("vf_accept="));
@@ -1926,13 +2097,14 @@ describe("Stage B outcome matrix", () => {
 
   it("other Stage B violations fail as expected", () => {
     const cases = [
-      [{ genericAnalysis: measured({ extractor: "yt-dlp", directAttempted: false, formats: [], presets: APP_PRESETS, thumbnail: null }) }, "analysis.routed-to-generic"],
-      [{ genericAnalysis: measured({ extractor: "yt-dlp", directAttempted: true, formats: [{ format_id: "22" }], presets: APP_PRESETS, thumbnail: null }) }, "analysis.no-raw-formats"],
-      [{ genericAnalysis: measured({ extractor: "yt-dlp", directAttempted: true, formats: [], presets: APP_PRESETS, thumbnail: "https://t.invalid/x.jpg" }) }, "analysis.no-generic-thumbnail"],
+      [{ genericAnalysis: measured({ extractor: "direct", directControlExtractor: "direct", formats: [], presets: APP_PRESETS, thumbnail: null }) }, "analysis.generic-selected"],
+      [{ genericAnalysis: measured({ extractor: "yt-dlp", directControlExtractor: "yt-dlp", formats: [], presets: APP_PRESETS, thumbnail: null }) }, "analysis.direct-still-selected"],
+      [{ genericAnalysis: measured({ extractor: "yt-dlp", directControlExtractor: "direct", formats: [{ format_id: "22" }], presets: APP_PRESETS, thumbnail: null }) }, "analysis.no-raw-formats"],
+      [{ genericAnalysis: measured({ extractor: "yt-dlp", directControlExtractor: "direct", formats: [], presets: APP_PRESETS, thumbnail: "https://t.invalid/x.jpg" }) }, "analysis.no-generic-thumbnail"],
       [{ egressNegative: measured({ denied: true, attributedToBoundary: false }) }, "safe-egress.forbidden-destination-denied"],
       [{ egressPolicyFingerprint: measured({ beforeMatchesAfter: false }) }, "safe-egress.policy-unchanged"],
       [{ workerEnvironmentNames: measured(["R2_WRITER_ACCESS_KEY_ID"]) }, "r2.worker-holds-no-credential"],
-      [{ directAfterEnable: measured({ status: "ready", extractor: "direct", sampledBasenames: ["node", "python3"] }) }, "direct.no-ytdlp-spawned"],
+      [{ directAfterEnable: measured({ status: "ready", extractor: "direct", processSamplingMeasured: true, samplesTaken: 3, sampledBasenames: ["node", "python3"] }) }, "direct.no-ytdlp-spawned"],
       [{ killSwitch: measured({ genericUsableAfterDisable: true, directWorks: true }) }, "killswitch.rollback"],
       [{ siteCatalog: measured({ limitedEntriesPromoted: true }) }, "catalog.unchanged"],
       [{ shutdownCase: measured({ descendantsGone: false, recoveredStatus: "failed" }) }, "shutdown.group-terminated"],
@@ -1989,7 +2161,7 @@ describe("stage separation", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "success", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic", VIDEOFETCH_ACCEPT_DIRECT_URL: "https://f.invalid/c.mp4" }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 2);
     assert.match(run.err, /STAGE MISMATCH/);
@@ -2048,6 +2220,374 @@ describe("verdict algebra", () => {
     ]);
     assert.equal(summary.verdict, OUTCOMES.FAIL);
     assert.deepEqual([...summary.blocking].sort(), ["a", "b"]);
+  });
+});
+
+// ── CORRECTION-02 §22-§29: evidence provenance ─────────────────────────────
+
+describe("evidence provenance", () => {
+  const KEY = "a".repeat(64);
+  const RUN = { runId: "0123456789abcdef", key: KEY };
+  const expectations = { runId: RUN.runId, expectedSha: SHA, runningImageId: IMAGE_ID };
+
+  const genuineCase = () =>
+    sealRecord(
+      buildCaseRecord({
+        caseName: "cancellation",
+        binding: { expectedSha: SHA, runningImageId: IMAGE_ID },
+        payload: { cancellation: cancellationEvidence({ postSample: [] }) },
+        runId: RUN.runId,
+      }),
+      KEY,
+    );
+
+  const genuineStageA = () =>
+    sealRecord(
+      {
+        harness: HARNESS_ID,
+        schemaVersion: EVIDENCE_SCHEMA_VERSION,
+        runId: RUN.runId,
+        stage: "A",
+        verdict: "PASS",
+        expectedSha: SHA,
+        runningImageId: IMAGE_ID,
+        taggedImageId: IMAGE_ID,
+        binding: { expectedSha: SHA, runningImageId: IMAGE_ID, taggedImageId: IMAGE_ID },
+      },
+      KEY,
+    );
+
+  it("29. a genuine case artifact is accepted", () => {
+    const record = genuineCase();
+    assert.equal(verifySeal(record, KEY).ok, true);
+    assert.equal(verifyRecord(record, KEY, expectations).ok, true);
+    assert.equal(validateCaseRecord(record, { expectedSha: SHA, runningImageId: IMAGE_ID }).ok, true);
+  });
+
+  it("29b. a genuine Stage A artifact is accepted", async () => {
+    const record = genuineStageA();
+    const loaded = await loadStageA("/x", async () => JSON.stringify(record), {
+      run: RUN,
+      expectedSha: SHA,
+    });
+    assert.equal(loaded.ok, true, loaded.reason);
+  });
+
+  it("29c. editing ANY authenticated field invalidates the seal", () => {
+    const edits = [
+      ["a boolean", (r) => { r.payload.cancellation.lateReady = true; }],
+      ["a nested boolean", (r) => { r.payload.cancellation.workDirPresent = true; }],
+      ["a PID", (r) => { r.payload.cancellation.workerPid = 999; }],
+      ["a transition", (r) => { r.payload.cancellation.transitions.push("ready"); }],
+      ["the case name", (r) => { r.case = "success"; }],
+      ["the expected SHA", (r) => { r.expectedSha = "0".repeat(40); }],
+      ["the running image id", (r) => { r.runningImageId = `sha256:${"b".repeat(64)}`; }],
+      ["the run id", (r) => { r.runId = "ffffffffffffffff"; }],
+      ["the schema version", (r) => { r.schemaVersion = "made-up"; }],
+      ["the harness id", (r) => { r.harness = "somewhere/else.mjs"; }],
+    ];
+    for (const [what, mutate] of edits) {
+      const record = JSON.parse(JSON.stringify(genuineCase()));
+      mutate(record);
+      const verified = verifyRecord(record, KEY, expectations);
+      assert.equal(verified.ok, false, `editing ${what} must invalidate the record`);
+    }
+  });
+
+  it("29d. editing a DIGEST invalidates a success record", () => {
+    const record = sealRecord(
+      buildCaseRecord({
+        caseName: "success",
+        binding: { expectedSha: SHA, runningImageId: IMAGE_ID },
+        payload: { vercelDelivery: { clientDigest: "a".repeat(64) } },
+        runId: RUN.runId,
+      }),
+      KEY,
+    );
+    assert.equal(verifySeal(record, KEY).ok, true);
+    record.payload.vercelDelivery.clientDigest = "b".repeat(64);
+    assert.equal(verifySeal(record, KEY).ok, false);
+  });
+
+  it("29e. a missing or malformed authenticator is rejected", () => {
+    const noAuth = genuineCase();
+    delete noAuth.authenticator;
+    assert.match(verifySeal(noAuth, KEY).reason, /no usable authenticator/);
+
+    const badAlg = genuineCase();
+    badAlg.authenticator.alg = "none";
+    assert.match(verifySeal(badAlg, KEY).reason, /no usable authenticator/);
+
+    const badMac = genuineCase();
+    badMac.authenticator.mac = "short";
+    assert.match(verifySeal(badMac, KEY).reason, /malformed/);
+  });
+
+  it("29f. the wrong key rejects a genuine record", () => {
+    assert.equal(verifySeal(genuineCase(), "b".repeat(64)).ok, false);
+  });
+
+  it("29g. a record from another run is rejected", () => {
+    const record = genuineCase();
+    assert.equal(verifyRecord(record, KEY, { ...expectations, runId: "other-run" }).ok, false);
+    assert.match(
+      verifyRecord(record, KEY, { ...expectations, runId: "other-run" }).reason,
+      /different acceptance run/,
+    );
+  });
+
+  it("29h. a record from another image is rejected", () => {
+    const verified = verifyRecord(genuineCase(), KEY, {
+      ...expectations,
+      runningImageId: `sha256:${"c".repeat(64)}`,
+    });
+    assert.equal(verified.ok, false);
+    assert.match(verified.reason, /different image object/);
+  });
+
+  it("29i. a hand-written record cannot be accepted, however well-shaped", () => {
+    const forged = {
+      harness: HARNESS_ID,
+      schemaVersion: EVIDENCE_SCHEMA_VERSION,
+      runId: RUN.runId,
+      stage: "B",
+      case: "cancellation",
+      expectedSha: SHA,
+      runningImageId: IMAGE_ID,
+      payload: { cancellation: cancellationEvidence({ postSample: [] }) },
+    };
+    assert.equal(verifyRecord(forged, KEY, expectations).ok, false);
+    // Even with an invented authenticator.
+    forged.authenticator = { alg: "HMAC-SHA256", mac: "0".repeat(64) };
+    assert.equal(verifyRecord(forged, KEY, expectations).ok, false);
+  });
+
+  it("27. a Stage A record with runningImageId:null cannot authorize Stage B", async () => {
+    const record = sealRecord(
+      {
+        harness: HARNESS_ID,
+        schemaVersion: EVIDENCE_SCHEMA_VERSION,
+        runId: RUN.runId,
+        stage: "A",
+        verdict: "PASS",
+        expectedSha: SHA,
+        runningImageId: null,
+        taggedImageId: null,
+        binding: { expectedSha: SHA, runningImageId: null, taggedImageId: null },
+      },
+      KEY,
+    );
+    const loaded = await loadStageA("/x", async () => JSON.stringify(record), {
+      run: RUN,
+      expectedSha: SHA,
+    });
+    assert.equal(loaded.ok, false);
+    assert.match(loaded.reason, /valid running image identity|valid running image id/);
+  });
+
+  it("27b. the deployment binding must be complete and self-consistent", () => {
+    const good = { expectedSha: SHA, runningImageId: IMAGE_ID, taggedImageId: IMAGE_ID };
+    assert.equal(validateDeploymentBinding(good, SHA).ok, true);
+
+    const cases = [
+      [null, /no deployment binding/],
+      [{ ...good, expectedSha: "zzz" }, /valid expected source SHA/],
+      [{ ...good, runningImageId: null }, /valid running image id/],
+      [{ ...good, taggedImageId: null }, /valid SHA-tagged image id/],
+      [{ ...good, taggedImageId: `sha256:${"e".repeat(64)}` }, /not the image tagged with/],
+    ];
+    for (const [binding, pattern] of cases) {
+      const result = validateDeploymentBinding(binding, SHA);
+      assert.equal(result.ok, false, JSON.stringify(binding));
+      assert.match(result.reason, pattern);
+    }
+    // A binding for a different source SHA is refused.
+    assert.match(validateDeploymentBinding(good, "0".repeat(40)).reason, /is for source/);
+  });
+
+  it("28. canonicalization is order-independent", () => {
+    assert.equal(canonicalize({ b: 1, a: 2 }), canonicalize({ a: 2, b: 1 }));
+    assert.equal(canonicalize({ a: [1, { d: 4, c: 3 }] }), '{"a":[1,{"c":3,"d":4}]}');
+  });
+
+  it("24. the run key file is created 0600 and never printed", async () => {
+    const files = new Map();
+    const modes = new Map();
+    const deps = {
+      readFile: async (path) => {
+        if (files.has(path)) return files.get(path);
+        throw new Error("no such file");
+      },
+      writeFile: async (path, contents, options) => {
+        files.set(path, contents);
+        if (options?.mode) modes.set(path, options.mode);
+      },
+      mkdir: async () => {},
+      chmod: async (path, mode) => modes.set(path, mode),
+    };
+    const created = await loadOrCreateRun("/tmp/run.json", deps);
+    assert.equal(created.created, true);
+    assert.match(created.runId, /^[0-9a-f]{16}$/);
+    assert.match(created.key, /^[0-9a-f]{64}$/);
+    assert.equal(modes.get("/tmp/run.json"), 0o600, "the key file must be 0600");
+
+    // Loading again returns the SAME run, never a fresh key.
+    const again = await loadRun("/tmp/run.json", deps);
+    assert.equal(again.runId, created.runId);
+    assert.equal(again.key, created.key);
+
+    // A malformed file does not silently mint a usable run for loadRun.
+    files.set("/tmp/run.json", "{}");
+    assert.equal(await loadRun("/tmp/run.json", deps), null);
+  });
+
+  it("24b. the run key never appears in any evidence record", async () => {
+    const files = new Map();
+    const world = makeFakeWorld();
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/a.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+    assert.equal(run.code, 0);
+    const key = JSON.parse(files.get(RUN_KEY_PATH)).key;
+    const record = files.get("/tmp/a.json");
+    assert.doesNotMatch(record, new RegExp(key), "the run key must never reach evidence");
+    assert.doesNotMatch(run.out, new RegExp(key));
+    // The non-secret runId fingerprint IS reported, for correlation.
+    assert.match(run.out, /acceptance run [0-9a-f]{12} created/);
+  });
+});
+
+// ── CORRECTION-02 §38: measurement-failure propagation ─────────────────────
+
+describe("measurement failure propagation", () => {
+  /**
+   * Each entry replaces a measurement with the FAVOURABLE-LOOKING value an
+   * earlier draft produced on failure, and asserts the verdict is BLOCKED
+   * rather than PASS.
+   */
+  it("38. an unavailable measurement is BLOCKED, never a clean result", () => {
+    const cases = [
+      ["R2 read unavailable", { r2Evidence: unmeasured("worker job view unreadable") }, "r2.delegated-write"],
+      ["sentinel surfaces unavailable", { sentinelSweep: unmeasured("journal unreadable") }, "privacy.sentinel-not-leaked"],
+      ["post-cancel sampling unavailable", {
+        cancellation: measured(cancellationEvidence({ postSampleMeasured: false, postSample: [] })),
+      }, "cancel.processes-gone"],
+      ["workDir probe unavailable", {
+        cancellation: measured(cancellationEvidence({ workDirMeasured: false })),
+      }, "cancel.no-upload-no-workdir"],
+      ["direct process sampling unavailable", {
+        directAfterEnable: measured({
+          status: "ready",
+          extractor: "direct",
+          processSamplingMeasured: false,
+          samplesTaken: 0,
+          sampledBasenames: [],
+        }),
+      }, "direct.process-sampling-available"],
+      ["download window unavailable", { downloadingWindow: unmeasured("sampler failed") }, "process.window-observed"],
+      ["durable read unavailable", { durableJobRow: unmeasured("sqlite unreadable") }, "durable.extractor-is-ytdlp"],
+    ];
+    for (const [label, override, expectedId] of cases) {
+      const result = evaluateStageB(passingStageBObservations(override), passingStageA());
+      assert.equal(result.summary.verdict, OUTCOMES.BLOCKED, label);
+      assert.ok(result.summary.blocking.includes(expectedId), `${label} must block ${expectedId}`);
+    }
+  });
+
+  it("38b. an EMPTY basename list cannot read as 'no yt-dlp'", () => {
+    // The exact fallback an earlier draft produced: `sampledBasenames: []` from
+    // a failed sampler, which PASSED the no-yt-dlp check.
+    const result = evaluateStageB(
+      passingStageBObservations({
+        directAfterEnable: measured({
+          status: "ready",
+          extractor: "direct",
+          processSamplingMeasured: false,
+          samplesTaken: 0,
+          sampledBasenames: [],
+        }),
+      }),
+      passingStageA(),
+    );
+    assert.equal(result.summary.verdict, OUTCOMES.BLOCKED);
+    const noYtdlp = result.checks.find((c) => c.id === "direct.no-ytdlp-spawned");
+    assert.notEqual(noYtdlp.outcome, OUTCOMES.PASS, "an unmeasured sample must not pass");
+  });
+
+  it("38c. an EMPTY post-cancel sample cannot read as 'processes gone'", () => {
+    const result = evaluateStageB(
+      passingStageBObservations({
+        cancellation: measured(cancellationEvidence({ postSampleMeasured: false, postSample: [], workerPid: 0 })),
+      }),
+      passingStageA(),
+    );
+    const gone = result.checks.find((c) => c.id === "cancel.processes-gone");
+    assert.equal(gone.outcome, OUTCOMES.BLOCKED);
+  });
+
+  it("38d. a measured NEGATIVE is still FAIL, not BLOCKED", () => {
+    // The distinction the tri-state exists for: measurement failure vs a
+    // measured cleanup failure are different findings.
+    const result = evaluateStageB(
+      passingStageBObservations({
+        cancellation: measured(cancellationEvidence({ workDirMeasured: true, workDirPresent: true })),
+      }),
+      passingStageA(),
+    );
+    assert.equal(result.summary.verdict, OUTCOMES.FAIL);
+    const entry = result.checks.find((c) => c.id === "cancel.no-upload-no-workdir");
+    assert.equal(entry.outcome, OUTCOMES.FAIL);
+  });
+});
+
+// ── CORRECTION-02 §40: claim truthfulness ──────────────────────────────────
+
+describe("claim truthfulness", () => {
+  function allStageBChecks() {
+    return [
+      ...evaluateStageB(passingStageBObservations(), passingStageA()).checks,
+      ...evaluateStageA(passingStageAObservations()).checks,
+    ];
+  }
+
+  it("40. no check claims a direct fall-through was observed", () => {
+    for (const entry of allStageBChecks()) {
+      assert.doesNotMatch(
+        `${entry.id} ${entry.detail}`,
+        /fell through|fall.?through|direct was attempted/i,
+        `${entry.id} must not claim an unobservable internal fall-through`,
+      );
+    }
+    // The replacement names say exactly what was measured.
+    const ids = allStageBChecks().map((c) => c.id);
+    assert.ok(ids.includes("analysis.generic-selected"));
+    assert.ok(ids.includes("analysis.direct-still-selected"));
+    assert.ok(!ids.includes("analysis.routed-to-generic"));
+  });
+
+  it("40b. no check claims the private selector was observed", () => {
+    for (const entry of allStageBChecks()) {
+      assert.doesNotMatch(
+        `${entry.id} ${entry.detail}`,
+        /selector constraints satisfied/i,
+        `${entry.id} must not present a container comparison as selector proof`,
+      );
+    }
+    const ids = allStageBChecks().map((c) => c.id);
+    assert.ok(ids.includes("delivery.matches-advertised-preset"));
+    assert.ok(!ids.includes("selector.constraints-satisfied"));
+  });
+
+  it("40c. the byte claim names the boundaries it actually measured", () => {
+    const entry = allStageBChecks().find((c) => c.id === "vercel.byte-integrity");
+    assert.ok(entry);
+    assert.match(entry.detail, /durable fileSize/);
+    assert.match(entry.detail, /provider contentLength/);
+    // It must NOT claim an independent Worker-side digest comparison.
+    assert.doesNotMatch(entry.detail, /Worker-produced/i);
+    assert.doesNotMatch(entry.detail, /independent/i);
   });
 });
 

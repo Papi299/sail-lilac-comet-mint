@@ -76,6 +76,8 @@ No media URL, no hostname, no socket. Both exit non-zero on any deviation.
 | `lib/process-tree.mjs` | — | Closed sample schema, owned-PID identity, containment, namespace rules. |
 | `lib/redact.mjs` | — | The single redaction implementation and the console safety boundary. |
 | `lib/evidence.mjs` | — | The sanitized machine-readable record, and the sentinel. |
+| `lib/download-window.mjs` | — | The durable-`downloading` sampling window and its complete aggregate. |
+| `lib/provenance.mjs` | — | Tamper-evident artifacts: run identity, HMAC seal, deployment binding. |
 | `lib/coverage.mjs` | — | Which concrete producer obtains each check. Walked by the test suite. |
 | `lib/observers.mjs` | the VM host | Read-only system observers. Hard command allowlist. |
 | `lib/control-plane.mjs` | the VM host | The authenticated product-surface driver (login, analyze, job, signed GET). |
@@ -161,7 +163,9 @@ There is no unreviewed layer between Production and the acceptance logic.
 | `--stage B --case cancellation` | Cancel-during-`downloading`, survivors, cleanup. |
 | `--stage B --case direct-regression` | Post-enable direct job with no yt-dlp process. |
 | `--stage B --case kill-switch` | Generic unusable after rollback; direct still works. |
-| `--stage B --case byte-limit` \| `shutdown` \| `safe-egress` \| `fail-closed-runtime` | Operator-transition cases; see below. |
+| `--stage B --case byte-limit` | Unknown-declared-length over-limit source aborts as `TOO_LARGE`. |
+| `--stage B --case shutdown` | Worker stop during acquisition — the harness coordinates, the operator acts. |
+| `--stage B --case safe-egress` | Forbidden later destination denied, attributed to the boundary. |
 | `--stage B --aggregate` | Validates every case record and produces the Stage B verdict. |
 
 Each case writes its own record; the aggregation turns records into a verdict.
@@ -170,6 +174,48 @@ mid-acquisition and rolling the switch back are separate operator transitions
 that cannot share one process.
 
 ### Case records cannot be forged
+
+Every Stage A record and every Stage B case record is **sealed** with an
+HMAC-SHA256 over a canonical encoding of:
+
+```
+harness · schemaVersion · runId · stage · case · expectedSha
+· runningImageId · taggedImageId · verdict · payload
+```
+
+Editing any of them — a boolean, a digest, a PID, a transition, the case name,
+the binding — invalidates the seal, and an unverifiable record is **rejected
+outright rather than partially consumed**. Authenticity is checked *before* any
+field is read, because comparing binding fields out of an unverified record
+would be trusting the thing under test.
+
+Then, on top of that, the aggregator still requires the case name to be known,
+the payload to pass a **strict** validator with no unknown keys, and the pure
+evaluator to re-judge every field. A hand-written `{"passed": true}` cannot
+produce a PASS at any layer.
+
+#### The acceptance run key
+
+Stage A **begins** a run; Stage B cases and the aggregation **join** it.
+
+- random `runId` + 256-bit key, in `./.vf-acceptance-run.json` (`--run-key` to
+  relocate), written `0600`;
+- **never** an application credential — not `WORKER_CONTROL_SECRET`, not
+  `VIDEOFETCH_ACCESS_SECRET`, not an R2/Cloudflare/Vercel credential. Reusing one
+  would give the harness a reason to hold production secrets it does not need,
+  and would make a leak of its own state file a production incident;
+- never printed, never committed (it is in `.gitignore`), never in any evidence
+  record — only the non-secret `runId` travels with the artifacts;
+- **deleted by the operator when acceptance is complete.**
+
+Stage B refuses to mint a key: doing so would make every prior artifact
+unverifiable and would let a re-keyed run re-seal edited records.
+
+It is not a defence against an operator forging their own acceptance — nothing
+local can be. It is a defence against an artifact being **edited**, **mixed
+between runs**, or **carried over from a different image** without anyone
+noticing.
+
 
 `--stage B --aggregate` admits a case record only if:
 
@@ -407,6 +453,41 @@ Observation is what was strengthened to meet this, not the evaluator:
 If a complete trace still cannot be obtained, Phase 10D is `BLOCKED`. Do not add
 production instrumentation to close the gap.
 
+### The downloading window
+
+`no FFmpeg during downloading` is a **temporal** claim, so the evidence must be
+both *scoped to* `downloading` and *complete across* it.
+
+```
+before downloading   samples NOT admitted
+first downloading    window OPENS
+while downloading    sample repeatedly; every sample is retained
+first state after    window CLOSES, permanently
+processing/uploading samples NOT admitted
+```
+
+Worker FFmpeg is **legitimate** during `processing` — `preset:mp3`, and
+`preset:audio` from a muxed source, are Worker-side operations performed strictly
+after `beginProcessing()` commits. Feeding those samples into an acquisition
+check would fail a correct deployment.
+
+**Every sample contributes to the verdict.** A single appearance anywhere in the
+window fails, so a transient `ffmpeg` visible in one 250 ms sample and gone by
+the next cannot be missed. Likewise a transient unknown executable, a transient
+namespace mismatch, and a Node solver that appears in only one sample — which is
+**EXERCISED**, and whose containment is judged, rather than being reported as
+never having run.
+
+Sampling is asynchronous, so admission depends on when a sample was **taken**,
+not when it landed: a capture that begins inside the window and completes after
+the job moved on is still evidence about the window.
+
+If no sample was taken while the job was observed in `downloading`:
+
+```
+BLOCKED
+```
+
 ### Proving the exact yt-dlp process
 
 `process.ytdlp-identified` requires a specific PID, not "a Python process
@@ -552,6 +633,52 @@ the watchdog, or bind an internal fixture and call it a public-destination test.
 
 ---
 
+## Measurement failure is not a finding
+
+Every producer distinguishes three states. None of them invents a favourable
+value on failure, because "we could not look" and "we looked and it was clean"
+are different findings and only one is evidence.
+
+| Surface | Unavailable | Measured negative | Measured positive |
+| :--- | :--- | :--- | :--- |
+| R2 object evidence (Worker job view) | `BLOCKED` | `FAIL` | `PASS` |
+| Per-job workDir probe | `BLOCKED` | `FAIL` (present) | `PASS` (absent) |
+| Post-cancellation process sample | `BLOCKED` | `FAIL` (survivors) | `PASS` |
+| Direct-regression process sampling | `BLOCKED` | `FAIL` (yt-dlp seen) | `PASS` |
+| Downloading window | `BLOCKED` | `FAIL` | `PASS` |
+| Any sentinel surface | `BLOCKED` | `FAIL` (leaked) | `PASS` |
+| Durable job row | `BLOCKED` | `FAIL` | `PASS` |
+
+An earlier draft returned `objectExists: true` when the Worker job view could not
+be read (because the job was `ready`), `sampledBasenames: []` when the sampler
+failed, `postSample: []` after a failed post-cancel sample, and `""` for an
+unreadable log. Each of those turned an inability to measure into a clean result.
+
+## What the live checks actually claim
+
+The harness states only what it observed, and leaves source-reviewed invariants
+where they belong.
+
+| Claim | Where it is proven |
+| :--- | :--- |
+| The router is direct-first | **Source review** of the canonical router |
+| The generic source selected `yt-dlp` | **Live** — `analysis.generic-selected` |
+| A direct control source still selected `direct` | **Live** — `analysis.direct-still-selected` |
+| Those observations came from the reviewed code | The exact-image binding |
+| The selector's internal constraints | **Offline** — `verify-selector.py`, against the pinned parser |
+| The delivered artifact matches the accepted preset | **Live** — `delivery.matches-advertised-preset` |
+| Delivered length == durable `fileSize` == provider `contentLength` | **Live** — `vercel.byte-integrity` |
+| The delivered bytes' SHA-256 | **Live**, recorded |
+| An *independent* digest of the Worker-produced object | **Only for the direct fixture**, whose digest the harness derives itself |
+
+The internal direct→generic fall-through for the generic URL is **not**
+observable at the application boundary, and adding a surface to observe it would
+be the debug endpoint this design forbids. So no check says it was observed.
+
+Likewise, a container comparison is not proof of the private selector, and a
+digest of the client's bytes is not an independent measurement at the Worker
+boundary. The check names say which is which.
+
 ## Privacy controls
 
 ### Redaction
@@ -579,15 +706,28 @@ because the evidence record is redacted at more than one level.
 The `success` case — in the real CLI code path, not only in the specification —
 mints `VF_ACCEPT_SECRET_<random>` (a random marker, **never a real credential**),
 places it in a benign query parameter of the submitted URL, and submits it
-through the application surface. It must then appear in **none** of:
+through the application surface. It must then appear in **none** of these six
+surfaces, each with a real observer:
 
-- the Worker journal;
-- cloudflared-relevant application output;
-- any durable error;
-- job metadata;
-- the browser/API error body;
-- object metadata;
-- the acceptance JSON.
+| Surface | Observer |
+| :--- | :--- |
+| `worker-journal` | `journalctl -u videofetch-worker` |
+| `container-output` | `docker logs videofetch-worker` |
+| `cloudflared-journal` | `journalctl -u vf-cloudflared` (`--cloudflared-unit` to rename) |
+| `durable-row` | the projected durable job row |
+| `job-metadata` | the API's own job document |
+| `api-error` | a **genuine 404 error body**, obtained by requesting a job id that cannot exist |
+| `object-metadata` | the authenticated Worker job view |
+
+**A surface that cannot be read makes the sweep unmeasured**, which lands
+`privacy.sentinel-not-leaked` as `BLOCKED`. An earlier draft substituted `""`
+for an unreadable surface, turning "could not read the logs" into "the sentinel
+is absent from the logs". `api-error` is also a real error body now, not a
+successful status response relabelled as one.
+
+The final record is checked **before** it is written: if the scrubber had to act,
+the run is `BLOCKED`. The scrubber is a disclosure backstop, never evidence that
+upstream handling was clean.
 
 **The harness never prints the sentinel**, and never writes it to the record —
 only the sweep's verdict and the surface names.

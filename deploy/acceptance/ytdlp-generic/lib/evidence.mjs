@@ -119,6 +119,8 @@ export function buildEvidence(input) {
     task,
     stage,
     mode,
+    schemaVersion,
+    runId,
     startedAt,
     finishedAt,
     expectedSha,
@@ -144,6 +146,14 @@ export function buildEvidence(input) {
   const record = {
     task: task ?? "PHASE-10D-YTDLP-PRODUCTION-STAGED-DEPLOYMENT-AND-LIVE-ACCEPTANCE-001",
     harness: "deploy/acceptance/ytdlp-generic/acceptance.mjs",
+    schemaVersion: schemaVersion ?? null,
+    // The non-secret run identifier. The run KEY never appears here.
+    runId: runId ?? null,
+    // Hoisted alongside `source` because the authenticator covers them at the
+    // top level; `binding` keeps the human-readable grouping.
+    expectedSha: expectedSha ?? null,
+    runningImageId: binding?.runningImageId ?? runningImageId ?? null,
+    taggedImageId: binding?.taggedImageId ?? null,
     stage: stage ?? null,
     mode: mode ?? "dry-run",
     startedAt: startedAt ?? null,

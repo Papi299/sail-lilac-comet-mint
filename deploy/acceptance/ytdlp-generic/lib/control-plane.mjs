@@ -86,6 +86,17 @@ export function makeControlPlaneSession(deps = {}) {
       return true;
     },
 
+    /**
+     * A raw authenticated GET, for surfaces that must be observed as they are.
+     *
+     * Used by the sentinel sweep to obtain a genuine browser-facing ERROR body
+     * (§19 of CORRECTION-02) rather than relabelling a successful response as an
+     * error surface. Returns the Response untouched.
+     */
+    async rawGet(path) {
+      return call(path);
+    },
+
     async sites() {
       const response = await call("/api/sites");
       if (!response.ok) throw new Error(`/api/sites returned HTTP ${response.status}`);

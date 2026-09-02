@@ -1622,6 +1622,98 @@ real CLI code path rather than only specified, and console output crosses the
 central redaction/scrub boundary structurally instead of relying on each call
 site.
 
+#### CORRECTION-02 — five acceptance-integrity gaps closed
+
+**1. Four advertised Stage-B cases had no producer.** `byte-limit`, `shutdown`,
+`safe-egress` and `fail-closed-runtime` were listed as case names and counted as
+concrete producers, while the CLI dispatch implemented only four of the eight. A
+description string is not an implementation.
+
+`byte-limit`, `shutdown` and `safe-egress` are now real producers.
+`fail-closed-runtime` is declared **non-live** — it cannot be run as a case
+command, is refused at parse time with what it actually is, and its check is
+optional in the evaluator so it can never satisfy a required assertion. One
+registry (`CASE_PRODUCERS`) is now the single source of truth for the CLI, the
+coverage map and the tests, so a name cannot be advertised without a callable
+`run`.
+
+The `byte-limit` producer **measures** the unknown-declared-length property
+itself rather than accepting an operator boolean: a fixture that declares a
+usable `Content-Length` would be caught by `--max-filesize`, and a pass from it
+would be evidence for the wrong gate. The `shutdown` producer proves the job is
+genuinely acquiring, prints a sanitized prompt, and waits for the operator's
+separately authorized stop/restart — `systemctl stop` is not on the read-only
+allowlist and is never called. The `safe-egress` producer is an adapter over the
+accepted Phase-9 instrument, not a second firewall framework.
+
+**2. Process evidence was not scoped to `downloading`, and lost observations.**
+Sampling ran from job creation until the job settled, so `processing` samples fed
+a check named "no FFmpeg during downloading" — and Worker FFmpeg is *legitimate*
+during `processing` (`preset:mp3`, and `preset:audio` from a muxed source). A
+correct deployment would have failed it. The sampler also kept one "best" sample
+and discarded the rest, so a transient `ffmpeg` visible in one 250 ms sample was
+simply not in the retained evidence.
+
+The window now opens on the first observed `downloading` and closes permanently
+on the first state after it, and **every** sample in it contributes: one
+appearance of a forbidden or unknown executable, or one namespace mismatch,
+fails; a Node solver appearing in one sample is EXERCISED and judged rather than
+reported as never having run. Admission depends on when a sample was *taken*, not
+when it landed — sampling is asynchronous, and judging by landing time discarded
+every sample of a fast job.
+
+**3. Unavailable measurements were converted into clean-looking values.** The R2
+producer returned `objectExists: true` when the authenticated Worker job view
+could not be read, on the grounds that the job was `ready`. The workDir probe
+collapsed "could not measure" into "present". The post-cancellation sampler
+returned `postSample: []`, and the direct-regression sampler
+`sampledBasenames: []` — both of which *passed* their checks. The sentinel sweep
+substituted `""` for an unreadable surface, turning "could not read the logs"
+into "the sentinel is absent from the logs".
+
+Each is now a measurement with three distinct outcomes: unavailable is BLOCKED,
+measured-negative is FAIL, measured-positive is PASS. The sweep additionally
+covers six surfaces each with a real observer — including a cloudflared journal
+reader and a **genuine 404 error body** rather than a successful status response
+relabelled as an error surface — and the final record is checked before writing:
+if the scrubber had to act, the run is BLOCKED, because the scrubber is a
+disclosure backstop and not evidence of clean handling.
+
+**4. Local evidence artifacts were not tamper-evident, and the Stage-A image
+binding could be null.** Strict schema validation is not provenance: a
+hand-written record with the right field names was accepted, which violated the
+rule that no arbitrary operator JSON assertion may create a PASS.
+
+Every Stage A and case record is now sealed with an HMAC-SHA256 over a canonical
+encoding of harness, schema version, run id, stage, case, expected SHA, image
+ids, verdict and payload. Authenticity is verified **before** any field is read.
+The key is a per-run, acceptance-only random value in a `0600` local file,
+gitignored, never printed and never recorded — deliberately **not** any
+application credential, so a leak of the harness's own state is not a production
+incident. Stage A begins a run; Stage B joins it and refuses to mint one.
+`loadStageA` now requires a complete, self-consistent binding: valid
+`expectedSha`, `runningImageId` and `taggedImageId` matching each other and the
+current deployment. A `runningImageId: null` record can no longer authorize
+anything.
+
+**5. Two live checks overstated what they observed.**
+`analysis.routed-to-generic` claimed direct was observed falling through for the
+generic URL. It was not — nothing at the application boundary can observe that,
+and adding a surface that could would be the debug endpoint this design forbids.
+It is now two honest checks: `analysis.generic-selected` and
+`analysis.direct-still-selected`, with the direct-first router remaining a
+**source-reviewed invariant** tied to the observations by the exact-image
+binding.
+
+`selector.constraints-satisfied` presented a container comparison as proof of the
+private selector's internal constraints. Those are proven **offline** by
+`verify-selector.py` against the pinned parser; the live check is renamed
+`delivery.matches-advertised-preset` and claims only that. `vercel.byte-digest`
+became `vercel.byte-integrity` and now states exactly which boundaries it
+measured — durable `fileSize`, provider `contentLength`, delivered bytes and
+their SHA-256 — without implying an independent digest of the Worker-produced
+object, which only the direct fixture case genuinely has.
+
 #### What Phase 10D is authorized to do
 
 Nothing yet. Only after this harness has been **independently reviewed and

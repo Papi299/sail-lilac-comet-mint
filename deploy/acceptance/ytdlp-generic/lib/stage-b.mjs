@@ -8,14 +8,13 @@
 
 import { OUTCOMES, assertCheck, check, measuredCheck, summarize } from "./verdict.mjs";
 import { classifyTransitionTrace, classifyCancellationTrace } from "./lifecycle.mjs";
+import { evaluateTerminationCleanliness, validateSampleShape } from "./process-tree.mjs";
 import {
-  classifyAcquisitionTree,
-  evaluateNamespaceIdentity,
-  evaluateNodeContainment,
-  evaluateTerminationCleanliness,
-  evaluateYtdlpIdentity,
-  validateSampleShape,
-} from "./process-tree.mjs";
+  aggregateDownloadWindow,
+  nodeContained,
+  nodeExercised,
+  ytdlpIdentified,
+} from "./download-window.mjs";
 
 export { REQUIRED_TRANSITIONS } from "./lifecycle.mjs";
 
@@ -131,12 +130,30 @@ export function evaluateStageB(obs, stageAResult) {
   );
 
   // ── §25 generic HTTP analysis ──────────────────────────────────────────
+  // ── §31 of CORRECTION-02: say only what was observed ────────────────────
+  //
+  // The internal direct attempt for the generic URL is NOT observable at the
+  // application boundary, and adding a surface to observe it would be the debug
+  // endpoint this design forbids. Two live facts ARE observable, and combined
+  // with the exact-image binding they show the reviewed direct-first router is
+  // the code that produced them — but that is a conclusion drawn from a
+  // source-reviewed invariant, not a live observation of a fall-through, and
+  // the check name no longer claims otherwise.
   add(
     measuredCheck(
-      "analysis.routed-to-generic",
+      "analysis.generic-selected",
       obs.genericAnalysis,
-      (value) => value?.extractor === "yt-dlp" && value?.directAttempted === true,
-      "direct was attempted first and fell through to generic",
+      (value) => value?.extractor === "yt-dlp",
+      "the generic source selected extractor=yt-dlp",
+      { stage },
+    ),
+  );
+  add(
+    measuredCheck(
+      "analysis.direct-still-selected",
+      obs.genericAnalysis,
+      (value) => value?.directControlExtractor === "direct",
+      "a direct control source in the same deployment still selected extractor=direct",
       { stage },
     ),
   );
@@ -240,13 +257,20 @@ export function evaluateStageB(obs, stageAResult) {
       { stage },
     ),
   );
-  // §28: the raw upstream id is never reported. Structural statement only.
+  // ── §32 of CORRECTION-02: the selector's INTERNAL constraints are proven
+  // offline, against the pinned parser, by verify-selector.py. Nothing at the
+  // application boundary observes them, and exposing the raw upstream id to
+  // test them would breach the private boundary this design exists to keep.
+  //
+  // What IS measurable live is that the artifact delivered matches the
+  // application preset that was accepted — renamed so the label describes only
+  // that.
   add(
     measuredCheck(
-      "selector.constraints-satisfied",
+      "delivery.matches-advertised-preset",
       obs.selectorConstraints,
-      (value) => value?.satisfied === true,
-      "safe selector constraints satisfied (structural; no raw upstream id reported)",
+      (value) => value?.containerMatches === true,
+      "the delivered container matches the container advertised for the accepted preset",
       { stage },
     ),
   );
@@ -324,7 +348,13 @@ export function evaluateStageB(obs, stageAResult) {
         // fixture case); for a public generic source none can exist without
         // re-acquiring the media, which the harness must not do.
         (value.expectedDigest == null || value.expectedDigest === value.clientDigest),
-      "delivered bytes agree with durable and provider length, and hash to a recorded digest",
+      // §33: state exactly which boundaries were measured. The client digest is
+      // a digest of the bytes the client received; it is NOT an independent
+      // measurement of the Worker-produced object, because deriving one would
+      // mean re-acquiring the media outside the application path. The direct
+      // fixture case is where a genuinely independent digest exists, and there
+      // `expectedDigest` is populated and compared.
+      "delivered byte length agrees with the durable fileSize and the provider contentLength, and the delivered bytes hash to a recorded SHA-256",
       { stage },
     ),
   );
@@ -365,26 +395,68 @@ export function evaluateStageB(obs, stageAResult) {
         { stage },
       ),
     );
-    add(
-      assertCheck(
-        "cancel.processes-gone",
-        cancellation?.postSample != null &&
-          evaluateTerminationCleanliness(cancellation.postSample, cancellation.workerPid).clean ===
-            true,
-        "no yt-dlp or Node descendant survives cancellation",
-        { stage },
-      ),
-    );
-    add(
-      assertCheck(
-        "cancel.no-upload-no-workdir",
-        cancellation?.beganProcessing === false &&
-          cancellation?.uploaded === false &&
-          cancellation?.workDirPresent === false,
-        "cancellation performed no processing, no upload, and left no working directory",
-        { stage },
-      ),
-    );
+    // §14 of CORRECTION-02: three distinct states. An unmeasurable post-sample
+    // must not look process-clean, which the previous `postSample: []` /
+    // `workerPid: 0` fallback made it do.
+    if (cancellation?.postSampleMeasured !== true) {
+      add(
+        check(
+          "cancel.processes-gone",
+          OUTCOMES.BLOCKED,
+          `the post-cancellation process tree could not be sampled${
+            cancellation?.postSampleReason ? `: ${cancellation.postSampleReason}` : ""
+          }`,
+          { stage },
+        ),
+      );
+    } else {
+      const shape = validateSampleShape(cancellation.postSample);
+      const cleanliness = shape.ok
+        ? evaluateTerminationCleanliness(cancellation.postSample, cancellation.workerPid)
+        : null;
+      add(
+        shape.ok
+          ? assertCheck(
+              "cancel.processes-gone",
+              cleanliness.clean === true,
+              cleanliness.clean === true
+                ? "no yt-dlp or Node descendant survived cancellation"
+                : `survivors observed: ${cleanliness.survivors.map((r) => r.comm).join(", ")}`,
+              { stage },
+            )
+          : check(
+              "cancel.processes-gone",
+              OUTCOMES.BLOCKED,
+              `the post-cancellation sample violates the closed schema: ${shape.violations[0]}`,
+              { stage },
+            ),
+      );
+    }
+
+    // §17 of CORRECTION-02: `workDirPresent` is now a tri-state. A probe that
+    // could not read the container is BLOCKED — a measurement failure and a
+    // measured cleanup failure are different findings.
+    if (cancellation?.workDirMeasured !== true) {
+      add(
+        check(
+          "cancel.no-upload-no-workdir",
+          OUTCOMES.BLOCKED,
+          "the per-job working directory could not be probed after cancellation",
+          { stage },
+        ),
+      );
+    } else {
+      add(
+        assertCheck(
+          "cancel.no-upload-no-workdir",
+          cancellation?.beganProcessing === false &&
+            cancellation?.uploaded === false &&
+            cancellation?.workDirPresent === false,
+          "cancellation performed no processing, no upload, and left no working directory",
+          { stage },
+        ),
+      );
+    }
   }
 
   // ── §38 actual-byte limit ──────────────────────────────────────────────
@@ -427,17 +499,51 @@ export function evaluateStageB(obs, stageAResult) {
       { stage },
     ),
   );
-  add(
-    measuredCheck(
-      "direct.no-ytdlp-spawned",
-      obs.directAfterEnable,
-      (value) =>
-        Array.isArray(value?.sampledBasenames) &&
-        !value.sampledBasenames.some((name) => name.startsWith("python") || name === "yt-dlp"),
-      "no yt-dlp process appeared while the direct job ran",
-      { stage },
-    ),
-  );
+  // §13 of CORRECTION-02: an empty basename list is not evidence of absence.
+  // `sampledBasenames: []` from a failed sampler previously PASSED this check —
+  // the exact SKIPPED->PASS edge the harness forbids elsewhere. Sampling that
+  // never ran is BLOCKED, not a clean result.
+  const directSampling = obs.directAfterEnable;
+  const samplingRan =
+    directSampling?.measured === true &&
+    directSampling.value?.processSamplingMeasured === true &&
+    directSampling.value?.samplesTaken > 0;
+
+  if (!samplingRan) {
+    const why =
+      directSampling?.measured !== true
+        ? (directSampling?.reason ?? "the direct regression was not performed")
+        : (directSampling.value?.samplingFailure ?? "no process sample was taken during the direct job");
+    add(check("direct.process-sampling-available", OUTCOMES.BLOCKED, why, { stage }));
+    add(
+      check(
+        "direct.no-ytdlp-spawned",
+        OUTCOMES.BLOCKED,
+        "no process observation exists, so the absence of yt-dlp is unproven",
+        { stage },
+      ),
+    );
+  } else {
+    add(
+      assertCheck(
+        "direct.process-sampling-available",
+        true,
+        `${directSampling.value.samplesTaken} process sample(s) were taken during the direct job`,
+        { stage },
+      ),
+    );
+    add(
+      assertCheck(
+        "direct.no-ytdlp-spawned",
+        Array.isArray(directSampling.value.sampledBasenames) &&
+          !directSampling.value.sampledBasenames.some(
+            (name) => name.startsWith("python") || name === "yt-dlp",
+          ),
+        "no yt-dlp process appeared in any sample taken while the direct job ran",
+        { stage },
+      ),
+    );
+  }
 
   // ── §42 fail-closed runtime (optional; must not damage the live image) ──
   add(
@@ -533,19 +639,23 @@ export function stageBAuthorization(obs, stageAResult) {
 }
 
 /**
- * The process-tree checks, which share one sample and one shape validation.
+ * The process checks, over the COMPLETE measured `downloading` window.
+ *
+ * `obs.downloadingWindow` carries every sample taken while durable state was
+ * observed to be `downloading` — and only those. Samples from `processing` are
+ * excluded by the collector, because Worker FFmpeg is legitimate there and
+ * feeding them here would fail a correct deployment.
  */
 function evaluateProcessEvidence(obs, stage) {
   const out = [];
-  const observation = obs.downloadingSample;
+  const observation = obs.downloadingWindow;
 
   if (observation?.measured !== true) {
-    // §49: inability to inspect descendants is BLOCKED, never PASS.
     out.push(
       check(
-        "process.sample-available",
+        "process.window-observed",
         OUTCOMES.BLOCKED,
-        `the process tree could not be sampled during downloading${
+        `no process evidence was captured for the downloading window${
           observation?.reason ? `: ${observation.reason}` : ""
         }`,
         { stage },
@@ -554,77 +664,107 @@ function evaluateProcessEvidence(obs, stage) {
     return out;
   }
 
-  const { sample, workerPid, ytdlpPid, expectedNetns } = observation.value;
+  const window = observation.value;
+  if (window?.observedDownloading !== true) {
+    // The job never reached an observed `downloading`, so there is no window to
+    // make a statement about. That is an evidence gap, not a clean result.
+    out.push(
+      check(
+        "process.window-observed",
+        OUTCOMES.BLOCKED,
+        "the job was never observed in durable `downloading`; no acquisition window exists",
+        { stage },
+      ),
+    );
+    return out;
+  }
 
-  const shape = validateSampleShape(sample);
+  const aggregate = aggregateDownloadWindow(window);
+
+  // A schema violation is a DEFINITE finding — a sampler emitted a field the
+  // evidence contract forbids — so it fails rather than reporting an inability
+  // to look, and it is reported even when no sample survived.
   out.push(
     assertCheck(
       "process.sample-shape",
-      shape.ok,
-      shape.ok
-        ? "the process sample matches the closed schema (pid, ppid, pgid, comm, netns)"
-        : shape.violations.slice(0, 4).join("; "),
+      aggregate.shapeViolations.length === 0,
+      aggregate.shapeViolations.length === 0
+        ? "every sample matches the closed schema (pid, ppid, pgid, comm, netns)"
+        : aggregate.shapeViolations.slice(0, 3).join("; "),
       { stage },
     ),
   );
-  if (!shape.ok) return out;
 
-  const classified = classifyAcquisitionTree(sample, workerPid);
-
-  // ── §22 of CORRECTION-01: the EXACT owned yt-dlp process ───────────────
-  const identity = evaluateYtdlpIdentity(sample, workerPid, ytdlpPid, expectedNetns);
-  out.push(
-    identity.identified
-      ? assertCheck(
-          "process.ytdlp-identified",
-          true,
-          `the owned yt-dlp process (pid ${identity.pid}, ${identity.comm}, own process-group leader) was positively identified`,
-          { stage },
-        )
-      : check("process.ytdlp-identified", OUTCOMES.BLOCKED, identity.reason, { stage }),
-  );
+  if (!aggregate.usable) {
+    out.push(check("process.window-observed", OUTCOMES.BLOCKED, aggregate.reason, { stage }));
+    return out;
+  }
 
   out.push(
     assertCheck(
+      "process.window-observed",
+      true,
+      `${aggregate.usableSamples} process sample(s) captured across the observed downloading window`,
+      { stage },
+    ),
+  );
+
+  // The owned yt-dlp process must have been positively identified in at least
+  // one sample. It legitimately exits before the window closes, so "once" is
+  // the right threshold — but a window that never identified it cannot support
+  // any statement about "the owned process".
+  out.push(
+    ytdlpIdentified(aggregate)
+      ? assertCheck(
+          "process.ytdlp-identified",
+          true,
+          `the owned yt-dlp process was positively identified in ${aggregate.ytdlpIdentities.length} sample(s)`,
+          { stage },
+        )
+      : check(
+          "process.ytdlp-identified",
+          OUTCOMES.BLOCKED,
+          "no sample in the downloading window positively identified the owned yt-dlp process",
+          { stage },
+        ),
+  );
+
+  // A SINGLE appearance anywhere in the window fails. This is the transient
+  // case the previous "keep the largest sample" approach could miss entirely.
+  out.push(
+    assertCheck(
       "process.no-ffmpeg-during-downloading",
-      classified.forbidden.length === 0,
-      classified.forbidden.length === 0
-        ? "no forbidden executable ran under the Worker during downloading"
-        : `forbidden descendants observed: ${classified.forbidden.map((r) => r.comm).join(", ")}`,
+      aggregate.forbiddenSeen.length === 0,
+      aggregate.forbiddenSeen.length === 0
+        ? `no forbidden executable appeared in any of ${aggregate.usableSamples} downloading sample(s)`
+        : `forbidden executables observed: ${[...new Set(aggregate.forbiddenSeen.map((r) => r.comm))].join(", ")}`,
       { stage },
     ),
   );
   out.push(
     assertCheck(
       "process.no-unknown-descendants",
-      classified.unknown.length === 0,
-      classified.unknown.length === 0
-        ? "every descendant is on the approved acquisition list"
-        : `unclassified descendants observed: ${classified.unknown.map((r) => r.comm).join(", ")}`,
+      aggregate.unknownSeen.length === 0,
+      aggregate.unknownSeen.length === 0
+        ? "every descendant observed was on the approved acquisition list"
+        : `unclassified executables observed: ${[...new Set(aggregate.unknownSeen.map((r) => r.comm))].join(", ")}`,
+      { stage },
+    ),
+  );
+  out.push(
+    assertCheck(
+      "process.namespace-identity",
+      aggregate.namespaceViolations.length === 0,
+      aggregate.namespaceViolations.length === 0
+        ? "every sampled process shared the Worker's media network namespace"
+        : `namespace mismatch for pids ${aggregate.namespaceViolations.map((o) => o.pid).join(", ")}`,
       { stage },
     ),
   );
 
-  // §32 namespace identity.
-  const namespaces = evaluateNamespaceIdentity(classified, expectedNetns);
-  out.push(
-    namespaces.measured
-      ? assertCheck(
-          "process.namespace-identity",
-          namespaces.consistent,
-          namespaces.consistent
-            ? "every sampled process shares the Worker's media network namespace"
-            : `namespace mismatch for pids ${namespaces.offenders.map((o) => o.pid).join(", ")}`,
-          { stage },
-        )
-      : check("process.namespace-identity", OUTCOMES.BLOCKED, namespaces.reason, { stage }),
-  );
-
-  // §23/§31 Node/EJS containment, ANCHORED to the verified owned PID.
-  const node = evaluateNodeContainment(classified, identity, expectedNetns);
-  if (!node.anchored) {
-    out.push(check("process.node-ejs-containment", OUTCOMES.BLOCKED, node.reason, { stage }));
-  } else if (!node.exercised) {
+  // Node appearing in ANY sample makes the case exercised — the previous
+  // single-sample approach could report NOT_EXERCISED for a solver that ran.
+  if (!nodeExercised(aggregate)) {
     out.push(
       check(
         "process.node-ejs-containment",
@@ -634,13 +774,16 @@ function evaluateProcessEvidence(obs, stage) {
       ),
     );
   } else {
+    const failures = aggregate.nodeObservations
+      .filter((entry) => !(entry.anchored && entry.contained))
+      .flatMap((entry) => entry.failures);
     out.push(
       assertCheck(
         "process.node-ejs-containment",
-        node.contained,
-        node.contained
-          ? "the Node/EJS descendant is inside the owned group and namespace"
-          : node.failures.join("; "),
+        nodeContained(aggregate),
+        nodeContained(aggregate)
+          ? `every Node/EJS observation (${aggregate.nodeObservations.length}) was inside the owned group and namespace`
+          : failures.slice(0, 3).join("; "),
         { stage },
       ),
     );
