@@ -169,6 +169,25 @@ describe("Vercel control-plane boundary", () => {
       "sampleExtractor",
       "enqueueDownload",
       "diagnosticsSnapshot",
+      // STRENGTHENED in Phase 10C3 (§49). Generic execution now EXISTS, so the
+      // control plane must be barred from every part of it by name as well as
+      // by import. Vercel may know the compile-time capability constant and
+      // read Worker diagnostics; it may not reach the runtime, the analyzer,
+      // the download primitive, the plan, the executor or the process runner.
+      "runtime/ytdlp-runtime.server",
+      "analysis/ytdlp-analysis.server",
+      "analysis/media-analyzer.server",
+      "execution/ytdlp-download.server",
+      "execution/generic-source",
+      "execution/format-plan",
+      "execution/job-executor.server",
+      "processing/process-runner.server",
+      "analyzeGenericMedia",
+      "analyzeForExecution",
+      "downloadGenericOriginal",
+      "buildGenericFormatSelector",
+      "deriveExecutionPlan",
+      "probeYtdlpRuntime",
     ];
     for (const [file, rawSource] of graph) {
       const source = stripComments(rawSource);
@@ -557,28 +576,50 @@ describe("Worker execution boundary", () => {
     "src/worker/http/binaries.server.ts",
   ]);
 
-  it("no worker business or execution module reaches yt-dlp or a generic registry", () => {
-    // `ytdlp` alone is a legitimate DIAGNOSTICS FIELD NAME in the shared
-    // contract, so the ban is on execution entry points and on the modules
-    // that could actually run the binary against a user URL.
-    const forbidden = [
-      "yt-dlp",
-      "yt_dlp",
+  it("no worker business or execution module reaches the LEGACY extractor stack", () => {
+    // CHANGED in Phase 10C3. Until now this banned the token `yt-dlp` outright
+    // across the worker service graph, because no generic execution path
+    // existed. One exists now, so a blanket ban would only be satisfiable by
+    // deleting the feature.
+    //
+    // What replaces it is narrower and stronger where it matters: the LEGACY
+    // Vercel-era stack stays banned everywhere without exception (§50), and the
+    // set of modules allowed to name the yt-dlp runtime at all is an explicit
+    // allowlist, so a new module gaining generic coupling is a reviewed edit
+    // rather than an accident.
+    const forbiddenLegacy = [
       "downloadWithYtdlp",
       "ytdlpExtractor",
-      "ytdlpAvailable",
+      "normalizeYtdlpFormat",
+      "ytDlpFormatSelector",
+      "mapExtractorMessage",
       "getExtractorFor",
       "registry.server",
       "sampleExtractor",
       "spawnYtdlpNetwork",
       "resolveYtdlp",
     ];
+
+    // The ONLY worker modules permitted to name the pinned runtime.
+    const RUNTIME_ALLOWLIST = [
+      "src/worker/runtime/ytdlp-runtime.server.ts",
+      "src/worker/http/binaries.server.ts",
+      "src/worker/analysis/ytdlp-analysis.server.ts",
+      "src/worker/analysis/media-analyzer.server.ts",
+      "src/worker/execution/generic-source.ts",
+      "src/worker/execution/ytdlp-download.server.ts",
+      "src/worker/execution/format-plan.ts",
+      "src/worker/execution/job-executor.server.ts",
+      "src/worker/runtime/config.server.ts",
+      "src/shared/worker/contracts.ts",
+    ].map((rel_) => join(ROOT, rel_));
+
     let workerModules = 0;
     for (const [file, rawSource] of serviceGraph) {
       const source = stripComments(rawSource);
 
-      // Every module on the path — worker or shared — must import only the
-      // direct-media extractor.
+      // Unchanged and absolute: nothing on the path may import a legacy
+      // extractor module, whichever phase we are in.
       for (const spec of specifiers(source)) {
         assert.equal(
           /extractors\/(registry|ytdlp|sample)/.test(spec),
@@ -587,17 +628,22 @@ describe("Worker execution boundary", () => {
         );
       }
 
-      // The token ban applies to WORKER modules. `src/lib/config.ts` is shared
-      // and merely DEFINES the yt-dlp resolver for the legacy stack; the worker
-      // path imports only the read-only isolation attestation from it, and the
-      // import assertion above proves no extractor module is reachable.
       if (!file.startsWith(join(SRC, "worker") + "/")) continue;
       workerModules += 1;
-      for (const token of forbidden) {
+      for (const token of forbiddenLegacy) {
         assert.equal(
           source.includes(token),
           false,
-          `${rel(file)} references '${token}' on the worker execution path`,
+          `${rel(file)} references legacy '${token}' on the worker execution path`,
+        );
+      }
+
+      if (RUNTIME_ALLOWLIST.includes(file)) continue;
+      for (const token of ["yt-dlp", "yt_dlp"]) {
+        assert.equal(
+          source.includes(token),
+          false,
+          `${rel(file)} is not on the runtime allowlist but references '${token}'`,
         );
       }
     }
@@ -631,14 +677,26 @@ describe("Worker execution boundary", () => {
     }
   });
 
-  it("no user URL can reach yt-dlp from the worker business surface", () => {
-    // Analysis is the only place a user URL is interpreted, and it resolves to
-    // the direct-media analyzer alone.
+  it("a user URL reaches yt-dlp only through the direct-first, gated router", () => {
+    // CHANGED in Phase 10C3. This previously asserted that analysis "resolves to
+    // the direct-media analyzer alone". A generic path now exists, so the
+    // meaningful invariant is that a user URL cannot reach it EXCEPT through
+    // the router, which tries direct first and is fail-closed on enablement.
     const service = readSource(join(ROOT, "src/worker/http/business-service.server.ts"));
-    assert.match(service, /analyzeDirectMedia/);
+    assert.match(service, /analyzeMedia/, "analysis must go through the strategy router");
     assert.equal(service.includes("analyzeUrl"), false);
     assert.equal(service.includes("downloadMedia"), false);
+    // The business surface itself must not build a yt-dlp invocation.
+    for (const token of ["--format", "--output", "buildYtdlpDownloadArgv", "runProcess"]) {
+      assert.equal(
+        stripComments(service).includes(token),
+        false,
+        `the business surface constructs a yt-dlp invocation via '${token}'`,
+      );
+    }
 
+    // The DIRECT analyzer stays completely free of generic concepts, so the
+    // first attempt can never be anything but direct.
     const direct = stripComments(
       readSource(join(ROOT, "src/worker/execution/direct-media.server.ts")),
     );
@@ -719,62 +777,86 @@ describe("Worker execution boundary", () => {
     }
   });
 
-  it("the generic analysis modules are unreachable from the worker business surface", () => {
-    // PHASE-10C2. A bounded generic yt-dlp ANALYZER and a direct-first strategy
-    // router now exist under src/worker/analysis/. Neither may be reachable
-    // from the authenticated HTTP surface in this phase: the invariant
+  it("generic analysis is reachable ONLY through the reviewed strategy router", () => {
+    // DELIBERATELY REPLACED in Phase 10C3. The Phase-10C2 form of this test
+    // asserted the generic analyzer was unreachable from WorkerService, and
+    // said in its own comment that connecting it would be "a later, separately
+    // authorized task that will replace this assertion deliberately rather than
+    // by accident". This is that task, and this is that replacement.
     //
-    //     authenticated request -> WorkerService -> direct-media analyzer only
-    //
-    // must still hold. Connecting them is a later, separately authorized task
-    // that will replace this assertion deliberately rather than by accident.
+    // The invariant becomes a ROUTING one: a user URL may reach the generic
+    // analyzer, but only via `analyzeMedia`/`analyzeForExecution`, which try
+    // direct FIRST and fall through on exactly one error code, and only when
+    // the operator enabled the feature.
     const GENERIC_ANALYZER = join(ROOT, "src/worker/analysis/ytdlp-analysis.server.ts");
     const STRATEGY_ROUTER = join(ROOT, "src/worker/analysis/media-analyzer.server.ts");
 
     assert.ok(existsSync(GENERIC_ANALYZER), "the generic analyzer must exist");
     assert.ok(existsSync(STRATEGY_ROUTER), "the strategy router must exist");
 
-    assert.equal(
-      serviceGraph.has(GENERIC_ANALYZER),
-      false,
-      "the generic yt-dlp analyzer is reachable from WorkerService",
-    );
-    assert.equal(
-      serviceGraph.has(STRATEGY_ROUTER),
-      false,
-      "the strategy router is reachable from WorkerService",
-    );
-
+    // Nothing on the worker service path may call the generic analyzer
+    // DIRECTLY. Every caller must go through the router, which owns the
+    // direct-first rule and the fail-closed enablement check.
     for (const [file, rawSource] of serviceGraph) {
+      if (file === GENERIC_ANALYZER || file === STRATEGY_ROUTER) continue;
       const source = stripComments(rawSource);
-      for (const token of ["analyzeGenericMedia", "analyzeMedia", "analysis/ytdlp-analysis", "analysis/media-analyzer"]) {
+      for (const token of ["analyzeGenericMedia(", "analyzeGenericMediaInternal("]) {
         assert.equal(
           source.includes(token),
           false,
-          `${rel(file)} references '${token}' on the worker business path`,
+          `${rel(file)} calls the generic analyzer directly, bypassing the strategy router`,
         );
       }
     }
+
+    // The router itself must still express the direct-first rule and the
+    // fail-closed switch, so "reachable" never means "reachable unconditionally".
+    const router = stripComments(readSource(STRATEGY_ROUTER));
+    assert.match(router, /analyzeDirectMedia/, "the router must try direct first");
+    assert.match(
+      router,
+      /ytdlpEnabled\s*!==\s*true/,
+      "the router must fail closed when the operator has not enabled generic",
+    );
+    assert.match(
+      router,
+      /GENERIC_FALLBACK_TRIGGER_CODE/,
+      "fallback must be gated on the single canonical error code",
+    );
   });
 
-  it("neither the runtime composition root nor the job executor reaches generic analysis", () => {
-    // The composition root is where a generic analyzer would have to be injected
-    // to become live, and the executor is where a generic download branch would
-    // have to appear. Both are walked transitively.
+  it("the composition root and executor reach generic analysis ONLY through the router", () => {
+    // DELIBERATELY REPLACED in Phase 10C3, for the same reason as above: the
+    // composition root is exactly where the analyzer must now be injected, and
+    // the executor is exactly where the generic download branch must now live.
+    //
+    // What still must NOT happen is either of them reaching around the router
+    // to the generic analyzer, or reaching the legacy stack.
     for (const entry of [
       "src/worker/runtime/runtime.server.ts",
       "src/worker/runtime/main.server.ts",
       "src/worker/execution/job-executor.server.ts",
     ]) {
       const graph = productionGraph(entry);
-      for (const generic of [
-        "src/worker/analysis/ytdlp-analysis.server.ts",
-        "src/worker/analysis/media-analyzer.server.ts",
+      for (const [file, rawSource] of graph) {
+        if (file === join(ROOT, "src/worker/analysis/media-analyzer.server.ts")) continue;
+        if (file === join(ROOT, "src/worker/analysis/ytdlp-analysis.server.ts")) continue;
+        const source = stripComments(rawSource);
+        assert.equal(
+          source.includes("analyzeGenericMedia("),
+          false,
+          `${entry} -> ${rel(file)} calls the generic analyzer directly`,
+        );
+      }
+      for (const legacy of [
+        "src/services/extractors/registry.server.ts",
+        "src/services/extractors/ytdlp.server.ts",
+        "src/services/downloads/manager.server.ts",
       ]) {
         assert.equal(
-          graph.has(join(ROOT, generic)),
+          graph.has(join(ROOT, legacy)),
           false,
-          `${entry} can reach ${generic}`,
+          `${entry} can reach the legacy module ${legacy}`,
         );
       }
     }

@@ -28,7 +28,7 @@ describe("WorkerClient", () => {
         baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
         fetchImplementation: (async () => { called = true; return new Response(); }) as unknown as typeof fetch,
       });
-      await assert.rejects(client.createJob({ url: "http://test.com", formatId: "best", principalId: "wrong" } as any));
+      await assert.rejects(client.createJob({ url: "http://test.com", formatId: "preset:best", principalId: "wrong" } as any));
       assert.strictEqual(called, false);
     });
 
@@ -137,7 +137,7 @@ describe("WorkerClient", () => {
     it("create: POST /v1/jobs, Idempotency-Key", async () => {
       let capturedOptions: any;
       const client = makeClient(async (_url: any, opts: any) => { capturedOptions = opts; throw new Error("stop"); });
-      const body = { url: "https://example.com", formatId: "best", principalId: "private-access-user" as const };
+      const body = { url: "https://example.com", formatId: "preset:best", principalId: "private-access-user" as const };
       await client.createJob(body as any).catch(() => {});
 
       const headers = capturedOptions.headers as Headers;
@@ -542,7 +542,7 @@ describe("WorkerClient", () => {
           sink,
         );
         calls.push(["analyze", () => client.analyze({ url: "https://example.com" } as any)]);
-        calls.push(["createJob", () => client.createJob({ url: "https://example.com", formatId: "best", principalId: "private-access-user" } as any)]);
+        calls.push(["createJob", () => client.createJob({ url: "https://example.com", formatId: "preset:best", principalId: "private-access-user" } as any)]);
         calls.push(["getJob", () => client.getJob(jobId)]);
         calls.push(["cancelJob", () => client.cancelJob(jobId)]);
         calls.push(["diagnostics", () => client.diagnostics()]);
@@ -562,7 +562,7 @@ describe("WorkerClient", () => {
         const client = captureClient({}, sink);
         for (const call of [
           () => client.analyze({ url: "https://example.com" } as any),
-          () => client.createJob({ url: "https://example.com", formatId: "best", principalId: "private-access-user" } as any),
+          () => client.createJob({ url: "https://example.com", formatId: "preset:best", principalId: "private-access-user" } as any),
           () => client.getJob(jobId),
           () => client.cancelJob(jobId),
           () => client.diagnostics(),
@@ -581,9 +581,9 @@ describe("WorkerClient", () => {
         await captureClient(
           { cloudflareAccessClientId: ACCESS_ID, cloudflareAccessClientSecret: ACCESS_SECRET },
           withSink,
-        ).createJob({ url: "https://example.com", formatId: "best", principalId: "private-access-user" } as any).catch(() => {});
+        ).createJob({ url: "https://example.com", formatId: "preset:best", principalId: "private-access-user" } as any).catch(() => {});
         await captureClient({}, withoutSink)
-          .createJob({ url: "https://example.com", formatId: "best", principalId: "private-access-user" } as any).catch(() => {});
+          .createJob({ url: "https://example.com", formatId: "preset:best", principalId: "private-access-user" } as any).catch(() => {});
 
         const withHeaders = withSink.options.headers as Headers;
         const withoutHeaders = withoutSink.options.headers as Headers;
@@ -626,7 +626,7 @@ describe("WorkerClient", () => {
 
       const cases: Array<[string, (c: WorkerClient) => Promise<unknown>]> = [
         ["analyze", (c) => c.analyze({ url: "https://example.com" } as any)],
-        ["createJob", (c) => c.createJob({ url: "https://example.com", formatId: "best", principalId: "private-access-user" } as any)],
+        ["createJob", (c) => c.createJob({ url: "https://example.com", formatId: "preset:best", principalId: "private-access-user" } as any)],
         ["getJob", (c) => c.getJob(jobId)],
         ["cancelJob", (c) => c.cancelJob(jobId)],
         ["diagnostics", (c) => c.diagnostics()],

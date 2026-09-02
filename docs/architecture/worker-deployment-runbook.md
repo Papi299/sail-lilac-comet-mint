@@ -51,12 +51,17 @@ Precisely:
   separate signed-GET identity byte-identically. It was blocked until that day
   by `WORKER-TEMP-TMPFS-OWNERSHIP-001`, a runtime mount-ownership defect that is
   now fixed and deployed. See §11c.
-- **Phase 10 has begun in the repository only, and is NOT DEPLOYED.**
+- **Phase 10 has progressed in the repository only, and is NOT DEPLOYED.**
   `PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001` added a pinned yt-dlp runtime to the
   Worker **image definition** and retired the `YTDLP_NETWORK_ISOLATED` contract.
-  Nothing was deployed: the live Worker still runs the previously built image,
-  and **no user-supplied URL can reach yt-dlp in any build** — there is no
-  generic analyze or download path in the Worker at all. See §4.
+  `PHASE-10C2-YTDLP-GENERIC-ANALYSIS-FOUNDATION-001` added a bounded generic
+  analyzer, unconnected. `PHASE-10C3-YTDLP-GENERIC-EXECUTION-INTEGRATION-001`
+  **connected it**: a user-supplied URL can now reach yt-dlp in the source, via
+  the direct-first router and durable generic acquisition.
+
+  Nothing was deployed. The live Worker still runs the previously built image,
+  and Production `YTDLP_ENABLED` remains **unset**, so generic extraction is not
+  reachable in Production. See §4 and §4h.
 
 ---
 
@@ -464,14 +469,22 @@ follows once the deployment artefacts have been reviewed and installed.
 ## 4. yt-dlp
 
 **The Worker image ships a pinned yt-dlp runtime. Generic yt-dlp execution is
-not enabled, and no user-supplied URL can reach yt-dlp.**
+implemented in the source as of Phase 10C3, and is NOT ENABLED in Production.**
 
-Those two sentences are independent, and the whole design of this section is to
+Those statements are independent, and the whole design of this section is to
 keep them independent:
 
 ```
-yt-dlp runtime installed  !=  generic yt-dlp execution enabled
+yt-dlp runtime installed
+    !=  generic execution implemented
+    !=  generic execution enabled
 ```
+
+*Since `PHASE-10C3-YTDLP-GENERIC-EXECUTION-INTEGRATION-001` a user-supplied URL
+CAN reach yt-dlp in the source, through the direct-first router. It cannot in
+Production, because `YTDLP_ENABLED` is unset there and the fail-closed default
+is disabled. §4h records the connected contract in full; §4a–§4f below describe
+the runtime, argument and environment policy, which Phase 10C3 did not change.*
 
 *Historical note: throughout Phases 8 and 9 the image contained neither Python
 nor yt-dlp, and `YTDLP_NETWORK_ISOLATED=false` was the operative lock. Both
@@ -637,7 +650,14 @@ input reach it, so this was never a user-input vulnerability — it was an
 unnecessarily loose operator execution surface, and the Production Worker has no
 need of it. The runtime identity is a reviewed constant in the image.
 
-### 4f. What Phase 10C1 does NOT authorize
+### 4f. What Phase 10C1 did NOT authorize *(historical — superseded by §4h)*
+
+> **This subsection describes the state as of Phase 10C1 and is retained as
+> history. Its central claim — that no user-URL execution path exists — stopped
+> being true in Phase 10C3. See §4h for the current contract.** What remains
+> true and current is the last paragraph: `YTDLP_ENABLED` is still absent from
+> the image and from the committed systemd unit, and Production is still not
+> enabled.
 
 **No user-URL execution path exists.** `WorkerService.analyze()` still resolves
 only to the direct-media analyzer, `JobExecutor` still has no generic branch,
@@ -657,11 +677,17 @@ absent from the image and from the committed systemd unit.
 
 ---
 
-### 4g. Phase 10C2 — the generic analysis foundation (NOT connected)
+### 4g. Phase 10C2 — the generic analysis foundation *(historical — connected in §4h)*
 
-*The §4a–§4f contract above is unchanged and remains authoritative. This
-subsection records what `PHASE-10C2-YTDLP-GENERIC-ANALYSIS-FOUNDATION-001`
-added, which is **code only**.*
+> **This subsection describes the state as of Phase 10C2 and is retained as
+> history. Its central claim — that the analyzer is unreachable — stopped being
+> true in Phase 10C3, which connected it deliberately. So did its statement that
+> no upstream `format_id` is parsed at all. See §4h for both corrected
+> statements.** The analyzer's own bounds, gates and argument policy, described
+> below, are unchanged and remain authoritative.
+
+*This subsection records what `PHASE-10C2-YTDLP-GENERIC-ANALYSIS-FOUNDATION-001`
+added, which was **code only**.*
 
 A Worker-owned generic yt-dlp **analyzer** and a direct-first **strategy
 router** now exist:
@@ -868,11 +894,16 @@ preset:best  preset:2160 … preset:144  preset:audio  preset:mp3
 
 Every generic preset satisfies `id === formatId` and must match the
 application-owned pattern; the analyzer asserts this on its own output before
-returning. **No upstream `format_id` is parsed at all** — the field is absent
-from the validation schema, so no variable holds one and none can leak. This
-matters because the browser's advanced selector echoes `formats[].id` back as
-`formatId` on job creation, which would otherwise turn an upstream string into a
-browser-controlled `-f` expression in a later phase.
+returning. This matters because the browser's advanced selector echoes
+`formats[].id` back as `formatId` on job creation, which would otherwise turn an
+upstream string into a browser-controlled selector expression.
+
+> *Superseded in part by §4h.* Phase 10C2 additionally stated that **no upstream
+> `format_id` is parsed at all**, the field being absent from the validation
+> schema. That was true while no execution path existed to select a source with.
+> Phase 10C3 parses it — into a PRIVATE execution-analysis structure only, under
+> a strict ASCII grammar, never browser-facing and never durable. The current
+> governing statement is in §4h.
 
 Within one resolution bucket the ranking is container → video codec → audio
 codec → larger known size → higher fps → upstream position: total, deterministic
@@ -995,12 +1026,307 @@ application boolean.
 
 #### Future integration boundary
 
-A later, separately authorized task is required to connect any of this. It must
-address, at minimum: injecting the router into Worker HTTP; persisting a generic
-job strategy; generic download; enforcing the §4d FFmpeg-acquisition gate during
-download; generic processing; and only then flipping
-`GENERIC_YTDLP_EXECUTION_IMPLEMENTED` and enabling `YTDLP_ENABLED` in a
-deployment.
+*Closed by `PHASE-10C3-YTDLP-GENERIC-EXECUTION-INTEGRATION-001`. See §4h.*
+
+---
+
+### 4h. Phase 10C3 — generic execution, CONNECTED but NOT DEPLOYED
+
+*The §4a–§4f runtime, argument and environment contracts are unchanged and
+remain authoritative. This subsection records what
+`PHASE-10C3-YTDLP-GENERIC-EXECUTION-INTEGRATION-001` changed, which is **code
+only**.*
+
+| Property | State after Phase 10C3 |
+| :--- | :--- |
+| Generic execution code | **implemented** |
+| `WorkerService.analyze()` | the direct-first strategy router |
+| `JobExecutor` | re-analyzes each job and branches to generic acquisition |
+| Generic HTTP path | gated by `YTDLP_ENABLED` |
+| Generic durable jobs | implemented |
+| `GENERIC_YTDLP_EXECUTION_IMPLEMENTED` | **true** |
+| `/api/sites.ytdlp` | `implemented && runtime installed && YTDLP_ENABLED` |
+| `YTDLP_ENABLED` in Production | **unset — unchanged by this phase** |
+| Production deployment | **NOT performed** |
+| Production enablement | **NOT performed** |
+
+The operative distinction from §4g keeps all three terms, and the third has
+simply become true in the source:
+
+```
+runtime installed  !=  execution implemented  !=  generic execution enabled
+```
+
+Production still runs the previously built image, with `YTDLP_ENABLED` absent.
+Generic extraction is therefore **not reachable in Production**, and
+`/api/sites` continues to report `ytdlp: false` there. That is the truthful
+answer, and it is produced by conjunction rather than by the constant being
+pinned false.
+
+#### The browser trust boundary
+
+A download request is still exactly `{ url, formatId, principalId }`. The
+browser cannot name a strategy, an extractor, a raw yt-dlp format id, a yt-dlp
+argument, a downloader, an output template, a processing operation, or a source
+media URL.
+
+`formatId` is now a **closed vocabulary** (`WorkerRequestedFormatIdSchema`):
+`direct-original` plus the eleven `preset:*` rungs. It was previously any
+non-empty string. Both the control plane and the Worker validate it
+independently; anything outside the vocabulary is `FORMAT_UNAVAILABLE`.
+
+The Worker decides the strategy itself, during durable execution, by
+re-analyzing the job's own stored URL. The durable `extractor` column is
+**evidence of what an execution selected**, never an input: it is a closed
+`direct | yt-dlp` union, and a stale value from a previous attempt has no
+authority over the next one.
+
+#### Raw upstream format ids — the corrected statement
+
+Phase 10C2 could truthfully say *"`format_id` is not parsed at all"*, because no
+execution path existed to select a source with. **That statement is no longer
+true and has been removed from the current-state documentation.** The Phase-10C2
+text above is retained only as history.
+
+The governing statement is now:
+
+> A raw yt-dlp `format_id` may exist only inside a private Worker
+> execution-analysis structure. It is never browser-facing, never durable, never
+> request-controlled, never logged, and never passed to yt-dlp without strict
+> validation and application-owned selector construction.
+
+Concretely: `analyzeGenericMediaInternal` returns `{ video, selections }`, and
+only `selections` carries upstream ids. `analyzeGenericMedia` — the HTTP path —
+returns `video` alone, so the private half is unreachable from the authenticated
+surface. `WorkerVideoMetadata` still exposes `formats: []` for generic sources.
+The selection is not persisted: a restart re-derives it, which is why
+interrupted generic work is failed deterministically rather than resumed.
+
+To become executable at all, an upstream id must match a strict ASCII grammar:
+
+```
+^[A-Za-z0-9._-]{1,128}$
+```
+
+No `/`, `+`, `,`, `[`, `]`, `(`, `)`, `'`, `"`, `:`, backslash, whitespace or
+control character — every character that carries meaning inside yt-dlp's own
+selector grammar. An id that fails this produces **no advertised preset**.
+Reduced site coverage is the accepted outcome; a selector-injection surface is
+not.
+
+#### Why the selector is `b*[format_id="..."]` and not `-f <id>`
+
+Two properties of the pinned 2026.08.19 release drive the exact spelling. Both
+were verified by reading the source AND behaviourally, against the pinned
+artifact, with synthetic format dictionaries and no network
+(`deploy/acceptance/ytdlp-generic/verify-selector.py`).
+
+**1. The value must be QUOTED.** `YoutubeDL._build_format_filter` tries a
+NUMERIC regex first:
+
+```
+(?P<key>[\w.-]+)\s*(?P<op>=|!=|<|<=|>|>=)(...)?\s*
+(?P<value>[0-9.]+(?:[kKmMgGtTpPeEzZyY]i?[Bb]?)?)\s*
+```
+
+An unquoted numeric id — `[format_id=22]`, and numeric ids are extremely common
+— fullmatches that branch, so yt-dlp computes `float("22") -> 22.0` and compares
+`operator.eq("22", 22.0)`, which is False in Python. **The filter silently
+matches nothing.** Quoting defeats the numeric branch (its value group admits no
+quote character), so parsing falls through to `STR_OPERATORS`, where `=` is
+`operator.eq` on the strings. The safe-id grammar already excludes `"`, `'` and
+`\`, so the quoting cannot be escaped out of.
+
+**2. The atom must be stated as `b*`.** An OMITTED atom is not neutral:
+`_parse_format_selection` does
+`if not current_selector: current_selector = FormatSelector(SINGLE, 'best', [])`.
+Bare `best` requires a muxed format — so an audio-only source selects **nothing**
+— and it sets `format_fallback`, whose behaviour depends on the
+extractor-controlled `incomplete_formats` flag. `b*` sets `format_modified`, so
+`_filter_f` is `lambda f: True` (no shape restriction of its own, leaving every
+shape decision to the explicit filters) and `format_fallback` is False (it can
+never substitute a different format).
+
+A bare RAW-ID atom (`-f 22`) is forbidden outright: a bare atom is special-cased
+for `best`, `worst`, `all`, `mergeall`, extension names and the `/`, `+` and
+grouping operators, any of which an upstream id could collide with.
+
+Filters are applied to `ctx['formats']` BEFORE the atom runs, so an exact
+`format_id` equality filter leaves at most one candidate and the atom can only
+pick that one or nothing.
+
+The complete emitted selector binds every property the source was approved on,
+because acquisition re-runs extraction and the site may have changed in between:
+
+```
+b*[format_id="<safe-id>"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!="none"]
+```
+
+If the same id then resolves to a different protocol, container or stream shape,
+the selector matches nothing and the job fails `FORMAT_UNAVAILABLE` — never a
+silent substitution. There is no `/` fallback and no `+` merge.
+
+#### Generic v1 acquisition scope
+
+Unchanged from §4d/§4e, and now enforced rather than merely recorded:
+
+```
+public sources only          progressive HTTP/HTTPS source formats only
+single item only             native yt-dlp downloader only
+no playlist/channel/feed     no yt-dlp FFmpeg
+no live                      no yt-dlp postprocessing
+no HLS                       application-owned presets only
+no DASH/fragments            no split video+audio merge
+```
+
+Source containers are a closed allowlist: **mp4/webm** for video, and
+mp4/webm/m4a/mp3/ogg/opus/aac/flac/wav for audio-only. An unknown or absent
+upstream extension is a **rejection**, never a silent default to mp4 — for
+execution that value becomes a real file suffix, a MIME decision and an
+`[ext=...]` constraint at once.
+
+#### The acquisition command
+
+```
+/usr/bin/python3 /usr/local/lib/videofetch/yt-dlp
+  <Phase-10C1 closed base policy>
+  --no-cache-dir --quiet --no-progress --no-warnings
+  --socket-timeout=10 --retries=2 --fragment-retries=1 --extractor-retries=1
+  --ffmpeg-location=/nonexistent/videofetch-yt-dlp-no-ffmpeg
+  --fixup=never
+  --max-filesize=<configured maximum bytes>
+  --concurrent-fragments=1 --no-keep-fragments
+  --no-mtime --no-overwrites
+  --format=<application-built exact filter selector>
+  --output=<server-owned-workdir>/source.%(ext)s
+  -- <validated-url>
+```
+
+`PATH` is `/nonexistent/videofetch-yt-dlp-no-path`. `--no-part` is deliberately
+NOT passed: keeping yt-dlp's default `.part` behaviour gives the byte guard a
+predictable path to watch.
+
+The only interpolation in the output template is `%(ext)s`, and the acquired
+extension must then equal the approved container. No title, id, format id or
+uploader can influence the path.
+
+#### No FFmpeg during `downloading`
+
+Five independent mechanisms, none trusted alone:
+
+1. `--downloader=native` (inherited from the base policy) → `HttpFD`;
+2. a single progressive http/https source, so no fragment or manifest
+   downloader is reachable and no merge is possible;
+3. a PATH that resolves nothing, so `ffmpeg`/`ffprobe` cannot be found by bare
+   name;
+4. `--ffmpeg-location` at a fixed nonexistent path, which makes the pinned
+   release report FFmpeg and ffprobe as unavailable and `FFmpegFD.available()`
+   as False;
+5. `--fixup=never`, removing the fixup behaviour rather than relying on its tool
+   being absent.
+
+Mechanisms 3, 4 and 5 are verified inside the hardened container by
+`deploy/acceptance/ytdlp-generic/verify-download-policy.py`.
+
+#### Size enforcement — three gates
+
+`--max-filesize` is **defence in depth, not sufficient**. The pinned
+`HttpFD.real_download` checks it only inside `if data_len is not None`, so an
+unknown or decompressed Content-Length streams past it unchecked. The three
+gates are:
+
+| Gate | What it catches |
+| :--- | :--- |
+| Metadata bound at analysis | a KNOWN upstream size already over the limit — the preset is never advertised |
+| `--max-filesize` | a server-declared Content-Length over the limit |
+| **Application byte watcher** | actual bytes on disk, regardless of what any header claimed |
+
+The watcher polls the known `.part`/final paths every 150 ms, and on overflow
+aborts the owned process group and classifies the result as `TOO_LARGE` — not as
+a user cancellation. A final `stat` after a clean exit catches a file that grew
+between the last poll and process exit.
+
+#### Durable lifecycle
+
+```
+analyzing  -> Worker re-analyzes its own stored URL, derives the strategy,
+              pins the single source, then completeAnalysis(extractor=strategy)
+downloading-> yt-dlp progressive HTTP(S) acquisition ONLY. Zero Worker FFmpeg.
+processing -> Worker FFmpeg ONLY if the plan requires it
+uploading  -> R2
+ready
+```
+
+Generic video keeps one muxed source verbatim, so it invokes **zero** FFmpeg
+calls. `preset:audio` from an audio-only source is likewise kept. `preset:audio`
+from a muxed source, and `preset:mp3` from any source, are Worker-side FFmpeg
+operations performed strictly after `beginProcessing()` commits. `-x`,
+`--extract-audio` and `--audio-format` appear nowhere on this path.
+
+#### CORRECTION-01 — review findings closed
+
+Three integration defects were identified in review of the Phase-10C3 draft and
+corrected on the same branch. They are recorded here rather than folded silently
+into the description above, because each one falsified a claim the phase makes.
+
+**1. Generic-only capability probing was not lazy.** The canonical analysis
+policy awaited the Worker FFmpeg availability probe while building its options
+object — before the router ran — so on a `YTDLP_ENABLED=true` deployment every
+request paid for a subprocess probe that only the generic branch reads, and
+"direct first" was untrue in the composition root. FFmpeg availability is now a
+resolver (`getFfmpegAvailable`) invoked from exactly one place: inside the
+already-authorized generic fallback branch, after direct has failed with
+`EXTRACTOR_UNAVAILABLE` and after the operator's switch has been checked.
+
+The routing decision was also de-duplicated in the process. `analyzeMedia` and
+`analyzeForExecution` now share ONE `routeDirectFirst` implementation and differ
+only in the generic continuation they supply.
+
+**2. The byte monitor could act after acquisition settled.** `clearInterval`
+does not stop a sample already suspended on a filesystem await. Such a sample
+could resume after `beginProcessing()` had committed and emit `downloading`
+progress, which the executor's progress reporter would see fail as a state
+conflict — halting the reporter and aborting a job that had actually succeeded.
+Every side effect is now gated on a liveness flag cleared synchronously by
+`stopMonitor()`, which runs before any outcome is interpreted.
+
+The abort cause is now a one-way latch rather than a mutable boolean. Previously
+a later overflow sample could overwrite an earlier caller cancellation.
+First writer wins: caller-then-overflow stays a cancellation, and
+overflow-then-caller stays `TOO_LARGE`.
+
+**3. The durable schemas still accepted arbitrary strings.** Phase 10C3
+introduced the closed vocabularies but applied them only at the HTTP boundary,
+so a SQLite row could still carry `extractor = "Youtube"` or
+`formatId = "bestvideo+bestaudio"` and become trusted execution state.
+`DurableWorkerJob.formatId`, `DurableWorkerJob.extractor` and
+`CompleteAnalysisInput.extractor` now use the closed schemas.
+
+No SQLite migration was needed or added: the columns remain `TEXT` and the
+trusted read/write schemas enforce the vocabulary. A raw upstream source id
+still has no column at all — it stays memory-only for one execution attempt.
+
+An out-of-vocabulary durable value is now indistinguishable from row corruption,
+and the store's pre-existing corruption policy applies unchanged: the row is
+refused loudly and all-or-nothing rather than being written to or executed.
+
+#### Deployment status
+
+```
+generic execution code:   implemented
+generic HTTP path:        gated by YTDLP_ENABLED
+generic durable jobs:     implemented
+Production deployment:    NOT performed
+Production enablement:    NOT performed
+```
+
+Enabling generic extraction in Production remains a later, separately authorized
+task. It must include live public-site acceptance, a live safe-egress descendant
+proof, and a live R2 generic-media proof — none of which this phase performed.
+The site catalog stays conservative: `"limited"` entries were **not** upgraded,
+because an existing execution path does not guarantee any given URL satisfies
+the public-source, progressive-HTTP(S), muxed-single-stream, safe-format-id and
+no-live policies.
 
 ---
 

@@ -13,7 +13,10 @@ import {
   type WorkerJobStatusSuccess,
   type WorkerVideoMetadata,
 } from "../../shared/worker/contracts.ts";
-import { analyzeDirectMedia } from "../execution/direct-media.server.ts";
+import {
+  analyzeMedia,
+  type GenericAnalysisLimits,
+} from "../analysis/media-analyzer.server.ts";
 import type { JobExecutor } from "../execution/job-executor.server.ts";
 import { WORKER_MAX_CONCURRENT_JOBS, type QueuePump } from "../execution/queue-pump.server.ts";
 import type { WorkerJobStore } from "../state/job-store.ts";
@@ -22,6 +25,19 @@ import { WorkerBusinessError } from "./errors.server.ts";
 
 /** Bound on the queue-depth scan reported by diagnostics. */
 const QUEUE_DEPTH_SCAN_LIMIT = 1000;
+
+/**
+ * Bounds used only when composition supplied none.
+ *
+ * Deliberately conservative rather than permissive: an un-composed service that
+ * somehow reached the generic path would analyze under tighter limits, never
+ * looser ones. Production always injects the validated configuration.
+ */
+const CONSERVATIVE_ANALYSIS_LIMITS: GenericAnalysisLimits = {
+  analysisTimeoutSeconds: 45,
+  maxVideoDurationSeconds: 2 * 60 * 60,
+  maxFileSizeBytes: 500 * 1024 * 1024,
+};
 
 /**
  * The narrow business boundary the authenticated HTTP surface dispatches into.
@@ -58,6 +74,12 @@ export type WorkerServiceDeps = {
    * did not grant.
    */
   ytdlpEnabled?: boolean;
+  /**
+   * Bounds for the generic analyzer, supplied by the composition root from
+   * validated configuration. Only consulted when the generic path is both
+   * enabled and actually reached.
+   */
+  analysisLimits?: GenericAnalysisLimits;
 };
 
 export class WorkerService implements WorkerBusinessService {
@@ -68,25 +90,44 @@ export class WorkerService implements WorkerBusinessService {
   private readonly probeBinaries: WorkerBinaryProbe;
   private readonly clock: () => number;
   private readonly ytdlpEnabled: boolean;
+  private readonly analysisLimits: GenericAnalysisLimits;
 
   constructor(deps: WorkerServiceDeps) {
     this.store = deps.store;
     this.executor = deps.executor;
     this.pump = deps.pump;
-    // Direct-media only. There is no extractor registry, no yt-dlp, and no
-    // sample extractor on this path (§24).
-    this.analyzeFn = deps.analyze ?? analyzeDirectMedia;
+    // Fail-closed default: absent means disabled, exactly as YTDLP_ENABLED
+    // itself behaves at the configuration boundary. Read BEFORE the analyzer is
+    // built, because the analyzer closes over it.
+    this.ytdlpEnabled = deps.ytdlpEnabled ?? false;
+    this.analysisLimits = deps.analysisLimits ?? CONSERVATIVE_ANALYSIS_LIMITS;
+    // Phase 10C3: analysis is the SHARED strategy router, not the direct
+    // analyzer alone. It still tries direct FIRST and only considers generic on
+    // exactly one error code, and only when the operator enabled it — so a
+    // deployment with YTDLP_ENABLED unset behaves precisely as it did before.
+    //
+    // There is still no extractor registry and no legacy yt-dlp module on this
+    // path: `analyzeMedia` reaches only the reviewed Phase-10 analyzers.
+    this.analyzeFn =
+      deps.analyze ??
+      ((url, signal) =>
+        analyzeMedia(url, {
+          ytdlpEnabled: this.ytdlpEnabled,
+          limits: this.analysisLimits,
+          // Composition injects a policy with a real probe. The bare default
+          // stays false, which can only REMOVE generic audio presets, never add
+          // one that cannot be produced.
+          ffmpegAvailable: false,
+          ...(signal ? { signal } : {}),
+        }));
     this.probeBinaries = deps.probeBinaries ?? probeWorkerBinaries;
     this.clock = deps.clock ?? (() => Date.now());
-    // Fail-closed default: absent means disabled, exactly as YTDLP_ENABLED
-    // itself behaves at the configuration boundary.
-    this.ytdlpEnabled = deps.ytdlpEnabled ?? false;
   }
 
   public async analyze(request: WorkerAnalyzeRequest): Promise<WorkerAnalyzeSuccess> {
-    // analyzeDirectMedia performs the Worker's own independent URL/SSRF
-    // validation and fails closed with EXTRACTOR_UNAVAILABLE for anything that
-    // is not a direct media URL.
+    // The router performs the Worker's own independent URL/SSRF validation on
+    // the direct attempt, and fails closed with EXTRACTOR_UNAVAILABLE for
+    // anything that is not direct media when generic is disabled.
     const video = await this.analyzeFn(request.url);
     return WorkerAnalyzeSuccessSchema.parse({ success: true, video });
   }

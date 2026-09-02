@@ -8,7 +8,10 @@ import { applyMigrations } from "../state/migrations.server.ts";
 import { randomUUID } from "node:crypto";
 import { WorkerObjectKeySchema } from "../../shared/worker/contracts.ts";
 import { buildAttachmentContentDisposition } from "../../lib/filenames.ts";
-import type { WorkerJobView } from "../../shared/worker/contracts.ts";
+import type {
+  WorkerCreateJobRequest,
+  WorkerJobView,
+} from "../../shared/worker/contracts.ts";
 
 class FakeObjectStoreWriter implements ObjectStoreWriter {
   public objects = new Map<string, ObjectStorePutInput>();
@@ -101,9 +104,9 @@ describe("Upload Lifecycle Coordinator", () => {
   });
 
   function setupUploadingJob(): WorkerJobView {
-    const req = {
+    const req: WorkerCreateJobRequest = {
       url: "https://example.com/video",
-      formatId: "137",
+      formatId: "preset:1080",
       principalId: "private-access-user" as const,
     };
     const { job } = store.createJob(req, randomUUID()) as { job: WorkerJobView };

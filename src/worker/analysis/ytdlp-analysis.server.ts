@@ -13,6 +13,15 @@ import {
   type WorkerVideoMetadata,
 } from "../../shared/worker/contracts.ts";
 import {
+  GenericSourceSelectionSchema,
+  isSafeFormatId,
+  toGenericSourceContainer,
+  type GenericSourceContainer,
+  type GenericSourceProtocol,
+  type GenericSourceSelection,
+  type GenericSourceSelections,
+} from "../execution/generic-source.ts";
+import {
   YTDLP_PROBE_TIMEOUT_MS,
   YTDLP_RUNTIME,
   buildYtdlpEnvironment,
@@ -150,10 +159,12 @@ export const YTDLP_REJECTED_LIVE_STATUSES = Object.freeze([
   "post_live",
 ] as const);
 
-/** Container extensions that never represent acquirable media. */
-const NON_MEDIA_EXTENSIONS = Object.freeze(
-  new Set(["mhtml", "storyboard", "jpg", "jpeg", "png", "webp", "vtt", "srt", "ass"]),
-);
+// Phase 10C2 kept a DENYLIST of non-media extensions here (mhtml, jpg, vtt, …).
+// Phase 10C3 replaces it with the closed source-container ALLOWLIST in
+// `generic-source.ts`: a denylist has to anticipate every junk extension an
+// extractor might invent, while an allowlist rejects them all by default and
+// additionally refuses the merely-unsupported ones (mkv, mov, avi) that the
+// download path could not honour anyway.
 
 // ── Application-owned preset vocabulary ──────────────────────────────────────
 
@@ -362,12 +373,28 @@ export function buildYtdlpAnalysisArgv(validatedUrl: string): readonly string[] 
  * absent from this schema cannot become application data no matter what the
  * extractor emits.
  *
- * `format_id` is CONSPICUOUSLY ABSENT. Phase-10B forbids a raw yt-dlp format id
- * from reaching the browser, and not parsing it at all is a structural
- * guarantee rather than a discipline — there is no variable holding one, so
- * none can be returned by mistake.
+ * ─── `format_id` and the Phase-10C3 change (§10) ────────────────────────────
+ *
+ * Phase-10C2 deliberately did NOT parse `format_id`, and could therefore claim
+ * that no variable anywhere held one. That claim was only affordable because
+ * execution did not exist: with no download path, there was nothing to select.
+ *
+ * Phase 10C3 acquires media, so the Worker must be able to name the exact
+ * source it approved. The field is parsed here and the governing rule replaces
+ * the old one:
+ *
+ *   A raw yt-dlp `format_id` may exist only inside a private Worker
+ *   execution-analysis structure. It is never browser-facing, never durable,
+ *   never request-controlled, never logged, and never passed to yt-dlp without
+ *   strict validation and application-owned selector construction.
+ *
+ * Concretely, within this module the value can only ever reach
+ * `GenericSourceSelection` (private, returned by `analyzeGenericMediaInternal`
+ * alone). `WorkerVideoMetadata` still exposes `formats: []` and preset ids that
+ * are application-owned literals, so the public result is unchanged.
  */
 const RawFormatSchema = z.object({
+  format_id: z.string().nullish(),
   ext: z.string().nullish(),
   height: z.number().finite().nullish(),
   width: z.number().finite().nullish(),
@@ -479,13 +506,35 @@ type Candidate = {
   readonly hasAudio: boolean;
   readonly height: number | null;
   readonly fps: number | null;
-  readonly container: string;
+  /** Allowlisted SOURCE container. Never a defaulted or arbitrary extension. */
+  readonly container: GenericSourceContainer;
   readonly videoCodec: string | null;
   readonly audioCodec: string | null;
   readonly fileSize: number | null;
+  /**
+   * PRIVATE. The one raw upstream identifier this candidate was approved with,
+   * already proven to satisfy the safe grammar. It exists so execution can name
+   * the exact source it approved; it must never leave this module except inside
+   * a `GenericSourceSelection`.
+   */
+  readonly formatId: string;
+  /** PRIVATE. The acquisition protocol this candidate was approved on. */
+  readonly protocol: GenericSourceProtocol;
   /** Position in the upstream list. The final, fully deterministic tiebreak. */
   readonly index: number;
 };
+
+/** Projects a candidate into the private execution descriptor. */
+function toSelection(c: Candidate): GenericSourceSelection {
+  return GenericSourceSelectionSchema.parse({
+    formatId: c.formatId,
+    protocol: c.protocol,
+    container: c.container,
+    hasVideo: c.hasVideo,
+    hasAudio: c.hasAudio,
+    fileSize: c.fileSize,
+  });
+}
 
 function isPresentCodec(codec: string | null | undefined): boolean {
   return typeof codec === "string" && codec.length > 0 && codec !== "none" && codec !== "null";
@@ -513,14 +562,17 @@ export function normalizeCodecName(codec: string | null | undefined): string | n
  * Turns validated raw formats into the v1-eligible candidate set.
  *
  * A format is eligible only when ALL of the following hold. Every one of them
- * is a boundary the future generic download phase must also honour, so an
- * ineligible format is never advertised even though analysis itself could
- * describe it perfectly well:
+ * is a boundary the generic DOWNLOAD path must also honour, so an ineligible
+ * format is never advertised even though analysis itself could describe it
+ * perfectly well. "Advertise only what can actually be acquired" is the rule:
+ * a preset that would fail at download time is worse than an absent one,
+ * because the user has already chosen it by then.
  *
  *   1. its protocol is explicitly `http` or `https` (see YTDLP_V1_NATIVE_PROTOCOLS);
- *   2. it is a real media container, not a storyboard or subtitle track;
- *   3. it carries video, audio, or both — an empty format describes nothing;
- *   4. any KNOWN size is within the configured maximum.
+ *   2. its upstream `format_id` satisfies the safe literal grammar (§11);
+ *   3. its container is in the closed source allowlist for its stream shape (§15);
+ *   4. it carries video, audio, or both — an empty format describes nothing;
+ *   5. any KNOWN size is within the configured maximum.
  *
  * Requirement 1 is deliberately strict about ABSENCE too: a format with no
  * `protocol` field is not eligible. yt-dlp derives a missing protocol from the
@@ -538,10 +590,13 @@ export function selectCandidates(
     if (protocol === null) return;
     if (!(YTDLP_V1_NATIVE_PROTOCOLS as readonly string[]).includes(protocol)) return;
 
-    const container = (typeof raw.ext === "string" && raw.ext.length > 0 ? raw.ext : "mp4")
-      .toLowerCase()
-      .slice(0, 16);
-    if (NON_MEDIA_EXTENSIONS.has(container)) return;
+    // §11: a candidate whose upstream identifier does not satisfy the approved
+    // literal grammar is NOT executable, so it must not be advertised either.
+    // Advertising a preset the download path would refuse to acquire would move
+    // the failure from analysis (where it is one clear FORMAT_UNAVAILABLE) to
+    // mid-job, after the user already chose it.
+    if (!isSafeFormatId(raw.format_id)) return;
+    const formatId = raw.format_id;
 
     const note = (raw.format_note ?? "").toLowerCase();
     if (note.includes("storyboard") || note.includes("preview image")) return;
@@ -549,6 +604,16 @@ export function selectCandidates(
     const hasVideo = isPresentCodec(raw.vcodec) && raw.video_ext !== "none";
     const hasAudio = isPresentCodec(raw.acodec) && raw.audio_ext !== "none";
     if (!hasVideo && !hasAudio) return;
+
+    // §15: the source container comes from a closed allowlist, chosen by stream
+    // shape, and an unknown or absent extension is a REJECTION rather than a
+    // silent default to mp4. The value becomes a real file suffix, a MIME
+    // decision and an `[ext=...]` selector constraint, so guessing it would
+    // make all three wrong at once. This also subsumes the old non-media
+    // extension denylist: storyboards, images and subtitle tracks simply are
+    // not in the allowlist.
+    const container = toGenericSourceContainer(raw.ext, { hasVideo });
+    if (container === null) return;
 
     // A known size already over the limit must not be advertised. An UNKNOWN
     // size is not a rejection: the download path enforces an actual byte limit
@@ -570,6 +635,8 @@ export function selectCandidates(
       videoCodec: hasVideo ? normalizeCodecName(raw.vcodec) : null,
       audioCodec: hasAudio ? normalizeCodecName(raw.acodec) : null,
       fileSize,
+      formatId,
+      protocol: protocol as GenericSourceProtocol,
       index,
     });
   });
@@ -631,6 +698,19 @@ function bestOf(candidates: readonly Candidate[]): Candidate | null {
 }
 
 /**
+ * The result of preset construction: the browser-safe presets, plus the PRIVATE
+ * per-preset source selections execution needs.
+ *
+ * The two are produced together so they cannot drift: a preset with no
+ * selection would be unacquirable, and a selection with no preset would be
+ * unreachable.
+ */
+export type GenericPresetBuild = {
+  readonly presets: WorkerQualityPreset[];
+  readonly selections: GenericSourceSelections;
+};
+
+/**
  * Builds the generic v1 preset list.
  *
  * VIDEO presets come only from candidates that already carry video AND audio in
@@ -648,8 +728,14 @@ function bestOf(candidates: readonly Candidate[]): Candidate | null {
 export function buildGenericPresets(
   candidates: readonly Candidate[],
   opts: { readonly ffmpegAvailable: boolean },
-): WorkerQualityPreset[] {
+): GenericPresetBuild {
   const presets: WorkerQualityPreset[] = [];
+  // PRIVATE, and parallel to `presets` by construction: every preset pushed
+  // below records the exact candidate it was derived from, in the same step.
+  // Keeping the two together is what lets execution re-find the approved source
+  // without re-deriving it from the browser-facing preset, which carries no
+  // upstream identity at all.
+  const selections: Record<string, GenericSourceSelection> = {};
 
   // Muxed single-source video candidates only.
   const muxedVideo = candidates.filter((c) => c.hasVideo && c.hasAudio);
@@ -659,7 +745,7 @@ export function buildGenericPresets(
     label: string,
     resolution: string | null,
     c: Candidate,
-  ): WorkerQualityPreset => ({
+  ): WorkerQualityPreset => ((selections[id] = toSelection(c)), {
     id,
     label,
     resolution,
@@ -717,6 +803,10 @@ export function buildGenericPresets(
   const audioSource = bestAudioOnly ?? (opts.ffmpegAvailable ? bestOf(muxedVideo) : null);
 
   if (audioSource) {
+    // The SOURCE is `audioSource`; the ADVERTISED container may differ from it
+    // (a muxed source advertised as m4a is extracted by the Worker's own FFmpeg
+    // after `processing` begins, never by yt-dlp).
+    selections["preset:audio"] = toSelection(audioSource);
     presets.push({
       id: "preset:audio",
       label: "Audio only",
@@ -734,6 +824,7 @@ export function buildGenericPresets(
     // MP3 is always a Worker-side transcode, so it needs FFmpeg regardless of
     // which kind of source was chosen.
     if (opts.ffmpegAvailable) {
+      selections["preset:mp3"] = toSelection(audioSource);
       presets.push({
         id: "preset:mp3",
         label: "Audio only (MP3)",
@@ -750,7 +841,7 @@ export function buildGenericPresets(
     }
   }
 
-  return presets;
+  return { presets, selections };
 }
 
 // ── Sanitization ─────────────────────────────────────────────────────────────
@@ -863,7 +954,27 @@ export type GenericAnalysisDeps = {
 };
 
 /**
- * Analyzes one generic URL with the pinned yt-dlp runtime.
+ * The EXECUTION-side analysis result (§9).
+ *
+ * `video` is exactly what the browser may see. `selections` is the private
+ * half: one validated source descriptor per advertised preset, each carrying
+ * the raw upstream `format_id` the Worker approved.
+ *
+ * This type is returned by `analyzeGenericMediaInternal` and by nothing else.
+ * `selections` must never cross Worker HTTP, enter `WorkerVideoMetadata`, enter
+ * SQLite, reach Vercel or the browser, be logged, or appear in an error.
+ */
+export type GenericInternalAnalysis = {
+  readonly video: WorkerVideoMetadata;
+  readonly selections: GenericSourceSelections;
+};
+
+/**
+ * Analyzes one generic URL with the pinned yt-dlp runtime, returning BOTH the
+ * browser-safe metadata and the private execution selections.
+ *
+ * Callers on the HTTP path must use `analyzeGenericMedia` instead, which drops
+ * the private half.
  *
  * Order of operations is a security property, not a style choice:
  *
@@ -887,10 +998,10 @@ export type GenericAnalysisDeps = {
  * external media network namespace, its nftables policy and the watchdog — an
  * architecture this module deliberately does not restate as a boolean.
  */
-export async function analyzeGenericMedia(
+export async function analyzeGenericMediaInternal(
   url: string,
   deps: GenericAnalysisDeps,
-): Promise<WorkerVideoMetadata> {
+): Promise<GenericInternalAnalysis> {
   const runner = deps.runner ?? runProcess;
   const probe = deps.probeRuntime ?? probeYtdlpRuntime;
   const validate = deps.validateUrl ?? assertSafeUrl;
@@ -998,7 +1109,7 @@ export async function analyzeGenericMedia(
   }
 
   const candidates = selectCandidates(info.formats ?? [], deps.limits);
-  const presets = buildGenericPresets(candidates, {
+  const { presets, selections } = buildGenericPresets(candidates, {
     ffmpegAvailable: deps.ffmpegAvailable ?? false,
   });
 
@@ -1010,9 +1121,16 @@ export async function analyzeGenericMedia(
   for (const preset of presets) {
     if (!GENERIC_PRESET_ID_PATTERN.test(preset.id)) throw new AppError("EXTRACTION_FAILED");
     if (preset.formatId !== preset.id) throw new AppError("EXTRACTION_FAILED");
+    // Every advertised preset must be acquirable. A preset without a private
+    // selection could only fail later, after the user had chosen it.
+    if (!selections[preset.id]) throw new AppError("EXTRACTION_FAILED");
+  }
+  // ...and nothing may be selectable that was never advertised.
+  for (const id of Object.keys(selections)) {
+    if (!presets.some((p) => p.id === id)) throw new AppError("EXTRACTION_FAILED");
   }
 
-  return VideoMetadataSchema.parse({
+  const video = VideoMetadataSchema.parse({
     title: sanitizeUpstreamText(info.title, YTDLP_ANALYSIS_MAX_TITLE_LENGTH, "Video"),
     // Conservative Phase-10 v1 policy: an extractor-provided thumbnail URL is a
     // secondary network destination that would be handed straight to the
@@ -1041,4 +1159,22 @@ export async function analyzeGenericMedia(
       merge: false,
     },
   });
+
+  return { video, selections };
+}
+
+/**
+ * The BROWSER-SAFE generic analyzer.
+ *
+ * Returns the validated public metadata and nothing else. The private source
+ * selections are dropped here rather than merely "not used", so a caller on the
+ * HTTP path cannot reach them even by accident — which is the whole point of
+ * the split (§9).
+ */
+export async function analyzeGenericMedia(
+  url: string,
+  deps: GenericAnalysisDeps,
+): Promise<WorkerVideoMetadata> {
+  const internal = await analyzeGenericMediaInternal(url, deps);
+  return internal.video;
 }

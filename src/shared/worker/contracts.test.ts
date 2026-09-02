@@ -55,7 +55,7 @@ test("Worker Contracts - WorkerJobView", async (t) => {
     title: "Test Video",
     thumbnail: "https://example.com/thumb.jpg",
     source: "youtube",
-    extractor: "youtube",
+    extractor: "yt-dlp",
     createdAt: 1600000000,
     updatedAt: 1600000000,
     expiresAt: 1600086400,
@@ -122,14 +122,14 @@ test("Worker Contracts - Requests and URLs", async (t) => {
     assert.doesNotThrow(() =>
       WorkerCreateJobRequestSchema.parse({
         url: "https://youtube.com/watch?v=123",
-        formatId: "best",
+        formatId: "preset:best",
         principalId: WORKER_PRIVATE_PRINCIPAL,
       }),
     );
     assert.doesNotThrow(() =>
       WorkerCreateJobRequestSchema.parse({
         url: "http://youtube.com/watch?v=123",
-        formatId: "best",
+        formatId: "preset:best",
         principalId: WORKER_PRIVATE_PRINCIPAL,
       }),
     );
@@ -139,7 +139,7 @@ test("Worker Contracts - Requests and URLs", async (t) => {
     assert.throws(() =>
       WorkerCreateJobRequestSchema.parse({
         url: "https://youtube.com/watch?v=123",
-        formatId: "best",
+        formatId: "preset:best",
         principalId: "user-123",
       }),
     );
@@ -159,7 +159,7 @@ test("Worker Contracts - Requests and URLs", async (t) => {
       assert.throws(() =>
         WorkerCreateJobRequestSchema.parse({
           url,
-          formatId: "best",
+          formatId: "preset:best",
           principalId: WORKER_PRIVATE_PRINCIPAL,
         }),
       );
@@ -227,7 +227,7 @@ test("Worker Contracts - Media", async (t) => {
         thumbnail: "https://example.com/thumb.jpg",
         duration: 120,
         source: "youtube",
-        extractor: "youtube",
+        extractor: "yt-dlp",
         webpageUrl: "https://youtube.com/watch?v=123",
         formats: [],
         presets: [],
@@ -243,7 +243,7 @@ test("Worker Contracts - Media", async (t) => {
         thumbnail: "https://example.com/thumb.jpg",
         duration: 120,
         source: "youtube",
-        extractor: "youtube",
+        extractor: "yt-dlp",
         webpageUrl: "https://youtube.com/watch?v=123",
         formats: [],
         presets: [],

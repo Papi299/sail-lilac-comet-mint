@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { GENERIC_YTDLP_EXECUTION_IMPLEMENTED } from "@/shared/capabilities";
 
 export const Route = createFileRoute("/diagnostics")({
   component: DiagnosticsPage,
@@ -69,19 +70,38 @@ function DiagnosticsPage() {
               <CardTitle className="text-base">Generic extraction</CardTitle>
             </CardHeader>
             <CardContent className="grid gap-3 text-sm">
-              {/* Deliberately "configuration", not "feature enabled". The
-                  setting records operator intent; it does not make generic
-                  extraction operational, because this build contains no
-                  execution path for it. Calling it "enabled" would imply a
-                  capability that does not exist. */}
+              {/* Three INDEPENDENT facts, reported separately and never
+                  collapsed. Phase 10C3 made the third one true, which is
+                  precisely when conflating them becomes dangerous: "the code
+                  exists" reads as "it works" unless the runtime and the
+                  operator setting are shown beside it. */}
               <p>
-                yt-dlp configuration: {data.features.ytdlpEnabled ? "enabled" : "disabled"}
+                Runtime: {data.binaries.ytdlp ? "available" : "missing"}
               </p>
-              <p>Generic yt-dlp execution: not implemented in this build</p>
+              <p>
+                Configuration: {data.features.ytdlpEnabled ? "enabled" : "disabled"}
+              </p>
+              <p>
+                Generic yt-dlp execution:{" "}
+                {GENERIC_YTDLP_EXECUTION_IMPLEMENTED
+                  ? "implemented in this build"
+                  : "not implemented in this build"}
+              </p>
+              <p>
+                Usable right now:{" "}
+                <span className="font-medium">
+                  {GENERIC_YTDLP_EXECUTION_IMPLEMENTED &&
+                  data.binaries.ytdlp &&
+                  data.features.ytdlpEnabled
+                    ? "yes"
+                    : "no"}
+                </span>
+              </p>
               <p className="text-muted-foreground">
-                Neither an available runtime nor an enabled setting makes generic extraction
-                usable. This build has no generic analyze or download path, so only direct media
-                files are extractable.
+                Generic extraction requires all three: the execution path must exist in this
+                build, the pinned runtime must execute, and the operator must have enabled it.
+                An available runtime alone does not enable anything, and neither does the
+                setting. When any one is missing, only direct media files are extractable.
               </p>
             </CardContent>
           </Card>

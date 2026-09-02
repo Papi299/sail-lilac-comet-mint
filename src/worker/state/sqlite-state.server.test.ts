@@ -167,9 +167,11 @@ describe("Worker SQLite State", () => {
 
   it("prepared-value round trip with quotes/unicode", () => {
     const store = new SQLiteJobStore({ db });
+    // formatId is a CLOSED vocabulary since Phase 10C3, so the hostile
+    // characters this test exists for now travel in the URL query instead.
     const req: WorkerCreateJobRequest = {
-      url: "https://example.com/watch?v=hello",
-      formatId: "best'quote\"unicode🔥",
+      url: "https://example.com/watch?v=hello'quote%22unicode🔥",
+      formatId: "preset:best",
       principalId: "private-access-user"
     };
 
@@ -189,7 +191,7 @@ describe("Worker SQLite State", () => {
     const store = new SQLiteJobStore({ db });
     const result = store.createJob({
       url: "https://example.com/",
-      formatId: "fmt",
+      formatId: "preset:best",
       principalId: "private-access-user"
     }, "123e4567-e89b-42d3-a456-426614174002");
 
@@ -206,7 +208,7 @@ describe("Worker SQLite State", () => {
     assert.throws(() => {
       store.createJob({
         url: "https://example.com/",
-        formatId: "fmt",
+        formatId: "preset:best",
         principalId: "private-access-user"
       }, "123e4567-e89b-42d3-a456-426614174003");
     });
@@ -222,7 +224,7 @@ describe("Worker SQLite State", () => {
     assert.throws(() => {
       store.createJob({
         url: "https://example.com/",
-        formatId: "fmt",
+        formatId: "preset:best",
         principalId: "private-access-user"
       }, "not-a-uuid");
     });
@@ -239,9 +241,9 @@ describe("Worker SQLite State", () => {
     let mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, generateJobId: () => Math.random().toString(16).slice(2).padStart(32, '0') });
 
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174004");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174004");
     mockTime = 2000;
-    store.createJob({ url: "http://b", formatId: "2", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174005");
+    store.createJob({ url: "http://b", formatId: "preset:1080", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174005");
 
     const queued = store.listQueuedJobs(10);
     assert.strictEqual(queued.length, 2);
@@ -261,7 +263,7 @@ describe("Worker SQLite State", () => {
     let mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000, generateJobId: () => "00000000000000000000000000000001" });
 
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174006");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174006");
 
     mockTime = 7000;
     const claimed = store.claimNextQueuedJob();
@@ -272,7 +274,7 @@ describe("Worker SQLite State", () => {
 
   it("cancel CAS and failure CAS explicit returns", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000002" });
-    const res = store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174007");
+    const res = store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174007");
     if (res.type !== "created") assert.fail("not created");
 
     const cancelled = store.cancelJob(res.job.jobId);
@@ -290,7 +292,7 @@ describe("Worker SQLite State", () => {
 
   it("fail-first then cancel CAS", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000003" });
-    const res = store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174008");
+    const res = store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174008");
     if (res.type !== "created") assert.fail("not created");
 
     const failed = store.failJob(res.job.jobId, "NETWORK_ERROR", "failed");
@@ -314,7 +316,7 @@ describe("Worker SQLite State", () => {
   it("claimNextQueuedJob corrupted queue rollback", () => {
     const mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, generateJobId: () => "00000000000000000000000000000010" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174060");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174060");
     
     // Corrupt the row using prepared SQL
     const stmt = db.prepare("UPDATE worker_jobs SET object_key = ? WHERE job_id = ?");
@@ -329,7 +331,7 @@ describe("Worker SQLite State", () => {
   it("claimNextQueuedJob second claim corruption regression", () => {
     const mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, generateJobId: () => "00000000000000000000000000000011" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174061");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174061");
     
     // SQLite allows any string without constraints for url unless we add CHECK. But we rely on Zod schema.
     const stmt = db.prepare("UPDATE worker_jobs SET url = ? WHERE job_id = ?");
@@ -344,7 +346,7 @@ describe("Worker SQLite State", () => {
   it("claimNextQueuedJob post-transition validation rollback", () => {
     const mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, generateJobId: () => "00000000000000000000000000000012" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174062");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174062");
     
     // Test-only trigger to corrupt the resulting row during transition
     db.exec(`
@@ -366,7 +368,7 @@ describe("Worker SQLite State", () => {
 
   it("cancelJob corruption rollback", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000013" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174063");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174063");
     
     db.exec(`
       CREATE TRIGGER test_corrupt_cancel AFTER UPDATE ON worker_jobs
@@ -386,7 +388,7 @@ describe("Worker SQLite State", () => {
 
   it("failJob corruption behavior", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000014" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174064");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174064");
     
     // Corrupt the row before failing
     const stmt = db.prepare("UPDATE worker_jobs SET url = ? WHERE job_id = ?");
@@ -400,9 +402,9 @@ describe("Worker SQLite State", () => {
 
   it("recover atomic-corruption regression", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000015" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174065");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174065");
     const store2 = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000016" });
-    store2.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174066");
+    store2.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174066");
     
     // Advance both to active state
     db.prepare("UPDATE worker_jobs SET status = 'analyzing' WHERE job_id = '00000000000000000000000000000015'").run();
@@ -423,7 +425,7 @@ describe("Worker SQLite State", () => {
 
   it("recover post-update validation regression", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000017" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174067");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174067");
     
     db.prepare("UPDATE worker_jobs SET status = 'analyzing' WHERE job_id = '00000000000000000000000000000017'").run();
 
@@ -451,7 +453,7 @@ describe("Worker SQLite State", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => (idCounter++).toString().padStart(32, '0') });
 
     const create = () => {
-      const res = store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, `123e4567-e89b-42d3-a456-42661417401${idCounter}`);
+      const res = store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, `123e4567-e89b-42d3-a456-42661417401${idCounter}`);
       if (res.type !== "created") throw new Error("not created");
       return res.job.jobId;
     };
@@ -510,7 +512,7 @@ describe("Worker SQLite State", () => {
 
   it("existing retry does NOT invoke generator", () => {
     const storeA = new SQLiteJobStore({ db });
-    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
+    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     storeA.createJob(req, "123e4567-e89b-42d3-a456-426614174030");
 
     const storeB = new SQLiteJobStore({ db, generateJobId: () => { throw new Error("generator must not run"); } });
@@ -520,11 +522,11 @@ describe("Worker SQLite State", () => {
 
   it("conflict does NOT invoke generator", () => {
     const storeA = new SQLiteJobStore({ db });
-    const req1: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
+    const req1: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     storeA.createJob(req1, "123e4567-e89b-42d3-a456-426614174031");
 
     const storeB = new SQLiteJobStore({ db, generateJobId: () => { throw new Error("generator must not run"); } });
-    const req2: WorkerCreateJobRequest = { url: "http://b", formatId: "1", principalId: "private-access-user" };
+    const req2: WorkerCreateJobRequest = { url: "http://b", formatId: "preset:720", principalId: "private-access-user" };
     const res = storeB.createJob(req2, "123e4567-e89b-42d3-a456-426614174031");
     assert.strictEqual(res.type, "conflict");
   });
@@ -532,7 +534,7 @@ describe("Worker SQLite State", () => {
   it("expired-via-job-ttl does NOT invoke generator", () => {
     let mockTime = 1000;
     const storeA = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000 });
-    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
+    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     storeA.createJob(req, "123e4567-e89b-42d3-a456-426614174032");
 
     // Advance past job TTL but within idempotency retention (24h)
@@ -545,7 +547,7 @@ describe("Worker SQLite State", () => {
   it("tombstone (missing job row) does NOT invoke generator", () => {
     const mockTime = 1000;
     const storeA = new SQLiteJobStore({ db, clock: () => mockTime });
-    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
+    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     storeA.createJob(req, "123e4567-e89b-42d3-a456-426614174033");
 
     db.exec("DELETE FROM worker_jobs");
@@ -559,7 +561,7 @@ describe("Worker SQLite State", () => {
     let mockTime = 1000;
     let generatorCalled = false;
     const storeA = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000 });
-    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
+    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     storeA.createJob(req, "123e4567-e89b-42d3-a456-426614174034");
 
     // Advance past idempotency retention (24h)
@@ -568,7 +570,7 @@ describe("Worker SQLite State", () => {
       db, clock: () => mockTime, jobTtlMs: 5000,
       generateJobId: () => { generatorCalled = true; return Math.random().toString(16).slice(2).padStart(32, '0'); }
     });
-    const req2: WorkerCreateJobRequest = { url: "http://b", formatId: "1", principalId: "private-access-user" };
+    const req2: WorkerCreateJobRequest = { url: "http://b", formatId: "preset:720", principalId: "private-access-user" };
     const res = storeB.createJob(req2, "123e4567-e89b-42d3-a456-426614174034");
     assert.strictEqual(res.type, "created");
     assert.strictEqual(generatorCalled, true);
@@ -578,7 +580,7 @@ describe("Worker SQLite State", () => {
 
   it("queued + non-null objectKey fails closed", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174040");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174040");
 
     // Corrupt: set objectKey on a queued job
     const stmt = db.prepare("UPDATE worker_jobs SET object_key = ? WHERE job_id = ?");
@@ -589,7 +591,7 @@ describe("Worker SQLite State", () => {
 
   it("analyzing + objectKey rejected", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174041");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174041");
 
     const setStatus = db.prepare("UPDATE worker_jobs SET status = ?, object_key = ? WHERE job_id = ?");
     setStatus.run("analyzing", "videofetch/jobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2/12345678901234567890123456789012", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2");
@@ -599,7 +601,7 @@ describe("Worker SQLite State", () => {
 
   it("ready + null objectKey rejected", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174042");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174042");
 
     const stmt = db.prepare("UPDATE worker_jobs SET status = 'ready' WHERE job_id = ?");
     stmt.run("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3");
@@ -609,7 +611,7 @@ describe("Worker SQLite State", () => {
 
   it("ready + objectKey belonging to DIFFERENT job ID rejected", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174043");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174043");
 
     // objectKey embeds a DIFFERENT job ID
     const stmt = db.prepare("UPDATE worker_jobs SET status = 'ready', object_key = ? WHERE job_id = ?");
@@ -620,7 +622,7 @@ describe("Worker SQLite State", () => {
 
   it("ready + correctly matching objectKey accepted", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5" });
-    store.createJob({ url: "http://a", formatId: "1", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174044");
+    store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174044");
 
     const stmt = db.prepare("UPDATE worker_jobs SET status = 'ready', object_key = ? WHERE job_id = ?");
     stmt.run("videofetch/jobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5/12345678901234567890123456789012", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5");
@@ -637,7 +639,7 @@ describe("Worker SQLite State", () => {
     let mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000, generateJobId: () => Math.random().toString(16).slice(2).padStart(32, '0') });
 
-    const req1: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
+    const req1: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
 
     const res1 = store.createJob(req1, "123e4567-e89b-42d3-a456-426614174020");
     assert.strictEqual(res1.type, "created");
@@ -648,7 +650,7 @@ describe("Worker SQLite State", () => {
       assert.strictEqual(res1.job.jobId, res2.job.jobId);
     }
 
-    const req2: WorkerCreateJobRequest = { url: "http://b", formatId: "1", principalId: "private-access-user" };
+    const req2: WorkerCreateJobRequest = { url: "http://b", formatId: "preset:720", principalId: "private-access-user" };
     const res3 = store.createJob(req2, "123e4567-e89b-42d3-a456-426614174020");
     assert.strictEqual(res3.type, "conflict");
 
@@ -659,7 +661,7 @@ describe("Worker SQLite State", () => {
 
   it("idempotency restart persistence", () => {
     const store = new SQLiteJobStore({ db, generateJobId: () => "00000000000000000000000000000005" });
-    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
+    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     store.createJob(req, "123e4567-e89b-42d3-a456-426614174021");
 
     db.close();
@@ -676,7 +678,7 @@ describe("Worker SQLite State", () => {
   it("missing job / surviving tombstone -> expired", () => {
     const mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, generateJobId: () => "00000000000000000000000000000006" });
-    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
+    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     store.createJob(req, "123e4567-e89b-42d3-a456-426614174022");
 
     db.exec("DELETE FROM worker_jobs");
@@ -689,12 +691,12 @@ describe("Worker SQLite State", () => {
     let mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000, generateJobId: () => Math.random().toString(16).slice(2).padStart(32, '0') });
 
-    const req1: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
+    const req1: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     store.createJob(req1, "123e4567-e89b-42d3-a456-426614174023");
 
     mockTime = 1000 + 25 * 60 * 60 * 1000;
 
-    const req2: WorkerCreateJobRequest = { url: "http://b", formatId: "1", principalId: "private-access-user" };
+    const req2: WorkerCreateJobRequest = { url: "http://b", formatId: "preset:720", principalId: "private-access-user" };
     const res2 = store.createJob(req2, "123e4567-e89b-42d3-a456-426614174023");
     assert.strictEqual(res2.type, "created");
   });
@@ -704,7 +706,7 @@ describe("Worker SQLite State", () => {
   it("cleanupExpiredIdempotencyRecords deletes expired records", () => {
     let mockTime = 1000;
     const store = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000 });
-    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
+    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     store.createJob(req, "123e4567-e89b-42d3-a456-426614174050");
 
     // Count before
@@ -722,7 +724,7 @@ describe("Worker SQLite State", () => {
 
   it("cleanupExpiredIdempotencyRecords does not delete unexpired records", () => {
     const store = new SQLiteJobStore({ db, clock: () => 1000 });
-    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "1", principalId: "private-access-user" };
+    const req: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     store.createJob(req, "123e4567-e89b-42d3-a456-426614174051");
 
     const deleted = store.cleanupExpiredIdempotencyRecords();

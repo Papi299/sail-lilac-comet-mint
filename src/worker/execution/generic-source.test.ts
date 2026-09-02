@@ -1,0 +1,286 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import {
+  GENERIC_AUDIO_SOURCE_CONTAINERS,
+  GENERIC_FORMAT_SELECTOR_ATOM,
+  GENERIC_SOURCE_PROTOCOLS,
+  GENERIC_VIDEO_SOURCE_CONTAINERS,
+  GenericSourceSelectionSchema,
+  SAFE_FORMAT_ID_PATTERN,
+  buildGenericFormatSelector,
+  isSafeFormatId,
+  toGenericSourceContainer,
+  type GenericSourceSelection,
+} from "./generic-source.ts";
+
+/**
+ * Phase 10C3 §51: the raw upstream `format_id` boundary.
+ *
+ * These tests exist because this module is the ONE place a raw yt-dlp id is
+ * permitted to exist. They pin both halves of what makes that safe: the literal
+ * grammar an id must satisfy to become executable at all, and the exact shape
+ * of the selector expression built from it.
+ */
+
+const MUXED: GenericSourceSelection = {
+  formatId: "22",
+  protocol: "https",
+  container: "mp4",
+  hasVideo: true,
+  hasAudio: true,
+  fileSize: 1024,
+};
+
+describe("generic source: safe raw format id grammar (§11)", () => {
+  it("accepts the id shapes real extractors actually emit", () => {
+    const accepted = [
+      "22",
+      "137",
+      "18",
+      "best",
+      "hls-6",
+      "http-1080p",
+      "dash_video_1",
+      "audio.medium",
+      "vp9-2160p60",
+      "A".repeat(128),
+      "a",
+      "0",
+      "-",
+      "_",
+      ".",
+    ];
+    for (const id of accepted) {
+      assert.equal(isSafeFormatId(id), true, `expected ${JSON.stringify(id)} to be safe`);
+    }
+  });
+
+  // Each rejected character is one that carries meaning inside yt-dlp's own
+  // format-selector grammar, so accepting it would be a selector-injection
+  // surface rather than merely an odd identifier.
+  const REJECTED: Array<[string, string]> = [
+    ["slash", "bv/ba"],
+    ["plus", "bv+ba"],
+    ["comma", "22,18"],
+    ["open bracket", "22[ext=mp4"],
+    ["close bracket", "22]"],
+    ["open paren", "(22"],
+    ["close paren", "22)"],
+    ["double quote", 'a"b'],
+    ["single quote", "a'b"],
+    ["colon", "http:22"],
+    ["space", "22 18"],
+    ["tab", "22\t18"],
+    ["newline", "22\n18"],
+    ["carriage return", "22\r18"],
+    ["nul", "22\u000018"],
+    ["escape", "22\u001b18"],
+    ["del", "22\u007f"],
+    ["backslash", "a\\b"],
+    ["asterisk", "b*"],
+    ["equals", "ext=mp4"],
+    ["bang", "vcodec!=none"],
+    ["non-ascii", "22é"],
+    ["empty", ""],
+    ["over length", "A".repeat(129)],
+  ];
+
+  for (const [label, value] of REJECTED) {
+    it(`rejects ${label}`, () => {
+      assert.equal(isSafeFormatId(value), false, `expected ${JSON.stringify(value)} rejected`);
+      assert.equal(SAFE_FORMAT_ID_PATTERN.test(value), false);
+      assert.equal(
+        GenericSourceSelectionSchema.safeParse({ ...MUXED, formatId: value }).success,
+        false,
+        "an unsafe id must not survive selection validation either",
+      );
+    });
+  }
+
+  it("rejects a multi-line id even when the first line alone would be safe", () => {
+    // Guards the classic `^...$` regex mistake: without `\n` exclusion, `$`
+    // matches before a trailing newline and "22\nmalicious" would pass.
+    assert.equal(isSafeFormatId("22\nbv+ba"), false);
+    assert.equal(isSafeFormatId("22\n"), false);
+  });
+
+  it("is anchored, so a safe substring cannot smuggle an unsafe whole", () => {
+    assert.equal(isSafeFormatId("safe[ext=mp4]"), false);
+    assert.equal(isSafeFormatId("prefix safe"), false);
+  });
+
+  it("rejects non-string input", () => {
+    for (const value of [null, undefined, 22, {}, [], true]) {
+      assert.equal(isSafeFormatId(value), false);
+    }
+  });
+});
+
+describe("generic source: container allowlist (§15)", () => {
+  it("accepts only mp4/webm for video candidates", () => {
+    assert.deepEqual([...GENERIC_VIDEO_SOURCE_CONTAINERS], ["mp4", "webm"]);
+    for (const ext of ["mp4", "webm", "MP4", "WebM"]) {
+      assert.notEqual(toGenericSourceContainer(ext, { hasVideo: true }), null, ext);
+    }
+    for (const ext of ["mkv", "mov", "avi", "flv", "m4a", "mp3", "ts", "3gp"]) {
+      assert.equal(
+        toGenericSourceContainer(ext, { hasVideo: true }),
+        null,
+        `${ext} must not be an executable generic VIDEO container`,
+      );
+    }
+  });
+
+  it("accepts the audio subset for audio-only candidates", () => {
+    for (const ext of GENERIC_AUDIO_SOURCE_CONTAINERS) {
+      assert.notEqual(toGenericSourceContainer(ext, { hasVideo: false }), null, ext);
+    }
+    for (const ext of ["mkv", "mov", "avi", "vtt", "srt", "mhtml", "jpg"]) {
+      assert.equal(toGenericSourceContainer(ext, { hasVideo: false }), null, ext);
+    }
+  });
+
+  it("never defaults an unknown or absent extension to mp4", () => {
+    // Phase-10C2 analysis defaults a missing ext to "mp4" for DESCRIPTION.
+    // Execution must not: the extension becomes a real file suffix and a
+    // selector constraint.
+    for (const value of [null, undefined, "", "  ", "wat", "exe", "bin"]) {
+      assert.equal(toGenericSourceContainer(value, { hasVideo: true }), null);
+      assert.equal(toGenericSourceContainer(value, { hasVideo: false }), null);
+    }
+  });
+});
+
+describe("generic source: protocol policy (§16)", () => {
+  it("permits exactly http and https", () => {
+    assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https"]);
+  });
+
+  it("refuses every manifest, fragment and streaming protocol", () => {
+    for (const protocol of [
+      "m3u8",
+      "m3u8_native",
+      "http_dash_segments",
+      "rtmp",
+      "rtmp_ffmpeg",
+      "ism",
+      "mhtml",
+      "websocket_frag",
+      "niconico_live",
+      "ftp",
+      "",
+    ]) {
+      assert.equal(
+        GenericSourceSelectionSchema.safeParse({ ...MUXED, protocol }).success,
+        false,
+        `${protocol} must never be an executable generic protocol`,
+      );
+    }
+  });
+});
+
+describe("generic source: format selector construction (§12/§13/§14)", () => {
+  it("builds the exact expression for a muxed video source", () => {
+    assert.equal(
+      buildGenericFormatSelector(MUXED),
+      'b*[format_id="22"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!="none"]',
+    );
+  });
+
+  it("builds the exact expression for an audio-only source", () => {
+    assert.equal(
+      buildGenericFormatSelector({
+        formatId: "140",
+        protocol: "https",
+        container: "m4a",
+        hasVideo: false,
+        hasAudio: true,
+        fileSize: null,
+      }),
+      'b*[format_id="140"][protocol="https"][ext="m4a"][vcodec="none"][acodec!="none"]',
+    );
+  });
+
+  it("QUOTES the format id, which is what makes numeric ids work at all", () => {
+    // yt-dlp 2026.08.19 `_build_format_filter` tries a NUMERIC regex first.
+    // `[format_id=22]` fullmatches it, becomes float 22.0, and is compared
+    // against the STRING "22" — which is never equal, so the filter silently
+    // matches nothing. Quoting forces the STR_OPERATORS branch, where `=` is
+    // string equality. Numeric ids are extremely common, so this is not an
+    // edge case.
+    const selector = buildGenericFormatSelector(MUXED);
+    assert.match(selector, /\[format_id="22"\]/);
+    assert.doesNotMatch(selector, /\[format_id=22\]/);
+  });
+
+  it("uses the application-owned b* atom, never a bare raw-id atom (§12)", () => {
+    const selector = buildGenericFormatSelector(MUXED);
+    assert.equal(GENERIC_FORMAT_SELECTOR_ATOM, "b*");
+    assert.ok(selector.startsWith("b*["), "the atom must precede every filter");
+    // The raw id appears ONLY inside a quoted format_id filter — never as a
+    // standalone selector token, where it could collide with yt-dlp's special
+    // vocabulary (best/worst/all/mergeall/extension names).
+    assert.equal(selector.split('"22"').length - 1, 1, "the raw id appears exactly once");
+    assert.doesNotMatch(selector, /(^|[[\]/+,])22([[\]/+,]|$)/);
+  });
+
+  it("never emits a choice, merge or list operator", () => {
+    for (const shape of [
+      MUXED,
+      { ...MUXED, hasVideo: false, container: "m4a" as const },
+      { ...MUXED, hasAudio: false },
+    ]) {
+      const selector = buildGenericFormatSelector(shape);
+      assert.doesNotMatch(selector, /\//, "no `/` fallback: one source or none");
+      assert.doesNotMatch(selector, /\+/, "no `+` merge: generic v1 never merges streams");
+      assert.doesNotMatch(selector, /,/, "no `,` selector list");
+      assert.doesNotMatch(selector, /[()]/, "no grouping");
+    }
+  });
+
+  it("binds protocol, container and stream shape, not just the id (§14)", () => {
+    const selector = buildGenericFormatSelector(MUXED);
+    assert.match(selector, /\[protocol="https"\]/);
+    assert.match(selector, /\[ext="mp4"\]/);
+    assert.match(selector, /\[vcodec!="none"\]/);
+    assert.match(selector, /\[acodec!="none"\]/);
+  });
+
+  it("inverts the stream-shape constraints to match the approved shape", () => {
+    const videoOnly = buildGenericFormatSelector({ ...MUXED, hasAudio: false });
+    assert.match(videoOnly, /\[vcodec!="none"\]/);
+    assert.match(videoOnly, /\[acodec="none"\]/);
+
+    const audioOnly = buildGenericFormatSelector({
+      ...MUXED,
+      container: "m4a",
+      hasVideo: false,
+    });
+    assert.match(audioOnly, /\[vcodec="none"\]/);
+    assert.match(audioOnly, /\[acodec!="none"\]/);
+  });
+
+  it("refuses to build a selector from an unsafe id", () => {
+    for (const formatId of ['a"b', "bv+ba", "22/18", "a b", "22]"]) {
+      assert.throws(
+        () => buildGenericFormatSelector({ ...MUXED, formatId }),
+        "an unsafe id must never reach selector construction",
+      );
+    }
+  });
+
+  it("refuses to build a selector from a disallowed protocol or container", () => {
+    assert.throws(() =>
+      buildGenericFormatSelector({ ...MUXED, protocol: "m3u8_native" as never }),
+    );
+    assert.throws(() => buildGenericFormatSelector({ ...MUXED, container: "mkv" as never }));
+  });
+
+  it("produces a selector containing no character outside the safe filter set", () => {
+    // Whole-expression assertion: whatever the inputs, the emitted string is
+    // built only from the atom, bracket/quote delimiters, known keys, and
+    // grammar-checked values.
+    const selector = buildGenericFormatSelector(MUXED);
+    assert.match(selector, /^b\*(\[[a-z_]+!?="[A-Za-z0-9._-]{1,128}"\])+$/);
+  });
+});

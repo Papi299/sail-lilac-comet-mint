@@ -5,7 +5,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { AppError } from "../../lib/errors.ts";
-import type { WorkerVideoMetadata } from "../../shared/worker/contracts.ts";
+import type {
+  WorkerRequestedFormatId,
+  WorkerVideoMetadata,
+} from "../../shared/worker/contracts.ts";
 import { JobExecutor } from "../execution/job-executor.server.ts";
 import { QueuePump } from "../execution/queue-pump.server.ts";
 import { QueueRunner } from "../execution/queue-runner.server.ts";
@@ -39,7 +42,10 @@ class NoopWriter implements ObjectStoreWriter {
   async delete() {}
 }
 
-function request(url = "https://cdn.example/a.mp4", formatId = "direct-original") {
+function request(
+  url = "https://cdn.example/a.mp4",
+  formatId: WorkerRequestedFormatId = "direct-original",
+) {
   return { url, formatId, principalId: "private-access-user" as const };
 }
 

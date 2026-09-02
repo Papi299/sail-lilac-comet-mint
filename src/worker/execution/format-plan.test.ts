@@ -5,6 +5,11 @@ import { VideoMetadataSchema, type WorkerVideoMetadata } from "@/shared/worker/c
 import {
   DIRECT_KEEP_CONTAINERS,
   deriveDirectExecutionPlan,
+  deriveExecutionPlan,
+  deriveGenericExecutionPlan,
+  executionPlanRequestedFormatId,
+  executionPlanRequiresProcessing,
+  executionPlanTargetContainer,
   planRequiresProcessing,
 } from "./format-plan.ts";
 
@@ -337,5 +342,266 @@ describe("direct execution plan derivation", () => {
     const audioPlan = deriveDirectExecutionPlan(audioMeta, "preset:audio");
     assert.equal(audioPlan.expectHasVideo, false);
     assert.equal(audioPlan.expectHasAudio, true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC EXECUTION PLANS — Phase 10C3 §18/§19/§37/§38
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("generic execution plan (§18)", () => {
+  const MUXED_MP4 = {
+    formatId: "22",
+    protocol: "https" as const,
+    container: "mp4" as const,
+    hasVideo: true,
+    hasAudio: true,
+    fileSize: 1000,
+  };
+  const AUDIO_M4A = {
+    formatId: "140",
+    protocol: "https" as const,
+    container: "m4a" as const,
+    hasVideo: false,
+    hasAudio: true,
+    fileSize: 500,
+  };
+
+  function meta(presets: Array<{ id: string; container: string; hasVideo: boolean }>) {
+    return VideoMetadataSchema.parse({
+      title: "generic",
+      thumbnail: null,
+      duration: 100,
+      source: "example.invalid",
+      extractor: "yt-dlp",
+      webpageUrl: "https://example.invalid/x",
+      formats: [],
+      presets: presets.map((p) => ({
+        id: p.id,
+        label: p.id,
+        resolution: p.hasVideo ? "1080p" : "audio",
+        container: p.container,
+        fileSize: null,
+        hasVideo: p.hasVideo,
+        hasAudio: true,
+        formatId: p.id,
+        videoCodec: p.hasVideo ? "h264" : null,
+        audioCodec: "aac",
+        fps: null,
+      })),
+      capabilities: { mp3: true, merge: false },
+    });
+  }
+
+  it("generic VIDEO keeps the single muxed source verbatim (§37)", () => {
+    const plan = deriveGenericExecutionPlan(
+      meta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
+      { "preset:1080": MUXED_MP4 },
+      "preset:1080",
+    );
+    assert.equal(plan.strategy, "yt-dlp");
+    assert.equal(plan.operation, "keep-original");
+    assert.equal(plan.targetContainer, "mp4");
+    assert.equal(plan.source.formatId, "22");
+    assert.equal(plan.source.protocol, "https");
+    assert.equal(plan.source.hasVideo, true);
+    assert.equal(plan.source.hasAudio, true);
+  });
+
+  it("keeps a webm source as webm rather than remuxing it", () => {
+    const src = { ...MUXED_MP4, container: "webm" as const, formatId: "248" };
+    const plan = deriveGenericExecutionPlan(
+      meta([{ id: "preset:best", container: "webm", hasVideo: true }]),
+      { "preset:best": src },
+      "preset:best",
+    );
+    assert.equal(plan.operation, "keep-original");
+    assert.equal(plan.targetContainer, "webm");
+  });
+
+  it("preset:audio KEEPS a real audio-only source (§38)", () => {
+    const plan = deriveGenericExecutionPlan(
+      meta([{ id: "preset:audio", container: "m4a", hasVideo: false }]),
+      { "preset:audio": AUDIO_M4A },
+      "preset:audio",
+    );
+    assert.equal(plan.operation, "keep-original");
+    assert.equal(plan.targetContainer, "m4a");
+    assert.equal(plan.source.hasVideo, false);
+  });
+
+  it("preset:audio EXTRACTS m4a from a muxed source (§38)", () => {
+    const plan = deriveGenericExecutionPlan(
+      meta([{ id: "preset:audio", container: "m4a", hasVideo: false }]),
+      { "preset:audio": MUXED_MP4 },
+      "preset:audio",
+    );
+    assert.equal(plan.operation, "extract-m4a");
+    assert.equal(plan.targetContainer, "m4a");
+    // The SOURCE stays the muxed original: yt-dlp downloads it whole and the
+    // Worker's own FFmpeg extracts audio after processing begins.
+    assert.equal(plan.source.container, "mp4");
+    assert.equal(plan.source.hasVideo, true);
+  });
+
+  it("preset:mp3 is always a Worker transcode (§38)", () => {
+    for (const source of [MUXED_MP4, AUDIO_M4A]) {
+      const plan = deriveGenericExecutionPlan(
+        meta([{ id: "preset:mp3", container: "mp3", hasVideo: false }]),
+        { "preset:mp3": source },
+        "preset:mp3",
+      );
+      assert.equal(plan.operation, "extract-mp3");
+      assert.equal(plan.targetContainer, "mp3");
+      assert.equal(plan.source.container, source.container);
+    }
+  });
+
+  it("FORMAT_UNAVAILABLE when the preset is not advertised", () => {
+    assert.throws(
+      () =>
+        deriveGenericExecutionPlan(
+          meta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
+          { "preset:1080": MUXED_MP4 },
+          "preset:2160",
+        ),
+      (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
+    );
+  });
+
+  it("FORMAT_UNAVAILABLE when a preset carries no private selection", () => {
+    // Advertised but unacquirable is worse than absent, so it is refused.
+    assert.throws(
+      () =>
+        deriveGenericExecutionPlan(
+          meta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
+          {},
+          "preset:1080",
+        ),
+      (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
+    );
+  });
+
+  it("FORMAT_UNAVAILABLE when the selection fails its own validation", () => {
+    for (const bad of [
+      { ...MUXED_MP4, formatId: "bv+ba" },
+      { ...MUXED_MP4, protocol: "m3u8_native" },
+      { ...MUXED_MP4, container: "mkv" },
+    ]) {
+      assert.throws(
+        () =>
+          deriveGenericExecutionPlan(
+            meta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
+            { "preset:1080": bad as never },
+            "preset:1080",
+          ),
+        (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
+      );
+    }
+  });
+
+  it("FORMAT_UNAVAILABLE when the advertised container would not equal the produced one", () => {
+    // The preset promises webm; the source is mp4 and generic v1 never remuxes.
+    assert.throws(
+      () =>
+        deriveGenericExecutionPlan(
+          meta([{ id: "preset:1080", container: "webm", hasVideo: true }]),
+          { "preset:1080": MUXED_MP4 },
+          "preset:1080",
+        ),
+      (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
+    );
+  });
+
+  it("refuses a video preset backed by a split (video-only) source", () => {
+    assert.throws(
+      () =>
+        deriveGenericExecutionPlan(
+          meta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
+          { "preset:1080": { ...MUXED_MP4, hasAudio: false } },
+          "preset:1080",
+        ),
+      (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
+    );
+  });
+
+  it("refuses a concrete (non-preset) id: generic advertises no formats", () => {
+    assert.throws(
+      () =>
+        deriveGenericExecutionPlan(
+          meta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
+          { "preset:1080": MUXED_MP4 },
+          "direct-original",
+        ),
+      (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
+    );
+  });
+
+  it("refuses anything outside the closed request vocabulary", () => {
+    for (const id of ["22", "best", "preset:9999", "", "bv+ba"]) {
+      assert.throws(
+        () =>
+          deriveGenericExecutionPlan(
+            meta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
+            { "preset:1080": MUXED_MP4 },
+            id,
+          ),
+        (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
+      );
+    }
+  });
+});
+
+describe("strategy-aware plan wrapper (§19)", () => {
+  it("routes a direct analysis to the untouched direct planner", () => {
+    const meta = VideoMetadataSchema.parse({
+      title: "direct",
+      thumbnail: null,
+      duration: null,
+      source: "cdn.example",
+      extractor: "direct",
+      webpageUrl: "https://cdn.example/a.mp4",
+      formats: [
+        {
+          id: "direct-original",
+          resolution: "unknown",
+          width: null,
+          height: null,
+          fps: null,
+          container: "mp4",
+          videoCodec: "h264",
+          audioCodec: "aac",
+          bitrate: null,
+          fileSize: 10,
+          hasVideo: true,
+          hasAudio: true,
+          formatNote: null,
+        },
+      ],
+      presets: [],
+      capabilities: { mp3: false, merge: false },
+    });
+
+    const plan = deriveExecutionPlan(
+      { strategy: "direct", video: meta, selections: {} },
+      "direct-original",
+    );
+    assert.equal(plan.strategy, "direct");
+    assert.equal(executionPlanTargetContainer(plan), "mp4");
+    assert.equal(executionPlanRequestedFormatId(plan), "direct-original");
+    assert.equal(executionPlanRequiresProcessing(plan), false);
+    // No generic concept leaks into the direct plan.
+    assert.equal("source" in plan.direct, false);
+  });
+
+  it("rejects an out-of-vocabulary id before either planner runs", () => {
+    assert.throws(
+      () =>
+        deriveExecutionPlan(
+          { strategy: "direct", video: {} as never, selections: {} },
+          "bv+ba",
+        ),
+      (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
+    );
   });
 });

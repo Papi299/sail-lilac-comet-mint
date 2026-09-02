@@ -15,8 +15,13 @@ import {
   serializeAccessCookie,
   serializeClearedAccessCookie,
 } from "@/lib/security/private-access.server";
+import { GENERIC_YTDLP_EXECUTION_IMPLEMENTED } from "@/shared/capabilities";
 import { WORKER_PRIVATE_PRINCIPAL } from "@/shared/worker/constants";
-import { WorkerAnalyzeRequestSchema, WorkerJobIdSchema } from "@/shared/worker/contracts";
+import {
+  WorkerAnalyzeRequestSchema,
+  WorkerJobIdSchema,
+  WorkerRequestedFormatIdSchema,
+} from "@/shared/worker/contracts";
 import {
   getObjectStoreSigner,
   getWorkerClient,
@@ -52,23 +57,18 @@ export function resetPrivateAccessApiForTests(): void {
  * registry or binary probe of its own.
  */
 /**
- * Whether THIS BUILD contains a generic yt-dlp execution path at all.
+ * Re-exported from the dependency-free shared module so the browser diagnostics
+ * route can state the same compile-time fact without importing this server-only
+ * module (which carries the worker client, the object-store signer and the SSRF
+ * boundary).
  *
- * This is a compile-time fact about the source, not deployment configuration,
- * and it is deliberately a constant rather than an environment variable: an
- * operator setting must never be able to claim that code exists. As of
- * `PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001` the Worker has no generic analyze
- * or download path — `WorkerService.analyze()` resolves only to the
- * direct-media analyzer and `JobExecutor` has no generic branch — so no
- * combination of "runtime installed" and "operator enabled" can make generic
- * extraction usable.
- *
- * The later integration phase that actually adds the execution path flips this
- * in the same commit. Until then it fails closed in the safe direction: if the
- * Worker somehow gained the capability first, `/api/sites` would under-report
- * rather than over-promise.
+ * It is one of THREE independent conjuncts in `ytdlp` below, and the weakest
+ * kind of claim of the three: code existing is not a runtime being installed,
+ * and neither is an operator having enabled the feature. Production still runs
+ * with `YTDLP_ENABLED` unset as of this change, so `/api/sites.ytdlp` remains
+ * false there.
  */
-export const GENERIC_YTDLP_EXECUTION_IMPLEMENTED = false;
+export { GENERIC_YTDLP_EXECUTION_IMPLEMENTED } from "@/shared/capabilities";
 
 async function loadSites() {
   const diagnostics = await getWorkerClient().diagnostics();
@@ -76,9 +76,11 @@ async function loadSites() {
   // generic site right now? Three things must hold — the code path must exist,
   // the pinned runtime must execute, and the operator must have enabled it.
   //
-  // `installed && enabled` is NOT sufficient and must not be used here. Both
-  // can be true in Phase 10C1 while no execution path exists, and reporting
-  // that as capability would tell the browser that every catalog site works.
+  // All three are still required after Phase 10C3. The constant became true, so
+  // the conjunction now genuinely tracks the other two rather than being pinned
+  // false by the first — which is exactly why they must stay conjoined: an
+  // image without the runtime, or a deployment with YTDLP_ENABLED unset, must
+  // still report false.
   const ytdlpInstalled = diagnostics.binaries.ytdlp;
   const ytdlpEnabled = diagnostics.features.ytdlpEnabled;
   return {
@@ -205,8 +207,14 @@ export async function handleDownload(request: Request): Promise<Response> {
       url?: unknown;
       formatId?: unknown;
     } | null;
-    const formatId = typeof body?.formatId === "string" ? body.formatId : "";
-    if (!formatId) throw new AppError("FORMAT_UNAVAILABLE");
+    // §6: the browser's format vocabulary is CLOSED. Anything outside it —
+    // including a raw yt-dlp `format_id`, a strategy name, a downloader or a
+    // yt-dlp argument — is rejected here, before a job is created and before
+    // the Worker is contacted. The Worker validates independently again on its
+    // own side; this is the early, cheap half of that pair.
+    const requestedFormat = WorkerRequestedFormatIdSchema.safeParse(body?.formatId);
+    if (!requestedFormat.success) throw new AppError("FORMAT_UNAVAILABLE");
+    const formatId = requestedFormat.data;
     const url = await validateBrowserUrl(body?.url);
 
     const created = await getWorkerClient().createJob({

@@ -2,7 +2,10 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { AppError, type ErrorCode } from "../../lib/errors.ts";
 import { WORKER_ERROR_CODES } from "../../shared/worker/errors.ts";
-import type { WorkerVideoMetadata } from "../../shared/worker/contracts.ts";
+import type {
+  WorkerExtractorStrategy,
+  WorkerVideoMetadata,
+} from "../../shared/worker/contracts.ts";
 import {
   GENERIC_FALLBACK_TRIGGER_CODE,
   analyzeMedia,
@@ -19,7 +22,7 @@ const LIMITS: GenericAnalysisLimits = {
   maxFileSizeBytes: 500 * 1024 * 1024,
 };
 
-function metadata(extractor: string): WorkerVideoMetadata {
+function metadata(extractor: WorkerExtractorStrategy): WorkerVideoMetadata {
   return {
     title: "A Video",
     thumbnail: null,
