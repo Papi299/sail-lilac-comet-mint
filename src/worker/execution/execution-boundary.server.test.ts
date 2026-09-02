@@ -12,6 +12,7 @@ import { VideoMetadataSchema, type WorkerVideoMetadata } from "@/shared/worker/c
 import type { DurableWorkerJob } from "@/worker/state/job-store";
 import type { ObjectStoreWriter, ObjectStorePutInput } from "@/worker/storage/writer.ts";
 import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
+import type { WorkerRequestedFormatId } from "../../shared/worker/contracts.ts";
 
 type PresetSpec = { id: string; container: string; hasVideo: boolean };
 
@@ -61,6 +62,7 @@ function buildMeta(
 }
 
 type Harness = {
+  db: DatabaseSync;
   store: SQLiteJobStore;
   puts: ObjectStorePutInput[];
   deletes: string[];
@@ -104,6 +106,7 @@ function makeHarness(): Harness {
   };
 
   return {
+    db,
     store,
     puts,
     deletes,
@@ -117,7 +120,7 @@ function makeHarness(): Harness {
   };
 }
 
-function claimJob(store: SQLiteJobStore, formatId: string): DurableWorkerJob {
+function claimJob(store: SQLiteJobStore, formatId: WorkerRequestedFormatId): DurableWorkerJob {
   store.createJob(
     { url: "https://cdn.example.com/clip.mp4", formatId, principalId: "private-access-user" },
     randomUUID(),
@@ -240,7 +243,13 @@ describe("download → processing execution boundary", () => {
   });
 
   it("§10: the advertised preset equals the produced artifact end-to-end", async () => {
-    const cases = [
+    const cases: Array<{
+      formatId: WorkerRequestedFormatId;
+      source: string;
+      advertised: string;
+      expectProcess: boolean;
+      mime: string;
+    }> = [
       { formatId: "direct-original", source: "mp4", advertised: "mp4", expectProcess: false, mime: "video/mp4" },
       { formatId: "preset:best", source: "mkv", advertised: "mp4", expectProcess: true, mime: "video/mp4" },
       { formatId: "preset:best", source: "mkv", advertised: "webm", expectProcess: true, mime: "video/webm" },
@@ -339,7 +348,16 @@ describe("download → processing execution boundary", () => {
   });
 
   it("an unknown requested format fails before any download or processing", async () => {
-    const job = claimJob(h.store, "preset:does-not-exist");
+    // Since Phase 10C3 `createJob` refuses an unknown id outright (§6), so this
+    // writes the durable row DIRECTLY to reach past that boundary. It proves
+    // the EXECUTOR still fails closed when an unknown value nonetheless reaches
+    // durable state — a row written by an older build, or a preset the site has
+    // stopped advertising since the browser analyzed it (§17).
+    const seed = claimJob(h.store, "preset:best");
+    h.db
+      .prepare("UPDATE worker_jobs SET format_id = ? WHERE job_id = ?")
+      .run("preset:does-not-exist", seed.jobId);
+    const job = { ...seed, formatId: "preset:does-not-exist" as WorkerRequestedFormatId };
     let downloads = 0;
     let processes = 0;
 

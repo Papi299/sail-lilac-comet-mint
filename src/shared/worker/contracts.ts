@@ -30,6 +30,58 @@ export function workerJobCancelPath(jobId: string): string {
   return `${WORKER_JOBS_PATH}/${validId}/cancel`;
 }
 
+// --- Worker-owned execution strategy identity ---
+
+/**
+ * The CLOSED set of execution strategies the Worker may select and persist.
+ *
+ * This is a Worker-owned identity, never a browser input and never an upstream
+ * value. yt-dlp's own `extractor` / `extractor_key` fields are arbitrary
+ * strings the SOURCE controls; they are untrusted metadata and must never
+ * reach durable strategy state or influence execution.
+ *
+ * Phase 10C3 narrows every strategy-bearing field to this union so that an
+ * arbitrary string can no longer be stored as, or mistaken for, a strategy.
+ */
+export const WorkerExtractorStrategySchema = z.enum(["direct", "yt-dlp"]);
+export type WorkerExtractorStrategy = z.infer<typeof WorkerExtractorStrategySchema>;
+
+// --- Browser-selectable format vocabulary ---
+
+/**
+ * The COMPLETE set of format identifiers a browser may request (§6).
+ *
+ * Before Phase 10C3 this was `z.string().min(1)`, which let the browser send an
+ * arbitrary identifier. That surface is now closed: the vocabulary is
+ * application-owned, and a raw yt-dlp `format_id` can never appear here because
+ * no upstream string matches any member.
+ *
+ * The values are exactly what the product already advertises:
+ *   - `direct-original` — the direct extractor's single concrete format;
+ *   - `preset:*`        — the shared application preset ladder, used verbatim
+ *                         by BOTH the direct and the generic analyzers.
+ *
+ * Generic analysis returns `formats: []`, so presets are the only generic
+ * selectable options and no per-site identifier is ever exposed.
+ */
+export const WORKER_REQUESTED_FORMAT_IDS = [
+  "direct-original",
+  "preset:best",
+  "preset:2160",
+  "preset:1440",
+  "preset:1080",
+  "preset:720",
+  "preset:480",
+  "preset:360",
+  "preset:240",
+  "preset:144",
+  "preset:audio",
+  "preset:mp3",
+] as const;
+
+export const WorkerRequestedFormatIdSchema = z.enum(WORKER_REQUESTED_FORMAT_IDS);
+export type WorkerRequestedFormatId = z.infer<typeof WorkerRequestedFormatIdSchema>;
+
 // --- Status & DTOs ---
 
 export const WorkerJobStatusSchema = z.enum([
@@ -64,7 +116,8 @@ export const WorkerJobViewSchema = z
     title: z.string().nullable(),
     thumbnail: z.string().url().nullable(),
     source: z.string().nullable(),
-    extractor: z.string().nullable(),
+    // Worker-owned strategy identity, never an upstream extractor name.
+    extractor: WorkerExtractorStrategySchema.nullable(),
     createdAt: z.number().int().nonnegative(),
     updatedAt: z.number().int().nonnegative(),
     expiresAt: z.number().int().nonnegative(),
@@ -100,7 +153,9 @@ const UrlSchema = z
 export const WorkerCreateJobRequestSchema = z
   .object({
     url: UrlSchema,
-    formatId: z.string().min(1),
+    // §6: closed, application-owned vocabulary. The browser cannot send a raw
+    // yt-dlp format id, and cannot name a strategy, downloader or operation.
+    formatId: WorkerRequestedFormatIdSchema,
     principalId: z.literal(WORKER_PRIVATE_PRINCIPAL),
   })
   .strict();
@@ -157,7 +212,8 @@ export const VideoMetadataSchema = z
     thumbnail: z.string().nullable(), // url() not strictly enforced for legacy metadata, but usually url
     duration: z.number().nullable(),
     source: z.string(),
-    extractor: z.string(),
+    // Worker-owned strategy identity: exactly `direct` or `yt-dlp`.
+    extractor: WorkerExtractorStrategySchema,
     webpageUrl: z.string(),
     formats: z.array(NormalizedFormatSchema),
     presets: z.array(QualityPresetSchema),

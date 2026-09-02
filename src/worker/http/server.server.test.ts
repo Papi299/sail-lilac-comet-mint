@@ -10,6 +10,7 @@ import { request } from "node:http";
 import net from "node:net";
 import { WorkerAuthenticationError } from "../security/authenticate.server.ts";
 import type { WorkerBusinessService } from "./business-service.server.ts";
+import type { WorkerVideoMetadata } from "../../shared/worker/contracts.ts";
 
 class MockReplayStore implements WorkerReplayStore {
   public reserved = new Set<string>();
@@ -65,7 +66,7 @@ class SpyBusinessService implements WorkerBusinessService {
   }
 }
 
-const SAMPLE_VIDEO = {
+const SAMPLE_VIDEO: WorkerVideoMetadata = {
   title: "Clip",
   thumbnail: null,
   duration: null,
@@ -234,7 +235,7 @@ test("Worker HTTP Server", async (t) => {
         assert.strictEqual(res.status, expected, `${method} ${path} failed`);
       } else {
         const payload = type === "jobs_create" 
-          ? { url: "https://example.com", formatId: "best", principalId: "private-access-user" }
+          ? { url: "https://example.com", formatId: "preset:best", principalId: "private-access-user" }
           : (type === "analyze" ? { url: "https://example.com" } : "");
         const body = Buffer.from(typeof payload === "string" ? payload : JSON.stringify(payload));
         const idempotencyKey = type === "jobs_create" ? "11111111-1111-4111-a111-111111111111" : undefined;

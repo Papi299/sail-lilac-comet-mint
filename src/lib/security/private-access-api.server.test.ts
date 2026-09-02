@@ -31,6 +31,7 @@ import type {
   WorkerJobStatus,
   WorkerJobView,
   WorkerObjectKey,
+  WorkerVideoMetadata,
 } from "../../shared/worker/contracts.ts";
 import { WorkerJobViewSchema } from "../../shared/worker/contracts.ts";
 import {
@@ -50,7 +51,7 @@ const OBJECT_KEY = `videofetch/jobs/${JOB_ID}/aaaabbbbccccddddeeeeffff00001111`;
 const SIGNED_URL =
   "https://acct.r2.cloudflarestorage.com/bucket/videofetch/jobs/x?X-Amz-Signature=deadbeef";
 
-const VIDEO = {
+const VIDEO: WorkerVideoMetadata = {
   title: "Clip",
   thumbnail: null,
   duration: 10,

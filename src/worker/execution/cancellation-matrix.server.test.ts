@@ -13,6 +13,7 @@ import { VideoMetadataSchema, type WorkerVideoMetadata } from "@/shared/worker/c
 import type { DurableWorkerJob, WorkerJobStore } from "@/worker/state/job-store";
 import type { ObjectStoreWriter, ObjectStorePutInput } from "@/worker/storage/writer.ts";
 import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
+import type { WorkerRequestedFormatId } from "../../shared/worker/contracts.ts";
 
 function buildMeta(
   original: { container: string; hasVideo: boolean },
@@ -131,7 +132,7 @@ function makeHarness(): Harness {
   };
 }
 
-function claimJob(store: WorkerJobStore, formatId: string): DurableWorkerJob {
+function claimJob(store: WorkerJobStore, formatId: WorkerRequestedFormatId): DurableWorkerJob {
   store.createJob(
     { url: "https://cdn.example.com/clip.mp4", formatId, principalId: "private-access-user" },
     randomUUID(),

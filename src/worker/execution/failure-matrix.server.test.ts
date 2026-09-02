@@ -13,6 +13,7 @@ import { VideoMetadataSchema, type WorkerVideoMetadata } from "@/shared/worker/c
 import type { DurableWorkerJob } from "@/worker/state/job-store";
 import type { ObjectStoreWriter, ObjectStorePutInput } from "@/worker/storage/writer.ts";
 import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
+import type { WorkerRequestedFormatId } from "../../shared/worker/contracts.ts";
 
 /** Markers that must never survive into durable state or any log line. */
 const RAW_MARKERS = [
@@ -119,7 +120,7 @@ function makeHarness(): Harness {
   };
 }
 
-function claimJob(store: SQLiteJobStore, formatId: string): DurableWorkerJob {
+function claimJob(store: SQLiteJobStore, formatId: WorkerRequestedFormatId): DurableWorkerJob {
   store.createJob(
     { url: "https://cdn.example.com/clip.mp4", formatId, principalId: "private-access-user" },
     randomUUID(),
@@ -196,7 +197,7 @@ describe("failure matrix", () => {
     h.cleanup();
   });
 
-  function run(formatId: string, deps: JobExecutorDeps) {
+  function run(formatId: WorkerRequestedFormatId, deps: JobExecutorDeps) {
     const job = claimJob(h.store, formatId);
     const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps);
     return { job, executor, done: executor.execute(job) };
