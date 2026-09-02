@@ -122,6 +122,8 @@ export function buildEvidence(input) {
     startedAt,
     finishedAt,
     expectedSha,
+    binding,
+    acceptedCases,
     runningImageId,
     imageTags,
     runtime,
@@ -152,6 +154,14 @@ export function buildEvidence(input) {
       runningImageId: runningImageId ?? null,
       imageTags: imageTags ?? null,
     },
+
+    // The DEPLOYMENT BINDING (§29/§30 of CORRECTION-01). A Stage A PASS
+    // authorizes Stage B only for the source SHA and image object it actually
+    // passed against, so the identity travels inside the record itself.
+    binding: binding ?? null,
+
+    /** Which Stage B case records the aggregation accepted. */
+    acceptedCases: acceptedCases ?? null,
 
     runtime: runtime ?? null,
 

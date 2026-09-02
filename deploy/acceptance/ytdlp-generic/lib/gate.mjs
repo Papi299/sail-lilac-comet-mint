@@ -73,3 +73,23 @@ export function readOption(argv, flag) {
   if (typeof value !== "string" || value.startsWith("--")) return null;
   return value;
 }
+
+/**
+ * Reads a repeatable `--key value ...` option.
+ *
+ * Used for `--case-evidence`, which names one file per Stage B case. Values
+ * are consumed until the next flag, so a shell glob expands naturally.
+ */
+export function readOptionList(argv, flag) {
+  const args = Array.isArray(argv) ? argv : [];
+  const out = [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] !== flag) continue;
+    for (let j = i + 1; j < args.length; j += 1) {
+      const value = args[j];
+      if (typeof value !== "string" || value.startsWith("--")) break;
+      out.push(value);
+    }
+  }
+  return out;
+}

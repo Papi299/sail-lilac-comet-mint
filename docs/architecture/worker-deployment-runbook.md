@@ -1525,6 +1525,103 @@ then stripped of forbidden keys. `/etc/videofetch/worker.env` is never dumped or
 read — `YTDLP_ENABLED` is observed from the container's bound environment, and
 every other variable is reported as a bare name or a boolean.
 
+#### CORRECTION-01 — review findings closed
+
+Four findings were raised in review of the Phase-10C4 draft and corrected on the
+same branch. Each falsified something the phase claimed, so they are recorded
+rather than folded silently into the description above.
+
+**1. The live CLI depended on test-only observation injection.** The evaluators
+were sound, but most observations reached them through `deps.<name>` seams that
+only a test populated. A Phase-10D operator would have had to write a script
+importing `main()` and fabricating those objects — recreating precisely the
+improvised live layer this phase exists to eliminate.
+
+The harness now owns the acquisition path end to end:
+
+| Added | Obtains |
+| :--- | :--- |
+| `lib/control-plane.mjs` | authenticated login, analyze, job creation, status polling, the 303 signed GET, and byte digests |
+| `lib/process-sampler.mjs` | `docker top -o pid,ppid,pgid,comm`, per-PID namespace identity, and the owned yt-dlp PID |
+| `lib/cases.mjs` | Stage B case choreography and the case-record contract |
+| `lib/coverage.mjs` | the check → producer registry the test suite walks |
+| concrete observers | image-SHA and `latest` tag identity, the bundled-EJS version, durable job rows, workDir presence, log capture |
+
+`VIDEOFETCH_ACCESS_SECRET` is now genuinely used: a live run calls the existing
+`POST /api/access/login` exactly once and holds the cookie in memory. A missing
+secret is a **usage failure** (an unauthenticated probe would 401 and be recorded
+as a capability failure — a false finding); a failed login is `BLOCKED`, never a
+silent fall-through to unauthenticated observation. `--expected-sha` became
+mandatory for the same reason: a live run that cannot say which image it is
+grading should not start.
+
+Stage B became multi-run, because enabling generic, cancelling a job, stopping
+the Worker mid-acquisition and rolling the switch back are separate operator
+transitions. Each case is its own reviewed command emitting a sanitized record;
+`--stage B --aggregate` produces the verdict. A record is admitted only if its
+harness id, schema version, case name, expected SHA and image object all match
+and its payload passes a **strict** validator with no unknown keys — then every
+field is re-judged by the pure evaluator. A hand-written `{"passed": true}`
+cannot produce a PASS.
+
+A structural test walks `lib/coverage.mjs` against both evaluators and fails if
+any emitted check lacks a concrete, non-test producer, so the same incompleteness
+cannot return when a check is added.
+
+**2. `["ready"]` satisfied the lifecycle contract.** The old ordering predicate
+accepted any ordered subsequence, which made "the poller only ever saw the final
+state" indistinguishable from "the job passed through the ladder" — the very
+thing the evidence exists to show.
+
+All six states are now required, and the outcome is three-way: complete and
+ordered is `PASS`, a backwards trace is `FAIL`, and an **incomplete** trace is
+`BLOCKED` — an evidence gap, never proof. Observation was strengthened to meet
+the contract rather than the contract weakened to fit observation: the poller
+runs at 200 ms, and the trace is seeded from the `POST /api/download` response,
+which is the only observation that can witness `queued` for a job that leaves the
+queue before the first poll.
+
+**3. The legitimate durable `formatId` was mistaken for a raw selector.** Phase
+10C3 persists the application-owned preset in the `format_id` column on purpose;
+forbidding it would have rejected every real durable row, under both the
+snake_case column name and the camelCase projection.
+
+`formatId` / `format_id` were removed from the forbidden list and replaced with
+positive evidence: `durable.application-format-id` proves the durable value is a
+`preset:*` rung **and** equals the preset the job was created with. The forbidden
+list now names only fields that could carry the private upstream selection —
+`source_format_id`, `rawFormatId`, `selector`, `format_selector`, `ytdlpFormat`,
+`sourceUrl` and their variants — which have no column at all. The durable reader
+projects only `job_id, status, format_id, extractor`; the `url` column is never
+selected, because it holds the acceptance URL and, during the sentinel case, the
+sentinel.
+
+**4. Process proof accepted any Python process, and the sample schema was a
+blacklist.** `process.ytdlp-present` merely looked for a Python descendant, and
+`validateSampleShape` rejected a list of known-bad field names — which only
+catches the leaks somebody already thought of.
+
+`process.ytdlp-identified` now proves a specific PID: a descendant of the Worker,
+with an approved runtime basename, **its own process-group leader**, in the media
+namespace. Group leadership is the discriminator — `process-runner.server.ts`
+spawns acquisition with `detached: true`, so the owned process necessarily leads
+its group while an unrelated Python descendant inherits the Worker's — and it is
+the property every containment and termination proof is expressed in terms of.
+Zero or several candidates is a measurement failure, not a guess. Node
+containment is anchored to that verified PID, and is `BLOCKED` without an anchor
+rather than reported as contained.
+
+The sample schema became a true allowlist — exactly `pid`, `ppid`, `pgid`,
+`comm`, `netns`, with type validation and a `comm` that must be a bare basename.
+`docker top -o pid,ppid,pgid,comm` is used precisely because it cannot return a
+command line: `ps -ef` and `/proc/<pid>/cmdline` would each hand back the
+acquisition argv, whose last element is the submitted media URL.
+
+Also corrected while closing these: the sentinel is now minted and swept by the
+real CLI code path rather than only specified, and console output crosses the
+central redaction/scrub boundary structurally instead of relying on each call
+site.
+
 #### What Phase 10D is authorized to do
 
 Nothing yet. Only after this harness has been **independently reviewed and

@@ -272,7 +272,20 @@ export function evaluateStageA(obs) {
   );
 
   const summary = summarize(checks);
-  return Object.freeze({ stage, checks: Object.freeze(checks), summary });
+  return Object.freeze({
+    stage,
+    checks: Object.freeze(checks),
+    summary,
+    // The DEPLOYMENT BINDING (§29/§30 of CORRECTION-01). A Stage A PASS is an
+    // authorization artifact for one source SHA and one image object, never a
+    // permanent licence, so the identity it passed against travels with it.
+    binding: Object.freeze({
+      expectedSha: obs?.expectedSha ?? null,
+      runningImageId: obs?.runningImageId?.measured === true ? obs.runningImageId.value : null,
+      taggedImageId:
+        obs?.imageShaTag?.measured === true ? obs.imageShaTag.value.taggedImageId : null,
+    }),
+  });
 }
 
 /**
@@ -296,7 +309,12 @@ export function enablementAuthorized(stageAResult) {
 /** Convenience for the CLI: a Stage A run that never got to measure anything. */
 export function stageANotAttempted(reason) {
   const checks = [check("stage-a.attempted", OUTCOMES.BLOCKED, reason, { stage: "A" })];
-  return Object.freeze({ stage: "A", checks: Object.freeze(checks), summary: summarize(checks) });
+  return Object.freeze({
+    stage: "A",
+    checks: Object.freeze(checks),
+    summary: summarize(checks),
+    binding: Object.freeze({ expectedSha: null, runningImageId: null, taggedImageId: null }),
+  });
 }
 
 /** Exported for the CLI's stage-confusion guard (§11). */

@@ -1,29 +1,22 @@
-// Process-tree observation and classification (§29-§32).
+// Process-tree observation and classification (§29-§32; §22-§26 of CORRECTION-01).
 //
-// Pure over a SAMPLE. Taking the sample is the observer layer's job; deciding
+// Pure over a SAMPLE. Taking the sample is `process-sampler.mjs`'s job; deciding
 // what a sample means is this module's, so every rule below is testable without
 // a Production container.
 //
-// What a sample entry may carry — and this is a closed list on purpose (§29):
+// The sample schema is a CLOSED ALLOWLIST, not a blacklist of known-bad names:
 //
 //   pid, ppid, pgid, comm (executable BASENAME only), netns (namespace inode)
 //
-// What it must NEVER carry: the full command line. `argv` for the acquisition
-// process ends in the operator-supplied media URL (§24), so capturing it would
-// place a third-party URL — and, during the sentinel case, the sentinel itself —
-// into evidence that §46 requires to stay clean. The basename is sufficient for
-// every assertion this harness makes.
+// A blacklist only rejects the leaks somebody already thought of. An allowlist
+// rejects `environment`, `headers`, `query`, `fullCommand` and every other field
+// a future observer might add to an object that was designed specifically not to
+// hold them. The acquisition argv ends in the operator-supplied media URL, so a
+// command line in evidence would defeat both the URL redaction and the sentinel
+// test at once.
 
-/** A sample entry carrying a command line is a defect, not a richer sample. */
-export const FORBIDDEN_SAMPLE_FIELDS = Object.freeze([
-  "cmdline",
-  "args",
-  "argv",
-  "command",
-  "cmd",
-  "exe",
-  "url",
-]);
+/** The ONLY keys a sample row may carry. Anything else is a defect. */
+export const ALLOWED_SAMPLE_FIELDS = Object.freeze(["pid", "ppid", "pgid", "comm", "netns"]);
 
 /**
  * Executables that must NOT appear anywhere under the Worker during
@@ -58,19 +51,32 @@ export const FORBIDDEN_DOWNLOADING_DESCENDANTS = Object.freeze([
 ]);
 
 /**
+ * The exact executable shapes the pinned yt-dlp runtime may present as.
+ *
+ * The runtime is the zipimport artifact executed BY the interpreter
+ * (`/usr/bin/python3 /usr/local/lib/videofetch/yt-dlp`), so `comm` is the
+ * interpreter's basename. `yt-dlp` is admitted because a kernel that reports the
+ * script name rather than the interpreter is a plausible variation, not a
+ * different runtime.
+ */
+export const YTDLP_RUNTIME_BASENAMES = Object.freeze([
+  "python3",
+  "python3.11",
+  "yt-dlp",
+]);
+
+/**
  * Executables the acquisition hierarchy MAY legitimately contain.
  *
  * `node` is here because the approved EJS runtime is the Worker's own Node
  * binary, invoked by yt-dlp when an extractor needs a JS solver. It is allowed
- * STRUCTURALLY — being on this list is not permission to appear anywhere; §31's
+ * STRUCTURALLY — being on this list is not permission to appear anywhere; the
  * containment assertions still have to hold for it.
  */
 export const ALLOWED_ACQUISITION_DESCENDANTS = Object.freeze([
   "node",
-  "python3",
-  "python3.11",
+  ...YTDLP_RUNTIME_BASENAMES,
   "python",
-  "yt-dlp",
 ]);
 
 /** Normalizes a `comm`/executable field to a bare lowercase basename. */
@@ -80,28 +86,71 @@ export function basenameOf(value) {
   return last.trim().toLowerCase();
 }
 
+const isPositiveInt = (v) => Number.isInteger(v) && v > 0;
+const isNonNegativeInt = (v) => Number.isInteger(v) && v >= 0;
+
 /**
- * Rejects a sample that carries anything outside the closed field list.
+ * Validates a sample against the closed schema.
  *
- * Called before a sample is used for ANY assertion, so an observer that grows a
- * `cmdline` field fails the harness loudly instead of quietly writing a media
- * URL into the evidence file.
+ * Rejects, per row: any key outside `ALLOWED_SAMPLE_FIELDS`, a missing or
+ * malformed required field, and a `comm` that is not a bare basename. Called
+ * before a sample is used for ANY assertion, so a sampler that grows a field
+ * fails the harness loudly instead of quietly writing a media URL into
+ * evidence.
  */
 export function validateSampleShape(sample) {
-  const rows = Array.isArray(sample) ? sample : [];
   const violations = [];
-  for (const row of rows) {
-    if (!row || typeof row !== "object") {
-      violations.push("non-object sample row");
-      continue;
+  if (!Array.isArray(sample)) {
+    return Object.freeze({ ok: false, violations: Object.freeze(["the sample is not an array"]) });
+  }
+  if (sample.length === 0) {
+    return Object.freeze({ ok: false, violations: Object.freeze(["the sample is empty"]) });
+  }
+
+  sample.forEach((row, index) => {
+    const where = `row ${index}`;
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      violations.push(`${where}: not an object`);
+      return;
     }
-    for (const field of Object.keys(row)) {
-      if (FORBIDDEN_SAMPLE_FIELDS.includes(field.toLowerCase())) {
-        violations.push(`sample row ${row.pid ?? "?"} carries forbidden field '${field}'`);
+
+    // ── the allowlist ────────────────────────────────────────────────────
+    for (const key of Object.keys(row)) {
+      if (!ALLOWED_SAMPLE_FIELDS.includes(key)) {
+        violations.push(`${where}: field '${key}' is outside the closed sample schema`);
       }
     }
-  }
+
+    // ── required field types ─────────────────────────────────────────────
+    if (!isPositiveInt(row.pid)) violations.push(`${where}: pid must be a positive integer`);
+    if (!isNonNegativeInt(row.ppid)) {
+      violations.push(`${where}: ppid must be a non-negative integer`);
+    }
+    if (!isPositiveInt(row.pgid)) violations.push(`${where}: pgid must be a positive integer`);
+
+    if (typeof row.comm !== "string" || row.comm.trim().length === 0) {
+      violations.push(`${where}: comm must be a non-empty string`);
+    } else if (/[/\s]/.test(row.comm)) {
+      // A basename cannot contain a path separator or whitespace. Whitespace is
+      // what a full command line would bring, so this is the structural guard
+      // against `comm` quietly becoming `argv[0] argv[1] ...`.
+      violations.push(`${where}: comm must be a bare basename, not a path or command line`);
+    }
+
+    // `netns` may be an explicit null ONLY to mean "measurement failed"; the
+    // namespace evaluator then treats it as a mismatch, never as agreement.
+    if (row.netns !== null && !isSafeNetns(row.netns)) {
+      violations.push(`${where}: netns must be a namespace identity or explicit null`);
+    }
+  });
+
   return Object.freeze({ ok: violations.length === 0, violations: Object.freeze(violations) });
+}
+
+/** `net:[4026532001]`, or the bare inode. Nothing that could carry free text. */
+function isSafeNetns(value) {
+  if (typeof value !== "string") return false;
+  return /^net:\[\d+\]$/.test(value) || /^\d+$/.test(value);
 }
 
 /** Every descendant of `rootPid`, by ppid chain. The root itself is excluded. */
@@ -132,9 +181,6 @@ export function descendantsOf(sample, rootPid) {
 /**
  * The §30 rule: no forbidden executable may be running under the Worker while
  * durable state says `downloading`.
- *
- * Returns the offenders rather than a boolean so the evidence record can name
- * exactly what was seen — by basename, which is safe.
  */
 export function forbiddenDescendants(sample, rootPid) {
   return descendantsOf(sample, rootPid)
@@ -143,12 +189,11 @@ export function forbiddenDescendants(sample, rootPid) {
 }
 
 /**
- * Structural acceptance of the acquisition hierarchy.
+ * Structural classification of the acquisition hierarchy.
  *
  * Deliberately NOT "the tree must look exactly like this". Extractors differ,
- * and §30 explicitly says Node is not required for every site. The rule is the
- * negative one — nothing forbidden — plus: everything that IS present is on the
- * allowed list.
+ * and Node is not required for every site. The rule is the negative one —
+ * nothing forbidden — plus: everything present is on the allowed list.
  */
 export function classifyAcquisitionTree(sample, rootPid) {
   const descendants = descendantsOf(sample, rootPid).map((row) => ({
@@ -176,44 +221,119 @@ export function classifyAcquisitionTree(sample, rootPid) {
     /**
      * An executable that is neither approved nor on the forbidden list is NOT
      * quietly tolerated. The harness cannot know it is harmless, so it is
-     * surfaced and the caller treats it as a failure — unknown-is-safe is the
-     * assumption this whole boundary exists to avoid making.
+     * surfaced and the caller treats it as a failure.
      */
     unknown: Object.freeze(unknown),
-    ytdlpProcesses: Object.freeze(
-      descendants.filter((row) => row.comm.startsWith("python") || row.comm === "yt-dlp"),
-    ),
     nodeProcesses: Object.freeze(descendants.filter((row) => row.comm === "node")),
   });
 }
 
 /**
- * §31 — Node/EJS containment.
+ * §22 — prove the EXACT owned yt-dlp process, not "a Python process exists".
  *
- * Every clause is measured, never inferred from "the source was YouTube". When
- * no Node descendant is present the answer is `exercised: false`, which the
- * caller reports as NOT_EXERCISED — never as a pass.
+ * The discriminator that makes this meaningful is the process GROUP LEADERSHIP
+ * check. `process-runner.server.ts` spawns the acquisition with
+ * `detached: true`, which calls `setsid`/`setpgid` and makes the child its own
+ * process-group leader — so the owned yt-dlp process necessarily has
+ * `pgid === pid`. An unrelated Python descendant inherits the Worker's group
+ * instead and fails this, which is precisely the distinction the previous
+ * "some python3 exists" check could not draw. It is also the property every
+ * containment and termination assertion downstream depends on, since those are
+ * expressed in terms of that group.
  */
-export function evaluateNodeContainment(classified, ytdlpPid, expectedNetns) {
+export function evaluateYtdlpIdentity(sample, workerPid, ytdlpPid, expectedNetns) {
+  if (!isPositiveInt(ytdlpPid)) {
+    return Object.freeze({
+      identified: false,
+      reason: "no owned yt-dlp PID was established by the sampler",
+    });
+  }
+
+  const rows = Array.isArray(sample) ? sample : [];
+  const row = rows.find((entry) => entry.pid === ytdlpPid) ?? null;
+  if (!row) {
+    return Object.freeze({
+      identified: false,
+      reason: `the established yt-dlp PID ${ytdlpPid} is absent from the sample`,
+    });
+  }
+
+  const failures = [];
+
+  const descendantPids = new Set(descendantsOf(rows, workerPid).map((entry) => entry.pid));
+  if (!descendantPids.has(ytdlpPid)) {
+    failures.push(`PID ${ytdlpPid} is not a descendant of the Worker process`);
+  }
+
+  const comm = basenameOf(row.comm);
+  if (!YTDLP_RUNTIME_BASENAMES.includes(comm)) {
+    failures.push(`PID ${ytdlpPid} runs '${comm}', which is not an approved yt-dlp runtime shape`);
+  }
+
+  if (row.pgid !== row.pid) {
+    // Not a group leader => not the process the Worker spawned detached, so the
+    // group-based containment and termination proofs would be measuring the
+    // wrong group.
+    failures.push(
+      `PID ${ytdlpPid} is not its own process-group leader (pgid ${row.pgid}); ` +
+        "the owned acquisition process is spawned detached and must lead its group",
+    );
+  }
+
+  if (expectedNetns == null) {
+    failures.push("the expected media network namespace is unknown");
+  } else if (row.netns !== expectedNetns) {
+    failures.push(`PID ${ytdlpPid} is not in the Worker's media network namespace`);
+  }
+
+  return Object.freeze({
+    identified: failures.length === 0,
+    pid: ytdlpPid,
+    comm,
+    pgid: row.pgid,
+    failures: Object.freeze(failures),
+    reason: failures.length === 0 ? "the owned yt-dlp process was positively identified" : failures.join("; "),
+  });
+}
+
+/**
+ * §23/§31 — Node/EJS containment, anchored to the VERIFIED owned yt-dlp PID.
+ *
+ * The caller must pass an identity from `evaluateYtdlpIdentity` that actually
+ * identified; an unverified anchor makes every clause below meaningless, so
+ * this returns `anchored: false` and the caller raises BLOCKED rather than
+ * reporting containment against a process it could not name.
+ */
+export function evaluateNodeContainment(classified, ytdlpIdentity, expectedNetns) {
+  if (!ytdlpIdentity?.identified) {
+    return Object.freeze({
+      anchored: false,
+      exercised: false,
+      contained: false,
+      reason: "the owned yt-dlp process was not identified, so containment cannot be anchored",
+    });
+  }
+
   const nodes = classified.nodeProcesses;
   if (nodes.length === 0) {
     return Object.freeze({
+      anchored: true,
       exercised: false,
       contained: false,
       reason: "no Node/EJS descendant appeared for this source",
     });
   }
 
-  const ytdlp = classified.descendants.find((row) => row.pid === ytdlpPid) ?? null;
-  const expectedPgid = ytdlp?.pgid ?? null;
+  const anchorPid = ytdlpIdentity.pid;
+  const anchorPgid = ytdlpIdentity.pgid;
 
   const failures = [];
   for (const node of nodes) {
     const chain = ancestryOf(classified.descendants, node.pid);
-    if (!chain.includes(ytdlpPid)) {
+    if (!chain.includes(anchorPid)) {
       failures.push(`node ${node.pid} is not a descendant of the owned yt-dlp process`);
     }
-    if (expectedPgid === null || node.pgid !== expectedPgid) {
+    if (node.pgid !== anchorPgid) {
       failures.push(`node ${node.pid} left the owned process group`);
     }
     if (expectedNetns != null && node.netns !== expectedNetns) {
@@ -222,6 +342,7 @@ export function evaluateNodeContainment(classified, ytdlpPid, expectedNetns) {
   }
 
   return Object.freeze({
+    anchored: true,
     exercised: true,
     contained: failures.length === 0,
     count: nodes.length,

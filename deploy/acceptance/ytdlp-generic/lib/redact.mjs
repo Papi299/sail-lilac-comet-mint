@@ -128,3 +128,24 @@ export function scrubSecrets(text, needles) {
 export function safeOutput(value, needles) {
   return scrubSecrets(redactText(value), needles);
 }
+
+/**
+ * The central console safety boundary (§13 of CORRECTION-01).
+ *
+ * The harness previously CLAIMED one redaction implementation covered console
+ * output, but relied on every call site remembering to pre-redact its own
+ * string. This makes it structural: the CLI logs through this, so any dynamic
+ * value — an error message carrying a media URL, a status body, a command
+ * summary — is redacted and scrubbed on the way out.
+ *
+ * `needles` is passed BY REFERENCE and read at call time, so a secret
+ * registered later in the run (the per-run sentinel, the Worker control secret)
+ * protects output that was already wired up.
+ */
+export function createSafeConsole({ log, errorLog, needles }) {
+  const emit = (sink) => (value) => sink(safeOutput(String(value ?? ""), needles ?? []));
+  return {
+    log: emit(log ?? console.log),
+    error: emit(errorLog ?? console.error),
+  };
+}

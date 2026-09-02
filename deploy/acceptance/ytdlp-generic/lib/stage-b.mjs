@@ -1,37 +1,31 @@
-// Stage B — "generic explicitly ENABLED" (§21-§43).
+// Stage B — "generic explicitly ENABLED" (§21-§43; Corrections B/C/D).
 //
 // Pure over an observation bundle, exactly like Stage A. Stage B may only be
-// evaluated after a Stage A run verdicted PASS (§20); `evaluateStageB` refuses
-// to grade anything otherwise, so the authorization edge cannot be skipped by
-// invoking this module directly.
+// evaluated after a Stage A run verdicted PASS and whose record BINDS to this
+// deployment (§29/§30 of CORRECTION-01); `evaluateStageB` refuses to grade
+// anything otherwise, so the authorization edge cannot be skipped by invoking
+// this module directly.
 
-import {
-  OUTCOMES,
-  assertCheck,
-  check,
-  measuredCheck,
-  stageBPermitted,
-  summarize,
-} from "./verdict.mjs";
+import { OUTCOMES, assertCheck, check, measuredCheck, summarize } from "./verdict.mjs";
+import { classifyTransitionTrace, classifyCancellationTrace } from "./lifecycle.mjs";
 import {
   classifyAcquisitionTree,
   evaluateNamespaceIdentity,
   evaluateNodeContainment,
   evaluateTerminationCleanliness,
+  evaluateYtdlpIdentity,
   validateSampleShape,
 } from "./process-tree.mjs";
 
-/** The durable transitions a successful generic job must pass through (§26). */
-export const REQUIRED_TRANSITIONS = Object.freeze([
-  "queued",
-  "analyzing",
-  "downloading",
-  "processing",
-  "uploading",
-  "ready",
-]);
+export { REQUIRED_TRANSITIONS } from "./lifecycle.mjs";
 
-/** The application-owned preset vocabulary. A raw yt-dlp format id is never one of these. */
+/**
+ * The application-owned preset vocabulary, mirroring
+ * `GENERIC_PRESET_ID_PATTERN` in `src/worker/analysis/ytdlp-analysis.server.ts`.
+ *
+ * For a generic source the product contract is `id === formatId`, and both are
+ * one of these. A raw yt-dlp `format_id` is never one of them.
+ */
 export const APPLICATION_PRESETS = Object.freeze([
   "preset:best",
   "preset:2160",
@@ -46,56 +40,67 @@ export const APPLICATION_PRESETS = Object.freeze([
   "preset:mp3",
 ]);
 
+/** The direct-path format id, for the post-enable direct regression. */
+export const DIRECT_FORMAT_ID = "direct-original";
+
 /**
- * Durable fields that must NOT exist on a generic job (§27).
+ * Durable fields that must NOT exist on a generic job (§20 of CORRECTION-01).
  *
- * A raw upstream selector or source id in SQLite would mean the memory-only
- * contract had been broken and a site's own identifier had become trusted
- * durable state.
+ * `formatId` / `format_id` are deliberately ABSENT from this list. Phase 10C3
+ * persists the application-owned preset in the `format_id` column on purpose;
+ * forbidding it was a correctness defect, not a strictness win — it would have
+ * rejected every real durable row, in both the snake_case column name and the
+ * camelCase projection. What must never become durable is the PRIVATE upstream
+ * source selection, which has no column at all and stays memory-only for one
+ * execution attempt. Those are the names below.
  */
 export const FORBIDDEN_DURABLE_FIELDS = Object.freeze([
-  "format_id",
-  "formatId",
   "source_format_id",
   "sourceFormatId",
+  "raw_format_id",
+  "rawFormatId",
+  "upstream_format_id",
+  "upstreamFormatId",
   "selector",
   "format_selector",
+  "formatSelector",
   "ytdlp_format",
+  "ytdlpFormat",
   "source_url",
   "sourceUrl",
 ]);
 
+/** Values a durable `format_id` may legitimately hold. */
+export function isApplicationOwnedFormatId(value) {
+  return APPLICATION_PRESETS.includes(value) || value === DIRECT_FORMAT_ID;
+}
+
 /**
- * The observed transition list contains the required ones, in order.
+ * Every advertised option is an application-owned preset.
  *
- * Subsequence, not equality: polling legitimately misses a fast transition, and
- * the direct-media record in the runbook shows a whole job completing in ~1.2s.
- * ORDER is the invariant; observing every intermediate state is not.
+ * `presets` is an array of `WorkerQualityPreset` OBJECTS, each carrying both
+ * `id` and `formatId`; the generic builder sets them equal. BOTH are checked,
+ * because `formatId` is the field the browser echoes back on job creation and
+ * is therefore the one a raw upstream id would have to travel in.
  */
-export function transitionsAreOrdered(observed, required = REQUIRED_TRANSITIONS) {
-  if (!Array.isArray(observed)) return false;
-  // Every observed state must be a known one, and the observed sequence must
-  // never move backwards through the required ladder.
-  let cursor = -1;
-  for (const state of observed) {
-    const index = required.indexOf(state);
-    if (index === -1) return false;
-    if (index < cursor) return false;
-    cursor = index;
-  }
-  return observed.includes("ready");
+export function presetsAreApplicationOwned(presets) {
+  if (!Array.isArray(presets) || presets.length === 0) return false;
+  return presets.every(
+    (preset) =>
+      preset != null &&
+      typeof preset === "object" &&
+      APPLICATION_PRESETS.includes(preset.id) &&
+      APPLICATION_PRESETS.includes(preset.formatId) &&
+      preset.id === preset.formatId,
+  );
 }
 
 export function evaluateStageB(obs, stageAResult) {
-  // ── §11/§20 the authorization edge ─────────────────────────────────────
-  if (!stageBPermitted(stageAResult?.summary)) {
+  // ── §11/§20/§29 the authorization edge ──────────────────────────────────
+  const authorization = stageBAuthorization(obs, stageAResult);
+  if (!authorization.permitted) {
     const blocked = [
-      check(
-        "stage-b.authorized-by-stage-a",
-        OUTCOMES.BLOCKED,
-        "Stage B assertions require a Stage A run that verdicted PASS; refusing to grade",
-        { stage: "B" },
-      ),
+      check("stage-b.authorized-by-stage-a", OUTCOMES.BLOCKED, authorization.reason, { stage: "B" }),
     ];
     return Object.freeze({ stage: "B", checks: Object.freeze(blocked), summary: summarize(blocked) });
   }
@@ -139,8 +144,8 @@ export function evaluateStageB(obs, stageAResult) {
     measuredCheck(
       "analysis.no-raw-formats",
       obs.genericAnalysis,
-      // v1 exposes `formats: []` for generic sources. A non-empty array here
-      // would mean a raw upstream format id had reached the browser contract.
+      // v1 exposes `formats: []` for generic sources. A non-empty array would
+      // mean a raw upstream format id had reached the browser contract.
       (value) => Array.isArray(value?.formats) && value.formats.length === 0,
       "generic metadata exposes no raw format list",
       { stage },
@@ -150,11 +155,8 @@ export function evaluateStageB(obs, stageAResult) {
     measuredCheck(
       "analysis.presets-application-owned",
       obs.genericAnalysis,
-      (value) =>
-        Array.isArray(value?.presets) &&
-        value.presets.length > 0 &&
-        value.presets.every((preset) => APPLICATION_PRESETS.includes(preset)),
-      "every advertised option is an application-owned preset",
+      (value) => presetsAreApplicationOwned(value?.presets),
+      "every advertised option carries id === formatId === an application preset",
       { stage },
     ),
   );
@@ -168,27 +170,36 @@ export function evaluateStageB(obs, stageAResult) {
     ),
   );
 
-  // ── §26 durable job lifecycle ──────────────────────────────────────────
-  add(
-    measuredCheck(
-      "job.transitions-ordered",
-      obs.genericJob,
-      (value) => transitionsAreOrdered(value?.transitions),
-      `durable states advanced in order and reached ready`,
-      { stage },
-    ),
-  );
-  add(
-    measuredCheck(
-      "job.requested-preset-owned",
-      obs.genericJob,
-      (value) => APPLICATION_PRESETS.includes(value?.requestedFormatId),
-      "the job was created with an application-owned preset",
-      { stage },
-    ),
-  );
+  // ── §26 durable job lifecycle (CORRECTION-01 §14-§17) ──────────────────
+  //
+  // All six states, in order. An incomplete trace is an EVIDENCE GAP and lands
+  // as BLOCKED; only a genuine ordering violation is FAIL. Missed polling is
+  // never reinterpreted as proof.
+  if (obs.genericJob?.measured !== true) {
+    add(
+      check(
+        "job.lifecycle-complete",
+        OUTCOMES.BLOCKED,
+        `the durable lifecycle was not observed${obs.genericJob?.reason ? `: ${obs.genericJob.reason}` : ""}`,
+        { stage },
+      ),
+    );
+  } else {
+    const classified = classifyTransitionTrace(obs.genericJob.value?.transitions);
+    add(
+      check("job.lifecycle-complete", classified.outcome, classified.trace.reason, { stage }),
+    );
+    add(
+      assertCheck(
+        "job.requested-preset-owned",
+        APPLICATION_PRESETS.includes(obs.genericJob.value?.requestedFormatId),
+        "the job was created with an application-owned preset",
+        { stage },
+      ),
+    );
+  }
 
-  // ── §27 strategy persistence ───────────────────────────────────────────
+  // ── §27 strategy persistence, and the corrected durable-format contract ──
   add(
     measuredCheck(
       "durable.extractor-is-ytdlp",
@@ -198,6 +209,25 @@ export function evaluateStageB(obs, stageAResult) {
       { stage },
     ),
   );
+  // POSITIVE evidence (CORRECTION-01 §19): the durable format id is the
+  // reviewed application preset, and it is the one the job was created with.
+  add(
+    measuredCheck(
+      "durable.application-format-id",
+      obs.durableJobRow,
+      (value) => {
+        if (!isApplicationOwnedFormatId(value?.formatId)) return false;
+        const requested = obs.genericJob?.measured === true
+          ? obs.genericJob.value?.requestedFormatId
+          : undefined;
+        // When the requested preset is known, durable must equal it exactly.
+        return requested === undefined ? true : value.formatId === requested;
+      },
+      "the durable format id is the application preset the job was created with",
+      { stage },
+    ),
+  );
+  // NEGATIVE evidence: no field that could carry the private source selection.
   add(
     measuredCheck(
       "durable.no-raw-selector-fields",
@@ -210,8 +240,7 @@ export function evaluateStageB(obs, stageAResult) {
       { stage },
     ),
   );
-  // §28: the raw upstream id is never reported. The harness states only that
-  // the constraints held, in sanitized structural form.
+  // §28: the raw upstream id is never reported. Structural statement only.
   add(
     measuredCheck(
       "selector.constraints-satisfied",
@@ -222,9 +251,8 @@ export function evaluateStageB(obs, stageAResult) {
     ),
   );
 
-  // ── §29/§30 process descendants during downloading ─────────────────────
-  const treeChecks = evaluateProcessEvidence(obs, stage);
-  for (const entry of treeChecks) add(entry);
+  // ── §29-§32 process evidence ───────────────────────────────────────────
+  for (const entry of evaluateProcessEvidence(obs, stage)) add(entry);
 
   // ── §33/§34 safe-egress negative case ──────────────────────────────────
   add(
@@ -282,16 +310,21 @@ export function evaluateStageB(obs, stageAResult) {
   );
   add(
     measuredCheck(
-      "vercel.byte-digest",
+      "vercel.byte-integrity",
       obs.vercelDelivery,
-      // HTTP 200 alone is explicitly NOT proof (§37). Length AND digest.
+      // HTTP 200 alone is explicitly NOT proof (§37). Three-way length
+      // agreement — durable, provider and client — plus a real digest.
       (value) =>
-        typeof value?.workerDigest === "string" &&
-        value.workerDigest.length === 64 &&
-        value.workerDigest === value.clientDigest &&
-        value.workerBytes === value.clientBytes &&
-        value.clientBytes > 0,
-      "delivered bytes match the Worker-produced object by length and SHA-256",
+        typeof value?.clientDigest === "string" &&
+        /^[0-9a-f]{64}$/.test(value.clientDigest) &&
+        value.clientBytes > 0 &&
+        value.clientBytes === value.durableFileSize &&
+        value.clientBytes === value.r2ContentLength &&
+        // An independently known digest is compared when one exists (the direct
+        // fixture case); for a public generic source none can exist without
+        // re-acquiring the media, which the harness must not do.
+        (value.expectedDigest == null || value.expectedDigest === value.clientDigest),
+      "delivered bytes agree with durable and provider length, and hash to a recorded digest",
       { stage },
     ),
   );
@@ -301,7 +334,9 @@ export function evaluateStageB(obs, stageAResult) {
     measuredCheck(
       "privacy.sentinel-not-leaked",
       obs.sentinelSweep,
-      (value) => value?.leaked === false && Array.isArray(value?.surfacesChecked) &&
+      (value) =>
+        value?.leaked === false &&
+        Array.isArray(value?.surfacesChecked) &&
         value.surfacesChecked.length >= 5,
       "the ephemeral sentinel appears in none of the swept surfaces",
       { stage },
@@ -309,43 +344,50 @@ export function evaluateStageB(obs, stageAResult) {
   );
 
   // ── §39 cancellation ───────────────────────────────────────────────────
-  add(
-    measuredCheck(
-      "cancel.durable-cancelled",
-      obs.cancellation,
-      (value) => value?.finalStatus === "cancelled" && value?.lateReady === false,
-      "cancelling during downloading yields a durable cancelled job and no late ready",
-      { stage },
-    ),
-  );
-  add(
-    measuredCheck(
-      "cancel.processes-gone",
-      obs.cancellation,
-      (value) =>
-        value?.postSample != null &&
-        evaluateTerminationCleanliness(value.postSample, value.workerPid).clean === true,
-      "no yt-dlp or Node descendant survives cancellation",
-      { stage },
-    ),
-  );
-  add(
-    measuredCheck(
-      "cancel.no-upload-no-workdir",
-      obs.cancellation,
-      (value) =>
-        value?.beganProcessing === false &&
-        value?.uploaded === false &&
-        value?.workDirPresent === false,
-      "cancellation performed no processing, no upload, and left no working directory",
-      { stage },
-    ),
-  );
+  if (obs.cancellation?.measured !== true) {
+    add(
+      check(
+        "cancel.durable-cancelled",
+        OUTCOMES.BLOCKED,
+        `the cancellation case was not performed${obs.cancellation?.reason ? `: ${obs.cancellation.reason}` : ""}`,
+        { stage },
+      ),
+    );
+  } else {
+    const cancellation = obs.cancellation.value;
+    const classified = classifyCancellationTrace(cancellation?.transitions);
+    add(check("cancel.durable-cancelled", classified.outcome, classified.trace.reason, { stage }));
+    add(
+      assertCheck(
+        "cancel.no-late-ready",
+        cancellation?.lateReady === false,
+        "no late `ready` transition followed the cancellation",
+        { stage },
+      ),
+    );
+    add(
+      assertCheck(
+        "cancel.processes-gone",
+        cancellation?.postSample != null &&
+          evaluateTerminationCleanliness(cancellation.postSample, cancellation.workerPid).clean ===
+            true,
+        "no yt-dlp or Node descendant survives cancellation",
+        { stage },
+      ),
+    );
+    add(
+      assertCheck(
+        "cancel.no-upload-no-workdir",
+        cancellation?.beganProcessing === false &&
+          cancellation?.uploaded === false &&
+          cancellation?.workDirPresent === false,
+        "cancellation performed no processing, no upload, and left no working directory",
+        { stage },
+      ),
+    );
+  }
 
   // ── §38 actual-byte limit ──────────────────────────────────────────────
-  //
-  // Required, and deliberately BLOCKED rather than skipped when no safe live
-  // fixture exists at run time. `--max-filesize` is not evidence for this.
   add(
     measuredCheck(
       "limit.actual-byte-guard",
@@ -397,10 +439,7 @@ export function evaluateStageB(obs, stageAResult) {
     ),
   );
 
-  // ── §42 fail-closed runtime ────────────────────────────────────────────
-  //
-  // Optional at the RUN level because it must not be performed by damaging the
-  // live image (§42). Executed separately, its result is folded in here.
+  // ── §42 fail-closed runtime (optional; must not damage the live image) ──
   add(
     foldOptional(
       "runtime.fail-closed",
@@ -441,8 +480,60 @@ export function evaluateStageB(obs, stageAResult) {
 }
 
 /**
- * The process-tree checks, split out because they share one sample and one
- * shape validation.
+ * §29/§30 of CORRECTION-01 — the Stage A record must BIND to this deployment.
+ *
+ * A PASS is an authorization artifact for one image, not a permanent licence.
+ * Without the SHA and image-object bindings below, a Stage A record from an
+ * older deployment would silently authorize Stage B against an image nobody
+ * ran Stage A on — which is exactly the confusion the two-stage model exists to
+ * prevent.
+ */
+export function stageBAuthorization(obs, stageAResult) {
+  if (stageAResult?.summary?.verdict !== OUTCOMES.PASS) {
+    return {
+      permitted: false,
+      reason: "Stage B assertions require a Stage A run that verdicted PASS; refusing to grade",
+    };
+  }
+
+  const binding = stageAResult.binding ?? null;
+  if (!binding) {
+    return {
+      permitted: false,
+      reason: "the Stage A record carries no deployment binding; refusing to grade Stage B",
+    };
+  }
+
+  const expectedSha = obs?.expectedSha ?? null;
+  if (!expectedSha || binding.expectedSha !== expectedSha) {
+    return {
+      permitted: false,
+      reason: `the Stage A record binds to source ${binding.expectedSha ?? "<none>"}, not to ${expectedSha ?? "<none>"}`,
+    };
+  }
+
+  // The image object must match too. A restart legitimately recreates the
+  // container from the SAME image, so the IMAGE id is compared rather than the
+  // container id.
+  const running = obs?.runningImageId?.measured === true ? obs.runningImageId.value : null;
+  if (!running) {
+    return {
+      permitted: false,
+      reason: "the currently running image could not be identified; refusing to grade Stage B",
+    };
+  }
+  if (binding.runningImageId && binding.runningImageId !== running) {
+    return {
+      permitted: false,
+      reason: "Stage A passed against a different image object than the one now deployed",
+    };
+  }
+
+  return { permitted: true, reason: "Stage A passed and binds to this deployment" };
+}
+
+/**
+ * The process-tree checks, which share one sample and one shape validation.
  */
 function evaluateProcessEvidence(obs, stage) {
   const out = [];
@@ -470,13 +561,28 @@ function evaluateProcessEvidence(obs, stage) {
     assertCheck(
       "process.sample-shape",
       shape.ok,
-      "the process sample carries no command line or URL-bearing field",
+      shape.ok
+        ? "the process sample matches the closed schema (pid, ppid, pgid, comm, netns)"
+        : shape.violations.slice(0, 4).join("; "),
       { stage },
     ),
   );
   if (!shape.ok) return out;
 
   const classified = classifyAcquisitionTree(sample, workerPid);
+
+  // ── §22 of CORRECTION-01: the EXACT owned yt-dlp process ───────────────
+  const identity = evaluateYtdlpIdentity(sample, workerPid, ytdlpPid, expectedNetns);
+  out.push(
+    identity.identified
+      ? assertCheck(
+          "process.ytdlp-identified",
+          true,
+          `the owned yt-dlp process (pid ${identity.pid}, ${identity.comm}, own process-group leader) was positively identified`,
+          { stage },
+        )
+      : check("process.ytdlp-identified", OUTCOMES.BLOCKED, identity.reason, { stage }),
+  );
 
   out.push(
     assertCheck(
@@ -498,14 +604,6 @@ function evaluateProcessEvidence(obs, stage) {
       { stage },
     ),
   );
-  out.push(
-    assertCheck(
-      "process.ytdlp-present",
-      classified.ytdlpProcesses.length > 0,
-      "the owned yt-dlp process was observed during downloading",
-      { stage },
-    ),
-  );
 
   // §32 namespace identity.
   const namespaces = evaluateNamespaceIdentity(classified, expectedNetns);
@@ -522,26 +620,31 @@ function evaluateProcessEvidence(obs, stage) {
       : check("process.namespace-identity", OUTCOMES.BLOCKED, namespaces.reason, { stage }),
   );
 
-  // §31 Node/EJS containment — measured, and honestly NOT_EXERCISED when the
-  // chosen source never invoked the JS runtime.
-  const node = evaluateNodeContainment(classified, ytdlpPid, expectedNetns);
-  out.push(
-    node.exercised
-      ? assertCheck(
-          "process.node-ejs-containment",
-          node.contained,
-          node.contained
-            ? "the Node/EJS descendant is inside the owned group and namespace"
-            : node.failures.join("; "),
-          { stage },
-        )
-      : check(
-          "process.node-ejs-containment",
-          OUTCOMES.NOT_EXERCISED,
-          "NODE/EJS DESCENDANT NOT EXERCISED BY THIS SOURCE",
-          { stage, required: false },
-        ),
-  );
+  // §23/§31 Node/EJS containment, ANCHORED to the verified owned PID.
+  const node = evaluateNodeContainment(classified, identity, expectedNetns);
+  if (!node.anchored) {
+    out.push(check("process.node-ejs-containment", OUTCOMES.BLOCKED, node.reason, { stage }));
+  } else if (!node.exercised) {
+    out.push(
+      check(
+        "process.node-ejs-containment",
+        OUTCOMES.NOT_EXERCISED,
+        "NODE/EJS DESCENDANT NOT EXERCISED BY THIS SOURCE",
+        { stage, required: false },
+      ),
+    );
+  } else {
+    out.push(
+      assertCheck(
+        "process.node-ejs-containment",
+        node.contained,
+        node.contained
+          ? "the Node/EJS descendant is inside the owned group and namespace"
+          : node.failures.join("; "),
+        { stage },
+      ),
+    );
+  }
 
   return out;
 }

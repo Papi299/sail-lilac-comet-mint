@@ -1,16 +1,18 @@
-// The observer layer — the ONLY impure module in this harness.
+// The observer layer — the impure edge of the harness.
 //
-// Everything else is a pure function over an observation bundle, which is what
-// makes the whole matrix testable with fakes and no Production system. This
-// module is where real commands and real HTTP live, and it is deliberately the
-// smallest and most constrained file here.
+// Everything in `stage-a.mjs`, `stage-b.mjs`, `lifecycle.mjs` and
+// `process-tree.mjs` is a pure function over an observation bundle. This module
+// and its siblings (`control-plane.mjs`, `process-sampler.mjs`, `cases.mjs`) are
+// what actually GO AND LOOK, so that Phase 10D runs reviewed code rather than
+// improvising one.
 //
 // Two structural properties, not two documented intentions:
 //
 //   1. `runReadOnly` accepts ONLY commands matching the allowlist below. A
 //      repair (§50) or a credential rotation (§51) is not "discouraged" — it is
-//      unrepresentable, because `systemctl restart`, `nft`, `ip route add` and
-//      friends do not match any entry and the function throws.
+//      unrepresentable, because `systemctl restart`, `nft`, `ip route add`,
+//      `docker run`, `docker tag` and `sh -c` match no entry and the function
+//      throws before a process is spawned.
 //
 //   2. Nothing here writes /etc/videofetch/worker.env or restarts the Worker to
 //      change YTDLP_ENABLED (§10). The harness measures the deployment state it
@@ -22,44 +24,130 @@ import { redactText } from "./redact.mjs";
 
 const execFileAsync = promisify(execFile);
 
+/** The durable state file the Worker owns on the VM. Read-only, and never copied. */
+export const WORKER_STATE_DB = "/var/lib/videofetch/videofetch.db";
+
+/**
+ * The ONLY durable columns the harness may project.
+ *
+ * `url` is deliberately absent and must stay absent: the durable row holds the
+ * operator-supplied acceptance URL, which during the sentinel case carries the
+ * sentinel itself. Selecting it would defeat both the URL redaction contract and
+ * the sentinel test, in the one place where the data is at its most raw.
+ */
+export const DURABLE_SAFE_COLUMNS = Object.freeze(["job_id", "status", "format_id", "extractor"]);
+
+/** A durable job id, as the Worker's own schema defines it. */
+const JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
+
+/** The exact SQL this harness may ever run. Built here, never assembled from input. */
+export function durableJobQuery(jobId) {
+  if (!JOB_ID_PATTERN.test(String(jobId))) throw new Error("refusing to query a malformed job id");
+  return `SELECT ${DURABLE_SAFE_COLUMNS.join(", ")} FROM jobs WHERE job_id = '${jobId}';`;
+}
+
+/** The fixed shape a durable read must have, so `sqlite3` cannot become a SQL console. */
+const DURABLE_QUERY_PATTERN = new RegExp(
+  `^SELECT ${DURABLE_SAFE_COLUMNS.join(", ")} FROM jobs WHERE job_id = '[0-9a-f]{32}';$`,
+);
+
 /**
  * The complete set of shapes this harness may execute.
  *
- * Each entry is `[executable, argv-prefix-predicate]`. A command is admissible
- * only if some entry's executable matches AND its predicate accepts the full
- * argv. Anything else throws before a process is spawned.
+ * Each entry is `[executable, argv predicate]`. A command is admissible only if
+ * some entry's executable matches AND its predicate accepts the full argv.
  */
 const READ_ONLY_COMMANDS = Object.freeze([
-  // Read-only container introspection.
+  // Read-only container and image introspection.
   ["docker", (a) => a[0] === "inspect"],
   ["docker", (a) => a[0] === "image" && a[1] === "inspect"],
   ["docker", (a) => a[0] === "logs"],
+  // Process listing with an EXPLICIT safe column set — never a command line.
   ["docker", (a) => a[0] === "top"],
   // Version probes inside the running container. Read-only by argument shape:
-  // the allowlist admits exactly the four version invocations and nothing else,
-  // so `docker exec` cannot become a general remote shell.
+  // the allowlist admits exactly the known version invocations and nothing
+  // else, so `docker exec` cannot become a general remote shell.
   ["docker", (a) => a[0] === "exec" && isVersionProbe(a)],
   // Read-only unit state.
   ["systemctl", (a) => a[0] === "is-active" || a[0] === "show" || a[0] === "status"],
   ["journalctl", () => true],
-  // The existing read-only safe-egress verifier (§15). It never repairs.
+  // The existing read-only safe-egress verifier. It never repairs.
   ["/usr/local/sbin/vf-egress-policy-verify", (a) => a.length === 0],
-  // Read-only process sampling (§29).
+  // Read-only process/namespace metadata.
   ["ps", () => true],
-  ["readlink", () => true],
+  ["readlink", (a) => a.length === 1 && a[0].startsWith("/proc/")],
+  // Durable state, read-only, projecting only the safe column list.
+  [
+    "sqlite3",
+    (a) =>
+      a.length === 3 &&
+      a[0] === "-readonly" &&
+      a[1] === WORKER_STATE_DB &&
+      DURABLE_QUERY_PATTERN.test(a[2]),
+  ],
 ]);
 
 /** The only in-container commands the allowlist admits. */
 function isVersionProbe(argv) {
-  const tail = argv.slice(2); // drop `exec <container>`
-  const joined = tail.join(" ");
+  const joined = argv.slice(2).join(" "); // drop `exec <container>`
   return (
     joined === "/usr/bin/python3 --version" ||
     joined === "node --version" ||
-    /^\/usr\/bin\/python3 \/usr\/local\/lib\/videofetch\/yt-dlp --version$/.test(joined) ||
-    /^\/usr\/bin\/python3 -c import yt_dlp_ejs/.test(joined)
+    joined === "/usr/bin/python3 /usr/local/lib/videofetch/yt-dlp --version" ||
+    joined === EJS_PROBE_ARGV.join(" ") ||
+    isWorkDirProbe(argv)
   );
 }
+
+/** `python3 -c <fixed isdir expression>` and nothing else. */
+function isWorkDirProbe(argv) {
+  const tail = argv.slice(2);
+  return (
+    tail.length === 3 &&
+    tail[0] === "/usr/bin/python3" &&
+    tail[1] === "-c" &&
+    WORKDIR_PROBE_PATTERN.test(tail[2])
+  );
+}
+
+/**
+ * The bundled-EJS version probe.
+ *
+ * Prints EXACTLY the version string and nothing else — no module path, no
+ * environment, no traceback body. `sys.path` is extended to the pinned
+ * zipimport artifact, which is where `yt_dlp_ejs` lives; a failure prints the
+ * fixed token `UNAVAILABLE` rather than a Python error, so nothing about the
+ * image's internals can arrive through this channel.
+ */
+export const EJS_PROBE_ARGV = Object.freeze([
+  "/usr/bin/python3",
+  "-c",
+  "import sys;sys.path.insert(0,'/usr/local/lib/videofetch/yt-dlp')\n" +
+    "try:\n from yt_dlp_ejs import __version__ as v\n print(v)\n" +
+    "except Exception:\n print('UNAVAILABLE')",
+]);
+
+/**
+ * The per-job working-directory probe.
+ *
+ * A FIXED shape with only a validated 32-hex job id interpolated, printing
+ * exactly `True` or `False`. Cancellation and byte-limit acceptance must prove
+ * the workDir is GONE, and without this the harness could not observe absence
+ * at all — which would have meant either widening the allowlist to a general
+ * container shell, or reporting an unprovable cleanup. Neither is acceptable,
+ * so the capability is added at exactly the width the assertion needs.
+ */
+export function workDirProbeArgv(jobId) {
+  if (!JOB_ID_PATTERN.test(String(jobId))) throw new Error("refusing to probe a malformed job id");
+  return Object.freeze([
+    "/usr/bin/python3",
+    "-c",
+    `import os;print(os.path.isdir('/tmp/videofetch/jobs/${jobId}'))`,
+  ]);
+}
+
+const WORKDIR_PROBE_PATTERN =
+  /^import os;print\(os\.path\.isdir\('\/tmp\/videofetch\/jobs\/[0-9a-f]{32}'\)\)$/;
 
 export function isReadOnlyCommand(file, argv) {
   const args = Array.isArray(argv) ? argv : [];
@@ -115,43 +203,87 @@ export function notMeasured(reason) {
   return Object.freeze({ measured: false, reason });
 }
 
-// ── Concrete observers ─────────────────────────────────────────────────────
-//
-// Each returns an observation. They are exported individually so the CLI can
-// compose exactly the bundle a stage needs, and so tests can substitute fakes
-// one at a time.
+// ── System observers ───────────────────────────────────────────────────────
 
 export function makeSystemObservers(deps = {}) {
   const run = deps.runReadOnly ?? runReadOnly;
   const container = deps.container ?? "videofetch-worker";
+  const imageRepo = deps.imageRepo ?? "videofetch-worker";
 
-  return {
+  /** `docker inspect --format` on the container, returning a trimmed scalar. */
+  async function inspectContainer(format) {
+    const result = await run("docker", ["inspect", "--format", format, container]);
+    return String(result.stdout ?? "").trim();
+  }
+
+  /** Resolves one image REFERENCE to its content id, or null when absent. */
+  async function imageId(reference) {
+    const result = await run("docker", ["image", "inspect", "--format", "{{.Id}}", reference]);
+    if (result.exitCode !== 0) return null;
+    const id = String(result.stdout ?? "").trim();
+    return /^sha256:[0-9a-f]{64}$/.test(id) ? id : null;
+  }
+
+  const observers = {
     async serviceState(unit) {
       return observe(`systemctl is-active ${unit}`, async () => {
         const result = await run("systemctl", ["is-active", unit]);
-        return { unit, activeState: result.stdout.trim() };
+        // `is-active` exits non-zero for an inactive unit; the STATE is the
+        // measurement, so a non-zero exit is data rather than a failure.
+        return { unit, activeState: String(result.stdout ?? "").trim() || "unknown" };
       });
     },
 
     async runningImageId() {
       return observe("docker inspect worker image id", async () => {
-        const result = await run("docker", ["inspect", "--format", "{{.Image}}", container]);
-        const id = result.stdout.trim();
-        if (!id) throw new Error("container is not running");
+        const id = await inspectContainer("{{.Image}}");
+        if (!id) throw new Error("the Worker container is not running");
         return id;
       });
     },
 
-    async networkMode() {
-      return observe("docker inspect network mode", async () => {
-        const result = await run("docker", [
-          "inspect",
-          "--format",
-          "{{.HostConfig.NetworkMode}}",
-          container,
-        ]);
-        return result.stdout.trim();
+    /**
+     * §6 of CORRECTION-01 — the concrete image-identity observer.
+     *
+     * Resolves `videofetch-worker:<authorized sha>` and compares it with the id
+     * the running container actually reports. Inspection only: no build, no
+     * tag, no pull.
+     */
+    async imageShaTag(expectedSha) {
+      return observe(`docker image inspect ${imageRepo}:<sha>`, async () => {
+        if (!/^[0-9a-f]{7,40}$/.test(String(expectedSha ?? ""))) {
+          throw new Error("no authorized --expected-sha was supplied");
+        }
+        const taggedImageId = await imageId(`${imageRepo}:${expectedSha}`);
+        if (!taggedImageId) {
+          throw new Error(`no local image is tagged ${imageRepo}:${expectedSha}`);
+        }
+        const runningImageId = await inspectContainer("{{.Image}}");
+        return { expectedSha, taggedImageId, runningImageId };
       });
+    },
+
+    /**
+     * The unit still starts `videofetch-worker:latest`, so `latest` and the SHA
+     * tag must name ONE image object; two ids mean the unit would start an
+     * image nobody reviewed.
+     */
+    async imageLatestAlias(expectedSha) {
+      return observe(`docker image inspect ${imageRepo}:latest`, async () => {
+        if (!/^[0-9a-f]{7,40}$/.test(String(expectedSha ?? ""))) {
+          throw new Error("no authorized --expected-sha was supplied");
+        }
+        const latestImageId = await imageId(`${imageRepo}:latest`);
+        const taggedImageId = await imageId(`${imageRepo}:${expectedSha}`);
+        if (!latestImageId) throw new Error(`no local image is tagged ${imageRepo}:latest`);
+        return { latestImageId, taggedImageId };
+      });
+    },
+
+    async networkMode() {
+      return observe("docker inspect network mode", async () =>
+        inspectContainer("{{.HostConfig.NetworkMode}}"),
+      );
     },
 
     /**
@@ -163,13 +295,8 @@ export function makeSystemObservers(deps = {}) {
      */
     async environmentNames() {
       return observe("docker inspect worker environment names", async () => {
-        const result = await run("docker", [
-          "inspect",
-          "--format",
-          "{{range .Config.Env}}{{println .}}{{end}}",
-          container,
-        ]);
-        return result.stdout
+        const raw = await inspectContainer("{{range .Config.Env}}{{println .}}{{end}}");
+        return raw
           .split("\n")
           .map((line) => line.split("=")[0].trim())
           .filter((name) => name.length > 0);
@@ -181,17 +308,12 @@ export function makeSystemObservers(deps = {}) {
      *
      * Read from the container's bound environment rather than by reading
      * worker.env, so the harness never opens the secret-bearing file at all.
-     * An unset variable yields `undefined`, which Stage A treats as disabled.
+     * An unset variable yields `null`, which Stage A treats as disabled.
      */
     async ytdlpEnabledRaw() {
       return observe("docker inspect YTDLP_ENABLED", async () => {
-        const result = await run("docker", [
-          "inspect",
-          "--format",
-          "{{range .Config.Env}}{{println .}}{{end}}",
-          container,
-        ]);
-        for (const line of result.stdout.split("\n")) {
+        const raw = await inspectContainer("{{range .Config.Env}}{{println .}}{{end}}");
+        for (const line of raw.split("\n")) {
           const [name, ...rest] = line.split("=");
           if (name.trim() === "YTDLP_ENABLED") return rest.join("=").trim();
         }
@@ -209,85 +331,89 @@ export function makeSystemObservers(deps = {}) {
 
     async pythonVersion() {
       return observe("python3 --version", async () => {
-        const result = await run("docker", [
-          "exec",
-          container,
-          "/usr/bin/python3",
-          "--version",
-        ]);
-        return (result.stdout || result.stderr).trim().replace(/^Python\s+/i, "");
+        const result = await run("docker", ["exec", container, "/usr/bin/python3", "--version"]);
+        return String(result.stdout || result.stderr || "").trim().replace(/^Python\s+/i, "");
       });
     },
 
     async nodeVersion() {
       return observe("node --version", async () => {
         const result = await run("docker", ["exec", container, "node", "--version"]);
-        return result.stdout.trim();
+        return String(result.stdout ?? "").trim();
+      });
+    },
+
+    /** §7 of CORRECTION-01 — the concrete bundled-EJS observer. */
+    async bundledEjsVersion() {
+      return observe("bundled yt_dlp_ejs version", async () => {
+        const result = await run("docker", ["exec", container, ...EJS_PROBE_ARGV]);
+        const value = String(result.stdout ?? "").trim();
+        // The probe prints a version or the fixed token. Anything else is a
+        // measurement failure, never a reported value.
+        if (!/^\d+\.\d+\.\d+$/.test(value)) {
+          throw new Error(`the EJS probe did not report a version (${value === "UNAVAILABLE" ? "UNAVAILABLE" : "unexpected output"})`);
+        }
+        return value;
+      });
+    },
+
+    /**
+     * Durable job evidence, projecting ONLY the safe columns.
+     *
+     * The row also holds the submitted URL; it is never selected. See
+     * `DURABLE_SAFE_COLUMNS`.
+     */
+    async durableJobRow(jobId) {
+      return observe(`durable job ${jobId}`, async () => {
+        const result = await run("sqlite3", ["-readonly", WORKER_STATE_DB, durableJobQuery(jobId)]);
+        if (result.exitCode !== 0) throw new Error("durable state could not be read");
+        const line = String(result.stdout ?? "").trim();
+        if (!line) throw new Error("no durable row exists for this job");
+        const parts = line.split("|");
+        if (parts.length !== DURABLE_SAFE_COLUMNS.length) {
+          throw new Error("durable row shape did not match the projected columns");
+        }
+        const [jobIdValue, status, formatId, extractor] = parts;
+        return { jobId: jobIdValue, status, formatId, extractor };
+      });
+    },
+
+    /**
+     * Whether a per-job working directory still exists inside the container.
+     *
+     * An unreadable answer is a MEASUREMENT FAILURE, never "absent": reporting
+     * absence we could not observe is exactly the SKIPPED->PASS edge §49 bans.
+     */
+    async workDirPresent(jobId) {
+      return observe(`workDir for job ${jobId}`, async () => {
+        const result = await run("docker", ["exec", container, ...workDirProbeArgv(jobId)]);
+        const value = String(result.stdout ?? "").trim();
+        if (value !== "True" && value !== "False") {
+          throw new Error("the workDir probe did not return a boolean");
+        }
+        return value === "True";
+      });
+    },
+
+    /** Read-only log capture for the sentinel sweep. Logging config is never changed (§47). */
+    async workerLogs(sinceIso) {
+      return observe("docker logs", async () => {
+        const args = ["logs", container];
+        if (sinceIso) args.push("--since", sinceIso);
+        const result = await run("docker", args);
+        return `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+      });
+    },
+
+    async workerJournal(sinceIso) {
+      return observe("journalctl videofetch-worker", async () => {
+        const args = ["-u", "videofetch-worker", "--no-pager"];
+        if (sinceIso) args.push("--since", sinceIso);
+        const result = await run("journalctl", args);
+        return String(result.stdout ?? "");
       });
     },
   };
-}
 
-/**
- * Control-plane observers.
- *
- * Authentication reuses the EXISTING private-access mechanism (§19): a POST to
- * `/api/access/login` with the operator's own secret, and the returned HttpOnly
- * cookie held in memory for the run. No bypass, no debug route, no committed
- * credential, and nothing written to disk.
- */
-export function makeControlPlaneObservers(deps = {}) {
-  const fetchImpl = deps.fetch ?? globalThis.fetch;
-  const baseUrl = deps.baseUrl;
-  let cookie = deps.cookie ?? null;
-
-  async function authenticatedFetch(path, init = {}) {
-    const headers = new Headers(init.headers ?? {});
-    if (cookie) headers.set("cookie", cookie);
-    headers.set("accept", "application/json");
-    return fetchImpl(new URL(path, baseUrl).toString(), { ...init, headers, redirect: "manual" });
-  }
-
-  return {
-    /** Establishes the session. The secret is never stored, logged or returned. */
-    async login(secret) {
-      return observe("private-access login", async () => {
-        const response = await fetchImpl(new URL("/api/access/login", baseUrl).toString(), {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ secret }),
-          redirect: "manual",
-        });
-        const setCookie = response.headers.get("set-cookie");
-        if (!response.ok || !setCookie) throw new Error(`login failed with ${response.status}`);
-        cookie = setCookie.split(";")[0];
-        return { authenticated: true };
-      });
-    },
-
-    async capabilities() {
-      return observe("GET /api/sites", async () => {
-        const response = await authenticatedFetch("/api/sites");
-        if (!response.ok) throw new Error(`/api/sites returned ${response.status}`);
-        const body = await response.json();
-        return {
-          ytdlp: body.ytdlp === true,
-          ytdlpInstalled: body.ytdlpInstalled === true,
-          ytdlpEnabled: body.ytdlpEnabled === true,
-          ffmpeg: body.ffmpeg === true,
-        };
-      });
-    },
-
-    async diagnostics() {
-      return observe("GET /api/diagnostics", async () => {
-        const response = await authenticatedFetch("/api/diagnostics");
-        if (!response.ok) throw new Error(`/api/diagnostics returned ${response.status}`);
-        return response.json();
-      });
-    },
-
-    /** `fetchImpl` and the session cookie, for the job-lifecycle steps. */
-    authenticatedFetch,
-  };
+  return observers;
 }

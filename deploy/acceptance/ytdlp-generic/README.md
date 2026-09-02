@@ -70,12 +70,17 @@ No media URL, no hostname, no socket. Both exit non-zero on any deviation.
 | `acceptance.mjs` | the VM host | The live orchestrator. Refuses to run live by default. |
 | `lib/gate.mjs` | — | The double opt-in. Pure. |
 | `lib/verdict.mjs` | — | `PASS` / `FAIL` / `BLOCKED` / `NOT_EXERCISED`, and the Stage A → Stage B edge. |
+| `lib/lifecycle.mjs` | — | The six-state durable ladder: ordered / complete / missing. |
 | `lib/stage-a.mjs` | — | Every precondition that must hold before enablement is permitted. |
 | `lib/stage-b.mjs` | — | The enabled-state acceptance matrix. |
-| `lib/process-tree.mjs` | — | Descendant classification, process-group and namespace rules. |
-| `lib/redact.mjs` | — | The single redaction implementation. |
+| `lib/process-tree.mjs` | — | Closed sample schema, owned-PID identity, containment, namespace rules. |
+| `lib/redact.mjs` | — | The single redaction implementation and the console safety boundary. |
 | `lib/evidence.mjs` | — | The sanitized machine-readable record, and the sentinel. |
-| `lib/observers.mjs` | the VM host | The only impure module. Hard read-only command allowlist. |
+| `lib/coverage.mjs` | — | Which concrete producer obtains each check. Walked by the test suite. |
+| `lib/observers.mjs` | the VM host | Read-only system observers. Hard command allowlist. |
+| `lib/control-plane.mjs` | the VM host | The authenticated product-surface driver (login, analyze, job, signed GET). |
+| `lib/process-sampler.mjs` | the VM host | The real `docker top` sampler; establishes the owned yt-dlp PID. |
+| `lib/cases.mjs` | the VM host | Stage B case producers and the case-record contract. |
 
 Tests: `scripts/ytdlp-acceptance.test.mjs`, run by `npm test`. They drive the
 real evaluators with fakes; **no test performs a live run.**
@@ -121,6 +126,84 @@ Production-looking environment with no flag still produces a dry run.
 `lib/observers.mjs` enforces the first four **structurally**: `runReadOnly`
 accepts only commands matching an allowlist, so `systemctl restart`, `nft`,
 `ip route add`, `docker run` and `sh -c` throw before a process is spawned.
+
+---
+
+## The harness is the orchestrator, not a policy model
+
+**Phase 10D does not write a script.** Every required observation has a
+committed producer reachable from the CLI, and `scripts/ytdlp-acceptance.test.mjs`
+walks `lib/coverage.mjs` against the live evaluators to prove it: a check with no
+concrete producer fails the test suite.
+
+```
+Production
+   │
+   ▼  lib/observers.mjs        read-only commands (allowlisted)
+   │  lib/control-plane.mjs    authenticated product surface
+   │  lib/process-sampler.mjs  docker top -o pid,ppid,pgid,comm
+   │  lib/cases.mjs            case choreography
+   ▼
+reviewed evaluator (stage-a.mjs / stage-b.mjs / lifecycle.mjs / process-tree.mjs)
+   │
+   ▼
+sanitized evidence  →  PASS / FAIL / BLOCKED
+```
+
+There is no unreviewed layer between Production and the acceptance logic.
+
+### Commands
+
+| Command | Produces |
+| :--- | :--- |
+| `--stage A` | Every Stage A gate, including the direct-media regression. Writes the Stage A record. |
+| `--stage B --case success` | Generic analysis, job lifecycle, durable evidence, process sample, R2, signed GET, sentinel sweep. |
+| `--stage B --case cancellation` | Cancel-during-`downloading`, survivors, cleanup. |
+| `--stage B --case direct-regression` | Post-enable direct job with no yt-dlp process. |
+| `--stage B --case kill-switch` | Generic unusable after rollback; direct still works. |
+| `--stage B --case byte-limit` \| `shutdown` \| `safe-egress` \| `fail-closed-runtime` | Operator-transition cases; see below. |
+| `--stage B --aggregate` | Validates every case record and produces the Stage B verdict. |
+
+Each case writes its own record; the aggregation turns records into a verdict.
+Multi-run is deliberate: enabling generic, cancelling a job, stopping the Worker
+mid-acquisition and rolling the switch back are separate operator transitions
+that cannot share one process.
+
+### Case records cannot be forged
+
+`--stage B --aggregate` admits a case record only if:
+
+1. `harness` and `schemaVersion` are exactly this harness's;
+2. `case` is a known case name;
+3. `expectedSha` **and** `runningImageId` match the current run;
+4. the payload passes that case's **strict** validator — required fields of the
+   right type, and **no unknown keys**.
+
+Then the pure evaluator re-judges every field. A hand-written
+`{"passed": true}` cannot produce a PASS: there is no field called `passed`, and
+nothing in a record is believed — only re-evaluated.
+
+### Authentication
+
+A live run **requires** `VIDEOFETCH_ACCESS_SECRET` and calls the existing
+`POST /api/access/login` exactly once, holding the `HttpOnly` cookie in memory.
+
+- A **missing** secret is a **usage failure**, not a capability failure — an
+  unauthenticated probe would 401 and be recorded as "the control plane is
+  broken", which is a false finding.
+- A **failed** login is `BLOCKED`. The harness never continues as an
+  unauthenticated observer.
+- The secret is registered with the console safety pipeline the moment it is
+  read, so it cannot reach output even through an error message.
+
+### Operator-transition cases
+
+`byte-limit`, `shutdown`, `safe-egress` and `fail-closed-runtime` involve a
+transition the harness must not perform (stopping the Worker, damaging a
+runtime, standing up a forbidden-destination fixture). Running them without a
+producer exits `BLOCKED` with the reviewed procedure named — never a pass. The
+operator performs the transition, and the case's evidence is produced by the
+reviewed path described in the sections below.
 
 ---
 
@@ -262,22 +345,24 @@ does not do this.**
 | | `analysis.no-raw-formats` | `formats: []`. No raw `format_id` reaches the browser contract. |
 | | `analysis.presets-application-owned` | Every advertised option is a `preset:*` rung. |
 | | `analysis.no-generic-thumbnail` | No generic thumbnail URL under the v1 contract. |
-| Job | `job.transitions-ordered` | `queued → analyzing → downloading → processing → uploading → ready`, in order, reaching `ready`. Never faked. |
+| Job | `job.lifecycle-complete` | **All six** durable states — `queued → analyzing → downloading → processing → uploading → ready` — observed, in order. See below. |
 | | `job.requested-preset-owned` | Created with an application-owned preset. |
 | Durable | `durable.extractor-is-ytdlp` | `extractor: yt-dlp` persisted after analysis. |
-| | `durable.no-raw-selector-fields` | No `format_id`, `selector`, `sourceUrl` … field exists in durable evidence. |
+| | `durable.application-format-id` | The durable `format_id` **is** an application preset, and equals the one the job was created with. Positive evidence. |
+| | `durable.no-raw-selector-fields` | No `source_format_id`, `rawFormatId`, `selector`, `sourceUrl` … field exists. |
 | | `selector.constraints-satisfied` | Structural only. The raw upstream id is **never** reported or persisted. |
-| Process | `process.no-ffmpeg-during-downloading` | No `ffmpeg`, `ffprobe`, `curl`, `wget`, `aria2c`, `axel`, shell … under the Worker while durable state is `downloading`. |
+| Process | `process.sample-shape` | The sample matches the **closed** schema: `pid`, `ppid`, `pgid`, `comm`, `netns` and nothing else. |
+| | `process.ytdlp-identified` | The **exact** owned yt-dlp PID — descendant of the Worker, approved runtime basename, **its own process-group leader**, in the media namespace. |
+| | `process.no-ffmpeg-during-downloading` | No `ffmpeg`, `ffprobe`, `curl`, `wget`, `aria2c`, `axel`, shell … under the Worker while durable state is `downloading`. |
 | | `process.no-unknown-descendants` | Anything neither approved nor forbidden fails — unknown is not assumed safe. |
-| | `process.ytdlp-present` | The owned yt-dlp process was actually observed. |
 | | `process.namespace-identity` | Worker, yt-dlp and any Node descendant share one media netns inode. |
-| | `process.node-ejs-containment` | *Optional.* If Node appears: descendant of the owned yt-dlp process, same process group, same namespace, gone at the end. If it never appears: `NODE/EJS DESCENDANT NOT EXERCISED BY THIS SOURCE`. |
+| | `process.node-ejs-containment` | *Optional.* Anchored to the **verified** owned PID: descendant of it, same process group, same namespace. Unanchored ⇒ `BLOCKED`. Never invoked ⇒ `NODE/EJS DESCENDANT NOT EXERCISED BY THIS SOURCE`. |
 | Egress | `safe-egress.forbidden-destination-denied` | A later forbidden destination denied by the **external boundary**, attributed to it. |
 | | `safe-egress.policy-unchanged` | The policy fingerprint is identical before and after the run. |
 | R2 | `r2.delegated-write` | The object exists with non-zero length, written through the AF_UNIX broker. |
 | | `r2.worker-holds-no-credential` | The Worker still holds no persistent R2 credential. |
 | Vercel | `vercel.signed-get` | `303` to a presigned read-only GET. The Worker never performs the GET. |
-| | `vercel.byte-digest` | Length **and** SHA-256 match. `HTTP 200` alone is not proof. |
+| | `vercel.byte-integrity` | **Three-way** length agreement — durable `fileSize`, R2 `contentLength`, delivered bytes — plus a real SHA-256. `HTTP 200` alone is not proof. |
 | Privacy | `privacy.sentinel-not-leaked` | The ephemeral sentinel appears in none of the swept surfaces. |
 | Cancel | `cancel.durable-cancelled` | Cancel during `downloading` → durable `cancelled`, no late `ready`. |
 | | `cancel.processes-gone` | No yt-dlp or Node descendant survives. |
@@ -289,6 +374,95 @@ does not do this.**
 | Runtime | `runtime.fail-closed` | *Optional.* Exact runtime unavailable → generic unusable, **no PATH fallback**, direct still works. |
 | Kill switch | `killswitch.rollback` | Restoring the disabled state makes generic unusable while direct keeps working. |
 | Catalog | `catalog.unchanged` | No `"limited"` entry was promoted on the strength of this run. |
+
+### The durable lifecycle contract
+
+All six states are required evidence for the normal generic success case:
+
+```
+queued → analyzing → downloading → processing → uploading → ready
+```
+
+Three distinct outcomes, and the distinction is the point:
+
+| Observation | Outcome |
+| :--- | :--- |
+| Complete and ordered | `PASS` |
+| Measured, but moves backwards through the ladder | `FAIL` |
+| Measured, but a required state was never seen | **`BLOCKED`** |
+
+A missed poll is an **evidence gap**, never proof. `["ready"]` cannot pass, and
+neither can `[queued, analyzing, ready]`. Consecutive duplicates from polling are
+collapsed and are fine; a state outside the closed durable vocabulary rejects the
+trace outright.
+
+Observation is what was strengthened to meet this, not the evaluator:
+
+- the poller runs at **200 ms**, because the runbook's own direct-media record
+  shows a whole job completing in ~1.2 s;
+- the trace is **seeded from the `POST /api/download` response**, which is the
+  only observation that can witness `queued` for a job that leaves the queue
+  before the first poll.
+
+If a complete trace still cannot be obtained, Phase 10D is `BLOCKED`. Do not add
+production instrumentation to close the gap.
+
+### Proving the exact yt-dlp process
+
+`process.ytdlp-identified` requires a specific PID, not "a Python process
+exists". The sampler **establishes** a candidate and the evaluator then
+re-verifies every property independently:
+
+1. it is a descendant of the Worker;
+2. its basename is an approved runtime shape (`python3`, `python3.11`, `yt-dlp`);
+3. **it is its own process-group leader** (`pgid === pid`);
+4. it is in the Worker's media network namespace.
+
+Clause 3 is the discriminator. `process-runner.server.ts` spawns acquisition with
+`detached: true`, so the owned process necessarily leads its own group, while an
+unrelated Python descendant inherits the Worker's. It is also the property every
+containment and termination proof depends on, since those are expressed in terms
+of that group.
+
+If **zero or several** candidates match, the sampler reports a measurement
+failure rather than picking one — guessing which of two Python processes is "the"
+acquisition would make every downstream proof meaningless. Node containment is
+then anchored to that verified PID; without an anchor it is `BLOCKED`, never
+"contained".
+
+### The closed process-sample schema
+
+A row may carry **exactly** `pid`, `ppid`, `pgid`, `comm`, `netns` — an
+allowlist, not a blacklist of names someone thought of. `environment`,
+`headers`, `query`, `fullCommand`, `cmdline`, `argv` and anything else are
+rejected, as are malformed types and a `comm` containing a path separator or
+whitespace (which is what a command line would bring).
+
+The sampler uses `docker top <container> -o pid,ppid,pgid,comm` precisely
+because it *cannot* return a command line. `ps -ef` and `/proc/<pid>/cmdline`
+would each hand back the acquisition argv, whose last element is the submitted
+media URL — and, during the sentinel case, the sentinel. Selecting the four safe
+columns means the URL is never read, rather than being read and then redacted.
+
+### The durable format contract
+
+The durable `format_id` column legitimately holds the **application-owned**
+preset, and the harness now proves that positively:
+
+```
+durable.application-format-id   format_id ∈ preset:*  AND  == the requested preset
+durable.no-raw-selector-fields  no source_format_id / rawFormatId / selector /
+                                format_selector / ytdlpFormat / sourceUrl
+```
+
+An earlier draft forbade `formatId` outright, which would have rejected every
+real durable row. What must never become durable is the **private upstream
+source selection** — which has no column at all and stays memory-only for one
+execution attempt.
+
+The durable reader projects **only** `job_id, status, format_id, extractor`. The
+`url` column is deliberately never selected: it holds the acceptance URL, and
+during the sentinel case the sentinel itself.
 
 ### The live test URL is an input, never a constant
 
@@ -382,8 +556,11 @@ the watchdog, or bind an internal fixture and call it a public-destination test.
 
 ### Redaction
 
-One implementation, `lib/redact.mjs`, used by console output, the JSON record,
-errors and command summaries alike.
+One implementation, `lib/redact.mjs`. The CLI logs through
+`createSafeConsole(...)`, so console output crosses the boundary
+**structurally** rather than by every call site remembering to pre-redact — and
+the needle list is read at call time, so a secret registered mid-run (the
+sentinel, the Worker control secret) protects output that was already wired up.
 
 ```
 https://host/path?token=secret   →   https://host/path?<redacted>
@@ -399,10 +576,10 @@ because the evidence record is redacted at more than one level.
 
 ### The sentinel
 
-Each live run mints `VF_ACCEPT_SECRET_<random>` — a random marker, **never a
-real credential** — and places it in a benign query parameter of a submitted
-URL where doing so cannot alter media selection. It must then appear in **none**
-of:
+The `success` case — in the real CLI code path, not only in the specification —
+mints `VF_ACCEPT_SECRET_<random>` (a random marker, **never a real credential**),
+places it in a benign query parameter of the submitted URL, and submits it
+through the application surface. It must then appear in **none** of:
 
 - the Worker journal;
 - cloudflared-relevant application output;
