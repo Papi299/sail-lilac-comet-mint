@@ -1328,6 +1328,209 @@ because an existing execution path does not guarantee any given URL satisfies
 the public-source, progressive-HTTP(S), muxed-single-stream, safe-format-id and
 no-live policies.
 
+### 4i. Phase 10C4 — Production acceptance harness, NOT EXECUTED
+
+*`PHASE-10C4-YTDLP-PRODUCTION-ACCEPTANCE-HARNESS-001` added acceptance tooling
+and reconciled stale deployment prose. It changed no Worker execution code, no
+safe-egress policy and no functional systemd behaviour, and it touched nothing
+in Production.*
+
+```
+harness exists:            YES
+live generic acceptance:   NO
+Production deployment:     NO
+Production enablement:     NO
+```
+
+| Property | State after Phase 10C4 |
+| :--- | :--- |
+| Generic execution code | unchanged since §4h |
+| `GENERIC_YTDLP_EXECUTION_IMPLEMENTED` | `true`, unchanged |
+| `YTDLP_ENABLED` in Production | **unset — unchanged by this phase** |
+| Production deployment | **NOT performed** |
+| Production enablement | **NOT performed** |
+| Live generic media request | **NONE** |
+| Provider mutation (Cloudflare / R2 / Vercel) | **NONE** |
+| Lima VM | **not started for this phase** |
+
+#### Why the phase exists
+
+Phase 10C3 connected generic execution in source. Enabling it in Production is a
+different act, and the failure mode this phase exists to prevent is designing
+the test inside Production — improvising `docker`, `systemctl` and `curl`
+commands at the moment of enablement, then reporting whatever they happened to
+show. That produces evidence nobody reviewed the shape of beforehand.
+
+The ordering is therefore:
+
+```
+reviewed generic implementation  (10C3, merged)
+        +
+reviewed acceptance harness      (10C4, this phase)
+        |
+        v
+staged live deployment           (10D, not yet authorized)
+```
+
+#### What was added
+
+`deploy/acceptance/ytdlp-generic/` gains a live-acceptance layer beside the two
+existing offline verifiers, which are retained unchanged:
+
+| File | Kind |
+| :--- | :--- |
+| `verify-selector.py` | offline / static — **retained** |
+| `verify-download-policy.py` | offline / static — **retained** |
+| `README.md` | the Phase-10D specification |
+| `acceptance.mjs` | the live orchestrator |
+| `lib/{gate,verdict,stage-a,stage-b,process-tree,redact,evidence,observers}.mjs` | small single-purpose modules |
+| `scripts/ytdlp-acceptance.test.mjs` | 84 tests, run by `npm test` |
+
+The two kinds of evidence are kept explicitly separate. The offline verifiers
+prove pinned-runtime **semantics** without a network; the orchestrator proves
+the behaviour of a **deployed system**. Offline evidence is never labelled
+Production acceptance.
+
+#### Accidental live execution
+
+The default invocation is a dry run that exits `BLOCKED`:
+
+```
+live execution         : REFUSED
+Production mutation    : NONE
+network media request  : NONE
+job created            : NONE
+```
+
+A live run requires **both** `--live` and an exact `VIDEOFETCH_ACCEPT_LIVE=1`.
+Neither is inferred from anything: there is no "live if a Production host is
+reachable" heuristic, and a Production-shaped environment with no flag still
+produces a dry run.
+
+#### The harness does not change what it measures
+
+It never writes `/etc/videofetch/worker.env`, never restarts the Worker to
+enable generic execution, never repairs a failed service or policy, and never
+creates or rotates a credential. `lib/observers.mjs` enforces this
+structurally: a hard read-only command allowlist means `systemctl restart`,
+`nft`, `ip route add`, `docker run` and `sh -c` throw before a process is
+spawned, rather than being merely discouraged.
+
+Enablement, repair and rollback are Phase-10D operator steps.
+
+#### The two-stage procedure Phase 10D must follow
+
+```
+STAGE A — reviewed image deployed, generic DISABLED
+   │   17 gates: exact image identity, seven active services, the read-only
+   │   vf-egress-policy-verify, media-namespace placement, exact runtime
+   │   identity, truthful generic-disabled diagnostics, a forbidden-variable
+   │   audit by NAME, and a full direct-media regression proven to the byte.
+   │
+   │   ALL must PASS. There is no warn-and-continue.
+   ▼
+   OPERATOR sets YTDLP_ENABLED=true, restarts only what is required
+   ▼
+STAGE B — generic ENABLED
+       capability truthfulness, generic analysis, a real durable job through
+       queued→ready, process-descendant sampling, the no-FFmpeg rule, Node/EJS
+       containment, namespace identity, a safe-egress negative case, delegated
+       R2 write, a Vercel signed GET validated by digest, cancellation,
+       shutdown, the actual-byte guard, post-enable direct regression and the
+       kill switch.
+```
+
+The harness **refuses to grade the wrong stage**: Stage A assertions against an
+enabled deployment, or Stage B against a disabled one, exit `BLOCKED` with
+`STAGE MISMATCH`. Stage B additionally requires a Stage A evidence record whose
+verdict is literally `PASS`; there is no override flag.
+
+#### Stop gates
+
+Stage B is unreachable if any of these is not proven in Stage A:
+
+```
+exact image identity      required service chain     safe-egress verifier
+exact runtime identity    generic-disabled truth     direct regression
+R2 path                   Vercel delivery
+```
+
+A security-relevant property that **could not be measured** is `BLOCKED`, not
+skipped, and `BLOCKED` stops the run exactly as `FAIL` does. Optional
+site-specific coverage reports `NOT_EXERCISED`, which proves nothing and can
+never satisfy a required check — so a source that never invokes the Node/EJS
+runtime records that fact rather than claiming the containment case passed.
+
+#### Known evidence gap, recorded in advance
+
+The actual-byte-limit case (unknown or misdeclared `Content-Length`) requires a
+safe, reproducible live fixture. `--max-filesize` does **not** prove it: the
+pinned `HttpFD.real_download` checks that option only inside
+`if data_len is not None`. If no such fixture exists at Phase 10D time, the run
+must report
+
+```
+LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN
+```
+
+and the acceptance is **incomplete**. Substituting a unit test for it is
+explicitly forbidden, and the harness fails a case whose declared length was
+known — so a `--max-filesize` catch cannot be submitted as evidence for the
+application byte watcher.
+
+#### Deployment prose reconciled
+
+Three comments asserted a Phase-10C1 fact that Phase 10C3 falsified — that no
+user-URL yt-dlp execution path exists:
+
+- `deploy/systemd/videofetch-worker.service`
+- `src/shared/worker/contracts.ts` (the `features.ytdlpEnabled` contract)
+- `src/worker/runtime/config.server.ts` (the `ytdlp.enabled` config field)
+
+All three are **comment-only** changes; no functional systemd directive, schema
+or code path was altered. The unit's `YTDLP_ENABLED` block now states the
+three-value grammar (absent / `"false"` / `"true"`), records that the image may
+contain the reviewed execution path while enabling it remains a separate
+deployment decision, and reiterates that safe egress is the external
+systemd/netns/nftables boundary rather than anything this variable controls.
+
+The unit still sets **no** `Environment=YTDLP_ENABLED`. The deployed value comes
+only from `/etc/videofetch/worker.env`, so the operator disables generic
+execution by removing the variable there — or setting the approved disabled
+value — with no edit to the committed unit.
+
+`src/worker/runtime/worker-unit-ytdlp-policy.test.ts` asserts both halves: that
+the retired claim is absent from the unit's comments in any wording, and that
+the accepted functional controls are unchanged — the safe-egress and broker
+`Requires`/`After`/`BindsTo` edges, both fatal `ExecStartPre` gates, the media
+namespace with no fallback, `--cap-drop=ALL`, `no-new-privileges`, the read-only
+root, the 2 GiB `noexec,nosuid` tmpfs, the read-only broker socket directory,
+the numeric `--group-add`, and the absence of any Docker socket mount.
+
+#### Privacy contract of the harness
+
+One redaction implementation covers console output, the JSON record, errors and
+command summaries. Query strings are removed wholesale rather than
+per-parameter, because the acceptance URL is third-party test data and the
+per-run sentinel deliberately lives in a query parameter — a "safe parameter"
+allowlist would make the sentinel test unfalsifiable.
+
+Process sampling collects `pid`, `ppid`, `pgid`, executable **basename** and
+network-namespace inode. It never collects command lines: the acquisition argv
+ends in the submitted URL. A sample carrying `cmdline`, `argv`, `exe`, `command`
+or `url` is rejected outright rather than redacted.
+
+The evidence record is assembled from an allowlist, redacted at every depth,
+then stripped of forbidden keys. `/etc/videofetch/worker.env` is never dumped or
+read — `YTDLP_ENABLED` is observed from the container's bound environment, and
+every other variable is reported as a bare name or a boolean.
+
+#### What Phase 10D is authorized to do
+
+Nothing yet. Only after this harness has been **independently reviewed and
+merged** may Phase 10D be authorized to touch the Lima VM, build and deploy the
+exact reviewed image, or set `YTDLP_ENABLED=true`.
+
 ---
 
 ## 5. Object storage (R2)
