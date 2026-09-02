@@ -1,14 +1,11 @@
-import { describe, it, afterEach } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isYtdlpNetworkIsolated } from "../../lib/config.ts";
 import {
-  assertYtdlpDeploymentLock,
   loadWorkerRuntimeConfig,
-  parsesYtdlpIsolationTruthy,
   WORKER_DEFAULT_BIND_HOST,
   WORKER_DEFAULT_PORT,
+  WORKER_FORBIDDEN_YTDLP_VARIABLES,
   WorkerRuntimeConfigError,
-  WorkerYtdlpDeploymentLockError,
 } from "./config.server.ts";
 
 /**
@@ -535,86 +532,133 @@ describe("Worker runtime configuration", () => {
     });
   });
 });
+/**
+ * PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001 — yt-dlp configuration contract.
+ *
+ * This block deliberately REPLACES the Phase-8A deployment lock, which asserted
+ * that `YTDLP_NETWORK_ISOLATED` could not be truthy. That contract is retired:
+ * the variable was an operator assertion, never the safe-egress boundary, and
+ * a retired contract that still parses is worse than one that fails closed.
+ *
+ * The invariants below are strictly stronger than the ones they replace:
+ * presence of the retired variable is now fatal at ANY value, and enablement
+ * moved to its own explicit, strictly-parsed flag.
+ */
+describe("Phase-10C1 yt-dlp configuration contract", () => {
+  describe("retired variables are refused by presence", () => {
+    it("names both retired variables", () => {
+      assert.deepEqual([...WORKER_FORBIDDEN_YTDLP_VARIABLES], [
+        "YTDLP_NETWORK_ISOLATED",
+        "YTDLP_PATH",
+      ]);
+    });
 
-describe("Phase-8A yt-dlp deployment lock", () => {
-  const ORIGINAL = process.env.YTDLP_NETWORK_ISOLATED;
+    // The retired lock only rejected TRUTHY values. A stale deployment still
+    // shipping `false` looked correct while carrying a dead contract, so the
+    // replacement rejects the variable existing at all.
+    for (const value of ["true", "false", "1", "0", "yes", "no", "", "   ", "TRUE"]) {
+      it(`rejects YTDLP_NETWORK_ISOLATED=${JSON.stringify(value)}`, () => {
+        expectInvalid(baseEnv({ YTDLP_NETWORK_ISOLATED: value }), "YTDLP_NETWORK_ISOLATED");
+      });
+    }
 
-  afterEach(() => {
-    if (ORIGINAL === undefined) delete process.env.YTDLP_NETWORK_ISOLATED;
-    else process.env.YTDLP_NETWORK_ISOLATED = ORIGINAL;
-  });
+    for (const value of ["/usr/bin/yt-dlp", "python3 -m yt_dlp", ""]) {
+      it(`rejects YTDLP_PATH=${JSON.stringify(value)}`, () => {
+        expectInvalid(baseEnv({ YTDLP_PATH: value }), "YTDLP_PATH");
+      });
+    }
 
-  const ACCEPTED: Array<[string, string | undefined]> = [
-    ["undefined", undefined],
-    ["empty string", ""],
-    ["false", "false"],
-    ["0", "0"],
-  ];
-
-  const REJECTED: Array<[string, string]> = [
-    ["true", "true"],
-    ["1", "1"],
-    ["yes", "yes"],
-  ];
-
-  for (const [label, value] of ACCEPTED) {
-    it(`accepts startup when YTDLP_NETWORK_ISOLATED is ${label}`, () => {
-      const env = baseEnv({ YTDLP_NETWORK_ISOLATED: value });
-      assert.doesNotThrow(() => assertYtdlpDeploymentLock(env));
-      const config = loadWorkerRuntimeConfig(env);
+    it("accepts startup when neither retired variable is present", () => {
+      const config = loadWorkerRuntimeConfig(baseEnv());
       assert.equal(config.dataDirectory, "/var/lib/videofetch");
+      assert.equal(config.media.ytdlp.enabled, false);
     });
-  }
 
-  for (const [label, value] of REJECTED) {
-    it(`REJECTS startup when YTDLP_NETWORK_ISOLATED is ${label}`, () => {
-      const env = baseEnv({ YTDLP_NETWORK_ISOLATED: value });
+    it("reports the retired variable even when the rest of the environment is empty", () => {
+      // A stale deployment must be told WHICH contract it is still carrying,
+      // rather than having it buried under unrelated missing-variable noise.
       assert.throws(
-        () => assertYtdlpDeploymentLock(env),
-        (err: unknown) => err instanceof WorkerYtdlpDeploymentLockError,
-      );
-      assert.throws(
-        () => loadWorkerRuntimeConfig(env),
-        (err: unknown) => err instanceof WorkerYtdlpDeploymentLockError,
+        () => loadWorkerRuntimeConfig({ YTDLP_NETWORK_ISOLATED: "false" }),
+        (err: unknown) => {
+          assert.ok(err instanceof WorkerRuntimeConfigError);
+          assert.ok(err.variables.includes("YTDLP_NETWORK_ISOLATED"));
+          return true;
+        },
       );
     });
-  }
 
-  it("rejects case and whitespace variants of the truthy set", () => {
-    for (const value of ["TRUE", " true ", "Yes", "YES", " 1"]) {
+    it("never renders the rejected value", () => {
       assert.throws(
-        () => loadWorkerRuntimeConfig(baseEnv({ YTDLP_NETWORK_ISOLATED: value })),
-        (err: unknown) => err instanceof WorkerYtdlpDeploymentLockError,
-        `${value} must be rejected`,
+        () => loadWorkerRuntimeConfig(baseEnv({ YTDLP_PATH: "/opt/secret-path/yt-dlp" })),
+        (err: unknown) => {
+          assert.ok(err instanceof WorkerRuntimeConfigError);
+          assert.equal(err.message.includes("secret-path"), false);
+          assert.ok(err.message.includes("YTDLP_PATH"));
+          return true;
+        },
       );
-    }
+    });
   });
 
-  it("is evaluated before any other configuration error", () => {
-    // A completely empty environment plus the flag still reports the LOCK, so
-    // the operator cannot mistake it for an ordinary misconfiguration.
-    assert.throws(
-      () => loadWorkerRuntimeConfig({ YTDLP_NETWORK_ISOLATED: "true" }),
-      (err: unknown) => err instanceof WorkerYtdlpDeploymentLockError,
-    );
-  });
+  describe("YTDLP_ENABLED is an explicit, fail-closed feature flag", () => {
+    it("defaults to disabled when absent", () => {
+      assert.equal(loadWorkerRuntimeConfig(baseEnv()).media.ytdlp.enabled, false);
+    });
 
-  it("matches the existing attestation semantics exactly", () => {
-    // Proves the lock reuses the SAME truthiness rule as the merged execution
-    // guard, without modifying that guard.
-    const cases: Array<string | undefined> = [
-      undefined, "", "false", "0", "true", "1", "yes", "TRUE", " true ", "no", "2", "on",
-    ];
+    it("defaults to disabled when empty", () => {
+      const config = loadWorkerRuntimeConfig(baseEnv({ YTDLP_ENABLED: "" }));
+      assert.equal(config.media.ytdlp.enabled, false);
+    });
 
-    for (const value of cases) {
-      if (value === undefined) delete process.env.YTDLP_NETWORK_ISOLATED;
-      else process.env.YTDLP_NETWORK_ISOLATED = value;
-
+    it('accepts exactly "false"', () => {
       assert.equal(
-        parsesYtdlpIsolationTruthy(value),
-        isYtdlpNetworkIsolated(),
-        `truthiness must agree for ${JSON.stringify(value)}`,
+        loadWorkerRuntimeConfig(baseEnv({ YTDLP_ENABLED: "false" })).media.ytdlp.enabled,
+        false,
       );
+    });
+
+    it('accepts exactly "true"', () => {
+      assert.equal(
+        loadWorkerRuntimeConfig(baseEnv({ YTDLP_ENABLED: "true" })).media.ytdlp.enabled,
+        true,
+      );
+    });
+
+    it("tolerates surrounding whitespace, which environment files introduce", () => {
+      assert.equal(
+        loadWorkerRuntimeConfig(baseEnv({ YTDLP_ENABLED: "  true  " })).media.ytdlp.enabled,
+        true,
+      );
+    });
+
+    // Deliberately NOT the retired 1/true/yes truthiness rule. A flag deciding
+    // whether a media extractor may run has exactly two spellings; every other
+    // spelling is a guess about the grammar and fails closed at startup rather
+    // than resolving to either state.
+    for (const value of ["1", "0", "yes", "no", "on", "off", "TRUE", "True", "False", "enabled"]) {
+      it(`rejects the non-boolean spelling ${JSON.stringify(value)}`, () => {
+        expectInvalid(baseEnv({ YTDLP_ENABLED: value }), "YTDLP_ENABLED");
+      });
     }
+
+    it("never renders the rejected value", () => {
+      assert.throws(
+        () => loadWorkerRuntimeConfig(baseEnv({ YTDLP_ENABLED: "sekrit-typo" })),
+        (err: unknown) => {
+          assert.ok(err instanceof WorkerRuntimeConfigError);
+          assert.equal(err.message.includes("sekrit-typo"), false);
+          assert.ok(err.message.includes("YTDLP_ENABLED"));
+          return true;
+        },
+      );
+    });
+
+    it("enabling the feature does not require, imply or check a runtime install", () => {
+      // The configuration boundary owns INTENT only. Whether the pinned runtime
+      // is actually present is probed separately and reported separately, so a
+      // parsed `true` is never evidence that anything can execute.
+      const config = loadWorkerRuntimeConfig(baseEnv({ YTDLP_ENABLED: "true" }));
+      assert.equal(config.media.ytdlp.enabled, true);
+    });
   });
 });

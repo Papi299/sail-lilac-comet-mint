@@ -608,11 +608,17 @@ describe("Worker execution boundary", () => {
     const service = stripComments(
       readSource(join(ROOT, "src/worker/http/business-service.server.ts")),
     );
-    // Only the read-only attestation getter may be imported from shared config.
+    // STRENGTHENED in Phase 10C1. Previously the service was permitted exactly
+    // one shared-config binding, the `isYtdlpNetworkIsolated` attestation
+    // getter. That attestation is retired: the yt-dlp feature state now travels
+    // from the Worker runtime configuration boundary as an injected dependency,
+    // so the business surface needs nothing from shared config at all.
     const configImport = service.match(/import\s*\{([^}]*)\}\s*from\s*["'][^"']*lib\/config[^"']*["']/);
-    assert.ok(configImport, "the service must import from shared config explicitly");
-    const bindings = configImport![1].split(",").map((b) => b.trim()).filter(Boolean);
-    assert.deepEqual(bindings, ["isYtdlpNetworkIsolated"]);
+    assert.equal(
+      configImport,
+      null,
+      "the worker business surface must not import from shared config at all",
+    );
 
     for (const [file, rawSource] of serviceGraph) {
       if (!file.startsWith(join(SRC, "worker") + "/")) continue;
@@ -642,12 +648,74 @@ describe("Worker execution boundary", () => {
   });
 
   it("the binary probe only performs a version check", () => {
-    const probe = readSource(join(ROOT, "src/worker/http/binaries.server.ts"));
-    assert.match(probe, /ytdlpAvailable/);
+    const raw = readSource(join(ROOT, "src/worker/http/binaries.server.ts"));
+    // Comments are stripped before every token scan: this module's doc comment
+    // legitimately NAMES the legacy extractor in order to state that it must
+    // not be reached. Scanning prose would fail on the very sentence that
+    // documents the boundary.
+    const probe = stripComments(raw);
     assert.match(probe, /ffmpegAvailable/);
+
+    // Phase 10C1 moved the yt-dlp half onto the Worker's OWN runtime module.
+    // The probe must reach that module and NOT the legacy extractor, which
+    // carries analyze and download entry points the Worker must never load.
+    assert.match(probe, /probeYtdlpRuntime/);
+    for (const spec of specifiers(probe)) {
+      assert.equal(
+        /extractors\//.test(spec),
+        false,
+        `the probe imports '${spec}' — it must not reach any legacy extractor`,
+      );
+    }
+    assert.ok(
+      specifiers(probe).some((spec) => /runtime\/ytdlp-runtime\.server/.test(spec)),
+      "the probe must use the Worker-owned yt-dlp runtime module",
+    );
+
     // No extraction, download or user-URL entry point may exist here.
     for (const token of ["downloadWithYtdlp", "ytdlpExtractor", "dumpInfo", "analyze", "url"]) {
       assert.equal(probe.includes(token), false, `the probe references '${token}'`);
+    }
+  });
+
+  it("the worker runtime module is the only yt-dlp-capable module the worker loads", () => {
+    // The Worker's yt-dlp surface is exactly one module, and it must remain a
+    // RUNTIME foundation: no URL, no format selection, no output template, no
+    // media dispatch. This is what keeps "the runtime is installed" from
+    // quietly becoming "a user URL can be executed".
+    const runtimeModule = join(ROOT, "src/worker/runtime/ytdlp-runtime.server.ts");
+    const source = stripComments(readSource(runtimeModule));
+
+    // Identifier-level tokens only. Scanning for bare option strings like
+    // "-f" or "-o" would match inside unrelated flags ("--ffmpeg-location",
+    // "--no-config-locations") and produce a test that fails for reasons
+    // having nothing to do with the invariant. The ACTUAL argument policy is
+    // asserted element-by-element in ytdlp-runtime.server.test.ts, where the
+    // built argv can be inspected semantically instead of grepped.
+    for (const token of [
+      "getMetadata",
+      "downloadWithYtdlp",
+      "ytdlpExtractor",
+      "registry.server",
+      "getExtractorFor",
+      "assertSafeUrl",
+      "--output",
+      "--format",
+    ]) {
+      assert.equal(
+        source.includes(token),
+        false,
+        `the yt-dlp runtime module references '${token}', which would widen it beyond a runtime probe`,
+      );
+    }
+
+    // It must not import anything that interprets a URL or plans media work.
+    for (const spec of specifiers(source)) {
+      assert.equal(
+        /extractors\/|security\/ssrf|validation\/url|execution\//.test(spec),
+        false,
+        `the yt-dlp runtime module imports '${spec}'`,
+      );
     }
   });
 
@@ -662,23 +730,43 @@ describe("Worker execution boundary", () => {
     assert.match(server, /service\.diagnostics\(\)/);
   });
 
-  it("nothing in the repository enables YTDLP_NETWORK_ISOLATED", () => {
-    // Test files legitimately toggle the flag to prove fail-closed behaviour;
-    // only PRODUCTION source may never enable it.
+  it("nothing in the repository enables generic yt-dlp execution", () => {
+    // REPLACED in Phase 10C1. The previous assertion required
+    // `.env.example` to CARRY `YTDLP_NETWORK_ISOLATED=` unset. That variable is
+    // retired: the Worker runtime now refuses to start if it is present at any
+    // value, so an example file still declaring it would document a
+    // configuration that cannot boot. The invariant it protected — no
+    // production artefact may switch generic extraction on — is preserved
+    // below and extended to the replacement flag.
     for (const file of productionSourceFiles()) {
       const source = readSource(file);
       for (const enabled of [
-        "YTDLP_NETWORK_ISOLATED=true",
-        "YTDLP_NETWORK_ISOLATED=1",
-        'YTDLP_NETWORK_ISOLATED = "true"',
-        'process.env.YTDLP_NETWORK_ISOLATED = "true"',
-        'process.env.YTDLP_NETWORK_ISOLATED = "1"',
+        "YTDLP_ENABLED=true",
+        'YTDLP_ENABLED = "true"',
+        'process.env.YTDLP_ENABLED = "true"',
       ]) {
-        assert.equal(source.includes(enabled), false, `${rel(file)} enables safe-egress attestation`);
+        assert.equal(
+          source.includes(enabled),
+          false,
+          `${rel(file)} enables generic yt-dlp execution`,
+        );
       }
     }
+
     const envExample = readFileSync(join(ROOT, ".env.example"), "utf8");
-    assert.match(envExample, /^YTDLP_NETWORK_ISOLATED=\s*$/m, "the flag must stay unset and fail-closed");
+    // The example must offer the flag, unset, so an operator sees the contract
+    // without being handed an enabled one.
+    assert.match(envExample, /^YTDLP_ENABLED=\s*$/m, "the feature flag must ship unset");
+    // The retired variables must not be presented as live configuration. They
+    // may still be NAMED in prose that documents their retirement, so the scan
+    // is for an assignment at the start of a line, not for the bare name.
+    for (const retired of ["YTDLP_NETWORK_ISOLATED", "YTDLP_PATH"]) {
+      assert.doesNotMatch(
+        envExample,
+        new RegExp(`^\\s*${retired}=`, "m"),
+        `${retired} is retired and must not be offered as configuration`,
+      );
+    }
   });
 });
 

@@ -216,6 +216,10 @@ export async function createWorkerRuntime(
       store,
       executor,
       pump,
+      // The validated application feature state travels from the configuration
+      // boundary to diagnostics explicitly. Nothing below this layer reads the
+      // environment for it.
+      ytdlpEnabled: config.media.ytdlp.enabled,
       ...(overrides.analyze ? { analyze: overrides.analyze } : {}),
       ...(overrides.probeBinaries ? { probeBinaries: overrides.probeBinaries } : {}),
       ...(overrides.clock ? { clock: overrides.clock } : {}),

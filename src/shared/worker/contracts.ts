@@ -211,15 +211,53 @@ export const WorkerDiagnosticsSuccessSchema = z
     queueDepth: z.number().int().nonnegative(),
     runningJobs: z.number().int().nonnegative(),
     maxConcurrent: z.number().int().nonnegative(),
+    /**
+     * Whether each media binary is present AND executes correctly.
+     *
+     * `ytdlp` means specifically: the EXACT pinned yt-dlp runtime this image
+     * ships answered its version probe. It does not mean "some command named
+     * yt-dlp exists", and — importantly — it says nothing about whether
+     * generic extraction is allowed to run. That is `features.ytdlpEnabled`.
+     */
     binaries: z
       .object({
         ffmpeg: z.boolean(),
         ytdlp: z.boolean(),
       })
       .strict(),
+    /** Reported runtime identity. Non-secret; null when unavailable. */
+    runtime: z
+      .object({
+        ytdlpVersion: z.string().nullable(),
+      })
+      .strict(),
+    /**
+     * APPLICATION feature state, distinct from runtime availability.
+     *
+     * `ytdlpEnabled` is the operator's explicit `YTDLP_ENABLED` intent. It is
+     * fail-closed, and installing the runtime never sets it. As of Phase 10C1
+     * it gates nothing, because no user-URL yt-dlp execution path exists.
+     */
+    features: z
+      .object({
+        ytdlpEnabled: z.boolean(),
+      })
+      .strict(),
+    /**
+     * Safe egress is enforced OUTSIDE this container, by the media network
+     * namespace, its externally owned nftables policy, the policy verifier and
+     * the watchdog. The Worker holds no NET_ADMIN, cannot read the ruleset and
+     * cannot alter it.
+     *
+     * The field therefore states WHO enforces, and deliberately offers no
+     * boolean claiming the boundary is intact: the Worker cannot prove that,
+     * and the retired `attested` flag — an operator-set environment variable —
+     * only ever looked like proof. `policyVersion` stays null until something
+     * that genuinely owns the policy publishes one.
+     */
     safeEgress: z
       .object({
-        attested: z.boolean(),
+        enforcement: z.literal("external"),
         policyVersion: z.string().nullable(),
       })
       .strict(),

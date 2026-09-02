@@ -17,7 +17,9 @@ type WorkerDiagnostics = {
   runningJobs: number;
   maxConcurrent: number;
   binaries: { ffmpeg: boolean; ytdlp: boolean };
-  safeEgress: { attested: boolean; policyVersion: string | null };
+  runtime: { ytdlpVersion: string | null };
+  features: { ytdlpEnabled: boolean };
+  safeEgress: { enforcement: "external"; policyVersion: string | null };
 };
 
 function DiagnosticsPage() {
@@ -56,16 +58,39 @@ function DiagnosticsPage() {
             </CardHeader>
             <CardContent className="grid gap-3 text-sm sm:grid-cols-2">
               <p>FFmpeg: {data.binaries.ffmpeg ? "available" : "missing"}</p>
-              <p>yt-dlp: {data.binaries.ytdlp ? "available" : "missing"}</p>
+              <p>
+                yt-dlp runtime: {data.binaries.ytdlp ? "available" : "missing"}
+                {data.runtime.ytdlpVersion ? ` (${data.runtime.ytdlpVersion})` : ""}
+              </p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Generic extraction</CardTitle>
+            </CardHeader>
+            <CardContent className="grid gap-3 text-sm">
+              <p>yt-dlp feature: {data.features.ytdlpEnabled ? "enabled" : "disabled"}</p>
+              {/* An installed runtime is not a usable feature. Saying so here
+                  keeps the operator view honest at a glance. */}
+              <p className="text-muted-foreground">
+                An available runtime does not by itself permit generic extraction; the feature must
+                also be enabled.
+              </p>
             </CardContent>
           </Card>
           <Card>
             <CardHeader>
               <CardTitle className="text-base">Safe egress</CardTitle>
             </CardHeader>
-            <CardContent className="grid gap-3 text-sm sm:grid-cols-2">
-              <p>Attested: {data.safeEgress.attested ? "yes" : "no"}</p>
+            <CardContent className="grid gap-3 text-sm">
+              <p>Enforcement: {data.safeEgress.enforcement}</p>
               <p>Policy version: {data.safeEgress.policyVersion ?? "—"}</p>
+              {/* The Worker holds no NET_ADMIN and cannot read the ruleset, so
+                  it must not imply it has verified anything. */}
+              <p className="text-muted-foreground">
+                Egress is enforced outside this container by the media network namespace and its
+                host-owned policy. The worker cannot inspect or attest that boundary.
+              </p>
             </CardContent>
           </Card>
         </div>

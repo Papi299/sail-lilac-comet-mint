@@ -51,9 +51,12 @@ Precisely:
   separate signed-GET identity byte-identically. It was blocked until that day
   by `WORKER-TEMP-TMPFS-OWNERSHIP-001`, a runtime mount-ownership defect that is
   now fixed and deployed. See §11c.
-- **Phase 10 is NOT BEGUN.** `YTDLP_NETWORK_ISOLATED` remains `false` and yt-dlp
-  remains absent. Phase 9 passing is a prerequisite for Phase 10, not entry to
-  it.
+- **Phase 10 has begun in the repository only, and is NOT DEPLOYED.**
+  `PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001` added a pinned yt-dlp runtime to the
+  Worker **image definition** and retired the `YTDLP_NETWORK_ISOLATED` contract.
+  Nothing was deployed: the live Worker still runs the previously built image,
+  and **no user-supplied URL can reach yt-dlp in any build** — there is no
+  generic analyze or download path in the Worker at all. See §4.
 
 ---
 
@@ -223,8 +226,11 @@ silently unconfined.
 
 That result is **evidence about the enforcement model, not an acceptance**:
 
-- `YTDLP_NETWORK_ISOLATED` remains **`false`**, and the runtime still refuses to
-  start if it parses truthy. §4 is unchanged.
+- `YTDLP_NETWORK_ISOLATED` was **`false`** throughout Phases 8 and 9, and the
+  runtime refused to start if it parsed truthy. That contract has since been
+  **retired** by Phase 10C1 — the variable is now refused at *any* value — but
+  the property it was standing in for is unchanged: generic yt-dlp execution
+  remains impossible. See §4.
 - Formal Phase 9 **was re-run against the exact final topology** on 2026-08-30
   and PASSED. See §11a. Its scope was the Worker **safe-egress** boundary; it did
   not remeasure the ingress path (§1a), which was left unchanged throughout.
@@ -457,19 +463,100 @@ follows once the deployment artefacts have been reviewed and installed.
 
 ## 4. yt-dlp
 
-`YTDLP_NETWORK_ISOLATED` **must be `false` (or unset) throughout Phases 8 and 9.**
+**The Worker image ships a pinned yt-dlp runtime. Generic yt-dlp execution is
+not enabled, and no user-supplied URL can reach yt-dlp.**
 
-This is enforced in code, not merely by convention: the Worker runtime
-**refuses to start** if the variable parses truthy (`1`, `true`, `yes`, in any
-case, with surrounding whitespace ignored). The lock exists so an operator typo
-or environment drift cannot activate yt-dlp before the Phase-9 acceptance
-evidence is approved.
+Those two sentences are independent, and the whole design of this section is to
+keep them independent:
 
-The Worker image does not install yt-dlp or Python at all. Diagnostics reports
-`ytdlp: false` honestly.
+```
+yt-dlp runtime installed  !=  generic yt-dlp execution enabled
+```
 
-Phase 10 — and only Phase 10, after approved Phase-9 evidence — may relax this
-startup lock and enable the flag.
+*Historical note: throughout Phases 8 and 9 the image contained neither Python
+nor yt-dlp, and `YTDLP_NETWORK_ISOLATED=false` was the operative lock. Both
+statements were accurate at the time and the Phase-9 and direct-media
+acceptance records in §11 are unaffected. What follows describes the contract
+as of `PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001`.*
+
+### 4a. The pinned runtime
+
+| Property | Value |
+| :--- | :--- |
+| yt-dlp release | `2026.08.19` (exact, immutable release tag) |
+| Artifact | The official **platform-independent Unix zipimport executable** — the release's bare `yt-dlp` asset |
+| SHA-256 | Pinned in `Dockerfile.worker` via `ADD --checksum` and verified at build time |
+| Python | Debian Bookworm system `python3` (3.11). The release requires >= 3.10 |
+| Bundled EJS | `yt_dlp_ejs` 0.8.0, shipped **inside** the artifact |
+| Install path | `/usr/local/lib/videofetch/yt-dlp`, root-owned, mode `0555`, on the read-only root filesystem |
+
+The PyInstaller builds (`yt-dlp_linux_aarch64` and friends) are deliberately
+**not** used: they unpack themselves into a temporary directory on every run,
+which this container's read-only root and `noexec` media tmpfs would break.
+
+There is no `pip`, no virtual environment and no package installer anywhere in
+the image, so nothing inside it can add, upgrade or replace a Python package.
+**yt-dlp cannot update itself**: the artifact is root-owned and read-only, the
+Worker runs as `node`, and the argument policy passes `--no-update`. Upgrading
+yt-dlp is a reviewed code change to the version and digest — together — followed
+by a deployment, never a runtime event.
+
+`src/worker/runtime/ytdlp-runtime.server.ts` holds the same version, digest and
+paths, and `container-policy.test.ts` asserts the image and the module agree, so
+a bump that touches only one of the two fails the build rather than shipping a
+Worker whose probe can never match its image.
+
+### 4b. Execution policy
+
+Every invocation uses one closed, application-owned argument set and one
+allowlisted environment built from nothing — `process.env` is never inherited.
+The options below were verified against this exact release's own `options.py`
+rather than assumed from historical spelling:
+
+| Concern | Mechanism |
+| :--- | :--- |
+| Configuration discovery | `--ignore-config --no-config-locations` — no system, user, home, XDG or portable config |
+| Plugins | `--no-plugin-dirs` (this release has no `--no-plugins`) |
+| JavaScript runtime | `--no-js-runtimes` then `--js-runtimes=node:<absolute path>`. The default is otherwise **Deno**, which is not in this image. Order matters: `--js-runtimes` appends |
+| Remote components | `--no-remote-components` — EJS is never fetched from npm or GitHub. The requisite package is bundled, so this costs no functionality |
+| Self-update | `--no-update`, on a read-only root-owned file |
+| Credentials | `--no-cookies --no-cookies-from-browser`; no `--netrc`, username, password, token or authorization header. **Public sources only** |
+| External downloaders | None configured. `--downloader`, `--exec` and postprocessor commands are never passed, and no such helper is installed |
+
+### 4c. Configuration contract
+
+| Variable | Status |
+| :--- | :--- |
+| `YTDLP_NETWORK_ISOLATED` | **RETIRED.** Startup-fatal if present at *any* value, `false` included |
+| `YTDLP_PATH` | **RETIRED.** Startup-fatal if present |
+| `YTDLP_ENABLED` | The application feature state. Absent means disabled. Exactly `true` or `false`; any other spelling is a startup failure |
+
+`YTDLP_NETWORK_ISOLATED` was an operator *assertion* that yt-dlp ran behind an
+isolated network. It was never the boundary — the media network namespace and
+its externally owned nftables policy are, and this container can neither read
+nor alter them. A boolean that merely restates its own configuration while
+looking like a security control is worse than no boolean, so it is retired
+outright rather than repurposed, and a stale deployment still setting it fails
+closed and visibly.
+
+`YTDLP_PATH` chose the executable *and* prepended arbitrary leading arguments to
+every invocation, because it was split on spaces. No repository path let user
+input reach it, so this was never a user-input vulnerability — it was an
+unnecessarily loose operator execution surface, and the Production Worker has no
+need of it. The runtime identity is a reviewed constant in the image.
+
+### 4d. What Phase 10C1 does NOT authorize
+
+**No user-URL execution path exists.** `WorkerService.analyze()` still resolves
+only to the direct-media analyzer, `JobExecutor` still has no generic branch,
+and the only yt-dlp subprocess operation in any Production Worker code is a
+non-network version probe. Setting `YTDLP_ENABLED=true` today would change a
+diagnostics field and nothing else.
+
+Generic analysis, generic download, format planning and the live acceptance
+matrix that must precede enabling any of it are later, separately authorized
+phases. **Phase 10C1 has not been deployed**, and `YTDLP_ENABLED` is deliberately
+absent from the image and from the committed systemd unit.
 
 ---
 

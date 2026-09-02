@@ -66,7 +66,9 @@ See `.env.example`. Important knobs:
 | `MAX_CONCURRENT_PER_PRINCIPAL` | 2 | Active downloads per authenticated operator. Process-local. |
 | `RATE_LIMIT` | 20/min | Analyze requests per authenticated operator. Process-local. Forwarded-IP headers are not used as identity. |
 | `TEMP_DIRECTORY` | OS temp `/videofetch` | Isolated job folders |
-| `YTDLP_NETWORK_ISOLATED` | unset / `false` | Operator attestation that yt-dlp has an independent safe-egress boundary. Default is fail-closed. The flag is **not** itself isolation. |
+| `YTDLP_ENABLED` | unset (disabled) | Worker-only. Whether generic yt-dlp extraction is enabled. Exactly `true` or `false`; any other spelling is a startup failure. Absent means disabled. Installing the yt-dlp runtime does **not** enable it, and as of Phase 10C1 no user-URL yt-dlp execution path exists at all. |
+| ~~`YTDLP_NETWORK_ISOLATED`~~ | — | **Retired.** It was an operator attestation, never the boundary. The Worker runtime refuses to start if it is present at any value, `false` included. |
+| ~~`YTDLP_PATH`~~ | — | **Retired** for the Worker: it chose the executable and prepended arbitrary leading arguments to every invocation. Also startup-fatal if present. |
 | `VIDEOFETCH_ACCESS_SECRET` | unset | Server-only private-access secret. Minimum 32 UTF-8 bytes. Required in production for downloader APIs; missing/short values fail closed (HTTP 503) instead of exposing the downloader. **`GET /api/diagnostics` requires a configured secret and a valid session in every environment**, including local development — the ordinary development bypass does not apply there. Rotating it invalidates active sessions. Generate with `openssl rand -base64 32`. Never expose via `VITE_*`. |
 
 Analyze/download rate limits and per-operator concurrency are keyed on the private-access principal after a successful gate, not on `X-Forwarded-For` or other client-address headers. Limits are process-local and are not shared across horizontally scaled instances.
@@ -114,11 +116,13 @@ Docker already excludes `.vercel` (see `.dockerignore`) and runs `npm run build`
 
 ## Tests
 
-Unit tests cover URL validation, SSRF helpers, pinned HTTP transport, yt-dlp network policy, temp-directory containment, private-access gating, filename sanitization, format normalization, progress parsing, job status, rate limiting, and error mapping. External downloads are not performed in CI.
+Unit tests cover URL validation, SSRF helpers, pinned HTTP transport, the pinned yt-dlp runtime policy (closed arguments, closed environment, exact version probe), temp-directory containment, private-access gating, filename sanitization, format normalization, progress parsing, job status, rate limiting, and error mapping. External downloads are not performed in CI.
 
 ## Notes
 
-yt-dlp remains the generic HTTP/HTTPS extractor. It performs its own DNS lookups, redirects, and media requests, so application URL validation is **not** yt-dlp egress enforcement. Generic extraction is therefore refused unless `YTDLP_NETWORK_ISOLATED=true` is set by an operator who has independently isolated yt-dlp's network. Do not enable that flag in this repository's defaults.
+yt-dlp is intended to become the generic HTTP/HTTPS extractor, and the standalone Worker image ships a **pinned** yt-dlp runtime (exact release, digest-verified at build time, root-owned and read-only, no pip, no self-update). It is **not wired to anything**: as of `PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001` no user-supplied URL can reach yt-dlp, the Worker's only yt-dlp operation is a non-network version probe, and generic extraction is a later, separately authorized phase gated by `YTDLP_ENABLED`.
+
+The reason the boundary matters: yt-dlp performs its own DNS lookups, follows redirects, and issues many subrequests, so application URL validation is **not** yt-dlp egress enforcement. Egress is enforced outside the container by the media network namespace and its host-owned nftables policy — which the Worker cannot read or alter, and therefore cannot attest to. See `docs/architecture/safe-egress.md`.
 
 Some websites (including YouTube and Vimeo) may require a signed-in session or block datacenter IP addresses. Direct media files and public archive sources are the most reliable. Only download media you have the right to save.
 

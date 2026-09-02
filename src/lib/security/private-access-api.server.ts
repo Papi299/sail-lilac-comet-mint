@@ -53,8 +53,19 @@ export function resetPrivateAccessApiForTests(): void {
  */
 async function loadSites() {
   const diagnostics = await getWorkerClient().diagnostics();
+  // `ytdlp` is a CAPABILITY, not an inventory entry: generic extraction is
+  // usable only when the pinned runtime executes AND the operator enabled the
+  // feature. Reporting the binary alone would tell the browser that every
+  // catalog site works the moment the runtime ships in the image, which is
+  // exactly the claim Phase 10C1 must not make.
+  const ytdlpInstalled = diagnostics.binaries.ytdlp;
+  const ytdlpEnabled = diagnostics.features.ytdlpEnabled;
   return {
-    ytdlp: diagnostics.binaries.ytdlp,
+    ytdlp: ytdlpInstalled && ytdlpEnabled,
+    // Reported separately so an operator can tell "not installed" from
+    // "installed but deliberately switched off" without guessing.
+    ytdlpInstalled,
+    ytdlpEnabled,
     ffmpeg: diagnostics.binaries.ffmpeg,
     sites: SITE_CATALOG,
     note: "Support depends on each website’s delivery method and can change without notice. Direct media files and publicly accessible archive sources are the most reliable.",

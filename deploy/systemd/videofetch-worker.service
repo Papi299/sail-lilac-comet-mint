@@ -94,8 +94,29 @@ TimeoutStopSec=30
 #   R2_BUCKET=
 #   R2_JURISDICTION=
 #
-# YTDLP_NETWORK_ISOLATED stays false; Phase 10 is the only phase authorized to
-# enable it, and the runtime refuses to start if it parses truthy.
+# yt-dlp contract (PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001):
+#
+#   YTDLP_NETWORK_ISOLATED  RETIRED. It must not appear in worker.env at ANY
+#                           value, including `false`. It was an operator
+#                           assertion, never the boundary — the boundary is the
+#                           media namespace and nftables policy enforced by the
+#                           units above, which this container cannot read or
+#                           alter. The Worker runtime now REFUSES TO START if
+#                           the variable is present, so a stale worker.env fails
+#                           closed and visibly rather than looking correct.
+#
+#   YTDLP_PATH              RETIRED for the same reason: it let one variable
+#                           choose the executable and prepend arbitrary leading
+#                           arguments to every invocation. The runtime identity
+#                           is a reviewed constant in the image, not deployment
+#                           configuration. Also startup-fatal if present.
+#
+#   YTDLP_ENABLED           NOT SET, and must stay unset for this phase. Absent
+#                           means disabled. The image ships a pinned yt-dlp
+#                           runtime, but installing a runtime is not enabling a
+#                           feature: no user-URL yt-dlp execution path exists in
+#                           the Worker yet. Enabling it is a later, separately
+#                           authorized deployment decision.
 # The broker's NUMERIC GID, resolved on this host at install time by
 # vf-r2-broker-gid-write. Not a secret: an integer group id.
 #

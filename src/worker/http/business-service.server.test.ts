@@ -58,7 +58,7 @@ describe("Worker business service", () => {
       executor,
       pump,
       analyze: overrides.analyze ?? (async () => META),
-      probeBinaries: async () => ({ ffmpeg: true, ytdlp: false }),
+      probeBinaries: async () => ({ ffmpeg: true, ytdlp: false, ytdlpVersion: null }),
       clock: () => now,
     });
   }
@@ -229,7 +229,7 @@ describe("Worker business service", () => {
       executor: abortingExecutor,
       pump,
       analyze: async () => META,
-      probeBinaries: async () => ({ ffmpeg: true, ytdlp: false }),
+      probeBinaries: async () => ({ ffmpeg: true, ytdlp: false, ytdlpVersion: null }),
       clock: () => now,
     });
 
@@ -259,9 +259,11 @@ describe("Worker business service", () => {
     const diag = await service.diagnostics();
     assert.deepEqual(Object.keys(diag).sort(), [
       "binaries",
+      "features",
       "maxConcurrent",
       "queueDepth",
       "runningJobs",
+      "runtime",
       "safeEgress",
       "status",
     ]);
@@ -272,17 +274,61 @@ describe("Worker business service", () => {
     assert.equal(diag.binaries.ytdlp, false);
   });
 
-  it("keeps safe-egress attestation fail-closed by default", async () => {
+  it("reports safe-egress enforcement as external, never as a self-attestation", async () => {
+    // Phase 10C1 retired the `attested` boolean. It was set from an operator
+    // environment variable, so a `true` only ever restated its own
+    // configuration — the Worker holds no NET_ADMIN and cannot read the
+    // ruleset. The honest report is WHO enforces the boundary.
     const previous = process.env.YTDLP_NETWORK_ISOLATED;
     try {
-      delete process.env.YTDLP_NETWORK_ISOLATED;
+      // Even with the retired variable set truthy in the ambient environment,
+      // diagnostics must not derive any claim from it.
+      process.env.YTDLP_NETWORK_ISOLATED = "true";
       const diag = await makeService().diagnostics();
-      assert.equal(diag.safeEgress.attested, false);
+      assert.equal(diag.safeEgress.enforcement, "external");
       assert.equal(diag.safeEgress.policyVersion, null);
+      assert.equal("attested" in diag.safeEgress, false, "the attestation flag is retired");
     } finally {
       if (previous === undefined) delete process.env.YTDLP_NETWORK_ISOLATED;
       else process.env.YTDLP_NETWORK_ISOLATED = previous;
     }
+  });
+
+  it("separates yt-dlp runtime availability from feature enablement", async () => {
+    // An available runtime must never imply the feature is on, and an enabled
+    // feature must never imply the runtime is present. They are independent
+    // facts and diagnostics reports them independently.
+    const runtimeOnly = new WorkerService({
+      store,
+      executor,
+      pump,
+      analyze: async () => META,
+      probeBinaries: async () => ({ ffmpeg: true, ytdlp: true, ytdlpVersion: "2026.08.19" }),
+      clock: () => now,
+    });
+    const a = await runtimeOnly.diagnostics();
+    assert.equal(a.binaries.ytdlp, true);
+    assert.equal(a.runtime.ytdlpVersion, "2026.08.19");
+    assert.equal(a.features.ytdlpEnabled, false, "installing the runtime must not enable it");
+
+    const enabledOnly = new WorkerService({
+      store,
+      executor,
+      pump,
+      analyze: async () => META,
+      probeBinaries: async () => ({ ffmpeg: true, ytdlp: false, ytdlpVersion: null }),
+      clock: () => now,
+      ytdlpEnabled: true,
+    });
+    const b = await enabledOnly.diagnostics();
+    assert.equal(b.binaries.ytdlp, false);
+    assert.equal(b.runtime.ytdlpVersion, null);
+    assert.equal(b.features.ytdlpEnabled, true);
+  });
+
+  it("defaults the yt-dlp feature to disabled when the composition root omits it", async () => {
+    const diag = await makeService().diagnostics();
+    assert.equal(diag.features.ytdlpEnabled, false);
   });
 
   it("degrades status when FFmpeg is unavailable", async () => {
@@ -291,7 +337,7 @@ describe("Worker business service", () => {
       executor,
       pump,
       analyze: async () => META,
-      probeBinaries: async () => ({ ffmpeg: false, ytdlp: false }),
+      probeBinaries: async () => ({ ffmpeg: false, ytdlp: false, ytdlpVersion: null }),
       clock: () => now,
     });
     const diag = await service.diagnostics();

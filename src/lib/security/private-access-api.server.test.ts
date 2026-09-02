@@ -67,7 +67,9 @@ const DIAGNOSTICS = {
   runningJobs: 0,
   maxConcurrent: 1,
   binaries: { ffmpeg: true, ytdlp: false },
-  safeEgress: { attested: false, policyVersion: null },
+  runtime: { ytdlpVersion: null },
+  features: { ytdlpEnabled: false },
+  safeEgress: { enforcement: "external" as const, policyVersion: null },
 };
 
 function workerJob(overrides: Partial<WorkerJobView> = {}): WorkerJobView {
