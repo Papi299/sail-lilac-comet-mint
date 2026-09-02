@@ -9,7 +9,45 @@ export type RunResult = {
 
 const SIGKILL = "SIGKILL" as const;
 
-type TerminationReason = "none" | "timeout" | "abort";
+/**
+ * Default in-memory retention ceilings.
+ *
+ * These are RETENTION bounds, not process bounds: on overflow the runner keeps
+ * only the tail and the child keeps running. Every existing caller relies on
+ * that lenient behaviour (FFmpeg, for instance, is expected to be chatty), so
+ * the defaults are unchanged.
+ */
+const DEFAULT_STDOUT_RETENTION_BYTES = 8_000_000;
+const DEFAULT_STDOUT_RETAINED_TAIL_BYTES = 4_000_000;
+const DEFAULT_STDERR_RETENTION_BYTES = 2_000_000;
+const DEFAULT_STDERR_RETAINED_TAIL_BYTES = 1_000_000;
+
+/**
+ * Raised when a caller-supplied HARD output ceiling is exceeded.
+ *
+ * A caller that sets `maxStdoutBytes`/`maxStderrBytes` is stating that output
+ * beyond that size is not merely uninteresting but unacceptable — the yt-dlp
+ * analysis path needs a complete, parseable JSON document or nothing at all,
+ * and silently retaining a tail would hand it a truncated document that looks
+ * like malformed extractor output. So the ceiling terminates the owned process
+ * group and rejects, and the partial output is never returned to anyone.
+ *
+ * It is a distinct class rather than a bare `AppError` so a caller can tell an
+ * overflow apart from cancellation, which shares `PROCESSING_FAILED`.
+ */
+export class ProcessOutputLimitError extends AppError {
+  readonly stream: "stdout" | "stderr";
+
+  constructor(stream: "stdout" | "stderr") {
+    // The message names the STREAM and the fact of the overflow. It never
+    // carries any subprocess output, not even a length.
+    super("PROCESSING_FAILED", `Subprocess ${stream} exceeded its byte ceiling.`);
+    this.name = "ProcessOutputLimitError";
+    this.stream = stream;
+  }
+}
+
+type TerminationReason = "none" | "timeout" | "abort" | "stdout_limit" | "stderr_limit";
 
 export type SpawnImpl = (
   command: string,
@@ -142,8 +180,30 @@ export function runProcess(opts: {
   onStdout?: (chunk: string) => void;
   onStderr?: (chunk: string) => void;
   env?: NodeJS.ProcessEnv;
+  /**
+   * HARD ceiling on total stdout bytes. When supplied and exceeded, the owned
+   * process group is terminated and the promise rejects with
+   * `ProcessOutputLimitError`; no partial output is resolved or returned.
+   *
+   * Omitting it preserves the historical lenient behaviour exactly: retain at
+   * most ~8 MB, keeping the last ~4 MB, and let the child run on.
+   */
+  maxStdoutBytes?: number;
+  /** HARD ceiling on total stderr bytes. Same semantics as `maxStdoutBytes`. */
+  maxStderrBytes?: number;
 }): Promise<RunResult> {
-  const { command, args, timeoutMs, cwd, signal, onStdout, onStderr, env } = opts;
+  const {
+    command,
+    args,
+    timeoutMs,
+    cwd,
+    signal,
+    onStdout,
+    onStderr,
+    env,
+    maxStdoutBytes,
+    maxStderrBytes,
+  } = opts;
 
   if (signal?.aborted) {
     return Promise.reject(new AppError("PROCESSING_FAILED", "Download was cancelled."));
@@ -162,7 +222,9 @@ export function runProcess(opts: {
     let terminationReason: TerminationReason = "none";
     let settled = false;
 
-    const requestTermination = (reason: "timeout" | "abort") => {
+    const requestTermination = (
+      reason: "timeout" | "abort" | "stdout_limit" | "stderr_limit",
+    ) => {
       if (terminationReason !== "none") return;
       terminationReason = reason;
       try {
@@ -214,37 +276,65 @@ export function runProcess(opts: {
 
     stdoutStream.on("data", (chunk: string) => {
       stdout += chunk;
-      if (stdout.length > 8_000_000) stdout = stdout.slice(-4_000_000);
+      if (maxStdoutBytes !== undefined) {
+        if (stdout.length > maxStdoutBytes) {
+          // Drop what we hold immediately: an over-limit stream is never
+          // returned, never parsed and never classified, so retaining it would
+          // only keep unwanted bytes alive until the promise settles.
+          stdout = "";
+          requestTermination("stdout_limit");
+          return;
+        }
+      } else if (stdout.length > DEFAULT_STDOUT_RETENTION_BYTES) {
+        stdout = stdout.slice(-DEFAULT_STDOUT_RETAINED_TAIL_BYTES);
+      }
       onStdout?.(chunk);
     });
     stderrStream.on("data", (chunk: string) => {
       stderr += chunk;
-      if (stderr.length > 2_000_000) stderr = stderr.slice(-1_000_000);
+      if (maxStderrBytes !== undefined) {
+        if (stderr.length > maxStderrBytes) {
+          stderr = "";
+          requestTermination("stderr_limit");
+          return;
+        }
+      } else if (stderr.length > DEFAULT_STDERR_RETENTION_BYTES) {
+        stderr = stderr.slice(-DEFAULT_STDERR_RETAINED_TAIL_BYTES);
+      }
       onStderr?.(chunk);
     });
 
+    /**
+     * The rejection a termination implies, or null when the run was allowed to
+     * finish normally. Shared by the `error` and `close` handlers so a killed
+     * process reports identically whichever fires first.
+     */
+    const terminationRejection = (): Error | null => {
+      switch (terminationReason) {
+        case "timeout":
+          return new AppError("TIMEOUT");
+        case "abort":
+          return new AppError("PROCESSING_FAILED", "Download was cancelled.");
+        case "stdout_limit":
+          return new ProcessOutputLimitError("stdout");
+        case "stderr_limit":
+          return new ProcessOutputLimitError("stderr");
+        case "none":
+          return null;
+      }
+    };
+
     child.on("error", (err) => {
       settle(() => {
-        if (terminationReason === "timeout") {
-          reject(new AppError("TIMEOUT"));
-          return;
-        }
-        if (terminationReason === "abort") {
-          reject(new AppError("PROCESSING_FAILED", "Download was cancelled."));
-          return;
-        }
-        reject(err);
+        reject(terminationRejection() ?? err);
       });
     });
 
     child.on("close", (code) => {
       settle(() => {
-        if (terminationReason === "timeout") {
-          reject(new AppError("TIMEOUT"));
-          return;
-        }
-        if (terminationReason === "abort") {
-          reject(new AppError("PROCESSING_FAILED", "Download was cancelled."));
+        const terminated = terminationRejection();
+        if (terminated) {
+          reject(terminated);
           return;
         }
         resolve({ code, stdout, stderr });

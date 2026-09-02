@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { AppError } from "../../lib/errors.ts";
 import {
+  ProcessOutputLimitError,
   buildSpawnOptions,
   isValidChildPid,
   posixProcessGroupsEnabled,
@@ -452,6 +453,163 @@ describe("process runner result semantics", () => {
     assert.equal(result.stderr, "err-1");
     assert.deepEqual(stdoutChunks, ["out-1"]);
     assert.deepEqual(stderrChunks, ["err-1"]);
+  });
+});
+
+describe("process runner output ceilings", () => {
+  afterEach(() => {
+    setProcessRunnerTestHooks(null);
+  });
+
+  /**
+   * The ceilings are OPT-IN. Every pre-existing caller omits them and must keep
+   * the historical lenient behaviour: retain a tail, never kill the child.
+   */
+  it("defaults are unchanged: no ceiling, no termination, output retained", async () => {
+    const child = createFakeChild(41);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const pending = runProcess({ command: "tool", args: [], timeoutMs: 5_000 });
+    child.stdout.write("x".repeat(50_000));
+    child.stderr.write("y".repeat(50_000));
+    closeSoon(child, 0);
+
+    const result = await pending;
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout.length, 50_000);
+    assert.equal(result.stderr.length, 50_000);
+    assert.deepEqual(child.killCalls, [], "no ceiling means no termination");
+  });
+
+  it("terminates the process GROUP and rejects when stdout exceeds its ceiling", async () => {
+    const child = createFakeChild(42);
+    const killed: number[] = [];
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: (pid) => {
+        killed.push(pid);
+        return true;
+      },
+    });
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 1_000,
+    });
+    child.stdout.write("a".repeat(1_001));
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
+    assert.equal(err.stream, "stdout");
+    assert.equal(err.code, "PROCESSING_FAILED");
+    assert.deepEqual(killed, [-42], "the whole owned process group must be signalled");
+  });
+
+  it("terminates and rejects when stderr exceeds its ceiling", async () => {
+    const child = createFakeChild(43);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStderrBytes: 10,
+    });
+    child.stderr.write("z".repeat(11));
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
+    assert.equal(err.stream, "stderr");
+  });
+
+  it("never resolves partial output after an overflow", async () => {
+    const child = createFakeChild(44);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 8,
+    });
+    child.stdout.write("SECRET_PREFIX");
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => "RESOLVED",
+      (e: unknown) => e,
+    );
+    assert.notEqual(err, "RESOLVED", "a truncated document must never be handed back");
+    assert.ok(err instanceof ProcessOutputLimitError);
+    // The error names the stream and nothing that came out of it.
+    assert.equal(err.message.includes("SECRET_PREFIX"), false);
+  });
+
+  it("accepts output exactly at the ceiling", async () => {
+    const child = createFakeChild(45);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 16,
+    });
+    child.stdout.write("b".repeat(16));
+    closeSoon(child, 0);
+
+    const result = await pending;
+    assert.equal(result.stdout.length, 16);
+    assert.deepEqual(child.killCalls, []);
+  });
+
+  it("an overflow outranks a normal nonzero exit", async () => {
+    const child = createFakeChild(46);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 4,
+    });
+    child.stdout.write("overflowing");
+    closeSoon(child, 3);
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
   });
 });
 
