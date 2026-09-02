@@ -587,12 +587,23 @@ describe("generic analysis: bounded, strictly validated JSON", () => {
     }
   });
 
-  it("never parses an upstream format_id at all", () => {
+  it("parses an upstream format_id, and keeps every other identity field out", () => {
+    // §10: Phase-10C2 could say "format_id is not parsed at all", because no
+    // execution path existed to select a source. Phase 10C3 acquires media, so
+    // the Worker must be able to name the exact source it approved. The
+    // guarantee therefore moves from "never parsed" to "never ESCAPES the
+    // private execution structure" — asserted below and, end-to-end, by
+    // "never lets an upstream format_id reach the response".
     const parsed = parseAnalysisInfo(JSON.stringify(singleVideoInfo()));
     assert.equal(parsed.ok, true);
     if (parsed.ok) {
       for (const format of parsed.info.formats ?? []) {
-        assert.equal("format_id" in format, false, "format_id must be structurally absent");
+        assert.equal(format.format_id, "http-1080");
+        // The other upstream identity fields stay structurally absent: nothing
+        // needs them, so the schema does not admit them.
+        for (const field of ["url", "manifest_url", "fragment_base_url", "http_headers"]) {
+          assert.equal(field in format, false, `${field} must stay unparsed`);
+        }
       }
     }
   });
@@ -608,8 +619,15 @@ describe("generic analysis: bounded, strictly validated JSON", () => {
 
 // ── Candidate eligibility and presets ────────────────────────────────────────
 
+let videoFixtureSeq = 0;
+
 function video(overrides: Record<string, unknown> = {}) {
   return {
+    // Since Phase 10C3 a candidate must carry an upstream id matching the safe
+    // grammar to be eligible at all (§11), so the fixture supplies a distinct
+    // safe one. Distinctness matters: several tests build multi-format ladders
+    // and each rung must be separately identifiable as a source.
+    format_id: `http-${(videoFixtureSeq += 1)}`,
     ext: "mp4",
     height: 1080,
     width: 1920,
@@ -709,7 +727,7 @@ describe("generic analysis: preset policy", () => {
   it("split-stream video-only formats produce NO video preset", async () => {
     const meta = await presetsFor([
       video({ acodec: "none", audio_ext: "none" }),
-      { ext: "m4a", vcodec: "none", acodec: "mp4a.40.2", protocol: "https" },
+      { format_id: "audio-m4a", ext: "m4a", vcodec: "none", acodec: "mp4a.40.2", protocol: "https" },
     ]);
     const videoPresets = meta.presets.filter((p) => p.hasVideo);
     assert.deepEqual(videoPresets, [], "merging separate streams is out of scope for v1");
@@ -778,7 +796,7 @@ describe("generic analysis: preset policy", () => {
 
   it("offers audio from an audio-only source without needing FFmpeg", async () => {
     const meta = await presetsFor(
-      [{ ext: "m4a", vcodec: "none", acodec: "mp4a.40.2", protocol: "https" }],
+      [{ format_id: "audio-m4a", ext: "m4a", vcodec: "none", acodec: "mp4a.40.2", protocol: "https" }],
       { ffmpegAvailable: false },
     );
     const audio = meta.presets.find((p) => p.id === "preset:audio");
@@ -797,7 +815,7 @@ describe("generic analysis: preset policy", () => {
 
   it("emits only application-owned preset ids, with id === formatId", async () => {
     const meta = await presetsFor(
-      [video({ height: 2160 }), video({ height: 720 }), { ext: "m4a", vcodec: "none", acodec: "mp4a", protocol: "https" }],
+      [video({ height: 2160 }), video({ height: 720 }), { format_id: "audio-m4a", ext: "m4a", vcodec: "none", acodec: "mp4a", protocol: "https" }],
       { ffmpegAvailable: true },
     );
     assert.ok(meta.presets.length > 0);
