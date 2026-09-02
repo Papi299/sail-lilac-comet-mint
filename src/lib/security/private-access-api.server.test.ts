@@ -1000,23 +1000,30 @@ describe("sites and diagnostics are served from worker capability data", () => {
     assert.equal("extractors" in body, false, "no local extractor registry may be exposed");
   });
 
-  // ── Phase-10C1 generic capability matrix ─────────────────────────────────
+  // ── Phase-10C3 generic capability matrix ─────────────────────────────────
   //
   // `ytdlp` answers "can this build extract from a generic site right now?".
   // Three things must hold: the execution path must EXIST in the build, the
-  // pinned runtime must execute, and the operator must have enabled it. In
-  // Phase 10C1 the first is false by construction, so the answer is false for
-  // every combination of the other two — including installed + enabled, which
-  // is the regression this matrix exists to catch.
-  const CAPABILITY_MATRIX: Array<{ installed: boolean; enabled: boolean }> = [
-    { installed: false, enabled: false },
-    { installed: true, enabled: false },
-    { installed: false, enabled: true },
-    { installed: true, enabled: true },
+  // pinned runtime must execute, and the operator must have enabled it.
+  //
+  // CHANGED from the Phase-10C1 form of this matrix, which expected `false` in
+  // every row because the first conjunct was false by construction. Phase 10C3
+  // added the execution path, so the constant is now true and the matrix
+  // genuinely exercises the other two conjuncts. That old all-false expectation
+  // is historical; keeping it would have asserted the feature does not exist.
+  //
+  // The regression this still exists to catch is unchanged and is now the ONLY
+  // interesting row: `installed && enabled` must be required TOGETHER, and
+  // neither alone may report capability.
+  const CAPABILITY_MATRIX: Array<{ installed: boolean; enabled: boolean; expected: boolean }> = [
+    { installed: false, enabled: false, expected: false },
+    { installed: true, enabled: false, expected: false },
+    { installed: false, enabled: true, expected: false },
+    { installed: true, enabled: true, expected: true },
   ];
 
-  for (const { installed, enabled } of CAPABILITY_MATRIX) {
-    it(`reports ytdlp:false with installed=${installed} enabled=${enabled} (no execution path in this build)`, async () => {
+  for (const { installed, enabled, expected } of CAPABILITY_MATRIX) {
+    it(`reports ytdlp:${expected} with installed=${installed} enabled=${enabled}`, async () => {
       setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
       const { client } = installWorker();
       client.diagnosticsOverride = {
@@ -1034,8 +1041,8 @@ describe("sites and diagnostics are served from worker capability data", () => {
 
       assert.equal(
         body.ytdlp,
-        false,
-        "generic capability must stay false while no execution path exists",
+        expected,
+        "generic capability requires the build, the runtime AND the operator setting",
       );
       // The two underlying facts remain independently observable, so an
       // operator can still tell "runtime absent" from "installed but off".
@@ -1045,14 +1052,30 @@ describe("sites and diagnostics are served from worker capability data", () => {
   }
 
   it("keeps the generic capability flag pinned to the build, not to configuration", async () => {
-    // Guards the specific mistake the matrix above exists to prevent: deriving
-    // capability from `installed && enabled`. If that regression is
-    // reintroduced, this constant is what makes the intent unambiguous.
+    // The constant must remain a COMPILE-TIME fact. It became true in Phase
+    // 10C3 because the code path was added in the same commit — never because
+    // an operator set something.
     assert.equal(
       GENERIC_YTDLP_EXECUTION_IMPLEMENTED,
-      false,
-      "Phase 10C1 has no generic yt-dlp execution path; flip this only when one exists",
+      true,
+      "Phase 10C3 added the generic execution path; this states that it exists",
     );
+
+    // ...and it is still not sufficient on its own. With the path implemented
+    // but the runtime missing and the feature disabled, capability is false.
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    const { client } = installWorker();
+    client.diagnosticsOverride = {
+      ...DIAGNOSTICS,
+      binaries: { ...DIAGNOSTICS.binaries, ytdlp: false },
+      runtime: { ytdlpVersion: null },
+      features: { ytdlpEnabled: false },
+    };
+    const res = await handleSites(
+      apiRequest("/api/sites", { cookie: authedCookie(), site: "same-origin" }),
+    );
+    const body = await readJson(res);
+    assert.equal(body.ytdlp, false, "an implemented path alone must not claim capability");
   });
 
   it("proxies authenticated worker diagnostics", async () => {

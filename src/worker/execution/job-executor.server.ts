@@ -9,9 +9,17 @@ import { mimeForContainer } from "@/services/extractors/normalize";
 import { convertMedia } from "@/services/processing/ffmpeg.server";
 import { validateLocalOutput } from "./local-output.server.ts";
 import {
-  deriveDirectExecutionPlan,
-  type DirectExecutionPlan,
+  deriveExecutionPlan,
+  executionPlanRequestedFormatId,
+  executionPlanTargetContainer,
+  type ExecutionPlan,
 } from "./format-plan.ts";
+import {
+  downloadGenericOriginal,
+  type GenericDownloadLimits,
+} from "./ytdlp-download.server.ts";
+import type { ExecutionAnalysis } from "../analysis/media-analyzer.server.ts";
+import type { GenericExecutionPlan } from "./format-plan.ts";
 import type { CancelJobResult, DurableWorkerJob, WorkerJobStore } from "@/worker/state/job-store";
 import type { ObjectStoreWriter } from "@/worker/storage/writer";
 import type { WorkerVideoMetadata } from "@/shared/worker/contracts";
@@ -26,6 +34,18 @@ export type AnalyzeDirectMediaFn = (
   url: string,
   signal?: AbortSignal,
 ) => Promise<WorkerVideoMetadata>;
+
+/**
+ * §17/§35: the STRATEGY-AWARE execution analysis.
+ *
+ * A durable job re-analyzes its own stored URL at execution time and decides
+ * direct-vs-generic itself. It never trusts the browser's earlier analysis and
+ * never reads strategy back from durable state.
+ */
+export type AnalyzeForExecutionFn = (
+  url: string,
+  signal?: AbortSignal,
+) => Promise<ExecutionAnalysis>;
 
 export type OriginalDownloadResult = {
   filePath: string;
@@ -55,6 +75,30 @@ export type DownloadOriginalFn = (
 ) => Promise<OriginalDownloadResult>;
 
 /**
+ * §20: acquires the ONE original described by a generic execution plan. Like
+ * the direct downloader it must never convert — but unlike the direct one it
+ * DOES receive a plan, because the plan names the single upstream source the
+ * Worker approved. It receives no browser value of any kind.
+ */
+export type DownloadGenericOriginalFn = (
+  url: string,
+  workDir: string,
+  plan: GenericExecutionPlan,
+  ctx: {
+    limits: GenericDownloadLimits;
+    signal?: AbortSignal;
+    onProgress?: (update: {
+      progress: number | null;
+      downloadedBytes?: number | null;
+      totalBytes?: number | null;
+      speed?: number | null;
+      eta?: number | null;
+      stage?: string;
+    }) => void;
+  },
+) => Promise<OriginalDownloadResult>;
+
+/**
  * §12: local processing is dependency-injected so acceptance tests can observe
  * the durable job status at the exact moment FFmpeg would be invoked.
  */
@@ -67,10 +111,34 @@ export type LocalProcessingFn = (opts: {
 }) => Promise<string>;
 
 export type JobExecutorDeps = {
+  /**
+   * The authoritative, strategy-aware analysis. Production composition supplies
+   * this, built from the SAME routing policy `WorkerService.analyze()` uses, so
+   * the HTTP endpoint and durable jobs cannot drift apart (§43).
+   */
+  analyzeForExecution?: AnalyzeForExecutionFn;
+  /**
+   * A DIRECT-ONLY convenience seam. Supplying it states "direct analysis
+   * returns this", and the executor adapts the result into a direct
+   * `ExecutionAnalysis`. It cannot express a generic outcome, and production
+   * never uses it.
+   */
   analyze?: AnalyzeDirectMediaFn;
   downloadOriginal?: DownloadOriginalFn;
+  downloadGeneric?: DownloadGenericOriginalFn;
   processLocally?: LocalProcessingFn;
+  /** Bounds handed to generic acquisition. Defaults to the process config. */
+  genericLimits?: GenericDownloadLimits;
 };
+
+/** Wraps a direct-only analyzer as a direct `ExecutionAnalysis`. */
+function asDirectExecutionAnalysis(fn: AnalyzeDirectMediaFn): AnalyzeForExecutionFn {
+  return async (url, signal) => ({
+    strategy: "direct",
+    video: await fn(url, signal),
+    selections: {},
+  });
+}
 
 /**
  * Strips every ASCII control character (U+0000–U+001F and U+007F) and clamps
@@ -88,9 +156,11 @@ export class JobExecutor {
   private readonly writer: ObjectStoreWriter;
   private readonly getClock: () => number;
   private readonly activeControllers: Map<string, AbortController>;
-  private readonly analyze: AnalyzeDirectMediaFn;
+  private readonly analyzeForExecution: AnalyzeForExecutionFn;
   private readonly downloadOriginal: DownloadOriginalFn;
+  private readonly downloadGeneric: DownloadGenericOriginalFn;
   private readonly processLocally: LocalProcessingFn;
+  private readonly genericLimits: GenericDownloadLimits;
 
   constructor(
     store: WorkerJobStore,
@@ -103,9 +173,32 @@ export class JobExecutor {
     this.writer = writer;
     this.getClock = getClock;
     this.activeControllers = activeControllers;
-    this.analyze = deps.analyze ?? analyzeDirectMedia;
+    // Fail-closed default: with no strategy-aware analyzer injected, execution
+    // is DIRECT-ONLY. A deployment that forgets to compose the router therefore
+    // behaves exactly as it did before Phase 10C3 rather than silently gaining
+    // a generic path.
+    this.analyzeForExecution =
+      deps.analyzeForExecution ??
+      asDirectExecutionAnalysis(deps.analyze ?? analyzeDirectMedia);
     this.downloadOriginal = deps.downloadOriginal ?? downloadDirectOriginalWorker;
+    this.downloadGeneric =
+      deps.downloadGeneric ??
+      ((url, workDir, plan, ctx) =>
+        downloadGenericOriginal(url, workDir, plan, {
+          limits: ctx.limits,
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+          ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
+        }).then((res) => ({
+          filePath: res.filePath,
+          container: res.container,
+          mime: mimeForContainer(res.container),
+          fileSize: res.fileSize,
+        })));
     this.processLocally = deps.processLocally ?? convertMedia;
+    this.genericLimits = deps.genericLimits ?? {
+      maxFileSizeBytes: config.maxFileSize,
+      downloadTimeoutSeconds: Math.max(1, Math.floor(config.downloadTimeoutMs / 1000)),
+    };
   }
 
   /** Number of executions currently holding an AbortController (§11 diagnostics). */
@@ -213,17 +306,29 @@ export class JobExecutor {
     this.checkCancelled(signal);
 
     // ── analyzing ────────────────────────────────────────────────────────────
-    const meta = await this.analyze(job.url, signal);
+    // §17/§42: the job re-analyzes its OWN stored URL and re-decides the
+    // strategy here. The browser's earlier analysis is not consulted, and the
+    // durable `extractor` column is not read back as an input — a queued job's
+    // value is null, and a previous attempt's value is history, not authority.
+    const analysis = await this.analyzeForExecution(job.url, signal);
+    const meta = analysis.video;
 
-    // §8: locate the exact selected item and derive the explicit execution plan
-    // from trusted, runtime-validated metadata before any state advances.
-    const plan = deriveDirectExecutionPlan(meta, job.formatId);
+    // §8/§18: locate the exact selected item and derive the explicit execution
+    // plan from trusted, runtime-validated metadata before any state advances.
+    // On the generic path this also pins the single upstream source, so nothing
+    // is left to be chosen later.
+    const plan = deriveExecutionPlan(analysis, job.formatId);
 
+    // §8: the strategy persisted here is EVIDENCE of what this execution
+    // selected. It is never a browser field, never an input, and never a raw
+    // upstream extractor name — `plan.strategy` is the closed
+    // `direct` | `yt-dlp` union. No source selector and no upstream format id
+    // is persisted: the selection is re-derived on any future attempt (§62).
     const analysisRes = this.store.completeAnalysis(jobId, {
       title: sanitizeForDurableState(meta.title, 1024) || "Video",
       thumbnail: meta.thumbnail || null,
       source: sanitizeForDurableState(meta.source, 2048) || "unknown",
-      extractor: "direct",
+      extractor: plan.strategy,
     });
     if (analysisRes.type !== "updated") return;
 
@@ -231,13 +336,22 @@ export class JobExecutor {
     this.checkCancelled(signal);
 
     // ── downloading: ORIGINAL BYTES ONLY ─────────────────────────────────────
-    // §4: no FFmpeg work of any kind may start while the durable job says
-    // `downloading`. This call cannot convert — it takes no format at all.
-    const original = await this.downloadOriginal(job.url, {
-      workDir,
-      signal,
-      onProgress: this.makeProgressReporter(jobId),
-    });
+    // §4/§36: no FFmpeg work of any kind may start while the durable job says
+    // `downloading`. Neither branch can convert: the direct downloader takes no
+    // format at all, and the generic one acquires exactly the one progressive
+    // source its plan names, with yt-dlp's own FFmpeg made unavailable.
+    const original =
+      plan.strategy === "direct"
+        ? await this.downloadOriginal(job.url, {
+            workDir,
+            signal,
+            onProgress: this.makeProgressReporter(jobId),
+          })
+        : await this.downloadGeneric(job.url, workDir, plan.generic, {
+            limits: this.genericLimits,
+            signal,
+            onProgress: this.makeProgressReporter(jobId),
+          });
 
     // ── processing ───────────────────────────────────────────────────────────
     const procRes = this.store.beginProcessing(jobId);
@@ -246,7 +360,9 @@ export class JobExecutor {
     this.checkExpiry(job);
     this.checkCancelled(signal);
 
-    // §11: local processing happens strictly AFTER beginProcessing() committed.
+    // §11/§36: local processing happens strictly AFTER beginProcessing()
+    // committed. This is the ONLY place Worker FFmpeg can be reached, on either
+    // strategy.
     const producedPath = await this.executePlan(plan, original, workDir, signal);
 
     const validOut = await validateLocalOutput(workDir, producedPath);
@@ -261,9 +377,10 @@ export class JobExecutor {
     // §10: the container, MIME and filename extension all come from the plan's
     // single allowlisted target, so the advertised preset and the produced
     // artifact cannot diverge.
-    const container = plan.targetContainer;
-    const quality = plan.requestedFormatId.startsWith("preset:")
-      ? plan.requestedFormatId.slice("preset:".length)
+    const container = executionPlanTargetContainer(plan);
+    const requestedFormatId = executionPlanRequestedFormatId(plan);
+    const quality = requestedFormatId.startsWith("preset:")
+      ? requestedFormatId.slice("preset:".length)
       : "original";
     const filename = buildDownloadFilename({ title: meta.title, quality, container });
 
@@ -296,19 +413,35 @@ export class JobExecutor {
    * an output extension, or a path segment.
    */
   private async executePlan(
-    plan: DirectExecutionPlan,
+    plan: ExecutionPlan,
     original: OriginalDownloadResult,
     workDir: string,
     signal: AbortSignal,
   ): Promise<string> {
-    if (plan.operation === "keep-original") {
-      if (original.container !== plan.targetContainer) {
+    const operation =
+      plan.strategy === "direct" ? plan.direct.operation : plan.generic.operation;
+    const targetContainer = executionPlanTargetContainer(plan);
+
+    if (operation === "keep-original") {
+      if (original.container !== targetContainer) {
         throw new AppError("FORMAT_UNAVAILABLE");
       }
       return original.filePath;
     }
 
-    const target = plan.targetContainer;
+    // Every processing operation across both strategies targets exactly one of
+    // these four. Checked rather than cast: `targetContainer` is widened by the
+    // union of two plan types, and a silent cast here would be the one place a
+    // container outside `convertMedia`'s closed vocabulary could reach FFmpeg.
+    if (
+      targetContainer !== "mp4" &&
+      targetContainer !== "webm" &&
+      targetContainer !== "mp3" &&
+      targetContainer !== "m4a"
+    ) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    const target = targetContainer;
     const produced = await this.processLocally({
       inputPath: original.filePath,
       workDir,

@@ -1062,11 +1062,18 @@ describe("generic analysis: no raw output ever escapes", () => {
 
 // ── Static reachability proof ────────────────────────────────────────────────
 
-describe("generic analysis: not reachable from Production", () => {
+describe("generic analysis: reachable from Production, but only through the router", () => {
   const ROOT = process.cwd();
   const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
 
-  it("no Worker composition, business or execution module imports it", () => {
+  // DELIBERATELY INVERTED in Phase 10C3. Through Phase 10C2 this block proved
+  // the generic analyzer was UNREACHABLE from Production, which was the honest
+  // statement while no execution path existed. One exists now, so the same
+  // facts are re-stated as the routing and gating rules that keep it safe.
+
+  it("no module reaches around the strategy router to the generic analyzer", () => {
+    // The router owns direct-first ordering and the fail-closed enablement
+    // check. A caller that skipped it would get generic analysis with neither.
     for (const file of [
       "src/worker/runtime/runtime.server.ts",
       "src/worker/runtime/main.server.ts",
@@ -1081,39 +1088,61 @@ describe("generic analysis: not reachable from Production", () => {
       assert.equal(
         source.includes("analysis/ytdlp-analysis"),
         false,
-        `${file} imports the generic analyzer`,
-      );
-      assert.equal(
-        source.includes("analysis/media-analyzer"),
-        false,
-        `${file} imports the strategy router`,
+        `${file} imports the generic analyzer directly instead of the router`,
       );
       assert.equal(
         source.includes("analyzeGenericMedia"),
         false,
-        `${file} calls the generic analyzer`,
+        `${file} calls the generic analyzer directly`,
       );
-      assert.equal(source.includes("analyzeMedia"), false, `${file} calls the router`);
     }
   });
 
-  it("WorkerService still resolves analysis to the direct-media analyzer alone", () => {
+  it("WorkerService analysis is the router, and defaults fail closed", () => {
     const service = read("src/worker/http/business-service.server.ts");
-    assert.match(service, /analyzeDirectMedia/);
-    assert.match(service, /deps\.analyze \?\? analyzeDirectMedia/);
+    // The HTTP surface routes through the shared policy...
+    assert.match(service, /analyzeMedia/, "WorkerService must use the strategy router");
+    // ...and an un-composed service still cannot enable generic by itself.
+    assert.match(
+      service,
+      /ytdlpEnabled\s*(\?\?|=)\s*(deps\.ytdlpEnabled \?\? )?false/,
+      "the ytdlp feature state must default to disabled",
+    );
   });
 
-  it("the JobExecutor has no generic branch", () => {
+  it("the JobExecutor derives strategy itself and persists only a closed identity", () => {
     const executor = read("src/worker/execution/job-executor.server.ts");
-    for (const token of ["ytdlp", "yt-dlp", "yt_dlp", "analyzeGenericMedia", "analyzeMedia"]) {
+    // It re-analyzes rather than trusting the browser or durable state (§17/§42).
+    assert.match(executor, /analyzeForExecution/);
+    assert.match(executor, /deriveExecutionPlan/);
+    // The persisted extractor is the PLAN's strategy, never a literal and never
+    // an upstream name.
+    assert.match(executor, /extractor:\s*plan\.strategy/);
+    assert.equal(
+      /extractor:\s*"(direct|yt-dlp)"/.test(executor),
+      false,
+      "strategy must not be hardcoded at the completeAnalysis call",
+    );
+    // The legacy stack stays unreachable regardless (§50).
+    for (const token of ["downloadWithYtdlp", "ytdlpExtractor", "mapExtractorMessage"]) {
       assert.equal(executor.includes(token), false, `JobExecutor references '${token}'`);
     }
   });
 
-  it("generic capability remains unimplemented and /api/sites stays truthful", () => {
+  it("generic capability is now implemented, and /api/sites stays truthful", () => {
+    // The constant lives in a dependency-free shared module so the browser
+    // diagnostics route can state the same fact without importing the
+    // server-only control-plane module.
+    const capabilities = read("src/shared/capabilities.ts");
+    assert.match(capabilities, /export const GENERIC_YTDLP_EXECUTION_IMPLEMENTED = true;/);
+
     const sites = read("src/lib/security/private-access-api.server.ts");
-    assert.match(sites, /export const GENERIC_YTDLP_EXECUTION_IMPLEMENTED = false;/);
-    assert.match(sites, /ytdlp: GENERIC_YTDLP_EXECUTION_IMPLEMENTED && ytdlpInstalled && ytdlpEnabled/);
+    // ...but it is still only ONE of three conjuncts. Runtime presence and
+    // operator enablement remain independently required.
+    assert.match(
+      sites,
+      /ytdlp: GENERIC_YTDLP_EXECUTION_IMPLEMENTED && ytdlpInstalled && ytdlpEnabled/,
+    );
   });
 });
 

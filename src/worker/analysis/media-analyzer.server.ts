@@ -1,10 +1,22 @@
 import { AppError } from "../../lib/errors.ts";
-import type { WorkerVideoMetadata } from "../../shared/worker/contracts.ts";
+import type {
+  WorkerExtractorStrategy,
+  WorkerVideoMetadata,
+} from "../../shared/worker/contracts.ts";
+import type { GenericSourceSelections } from "../execution/generic-source.ts";
 import { analyzeDirectMedia } from "../execution/direct-media.server.ts";
 import {
   analyzeGenericMedia,
+  analyzeGenericMediaInternal,
   type GenericAnalysisLimits,
 } from "./ytdlp-analysis.server.ts";
+
+/**
+ * Re-exported so callers can state the analyzer's bounds without naming the
+ * generic analyzer module. Everything reaches generic analysis THROUGH this
+ * router, imports included.
+ */
+export type { GenericAnalysisLimits };
 
 /**
  * Worker-owned media analysis STRATEGY ROUTER (Phase 10C2).
@@ -147,4 +159,161 @@ export async function analyzeMedia(
       signal: options.signal,
     });
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EXECUTION-SIDE ANALYSIS — Phase 10C3 §17
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The result of analyzing a URL for DURABLE EXECUTION.
+ *
+ * `strategy` is the Worker's own decision, reached by running the same
+ * direct-first rules the HTTP path uses. It is evidence of what THIS execution
+ * selected — never a browser input, and never read back from durable state
+ * (§5/§42).
+ *
+ * `selections` is populated only on the generic path and is PRIVATE: it carries
+ * the one raw upstream `format_id` per advertised preset. It must never cross
+ * Worker HTTP, enter `WorkerVideoMetadata`, enter SQLite, reach Vercel or the
+ * browser, be logged, or appear in an error message (§9).
+ */
+export type ExecutionAnalysis = {
+  readonly strategy: WorkerExtractorStrategy;
+  readonly video: WorkerVideoMetadata;
+  readonly selections: GenericSourceSelections;
+};
+
+/** The internal generic analyzer, injectable exactly like the public one. */
+export type GenericExecutionAnalyzeFn = (
+  url: string,
+  opts: {
+    readonly limits: GenericAnalysisLimits;
+    readonly ffmpegAvailable: boolean;
+    readonly signal?: AbortSignal;
+  },
+) => Promise<{
+  readonly video: WorkerVideoMetadata;
+  readonly selections: GenericSourceSelections;
+}>;
+
+export type ExecutionAnalyzerOptions = Omit<MediaAnalyzerOptions, "analyzeGeneric"> & {
+  readonly analyzeGeneric?: GenericExecutionAnalyzeFn;
+};
+
+/**
+ * Analyzes one URL for durable execution, direct-first.
+ *
+ * Deliberately the SAME routing rules as `analyzeMedia` — `directFailureAllowsGenericFallback`
+ * is the single shared decision function — so the HTTP endpoint and durable jobs
+ * cannot drift onto subtly different direct-vs-generic policy (§43). The only
+ * difference is what comes back: this returns the strategy it chose and, on the
+ * generic path, the private source selections execution needs.
+ *
+ * A durable job calls this on its OWN stored URL, at execution time. It never
+ * reuses the browser's earlier analysis, so a site that changed in between is
+ * observed here rather than silently acquired (§17).
+ */
+export async function analyzeForExecution(
+  url: string,
+  options: ExecutionAnalyzerOptions,
+): Promise<ExecutionAnalysis> {
+  const direct = options.analyzeDirect ?? analyzeDirectMedia;
+  const generic =
+    options.analyzeGeneric ??
+    ((target: string, opts) =>
+      analyzeGenericMediaInternal(target, {
+        limits: opts.limits,
+        ffmpegAvailable: opts.ffmpegAvailable,
+        signal: opts.signal,
+      }));
+
+  try {
+    const video = await direct(url, options.signal);
+    // Direct advertises concrete formats and needs no private selection map.
+    return { strategy: "direct", video, selections: {} };
+  } catch (err: unknown) {
+    if (options.signal?.aborted) throw err;
+    if (!directFailureAllowsGenericFallback(err)) throw err;
+
+    if (options.ytdlpEnabled !== true) {
+      throw new AppError(GENERIC_FALLBACK_TRIGGER_CODE);
+    }
+
+    const internal = await generic(url, {
+      limits: options.limits,
+      ffmpegAvailable: options.ffmpegAvailable ?? false,
+      signal: options.signal,
+    });
+    return {
+      strategy: "yt-dlp",
+      video: internal.video,
+      selections: internal.selections,
+    };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE CANONICAL MEDIA-ANALYSIS POLICY — Phase 10C3 §43
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type MediaAnalysisPolicyConfig = {
+  /** The operator's validated `YTDLP_ENABLED` intent. Fail-closed. */
+  readonly ytdlpEnabled: boolean;
+  readonly limits: GenericAnalysisLimits;
+  /**
+   * Whether the Worker's OWN FFmpeg is usable.
+   *
+   * A thunk rather than a boolean because it is a real probe, and because the
+   * answer must be cached by the composition root rather than re-probed on
+   * every analyze: generic AUDIO presets from a muxed source depend on it, so
+   * it is consulted on the hot path.
+   */
+  readonly ffmpegAvailable: () => Promise<boolean>;
+};
+
+export type MediaAnalysisPolicy = {
+  /** Browser-facing analysis. Returns public metadata only. */
+  readonly analyze: (url: string, signal?: AbortSignal) => Promise<WorkerVideoMetadata>;
+  /** Durable-execution analysis. Also returns strategy and private selections. */
+  readonly analyzeForExecution: (
+    url: string,
+    signal?: AbortSignal,
+  ) => Promise<ExecutionAnalysis>;
+};
+
+/**
+ * Builds the ONE analysis policy the whole Worker uses.
+ *
+ * Both entry points close over the SAME configuration and share the same
+ * routing function, so `/analyze` and durable execution cannot end up with
+ * subtly different direct-vs-generic behaviour — a browser that was offered a
+ * generic preset must not then meet a Worker that refuses generic, and vice
+ * versa (§43).
+ *
+ * Fail-closed by construction: `ytdlpEnabled` is a value the composition root
+ * must supply from validated configuration. This module never reads the
+ * environment.
+ */
+export function createMediaAnalysisPolicy(
+  cfg: MediaAnalysisPolicyConfig,
+): MediaAnalysisPolicy {
+  return {
+    analyze: async (url, signal) =>
+      analyzeMedia(url, {
+        ytdlpEnabled: cfg.ytdlpEnabled,
+        limits: cfg.limits,
+        // Probed only when the direct path has already declined, so a
+        // direct-media request never pays for it.
+        ffmpegAvailable: cfg.ytdlpEnabled ? await cfg.ffmpegAvailable() : false,
+        ...(signal ? { signal } : {}),
+      }),
+    analyzeForExecution: async (url, signal) =>
+      analyzeForExecution(url, {
+        ytdlpEnabled: cfg.ytdlpEnabled,
+        limits: cfg.limits,
+        ffmpegAvailable: cfg.ytdlpEnabled ? await cfg.ffmpegAvailable() : false,
+        ...(signal ? { signal } : {}),
+      }),
+  };
 }

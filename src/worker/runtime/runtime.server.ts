@@ -6,6 +6,8 @@ import { QueueRunner } from "../execution/queue-runner.server.ts";
 import type { AnalyzeFn } from "../http/business-service.server.ts";
 import { WorkerService } from "../http/business-service.server.ts";
 import type { WorkerBinaryProbe } from "../http/binaries.server.ts";
+import { createMediaAnalysisPolicy } from "../analysis/media-analyzer.server.ts";
+import { ffmpegAvailable } from "../../services/processing/ffmpeg.server.ts";
 import { createWorkerServer } from "../http/server.server.ts";
 import { SQLiteWorkerReplayStore } from "../security/sqlite-replay-store.server.ts";
 import { openWorkerDatabase } from "../state/database.server.ts";
@@ -201,12 +203,59 @@ export async function createWorkerRuntime(
         ...(overrides.r2CreateWriter ? { createWriter: overrides.r2CreateWriter } : {}),
       });
 
+    // ── The canonical media-analysis policy (§43) ────────────────────────
+    //
+    // ONE policy object, built from validated configuration, injected into BOTH
+    // the HTTP analyze endpoint and durable job execution. Building it twice —
+    // or letting either side default — is exactly how `/analyze` and the
+    // executor would drift onto different direct-vs-generic behaviour, so a
+    // browser could be offered a preset the Worker would then refuse.
+    //
+    // `config.media.ytdlp.enabled` is the operator's validated intent and is
+    // fail-closed at the configuration boundary; nothing below this line reads
+    // the environment.
+    const analysisPolicy = createMediaAnalysisPolicy({
+      ytdlpEnabled: config.media.ytdlp.enabled,
+      limits: {
+        analysisTimeoutSeconds: config.media.analysisTimeoutSeconds,
+        maxVideoDurationSeconds: config.media.maxVideoDurationSeconds,
+        maxFileSizeBytes: config.media.maxFileSizeBytes,
+      },
+      // A real probe, memoized for the process lifetime: FFmpeg is installed at
+      // image build time and cannot appear or vanish while the Worker runs, so
+      // re-probing per request would spend a subprocess to learn a constant.
+      // Generic AUDIO presets from a muxed source depend on the answer, so a
+      // wrong `true` here would advertise a preset the Worker could not produce.
+      ffmpegAvailable: memoizeOnce(ffmpegAvailable),
+    });
+
+    const executorDeps = overrides.executorDeps ?? {};
+    // An injected analysis seam — strategy-aware OR direct-only — must WIN over
+    // the composed policy. Spreading the overrides last is not enough: they
+    // would not contain the `analyzeForExecution` key, so the composed policy
+    // would survive and a test that injected `analyze` would silently perform
+    // real network analysis instead.
+    const injectsOwnAnalysis =
+      executorDeps.analyzeForExecution !== undefined || executorDeps.analyze !== undefined;
+
     const executor = new JobExecutor(
       store,
       writer,
       overrides.clock,
       new Map(),
-      overrides.executorDeps ?? {},
+      {
+        // Durable execution re-analyzes its own URL under the SAME policy as
+        // `/analyze`, and derives the strategy itself (§17/§42).
+        ...(injectsOwnAnalysis
+          ? {}
+          : { analyzeForExecution: analysisPolicy.analyzeForExecution }),
+        // Generic acquisition is bounded by the same validated configuration.
+        genericLimits: {
+          maxFileSizeBytes: config.media.maxFileSizeBytes,
+          downloadTimeoutSeconds: config.media.downloadTimeoutSeconds,
+        },
+        ...executorDeps,
+      },
     );
 
     const runner = new ShutdownAwareQueueRunner(store, executor);
@@ -220,7 +269,12 @@ export async function createWorkerRuntime(
       // boundary to diagnostics explicitly. Nothing below this layer reads the
       // environment for it.
       ytdlpEnabled: config.media.ytdlp.enabled,
-      ...(overrides.analyze ? { analyze: overrides.analyze } : {}),
+      analysisLimits: {
+        analysisTimeoutSeconds: config.media.analysisTimeoutSeconds,
+        maxVideoDurationSeconds: config.media.maxVideoDurationSeconds,
+        maxFileSizeBytes: config.media.maxFileSizeBytes,
+      },
+      analyze: overrides.analyze ?? analysisPolicy.analyze,
       ...(overrides.probeBinaries ? { probeBinaries: overrides.probeBinaries } : {}),
       ...(overrides.clock ? { clock: overrides.clock } : {}),
     });
@@ -390,4 +444,23 @@ async function awaitUntilDeadline(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/**
+ * Runs `fn` at most once and reuses its answer for the process lifetime.
+ *
+ * Used for the FFmpeg availability probe: the binary is installed at image
+ * build time on a read-only root filesystem, so the answer cannot change while
+ * the Worker runs. A rejection is NOT cached — a transient probe failure should
+ * not permanently disable generic audio presets.
+ */
+function memoizeOnce<T>(fn: () => Promise<T>): () => Promise<T> {
+  let pending: Promise<T> | null = null;
+  return () => {
+    pending ??= fn().catch((err: unknown) => {
+      pending = null;
+      throw err;
+    });
+    return pending;
+  };
 }
