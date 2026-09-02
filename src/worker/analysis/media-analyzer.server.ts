@@ -93,7 +93,30 @@ export type MediaAnalyzerOptions = {
    */
   readonly ytdlpEnabled?: boolean;
   readonly limits: GenericAnalysisLimits;
+  /**
+   * Whether the Worker's OWN FFmpeg is usable, when the caller already knows.
+   *
+   * Only ever consulted on the generic branch. Prefer `getFfmpegAvailable` when
+   * the answer costs anything to obtain.
+   */
   readonly ffmpegAvailable?: boolean;
+  /**
+   * CORRECTION-01. The LAZY form of `ffmpegAvailable`.
+   *
+   * Generic AUDIO presets from a muxed source need the Worker's own FFmpeg, so
+   * the answer is a generic-ONLY input: a direct-media URL never needs it, and a
+   * direct failure that forbids fallback never needs it either.
+   *
+   * Passing an already-resolved boolean forced the composition root to await a
+   * real subprocess probe BEFORE direct analysis ran, which made every direct
+   * request pay for a capability only the generic branch consults — and, worse,
+   * made "direct first" false in the one place the whole phase depends on it.
+   *
+   * This resolver is invoked from exactly one place: inside the already-
+   * authorized generic fallback branch, after direct has failed with
+   * EXTRACTOR_UNAVAILABLE and after the operator's switch has been checked.
+   */
+  readonly getFfmpegAvailable?: () => Promise<boolean>;
   readonly signal?: AbortSignal;
   /** Test seams. Production would use the real analyzers. */
   readonly analyzeDirect?: DirectAnalyzeFn;
@@ -114,33 +137,61 @@ export function directFailureAllowsGenericFallback(err: unknown): boolean {
 }
 
 /**
- * Analyzes one submitted URL, direct-media first.
+ * The ONE direct-first routing implementation (CORRECTION-01 §4).
  *
- * On the generic path this returns metadata whose `extractor` is exactly
- * `"yt-dlp"`; on the direct path it returns the direct analyzer's own result
- * completely unmodified, `extractor: "direct"` included. Direct's format and
- * preset semantics are not reshaped to resemble generic's — the two contracts
- * stay independent.
+ * `analyzeMedia` and `analyzeForExecution` differ only in what the generic
+ * branch RETURNS — browser-safe metadata versus metadata plus the private
+ * source selections. The decision itself must not be written twice: two copies
+ * of "try direct, fall back on exactly one code, only when enabled" is exactly
+ * how the HTTP surface and durable execution would drift apart.
+ *
+ * So the decision lives here, once, and the callers supply only the generic
+ * continuation.
+ *
+ * Order is a security property, not a style choice:
+ *
+ *   1. attempt DIRECT — nothing generic has happened yet, not even a
+ *      capability probe;
+ *   2. on success, return immediately;
+ *   3. on cancellation, propagate — an aborted analysis must never start a
+ *      second, more capable network client;
+ *   4. on any code other than EXTRACTOR_UNAVAILABLE, propagate;
+ *   5. if the operator did not enable generic, fail closed with the same code
+ *      direct produced;
+ *   6. ONLY NOW resolve generic-only capability, then run generic.
+ *
+ * Step 6 is the correction. Resolving FFmpeg availability before step 1 made
+ * every direct-media request pay for a probe it never consults, and made the
+ * direct-first contract untrue in the composition root.
  */
-export async function analyzeMedia(
-  url: string,
-  options: MediaAnalyzerOptions,
-): Promise<WorkerVideoMetadata> {
-  const direct = options.analyzeDirect ?? analyzeDirectMedia;
-  const generic =
-    options.analyzeGeneric ??
-    ((target: string, opts) =>
-      analyzeGenericMedia(target, {
-        limits: opts.limits,
-        ffmpegAvailable: opts.ffmpegAvailable,
-        signal: opts.signal,
-      }));
+type RoutedAnalysis<G> =
+  | { readonly strategy: "direct"; readonly video: WorkerVideoMetadata }
+  | { readonly strategy: "yt-dlp"; readonly generic: G };
 
+/**
+ * Everything the routing decision needs — and deliberately NOT the generic
+ * analyzer seam, which each caller supplies as its own continuation. Omitting
+ * it is what lets the HTTP and execution option types share one router despite
+ * their generic analyzers returning different shapes.
+ */
+type DirectFirstRoutingOptions = Omit<MediaAnalyzerOptions, "analyzeGeneric">;
+
+async function routeDirectFirst<G>(
+  url: string,
+  options: DirectFirstRoutingOptions,
+  runGeneric: (opts: {
+    readonly limits: GenericAnalysisLimits;
+    readonly ffmpegAvailable: boolean;
+    readonly signal?: AbortSignal;
+  }) => Promise<G>,
+): Promise<RoutedAnalysis<G>> {
+  const direct = options.analyzeDirect ?? analyzeDirectMedia;
+
+  let video: WorkerVideoMetadata;
   try {
-    return await direct(url, options.signal);
+    video = await direct(url, options.signal);
   } catch (err: unknown) {
-    // Cancellation is never a strategy decision. An aborted analysis must not
-    // silently start a second, more capable network client.
+    // Cancellation is never a strategy decision.
     if (options.signal?.aborted) throw err;
 
     if (!directFailureAllowsGenericFallback(err)) throw err;
@@ -153,12 +204,49 @@ export async function analyzeMedia(
       throw new AppError(GENERIC_FALLBACK_TRIGGER_CODE);
     }
 
-    return await generic(url, {
-      limits: options.limits,
-      ffmpegAvailable: options.ffmpegAvailable ?? false,
-      signal: options.signal,
-    });
+    // The ONLY place generic-only capability is resolved. Everything above
+    // this line has completed without it.
+    const ffmpegAvailable = options.getFfmpegAvailable
+      ? await options.getFfmpegAvailable()
+      : (options.ffmpegAvailable ?? false);
+
+    return {
+      strategy: "yt-dlp",
+      generic: await runGeneric({
+        limits: options.limits,
+        ffmpegAvailable,
+        ...(options.signal ? { signal: options.signal } : {}),
+      }),
+    };
   }
+
+  return { strategy: "direct", video };
+}
+
+/**
+ * Analyzes one submitted URL, direct-media first.
+ *
+ * On the generic path this returns metadata whose `extractor` is exactly
+ * `"yt-dlp"`; on the direct path it returns the direct analyzer's own result
+ * completely unmodified, `extractor: "direct"` included. Direct's format and
+ * preset semantics are not reshaped to resemble generic's — the two contracts
+ * stay independent.
+ */
+export async function analyzeMedia(
+  url: string,
+  options: MediaAnalyzerOptions,
+): Promise<WorkerVideoMetadata> {
+  const generic =
+    options.analyzeGeneric ??
+    ((target: string, opts) =>
+      analyzeGenericMedia(target, {
+        limits: opts.limits,
+        ffmpegAvailable: opts.ffmpegAvailable,
+        signal: opts.signal,
+      }));
+
+  const routed = await routeDirectFirst(url, options, (opts) => generic(url, opts));
+  return routed.strategy === "direct" ? routed.video : routed.generic;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -218,7 +306,6 @@ export async function analyzeForExecution(
   url: string,
   options: ExecutionAnalyzerOptions,
 ): Promise<ExecutionAnalysis> {
-  const direct = options.analyzeDirect ?? analyzeDirectMedia;
   const generic =
     options.analyzeGeneric ??
     ((target: string, opts) =>
@@ -228,29 +315,19 @@ export async function analyzeForExecution(
         signal: opts.signal,
       }));
 
-  try {
-    const video = await direct(url, options.signal);
+  // The SAME routing implementation the HTTP path uses. Only the generic
+  // continuation differs: execution additionally keeps the private selections.
+  const routed = await routeDirectFirst(url, options, (opts) => generic(url, opts));
+
+  if (routed.strategy === "direct") {
     // Direct advertises concrete formats and needs no private selection map.
-    return { strategy: "direct", video, selections: {} };
-  } catch (err: unknown) {
-    if (options.signal?.aborted) throw err;
-    if (!directFailureAllowsGenericFallback(err)) throw err;
-
-    if (options.ytdlpEnabled !== true) {
-      throw new AppError(GENERIC_FALLBACK_TRIGGER_CODE);
-    }
-
-    const internal = await generic(url, {
-      limits: options.limits,
-      ffmpegAvailable: options.ffmpegAvailable ?? false,
-      signal: options.signal,
-    });
-    return {
-      strategy: "yt-dlp",
-      video: internal.video,
-      selections: internal.selections,
-    };
+    return { strategy: "direct", video: routed.video, selections: {} };
   }
+  return {
+    strategy: "yt-dlp",
+    video: routed.generic.video,
+    selections: routed.generic.selections,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -264,12 +341,29 @@ export type MediaAnalysisPolicyConfig = {
   /**
    * Whether the Worker's OWN FFmpeg is usable.
    *
-   * A thunk rather than a boolean because it is a real probe, and because the
-   * answer must be cached by the composition root rather than re-probed on
-   * every analyze: generic AUDIO presets from a muxed source depend on it, so
-   * it is consulted on the hot path.
+   * A thunk rather than a boolean because it is a real subprocess probe, and
+   * because it is a generic-ONLY input: only generic AUDIO presets from a muxed
+   * source consult it. It is therefore invoked lazily, from inside the generic
+   * fallback branch, and never on a direct-media request (CORRECTION-01 §3).
+   *
+   * The composition root may memoize it — the binary is installed at image
+   * build time on a read-only root and cannot change while the Worker runs. The
+   * defect this corrects was never the memoization; it was WHEN the memoized
+   * resolver was first invoked.
    */
   readonly ffmpegAvailable: () => Promise<boolean>;
+  /**
+   * Test seams. Production composition passes neither, so the policy resolves
+   * to the real direct and generic analyzers.
+   *
+   * The generic seam takes the INTERNAL shape (`{ video, selections }`) because
+   * that is the single source both entry points derive from: the HTTP path
+   * projects `video` out of it, exactly as `analyzeGenericMedia` does. Having
+   * one seam rather than two is what keeps the public/private split from
+   * needing to be re-stated here.
+   */
+  readonly analyzeDirect?: DirectAnalyzeFn;
+  readonly analyzeGeneric?: GenericExecutionAnalyzeFn;
 };
 
 export type MediaAnalysisPolicy = {
@@ -298,22 +392,49 @@ export type MediaAnalysisPolicy = {
 export function createMediaAnalysisPolicy(
   cfg: MediaAnalysisPolicyConfig,
 ): MediaAnalysisPolicy {
+  // CORRECTION-01. The resolver is passed THROUGH, never awaited here.
+  //
+  // The previous form awaited `cfg.ffmpegAvailable()` while building the
+  // options object, which runs BEFORE `analyzeMedia` is even entered. The
+  // comment claimed the probe happened "only when the direct path has already
+  // declined"; it did not. Every request on a yt-dlp-enabled deployment paid
+  // for a subprocess probe that only the generic branch reads — including
+  // direct-media requests, which is precisely the case direct-first exists to
+  // keep cheap and unentangled.
+  //
+  // `getFfmpegAvailable` is invoked by the router inside the generic fallback
+  // branch and nowhere else.
+  const getFfmpegAvailable = cfg.ytdlpEnabled
+    ? cfg.ffmpegAvailable
+    : // A disabled deployment can never reach the generic branch, so it must
+      // never hold a resolver that could probe. Fail-closed, and free.
+      async () => false;
+
+  const shared = (signal?: AbortSignal) => ({
+    ytdlpEnabled: cfg.ytdlpEnabled,
+    limits: cfg.limits,
+    getFfmpegAvailable,
+    ...(cfg.analyzeDirect ? { analyzeDirect: cfg.analyzeDirect } : {}),
+    ...(signal ? { signal } : {}),
+  });
+
   return {
-    analyze: async (url, signal) =>
+    analyze: (url, signal) =>
       analyzeMedia(url, {
-        ytdlpEnabled: cfg.ytdlpEnabled,
-        limits: cfg.limits,
-        // Probed only when the direct path has already declined, so a
-        // direct-media request never pays for it.
-        ffmpegAvailable: cfg.ytdlpEnabled ? await cfg.ffmpegAvailable() : false,
-        ...(signal ? { signal } : {}),
+        ...shared(signal),
+        // The public path projects `video` out of the internal result and drops
+        // the private selections, exactly as `analyzeGenericMedia` does.
+        ...(cfg.analyzeGeneric
+          ? {
+              analyzeGeneric: async (target: string, opts) =>
+                (await cfg.analyzeGeneric!(target, opts)).video,
+            }
+          : {}),
       }),
-    analyzeForExecution: async (url, signal) =>
+    analyzeForExecution: (url, signal) =>
       analyzeForExecution(url, {
-        ytdlpEnabled: cfg.ytdlpEnabled,
-        limits: cfg.limits,
-        ffmpegAvailable: cfg.ytdlpEnabled ? await cfg.ffmpegAvailable() : false,
-        ...(signal ? { signal } : {}),
+        ...shared(signal),
+        ...(cfg.analyzeGeneric ? { analyzeGeneric: cfg.analyzeGeneric } : {}),
       }),
   };
 }

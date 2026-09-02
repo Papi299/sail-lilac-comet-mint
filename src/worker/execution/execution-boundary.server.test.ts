@@ -348,16 +348,34 @@ describe("download → processing execution boundary", () => {
   });
 
   it("an unknown requested format fails before any download or processing", async () => {
-    // Since Phase 10C3 `createJob` refuses an unknown id outright (§6), so this
-    // writes the durable row DIRECTLY to reach past that boundary. It proves
-    // the EXECUTOR still fails closed when an unknown value nonetheless reaches
-    // durable state — a row written by an older build, or a preset the site has
-    // stopped advertising since the browser analyzed it (§17).
+    // CORRECTION-01 §16/§21 STRENGTHENED this case.
+    //
+    // `createJob` has refused an unknown id since Phase 10C3, so this writes the
+    // durable row directly to reach past that boundary. What changed is where it
+    // now stops: the DURABLE HYDRATION boundary rejects the row outright, rather
+    // than letting an unknown value become trusted execution state and be caught
+    // later by `deriveExecutionPlan()`.
+    //
+    // The observable contract is unchanged where it matters — nothing is
+    // downloaded, nothing is processed, nothing is uploaded, and the job ends
+    // terminally failed. The code is now PROCESSING_FAILED rather than
+    // FORMAT_UNAVAILABLE because an unhydratable row is a state-integrity
+    // problem, not a statement about which formats a site offers. (The realistic
+    // "the site stopped offering this preset" case still yields
+    // FORMAT_UNAVAILABLE; it is covered in generic-execution.server.test.ts.)
     const seed = claimJob(h.store, "preset:best");
     h.db
       .prepare("UPDATE worker_jobs SET format_id = ? WHERE job_id = ?")
       .run("preset:does-not-exist", seed.jobId);
+
+    // The row can no longer be hydrated at all.
+    assert.throws(
+      () => h.store.getJob(seed.jobId),
+      "an out-of-vocabulary durable formatId must not hydrate",
+    );
+
     const job = { ...seed, formatId: "preset:does-not-exist" as WorkerRequestedFormatId };
+
     let downloads = 0;
     let processes = 0;
 
@@ -374,14 +392,23 @@ describe("download → processing execution boundary", () => {
     };
 
     const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps);
-    await executor.execute(job);
 
-    assert.equal(downloads, 0);
-    assert.equal(processes, 0);
-    const view = h.store.getJob(job.jobId)!;
-    assert.equal(view.status, "failed");
-    assert.equal(view.errorCode, "FORMAT_UNAVAILABLE");
-    assert.equal(h.puts.length, 0);
+    // The store's pre-existing corruption policy applies: a row that cannot
+    // hydrate is refused LOUDLY and all-or-nothing rather than being written to.
+    // That policy is deliberate and is asserted independently in
+    // sqlite-state.server.test.ts; an out-of-vocabulary formatId is simply
+    // another row the trusted schema will not accept.
+    await assert.rejects(() => executor.execute(job));
+
+    assert.equal(downloads, 0, "nothing may be downloaded");
+    assert.equal(processes, 0, "nothing may be processed");
+    assert.equal(h.puts.length, 0, "nothing may be uploaded");
+
+    // The row is untouched, exactly as the corruption policy requires.
+    const row = h.db
+      .prepare("SELECT status FROM worker_jobs WHERE job_id = ?")
+      .get(seed.jobId) as { status: string };
+    assert.equal(row.status, "analyzing", "a refused row must not be rewritten");
   });
 
   it("a plan whose produced artifact has the wrong extension fails safely", async () => {

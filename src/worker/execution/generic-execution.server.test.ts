@@ -19,6 +19,8 @@ import type { ObjectStoreWriter, ObjectStorePutInput } from "@/worker/storage/wr
 import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
 import type { ExecutionAnalysis } from "../analysis/media-analyzer.server.ts";
 import type { GenericSourceSelections } from "./generic-source.ts";
+import { downloadGenericOriginal, type GenericDownloadLimits } from "./ytdlp-download.server.ts";
+import type { GenericExecutionPlan } from "./format-plan.ts";
 
 /**
  * Phase 10C3 §54/§55/§36/§40/§42: generic jobs on the ONE durable state machine.
@@ -673,5 +675,117 @@ describe("generic job: the private selection never becomes durable (§9/§60)", 
       .prepare("SELECT format_id FROM worker_jobs WHERE job_id = ?")
       .get(job.jobId) as { format_id: string };
     assert.equal(row.format_id, "preset:720");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CORRECTION-01 §10: the durable-state race between the byte monitor and
+// beginProcessing(), exercised through the REAL acquisition primitive.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A barrier the test controls explicitly. No sleeps, no timing luck. */
+function deferred<T = void>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+async function flush(turns = 4) {
+  for (let i = 0; i < turns; i += 1) {
+    await new Promise((r) => setImmediate(r));
+  }
+}
+
+describe("generic job: a late byte-monitor sample cannot break a succeeding job (§10)", () => {
+  it("reaches ready even when a suspended stat resolves after acquisition returned", async () => {
+    // This binds BOTH layers: the real `downloadGenericOriginal` runs inside the
+    // executor, with only its subprocess and filesystem probes faked.
+    //
+    // The defect this guards: a sample suspended on a stat resumes after
+    // `beginProcessing()` has committed, emits `downloading` progress, and the
+    // executor's progress reporter sees `updateExecutionProgress(..., "downloading")`
+    // fail with a state conflict — which HALTS the reporter and ABORTS the
+    // execution. A job that had actually succeeded would end up cancelled.
+    const job = claimJob(h.store, "preset:1080");
+
+    const sampleStarted = deferred();
+    const releaseStat = deferred();
+    let statCalls = 0;
+    let progressAfterSettlement = 0;
+    let settled = false;
+
+    const statSize = async (): Promise<number | null> => {
+      statCalls += 1;
+      if (statCalls === 1) {
+        sampleStarted.resolve();
+        await releaseStat.promise;
+        // Under-limit, so this sample would emit progress if it were still live.
+        return 12;
+      }
+      return null;
+    };
+
+    const deps: JobExecutorDeps = {
+      analyzeForExecution: async () =>
+        genericAnalysis(
+          [{ id: "preset:1080", container: "mp4", hasVideo: true }],
+          { "preset:1080": selection() },
+        ),
+      downloadGeneric: (async (
+        url: string,
+        workDir: string,
+        plan: GenericExecutionPlan,
+        ctx: { limits: GenericDownloadLimits; signal?: AbortSignal; onProgress?: (p: unknown) => void },
+      ) => {
+        const res = await downloadGenericOriginal(url, workDir, plan, {
+          limits: ctx.limits,
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+          onProgress: (p) => {
+            if (settled) progressAfterSettlement += 1;
+            ctx.onProgress?.(p);
+          },
+          statSize,
+          sizePollMs: 1,
+          probeRuntime: async () => ({
+            available: true,
+            version: "2026.08.19",
+            reason: "ok" as const,
+          }),
+          validateUrl: async (raw: string) => ({ url: raw, hostname: "example.invalid" }),
+          runner: async () => {
+            await sampleStarted.promise;
+            fs.writeFileSync(path.join(workDir, "source.mp4"), "GENERIC-BYTES");
+            return { code: 0, stdout: "", stderr: "" };
+          },
+        });
+        settled = true;
+        // Release the suspended stat at the exact moment acquisition has
+        // returned and the executor is about to commit `beginProcessing()`.
+        releaseStat.resolve();
+        return {
+          filePath: res.filePath,
+          container: res.container,
+          mime: "video/mp4",
+          fileSize: res.fileSize,
+        };
+      }) as NonNullable<JobExecutorDeps["downloadGeneric"]>,
+    };
+
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps);
+    await executor.execute(job);
+    await flush();
+
+    const final = h.store.getJob(job.jobId);
+    assert.equal(final?.status, "ready", "the job must NOT be aborted by a stale progress write");
+    assert.equal(final?.errorCode, null);
+    assert.equal(final?.extractor, "yt-dlp");
+    assert.equal(h.puts.length, 1, "the object is still uploaded");
+    assert.equal(
+      progressAfterSettlement,
+      0,
+      "no progress may be emitted after acquisition settled",
+    );
   });
 });

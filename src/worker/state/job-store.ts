@@ -3,9 +3,11 @@ import { z } from "zod";
 import {
   type WorkerJobView,
   type WorkerCreateJobRequest,
+  WorkerExtractorStrategySchema,
   WorkerJobIdSchema,
   WorkerJobStatusSchema,
-  WorkerObjectKeySchema
+  WorkerObjectKeySchema,
+  WorkerRequestedFormatIdSchema
 } from "../../shared/worker/contracts.ts";
 import { WorkerErrorCodeSchema } from "../../shared/worker/errors.ts";
 
@@ -17,7 +19,17 @@ import { WorkerErrorCodeSchema } from "../../shared/worker/errors.ts";
 export const DurableWorkerJobSchema = z.object({
   jobId: WorkerJobIdSchema,
   url: z.string().url().max(2048).refine(val => val.startsWith("http://") || val.startsWith("https://")),
-  formatId: z.string().min(1),
+  /**
+   * CORRECTION-01 §16. The CLOSED, application-owned vocabulary — not any
+   * non-empty string.
+   *
+   * A raw SQLite row is not trusted merely because some earlier value passed
+   * through an HTTP request schema. The row could have been written by an older
+   * build, edited out of band, or corrupted, and this is the boundary where an
+   * untrusted row becomes trusted execution state. It must therefore enforce
+   * the vocabulary independently rather than defer to `deriveExecutionPlan()`.
+   */
+  formatId: WorkerRequestedFormatIdSchema,
   principalId: z.literal("private-access-user"),
 
   status: WorkerJobStatusSchema,
@@ -41,7 +53,14 @@ export const DurableWorkerJobSchema = z.object({
   title: z.string().nullable(),
   thumbnail: z.string().url().nullable(),
   source: z.string().nullable(),
-  extractor: z.string().nullable(),
+  /**
+   * CORRECTION-01 §17. Exactly `null`, `direct` or `yt-dlp`.
+   *
+   * `null` is a job that has not completed analysis yet. Anything else is the
+   * Worker's own recorded strategy decision, and an arbitrary upstream or
+   * corrupted string is not one.
+   */
+  extractor: WorkerExtractorStrategySchema.nullable(),
 
   createdAt: z.number().int().nonnegative(),
   updatedAt: z.number().int().nonnegative(),
@@ -99,7 +118,15 @@ export const CompleteAnalysisInputSchema = z.object({
   title: z.string().min(1).max(1024).regex(/^[^\u0000-\u001F\u007F]*$/, "no control characters allowed"),
   thumbnail: z.string().url().nullable(),
   source: z.string().min(1).max(2048).regex(/^[^\u0000-\u001F\u007F]*$/, "no control characters allowed"),
-  extractor: z.string().min(1).max(255).regex(/^[^\u0000-\u001F\u007F]*$/, "no control characters allowed")
+  /**
+   * CORRECTION-01 §18. The WRITE boundary for execution strategy.
+   *
+   * `completeAnalysis()` is what persists which strategy an execution selected,
+   * so it must be impossible for any internal caller to store `youtube`,
+   * `generic`, an upstream `extractor_key`, or any other string merely because
+   * strings were accepted here.
+   */
+  extractor: WorkerExtractorStrategySchema
 }).strict();
 
 export type CompleteAnalysisInput = z.infer<typeof CompleteAnalysisInputSchema>;

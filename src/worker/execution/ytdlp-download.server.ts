@@ -348,6 +348,16 @@ export function classifyDownloadFailure(raw: string): AppError["code"] {
 
 // ── Public shapes ────────────────────────────────────────────────────────────
 
+/**
+ * What caused this acquisition's abort, if anything.
+ *
+ * One-way: whoever writes it first owns the interpretation for the rest of the
+ * call. `caller` covers user cancellation and operator shutdown alike — both
+ * arrive through the caller's signal — while `overflow` is this module's own
+ * byte guard.
+ */
+type AbortCause = "caller" | "overflow" | null;
+
 export type GenericDownloadLimits = {
   readonly maxFileSizeBytes: number;
   readonly downloadTimeoutSeconds: number;
@@ -485,12 +495,24 @@ export async function downloadGenericOriginal(
   // abort path reaches the process group whether the trigger was the user, a
   // shutdown, or this guard.
   const controller = new AbortController();
-  let overflowed = false;
-  const abortForOverflow = () => {
-    overflowed = true;
-    controller.abort(new AppError("TOO_LARGE"));
+
+  // ── first-cause abort latch (CORRECTION-01 §11) ──────────────────────────
+  //
+  // A plain `overflowed` boolean was not enough: a sample that finished LATER
+  // could set it after the caller had already cancelled, silently rewriting a
+  // user cancellation as a size refusal. Cause is therefore recorded ONCE, by
+  // whoever aborts first, and is never mutated afterwards.
+  //
+  // Both orderings are covered: caller-then-overflow stays a cancellation, and
+  // overflow-then-caller stays TOO_LARGE.
+  let abortCause: AbortCause = null;
+  const abortOnce = (cause: NonNullable<AbortCause>, reason: unknown) => {
+    if (abortCause !== null) return;
+    abortCause = cause;
+    controller.abort(reason);
   };
-  const relayCallerAbort = () => controller.abort(deps.signal?.reason);
+
+  const relayCallerAbort = () => abortOnce("caller", deps.signal?.reason);
   if (deps.signal) {
     if (deps.signal.aborted) relayCallerAbort();
     else deps.signal.addEventListener("abort", relayCallerAbort, { once: true });
@@ -504,16 +526,36 @@ export async function downloadGenericOriginal(
       ? validPlan.source.fileSize
       : null;
 
+  // ── monitor liveness gate (CORRECTION-01 §7/§8) ──────────────────────────
+  //
+  // `clearInterval` alone proves nothing: a sample already suspended on a
+  // filesystem await resumes AFTER the timer is gone and would then emit
+  // progress or abort, crossing the acquisition -> processing boundary. Worse,
+  // by then the executor may have committed `beginProcessing()`, so a late
+  // `downloading` progress write would be a state conflict that aborts a job
+  // which had actually succeeded.
+  //
+  // So every side effect is gated on a liveness flag that `stopMonitor()` clears
+  // SYNCHRONOUSLY. Because the event loop is single-threaded, any continuation
+  // scheduled after that point observes `false` and becomes a pure no-op.
+  let monitorActive = true;
+
   const sample = async () => {
+    if (!monitorActive) return;
+
     // Either path may be absent: before yt-dlp creates the file, and after it
     // renames `.part` away. Neither is an error.
     const partSize = await statSize(partPath);
+    if (!monitorActive) return;
+
     const finalSize = partSize === null ? await statSize(finalPath) : null;
+    if (!monitorActive) return;
+
     const observed = partSize ?? finalSize;
     if (observed === null) return;
 
     if (observed > maxBytes) {
-      abortForOverflow();
+      abortOnce("overflow", new AppError("TOO_LARGE"));
       return;
     }
 
@@ -563,7 +605,15 @@ export async function downloadGenericOriginal(
     // The timer must never keep the process alive on its own (§31).
     timer.unref?.();
   };
+  /**
+   * Permanently disarms the monitor. Idempotent.
+   *
+   * Clearing the flag comes FIRST and synchronously, so an in-flight sample is
+   * neutralised even though its filesystem await has not resolved yet. The
+   * timer is then cleared so no further sample is scheduled.
+   */
   const stopMonitor = () => {
+    monitorActive = false;
     if (timer !== null) {
       clearInterval(timer);
       timer = null;
@@ -589,10 +639,21 @@ export async function downloadGenericOriginal(
       maxStdoutBytes: YTDLP_DOWNLOAD_MAX_STDOUT_BYTES,
       maxStderrBytes: YTDLP_DOWNLOAD_MAX_STDERR_BYTES,
     });
+    // Disarm on the success path too, synchronously, so no in-flight sample can
+    // emit progress or abort while the artifact is being validated and the
+    // executor moves on to `beginProcessing()`.
+    stopMonitor();
   } catch (err: unknown) {
-    // An internal size abort is a TOO_LARGE, not a cancellation. It is checked
-    // FIRST so it cannot be misreported as the user's own cancel (§30).
-    if (overflowed) throw new AppError("TOO_LARGE");
+    // Disarm FIRST, before anything is interpreted. Otherwise a sample whose
+    // stat resolves in this same turn could still latch a cause and convert an
+    // already-determined TIMEOUT into a TOO_LARGE (§13).
+    stopMonitor();
+
+    // An internal size abort is a TOO_LARGE, not a cancellation. Checked before
+    // the signal so it cannot be misreported as the user's own cancel (§30) —
+    // and, because the cause latch is one-way, a caller abort that arrived
+    // afterwards cannot overwrite it either.
+    if (abortCause === "overflow") throw new AppError("TOO_LARGE");
     // Real cancellation propagates verbatim so the executor can tell it apart.
     if (deps.signal?.aborted) throw err;
     if (err instanceof ProcessOutputLimitError) {

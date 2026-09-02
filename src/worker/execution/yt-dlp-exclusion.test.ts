@@ -80,13 +80,43 @@ test("No LEGACY extractor coupling anywhere in the Phase-6 production surface", 
   assert.ok(scanned >= 6, `expected to scan the Phase-6 production surface, saw ${scanned} files`);
 });
 
-test("Durable state remains free of yt-dlp runtime coupling", () => {
+test("Durable state remains free of yt-dlp RUNTIME coupling", () => {
+  // CORRECTION-01 refined this from a blanket token ban.
+  //
+  // Durable state now names the strategy identity `yt-dlp` on purpose: closing
+  // `extractor` to `WorkerExtractorStrategySchema` is what stops an arbitrary
+  // upstream string from being persisted as a strategy. Banning the literal
+  // would forbid the very hardening that makes durable state safer.
+  //
+  // What must stay absent is coupling to the RUNTIME — the module that can
+  // execute it. So the ban is on identifier/module forms and on any import of a
+  // yt-dlp-capable module, while the closed enum's own value is permitted.
+  const RUNTIME_IDENTIFIER_TOKENS = [
+    "ytdlp",
+    "yt_dlp",
+    "YTDLP_RUNTIME",
+    "probeYtdlpRuntime",
+    "buildYtdlpDownloadArgv",
+    "downloadGenericOriginal",
+    "runProcess",
+  ];
+
   for (const file of productionFiles("src/worker/state")) {
     const content = readFileSync(file, "utf8");
-    for (const token of YTDLP_RUNTIME_TOKENS) {
+    for (const token of RUNTIME_IDENTIFIER_TOKENS) {
       assert.ok(
         !content.includes(token),
         `${file} couples durable state to the yt-dlp runtime via '${token}'`,
+      );
+    }
+    // No durable-state module may import anything yt-dlp-capable.
+    for (const line of content.split("\n")) {
+      if (!/\bfrom\s+["']/.test(line)) continue;
+      assert.ok(
+        !/(runtime\/ytdlp-runtime|execution\/ytdlp-download|analysis\/ytdlp-analysis|processing\/process-runner)/.test(
+          line,
+        ),
+        `${file} imports a yt-dlp-capable module: ${line.trim()}`,
       );
     }
   }

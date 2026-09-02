@@ -947,3 +947,366 @@ describe("generic download: cancellation (§40)", () => {
     );
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CORRECTION-01 §7-§14: monitor lifecycle and first-cause abort semantics
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A barrier the test controls explicitly. No sleeps, no timing luck. */
+function deferred<T = void>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * Drains the microtask queue a bounded number of times.
+ *
+ * Everything a suspended `sample()` still has to do after its stat resolves is
+ * pure microtask work, so draining is deterministic — it is not a sleep and does
+ * not depend on how long anything takes.
+ */
+async function flush(turns = 4) {
+  for (let i = 0; i < turns; i += 1) {
+    await new Promise((r) => setImmediate(r));
+  }
+}
+
+describe("generic download: the monitor cannot act after settlement (§7/§8/§9)", () => {
+  it("emits NO progress from a sample whose stat resolves after the downloader returned", async () => {
+    const trace: string[] = [];
+    const sampleStarted = deferred();
+    const releaseStat = deferred();
+    let statCalls = 0;
+    let progressCalls = 0;
+
+    // The first stat suspends until the test releases it, then reports a normal
+    // UNDER-limit size. Under-limit is deliberate: an oversized value would take
+    // the early-return overflow branch and never reach `onProgress`, so it could
+    // not distinguish a gated monitor from an ungated one.
+    const statSize = async (): Promise<number | null> => {
+      statCalls += 1;
+      if (statCalls === 1) {
+        trace.push("sample-start");
+        sampleStarted.resolve();
+        await releaseStat.promise;
+        trace.push("sample-release");
+        return 512;
+      }
+      return null;
+    };
+
+    const runner = async (): Promise<RunResult> => {
+      // Only settle once a sample is genuinely suspended mid-stat.
+      await sampleStarted.promise;
+      trace.push("runner-resolve");
+      writeSource("mp4", "OK");
+      return ok;
+    };
+
+    const res = await downloadGenericOriginal(
+      SAFE_URL,
+      workDir,
+      videoPlan(),
+      baseDeps({
+        runner,
+        statSize,
+        sizePollMs: 1,
+        onProgress: () => {
+          progressCalls += 1;
+          trace.push("progress");
+        },
+      }),
+    );
+    trace.push("download-return");
+
+    // The acquisition succeeded and is now, from the executor's point of view,
+    // finished — `beginProcessing()` would be the very next thing to commit.
+    assert.equal(res.fileSize, 2);
+    assert.equal(progressCalls, 0, "no progress may have been emitted yet");
+
+    // NOW let the suspended sample finish.
+    releaseStat.resolve();
+    await flush();
+
+    assert.equal(progressCalls, 0, "a post-settlement sample must emit no progress");
+    assert.deepEqual(trace, [
+      "sample-start",
+      "runner-resolve",
+      "download-return",
+      "sample-release",
+    ]);
+  });
+
+  it("does NOT convert a settled success into TOO_LARGE from a late oversized sample", async () => {
+    // Same shape as above, asserted as an outcome rather than a trace: the
+    // returned result must stand, unaffected by what the stale sample saw.
+    const sampleStarted = deferred();
+    const releaseStat = deferred();
+    let statCalls = 0;
+
+    const statSize = async (): Promise<number | null> => {
+      statCalls += 1;
+      if (statCalls === 1) {
+        sampleStarted.resolve();
+        await releaseStat.promise;
+        return MAX_BYTES * 10;
+      }
+      return null;
+    };
+
+    const runner = async (): Promise<RunResult> => {
+      await sampleStarted.promise;
+      writeSource("mp4", "PAYLOAD");
+      return ok;
+    };
+
+    const res = await downloadGenericOriginal(
+      SAFE_URL,
+      workDir,
+      videoPlan(),
+      baseDeps({ runner, statSize, sizePollMs: 1 }),
+    );
+
+    releaseStat.resolve();
+    await flush();
+
+    assert.equal(res.container, "mp4");
+    assert.equal(res.fileSize, 7);
+  });
+
+  it("a stale sample cannot turn a TIMEOUT into a TOO_LARGE (§13)", async () => {
+    const sampleStarted = deferred();
+    const releaseStat = deferred();
+    let statCalls = 0;
+    let progressCalls = 0;
+
+    const statSize = async (): Promise<number | null> => {
+      statCalls += 1;
+      if (statCalls === 1) {
+        sampleStarted.resolve();
+        await releaseStat.promise;
+        // Under-limit, so the sample would reach `onProgress` if it were still
+        // live — the observable effect that crosses the module boundary.
+        return 512;
+      }
+      return null;
+    };
+
+    const runner = async (): Promise<RunResult> => {
+      await sampleStarted.promise;
+      // The runner's own deadline expired: the outcome is already determined.
+      throw new AppError("TIMEOUT");
+    };
+
+    let code = "";
+    await downloadGenericOriginal(
+      SAFE_URL,
+      workDir,
+      videoPlan(),
+      baseDeps({ runner, statSize, sizePollMs: 1, onProgress: () => { progressCalls += 1; } }),
+    ).catch((err: unknown) => {
+      code = err instanceof AppError ? err.code : "other";
+    });
+
+    releaseStat.resolve();
+    await flush();
+
+    assert.equal(code, "TIMEOUT", "the already-determined outcome must stand");
+    assert.equal(progressCalls, 0);
+  });
+
+  it("a stale sample cannot turn an output-overflow failure into TOO_LARGE", async () => {
+    const sampleStarted = deferred();
+    const releaseStat = deferred();
+    let statCalls = 0;
+
+    const statSize = async (): Promise<number | null> => {
+      statCalls += 1;
+      if (statCalls === 1) {
+        sampleStarted.resolve();
+        await releaseStat.promise;
+        return MAX_BYTES * 10;
+      }
+      return null;
+    };
+
+    const runner = async (): Promise<RunResult> => {
+      await sampleStarted.promise;
+      throw new ProcessOutputLimitError("stderr");
+    };
+
+    let code = "";
+    await downloadGenericOriginal(
+      SAFE_URL,
+      workDir,
+      videoPlan(),
+      baseDeps({ runner, statSize, sizePollMs: 1 }),
+    ).catch((err: unknown) => {
+      code = err instanceof AppError ? err.code : "other";
+    });
+
+    releaseStat.resolve();
+    await flush();
+
+    assert.equal(code, "EXTRACTION_FAILED");
+  });
+});
+
+describe("generic download: first-cause abort latch (§11/§12)", () => {
+  it("caller cancels FIRST: a later oversized sample does not make it TOO_LARGE", async () => {
+    const caller = new AbortController();
+    const sampleFinished = deferred();
+    let statCalls = 0;
+
+    // Every stat reports an oversized file, so the byte guard WOULD abort — but
+    // the caller has already cancelled by the time any sample completes.
+    const statSize = async (): Promise<number | null> => {
+      statCalls += 1;
+      if (statCalls === 1) {
+        // Resolve on the next turn so the sample's own continuation — including
+        // its overflow attempt — has definitely run first.
+        setImmediate(() => sampleFinished.resolve());
+      }
+      return MAX_BYTES * 10;
+    };
+
+    const runner = async (opts: RunnerCall): Promise<RunResult> => {
+      // Cancel while the acquisition is genuinely in flight.
+      caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+      // Let at least one full sample observe the oversized file and attempt to
+      // latch an overflow cause.
+      await sampleFinished.promise;
+      await flush(2);
+      void opts;
+      throw new AppError("PROCESSING_FAILED", "Download was cancelled.");
+    };
+
+    let code = "";
+    await downloadGenericOriginal(SAFE_URL, workDir, videoPlan(), {
+      ...baseDeps({ runner, statSize, sizePollMs: 1 }),
+      signal: caller.signal,
+    }).catch((err: unknown) => {
+      code = err instanceof AppError ? err.code : "other";
+    });
+
+    assert.ok(statCalls > 0, "at least one oversized sample must have run");
+    assert.notEqual(code, "TOO_LARGE", "the first cause was the caller, and it must stand");
+    assert.equal(code, "PROCESSING_FAILED");
+  });
+
+  it("overflow happens FIRST: a later caller abort does not change TOO_LARGE", async () => {
+    const caller = new AbortController();
+    const overflowAborted = deferred();
+
+    const statSize = async (): Promise<number | null> => MAX_BYTES * 10;
+
+    const runner = async (opts: RunnerCall): Promise<RunResult> =>
+      new Promise((_resolve, reject) => {
+        // The byte guard fires first, through the OWNED controller.
+        opts.signal?.addEventListener("abort", () => {
+          overflowAborted.resolve();
+          // The caller then cancels too, after the cause is already latched.
+          caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+          reject(new AppError("PROCESSING_FAILED", "Download was cancelled."));
+        });
+      });
+
+    let code = "";
+    await downloadGenericOriginal(SAFE_URL, workDir, videoPlan(), {
+      ...baseDeps({
+        runner,
+        statSize,
+        sizePollMs: 1,
+        limits: { maxFileSizeBytes: 16, downloadTimeoutSeconds: 60 },
+      }),
+      signal: caller.signal,
+    }).catch((err: unknown) => {
+      code = err instanceof AppError ? err.code : "other";
+    });
+
+    await overflowAborted.promise;
+    assert.equal(code, "TOO_LARGE", "the first cause was the overflow, and it must stand");
+  });
+
+  it("an already-aborted caller is the first cause, before any sampling", async () => {
+    const caller = new AbortController();
+    caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+
+    let code = "";
+    await downloadGenericOriginal(SAFE_URL, workDir, videoPlan(), {
+      ...baseDeps({
+        runner: forbiddenRunner().runner,
+        statSize: async () => MAX_BYTES * 10,
+        sizePollMs: 1,
+      }),
+      signal: caller.signal,
+    }).catch((err: unknown) => {
+      code = err instanceof AppError ? err.code : "other";
+    });
+
+    assert.equal(code, "PROCESSING_FAILED");
+    assert.notEqual(code, "TOO_LARGE");
+  });
+});
+
+describe("generic download: no residual monitor work after settlement (§14)", () => {
+  it("leaves neither a timer nor a live sample on every settlement path", async () => {
+    const before = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+    let lateEffects = 0;
+
+    // Each case suspends a sample mid-stat, settles the download, then releases
+    // the stat and asserts the sample produced NOTHING.
+    const paths: Array<{ label: string; run: () => Promise<RunResult> }> = [
+      { label: "success", run: async () => { writeSource(); return ok; } },
+      { label: "yt-dlp failure", run: async () => ({ code: 1, stdout: "", stderr: "boom" }) },
+      { label: "timeout", run: async () => { throw new AppError("TIMEOUT"); } },
+      { label: "output overflow", run: async () => { throw new ProcessOutputLimitError("stdout"); } },
+    ];
+
+    for (const { label, run } of paths) {
+      const sampleStarted = deferred();
+      const releaseStat = deferred();
+      let statCalls = 0;
+
+      const statSize = async (): Promise<number | null> => {
+        statCalls += 1;
+        if (statCalls === 1) {
+          sampleStarted.resolve();
+          await releaseStat.promise;
+          // Under-limit: this is the value that would reach `onProgress`, which
+          // is the side effect that actually crosses into the executor.
+          return 512;
+        }
+        return null;
+      };
+
+      await downloadGenericOriginal(
+        SAFE_URL,
+        workDir,
+        videoPlan(),
+        baseDeps({
+          runner: async () => {
+            await sampleStarted.promise;
+            return run();
+          },
+          statSize,
+          sizePollMs: 1,
+          onProgress: () => {
+            lateEffects += 1;
+          },
+        }),
+      ).catch(() => {});
+
+      releaseStat.resolve();
+      await flush();
+      assert.equal(lateEffects, 0, `${label}: a released sample produced a side effect`);
+      rmSync(expectedSourcePath(workDir, "mp4"), { force: true });
+    }
+
+    const after = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+    assert.ok(after <= before, `timer leak: ${before} -> ${after}`);
+  });
+});

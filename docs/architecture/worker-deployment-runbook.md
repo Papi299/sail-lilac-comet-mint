@@ -1263,6 +1263,53 @@ from a muxed source, and `preset:mp3` from any source, are Worker-side FFmpeg
 operations performed strictly after `beginProcessing()` commits. `-x`,
 `--extract-audio` and `--audio-format` appear nowhere on this path.
 
+#### CORRECTION-01 — review findings closed
+
+Three integration defects were identified in review of the Phase-10C3 draft and
+corrected on the same branch. They are recorded here rather than folded silently
+into the description above, because each one falsified a claim the phase makes.
+
+**1. Generic-only capability probing was not lazy.** The canonical analysis
+policy awaited the Worker FFmpeg availability probe while building its options
+object — before the router ran — so on a `YTDLP_ENABLED=true` deployment every
+request paid for a subprocess probe that only the generic branch reads, and
+"direct first" was untrue in the composition root. FFmpeg availability is now a
+resolver (`getFfmpegAvailable`) invoked from exactly one place: inside the
+already-authorized generic fallback branch, after direct has failed with
+`EXTRACTOR_UNAVAILABLE` and after the operator's switch has been checked.
+
+The routing decision was also de-duplicated in the process. `analyzeMedia` and
+`analyzeForExecution` now share ONE `routeDirectFirst` implementation and differ
+only in the generic continuation they supply.
+
+**2. The byte monitor could act after acquisition settled.** `clearInterval`
+does not stop a sample already suspended on a filesystem await. Such a sample
+could resume after `beginProcessing()` had committed and emit `downloading`
+progress, which the executor's progress reporter would see fail as a state
+conflict — halting the reporter and aborting a job that had actually succeeded.
+Every side effect is now gated on a liveness flag cleared synchronously by
+`stopMonitor()`, which runs before any outcome is interpreted.
+
+The abort cause is now a one-way latch rather than a mutable boolean. Previously
+a later overflow sample could overwrite an earlier caller cancellation.
+First writer wins: caller-then-overflow stays a cancellation, and
+overflow-then-caller stays `TOO_LARGE`.
+
+**3. The durable schemas still accepted arbitrary strings.** Phase 10C3
+introduced the closed vocabularies but applied them only at the HTTP boundary,
+so a SQLite row could still carry `extractor = "Youtube"` or
+`formatId = "bestvideo+bestaudio"` and become trusted execution state.
+`DurableWorkerJob.formatId`, `DurableWorkerJob.extractor` and
+`CompleteAnalysisInput.extractor` now use the closed schemas.
+
+No SQLite migration was needed or added: the columns remain `TEXT` and the
+trusted read/write schemas enforce the vocabulary. A raw upstream source id
+still has no column at all — it stays memory-only for one execution attempt.
+
+An out-of-vocabulary durable value is now indistinguishable from row corruption,
+and the store's pre-existing corruption policy applies unchanged: the row is
+refused loudly and all-or-nothing rather than being written to or executed.
+
 #### Deployment status
 
 ```
