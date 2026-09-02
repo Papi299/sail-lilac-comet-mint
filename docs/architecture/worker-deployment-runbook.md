@@ -521,6 +521,7 @@ rather than assumed from historical spelling:
 | Remote components | `--no-remote-components` — EJS is never fetched from npm or GitHub. The requisite package is bundled, so this costs no functionality |
 | Self-update | `--no-update`, on a read-only root-owned file |
 | Credentials | `--no-cookies --no-cookies-from-browser`; no `--netrc`, username, password, token or authorization header. **Public sources only** |
+| Selection | `--no-playlist`, and `--yes-playlist` is never passed. Playlist behaviour is not configurable and not reachable from request data. **Single media item only** — see §4d |
 | Downloader | `--downloader=native`, a fixed application-owned value. No caller or user may choose a downloader, and `--downloader-args`, `--exec` and postprocessor commands are never passed. No third-party downloader (`curl`, `wget`, `aria2c`, `httpie`, `axel`) is installed or configurable. **FFmpeg *is* installed** — it is VideoFetch's own processing tool — and yt-dlp recognises `ffmpeg` as a downloader name, so "no external downloader is installed" would be false. See §4c |
 
 ### 4c. What `--downloader=native` does and does not guarantee
@@ -570,7 +571,51 @@ or separately design for — every mode in
 
 Protocol selection is deliberately **not** implemented in this phase.
 
-### 4d. Configuration contract
+### 4d. Single-item contract
+
+**Phase-10 generic v1 is single media item only.**
+
+```
+one submitted generic URL  ->  at most one accepted media item
+```
+
+Playlists, channels, feeds and other multi-entry extraction are separate future
+product features. They must never arrive implicitly through a yt-dlp default.
+
+`--no-playlist` is in the closed base policy and `--yes-playlist` is never
+passed, so playlist behaviour is neither operator-configurable nor reachable
+from request data.
+
+**What that control actually does, precisely.** In the pinned release,
+`InfoExtractor._yes_playlist(playlist_id, video_id, ...)` opens with:
+
+```python
+if not playlist_id or not video_id:
+    return not video_id
+```
+
+so when a URL carries **both** a playlist id and a video id, `--no-playlist`
+makes yt-dlp take just the video. When the URL is playlist-only, that early
+return fires and the option is never consulted — and extractors that build a
+`playlist_result` directly (channels, feeds, listings) do not call
+`_yes_playlist` at all.
+
+**Therefore `--no-playlist` is defence in depth against video-vs-playlist
+ambiguity. It is not proof that a playlist or multi-video result cannot be
+returned.** Any claim that the flag alone prevents playlist extraction is
+false.
+
+**Recorded integration gate.** Phase 10C1 has no generic analysis, so no result
+inspection is implemented here. The later generic-analysis layer must
+explicitly reject, unless a separate product phase authorizes them:
+
+- playlist URLs;
+- channel / feed / listing URLs returning playlist-like data;
+- multi-video extractor results;
+- any other result that expands one submitted URL into multiple independent
+  media entries.
+
+### 4e. Configuration contract
 
 | Variable | Status |
 | :--- | :--- |
@@ -592,7 +637,7 @@ input reach it, so this was never a user-input vulnerability — it was an
 unnecessarily loose operator execution surface, and the Production Worker has no
 need of it. The runtime identity is a reviewed constant in the image.
 
-### 4e. What Phase 10C1 does NOT authorize
+### 4f. What Phase 10C1 does NOT authorize
 
 **No user-URL execution path exists.** `WorkerService.analyze()` still resolves
 only to the direct-media analyzer, `JobExecutor` still has no generic branch,

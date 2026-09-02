@@ -222,6 +222,25 @@ export function ytdlpPolicyArgs(opts: { workDir?: string } = {}): readonly strin
     "--no-cookies",
     "--no-cookies-from-browser",
 
+    // ── selection policy ─────────────────────────────────────────────────
+    // Phase-10 generic v1 is SINGLE MEDIA ITEM ONLY. One submitted URL may
+    // yield at most one accepted media item; playlists, channels and feeds
+    // are separate future product features and must never arrive implicitly
+    // through a yt-dlp default.
+    //
+    // Scope, precisely, per `_yes_playlist` in the pinned release: when a URL
+    // carries BOTH a playlist id and a video id, this makes yt-dlp take just
+    // the video. When the URL is playlist-only, `_yes_playlist` returns before
+    // consulting this option at all — and extractors that build a
+    // `playlist_result` directly (channels, feeds) never call it. So this is
+    // defence in depth against video-vs-playlist ambiguity, NOT proof that a
+    // playlist or multi-video result cannot be returned.
+    //
+    // The later generic-analysis layer must therefore reject playlist and
+    // multi-video result types outright. See the runbook's "single-item
+    // contract" section.
+    "--no-playlist",
+
     // ── downloader policy ────────────────────────────────────────────────
     // Acquisition uses yt-dlp's NATIVE downloader. See YTDLP_FFMPEG_ACQUISITION_MODES
     // below for what this does and does not guarantee — it is emphatically not

@@ -264,6 +264,31 @@ describe("yt-dlp closed argument policy", () => {
     }
   });
 
+  it("disables playlist expansion exactly once, and never re-enables it", () => {
+    const args = ytdlpPolicyArgs();
+    const occurrences = args.filter((a) => a === "--no-playlist");
+    assert.equal(occurrences.length, 1, "--no-playlist must appear exactly once");
+    assert.ok(flags.has("--no-playlist"));
+
+    // `--yes-playlist` sets the same dest back to false, so its presence
+    // anywhere later in the argv would silently undo the policy.
+    assert.equal(flags.has("--yes-playlist"), false, "--yes-playlist must never be passed");
+    assert.equal(
+      args.some((a) => a.startsWith("--yes-playlist")),
+      false,
+    );
+  });
+
+  it("keeps playlist behaviour out of caller and user control", () => {
+    // The policy takes only a working directory, and the array is frozen, so
+    // there is no parameter through which a caller — let alone a request —
+    // could opt into playlist expansion.
+    const withWorkDir = ytdlpPolicyArgs({ workDir: "/tmp/videofetch/jobs/" + "b".repeat(32) });
+    assert.equal(withWorkDir.filter((a) => a === "--no-playlist").length, 1);
+    assert.equal(withWorkDir.includes("--yes-playlist"), false);
+    assert.ok(Object.isFrozen(withWorkDir));
+  });
+
   it("requests exactly the native downloader, as a fixed application-owned value", () => {
     // CORRECTED: this previously asserted that NO `--downloader` option was
     // present at all. That was weaker than it looked. With no downloader
@@ -336,7 +361,18 @@ describe("yt-dlp closed argument policy", () => {
   it("contains no URL, format selector, or output template", () => {
     // Phase 10C1 has NO user-URL execution path. The base policy is the whole
     // policy, and it must not carry the pieces an extraction would need.
-    for (const forbidden of ["-f", "--format", "-o", "--output", "--paths", "-P"]) {
+    for (const forbidden of [
+      "-f",
+      "--format",
+      "-o",
+      "--output",
+      "--paths",
+      "-P",
+      // Playlist RANGE/INDEX selection would imply playlist handling exists.
+      "--playlist-items",
+      "-I",
+      "--max-downloads",
+    ]) {
       assert.equal(flags.has(forbidden), false, `${forbidden} must not be in the base policy`);
     }
     // No bare positional argument (a URL) may be present either.
