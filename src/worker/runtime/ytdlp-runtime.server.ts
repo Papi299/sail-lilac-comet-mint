@@ -347,6 +347,36 @@ export function parseYtdlpVersion(stdout: string): string | null {
 }
 
 /**
+ * Options for a probe that participates in a caller's cancellation and budget.
+ *
+ * Both fields are OPTIONAL and the whole object may be omitted, which is what
+ * keeps the Phase-10C1 diagnostics caller (`probeYtdlpRuntime()`) behaving
+ * exactly as before.
+ */
+export type YtdlpProbeOptions = {
+  /**
+   * Propagated to the hardened runner, so a cancelled caller terminates the
+   * probe's owned process group instead of leaking it.
+   *
+   * When this signal is aborted the probe RE-THROWS the cancellation rather
+   * than reporting `available: false`. A cancelled probe says nothing about
+   * whether the runtime is installed, and collapsing it into "unavailable"
+   * would let a cancellation surface downstream as `EXTRACTOR_UNAVAILABLE` —
+   * a runtime-installation problem the operator would then go looking for.
+   */
+  readonly signal?: AbortSignal;
+  /**
+   * Caller's remaining budget for this probe, in milliseconds.
+   *
+   * The probe never runs LONGER than `YTDLP_PROBE_TIMEOUT_MS`; this can only
+   * shorten it. That ordering matters: a caller sharing one deadline across a
+   * probe and a follow-on subprocess must not be able to hand the probe a
+   * budget larger than the probe's own conservative maximum.
+   */
+  readonly timeoutMs?: number;
+};
+
+/**
  * Probes the pinned yt-dlp runtime.
  *
  * Executes the interpreter and the artifact by ABSOLUTE path, under the closed
@@ -357,17 +387,32 @@ export function parseYtdlpVersion(stdout: string): string | null {
  * Every failure mode — missing interpreter, missing artifact, wrong version,
  * malformed output, spawn error, timeout — is reported as unavailable with a
  * bounded reason code. Raw stdout/stderr never escapes this function.
+ *
+ * Called with no arguments it behaves exactly as it did in Phase 10C1: the full
+ * `YTDLP_PROBE_TIMEOUT_MS` budget, no signal, and no path that can throw
+ * instead of returning a status.
  */
-export async function probeYtdlpRuntime(): Promise<YtdlpRuntimeStatus> {
+export async function probeYtdlpRuntime(
+  opts: YtdlpProbeOptions = {},
+): Promise<YtdlpRuntimeStatus> {
+  const timeoutMs =
+    opts.timeoutMs === undefined
+      ? YTDLP_PROBE_TIMEOUT_MS
+      : Math.min(YTDLP_PROBE_TIMEOUT_MS, opts.timeoutMs);
+
   let result: RunResult;
   try {
     result = await processRunner({
       command: YTDLP_RUNTIME.pythonPath,
       args: [YTDLP_RUNTIME.artifactPath, ...ytdlpPolicyArgs(), "--version"],
-      timeoutMs: YTDLP_PROBE_TIMEOUT_MS,
+      timeoutMs,
       env: buildYtdlpEnvironment(),
+      signal: opts.signal,
     });
   } catch (err: unknown) {
+    // Cancellation is not a statement about the runtime. Propagate it verbatim
+    // so the caller can tell "you cancelled" from "yt-dlp is not installed".
+    if (opts.signal?.aborted) throw err;
     // The runner rejects with a TIMEOUT AppError when it killed the process
     // group, and with the spawn error otherwise.
     const code = (err as { code?: unknown } | null)?.code;

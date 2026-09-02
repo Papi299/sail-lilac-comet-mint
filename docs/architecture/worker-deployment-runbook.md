@@ -657,6 +657,353 @@ absent from the image and from the committed systemd unit.
 
 ---
 
+### 4g. Phase 10C2 — the generic analysis foundation (NOT connected)
+
+*The §4a–§4f contract above is unchanged and remains authoritative. This
+subsection records what `PHASE-10C2-YTDLP-GENERIC-ANALYSIS-FOUNDATION-001`
+added, which is **code only**.*
+
+A Worker-owned generic yt-dlp **analyzer** and a direct-first **strategy
+router** now exist:
+
+```
+src/worker/analysis/ytdlp-analysis.server.ts   generic metadata analyzer
+src/worker/analysis/media-analyzer.server.ts   direct-first strategy router
+```
+
+**Neither is reachable.** All of the following remain exactly as they were:
+
+| Property | State after Phase 10C2 |
+| :--- | :--- |
+| `WorkerService.analyze()` | direct-media analyzer only |
+| `JobExecutor` | direct-media only, no generic branch |
+| Worker runtime composition | injects no generic analyzer |
+| Vercel `/api/analyze` | unchanged |
+| `/api/sites.ytdlp` | **false** |
+| `GENERIC_YTDLP_EXECUTION_IMPLEMENTED` | **false** |
+| `YTDLP_ENABLED` in Production | unset (absent means disabled) |
+| Deployment | **none — Phase 10C2 has not been deployed** |
+
+The operative distinction from §4 now has a third term:
+
+```
+runtime installed  !=  analyzer implemented  !=  generic execution enabled
+```
+
+A tested-but-unconnected analyzer is not a capability. `/api/sites` therefore
+still reports `ytdlp: false`, and that remains the truthful answer.
+
+`control-plane-boundary.test.ts` asserts the disconnection structurally, by
+walking the real module graphs from `WorkerService`, the runtime composition
+root, the `JobExecutor` and every Vercel API route.
+
+#### Strategy rule
+
+```
+1. try direct
+2. direct succeeds                       -> return direct metadata, unmodified
+3. direct fails EXTRACTOR_UNAVAILABLE
+     + ytdlpEnabled = false              -> EXTRACTOR_UNAVAILABLE (fail closed)
+     + ytdlpEnabled = true               -> generic analyzer
+4. any other direct failure              -> propagate unchanged, NO fallback
+```
+
+`EXTRACTOR_UNAVAILABLE` is the **only** code that permits the generic path. It
+is the only outcome meaning "this is not a direct media file, so another
+strategy might apply". Every other failure is terminal, and one case is a
+security property rather than a preference: an `INVALID_URL` from the Worker's
+own SSRF/URL boundary must never be retried through yt-dlp, because that would
+take a URL the security boundary just rejected and hand it to a second, far
+more capable network client. An unexpected non-`AppError` exception and a
+caller cancellation are likewise never fallback triggers.
+
+Direct metadata is returned **byte-for-byte unmodified** when direct succeeds;
+its formats, presets and `extractor: "direct"` contract are untouched.
+
+#### Analysis command
+
+The base policy from §4c, plus:
+
+```
+--dump-single-json --skip-download --no-progress --no-warnings --no-cache-dir
+--socket-timeout=10 --retries=2 --extractor-retries=1
+--ffmpeg-location=/nonexistent/videofetch-yt-dlp-analysis-no-ffmpeg
+--
+<validated-url>
+```
+
+run under an analysis-specific environment whose `PATH` is
+`/nonexistent/videofetch-yt-dlp-analysis-no-path`.
+
+Every option is verified against yt-dlp 2026.08.19's own `options.py`. The
+bounded retry/timeout values replace upstream defaults (`--retries 10`,
+`--extractor-retries 3`, no socket timeout) that could consume the whole
+analysis budget on one unresponsive host.
+
+The URL is always the **final positional argument after a bare `--`**. Both
+`optparse` and yt-dlp's own `parse_known_args` override handle `--` explicitly
+and stop option processing there, so no user-supplied string can become an
+option, an alias, or an option's value. Verified on the pinned runtime in a
+`--network none --read-only --cap-drop=ALL` container: the identical token
+`--skip-download` is consumed as an *option* without the barrier ("You must
+provide at least one URL") and treated as a *positional URL* with it
+("'--skip-download' is not a valid URL").
+
+`--skip-download` is passed even though `-J` already implies simulation
+(`dump_single_json` is in `any_getting`, so `simulate` resolves true), so that a
+change to either mechanism cannot quietly turn analysis into acquisition. No
+`-o`, `-P`, `-f`, `--merge-output-format`, `--remux-video`, `-x`,
+`--audio-format`, `--download-sections`, `--wait-for-video`, `--write-*`,
+`--download-archive`, credential, header or proxy option appears anywhere on
+this path.
+
+#### Analysis descendants cannot reach Worker FFmpeg/ffprobe
+
+The generic analysis child **cannot discover Worker FFmpeg/ffprobe**: its closed
+`PATH` excludes their location and yt-dlp is explicitly pointed at a fixed
+nonexistent ffmpeg location. Node remains available only through its approved
+absolute path.
+
+Two independent mechanisms, so the invariant does not rest on either alone.
+
+**1. A PATH that resolves nothing.** The image intentionally ships
+`/usr/bin/ffmpeg` and `/usr/bin/ffprobe`, and the Phase-10C1 base environment
+sets `PATH=/usr/bin:/bin`. That base environment is unchanged for its existing
+callers (notably the non-network diagnostics probe); analysis alone runs with
+`PATH=/nonexistent/videofetch-yt-dlp-analysis-no-path`, a directory that does
+not exist. It is deliberately a nonexistent absolute path rather than an empty
+string, because an empty `PATH` is read by some resolvers as "use the system
+default" (`confstr(_CS_PATH)` → `/bin:/usr/bin`), which would silently restore
+exactly what this removes.
+
+**2. An explicit ffmpeg-location denial.** Leaving `--ffmpeg-location` unset is
+not neutral. Per `FFmpegPostProcessor._determine_executables` in the pinned
+release:
+
+```python
+location = self.get_param('ffmpeg_location', ...)
+if location is None:
+    return {p: p for p in programs}   # bare 'ffmpeg'/'ffprobe' -> PATH lookup
+if not os.path.exists(location):
+    self.report_warning('... does not exist! Continuing without ffmpeg')
+    return {}                          # nothing resolvable at all
+```
+
+So unset is an *active grant* of PATH discovery, while a nonexistent location
+yields an empty executable map. An empty `_paths` makes `_get_ffmpeg_version`
+return `(None, {})` through its `{None: None}` cache seed — without attempting a
+subprocess — so `basename` is `None`, `available` and `probe_available` are
+false, and `FFmpegFD.available()` (which delegates straight to
+`FFmpegPostProcessor().available`) is false too. The location is a compile-time
+constant: it is never read from the request, the environment, or configuration.
+
+**Node is unaffected.** `_determine_runtime_path` calls `_find_exe` (PATH
+discovery) *only* when no path was supplied, and returns an absolute path
+verbatim otherwise, so `--js-runtimes=node:<absolute path>` keeps working with a
+dead PATH. Deno, Bun and QuickJS stay disabled by `--no-js-runtimes` and would
+additionally be undiscoverable.
+
+*Scope: these are subprocess-boundary guarantees. They deny FFmpeg/ffprobe
+discovery; they are not a claim about every future upstream extractor
+behaviour. Live acceptance must still inspect real descendants under generic
+extraction.*
+
+#### Single-item enforcement
+
+`-J` does **not** enforce the single-item contract: its own help text states
+that a playlist URL dumps the whole playlist as one object. The parser enforces
+it instead.
+
+The gate is `_type === "video"` **exactly**. This is reliable because
+`YoutubeDL.sanitize_info` — the function producing every `-J` document — calls
+`info_dict.setdefault('_type', 'video')`, so the key is always present and
+explicit. `playlist`, `multi_video`, `url`, `url_transparent` and any
+unrecognized value are all refused: an unknown shape is rejected, never guessed
+at. A second independent gate rejects any document carrying `entries`.
+
+#### Live sources
+
+Rejected: `is_live: true`, and `live_status` of `is_live`, `is_upcoming` or
+`post_live`. `post_live` ("was live, VOD not yet processed") is a wait-for-media
+state and is refused with the other two. `was_live`, `not_live` and an unknown
+status describe finished, fixed-length media and are accepted. Live sources
+surface as `VIDEO_UNAVAILABLE`. `--wait-for-video` is never passed and no live
+polling exists.
+
+#### No split-stream video
+
+Video presets are built **only** from source formats that already contain video
+*and* audio in one format. A video-only rendition would need yt-dlp to merge it
+with a separate audio stream, which Phase-10B rules out of generic v1, so
+split-stream renditions produce **no video preset at all** — even when they are
+the only high-quality options a site offers. `capabilities.merge` is always
+`false`. This is an accepted, recorded reduction in capability, not a defect.
+
+#### Acquisition eligibility: progressive HTTP(S) only
+
+A candidate must carry an explicit `protocol` of `http` or `https`. A format
+with **no** protocol field is not eligible either — yt-dlp derives a missing
+protocol from the media URL at download time, which analysis cannot do without
+trusting an upstream URL.
+
+**Native HLS is excluded**, despite `m3u8_native` selecting `HlsFD` under
+`--downloader=native`. `HlsFD.real_download` inspects the media playlist at
+*download* time and, when `can_download()` rejects it (DRM markers, AES-128 with
+ffmpeg present, other unsupported tags), constructs an `FFmpegFD` and delegates
+to it — `yt_dlp/downloader/hls.py`, the `if not can_download:` branch. That
+decision depends on manifest bytes analysis never fetches, so HLS **cannot be
+proven native at analysis time**, and advertising it would risk local FFmpeg
+work running while a future durable job still reports `downloading`. This is the
+fail-closed reading of the §4d acquisition boundary and can be widened later by
+a phase that proves the manifest is native — with evidence.
+
+#### Application-owned presets only, no raw format IDs
+
+Generic metadata returns `formats: []`. All selectable options are presets whose
+ids come from a closed vocabulary:
+
+```
+preset:best  preset:2160 … preset:144  preset:audio  preset:mp3
+```
+
+Every generic preset satisfies `id === formatId` and must match the
+application-owned pattern; the analyzer asserts this on its own output before
+returning. **No upstream `format_id` is parsed at all** — the field is absent
+from the validation schema, so no variable holds one and none can leak. This
+matters because the browser's advanced selector echoes `formats[].id` back as
+`formatId` on job creation, which would otherwise turn an upstream string into a
+browser-controlled `-f` expression in a later phase.
+
+Within one resolution bucket the ranking is container → video codec → audio
+codec → larger known size → higher fps → upstream position: total, deterministic
+and unit-tested. Resolution is never traded away for a nicer codec, because
+ranking only ever runs *inside* a bucket.
+
+Audio may additionally derive from a muxed source, because the Worker can
+extract with its **own** FFmpeg after a future durable job enters `processing`.
+yt-dlp is never asked to extract audio.
+
+#### Bounds
+
+| Bound | Value | Behaviour on breach |
+| :--- | :--- | :--- |
+| analysis stdout | 4 MiB (UTF-8 **bytes**) | process group terminated, nothing parsed |
+| analysis stderr | 256 KiB (UTF-8 **bytes**) | process group terminated |
+| raw formats | 512 | fail closed (never silently truncated) |
+| emitted presets | 11 | structural assertion on own output |
+| title | 1024 chars | truncated, control characters replaced |
+| duration | `maxVideoDurationSeconds` | `TOO_LONG` before metadata is returned |
+| known file size | `maxFileSizeBytes` | candidate not advertised |
+| wall clock | `analysisTimeoutSeconds` | runner terminates the process group |
+
+The stdout ceiling is the only bound that limits what reaches memory; the
+format-count bound can only apply after `JSON.parse`. A truncated document is
+**never** parsed — partial JSON must not be interpreted as extractor output.
+
+The ceilings are an opt-in extension of the shared hardened process runner
+(`maxStdoutBytes` / `maxStderrBytes`). Omitting them preserves the historical
+lenient retain-a-tail behaviour exactly, so every pre-existing caller is
+unaffected.
+
+They count **UTF-8 bytes**, via `Buffer.byteLength`, not JavaScript UTF-16 code
+units. `"€"` is one code unit but three bytes and `"😀"` is two code units but
+four, so a `.length` comparison would under-count real output by up to 4x
+against a limit that claims to bound memory. Counting decoded chunks is exact
+across chunk boundaries: `setEncoding("utf8")` puts a `StringDecoder` in front
+of the stream, which buffers an incomplete multibyte sequence and emits it only
+once complete, so a sequence split across raw reads is counted once, in full.
+The only divergence is malformed UTF-8, where the decoder's U+FFFD replacement
+over-counts — a direction that still fails closed.
+
+Analysis writes no persistent cache and no metadata side files.
+
+#### Raw output is never retained
+
+Raw stdout and stderr exist transiently in memory for classification only. They
+are never logged, persisted, placed in durable state, returned in HTTP JSON,
+surfaced to the browser, or attached to an exception that crosses a module
+boundary. The legacy `stderr.slice(-800)` logging pattern is not reproduced, and
+the submitted URL is never logged with its query string.
+
+Error classification is a small Worker-owned function mapping a handful of
+stable upstream phrases to canonical codes, collapsing anything unrecognized to
+`EXTRACTION_FAILED`. The legacy `mapExtractorMessage()` is deliberately not
+reused: it returns errors carrying text derived from its input. Tests inject a
+`SUPER_SECRET_VALUE` sentinel into fake stdout and stderr and assert it never
+appears in any thrown error, returned value, or console call.
+
+#### Thumbnails
+
+Generic metadata returns `thumbnail: null`. An extractor-supplied thumbnail URL
+is a secondary network destination that would be handed straight to the browser,
+and no repository mechanism validates or proxies such a URL today. The resulting
+missing-thumbnail UX for generic sources is **intentional Phase-10 v1
+behaviour**, to be revisited only by a deliberate thumbnail-security policy.
+
+#### Metadata ownership
+
+`extractor` is exactly `"yt-dlp"` — the application-owned execution-strategy
+identity, never the upstream `extractor`/`extractor_key`, which is an arbitrary
+source-controlled string. `webpageUrl` is the URL the **Worker** validated;
+upstream `webpage_url` and `original_url` are not parsed at all, so neither can
+override it. `source` is derived from the validated URL's hostname.
+
+#### Ordering is a security property
+
+```
+1. validate request shape
+2. Worker SSRF / URL validation
+3. open ONE subprocess deadline for the whole phase
+4. exact pinned-runtime probe   (capped by the smaller of its own
+                                 maximum and the remaining budget)
+5. only now: a network-capable subprocess, with the REMAINING budget
+```
+
+Steps 1–2 complete **before any process is spawned, the version probe
+included**, so an unsafe or malformed URL causes zero yt-dlp processes and zero
+Node/EJS descendants. Step 4 exists because a user URL must never be executed by
+an unverified runtime: a missing, mismatched, malformed or unrunnable yt-dlp
+fails closed as `EXTRACTOR_UNAVAILABLE` rather than falling back to whatever is
+on disk.
+
+**One budget, not two.** `analysisTimeoutSeconds` is the budget for analyzing a
+URL, not a per-subprocess allowance. The probe and the network run share a
+single deadline: the probe is capped at `min(YTDLP_PROBE_TIMEOUT_MS, remaining)`
+and the network run receives only what is left. If the probe exhausts the
+budget, **the network-capable subprocess is never started** and the call fails
+`TIMEOUT`. Giving the network run a fresh full budget after the probe had
+already spent part of one would let the pair consume up to twice what the
+configuration permits.
+
+**Cancellation is real, not advisory.** An already-aborted caller starts nothing
+at all — not even the probe. The caller's `AbortSignal` is passed into the probe
+as well as the analysis run, so a cancellation mid-probe terminates the probe's
+own process group through the hardened runner. A cancelled probe **re-throws**
+rather than reporting `available: false`: collapsing it into "unavailable" would
+surface a cancellation downstream as `EXTRACTOR_UNAVAILABLE`, sending an
+operator to look for a runtime-installation problem that does not exist. The
+probe's no-argument form is unchanged, so Phase-10C1 diagnostics behave exactly
+as before.
+
+Initial URL validation is **defence in depth and not a claim about yt-dlp's own
+networking**. Once running, yt-dlp issues its own secondary requests, follows
+its own redirects, and fetches manifests, fragments, extractor APIs and
+EJS-related resources that this validation never sees. Those are constrained in
+Production by the external media network namespace, its nftables policy and the
+watchdog (§3) — an architecture this code deliberately does not restate as an
+application boolean.
+
+#### Future integration boundary
+
+A later, separately authorized task is required to connect any of this. It must
+address, at minimum: injecting the router into Worker HTTP; persisting a generic
+job strategy; generic download; enforcing the §4d FFmpeg-acquisition gate during
+download; generic processing; and only then flipping
+`GENERIC_YTDLP_EXECUTION_IMPLEMENTED` and enabling `YTDLP_ENABLED` in a
+deployment.
+
+---
+
 ## 5. Object storage (R2)
 
 Three boundaries operate here and they are documented separately, because

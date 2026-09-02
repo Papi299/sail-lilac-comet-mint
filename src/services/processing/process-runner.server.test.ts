@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { AppError } from "../../lib/errors.ts";
 import {
+  ProcessOutputLimitError,
   buildSpawnOptions,
   isValidChildPid,
   posixProcessGroupsEnabled,
@@ -452,6 +453,350 @@ describe("process runner result semantics", () => {
     assert.equal(result.stderr, "err-1");
     assert.deepEqual(stdoutChunks, ["out-1"]);
     assert.deepEqual(stderrChunks, ["err-1"]);
+  });
+});
+
+describe("process runner output ceilings", () => {
+  afterEach(() => {
+    setProcessRunnerTestHooks(null);
+  });
+
+  /**
+   * The ceilings are OPT-IN. Every pre-existing caller omits them and must keep
+   * the historical lenient behaviour: retain a tail, never kill the child.
+   */
+  it("defaults are unchanged: no ceiling, no termination, output retained", async () => {
+    const child = createFakeChild(41);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const pending = runProcess({ command: "tool", args: [], timeoutMs: 5_000 });
+    child.stdout.write("x".repeat(50_000));
+    child.stderr.write("y".repeat(50_000));
+    closeSoon(child, 0);
+
+    const result = await pending;
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout.length, 50_000);
+    assert.equal(result.stderr.length, 50_000);
+    assert.deepEqual(child.killCalls, [], "no ceiling means no termination");
+  });
+
+  it("terminates the process GROUP and rejects when stdout exceeds its ceiling", async () => {
+    const child = createFakeChild(42);
+    const killed: number[] = [];
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: (pid) => {
+        killed.push(pid);
+        return true;
+      },
+    });
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 1_000,
+    });
+    child.stdout.write("a".repeat(1_001));
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
+    assert.equal(err.stream, "stdout");
+    assert.equal(err.code, "PROCESSING_FAILED");
+    assert.deepEqual(killed, [-42], "the whole owned process group must be signalled");
+  });
+
+  it("terminates and rejects when stderr exceeds its ceiling", async () => {
+    const child = createFakeChild(43);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStderrBytes: 10,
+    });
+    child.stderr.write("z".repeat(11));
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
+    assert.equal(err.stream, "stderr");
+  });
+
+  it("never resolves partial output after an overflow", async () => {
+    const child = createFakeChild(44);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 8,
+    });
+    child.stdout.write("SECRET_PREFIX");
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => "RESOLVED",
+      (e: unknown) => e,
+    );
+    assert.notEqual(err, "RESOLVED", "a truncated document must never be handed back");
+    assert.ok(err instanceof ProcessOutputLimitError);
+    // The error names the stream and nothing that came out of it.
+    assert.equal(err.message.includes("SECRET_PREFIX"), false);
+  });
+
+  it("accepts output exactly at the ceiling", async () => {
+    const child = createFakeChild(45);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 16,
+    });
+    child.stdout.write("b".repeat(16));
+    closeSoon(child, 0);
+
+    const result = await pending;
+    assert.equal(result.stdout.length, 16);
+    assert.deepEqual(child.killCalls, []);
+  });
+
+  // ── byte accounting ───────────────────────────────────────────────────────
+  //
+  // The ceilings are named in BYTES and must count bytes. Every test below
+  // fails under a string `.length` comparison, which counts UTF-16 code units:
+  // "€" is 1 unit / 3 bytes and "😀" is 2 units / 4 bytes, so `.length`
+  // under-counts real output by up to 4x.
+
+  it("accepts a multibyte string that is exactly at the byte ceiling", async () => {
+    const child = createFakeChild(47);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    // "€€" is 2 UTF-16 code units but exactly 6 UTF-8 bytes.
+    const payload = "\u20AC\u20AC";
+    assert.equal(payload.length, 2);
+    assert.equal(Buffer.byteLength(payload, "utf8"), 6);
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 6,
+    });
+    child.stdout.write(payload);
+    closeSoon(child, 0);
+
+    const result = await pending;
+    assert.equal(result.stdout, payload);
+    assert.deepEqual(child.killCalls, []);
+  });
+
+  it("overflows on bytes even though the JS string length is far below the ceiling", async () => {
+    const child = createFakeChild(48);
+    const killed: number[] = [];
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: (pid) => {
+        killed.push(pid);
+        return true;
+      },
+    });
+
+    // 6 bytes against a 5-byte ceiling. `.length` is 2, so a code-unit
+    // comparison would wrongly ACCEPT this.
+    const payload = "\u20AC\u20AC";
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 5,
+    });
+    child.stdout.write(payload);
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError, "byte overflow must reject");
+    assert.equal(err.stream, "stdout");
+    assert.deepEqual(killed, [-48], "the whole owned process group must be killed");
+  });
+
+  it("counts astral-plane emoji as their four UTF-8 bytes", async () => {
+    const child = createFakeChild(49);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    // "😀" is 2 UTF-16 code units but 4 UTF-8 bytes.
+    const emoji = "\u{1F600}";
+    assert.equal(emoji.length, 2);
+    assert.equal(Buffer.byteLength(emoji, "utf8"), 4);
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 3,
+    });
+    child.stdout.write(emoji);
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
+  });
+
+  it("applies byte accounting to stderr too", async () => {
+    const child = createFakeChild(50);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    // "é" is 1 code unit / 2 bytes. Four of them are 4 units but 8 bytes.
+    const payload = "\u00E9\u00E9\u00E9\u00E9";
+    assert.equal(payload.length, 4);
+    assert.equal(Buffer.byteLength(payload, "utf8"), 8);
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStderrBytes: 7,
+    });
+    child.stderr.write(payload);
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
+    assert.equal(err.stream, "stderr");
+  });
+
+  it("accumulates bytes across chunks rather than judging each in isolation", async () => {
+    const child = createFakeChild(51);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 8,
+    });
+    // Three chunks of 3 bytes each: no single chunk exceeds 8, the total does.
+    child.stdout.write("\u20AC");
+    child.stdout.write("\u20AC");
+    child.stdout.write("\u20AC");
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
+  });
+
+  it("counts a multibyte sequence split across raw stream chunks exactly once", async () => {
+    // The stream is decoded with setEncoding("utf8"), so Node's StringDecoder
+    // holds an incomplete sequence back and emits it with the chunk that
+    // completes it. Writing the raw bytes of "€" in two pieces must therefore
+    // count 3 bytes in total — not 6, and not 0.
+    const child = createFakeChild(52);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const euro = Buffer.from("\u20AC", "utf8");
+    assert.equal(euro.length, 3);
+
+    const seen: string[] = [];
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      // Exactly one euro fits; a double-count would push this over.
+      maxStdoutBytes: 3,
+      onStdout: (chunk) => seen.push(chunk),
+    });
+    child.stdout.write(euro.subarray(0, 1));
+    child.stdout.write(euro.subarray(1));
+    closeSoon(child, 0);
+
+    const result = await pending;
+    assert.equal(result.stdout, "\u20AC", "the split sequence must decode intact");
+    assert.equal(seen.join(""), "\u20AC", "callbacks must see the decoded text");
+    assert.deepEqual(child.killCalls, [], "3 bytes must not exceed a 3-byte ceiling");
+  });
+
+  it("an overflow outranks a normal nonzero exit", async () => {
+    const child = createFakeChild(46);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 4,
+    });
+    child.stdout.write("overflowing");
+    closeSoon(child, 3);
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
   });
 });
 

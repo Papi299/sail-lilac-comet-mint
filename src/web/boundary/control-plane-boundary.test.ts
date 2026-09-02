@@ -719,6 +719,133 @@ describe("Worker execution boundary", () => {
     }
   });
 
+  it("the generic analysis modules are unreachable from the worker business surface", () => {
+    // PHASE-10C2. A bounded generic yt-dlp ANALYZER and a direct-first strategy
+    // router now exist under src/worker/analysis/. Neither may be reachable
+    // from the authenticated HTTP surface in this phase: the invariant
+    //
+    //     authenticated request -> WorkerService -> direct-media analyzer only
+    //
+    // must still hold. Connecting them is a later, separately authorized task
+    // that will replace this assertion deliberately rather than by accident.
+    const GENERIC_ANALYZER = join(ROOT, "src/worker/analysis/ytdlp-analysis.server.ts");
+    const STRATEGY_ROUTER = join(ROOT, "src/worker/analysis/media-analyzer.server.ts");
+
+    assert.ok(existsSync(GENERIC_ANALYZER), "the generic analyzer must exist");
+    assert.ok(existsSync(STRATEGY_ROUTER), "the strategy router must exist");
+
+    assert.equal(
+      serviceGraph.has(GENERIC_ANALYZER),
+      false,
+      "the generic yt-dlp analyzer is reachable from WorkerService",
+    );
+    assert.equal(
+      serviceGraph.has(STRATEGY_ROUTER),
+      false,
+      "the strategy router is reachable from WorkerService",
+    );
+
+    for (const [file, rawSource] of serviceGraph) {
+      const source = stripComments(rawSource);
+      for (const token of ["analyzeGenericMedia", "analyzeMedia", "analysis/ytdlp-analysis", "analysis/media-analyzer"]) {
+        assert.equal(
+          source.includes(token),
+          false,
+          `${rel(file)} references '${token}' on the worker business path`,
+        );
+      }
+    }
+  });
+
+  it("neither the runtime composition root nor the job executor reaches generic analysis", () => {
+    // The composition root is where a generic analyzer would have to be injected
+    // to become live, and the executor is where a generic download branch would
+    // have to appear. Both are walked transitively.
+    for (const entry of [
+      "src/worker/runtime/runtime.server.ts",
+      "src/worker/runtime/main.server.ts",
+      "src/worker/execution/job-executor.server.ts",
+    ]) {
+      const graph = productionGraph(entry);
+      for (const generic of [
+        "src/worker/analysis/ytdlp-analysis.server.ts",
+        "src/worker/analysis/media-analyzer.server.ts",
+      ]) {
+        assert.equal(
+          graph.has(join(ROOT, generic)),
+          false,
+          `${entry} can reach ${generic}`,
+        );
+      }
+    }
+  });
+
+  it("the generic analysis modules are worker-only and import no legacy extractor", () => {
+    // They may use the shared SSRF boundary and the hardened process runner —
+    // that is the point of them — but never the Vercel-era extractor stack, the
+    // legacy global config, or FFmpeg.
+    for (const file of [
+      join(ROOT, "src/worker/analysis/ytdlp-analysis.server.ts"),
+      join(ROOT, "src/worker/analysis/media-analyzer.server.ts"),
+    ]) {
+      const source = stripComments(readSource(file));
+      for (const spec of specifiers(source)) {
+        assert.equal(
+          /extractors\/(registry|ytdlp|sample|normalize)/.test(spec),
+          false,
+          `${rel(file)} imports the legacy extractor stack via '${spec}'`,
+        );
+        assert.equal(
+          /lib\/config/.test(spec),
+          false,
+          `${rel(file)} imports the legacy global config via '${spec}'`,
+        );
+        assert.equal(
+          /processing\/ffmpeg/.test(spec),
+          false,
+          `${rel(file)} imports FFmpeg via '${spec}'`,
+        );
+      }
+      for (const token of [
+        "ytdlpExtractor",
+        "downloadWithYtdlp",
+        "dumpInfo",
+        "assertYtdlpNetworkPolicy",
+        "resolveYtdlp",
+        "ytDlpFormatSelector",
+        "mapExtractorMessage",
+        "getExtractorFor",
+        "isYtdlpNetworkIsolated",
+        "YTDLP_NETWORK_ISOLATED",
+      ]) {
+        assert.equal(
+          source.includes(token),
+          false,
+          `${rel(file)} reuses the legacy yt-dlp surface via '${token}'`,
+        );
+      }
+      // They spawn nothing directly; the hardened runner owns the process group.
+      assert.equal(source.includes("node:child_process"), false);
+      assert.equal(/\bspawn\s*\(/.test(source), false);
+    }
+  });
+
+  it("no Vercel API route can reach the generic analysis modules", () => {
+    for (const route of apiRouteFiles()) {
+      const graph = productionGraph(relative(ROOT, route));
+      for (const generic of [
+        "src/worker/analysis/ytdlp-analysis.server.ts",
+        "src/worker/analysis/media-analyzer.server.ts",
+      ]) {
+        assert.equal(
+          graph.has(join(ROOT, generic)),
+          false,
+          `${rel(route)} can reach ${generic}`,
+        );
+      }
+    }
+  });
+
   it("the worker HTTP surface has no live 501 business placeholder", () => {
     const server = readSource(join(ROOT, "src/worker/http/server.server.ts"));
     assert.equal(server.includes("501"), false, "a 501 placeholder is still present");
