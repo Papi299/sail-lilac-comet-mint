@@ -221,8 +221,67 @@ export function ytdlpPolicyArgs(opts: { workDir?: string } = {}): readonly strin
     // no username, password, token or authorization header is ever supplied.
     "--no-cookies",
     "--no-cookies-from-browser",
+
+    // ── downloader policy ────────────────────────────────────────────────
+    // Acquisition uses yt-dlp's NATIVE downloader. See YTDLP_FFMPEG_ACQUISITION_MODES
+    // below for what this does and does not guarantee — it is emphatically not
+    // "yt-dlp will never invoke FFmpeg".
+    //
+    // `--downloader` parses as `[PROTO:]NAME` into a dict, so a bare value
+    // becomes `{default: "native"}`. It is a fixed application-owned constant:
+    // no caller, and no user, can choose a downloader or pass downloader args.
+    "--downloader=native",
   ] as const);
 }
+
+/**
+ * Source modes where yt-dlp 2026.08.19 selects `FFmpegFD` for ACQUISITION even
+ * under `--downloader=native`, and which later generic integration must
+ * therefore reject (or separately design for) rather than execute.
+ *
+ * This matters because of an accepted Worker invariant:
+ *
+ *     downloading  = network acquisition
+ *     processing   = local FFmpeg/remux/transcode/extraction
+ *
+ * A yt-dlp download that internally shells out to FFmpeg performs local media
+ * work while the durable job still says `downloading`, which breaks that
+ * boundary. Phase 10C1 has no user-URL execution path at all, so nothing here
+ * is enforced yet; this list is the recorded integration gate.
+ *
+ * Determined by reading `yt_dlp/downloader/__init__.py` in the pinned release
+ * and confirmed by exercising `_get_suitable_downloader` against it:
+ *
+ *     https               is_live=False  -> HttpFD          (native)
+ *     m3u8_native         is_live=False  -> HlsFD           (native)
+ *     m3u8_native         is_live=True   -> FFmpegFD        <-- forced
+ *     http_dash_segments  is_live=True   -> DashSegmentsFD  (native prevents FFmpegFD)
+ *     rtmp_ffmpeg                        -> FFmpegFD        <-- forced
+ */
+export const YTDLP_FFMPEG_ACQUISITION_MODES = Object.freeze([
+  // `if protocol in ('m3u8', 'm3u8_native'): if info_dict.get('is_live'): return FFmpegFD`
+  // — this test runs BEFORE the `native` branch, so the downloader policy
+  // cannot override it.
+  "live HLS (m3u8 / m3u8_native with is_live)",
+  // PROTOCOL_MAP maps this protocol directly to FFmpegFD; `native` is only
+  // consulted for m3u8/m3u8_native and http_dash_segments.
+  "rtmp_ffmpeg",
+  // `if (section_start or section_end) and FFmpegFD.can_download(...)` is the
+  // FIRST check in `_get_suitable_downloader`, ahead of any downloader
+  // preference. We never pass `--download-sections`, so this is unreachable
+  // today; it is listed so a future option addition cannot reintroduce it
+  // silently.
+  "section downloads (--download-sections)",
+  // `if external_downloader is None and to_stdout and FFmpegFD.can_merge_formats(...)`.
+  // Passing `--downloader=native` makes `external_downloader` non-None, which
+  // already disables this branch; it stays listed because `-o -` plus a
+  // multi-format selection is the shape that would reopen it.
+  "stdout output with a merge-requiring format selection",
+  // The top-level `get_suitable_downloader` returns FFmpegFD when every
+  // protocol in a `+`-joined selection resolves to it and the formats can be
+  // merged. A single-format selection cannot reach this.
+  "multi-protocol format selections that resolve wholly to FFmpegFD",
+] as const);
 
 /** The outcome of a runtime probe. Never carries raw subprocess output. */
 export type YtdlpRuntimeStatus = {

@@ -7,6 +7,7 @@ import {
   parseYtdlpVersion,
   probeYtdlpRuntime,
   setYtdlpRuntimeProcessRunnerForTests,
+  YTDLP_FFMPEG_ACQUISITION_MODES,
   YTDLP_FORBIDDEN_ENVIRONMENT,
   YTDLP_RUNTIME,
   ytdlpPolicyArgs,
@@ -263,14 +264,38 @@ describe("yt-dlp closed argument policy", () => {
     }
   });
 
-  it("configures no external downloader and no command execution hook", () => {
-    // yt-dlp network acquisition must never silently become local processing
-    // or an arbitrary child command.
+  it("requests exactly the native downloader, as a fixed application-owned value", () => {
+    // CORRECTED: this previously asserted that NO `--downloader` option was
+    // present at all. That was weaker than it looked. With no downloader
+    // preference, `external_downloader` is None, and yt-dlp's dispatch is then
+    // free to select FFmpegFD for several ordinary cases. Asking for `native`
+    // explicitly is the stronger position.
+    const downloaders = ytdlpPolicyArgs().filter((a) => a.startsWith("--downloader"));
+    assert.equal(downloaders.length, 1, "exactly one downloader policy may exist");
+    assert.equal(values.get("--downloader"), "native");
+
+    // `--downloader` parses as `[PROTO:]NAME` into a dict, so a bare value
+    // becomes `{default: "native"}` — the policy for every protocol.
+    assert.equal(
+      values.get("--downloader")!.includes(":"),
+      false,
+      "the downloader policy must apply to every protocol, not one protocol",
+    );
+  });
+
+  it("permits no downloader arguments and no per-protocol downloader override", () => {
     for (const forbidden of [
-      "--downloader",
       "--external-downloader",
       "--downloader-args",
       "--external-downloader-args",
+    ]) {
+      assert.equal(flags.has(forbidden), false, `${forbidden} must never be passed`);
+    }
+  });
+
+  it("configures no third-party downloader and no command execution hook", () => {
+    // yt-dlp acquisition must never become an arbitrary child command.
+    for (const forbidden of [
       "--exec",
       "--exec-before-download",
       "--postprocessor-args",
@@ -278,14 +303,34 @@ describe("yt-dlp closed argument policy", () => {
     ]) {
       assert.equal(flags.has(forbidden), false, `${forbidden} must never be passed`);
     }
-    const joined = ytdlpPolicyArgs().join(" ");
-    for (const helper of ["aria2c", "ffmpeg", "curl", "wget", "httpie", "axel"]) {
+
+    // `ffmpeg` is deliberately NOT in this list. FFmpeg IS installed in the
+    // Worker image — it is VideoFetch's own processing tool — and yt-dlp
+    // recognises `ffmpeg` as a downloader name. What must not happen is
+    // yt-dlp being CONFIGURED to use it, which the `native` assertion above
+    // covers. The names below are third-party downloaders that are neither
+    // installed nor configurable.
+    const downloaderValue = values.get("--downloader") ?? "";
+    for (const helper of ["aria2c", "curl", "wget", "httpie", "axel", "ffmpeg"]) {
       assert.equal(
-        joined.includes(helper),
+        downloaderValue.includes(helper),
         false,
-        `${helper} must not appear as a downloader or helper in the base policy`,
+        `${helper} must not be configured as the yt-dlp downloader`,
       );
     }
+  });
+
+  it("records the acquisition modes that still resolve to FFmpeg under native", () => {
+    // The native downloader does NOT mean "yt-dlp will never invoke FFmpeg".
+    // Verified against the pinned release's own dispatch: live HLS and
+    // rtmp_ffmpeg still resolve to FFmpegFD regardless of this policy. Those
+    // are integration-time protocol gates, recorded here so the limitation is
+    // impossible to lose track of.
+    assert.ok(YTDLP_FFMPEG_ACQUISITION_MODES.length >= 2);
+    const joined = YTDLP_FFMPEG_ACQUISITION_MODES.join(" | ").toLowerCase();
+    assert.ok(joined.includes("m3u8"), "live HLS must be recorded");
+    assert.ok(joined.includes("rtmp_ffmpeg"), "rtmp_ffmpeg must be recorded");
+    assert.ok(Object.isFrozen(YTDLP_FFMPEG_ACQUISITION_MODES));
   });
 
   it("contains no URL, format selector, or output template", () => {

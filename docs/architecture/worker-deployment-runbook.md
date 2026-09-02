@@ -521,9 +521,56 @@ rather than assumed from historical spelling:
 | Remote components | `--no-remote-components` — EJS is never fetched from npm or GitHub. The requisite package is bundled, so this costs no functionality |
 | Self-update | `--no-update`, on a read-only root-owned file |
 | Credentials | `--no-cookies --no-cookies-from-browser`; no `--netrc`, username, password, token or authorization header. **Public sources only** |
-| External downloaders | None configured. `--downloader`, `--exec` and postprocessor commands are never passed, and no such helper is installed |
+| Downloader | `--downloader=native`, a fixed application-owned value. No caller or user may choose a downloader, and `--downloader-args`, `--exec` and postprocessor commands are never passed. No third-party downloader (`curl`, `wget`, `aria2c`, `httpie`, `axel`) is installed or configurable. **FFmpeg *is* installed** — it is VideoFetch's own processing tool — and yt-dlp recognises `ffmpeg` as a downloader name, so "no external downloader is installed" would be false. See §4c |
 
-### 4c. Configuration contract
+### 4c. What `--downloader=native` does and does not guarantee
+
+`--downloader native` parses to `{default: "native"}` and is applied to every
+protocol. Measured against the pinned release's own `_get_suitable_downloader`:
+
+| Protocol | Live | Resolves to |
+| :--- | :--- | :--- |
+| `https` (progressive) | no | `HttpFD` |
+| `m3u8_native` | no | `HlsFD` |
+| `http_dash_segments` | yes | `DashSegmentsFD` |
+| `m3u8` / `m3u8_native` | **yes** | **`FFmpegFD`** |
+| `rtmp_ffmpeg` | — | **`FFmpegFD`** |
+
+**It guarantees** that no third-party downloader is ever invoked
+(`get_external_downloader()` is not even reached for the value `native`), that
+non-live HLS uses the native `HlsFD`, that live DASH segments stay native, and
+that the `to_stdout` FFmpeg-merge branch is skipped.
+
+**It does not guarantee that yt-dlp never invokes FFmpeg.** In this release the
+live-HLS test runs *before* the downloader preference is consulted, and
+`rtmp_ffmpeg` maps straight to `FFmpegFD`. Any claim that "no external
+downloader is configured, therefore FFmpeg cannot run during acquisition" is
+false.
+
+This matters because of an accepted Worker invariant:
+
+```
+downloading  = network acquisition
+processing   = local FFmpeg/remux/transcode/extraction
+```
+
+An acquisition that internally shells out to FFmpeg performs local media work
+while the durable job still says `downloading`.
+
+**Recorded integration gate.** Phase 10C1 has no user-URL execution path, so
+nothing is enforced yet. When generic integration is built, it must reject —
+or separately design for — every mode in
+`YTDLP_FFMPEG_ACQUISITION_MODES` (`src/worker/runtime/ytdlp-runtime.server.ts`):
+
+- live HLS (`m3u8` / `m3u8_native` with `is_live`);
+- `rtmp_ffmpeg`;
+- section downloads (`--download-sections`);
+- stdout output with a merge-requiring format selection;
+- multi-protocol format selections that resolve wholly to `FFmpegFD`.
+
+Protocol selection is deliberately **not** implemented in this phase.
+
+### 4d. Configuration contract
 
 | Variable | Status |
 | :--- | :--- |
@@ -545,13 +592,18 @@ input reach it, so this was never a user-input vulnerability — it was an
 unnecessarily loose operator execution surface, and the Production Worker has no
 need of it. The runtime identity is a reviewed constant in the image.
 
-### 4d. What Phase 10C1 does NOT authorize
+### 4e. What Phase 10C1 does NOT authorize
 
 **No user-URL execution path exists.** `WorkerService.analyze()` still resolves
 only to the direct-media analyzer, `JobExecutor` still has no generic branch,
 and the only yt-dlp subprocess operation in any Production Worker code is a
-non-network version probe. Setting `YTDLP_ENABLED=true` today would change a
-diagnostics field and nothing else.
+non-network version probe.
+
+Setting `YTDLP_ENABLED=true` in Phase 10C1 changes **reported configuration
+state only** — `features.ytdlpEnabled` in Worker diagnostics and the
+informational `ytdlpEnabled` field on `/api/sites`. It does not enable generic
+extraction, and it must not make `/api/sites.ytdlp` true: that field additionally
+requires a generic execution path to exist in the build, which it does not.
 
 Generic analysis, generic download, format planning and the live acceptance
 matrix that must precede enabling any of it are later, separately authorized

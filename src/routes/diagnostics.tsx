@@ -69,12 +69,19 @@ function DiagnosticsPage() {
               <CardTitle className="text-base">Generic extraction</CardTitle>
             </CardHeader>
             <CardContent className="grid gap-3 text-sm">
-              <p>yt-dlp feature: {data.features.ytdlpEnabled ? "enabled" : "disabled"}</p>
-              {/* An installed runtime is not a usable feature. Saying so here
-                  keeps the operator view honest at a glance. */}
+              {/* Deliberately "configuration", not "feature enabled". The
+                  setting records operator intent; it does not make generic
+                  extraction operational, because this build contains no
+                  execution path for it. Calling it "enabled" would imply a
+                  capability that does not exist. */}
+              <p>
+                yt-dlp configuration: {data.features.ytdlpEnabled ? "enabled" : "disabled"}
+              </p>
+              <p>Generic yt-dlp execution: not implemented in this build</p>
               <p className="text-muted-foreground">
-                An available runtime does not by itself permit generic extraction; the feature must
-                also be enabled.
+                Neither an available runtime nor an enabled setting makes generic extraction
+                usable. This build has no generic analyze or download path, so only direct media
+                files are extractable.
               </p>
             </CardContent>
           </Card>
