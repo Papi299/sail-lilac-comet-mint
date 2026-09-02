@@ -8,6 +8,7 @@ import {
   probeYtdlpRuntime,
   setYtdlpRuntimeProcessRunnerForTests,
   YTDLP_FFMPEG_ACQUISITION_MODES,
+  YTDLP_PROBE_TIMEOUT_MS,
   YTDLP_FORBIDDEN_ENVIRONMENT,
   YTDLP_RUNTIME,
   ytdlpPolicyArgs,
@@ -512,5 +513,101 @@ describe("yt-dlp runtime probe", () => {
     const serialized = JSON.stringify(status);
     assert.equal(serialized.includes("SENTINEL"), false);
     assert.equal(serialized.includes("token=abc123"), false);
+  });
+});
+
+describe("yt-dlp runtime probe: opt-in cancellation and budget", () => {
+  afterEach(() => setYtdlpRuntimeProcessRunnerForTests(null));
+
+  it("preserves the Phase-10C1 no-argument contract exactly", async () => {
+    const seen: { timeoutMs: number; signal?: AbortSignal }[] = [];
+    setYtdlpRuntimeProcessRunnerForTests(async (opts) => {
+      seen.push({ timeoutMs: opts.timeoutMs, signal: opts.signal });
+      return { code: 0, stdout: `${YTDLP_RUNTIME.expectedVersion}\n`, stderr: "" };
+    });
+
+    const status = await probeYtdlpRuntime();
+
+    assert.equal(status.available, true);
+    assert.equal(status.reason, "ok");
+    assert.equal(seen[0]!.timeoutMs, YTDLP_PROBE_TIMEOUT_MS, "full default budget");
+    assert.equal(seen[0]!.signal, undefined, "no signal is introduced");
+  });
+
+  it("shortens the probe to a caller's remaining budget", async () => {
+    const seen: number[] = [];
+    setYtdlpRuntimeProcessRunnerForTests(async (opts) => {
+      seen.push(opts.timeoutMs);
+      return { code: 0, stdout: `${YTDLP_RUNTIME.expectedVersion}\n`, stderr: "" };
+    });
+
+    await probeYtdlpRuntime({ timeoutMs: 2_000 });
+    assert.equal(seen[0], 2_000);
+  });
+
+  it("never lengthens the probe beyond its own conservative maximum", async () => {
+    const seen: number[] = [];
+    setYtdlpRuntimeProcessRunnerForTests(async (opts) => {
+      seen.push(opts.timeoutMs);
+      return { code: 0, stdout: `${YTDLP_RUNTIME.expectedVersion}\n`, stderr: "" };
+    });
+
+    await probeYtdlpRuntime({ timeoutMs: 10 * 60 * 1000 });
+    assert.equal(seen[0], YTDLP_PROBE_TIMEOUT_MS, "a large budget must not widen the probe");
+  });
+
+  it("passes the caller's signal to the hardened runner", async () => {
+    const controller = new AbortController();
+    let received: AbortSignal | undefined;
+    setYtdlpRuntimeProcessRunnerForTests(async (opts) => {
+      received = opts.signal;
+      return { code: 0, stdout: `${YTDLP_RUNTIME.expectedVersion}\n`, stderr: "" };
+    });
+
+    await probeYtdlpRuntime({ signal: controller.signal });
+    assert.equal(
+      received,
+      controller.signal,
+      "the runner owns the process group and needs the signal to terminate it",
+    );
+  });
+
+  it("re-throws a cancellation instead of reporting the runtime unavailable", async () => {
+    const controller = new AbortController();
+    const cancelled = new AppError("PROCESSING_FAILED", "Download was cancelled.");
+    setYtdlpRuntimeProcessRunnerForTests(async () => {
+      controller.abort();
+      throw cancelled;
+    });
+
+    const err = await probeYtdlpRuntime({ signal: controller.signal }).then(
+      (status) => status,
+      (e: unknown) => e,
+    );
+
+    assert.equal(err, cancelled, "cancellation must propagate verbatim");
+  });
+
+  it("still reports unavailable for a genuine failure when a signal is supplied", async () => {
+    // A signal that was NEVER aborted must not change failure classification.
+    const controller = new AbortController();
+    setYtdlpRuntimeProcessRunnerForTests(async () => {
+      throw new Error("ENOENT");
+    });
+
+    const status = await probeYtdlpRuntime({ signal: controller.signal });
+    assert.equal(status.available, false);
+    assert.equal(status.reason, "process_error");
+  });
+
+  it("still reports a timeout as a timeout when a signal is supplied", async () => {
+    const controller = new AbortController();
+    setYtdlpRuntimeProcessRunnerForTests(async () => {
+      throw new AppError("TIMEOUT");
+    });
+
+    const status = await probeYtdlpRuntime({ signal: controller.signal });
+    assert.equal(status.available, false);
+    assert.equal(status.reason, "timeout");
   });
 });

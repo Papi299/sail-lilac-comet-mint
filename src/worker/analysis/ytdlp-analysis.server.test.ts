@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { AppError } from "../../lib/errors.ts";
 import type { RunResult } from "../../services/processing/process-runner.server.ts";
@@ -11,8 +11,11 @@ import {
   YTDLP_ANALYSIS_MAX_RAW_FORMATS,
   YTDLP_ANALYSIS_MAX_STDERR_BYTES,
   YTDLP_ANALYSIS_MAX_STDOUT_BYTES,
+  YTDLP_ANALYSIS_FFMPEG_LOCATION,
   YTDLP_ANALYSIS_MAX_TITLE_LENGTH,
+  YTDLP_ANALYSIS_PATH,
   YTDLP_V1_NATIVE_PROTOCOLS,
+  buildYtdlpAnalysisEnvironment,
   analyzeGenericMedia,
   buildYtdlpAnalysisArgv,
   classifyAnalysisFailure,
@@ -22,7 +25,13 @@ import {
   ytdlpAnalysisPolicyArgs,
   type GenericAnalysisLimits,
 } from "./ytdlp-analysis.server.ts";
-import { YTDLP_RUNTIME, type YtdlpRuntimeStatus } from "../runtime/ytdlp-runtime.server.ts";
+import { buildYtdlpEnvironment } from "../runtime/ytdlp-runtime.server.ts";
+import {
+  YTDLP_PROBE_TIMEOUT_MS,
+  YTDLP_RUNTIME,
+  type YtdlpProbeOptions,
+  type YtdlpRuntimeStatus,
+} from "../runtime/ytdlp-runtime.server.ts";
 
 /**
  * The secret-bearing URL used throughout. It never appears in a real request:
@@ -105,16 +114,18 @@ async function analyze(
   url: string,
   opts: {
     runner: (o: RunnerCall) => Promise<RunResult>;
-    probeRuntime?: () => Promise<YtdlpRuntimeStatus>;
+    probeRuntime?: (o: YtdlpProbeOptions) => Promise<YtdlpRuntimeStatus>;
     validateUrl?: (raw: string) => Promise<{ url: string; hostname: string }>;
     ffmpegAvailable?: boolean;
     signal?: AbortSignal;
     limits?: GenericAnalysisLimits;
+    clock?: () => number;
   },
 ) {
   return analyzeGenericMedia(url, {
     limits: opts.limits ?? LIMITS,
     runner: opts.runner,
+    clock: opts.clock,
     probeRuntime: opts.probeRuntime ?? (async () => OK_RUNTIME),
     // The default validator is the real SSRF boundary, which performs DNS.
     // Unit tests inject a pure one and exercise the real boundary separately.
@@ -345,7 +356,6 @@ describe("generic analysis: closed argv", () => {
       "--add-header",
       "--exec",
       "--postprocessor-args",
-      "--ffmpeg-location",
       "--load-info-json",
     ];
     for (const flag of banned) {
@@ -391,6 +401,7 @@ describe("generic analysis: closed argv", () => {
         "--socket-timeout=10",
         "--retries=2",
         "--extractor-retries=1",
+        `--ffmpeg-location=${YTDLP_ANALYSIS_FFMPEG_LOCATION}`,
       ],
     );
   });
@@ -405,8 +416,9 @@ describe("generic analysis: closed argv", () => {
     assert.equal(call.maxStdoutBytes, YTDLP_ANALYSIS_MAX_STDOUT_BYTES);
     assert.equal(call.maxStderrBytes, YTDLP_ANALYSIS_MAX_STDERR_BYTES);
     assert.equal(call.timeoutMs, LIMITS.analysisTimeoutSeconds * 1000);
-    // The environment is the closed allowlist, never the ambient one.
-    assert.equal(call.env?.PATH, "/usr/bin:/bin");
+    // The environment is the ANALYSIS closed allowlist, never the ambient one
+    // and never the base one that keeps /usr/bin (where ffmpeg lives) on PATH.
+    assert.equal(call.env?.PATH, YTDLP_ANALYSIS_PATH);
     assert.equal(call.env?.PYTHONPATH, undefined);
   });
 
@@ -946,11 +958,13 @@ describe("generic analysis: error classification", () => {
     await expectCode(analyze(SAFE_URL, { runner }), "EXTRACTOR_UNAVAILABLE");
   });
 
-  it("propagates cancellation verbatim instead of flattening it", async () => {
+  it("propagates a mid-run cancellation verbatim instead of flattening it", async () => {
+    // The signal is aborted only once the runner is already executing, so the
+    // early gate does not fire and the runner's own reason must survive.
     const controller = new AbortController();
-    controller.abort();
     const cancelled = new AppError("PROCESSING_FAILED", "Download was cancelled.");
     const { runner } = fakeRunner(async () => {
+      controller.abort();
       throw cancelled;
     });
     const err = await analyze(SAFE_URL, { runner, signal: controller.signal }).then(
@@ -1082,5 +1096,381 @@ describe("generic analysis: not reachable from Production", () => {
     const sites = read("src/lib/security/private-access-api.server.ts");
     assert.match(sites, /export const GENERIC_YTDLP_EXECUTION_IMPLEMENTED = false;/);
     assert.match(sites, /ytdlp: GENERIC_YTDLP_EXECUTION_IMPLEMENTED && ytdlpInstalled && ytdlpEnabled/);
+  });
+});
+
+// ── Correction B: one shared subprocess budget, and real cancellation ────────
+
+describe("generic analysis: shared subprocess deadline", () => {
+  /** A clock the test advances explicitly. No real sleeps anywhere here. */
+  function fakeClock(startMs = 1_000_000) {
+    let now = startMs;
+    return {
+      now: () => now,
+      advance: (ms: number) => {
+        now += ms;
+      },
+    };
+  }
+
+  const TEN_SECOND_LIMITS: GenericAnalysisLimits = { ...LIMITS, analysisTimeoutSeconds: 10 };
+
+  it("gives the network subprocess only the budget the probe left behind", async () => {
+    const clock = fakeClock();
+    const { runner, calls } = fakeRunner(ok(JSON.stringify(singleVideoInfo())));
+
+    await analyze(SAFE_URL, {
+      runner,
+      limits: TEN_SECOND_LIMITS,
+      clock: clock.now,
+      probeRuntime: async () => {
+        clock.advance(3_000); // the probe takes 3s of the 10s budget
+        return OK_RUNTIME;
+      },
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(
+      calls[0]!.timeoutMs,
+      7_000,
+      "the network run must receive the REMAINING budget, not a fresh one",
+    );
+  });
+
+  it("caps the probe at the smaller of its own maximum and the remaining budget", async () => {
+    const seen: YtdlpProbeOptions[] = [];
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo())));
+
+    // A 2s analysis budget is far below YTDLP_PROBE_TIMEOUT_MS.
+    await analyze(SAFE_URL, {
+      runner,
+      limits: { ...LIMITS, analysisTimeoutSeconds: 2 },
+      clock: fakeClock().now,
+      probeRuntime: async (o) => {
+        seen.push(o);
+        return OK_RUNTIME;
+      },
+    });
+
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]!.timeoutMs, 2_000, "budget must shorten the probe");
+    assert.ok(seen[0]!.timeoutMs! <= YTDLP_PROBE_TIMEOUT_MS);
+  });
+
+  it("never lets the probe exceed its own conservative maximum", async () => {
+    const seen: YtdlpProbeOptions[] = [];
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo())));
+
+    // A very large analysis budget must NOT widen the probe.
+    await analyze(SAFE_URL, {
+      runner,
+      limits: { ...LIMITS, analysisTimeoutSeconds: 3600 },
+      clock: fakeClock().now,
+      probeRuntime: async (o) => {
+        seen.push(o);
+        return OK_RUNTIME;
+      },
+    });
+
+    assert.equal(seen[0]!.timeoutMs, YTDLP_PROBE_TIMEOUT_MS);
+  });
+
+  it("starts NO network subprocess when the probe exhausted the budget", async () => {
+    const clock = fakeClock();
+    const { runner, calls } = forbiddenRunner();
+
+    await expectCode(
+      analyze(SAFE_URL, {
+        runner,
+        limits: TEN_SECOND_LIMITS,
+        clock: clock.now,
+        probeRuntime: async () => {
+          clock.advance(10_000); // consumes the whole budget
+          return OK_RUNTIME;
+        },
+      }),
+      "TIMEOUT",
+    );
+
+    assert.equal(calls.length, 0, "an exhausted budget must start no network process");
+  });
+
+  it("starts no network subprocess when the probe overran the budget", async () => {
+    const clock = fakeClock();
+    const { runner, calls } = forbiddenRunner();
+
+    await expectCode(
+      analyze(SAFE_URL, {
+        runner,
+        limits: TEN_SECOND_LIMITS,
+        clock: clock.now,
+        probeRuntime: async () => {
+          clock.advance(25_000);
+          return OK_RUNTIME;
+        },
+      }),
+      "TIMEOUT",
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  it("uses the whole budget when the probe is instantaneous", async () => {
+    const { runner, calls } = fakeRunner(ok(JSON.stringify(singleVideoInfo())));
+    await analyze(SAFE_URL, {
+      runner,
+      limits: TEN_SECOND_LIMITS,
+      clock: fakeClock().now,
+    });
+    assert.equal(calls[0]!.timeoutMs, 10_000);
+  });
+});
+
+describe("generic analysis: cancellation", () => {
+  it("an already-aborted caller starts NEITHER the probe nor the network run", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const { runner, calls } = forbiddenRunner();
+    let probed = 0;
+
+    const err = await analyzeGenericMedia(SAFE_URL, {
+      limits: LIMITS,
+      runner,
+      signal: controller.signal,
+      probeRuntime: async () => {
+        probed += 1;
+        return OK_RUNTIME;
+      },
+      validateUrl: async (raw) => ({ url: raw, hostname: new URL(raw).hostname }),
+    }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    assert.ok(err instanceof AppError);
+    assert.equal(err.code, "PROCESSING_FAILED");
+    assert.equal(probed, 0, "no runtime probe may start");
+    assert.equal(calls.length, 0, "no network subprocess may start");
+  });
+
+  it("forwards the caller's signal to the runtime probe", async () => {
+    const controller = new AbortController();
+    const seen: YtdlpProbeOptions[] = [];
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo())));
+
+    await analyze(SAFE_URL, {
+      runner,
+      signal: controller.signal,
+      probeRuntime: async (o) => {
+        seen.push(o);
+        return OK_RUNTIME;
+      },
+    });
+
+    assert.equal(
+      seen[0]!.signal,
+      controller.signal,
+      "the probe must be able to terminate its own process group on cancel",
+    );
+  });
+
+  it("propagates a cancellation raised during the probe, and starts no network run", async () => {
+    const controller = new AbortController();
+    const { runner, calls } = forbiddenRunner();
+    const cancelled = new AppError("PROCESSING_FAILED", "Download was cancelled.");
+
+    const err = await analyzeGenericMedia(SAFE_URL, {
+      limits: LIMITS,
+      runner,
+      signal: controller.signal,
+      probeRuntime: async () => {
+        // Cancellation arrives while the probe is executing.
+        controller.abort();
+        throw cancelled;
+      },
+      validateUrl: async (raw) => ({ url: raw, hostname: new URL(raw).hostname }),
+    }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    assert.equal(err, cancelled, "cancellation must propagate verbatim");
+    assert.equal(calls.length, 0, "the network subprocess must never start");
+  });
+
+  it("does not report a cancelled probe as EXTRACTOR_UNAVAILABLE", async () => {
+    const controller = new AbortController();
+    const { runner } = forbiddenRunner();
+    const cancelled = new AppError("PROCESSING_FAILED", "Download was cancelled.");
+
+    const err = await analyzeGenericMedia(SAFE_URL, {
+      limits: LIMITS,
+      runner,
+      signal: controller.signal,
+      probeRuntime: async () => {
+        controller.abort();
+        throw cancelled;
+      },
+      validateUrl: async (raw) => ({ url: raw, hostname: new URL(raw).hostname }),
+    }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    assert.ok(err instanceof AppError);
+    assert.notEqual(
+      err.code,
+      "EXTRACTOR_UNAVAILABLE",
+      "a cancellation is not a runtime-installation problem",
+    );
+  });
+});
+
+// ── Correction C: the analysis child cannot reach FFmpeg or ffprobe ─────────
+
+describe("generic analysis: FFmpeg/ffprobe descendant isolation", () => {
+  it("runs under the analysis environment, whose PATH resolves nothing", async () => {
+    const { runner, calls } = fakeRunner(ok(JSON.stringify(singleVideoInfo())));
+    await analyze(SAFE_URL, { runner });
+
+    const env = calls[0]!.env!;
+    assert.equal(env.PATH, YTDLP_ANALYSIS_PATH);
+    assert.equal(env.PATH, buildYtdlpAnalysisEnvironment().PATH);
+  });
+
+  it("exposes neither /usr/bin nor /bin on the analysis PATH", async () => {
+    const { runner, calls } = fakeRunner(ok(JSON.stringify(singleVideoInfo())));
+    await analyze(SAFE_URL, { runner });
+
+    const entries = (calls[0]!.env!.PATH ?? "").split(":").filter(Boolean);
+    assert.ok(entries.length > 0, "PATH must be set, not merely empty");
+    for (const banned of ["/usr/bin", "/bin", "/usr/local/bin", "/sbin", "/usr/sbin", "."]) {
+      assert.equal(
+        entries.includes(banned),
+        false,
+        `the analysis PATH must not expose ${banned}, where ffmpeg/ffprobe live`,
+      );
+    }
+    // An empty PATH is NOT acceptable: some resolvers fall back to the system
+    // default (/bin:/usr/bin), which would restore exactly what this removes.
+    assert.notEqual(calls[0]!.env!.PATH, "");
+  });
+
+  it("no PATH entry can contain an ffmpeg or ffprobe binary", async () => {
+    const { runner, calls } = fakeRunner(ok(JSON.stringify(singleVideoInfo())));
+    await analyze(SAFE_URL, { runner });
+
+    for (const dir of (calls[0]!.env!.PATH ?? "").split(":").filter(Boolean)) {
+      for (const prog of ["ffmpeg", "ffprobe"]) {
+        assert.equal(
+          existsSync(join(dir, prog)),
+          false,
+          `${dir}/${prog} is discoverable from the analysis child`,
+        );
+      }
+      assert.equal(existsSync(dir), false, `${dir} exists; PATH must resolve nothing`);
+    }
+  });
+
+  it("passes exactly one fixed, application-owned --ffmpeg-location", () => {
+    const argv = buildYtdlpAnalysisArgv(SAFE_URL);
+    const found = argv.filter((a) => a.startsWith("--ffmpeg-location"));
+    assert.equal(found.length, 1, "exactly one ffmpeg location must be configured");
+    assert.equal(found[0], `--ffmpeg-location=${YTDLP_ANALYSIS_FFMPEG_LOCATION}`);
+    assert.ok(
+      YTDLP_ANALYSIS_FFMPEG_LOCATION.startsWith("/nonexistent/"),
+      "the location must be a path that cannot exist in the image",
+    );
+    assert.equal(
+      existsSync(YTDLP_ANALYSIS_FFMPEG_LOCATION),
+      false,
+      "the disabling location must not exist",
+    );
+  });
+
+  it("neither the caller nor the URL can influence the ffmpeg location", () => {
+    // The location is a module constant, so it is identical no matter what URL
+    // is analyzed — including a URL that tries to look like the option.
+    for (const hostile of [
+      SAFE_URL,
+      "https://example.invalid/x?--ffmpeg-location=/usr/bin",
+      "https://example.invalid/--ffmpeg-location=/usr/bin/ffmpeg",
+    ]) {
+      const found = buildYtdlpAnalysisArgv(hostile).filter((a) =>
+        a.startsWith("--ffmpeg-location="),
+      );
+      assert.deepEqual(found, [`--ffmpeg-location=${YTDLP_ANALYSIS_FFMPEG_LOCATION}`]);
+    }
+    // And it is not read from configuration or the environment.
+    const source = readFileSync(
+      join(process.cwd(), "src/worker/analysis/ytdlp-analysis.server.ts"),
+      "utf8",
+    );
+    assert.match(
+      source,
+      /export const YTDLP_ANALYSIS_FFMPEG_LOCATION\s*=\s*"\/nonexistent\/[^"]+";/,
+      "the location must be a plain string literal, not a computed value",
+    );
+    assert.equal(source.includes("process.env"), false, "no env lookup on this path");
+    // And likewise for the analysis PATH.
+    assert.match(
+      source,
+      /export const YTDLP_ANALYSIS_PATH\s*=\s*"\/nonexistent\/[^"]+";/,
+    );
+  });
+
+  it("keeps the approved Node runtime addressed by ABSOLUTE path", async () => {
+    const argv = buildYtdlpAnalysisArgv(SAFE_URL);
+    const jsRuntime = argv.find((a) => a.startsWith("--js-runtimes="));
+    assert.ok(jsRuntime, "Node must still be enabled");
+
+    const nodePath = jsRuntime.slice("--js-runtimes=node:".length);
+    assert.ok(nodePath.startsWith("/"), "Node must be absolute, not PATH-discovered");
+    assert.ok(existsSync(nodePath), "the approved Node binary must exist");
+    // yt-dlp 2026.08.19 `_determine_runtime_path` returns an absolute path
+    // verbatim and only calls `_find_exe` when no path was supplied, so the
+    // dead PATH cannot break Node.
+    assert.equal(argv.includes("--no-js-runtimes"), true);
+    assert.equal(argv.includes("--no-remote-components"), true);
+  });
+
+  it("configures FFmpeg neither as a downloader nor as a postprocessor", () => {
+    const argv = buildYtdlpAnalysisArgv(SAFE_URL);
+    assert.ok(argv.includes("--downloader=native"));
+    assert.equal(
+      argv.some((a) => /^--downloader=.*ffmpeg/i.test(a)),
+      false,
+    );
+    for (const pp of [
+      "--postprocessor-args",
+      "--exec",
+      "--embed-thumbnail",
+      "--embed-metadata",
+      "--embed-subs",
+      "--embed-chapters",
+      "--convert-thumbnails",
+      "--split-chapters",
+      "--sponsorblock-remove",
+      "--extract-audio",
+      "--recode-video",
+      "--remux-video",
+    ]) {
+      assert.ok(!argv.includes(pp), `${pp} must not be configured`);
+      assert.ok(!argv.some((a) => a.startsWith(`${pp}=`)), `${pp}= must not be configured`);
+    }
+  });
+
+  it("leaves the shared base environment untouched for its other callers", () => {
+    // The diagnostics version probe is non-network and keeps the accepted
+    // Phase-10C1 environment; only ANALYSIS narrows PATH.
+    assert.equal(buildYtdlpEnvironment().PATH, "/usr/bin:/bin");
+    assert.equal(buildYtdlpAnalysisEnvironment().PATH, YTDLP_ANALYSIS_PATH);
+    // Everything else is inherited unchanged.
+    const base = buildYtdlpEnvironment();
+    const analysis = buildYtdlpAnalysisEnvironment();
+    for (const key of Object.keys(base)) {
+      if (key === "PATH") continue;
+      assert.equal(analysis[key], base[key], `${key} must be inherited from the base policy`);
+    }
   });
 });

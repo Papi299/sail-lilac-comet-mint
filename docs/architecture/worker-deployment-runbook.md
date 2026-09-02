@@ -727,9 +727,13 @@ The base policy from §4c, plus:
 ```
 --dump-single-json --skip-download --no-progress --no-warnings --no-cache-dir
 --socket-timeout=10 --retries=2 --extractor-retries=1
+--ffmpeg-location=/nonexistent/videofetch-yt-dlp-analysis-no-ffmpeg
 --
 <validated-url>
 ```
+
+run under an analysis-specific environment whose `PATH` is
+`/nonexistent/videofetch-yt-dlp-analysis-no-path`.
 
 Every option is verified against yt-dlp 2026.08.19's own `options.py`. The
 bounded retry/timeout values replace upstream defaults (`--retries 10`,
@@ -751,7 +755,58 @@ change to either mechanism cannot quietly turn analysis into acquisition. No
 `-o`, `-P`, `-f`, `--merge-output-format`, `--remux-video`, `-x`,
 `--audio-format`, `--download-sections`, `--wait-for-video`, `--write-*`,
 `--download-archive`, credential, header or proxy option appears anywhere on
-this path. Analysis never invokes Worker FFmpeg.
+this path.
+
+#### Analysis descendants cannot reach Worker FFmpeg/ffprobe
+
+The generic analysis child **cannot discover Worker FFmpeg/ffprobe**: its closed
+`PATH` excludes their location and yt-dlp is explicitly pointed at a fixed
+nonexistent ffmpeg location. Node remains available only through its approved
+absolute path.
+
+Two independent mechanisms, so the invariant does not rest on either alone.
+
+**1. A PATH that resolves nothing.** The image intentionally ships
+`/usr/bin/ffmpeg` and `/usr/bin/ffprobe`, and the Phase-10C1 base environment
+sets `PATH=/usr/bin:/bin`. That base environment is unchanged for its existing
+callers (notably the non-network diagnostics probe); analysis alone runs with
+`PATH=/nonexistent/videofetch-yt-dlp-analysis-no-path`, a directory that does
+not exist. It is deliberately a nonexistent absolute path rather than an empty
+string, because an empty `PATH` is read by some resolvers as "use the system
+default" (`confstr(_CS_PATH)` → `/bin:/usr/bin`), which would silently restore
+exactly what this removes.
+
+**2. An explicit ffmpeg-location denial.** Leaving `--ffmpeg-location` unset is
+not neutral. Per `FFmpegPostProcessor._determine_executables` in the pinned
+release:
+
+```python
+location = self.get_param('ffmpeg_location', ...)
+if location is None:
+    return {p: p for p in programs}   # bare 'ffmpeg'/'ffprobe' -> PATH lookup
+if not os.path.exists(location):
+    self.report_warning('... does not exist! Continuing without ffmpeg')
+    return {}                          # nothing resolvable at all
+```
+
+So unset is an *active grant* of PATH discovery, while a nonexistent location
+yields an empty executable map. An empty `_paths` makes `_get_ffmpeg_version`
+return `(None, {})` through its `{None: None}` cache seed — without attempting a
+subprocess — so `basename` is `None`, `available` and `probe_available` are
+false, and `FFmpegFD.available()` (which delegates straight to
+`FFmpegPostProcessor().available`) is false too. The location is a compile-time
+constant: it is never read from the request, the environment, or configuration.
+
+**Node is unaffected.** `_determine_runtime_path` calls `_find_exe` (PATH
+discovery) *only* when no path was supplied, and returns an absolute path
+verbatim otherwise, so `--js-runtimes=node:<absolute path>` keeps working with a
+dead PATH. Deno, Bun and QuickJS stay disabled by `--no-js-runtimes` and would
+additionally be undiscoverable.
+
+*Scope: these are subprocess-boundary guarantees. They deny FFmpeg/ffprobe
+discovery; they are not a claim about every future upstream extractor
+behaviour. Live acceptance must still inspect real descendants under generic
+extraction.*
 
 #### Single-item enforcement
 
@@ -832,8 +887,8 @@ yt-dlp is never asked to extract audio.
 
 | Bound | Value | Behaviour on breach |
 | :--- | :--- | :--- |
-| analysis stdout | 4 MiB | process group terminated, nothing parsed |
-| analysis stderr | 256 KiB | process group terminated |
+| analysis stdout | 4 MiB (UTF-8 **bytes**) | process group terminated, nothing parsed |
+| analysis stderr | 256 KiB (UTF-8 **bytes**) | process group terminated |
 | raw formats | 512 | fail closed (never silently truncated) |
 | emitted presets | 11 | structural assertion on own output |
 | title | 1024 chars | truncated, control characters replaced |
@@ -849,6 +904,16 @@ The ceilings are an opt-in extension of the shared hardened process runner
 (`maxStdoutBytes` / `maxStderrBytes`). Omitting them preserves the historical
 lenient retain-a-tail behaviour exactly, so every pre-existing caller is
 unaffected.
+
+They count **UTF-8 bytes**, via `Buffer.byteLength`, not JavaScript UTF-16 code
+units. `"€"` is one code unit but three bytes and `"😀"` is two code units but
+four, so a `.length` comparison would under-count real output by up to 4x
+against a limit that claims to bound memory. Counting decoded chunks is exact
+across chunk boundaries: `setEncoding("utf8")` puts a `StringDecoder` in front
+of the stream, which buffers an incomplete multibyte sequence and emits it only
+once complete, so a sequence split across raw reads is counted once, in full.
+The only divergence is malformed UTF-8, where the decoder's U+FFFD replacement
+over-counts — a direction that still fails closed.
 
 Analysis writes no persistent cache and no metadata side files.
 
@@ -888,16 +953,37 @@ override it. `source` is derived from the validated URL's hostname.
 ```
 1. validate request shape
 2. Worker SSRF / URL validation
-3. exact pinned-runtime probe
-4. only now: a network-capable subprocess
+3. open ONE subprocess deadline for the whole phase
+4. exact pinned-runtime probe   (capped by the smaller of its own
+                                 maximum and the remaining budget)
+5. only now: a network-capable subprocess, with the REMAINING budget
 ```
 
 Steps 1–2 complete **before any process is spawned, the version probe
 included**, so an unsafe or malformed URL causes zero yt-dlp processes and zero
-Node/EJS descendants. Step 3 exists because a user URL must never be executed by
+Node/EJS descendants. Step 4 exists because a user URL must never be executed by
 an unverified runtime: a missing, mismatched, malformed or unrunnable yt-dlp
 fails closed as `EXTRACTOR_UNAVAILABLE` rather than falling back to whatever is
 on disk.
+
+**One budget, not two.** `analysisTimeoutSeconds` is the budget for analyzing a
+URL, not a per-subprocess allowance. The probe and the network run share a
+single deadline: the probe is capped at `min(YTDLP_PROBE_TIMEOUT_MS, remaining)`
+and the network run receives only what is left. If the probe exhausts the
+budget, **the network-capable subprocess is never started** and the call fails
+`TIMEOUT`. Giving the network run a fresh full budget after the probe had
+already spent part of one would let the pair consume up to twice what the
+configuration permits.
+
+**Cancellation is real, not advisory.** An already-aborted caller starts nothing
+at all — not even the probe. The caller's `AbortSignal` is passed into the probe
+as well as the analysis run, so a cancellation mid-probe terminates the probe's
+own process group through the hardened runner. A cancelled probe **re-throws**
+rather than reporting `available: false`: collapsing it into "unavailable" would
+surface a cancellation downstream as `EXTRACTOR_UNAVAILABLE`, sending an
+operator to look for a runtime-installation problem that does not exist. The
+probe's no-argument form is unchanged, so Phase-10C1 diagnostics behave exactly
+as before.
 
 Initial URL validation is **defence in depth and not a claim about yt-dlp's own
 networking**. Once running, yt-dlp issues its own secondary requests, follows

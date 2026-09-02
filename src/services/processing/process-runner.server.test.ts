@@ -590,6 +590,193 @@ describe("process runner output ceilings", () => {
     assert.deepEqual(child.killCalls, []);
   });
 
+  // ── byte accounting ───────────────────────────────────────────────────────
+  //
+  // The ceilings are named in BYTES and must count bytes. Every test below
+  // fails under a string `.length` comparison, which counts UTF-16 code units:
+  // "€" is 1 unit / 3 bytes and "😀" is 2 units / 4 bytes, so `.length`
+  // under-counts real output by up to 4x.
+
+  it("accepts a multibyte string that is exactly at the byte ceiling", async () => {
+    const child = createFakeChild(47);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    // "€€" is 2 UTF-16 code units but exactly 6 UTF-8 bytes.
+    const payload = "\u20AC\u20AC";
+    assert.equal(payload.length, 2);
+    assert.equal(Buffer.byteLength(payload, "utf8"), 6);
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 6,
+    });
+    child.stdout.write(payload);
+    closeSoon(child, 0);
+
+    const result = await pending;
+    assert.equal(result.stdout, payload);
+    assert.deepEqual(child.killCalls, []);
+  });
+
+  it("overflows on bytes even though the JS string length is far below the ceiling", async () => {
+    const child = createFakeChild(48);
+    const killed: number[] = [];
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: (pid) => {
+        killed.push(pid);
+        return true;
+      },
+    });
+
+    // 6 bytes against a 5-byte ceiling. `.length` is 2, so a code-unit
+    // comparison would wrongly ACCEPT this.
+    const payload = "\u20AC\u20AC";
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 5,
+    });
+    child.stdout.write(payload);
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError, "byte overflow must reject");
+    assert.equal(err.stream, "stdout");
+    assert.deepEqual(killed, [-48], "the whole owned process group must be killed");
+  });
+
+  it("counts astral-plane emoji as their four UTF-8 bytes", async () => {
+    const child = createFakeChild(49);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    // "😀" is 2 UTF-16 code units but 4 UTF-8 bytes.
+    const emoji = "\u{1F600}";
+    assert.equal(emoji.length, 2);
+    assert.equal(Buffer.byteLength(emoji, "utf8"), 4);
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 3,
+    });
+    child.stdout.write(emoji);
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
+  });
+
+  it("applies byte accounting to stderr too", async () => {
+    const child = createFakeChild(50);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    // "é" is 1 code unit / 2 bytes. Four of them are 4 units but 8 bytes.
+    const payload = "\u00E9\u00E9\u00E9\u00E9";
+    assert.equal(payload.length, 4);
+    assert.equal(Buffer.byteLength(payload, "utf8"), 8);
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStderrBytes: 7,
+    });
+    child.stderr.write(payload);
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
+    assert.equal(err.stream, "stderr");
+  });
+
+  it("accumulates bytes across chunks rather than judging each in isolation", async () => {
+    const child = createFakeChild(51);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      maxStdoutBytes: 8,
+    });
+    // Three chunks of 3 bytes each: no single chunk exceeds 8, the total does.
+    child.stdout.write("\u20AC");
+    child.stdout.write("\u20AC");
+    child.stdout.write("\u20AC");
+    closeSoon(child, 0);
+
+    const err = await pending.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(err instanceof ProcessOutputLimitError);
+  });
+
+  it("counts a multibyte sequence split across raw stream chunks exactly once", async () => {
+    // The stream is decoded with setEncoding("utf8"), so Node's StringDecoder
+    // holds an incomplete sequence back and emits it with the chunk that
+    // completes it. Writing the raw bytes of "€" in two pieces must therefore
+    // count 3 bytes in total — not 6, and not 0.
+    const child = createFakeChild(52);
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: () => child as unknown as ChildProcess,
+      processKill: () => true,
+    });
+
+    const euro = Buffer.from("\u20AC", "utf8");
+    assert.equal(euro.length, 3);
+
+    const seen: string[] = [];
+    const pending = runProcess({
+      command: "tool",
+      args: [],
+      timeoutMs: 5_000,
+      // Exactly one euro fits; a double-count would push this over.
+      maxStdoutBytes: 3,
+      onStdout: (chunk) => seen.push(chunk),
+    });
+    child.stdout.write(euro.subarray(0, 1));
+    child.stdout.write(euro.subarray(1));
+    closeSoon(child, 0);
+
+    const result = await pending;
+    assert.equal(result.stdout, "\u20AC", "the split sequence must decode intact");
+    assert.equal(seen.join(""), "\u20AC", "callbacks must see the decoded text");
+    assert.deepEqual(child.killCalls, [], "3 bytes must not exceed a 3-byte ceiling");
+  });
+
   it("an overflow outranks a normal nonzero exit", async () => {
     const child = createFakeChild(46);
     setProcessRunnerTestHooks({

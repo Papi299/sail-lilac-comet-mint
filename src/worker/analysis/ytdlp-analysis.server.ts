@@ -13,10 +13,12 @@ import {
   type WorkerVideoMetadata,
 } from "../../shared/worker/contracts.ts";
 import {
+  YTDLP_PROBE_TIMEOUT_MS,
   YTDLP_RUNTIME,
   buildYtdlpEnvironment,
   probeYtdlpRuntime,
   ytdlpPolicyArgs,
+  type YtdlpProbeOptions,
   type YtdlpRuntimeStatus,
 } from "../runtime/ytdlp-runtime.server.ts";
 
@@ -179,6 +181,79 @@ const RESOLUTION_STEPS = Object.freeze([
   { minHeight: 144, id: "preset:144", label: "144p", resolution: "144p" },
 ] as const);
 
+// ── Descendant isolation ─────────────────────────────────────────────────────
+
+/**
+ * PATH for the analysis child. It resolves nothing.
+ *
+ * The Phase-10C1 base environment sets `PATH=/usr/bin:/bin` so that
+ * well-behaved library code does not fail in surprising ways. For generic
+ * ANALYSIS that is too permissive: the Worker image intentionally ships
+ * `/usr/bin/ffmpeg` and `/usr/bin/ffprobe`, and yt-dlp resolves both by BARE
+ * NAME when no ffmpeg location is configured (see
+ * `YTDLP_ANALYSIS_FFMPEG_LOCATION`). Leaving `/usr/bin` on the child's PATH
+ * would therefore hand a metadata-only subprocess a working media toolchain.
+ *
+ * This directory does not exist in the image, so every PATH lookup fails. It is
+ * deliberately a nonexistent absolute path rather than an empty string: an
+ * empty PATH is interpreted by some resolvers as "use the system default"
+ * (`confstr(_CS_PATH)`, which is `/bin:/usr/bin`), which would silently restore
+ * exactly what this removes.
+ *
+ * Nothing the analysis actually needs is discovered through PATH — the Python
+ * interpreter, the yt-dlp artifact and the approved Node runtime are all passed
+ * as absolute paths.
+ */
+export const YTDLP_ANALYSIS_PATH = "/nonexistent/videofetch-yt-dlp-analysis-no-path";
+
+/**
+ * A fixed, nonexistent location handed to `--ffmpeg-location`.
+ *
+ * This is the second, independent half of the FFmpeg boundary, and it is the
+ * half that works even if the PATH restriction were ever weakened.
+ *
+ * Verified against yt-dlp 2026.08.19's `FFmpegPostProcessor._determine_executables`:
+ *
+ *     location = self.get_param('ffmpeg_location', ...)
+ *     if location is None:
+ *         return {p: p for p in programs}        # bare 'ffmpeg'/'ffprobe' -> PATH
+ *     if not os.path.exists(location):
+ *         self.report_warning('... does not exist! Continuing without ffmpeg')
+ *         return {}                              # nothing resolvable at all
+ *
+ * So leaving it unset is an active grant of PATH discovery, while a
+ * nonexistent location yields an EMPTY executable map. `_paths` being empty
+ * makes `_get_ffmpeg_version` return `(None, {})` via its `{None: None}` cache
+ * seed — without even attempting a subprocess — so `basename` is None,
+ * `available` is False, `probe_available` is False, and
+ * `FFmpegFD.available()` (which delegates straight to
+ * `FFmpegPostProcessor().available`) is False too.
+ *
+ * The value is a compile-time constant. It is never read from the request, the
+ * environment, or configuration, so no caller and no user can point it at a
+ * real binary.
+ */
+export const YTDLP_ANALYSIS_FFMPEG_LOCATION =
+  "/nonexistent/videofetch-yt-dlp-analysis-no-ffmpeg";
+
+/**
+ * The COMPLETE environment for an analysis subprocess.
+ *
+ * Derived from the accepted Phase-10C1 closed environment — which is an
+ * allowlist built from nothing, so no ambient variable survives — with PATH
+ * replaced by a location that resolves nothing. The base environment is left
+ * untouched for its existing callers, notably the diagnostics version probe,
+ * which is a non-network invocation with no FFmpeg exposure to worry about.
+ */
+export function buildYtdlpAnalysisEnvironment(
+  opts: { workDir?: string } = {},
+): NodeJS.ProcessEnv {
+  return Object.freeze({
+    ...buildYtdlpEnvironment(opts),
+    PATH: YTDLP_ANALYSIS_PATH,
+  }) as NodeJS.ProcessEnv;
+}
+
 // ── Analysis argument policy ─────────────────────────────────────────────────
 
 /**
@@ -246,6 +321,16 @@ export function ytdlpAnalysisPolicyArgs(): readonly string[] {
     `--socket-timeout=${ANALYSIS_SOCKET_TIMEOUT_SECONDS}`,
     `--retries=${ANALYSIS_RETRIES}`,
     `--extractor-retries=${ANALYSIS_EXTRACTOR_RETRIES}`,
+
+    // ── FFmpeg/ffprobe denial ────────────────────────────────────────────
+    // Points yt-dlp at a fixed nonexistent location so it treats FFmpeg and
+    // ffprobe as UNAVAILABLE. Leaving this unset is not neutral: the pinned
+    // release then resolves both by bare name through PATH. See
+    // YTDLP_ANALYSIS_FFMPEG_LOCATION for the exact upstream evidence.
+    //
+    // This is one of two independent mechanisms; the other is the analysis
+    // PATH, which resolves nothing at all.
+    `--ffmpeg-location=${YTDLP_ANALYSIS_FFMPEG_LOCATION}`,
   ] as const);
 }
 
@@ -766,10 +851,15 @@ export type GenericAnalysisDeps = {
   /** Whether the Worker's OWN FFmpeg is usable for post-`downloading` work. */
   readonly ffmpegAvailable?: boolean;
   readonly signal?: AbortSignal;
-  /** Test seams. Production uses the real hardened runner and probe. */
+  /** Test seams. Production uses the real hardened runner, probe and clock. */
   readonly runner?: typeof runProcess;
-  readonly probeRuntime?: () => Promise<YtdlpRuntimeStatus>;
+  readonly probeRuntime?: (opts: YtdlpProbeOptions) => Promise<YtdlpRuntimeStatus>;
   readonly validateUrl?: (raw: string) => Promise<{ url: string; hostname: string }>;
+  /**
+   * Monotonic-enough millisecond clock for the shared subprocess deadline.
+   * Injectable so budget arithmetic can be tested without real sleeps.
+   */
+  readonly clock?: () => number;
 };
 
 /**
@@ -804,6 +894,7 @@ export async function analyzeGenericMedia(
   const runner = deps.runner ?? runProcess;
   const probe = deps.probeRuntime ?? probeYtdlpRuntime;
   const validate = deps.validateUrl ?? assertSafeUrl;
+  const clock = deps.clock ?? Date.now;
 
   // 1. Request shape. Rejected before anything is spawned.
   const shape = WorkerAnalyzeRequestSchema.safeParse({ url });
@@ -813,24 +904,50 @@ export async function analyzeGenericMedia(
   //    Its AppErrors (INVALID_URL, NETWORK_ERROR) propagate unchanged.
   const { url: safeUrl, hostname } = await validate(shape.data.url);
 
-  // 3. Exact pinned-runtime gate. Only now may a process exist at all, and this
-  //    one is the non-network version probe.
-  const runtime = await probe();
-  if (!runtime.available) throw new AppError("EXTRACTOR_UNAVAILABLE");
-
-  // 4. Generic network analysis.
-  const timeoutMs = Math.max(
+  // 3. One deadline for the WHOLE subprocess phase.
+  //
+  //    `analysisTimeoutSeconds` is the caller's budget for analyzing this URL,
+  //    not a per-subprocess allowance. The probe and the network analysis
+  //    therefore share it: giving the network run a fresh full budget after the
+  //    probe had already spent part of one would let the pair take up to twice
+  //    what the configuration permits.
+  const budgetMs = Math.max(
     YTDLP_ANALYSIS_MIN_TIMEOUT_MS,
     Math.floor(deps.limits.analysisTimeoutSeconds * 1000),
   );
+  const deadline = clock() + budgetMs;
+
+  // An already-cancelled caller gets no subprocess at all — not even the probe.
+  // The runner would refuse to spawn anyway, but checking here makes "nothing
+  // was started" a property of this function rather than of its dependencies.
+  if (deps.signal?.aborted) {
+    throw new AppError("PROCESSING_FAILED", "Download was cancelled.");
+  }
+
+  // 4. Exact pinned-runtime gate. Only now may a process exist at all, and this
+  //    one is the non-network version probe. It is capped by whichever is
+  //    smaller: its own conservative maximum, or what is left of the budget.
+  const probeBudgetMs = Math.min(YTDLP_PROBE_TIMEOUT_MS, deadline - clock());
+  if (probeBudgetMs <= 0) throw new AppError("TIMEOUT");
+
+  const runtime = await probe({ signal: deps.signal, timeoutMs: probeBudgetMs });
+  if (!runtime.available) throw new AppError("EXTRACTOR_UNAVAILABLE");
+
+  // 5. Generic network analysis, with only the REMAINING budget. If the probe
+  //    consumed all of it, the network-capable subprocess is never started.
+  const networkTimeoutMs = deadline - clock();
+  if (networkTimeoutMs <= 0) throw new AppError("TIMEOUT");
 
   let result: RunResult;
   try {
     result = await runner({
       command: YTDLP_RUNTIME.pythonPath,
       args: [...buildYtdlpAnalysisArgv(safeUrl)],
-      timeoutMs,
-      env: buildYtdlpEnvironment(),
+      timeoutMs: networkTimeoutMs,
+      // The analysis-specific environment, whose PATH resolves nothing. This is
+      // NOT the shared base environment: that one keeps /usr/bin on PATH, where
+      // this image's ffmpeg and ffprobe live.
+      env: buildYtdlpAnalysisEnvironment(),
       signal: deps.signal,
       maxStdoutBytes: YTDLP_ANALYSIS_MAX_STDOUT_BYTES,
       maxStderrBytes: YTDLP_ANALYSIS_MAX_STDERR_BYTES,

@@ -47,6 +47,30 @@ export class ProcessOutputLimitError extends AppError {
   }
 }
 
+/**
+ * UTF-8 byte length of an already-decoded chunk.
+ *
+ * The hard ceilings are named `maxStdoutBytes`/`maxStderrBytes` and must
+ * therefore count BYTES, not JavaScript UTF-16 code units. `"€"` is one code
+ * unit but three UTF-8 bytes, and `"😀"` is two code units but four, so a
+ * `.length` comparison under-counts real output by up to 4x and would let a
+ * multibyte-heavy stream blow well past a ceiling that claims to bound memory.
+ *
+ * Counting the DECODED chunk is exact rather than approximate. The streams run
+ * through Node's `StringDecoder` (via `setEncoding("utf8")`), which buffers an
+ * incomplete multibyte sequence internally and emits it only once the
+ * continuation bytes arrive. A sequence split across two raw reads is therefore
+ * counted once, in full, in the chunk that completes it — never half-counted in
+ * one chunk and half in the next, and never double-counted.
+ *
+ * The one divergence is genuinely malformed UTF-8, which the decoder replaces
+ * with U+FFFD (3 bytes) where the raw input may have been 1-2. That direction
+ * over-counts, so the ceiling still fails closed.
+ */
+function utf8ByteLength(chunk: string): number {
+  return Buffer.byteLength(chunk, "utf8");
+}
+
 type TerminationReason = "none" | "timeout" | "abort" | "stdout_limit" | "stderr_limit";
 
 export type SpawnImpl = (
@@ -181,15 +205,22 @@ export function runProcess(opts: {
   onStderr?: (chunk: string) => void;
   env?: NodeJS.ProcessEnv;
   /**
-   * HARD ceiling on total stdout bytes. When supplied and exceeded, the owned
-   * process group is terminated and the promise rejects with
+   * HARD ceiling on total stdout UTF-8 BYTES. When supplied and exceeded, the
+   * owned process group is terminated and the promise rejects with
    * `ProcessOutputLimitError`; no partial output is resolved or returned.
    *
+   * Counted with `Buffer.byteLength`, not string `.length` — see
+   * `utf8ByteLength` for why the distinction matters and why counting decoded
+   * chunks is exact across chunk boundaries.
+   *
    * Omitting it preserves the historical lenient behaviour exactly: retain at
-   * most ~8 MB, keeping the last ~4 MB, and let the child run on.
+   * most ~8 MB, keeping the last ~4 MB, and let the child run on. That legacy
+   * retention path deliberately still uses `.length`; it is a pre-existing
+   * memory-retention heuristic rather than a ceiling anyone is promised, and
+   * changing it is out of scope here.
    */
   maxStdoutBytes?: number;
-  /** HARD ceiling on total stderr bytes. Same semantics as `maxStdoutBytes`. */
+  /** HARD ceiling on total stderr UTF-8 bytes. Same semantics as `maxStdoutBytes`. */
   maxStderrBytes?: number;
 }): Promise<RunResult> {
   const {
@@ -219,6 +250,11 @@ export function runProcess(opts: {
 
     let stdout = "";
     let stderr = "";
+    // Accumulated UTF-8 BYTE totals, maintained only when a hard ceiling is in
+    // force. Kept separate from the retained strings because the strings are
+    // cleared on overflow while the totals must stay monotonic.
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
     let terminationReason: TerminationReason = "none";
     let settled = false;
 
@@ -277,7 +313,8 @@ export function runProcess(opts: {
     stdoutStream.on("data", (chunk: string) => {
       stdout += chunk;
       if (maxStdoutBytes !== undefined) {
-        if (stdout.length > maxStdoutBytes) {
+        stdoutBytes += utf8ByteLength(chunk);
+        if (stdoutBytes > maxStdoutBytes) {
           // Drop what we hold immediately: an over-limit stream is never
           // returned, never parsed and never classified, so retaining it would
           // only keep unwanted bytes alive until the promise settles.
@@ -293,7 +330,8 @@ export function runProcess(opts: {
     stderrStream.on("data", (chunk: string) => {
       stderr += chunk;
       if (maxStderrBytes !== undefined) {
-        if (stderr.length > maxStderrBytes) {
+        stderrBytes += utf8ByteLength(chunk);
+        if (stderrBytes > maxStderrBytes) {
           stderr = "";
           requestTermination("stderr_limit");
           return;
