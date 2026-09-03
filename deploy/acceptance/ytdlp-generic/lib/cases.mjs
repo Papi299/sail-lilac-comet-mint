@@ -26,7 +26,7 @@ import { classifyTransitionTrace } from "./lifecycle.mjs";
 import { createDownloadWindowCollector } from "./download-window.mjs";
 import { attributeDenial } from "./egress-policy.mjs";
 
-import { EVIDENCE_SCHEMA_VERSION, HARNESS_ID } from "./provenance.mjs";
+import { EVIDENCE_SCHEMA_VERSION, HARNESS_ID, IMAGE_ID_PATTERN } from "./provenance.mjs";
 
 /** One schema constant governs both record kinds, so they cannot drift apart. */
 export const CASE_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION;
@@ -124,7 +124,14 @@ const CASE_PAYLOAD_VALIDATORS = Object.freeze({
       isBool(v?.restartObserved) &&
       isBool(v?.groupMembersMeasured) &&
       isArr(v?.groupSurvivors) &&
-      isStr(v?.recoveredStatus),
+      // §14 of CORRECTION-05: the deterministic recovery result, in full. All
+      // three are REQUIRED fields, so a record cannot omit one and have the
+      // evaluator read `undefined !== "failed"` as a coincidental refusal
+      // rather than a structural one.
+      isStr(v?.recoveredStatus) &&
+      "recoveredErrorCode" in v &&
+      "recoveredSafeErrorMessage" in v &&
+      isBool(v?.lateReady),
   },
   "safe-egress": {
     egressNegative: (v) =>
@@ -144,7 +151,11 @@ const CASE_PAYLOAD_VALIDATORS = Object.freeze({
       isStr(v?.status) &&
       isArr(v?.sampledBasenames) &&
       isBool(v?.processSamplingMeasured) &&
-      isInt(v?.samplesTaken),
+      isInt(v?.samplesTaken) &&
+      // The coverage gaps are REQUIRED fields, so a record cannot omit them and
+      // have the evaluator read `undefined` as "no gaps".
+      isArr(v?.samplingErrors) &&
+      isInt(v?.samplingErrorCount),
   },
   "kill-switch": {
     killSwitch: (v) => isBool(v?.genericUsableAfterDisable) && isBool(v?.directWorks),
@@ -232,6 +243,21 @@ export function isWellFormedFeatureState(value) {
   );
 }
 
+/**
+ * The shape a sealed `imageContinuity` must have to be believed.
+ *
+ * `same` is not taken on trust — it is recomputed from the two ids, so a record
+ * asserting `same: true` beside two different ids is refused rather than
+ * believed. All three ids must be the SAME object.
+ */
+export function isWellFormedImageContinuity(value) {
+  if (value == null || typeof value !== "object") return false;
+  const { before, after, taggedImageId, same } = value;
+  if (![before, after, taggedImageId].every((id) => IMAGE_ID_PATTERN.test(String(id)))) return false;
+  if (before !== after || before !== taggedImageId) return false;
+  return same === true;
+}
+
 /** Wraps a case's produced observations into the on-disk record. */
 export function buildCaseRecord({
   caseName,
@@ -241,6 +267,7 @@ export function buildCaseRecord({
   startedAt,
   finishedAt,
   featureState,
+  imageContinuity,
 }) {
   return {
     harness: HARNESS_ID,
@@ -252,6 +279,10 @@ export function buildCaseRecord({
     runningImageId: binding?.runningImageId ?? null,
     // Sealed WITH the record; see `describeFeatureState`.
     featureState: featureState ?? null,
+    // §8-§10 of CORRECTION-05: the image object on BOTH sides of the producer.
+    // Image ids are not secrets, and recording both is what lets a reviewer see
+    // that a restart-spanning case stayed on one image.
+    imageContinuity: imageContinuity ?? null,
     startedAt: startedAt ?? null,
     finishedAt: finishedAt ?? null,
     payload,
@@ -318,6 +349,29 @@ export function validateCaseRecord(record, binding) {
       reason:
         `case '${record.case}' requires generic ${requiredState}, but the sealed evidence records ` +
         `that it ran while generic was ${featureState.state}`,
+    };
+  }
+
+  // ── §9/§11 of CORRECTION-05: one image object, start to finish ────────────
+  //
+  // The producing CLI refuses to seal a record whose image changed, so a record
+  // that reaches here should always carry a consistent continuity object. It is
+  // re-checked anyway, because the aggregate must be able to state that no
+  // accepted record combines evidence from two images — and a claim the
+  // aggregator cannot verify itself is a claim it should not make.
+  const continuity = record.imageContinuity;
+  if (!isWellFormedImageContinuity(continuity)) {
+    return {
+      ok: false,
+      reason:
+        `case '${record.case}' carries no well-formed image-continuity evidence; the deployment ` +
+        "it ran against cannot be confirmed to have stayed the same",
+    };
+  }
+  if (continuity.before !== record.runningImageId) {
+    return {
+      ok: false,
+      reason: `case '${record.case}' records a different image before the case than it binds to`,
     };
   }
 
@@ -630,7 +684,15 @@ export async function runDirectRegressionCase(ctx) {
 
   const basenames = new Set();
   let samplesTaken = 0;
-  let samplingFailure = null;
+  // §16-§17 of CORRECTION-05: EVERY failed attempt is kept.
+  //
+  // The previous code held a single nullable `samplingFailure`, which a later
+  // successful sample then overwrote with nothing — so a run that lost an
+  // interval looked identical to one that never did. A failed attempt is an
+  // unobserved interval, and this case's whole claim is a negative one across
+  // the run, so the gaps travel with the evidence exactly as they do for the
+  // generic downloading window.
+  const samplingErrors = [];
   let settled = false;
 
   const samplingLoop = (async () => {
@@ -640,7 +702,7 @@ export async function runDirectRegressionCase(ctx) {
         samplesTaken += 1;
         for (const row of observed.sample) basenames.add(String(row.comm ?? "").toLowerCase());
       } catch (error) {
-        samplingFailure = String(error?.message ?? error);
+        samplingErrors.push(String(error?.message ?? error));
       }
       await ctx.sleep(150);
     }
@@ -665,7 +727,8 @@ export async function runDirectRegressionCase(ctx) {
       // §13: an empty list from a failed sampler must not read as "no yt-dlp".
       processSamplingMeasured: samplesTaken > 0,
       samplesTaken,
-      samplingFailure,
+      samplingErrors,
+      samplingErrorCount: samplingErrors.length,
       sampledBasenames: [...basenames].sort(),
     },
   };
@@ -886,7 +949,9 @@ export async function runShutdownCase(ctx) {
 
   // 4. The CAPTURED group must be gone, at host level.
   const survivors = await ctx.processGroupMembers(captured.pgid);
-  const finalJob = await session.jobStatus(jobId);
+
+  // 5. The AUTHORITATIVE recovery result (§12-§14 of CORRECTION-05).
+  const recovery = await awaitRecoveredJob(ctx, jobId);
 
   return {
     shutdownCase: {
@@ -902,9 +967,72 @@ export async function runShutdownCase(ctx) {
       groupMembersMeasured: survivors.measured === true,
       groupSurvivors: survivors.measured === true ? survivors.value : [],
       groupQueryReason: survivors.measured === true ? null : survivors.reason,
-      recoveredStatus: finalJob?.status ?? "unknown",
+      recoveredStatus: recovery.status,
+      recoveredErrorCode: recovery.errorCode,
+      recoveredSafeErrorMessage: recovery.safeErrorMessage,
+      recoveryPolls: recovery.polls,
+      lateReady: recovery.lateReady,
     },
   };
+}
+
+/**
+ * Polls, boundedly, for the job the restarted Worker recovered (§13).
+ *
+ * ── Why this is not a single request ───────────────────────────────────────
+ *
+ * The restart is detected by the container's main PID changing, which happens
+ * the instant the new container starts — well before the Worker has opened its
+ * database, run `recover()`, and begun answering HTTP. A single request at that
+ * moment would most often fail outright, and an early answer could still show
+ * the pre-restart row. So this waits for the Worker to answer at all, and then
+ * for the job to reach a terminal state.
+ *
+ * A window that expires without a terminal answer is a measurement failure and
+ * the case aborts — never a favourable default.
+ */
+async function awaitRecoveredJob(ctx, jobId) {
+  const { session } = ctx;
+  const timeoutMs = ctx.recoveryWindowMs ?? 2 * 60 * 1000;
+  const deadline = Date.now() + timeoutMs;
+  let polls = 0;
+  let lateReady = false;
+  let lastFailure = null;
+
+  while (Date.now() < deadline) {
+    polls += 1;
+    let job = null;
+    try {
+      job = await session.jobStatus(jobId);
+    } catch (error) {
+      // The Worker is not answering yet. That is expected immediately after a
+      // restart and is not itself a finding.
+      lastFailure = String(error?.message ?? error);
+      await ctx.sleep(500);
+      continue;
+    }
+
+    if (job.status === "ready") lateReady = true;
+    if (["ready", "failed", "cancelled"].includes(job.status)) {
+      return {
+        status: job.status,
+        // `error` is the browser projection of the durable `safeErrorMessage`
+        // — `src/web/jobs/public-job.ts` surfaces it under that name, and it is
+        // the deterministic recovery sentence when the restart path set one.
+        errorCode: job.errorCode ?? null,
+        safeErrorMessage: typeof job.error === "string" ? job.error : null,
+        polls,
+        lateReady,
+      };
+    }
+    await ctx.sleep(500);
+  }
+
+  throw new Error(
+    `the restarted Worker did not report a terminal state for the interrupted job within ` +
+      `${Math.round(timeoutMs / 1000)}s${lastFailure ? ` (last error: ${lastFailure})` : ""}; ` +
+      "the restart-recovery contract could not be observed",
+  );
 }
 
 /**

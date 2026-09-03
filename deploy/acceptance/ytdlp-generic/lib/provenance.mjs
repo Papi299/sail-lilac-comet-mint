@@ -251,6 +251,52 @@ async function inspectRunKeyPermissions(path, statFile) {
 }
 
 /**
+ * Reads and structurally validates an EXISTING run-key file (§23 of
+ * CORRECTION-05).
+ *
+ * Every failure is an error, never a reason to mint. The previous version fell
+ * through to "mint a fresh run" on unreadable content or malformed JSON, which
+ * OVERWROTE the file — destroying the only key that could verify the artifacts
+ * already sealed under it, and doing so silently at the exact moment something
+ * was already wrong. A damaged acceptance identity is the operator's to
+ * archive or delete; the harness stops and says so.
+ */
+async function readExistingRun(path, read) {
+  let contents;
+  try {
+    contents = await read(path, "utf8");
+  } catch (error) {
+    return {
+      error:
+        `the acceptance run key at ${path} exists but could not be read ` +
+        `(${String(error?.code ?? error?.message ?? error)}); refusing to replace it`,
+    };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(contents);
+  } catch {
+    return {
+      error:
+        `the acceptance run key at ${path} exists but is not valid JSON. Refusing to overwrite ` +
+        "it: the artifacts already sealed under this run could only ever be verified with the " +
+        "key it holds. Archive or delete it deliberately, then re-run Stage A.",
+    };
+  }
+
+  if (typeof parsed?.runId !== "string" || !/^[0-9a-f]{64}$/.test(String(parsed?.key ?? ""))) {
+    return {
+      error:
+        `the acceptance run key at ${path} exists but does not carry a usable runId and 256-bit ` +
+        "key. Refusing to overwrite it; archive or delete it deliberately, then re-run Stage A.",
+    };
+  }
+
+  return { runId: parsed.runId, key: parsed.key };
+}
+
+/**
  * Creates or loads the acceptance run identity.
  *
  * The file holds a random `runId` and a 256-bit key, is written `0600`, and is
@@ -258,9 +304,10 @@ async function inspectRunKeyPermissions(path, statFile) {
  * the `runId` — which is not secret — travels with the artifacts.
  *
  * §26 of CORRECTION-04: an EXISTING key is subject to the same permission
- * property as `loadRun` enforces. Stage A resuming a world-readable key would
- * have quietly re-established the exact weakness `loadRun` refuses, from the
- * one command that is expected to touch the file first.
+ * property as `loadRun` enforces. §23 of CORRECTION-05: a file that EXISTS is
+ * never replaced, whatever is wrong with it.
+ *
+ * ENOENT is the only condition that mints a new run.
  *
  * The operator deletes it when acceptance is complete; the README says so.
  */
@@ -275,16 +322,9 @@ export async function loadOrCreateRun(path, deps = {}) {
   if (permissions.error) return { error: permissions.error };
 
   if (!permissions.absent) {
-    try {
-      const parsed = JSON.parse(await read(path, "utf8"));
-      if (typeof parsed?.runId === "string" && /^[0-9a-f]{64}$/.test(String(parsed?.key ?? ""))) {
-        return { runId: parsed.runId, key: parsed.key, created: false };
-      }
-    } catch {
-      // Present but unusable content -> mint a fresh run over it. The
-      // PERMISSIONS were already measured and are private, so this is a
-      // corrupt file rather than an exposed one.
-    }
+    const existing = await readExistingRun(path, read);
+    if (existing.error) return { error: existing.error };
+    return { runId: existing.runId, key: existing.key, created: false };
   }
 
   const runId = randomBytes(8).toString("hex");
@@ -306,6 +346,10 @@ export async function loadOrCreateRun(path, deps = {}) {
  * Stage B cases and the aggregation must join the run Stage A began; silently
  * minting a new key here would make every prior artifact unverifiable and, worse,
  * would let a re-keyed run re-seal edited records.
+ *
+ * A file that exists but is damaged is an ERROR here too, not a `null`: `null`
+ * means "no run has been started", which would send the operator to re-run
+ * Stage A and quietly overwrite the very file that needed attention.
  */
 export async function loadRun(path, deps = {}) {
   const read = deps.readFile ?? readFile;
@@ -317,15 +361,9 @@ export async function loadRun(path, deps = {}) {
   // run, which is a different and more actionable message.
   if (permissions.absent) return null;
 
-  try {
-    const parsed = JSON.parse(await read(path, "utf8"));
-    if (typeof parsed?.runId === "string" && /^[0-9a-f]{64}$/.test(String(parsed?.key ?? ""))) {
-      return { runId: parsed.runId, key: parsed.key };
-    }
-    return null;
-  } catch {
-    return null;
-  }
+  const existing = await readExistingRun(path, read);
+  if (existing.error) return { error: existing.error };
+  return { runId: existing.runId, key: existing.key };
 }
 
 /** A non-secret fingerprint safe to place in evidence, for correlating artifacts. */

@@ -43,6 +43,30 @@ export const APPLICATION_PRESETS = Object.freeze([
 export const DIRECT_FORMAT_ID = "direct-original";
 
 /**
+ * The Worker's own deterministic restart-recovery result.
+ *
+ * Mirrors `recover()` in `src/worker/state/sqlite-job-store.server.ts`, which
+ * moves every job left in `analyzing`, `downloading`, `processing` or
+ * `uploading` to exactly these three values. `queued` is deliberately NOT
+ * recovered — it is still legitimately queued — but the shutdown case captures
+ * the job in durable `downloading`, so it is always inside the recovered set.
+ *
+ * `safeErrorMessage` is asserted rather than skipped as brittle: it is a
+ * literal in the Worker's own SQL, not a formatted or localized string, and it
+ * is the only field that distinguishes "the restart path recovered this job"
+ * from "the job failed for some other reason and happened to be classified
+ * PROCESSING_FAILED" — which every internal acquisition failure is. Without it,
+ * a job that failed on its own a moment before the restart would satisfy the
+ * check. The harness reads it through the browser projection `error`, which
+ * `src/web/jobs/public-job.ts` documents as where `safeErrorMessage` surfaces.
+ */
+export const RESTART_RECOVERY = Object.freeze({
+  status: "failed",
+  errorCode: "PROCESSING_FAILED",
+  safeErrorMessage: "Worker restarted before the job completed.",
+});
+
+/**
  * Durable fields that must NOT exist on a generic job (§20 of CORRECTION-01).
  *
  * `formatId` / `format_id` are deliberately ABSENT from this list. Phase 10C3
@@ -548,13 +572,36 @@ export function evaluateStageB(obs, stageAResult) {
     );
   } else {
     add(groupTerminationCheck("shutdown.group-terminated", obs.shutdownCase.value, stage, "the Worker restart"));
+    // §12-§15 of CORRECTION-05: the AUTHORITATIVE recovery result.
+    //
+    // The previous predicate accepted any non-empty status string, so `ready`,
+    // `cancelled`, or a job still sitting in `downloading` all passed a check
+    // named "job-recovered". The Worker's restart policy is deterministic —
+    // `sqlite-job-store.server.ts` `recover()` moves every job in `analyzing`,
+    // `downloading`, `processing` or `uploading` to exactly:
+    //
+    //     status             = 'failed'
+    //     error_code         = 'PROCESSING_FAILED'
+    //     safe_error_message = 'Worker restarted before the job completed.'
+    //
+    // so acceptance asserts that, not a shape. An interrupted job is neither
+    // resumed nor cancelled, and a `ready` here would mean the Worker somehow
+    // completed a job whose acquisition process was killed mid-download.
+    //
+    // This is a SEPARATE assertion from `shutdown.group-terminated`: a correct
+    // durable row says nothing about whether the acquisition process died, and
+    // a dead process group says nothing about the durable row. Neither may
+    // stand in for the other.
     add(
       assertCheck(
         "shutdown.job-recovered",
         obs.shutdownCase.value?.restartObserved === true &&
-          typeof obs.shutdownCase.value?.recoveredStatus === "string" &&
-          obs.shutdownCase.value.recoveredStatus.length > 0,
-        "the Worker restart was observed and the job was recovered per the restart policy",
+          obs.shutdownCase.value?.lateReady === false &&
+          obs.shutdownCase.value?.recoveredStatus === RESTART_RECOVERY.status &&
+          obs.shutdownCase.value?.recoveredErrorCode === RESTART_RECOVERY.errorCode &&
+          obs.shutdownCase.value?.recoveredSafeErrorMessage === RESTART_RECOVERY.safeErrorMessage,
+        `the interrupted job was recovered as ${RESTART_RECOVERY.status}/` +
+          `${RESTART_RECOVERY.errorCode} with the deterministic restart message`,
         { stage },
       ),
     );
@@ -574,17 +621,31 @@ export function evaluateStageB(obs, stageAResult) {
   // `sampledBasenames: []` from a failed sampler previously PASSED this check —
   // the exact SKIPPED->PASS edge the harness forbids elsewhere. Sampling that
   // never ran is BLOCKED, not a clean result.
+  // §16-§18 of CORRECTION-05: a sampling ERROR is a coverage gap, and a later
+  // successful sample cannot close it.
+  //
+  // This is the same rule the generic downloading window already applies, for
+  // the same reason: "no yt-dlp process appeared" is a claim across the WHOLE
+  // monitored run, and an attempt that returned nothing leaves an interval in
+  // which one could have appeared unobserved. Clean samples either side of a
+  // gap do not describe the gap. They stay in the evidence; they simply cannot
+  // support a continuous negative assertion.
   const directSampling = obs.directAfterEnable;
+  const samplingErrorCount = directSampling?.value?.samplingErrorCount ?? 0;
   const samplingRan =
     directSampling?.measured === true &&
     directSampling.value?.processSamplingMeasured === true &&
-    directSampling.value?.samplesTaken > 0;
+    directSampling.value?.samplesTaken > 0 &&
+    samplingErrorCount === 0;
 
   if (!samplingRan) {
     const why =
       directSampling?.measured !== true
         ? (directSampling?.reason ?? "the direct regression was not performed")
-        : (directSampling.value?.samplingFailure ?? "no process sample was taken during the direct job");
+        : samplingErrorCount > 0
+          ? `${samplingErrorCount} sampling attempt(s) failed while the direct job ran, leaving ` +
+            "unobserved interval(s) that cannot support a negative claim"
+          : "no process sample was taken during the direct job";
     add(check("direct.process-sampling-available", OUTCOMES.BLOCKED, why, { stage }));
     add(
       check(

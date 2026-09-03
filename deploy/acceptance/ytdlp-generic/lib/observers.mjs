@@ -87,9 +87,16 @@ const DURABLE_QUERY_PATTERN = new RegExp(
  * some entry's executable matches AND its predicate accepts the full argv.
  */
 const READ_ONLY_COMMANDS = Object.freeze([
-  // Read-only container and image introspection.
-  ["docker", (a) => a[0] === "inspect"],
-  ["docker", (a) => a[0] === "image" && a[1] === "inspect"],
+  // Read-only container and image introspection, restricted to the EXACT
+  // templates this harness uses (§4 of CORRECTION-05).
+  //
+  // `docker inspect` is read-only, but `--format '{{range .Config.Env}}...'`
+  // returns the complete `NAME=value` environment — every Worker secret
+  // included. Leaving the verb open and merely not using that template would
+  // make the secret one template string away; naming the four templates makes
+  // retrieving the environment through `docker inspect` unrepresentable.
+  ["docker", (a) => a[0] === "inspect" && isAllowedInspect(a)],
+  ["docker", (a) => a[0] === "image" && a[1] === "inspect" && isAllowedImageInspect(a)],
   ["docker", (a) => a[0] === "logs"],
   // Process listing with an EXPLICIT safe column set — never a command line.
   ["docker", (a) => a[0] === "top"],
@@ -143,6 +150,31 @@ const READ_ONLY_COMMANDS = Object.freeze([
   ],
 ]);
 
+/**
+ * The only container templates the allowlist admits.
+ *
+ * `docker inspect --format <one of these> <container>` and nothing else. The
+ * environment is not among them, and cannot be.
+ */
+const ALLOWED_INSPECT_FORMATS = Object.freeze([
+  "{{.Image}}",
+  "{{.HostConfig.NetworkMode}}",
+  "{{.State.Pid}}",
+]);
+
+function isAllowedInspect(argv) {
+  return (
+    argv.length === 4 &&
+    argv[1] === "--format" &&
+    ALLOWED_INSPECT_FORMATS.includes(argv[2])
+  );
+}
+
+/** `docker image inspect --format {{.Id}} <reference>` and nothing else. */
+function isAllowedImageInspect(argv) {
+  return argv.length === 5 && argv[2] === "--format" && argv[3] === "{{.Id}}";
+}
+
 /** The only in-container commands the allowlist admits. */
 function isVersionProbe(argv) {
   const joined = argv.slice(2).join(" "); // drop `exec <container>`
@@ -151,6 +183,12 @@ function isVersionProbe(argv) {
     joined === "node --version" ||
     joined === "/usr/bin/python3 /usr/local/lib/videofetch/yt-dlp --version" ||
     joined === EJS_PROBE_ARGV.join(" ") ||
+    // §6 of CORRECTION-05: three FIXED environment probes, matched whole. The
+    // variable name is inside the constant, so no argument the caller supplies
+    // can redirect the read to a different variable.
+    joined === ENV_NAMES_PROBE_ARGV.join(" ") ||
+    joined === YTDLP_ENABLED_PROBE_ARGV.join(" ") ||
+    joined === MAX_FILE_SIZE_PROBE_ARGV.join(" ") ||
     isWorkDirProbe(argv)
   );
 }
@@ -182,6 +220,71 @@ export const EJS_PROBE_ARGV = Object.freeze([
     "try:\n from yt_dlp_ejs import __version__ as v\n print(v)\n" +
     "except Exception:\n print('UNAVAILABLE')",
 ]);
+
+// ── The environment probes (§4-§6 of CORRECTION-05) ────────────────────────
+//
+// The previous observers rendered `{{range .Config.Env}}{{println .}}{{end}}`,
+// which emits the COMPLETE `NAME=value` environment — `WORKER_CONTROL_SECRET`
+// included — and then discarded the values in JavaScript.
+//
+// That is the wrong order of operations for a harness whose subject holds
+// secrets. The value crossed the process boundary into the harness before
+// anything decided it was unwanted: it existed in a Node string, in the child
+// process's stdout buffer, and in any core dump or stack trace taken in
+// between. "Fetched, then sanitized" is not "never fetched".
+//
+// These three probes retrieve only what is needed. Each source string is a
+// COMPILE-TIME CONSTANT admitted by the exact `docker exec` allowlist, so the
+// caller cannot choose which variable is read — there is no general Python
+// execution capability here, only three fixed questions.
+
+/**
+ * Names only. Environment variable names cannot contain `=` or a newline, so a
+ * line-oriented reading is exact — and no `=` is ever printed, so no value can
+ * ride along.
+ */
+export const ENV_NAMES_PROBE_ARGV = Object.freeze([
+  "/usr/bin/python3",
+  "-c",
+  'import os;print("\n".join(sorted(os.environ)))',
+]);
+
+/**
+ * The two non-secret deployment variables, each by NAME, each in its own probe.
+ *
+ * `<UNSET>` vs `SET:<value>` rather than a bare value, because a bare sentinel
+ * is ambiguous: a variable literally set to `<UNSET>` would be indistinguishable
+ * from an absent one, and for `YTDLP_ENABLED` that ambiguity resolves to
+ * "disabled" — a silent misreading of the deployment's own feature state.
+ */
+export const YTDLP_ENABLED_PROBE_ARGV = Object.freeze([
+  "/usr/bin/python3",
+  "-c",
+  'import os;v=os.environ.get("YTDLP_ENABLED");print("<UNSET>" if v is None else "SET:"+v)',
+]);
+
+export const MAX_FILE_SIZE_PROBE_ARGV = Object.freeze([
+  "/usr/bin/python3",
+  "-c",
+  'import os;v=os.environ.get("MAX_FILE_SIZE");print("<UNSET>" if v is None else "SET:"+v)',
+]);
+
+/**
+ * Decodes one `<UNSET>` / `SET:<value>` probe result.
+ *
+ * `print` appends exactly one newline, which is removed; nothing else is
+ * trimmed here, so a value's own surrounding whitespace reaches the caller
+ * intact and is subjected to the runtime's own grammar rather than this
+ * function's guess. An embedded newline in the value survives too, because the
+ * prefix is stripped from the WHOLE output rather than from a first line.
+ */
+export function decodeEnvProbe(stdout) {
+  const raw = String(stdout ?? "");
+  const body = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+  if (body === "<UNSET>") return { measured: true, present: false, value: null };
+  if (body.startsWith("SET:")) return { measured: true, present: true, value: body.slice(4) };
+  return { measured: false, reason: "the environment probe did not return its fixed shape" };
+}
 
 /**
  * The per-job working-directory probe.
@@ -396,62 +499,65 @@ export function makeSystemObservers(deps = {}) {
     },
 
     /**
-     * The Worker's bound environment VARIABLE NAMES (§16/§17).
+     * The Worker's bound environment VARIABLE NAMES (§16/§17; §5A of
+     * CORRECTION-05).
      *
-     * `{{range .Config.Env}}` yields `NAME=value` pairs, so the value is split
-     * off and discarded here, in the observer, before it can reach any other
-     * layer. Nothing downstream ever holds a value to accidentally print.
+     * The probe prints names and nothing else — no `=`, no value, no value
+     * length, no value hash. The previous implementation retrieved the complete
+     * `NAME=value` environment and split the values off afterwards, which meant
+     * every Worker secret was pulled into the harness process before anything
+     * decided it was unwanted.
      */
     async environmentNames() {
-      return observe("docker inspect worker environment names", async () => {
-        const raw = await inspectContainer("{{range .Config.Env}}{{println .}}{{end}}");
-        return raw
+      return observe("worker environment names", async () => {
+        const result = await run("docker", ["exec", container, ...ENV_NAMES_PROBE_ARGV]);
+        if (result.exitCode !== 0) throw new Error("the environment-name probe failed");
+        const names = String(result.stdout ?? "")
           .split("\n")
-          .map((line) => line.split("=")[0].trim())
+          .map((line) => line.trim())
           .filter((name) => name.length > 0);
+        // A name can never contain `=`. If one does, the probe did not return
+        // what this observer is defined to return, and the safest reading is a
+        // measurement failure rather than a best-effort parse of unknown text.
+        if (names.some((name) => name.includes("="))) {
+          throw new Error("the environment-name probe returned a value-bearing line");
+        }
+        return names;
       });
     },
 
     /**
-     * `YTDLP_ENABLED` as the deployment actually set it.
+     * `YTDLP_ENABLED` as the deployment actually set it (§5B).
      *
-     * Read from the container's bound environment rather than by reading
-     * worker.env, so the harness never opens the secret-bearing file at all.
-     * An unset variable yields `null`, which Stage A treats as disabled.
+     * ONE variable, by name, inside a fixed probe. worker.env is never opened,
+     * and no other environment value is retrieved. An unset variable yields
+     * `null`, which Stage A treats as disabled.
      */
     async ytdlpEnabledRaw() {
-      return observe("docker inspect YTDLP_ENABLED", async () => {
-        const raw = await inspectContainer("{{range .Config.Env}}{{println .}}{{end}}");
-        for (const line of raw.split("\n")) {
-          const [name, ...rest] = line.split("=");
-          if (name.trim() === "YTDLP_ENABLED") return rest.join("=").trim();
-        }
-        return null;
+      return observe("YTDLP_ENABLED", async () => {
+        const result = await run("docker", ["exec", container, ...YTDLP_ENABLED_PROBE_ARGV]);
+        if (result.exitCode !== 0) throw new Error("the YTDLP_ENABLED probe failed");
+        const decoded = decodeEnvProbe(result.stdout);
+        if (decoded.measured !== true) throw new Error(decoded.reason);
+        return decoded.present ? decoded.value.trim() : null;
       });
     },
 
     /**
-     * The EFFECTIVE `maxFileSizeBytes` the deployed Worker enforces (§13).
+     * The EFFECTIVE `maxFileSizeBytes` the deployed Worker enforces (§13 of
+     * CORRECTION-04; §5C of CORRECTION-05).
      *
-     * Read from the container's bound environment exactly as `ytdlpEnabledRaw`
-     * is, so no environment FILE is opened and no value other than this single
-     * non-secret variable is ever extracted. `environmentNames` remains the
-     * name-only observer; this one deliberately reads one named value, because
-     * the byte-limit assertion is a numeric comparison and cannot be made
-     * against a name.
+     * ONE variable, by name, inside a fixed probe — the byte-limit assertion is
+     * a numeric comparison and cannot be made against a name alone, so this is
+     * the narrowest observation that answers it.
      */
     async effectiveMaxFileSize() {
-      return observe("docker inspect MAX_FILE_SIZE", async () => {
-        const raw = await inspectContainer("{{range .Config.Env}}{{println .}}{{end}}");
-        let value = null;
-        for (const line of raw.split("\n")) {
-          const [name, ...rest] = line.split("=");
-          if (name.trim() === "MAX_FILE_SIZE") {
-            value = rest.join("=").trim();
-            break;
-          }
-        }
-        const parsed = parseMaxFileSize(value);
+      return observe("MAX_FILE_SIZE", async () => {
+        const result = await run("docker", ["exec", container, ...MAX_FILE_SIZE_PROBE_ARGV]);
+        if (result.exitCode !== 0) throw new Error("the MAX_FILE_SIZE probe failed");
+        const decoded = decodeEnvProbe(result.stdout);
+        if (decoded.measured !== true) throw new Error(decoded.reason);
+        const parsed = parseMaxFileSize(decoded.present ? decoded.value : null);
         if (parsed.measured !== true) throw new Error(parsed.reason);
         return { bytes: parsed.bytes, source: parsed.source };
       });
@@ -669,65 +775,97 @@ export function makeSystemObservers(deps = {}) {
 }
 
 /**
+ * The fixed token that stands in for a `comm` this harness will not copy
+ * verbatim (§21 of CORRECTION-05).
+ *
+ * A survivor is never dropped for having an unusual name — it is kept with its
+ * name replaced, so the row still counts as a survivor while nothing unexpected
+ * from the host reaches the evidence.
+ */
+export const UNCLASSIFIED_COMM = "<unclassified>";
+
+/** A plain executable basename, safe to carry into evidence verbatim. */
+const SAFE_COMM_PATTERN = /^[\w.:+-]{1,64}$/;
+
+/**
  * Parses `ps -eo pid=,ppid=,pgid=,comm=` into closed-schema rows, FAIL-CLOSED
- * (§22-§24 of CORRECTION-04).
+ * on the part that matters (§19-§21 of CORRECTION-05).
  *
- * ── Why dropping a row is not a safe default here ──────────────────────────
+ * ── The format, and what it does and does not contain ──────────────────────
  *
- * The termination proof this feeds is a NEGATIVE one: "no member of the
- * captured process group survives". Its evidence is the ABSENCE of matching
- * rows. So a row the parser cannot interpret is not noise to be skipped — it is
- * potentially the one surviving leaked acquisition process, and skipping it
- * turns a single real survivor into `[]` and therefore into a PASS.
+ * The allowlist admits exactly one `ps` invocation, and it selects four columns
+ * by name. There is no `args`, `cmd` or `command` column, so the trailing text
+ * on every line is the `comm` field — the executable name — and never argv.
+ * That boundary is what makes reading the remainder of the line safe.
  *
- * The previous implementation did exactly that: `continue` on a wrong field
- * count, on a non-numeric id, and on an unexpected `comm` shape. Every one of
- * those is now a MEASUREMENT FAILURE for the whole listing.
+ * ── Why "split on whitespace, require 4 tokens" was wrong ──────────────────
  *
- * The privacy contract is unchanged and is what makes fail-closed affordable:
- * the command is the single allowlisted `ps -eo pid=,ppid=,pgid=,comm=`, which
- * has no `args`/`cmd`/`command` column, so an unparseable row cannot be
- * admitted "just in case" — it is refused, and nothing from it reaches the
- * evidence path. BLOCKED is the correct verdict for a listing we could not
- * fully read; it is never traded for a cleaner-looking empty set.
+ * procps permits a `comm` containing spaces: it is derived from the executable
+ * name, and an unrelated process on the host may legitimately have one. The
+ * previous parser refused any line with a fifth token, so ONE unrelated process
+ * with a spaced name made the entire host listing unmeasurable — and every
+ * termination check BLOCKED — for a reason that had nothing to do with the
+ * captured group. That is a fail-closed rule misapplied: it converts an
+ * irrelevant oddity into an unanswerable question.
+ *
+ * ── What is still fail-closed, and why ─────────────────────────────────────
+ *
+ * The listing exists to answer one question: does the captured PGID still have
+ * members? So the NUMERIC PREFIX is what must parse. A line whose pid/ppid/pgid
+ * cannot be read might belong to the captured group, and dropping it would turn
+ * a real survivor into an empty set — the exact PASS this must never produce.
+ * Any such line makes the whole listing unmeasured, and the check BLOCKED.
+ *
+ * An unusual `comm` is different: the row is structurally understood, and its
+ * group membership is known. It is kept, with an unrecognizable name replaced
+ * by `UNCLASSIFIED_COMM` so nothing unexpected is copied into evidence. If such
+ * a row IS in the captured group, `evaluateGroupTermination` cannot classify it
+ * as a plausible acquisition member and reports the survivor set as ambiguous —
+ * BLOCKED, never `[]`.
  *
  * @returns `{ ok: true, rows }` or `{ ok: false, reason }`. The reason names the
- *   line NUMBER and the defect, never the line's content — a malformed line is
- *   exactly the case where the content might not be a `comm`.
+ *   line NUMBER and the defect, never the line's content — a line whose numeric
+ *   prefix is unreadable is precisely the case where the rest might not be a
+ *   `comm` at all.
  */
 export function parseHostProcessList(stdout) {
   const rows = [];
   const lines = String(stdout ?? "").split("\n");
   for (let index = 0; index < lines.length; index += 1) {
-    const trimmed = lines[index].trim();
+    const line = lines[index];
     // A blank line carries no process and hides nothing.
-    if (trimmed.length === 0) continue;
+    if (line.trim().length === 0) continue;
 
-    const parts = trimmed.split(/\s+/);
-    if (parts.length !== 4) {
+    // Three numeric columns, then the remainder as `comm`. The remainder is
+    // NOT re-split: it is one field by the format's own definition.
+    const matched = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S.*?)\s*$/.exec(line);
+    if (!matched) {
       return {
         ok: false,
         reason:
-          `line ${index + 1} of the host process listing has ${parts.length} fields, not the 4 the ` +
-          "requested format produces; the listing cannot be interpreted",
+          `line ${index + 1} of the host process listing does not begin with the three numeric ` +
+          "ids the requested format produces, so it cannot be assigned to a process group; " +
+          "the listing cannot be interpreted",
       };
     }
-    const [pid, ppid, pgid, comm] = parts;
-    if (!/^\d+$/.test(pid) || !/^\d+$/.test(ppid) || !/^\d+$/.test(pgid)) {
+
+    const [, pid, ppid, pgid, comm] = matched;
+    const numbers = [Number(pid), Number(ppid), Number(pgid)];
+    if (!numbers.every((value) => Number.isSafeInteger(value))) {
       return {
         ok: false,
-        reason: `line ${index + 1} of the host process listing has a non-numeric id field`,
+        reason: `line ${index + 1} of the host process listing has an out-of-range id field`,
       };
     }
-    if (!/^[\w.:+-]{1,64}$/.test(comm)) {
-      return {
-        ok: false,
-        reason:
-          `line ${index + 1} of the host process listing has a comm field that is not a plain ` +
-          "executable basename; refusing to admit it rather than risk command-line material",
-      };
-    }
-    rows.push({ pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), comm: comm.toLowerCase() });
+
+    rows.push({
+      pid: numbers[0],
+      ppid: numbers[1],
+      pgid: numbers[2],
+      // Kept verbatim only when it is a plain basename; otherwise the row
+      // survives under a fixed token. Never dropped — see the docblock.
+      comm: SAFE_COMM_PATTERN.test(comm) ? comm.toLowerCase() : UNCLASSIFIED_COMM,
+    });
   }
   return { ok: true, rows };
 }

@@ -535,12 +535,33 @@ async function runStageBCase(ctx, caseName) {
     return EXIT.BLOCKED;
   }
 
-  const runningImageId = await system.runningImageId();
-  if (runningImageId.measured !== true) {
-    errorLog("BLOCKED: the running image could not be identified; a case record cannot be bound to it.");
+  // ── §8-§10 of CORRECTION-05: image continuity ──────────────────────────
+  //
+  // A case record used to bind to the image measured BEFORE the producer ran.
+  // For a case that spans an operator restart — `shutdown` exists to span one —
+  // that is not enough: systemd starts `videofetch-worker:latest`, so a restart
+  // is an image-RESOLUTION event, and a record could combine pre-restart and
+  // post-restart evidence under one image id that only ever described the
+  // first half.
+  //
+  // So the authorized image is established before, re-established after, and
+  // the two must be the same object. The container id is deliberately not the
+  // binding: a restart legitimately recreates the container from the same
+  // image, and that is the case this must permit.
+  const preCase = await system.imageShaTag(expectedSha);
+  if (preCase.measured !== true) {
+    errorLog(`BLOCKED: the running image could not be identified before the case: ${preCase.reason}`);
     return EXIT.BLOCKED;
   }
-  const binding = { expectedSha, runningImageId: runningImageId.value };
+  if (preCase.value.runningImageId !== preCase.value.taggedImageId) {
+    errorLog(
+      "BLOCKED: the running image is not the image tagged with the authorized source SHA; " +
+        "a case run against an unauthorized image is not acceptance evidence.",
+    );
+    return EXIT.BLOCKED;
+  }
+  const authorizedImageId = preCase.value.taggedImageId;
+  const binding = { expectedSha, runningImageId: authorizedImageId };
 
   const producer = CASE_PRODUCERS[caseName];
   const caseCtx = {
@@ -571,6 +592,11 @@ async function runStageBCase(ctx, caseName) {
     // timestamps — `Date.now()` is the wrong instrument for interval
     // comparison, and sharing one name for both confused the two.
     monotonicNow: ctx.deps.monotonicNow,
+    // Bounded observation windows. Named on the context rather than baked into
+    // the producers so a test can shrink them; the defaults are the operator's
+    // real ones.
+    shutdownWindowMs: ctx.deps.shutdownWindowMs,
+    recoveryWindowMs: ctx.deps.recoveryWindowMs,
   };
 
   // Every input a case declares is required before anything is submitted.
@@ -600,6 +626,34 @@ async function runStageBCase(ctx, caseName) {
     return EXIT.BLOCKED;
   }
 
+  // §9: re-establish the image AFTER the producer, before anything is sealed.
+  // An unmeasurable or changed image means no record at all — a record that
+  // combined evidence from two images must not exist to be accepted later.
+  const postCase = await system.imageShaTag(expectedSha);
+  if (postCase.measured !== true) {
+    errorLog(
+      `BLOCKED: the deployed image could not be re-identified after case '${caseName}': ${postCase.reason}. ` +
+        "Refusing to seal evidence whose deployment cannot be confirmed.",
+    );
+    return EXIT.BLOCKED;
+  }
+  if (
+    postCase.value.runningImageId !== authorizedImageId ||
+    postCase.value.taggedImageId !== authorizedImageId
+  ) {
+    errorLog(
+      `BLOCKED — DEPLOYED IMAGE CHANGED DURING CASE '${caseName}'. The evidence spans two ` +
+        "different image objects and cannot be attributed to either.",
+    );
+    return EXIT.BLOCKED;
+  }
+  const imageContinuity = {
+    before: authorizedImageId,
+    after: postCase.value.runningImageId,
+    taggedImageId: postCase.value.taggedImageId,
+    same: true,
+  };
+
   const record = sealRecord(
     buildCaseRecord({
       caseName,
@@ -609,6 +663,7 @@ async function runStageBCase(ctx, caseName) {
       startedAt: ctx.startedAt,
       finishedAt: new Date().toISOString(),
       featureState: featureState.value,
+      imageContinuity,
     }),
     acceptanceRun.key,
   );

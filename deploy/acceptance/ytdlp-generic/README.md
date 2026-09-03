@@ -285,9 +285,32 @@ Stage A **begins** a run; Stage B cases and the aggregation **join** it.
   Stage A resuming an existing key as much as Stage B loading one. A key any
   local account can read is a key that can re-seal edited artifacts;
 - **refused if its permissions cannot be measured at all.** "We could not read
-  the mode" is not "the mode is fine"; only a missing file is a permissive
-  answer, and that one means *mint a fresh key*, not *use this one*;
+  the mode" is not "the mode is fine";
+- **never replaced.** A file that *exists* is never overwritten, whatever is
+  wrong with it;
 - **deleted by the operator when acceptance is complete.**
+
+`ENOENT` is the only condition that mints a run:
+
+| Existing file | Outcome |
+| :--- | :--- |
+| absent (`ENOENT`) | mint a new run |
+| private, valid structure | resume |
+| group/world-accessible | `BLOCKED` |
+| permissions unmeasurable | `BLOCKED` |
+| unreadable content | `BLOCKED` |
+| malformed JSON | `BLOCKED` |
+| no usable `runId` / 256-bit key | `BLOCKED` |
+
+An earlier version fell through to "mint a fresh run" on unreadable or malformed
+content — which **overwrote** the file, destroying the only key that could ever
+verify the artifacts already sealed under it, and doing so silently at the exact
+moment something was already wrong. A damaged acceptance identity is the
+operator's to archive or delete deliberately.
+
+Note that a damaged file is an **error**, not a `null`: `null` means "no run has
+been started", which would send the operator to re-run Stage A and overwrite the
+very file that needed attention.
 
 Stage B refuses to mint a key: doing so would make every prior artifact
 unverifiable and would let a re-keyed run re-seal edited records.
@@ -801,15 +824,122 @@ rows. So a line the parser cannot interpret is not noise — it is potentially t
 one leaked survivor, and dropping it turns a real leak into `[]` and therefore
 into a `PASS`.
 
-The parser therefore refuses the **whole listing** on any non-empty line that is
-not exactly four fields, three numeric ids, and a plain executable basename. The
-observation becomes unmeasured and the termination check lands `BLOCKED`.
+The listing answers exactly one question — *does the captured PGID still have
+members?* — and the parser is calibrated to that question:
 
-The refusal message names the line *number* and the defect, never the line's
-content — a malformed line is precisely the case where the content might not be
-a `comm`.
+```
+<pid> <ppid> <pgid> <the rest of the line is comm>
+```
 
-Blank lines are still skipped: they carry no process and hide nothing.
+| Line | Outcome |
+| :--- | :--- |
+| Three numeric ids parse | row kept, whatever follows |
+| Numeric prefix unreadable | **whole listing unmeasured → `BLOCKED`** |
+| `comm` is a plain basename | kept verbatim |
+| `comm` is anything else | kept, reported as `<unclassified>` |
+
+**Why the numeric prefix is the fail-closed part.** A line whose ids cannot be
+read might belong to the captured group and cannot be shown not to.
+
+**Why an unusual `comm` is not.** procps permits a `comm` containing spaces — it
+comes from the executable name, and an unrelated host process may legitimately
+have one. An earlier version split on whitespace and demanded exactly four
+tokens, so *one* unrelated process with a spaced name made the entire host
+listing unreadable and every termination check `BLOCKED`, for a reason with
+nothing to do with the captured group. That is a fail-closed rule misapplied: it
+turns an irrelevant oddity into an unanswerable question.
+
+The row is understood structurally either way, so it is never dropped. If an
+unclassifiable row **is** in the captured group, `evaluateGroupTermination`
+cannot call it a plausible acquisition member and reports the survivor set as
+ambiguous — `BLOCKED`, never `[]`.
+
+The trailing text is the `comm` field by the format's own definition: the
+allowlisted `ps` selects four columns by name, and there is no `args`, `cmd` or
+`command` column. It is still not copied verbatim unless it is a plain basename.
+
+Refusal messages name the line *number* and the defect, never its content — a
+line whose ids are unreadable is precisely the case where the rest might not be
+a `comm` at all. Blank lines are still skipped: they carry no process and hide
+nothing.
+
+## One image, start to finish
+
+A case record binds to an image object, and that object is established on **both
+sides** of the producer:
+
+```
+resolve videofetch-worker:<authorized sha>
+require running image == tagged image      ← the authorized object
+   │
+   ▼  run the case producer
+   │
+resolve again; require the SAME object
+   │
+   ▼  only then seal the record
+```
+
+| Outcome | Result |
+| :--- | :--- |
+| same image before and after | sealed with `imageContinuity` |
+| image changed during the case | `BLOCKED — DEPLOYED IMAGE CHANGED DURING CASE`, **no record written** |
+| post-case image unmeasurable | `BLOCKED`, no record written |
+| running image is not the SHA-tagged object | `BLOCKED`, no record written |
+
+This matters most for `shutdown`, which exists to span an operator restart.
+Systemd starts `videofetch-worker:latest`, so a restart is an image-**resolution**
+event: the container that comes back could be running a different object than the
+one the case began against, and a record sealed against the pre-restart id would
+describe only the first half of its own evidence.
+
+**Container identity is deliberately not the binding.** A restart legitimately
+recreates the container from the same image — the PID changes and must be allowed
+to. The image object is what must not.
+
+The aggregate re-checks the continuity object rather than trusting it, including
+recomputing `same` from the three ids, so it can state on its own authority that
+no accepted record combines evidence from two images.
+
+## The restart-recovery contract
+
+`shutdown` makes two independent claims, and neither may stand in for the other:
+
+| Claim | Evidence |
+| :--- | :--- |
+| the old acquisition group died | host survivors of the captured PGID |
+| the interrupted job was recovered correctly | the durable row, through the job view |
+
+A dead process group says nothing about the durable row, and a correct durable
+row says nothing about whether the process died.
+
+The Worker's restart policy is **deterministic**. `recover()` in
+`src/worker/state/sqlite-job-store.server.ts` moves every job left in
+`analyzing`, `downloading`, `processing` or `uploading` to exactly:
+
+```
+status             = failed
+error_code         = PROCESSING_FAILED
+safe_error_message = Worker restarted before the job completed.
+```
+
+It is not resumed, not `ready`, and not `cancelled`. So acceptance asserts that
+result, not a shape. The previous check accepted any non-empty status string —
+under which `ready`, `cancelled`, and a job still sitting in `downloading` all
+passed a check named `job-recovered`.
+
+**The safe message is asserted, not skipped as brittle.** It is a literal in the
+Worker's own SQL, not a formatted or localized string, and it is the only field
+that separates *the restart path recovered this job* from *the job failed on its
+own and was classified `PROCESSING_FAILED`* — which every internal acquisition
+failure is. Without it, a job that failed a moment **before** the restart would
+satisfy the check. The harness reads it through the browser projection `error`,
+which `src/web/jobs/public-job.ts` documents as where `safeErrorMessage`
+surfaces.
+
+Recovery is **polled within a bounded window**, not read once. The restart is
+detected the instant the new container's PID appears — well before the Worker has
+opened its database, run `recover()`, and begun answering HTTP. A window that
+expires without a terminal answer is a measurement failure and the case aborts.
 
 ## Attributing an egress denial to the boundary
 
@@ -936,6 +1066,29 @@ acceptance evidence), and is `BLOCKED` — `LIVE UNKNOWN-LENGTH BYTE-GUARD CASE
 NOT PROVEN` — if the correlation, the media request, or the effective limit
 cannot be established at all.
 
+## The direct regression is a negative claim too
+
+`direct.no-ytdlp-spawned` asserts that **no yt-dlp process appeared** while a
+direct job ran with generic enabled. That is a claim across the whole monitored
+run, so it obeys the same rule as the generic downloading window:
+
+```
+unobserved interval  !=  clean interval
+```
+
+Every failed sampling attempt is accumulated in `samplingErrors`, and **one is
+enough** to make both direct sampling checks `BLOCKED` — even with hundreds of
+clean samples on either side of it. Clean samples do not describe the gap
+between them.
+
+The previous code held a single nullable `samplingFailure` that the next
+successful sample overwrote with nothing, so a run that lost an interval looked
+identical to one that never did. The successful samples stay in the evidence;
+they simply cannot support a continuous absence.
+
+A yt-dlp process actually *observed* in a clean run is still a `FAIL`, not a
+`BLOCKED` — that is a measured finding, not a gap.
+
 ## Generic-specific cases must actually run generic
 
 `success`, `cancellation`, `byte-limit`, `shutdown` and `safe-egress` each assert
@@ -985,7 +1138,10 @@ where they belong.
 | The kill switch worked **while it was disabled** | **Live**, from the `kill-switch` record's sealed feature state |
 | This exact transfer crossed the byte threshold | **Live** — case-correlated fixture evidence vs. the deployed `MAX_FILE_SIZE` |
 | The firewall denied this connection | **Live** — one closed, genuine deny-rule counter moved |
-| The old process group has no survivors | **Live** — and only after **every** host process row parsed |
+| The old process group has no survivors | **Live** — and only after every host process row was assigned to a group |
+| The interrupted job was recovered per the restart policy | **Live** — `failed` / `PROCESSING_FAILED` / the deterministic restart message |
+| The case ran against one image, start to finish | **Live** — image resolved before and after the producer |
+| No yt-dlp appeared during the direct job | **Live** — and only across a run with zero sampling gaps |
 
 The internal direct→generic fall-through for the generic URL is **not**
 observable at the application boundary, and adding a surface to observe it would
@@ -1054,8 +1210,44 @@ The record states whether required configuration **exists**, as a boolean or a
 bare variable name. It never contains `WORKER_CONTROL_SECRET`, the R2 parent
 secret, temporary R2 credentials, Cloudflare Access or Tunnel credentials,
 Vercel signer credentials, session cookies or authorization tokens — and
-`/etc/videofetch/worker.env` is never dumped or even read: `YTDLP_ENABLED` is
-observed from the container's bound environment instead.
+`/etc/videofetch/worker.env` is never dumped or even read.
+
+#### A secret value is never *retrieved*, not merely never printed
+
+`docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}'` returns the
+complete `NAME=value` environment. An earlier version of this harness ran exactly
+that and then split the values off in JavaScript — so every Worker secret crossed
+into the harness process, lived in a Node string and in a child process's stdout
+buffer, and was discarded only afterwards. *Fetched, then sanitized* is not
+*never fetched*.
+
+Environment observation is now three fixed, separately allowlisted probes, each
+answering one question:
+
+| Observer | Probe | Output contract |
+| :--- | :--- | :--- |
+| `environmentNames` | `python3 -c '…sorted(os.environ)…'` | one **name** per line. No `=`, no value, no length, no hash |
+| `ytdlpEnabledRaw` | `python3 -c '…environ.get("YTDLP_ENABLED")…'` | `<UNSET>` or `SET:<value>` |
+| `effectiveMaxFileSize` | `python3 -c '…environ.get("MAX_FILE_SIZE")…'` | `<UNSET>` or `SET:<value>` |
+
+Two structural properties, not two conventions:
+
+- **The variable name is inside the constant.** Each probe's source string is a
+  compile-time constant matched *whole* by the `docker exec` allowlist, so no
+  argument the caller supplies can redirect the read to a different variable.
+  There is no general Python execution capability — only three fixed questions.
+- **`docker inspect` is restricted to three named templates** (`{{.Image}}`,
+  `{{.HostConfig.NetworkMode}}`, `{{.State.Pid}}`). A bare `docker inspect`, and
+  every environment template, is refused. Retrieving the environment that way is
+  unrepresentable rather than merely unused.
+
+`MAX_FILE_SIZE` and `YTDLP_ENABLED` are non-secret deployment configuration; the
+byte-limit comparison and the feature-state gate are numeric and grammatical
+assertions that cannot be made against a name alone.
+
+`SET:` rather than a bare value because a bare sentinel is ambiguous: a variable
+literally set to `<UNSET>` would be indistinguishable from an absent one, and for
+`YTDLP_ENABLED` that ambiguity resolves silently to "disabled".
 
 ### Logs are read, never mutated
 

@@ -1899,6 +1899,95 @@ stale comment in `download-window.mjs` claiming a straddling sample makes the
 window unusable was reworded to match the implemented discard-and-count policy.
 The accepted CORRECTION-03 ambiguity policy and monotonic clock are unchanged.
 
+#### CORRECTION-05 — six acceptance-integrity gaps closed
+
+**1. The observer retrieved every Worker environment VALUE before discarding the
+unwanted ones.** `environmentNames`, `ytdlpEnabledRaw` and `effectiveMaxFileSize`
+all rendered `{{range .Config.Env}}{{println .}}{{end}}`, which emits the
+complete `NAME=value` environment — `WORKER_CONTROL_SECRET` included — and then
+split the values off in JavaScript. For a harness whose subject holds secrets
+that is the wrong order of operations: the value crossed into the harness
+process, lived in a Node string and in a child process's stdout buffer, and was
+discarded only afterwards. Fetched-then-sanitized is not never-fetched.
+
+Environment observation is now three fixed probes, each answering one question:
+names only (no `=`, no value, no length, no hash), `YTDLP_ENABLED` alone, and
+`MAX_FILE_SIZE` alone — the two non-secret deployment variables the numeric and
+grammatical assertions genuinely need. Each probe's source is a compile-time
+constant matched whole by the `docker exec` allowlist, so the caller cannot
+redirect a read to a different variable, and no general Python execution
+capability exists. `docker inspect` is additionally restricted to three named
+templates (`{{.Image}}`, `{{.HostConfig.NetworkMode}}`, `{{.State.Pid}}`), which
+makes retrieving the environment that way unrepresentable rather than unused.
+
+**2. A case could be sealed against the pre-restart image.** The record bound to
+the image measured BEFORE the producer ran. `shutdown` exists to span an operator
+restart, and systemd starts `videofetch-worker:latest` — so a restart is an
+image-resolution event, and a record could combine pre-restart and post-restart
+evidence under an id that only ever described the first half.
+
+Every Stage B case now resolves the authorized SHA-tagged image before the
+producer, requires the running image to BE that object, resolves it again after,
+and requires exact equality before anything is sealed. An image that changed, or
+that could not be re-measured, is BLOCKED with no record written. Container
+identity is deliberately not the binding: a restart legitimately recreates the
+container from the same image, and the PID is expected to change.
+
+**3. Shutdown accepted any non-empty recovered status.** The predicate was
+`typeof recoveredStatus === "string" && length > 0`, under which `ready`,
+`cancelled`, and a job still sitting in `downloading` all passed a check named
+`job-recovered`. The Worker's policy is deterministic: `recover()` in
+`src/worker/state/sqlite-job-store.server.ts` moves every job left in
+`analyzing`, `downloading`, `processing` or `uploading` to exactly `failed` /
+`PROCESSING_FAILED` / `Worker restarted before the job completed.`
+
+Acceptance now asserts that result. The safe message is asserted rather than
+skipped as brittle, because it is a literal in the Worker's own SQL and is the
+only field separating "the restart path recovered this job" from "the job failed
+on its own and was classified PROCESSING_FAILED" — which every internal
+acquisition failure is. It is read through the browser projection `error`, which
+`src/web/jobs/public-job.ts` documents as where `safeErrorMessage` surfaces.
+Recovery is polled within a bounded window rather than read once, because the
+restart is detected the instant the new container's PID appears — before the
+Worker has opened its database, run `recover()`, or begun answering HTTP. The
+PGID-termination proof remains an independent requirement; neither substitutes
+for the other.
+
+**4. Direct-regression sampling errors could be erased by a later success.** The
+producer held a single nullable `samplingFailure` that the next successful sample
+overwrote with nothing, so a run that lost an observation interval looked
+identical to one that never did — while the check it fed claims that no yt-dlp
+process appeared across the whole run. Failed attempts are now accumulated, and
+one is enough to BLOCK both direct sampling checks regardless of how many clean
+samples surround it. This is the rule the generic downloading window already
+applied. A yt-dlp process actually observed remains a FAIL, not a BLOCKED.
+
+**5. The host `comm` parser was stricter than procps.** It split on whitespace
+and demanded exactly four tokens, but procps permits a `comm` containing spaces
+— it derives from the executable name. One unrelated host process with such a
+name made the entire listing unmeasurable and every termination check BLOCKED,
+for a reason with nothing to do with the captured group: a fail-closed rule
+misapplied, turning an irrelevant oddity into an unanswerable question.
+
+The three numeric ids are now parsed structurally and the remainder taken as the
+single `comm` field it is by the format's own definition. The fail-closed part is
+the numeric prefix — a line whose ids cannot be read might belong to the captured
+group — while an unusual `comm` keeps its row under the fixed token
+`<unclassified>` rather than being dropped or copied verbatim. An unclassifiable
+survivor inside the captured group is reported as ambiguous and BLOCKS; it can
+never become an empty survivor set. The `ps` invocation, and its absence of any
+argv column, is unchanged.
+
+**6. A present-but-malformed run-key file was silently overwritten.**
+`loadOrCreateRun` fell through to "mint a fresh run" on unreadable content or
+malformed JSON, which replaced the file — destroying the only key that could
+verify the artifacts already sealed under it, and doing so silently at the exact
+moment something was already wrong. `ENOENT` is now the only condition that mints
+a run; a file that exists is never replaced, and unreadable content, malformed
+JSON or an invalid structure each BLOCK. A damaged file is an error rather than a
+`null`, because `null` means "no run has been started" and would send the
+operator to re-run Stage A over the very file that needed attention.
+
 #### What Phase 10D is authorized to do
 
 Nothing yet. Only after this harness has been **independently reviewed and

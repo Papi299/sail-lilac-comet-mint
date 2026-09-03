@@ -69,6 +69,7 @@ import {
   presetsAreApplicationOwned,
   isApplicationOwnedFormatId,
   FORBIDDEN_DURABLE_FIELDS,
+  RESTART_RECOVERY,
 } from "../deploy/acceptance/ytdlp-generic/lib/stage-b.mjs";
 import {
   buildEvidence,
@@ -83,8 +84,12 @@ import {
   workDirProbeArgv,
   makeSystemObservers,
   parseMaxFileSize,
+  decodeEnvProbe,
   DEFAULT_MAX_FILE_SIZE_BYTES,
   EJS_PROBE_ARGV,
+  ENV_NAMES_PROBE_ARGV,
+  YTDLP_ENABLED_PROBE_ARGV,
+  MAX_FILE_SIZE_PROBE_ARGV,
 } from "../deploy/acceptance/ytdlp-generic/lib/observers.mjs";
 import {
   buildCaseRecord,
@@ -106,7 +111,7 @@ import {
   parseDenyClass,
   DENY_CLASSES,
 } from "../deploy/acceptance/ytdlp-generic/lib/egress-policy.mjs";
-import { parseHostProcessList } from "../deploy/acceptance/ytdlp-generic/lib/observers.mjs";
+import { parseHostProcessList, UNCLASSIFIED_COMM } from "../deploy/acceptance/ytdlp-generic/lib/observers.mjs";
 import { readFile } from "node:fs/promises";
 import {
   producerFor,
@@ -250,7 +255,12 @@ function shutdownEvidence(overrides = {}) {
     groupMembersMeasured: true,
     groupSurvivors: [],
     groupQueryReason: null,
+    // The Worker's deterministic restart-recovery result.
     recoveredStatus: "failed",
+    recoveredErrorCode: "PROCESSING_FAILED",
+    recoveredSafeErrorMessage: "Worker restarted before the job completed.",
+    recoveryPolls: 3,
+    lateReady: false,
     ...overrides,
   };
 }
@@ -258,6 +268,18 @@ function shutdownEvidence(overrides = {}) {
 /** The deployed default, as `MEDIA_DEFAULTS.maxFileSizeBytes` sets it. */
 const DEFAULT_LIMIT_BYTES = 500 * 1024 * 1024;
 const CASE_ID = "9".repeat(32);
+
+/**
+ * Values the harness must NEVER retrieve (§7 of CORRECTION-05).
+ *
+ * Deliberately unmistakable: any occurrence anywhere in a command, a result, a
+ * log line, an evidence record or an error is a genuine leak, not a false
+ * positive from a short or generic string.
+ */
+const SECRET_SENTINELS = Object.freeze({
+  workerControl: "VF_MUST_NEVER_BE_OBSERVED_worker_control_2f9c1a",
+  access: "VF_SECOND_SECRET_access_7d4b8e",
+});
 
 function byteLimitEvidence(overrides = {}) {
   return {
@@ -290,12 +312,17 @@ function byteLimitEvidence(overrides = {}) {
  * The harness measures this live; the tests fill it from the same registry the
  * validator consults, so a test record is realistic by construction.
  */
-function caseRecord({ caseName, binding, payload, state, ...rest }) {
+function caseRecord({ caseName, binding, payload, state, imageContinuity, ...rest }) {
+  const imageId = binding?.runningImageId ?? IMAGE_ID;
   return buildCaseRecord({
     caseName,
     binding,
     payload,
     featureState: featureState(state ?? expectedFeatureStateFor(caseName) ?? "enabled"),
+    // The producing CLI measures the image on both sides of the producer; a
+    // realistic test record carries the same evidence.
+    imageContinuity:
+      imageContinuity ?? { before: imageId, after: imageId, taggedImageId: imageId, same: true },
     ...rest,
   });
 }
@@ -391,6 +418,9 @@ function passingStageBObservations(overrides = {}) {
       extractor: "direct",
       processSamplingMeasured: true,
       samplesTaken: 5,
+      // The coverage gaps travel with the evidence; zero is a MEASURED zero.
+      samplingErrors: [],
+      samplingErrorCount: 0,
       sampledBasenames: ["node"],
     }),
     failClosedRuntime: measured({ genericUsable: false, fellBackToPath: false, directStillWorks: true }),
@@ -415,12 +445,55 @@ function makeFakeWorld(options = {}) {
     sites: options.sites ?? { ytdlp: false, ytdlpInstalled: true, ytdlpEnabled: false, ffmpeg: true },
     imageIds: options.imageIds ?? { [`videofetch-worker:${SHA}`]: IMAGE_ID, "videofetch-worker:latest": IMAGE_ID },
     runningImage: options.runningImage ?? IMAGE_ID,
+    // Simulated deployment drift, counted rather than scheduled, because a
+    // CLI-shaped test cannot intervene part-way through `main()`.
+    //
+    //   imageDriftsAfterReads — the running image changes after this many
+    //                           `{{.Image}}` reads (image redeployed mid-case)
+    //   restartAfterPidReads  — the operator's Worker restart lands after this
+    //                           many `{{.State.Pid}}` reads
+    imageDriftsAfterReads: options.imageDriftsAfterReads ?? null,
+    imageAfterDrift: options.imageAfterDrift ?? `sha256:${"e".repeat(64)}`,
+    restartAfterPidReads: options.restartAfterPidReads ?? null,
+    imageAfterRestart: options.imageAfterRestart ?? null,
     // The single non-secret deployment variable the byte-limit case reads.
     // `undefined` means the deployment does not set it and the Worker's own
     // 500 MiB default applies.
     maxFileSize: options.maxFileSize,
   };
   const calls = { commands: [], fetches: [], logins: 0 };
+
+  // Mutable container identity. A restart changes the PID; whether it changes
+  // the IMAGE is exactly what the continuity checks exist to detect.
+  const live = {
+    image: env.runningImage,
+    pid: 100,
+    imageReads: 0,
+    pidReads: 0,
+    restarted: false,
+  };
+
+  function currentImage() {
+    live.imageReads += 1;
+    if (env.imageDriftsAfterReads !== null && live.imageReads > env.imageDriftsAfterReads) {
+      live.image = env.imageAfterDrift;
+    }
+    return live.image;
+  }
+
+  function currentContainerPid() {
+    live.pidReads += 1;
+    if (
+      !live.restarted &&
+      env.restartAfterPidReads !== null &&
+      live.pidReads > env.restartAfterPidReads
+    ) {
+      live.restarted = true;
+      live.pid = 400;
+      if (env.imageAfterRestart) live.image = env.imageAfterRestart;
+    }
+    return live.pid;
+  }
 
   // The controlled byte-limit fixture, as a state machine rather than a static
   // document: it remembers the case id the submitted URL carried and answers
@@ -430,14 +503,22 @@ function makeFakeWorld(options = {}) {
     ...options.byteLimitFixture,
   };
 
-  const workerEnvLines = [
-    "WORKER_CONTROL_KEY_ID=k",
-    "WORKER_CONTROL_SECRET=s",
-    "R2_ACCOUNT_ID=a",
-    "R2_BUCKET=b",
-    ...(env.maxFileSize === undefined ? [] : [`MAX_FILE_SIZE=${env.maxFileSize}`]),
-    ...(env.ytdlpEnabled === null ? [] : [`YTDLP_ENABLED=${env.ytdlpEnabled}`]),
-  ].join("\n");
+  // The fake container's REAL environment, values and all.
+  //
+  // The secrets are deliberately unmistakable: the harness is supposed to never
+  // retrieve them, so the fake models a container that genuinely holds them and
+  // the tests assert they never come back. A fake that simply had no secrets
+  // could not catch a regression to a full-environment dump.
+  const workerEnvironment = {
+    WORKER_CONTROL_KEY_ID: "acceptance-key-id",
+    WORKER_CONTROL_SECRET: SECRET_SENTINELS.workerControl,
+    VIDEOFETCH_ACCESS_SECRET: SECRET_SENTINELS.access,
+    R2_ACCOUNT_ID: "an-account",
+    R2_BUCKET: "a-bucket",
+    ...(env.maxFileSize === undefined ? {} : { MAX_FILE_SIZE: String(env.maxFileSize) }),
+    ...(env.ytdlpEnabled === null ? {} : { YTDLP_ENABLED: String(env.ytdlpEnabled) }),
+    ...options.extraEnvironment,
+  };
 
   async function runReadOnly(file, argv) {
     calls.commands.push([file, ...argv].join(" "));
@@ -460,12 +541,23 @@ function makeFakeWorld(options = {}) {
           : { exitCode: 1, stdout: "", stderr: "no such image" };
       }
       if (argv[0] === "inspect") {
-        if (joined.includes("{{.Image}}")) return { exitCode: 0, stdout: `${env.runningImage}\n`, stderr: "" };
+        if (joined.includes("{{.Image}}")) {
+          return { exitCode: 0, stdout: `${currentImage()}\n`, stderr: "" };
+        }
         if (joined.includes("NetworkMode")) {
           return { exitCode: 0, stdout: "container:videofetch-media-netns\n", stderr: "" };
         }
-        if (joined.includes(".Config.Env")) return { exitCode: 0, stdout: `${workerEnvLines}\n`, stderr: "" };
-        if (joined.includes(".State.Pid")) return { exitCode: 0, stdout: "100\n", stderr: "" };
+        // Deliberately still answered with the COMPLETE NAME=value environment.
+        // The allowlist now refuses this template, so the branch is unreachable
+        // — and if a regression ever reopens it, the secret-non-observation
+        // tests catch a real leak rather than a sanitized stand-in.
+        if (joined.includes(".Config.Env")) {
+          const lines = Object.entries(workerEnvironment).map(([k, v]) => `${k}=${v}`);
+          return { exitCode: 0, stdout: `${lines.join("\n")}\n`, stderr: "" };
+        }
+        if (joined.includes(".State.Pid")) {
+          return { exitCode: 0, stdout: `${currentContainerPid()}\n`, stderr: "" };
+        }
       }
       if (argv[0] === "top") {
         return {
@@ -476,6 +568,20 @@ function makeFakeWorld(options = {}) {
       }
       if (argv[0] === "logs") return { exitCode: 0, stdout: "worker started\n", stderr: "" };
       if (argv[0] === "exec") {
+        // The three narrow environment probes, answered exactly as a real
+        // container would: names only, or one named variable only.
+        const probe = argv.slice(2).join(" ");
+        if (probe === ENV_NAMES_PROBE_ARGV.join(" ")) {
+          return { exitCode: 0, stdout: `${Object.keys(workerEnvironment).sort().join("\n")}\n`, stderr: "" };
+        }
+        if (probe === YTDLP_ENABLED_PROBE_ARGV.join(" ")) {
+          const value = workerEnvironment.YTDLP_ENABLED;
+          return { exitCode: 0, stdout: `${value === undefined ? "<UNSET>" : `SET:${value}`}\n`, stderr: "" };
+        }
+        if (probe === MAX_FILE_SIZE_PROBE_ARGV.join(" ")) {
+          const value = workerEnvironment.MAX_FILE_SIZE;
+          return { exitCode: 0, stdout: `${value === undefined ? "<UNSET>" : `SET:${value}`}\n`, stderr: "" };
+        }
         if (joined.includes("node --version")) return { exitCode: 0, stdout: "v22.23.2\n", stderr: "" };
         if (joined.endsWith("/usr/bin/python3 --version")) {
           return { exitCode: 0, stdout: "Python 3.11.2\n", stderr: "" };
@@ -502,9 +608,41 @@ function makeFakeWorld(options = {}) {
   // `processing` — which is exactly what `limit.actual-byte-guard` asserts.
   const BYTE_LIMIT_LADDER = ["queued", "analyzing", "downloading", "failed"];
   const jobs = new Map();
+
+  /**
+   * The Worker's own restart recovery, modelled faithfully.
+   *
+   * `recover()` in `src/worker/state/sqlite-job-store.server.ts` moves every job
+   * left in `analyzing`, `downloading`, `processing` or `uploading` to failed /
+   * PROCESSING_FAILED / 'Worker restarted before the job completed.'. A fake
+   * that let an interrupted job march on to `ready` would let the acceptance
+   * harness assert a contract nothing had to satisfy.
+   */
+  const RECOVERABLE = new Set(["analyzing", "downloading", "processing", "uploading"]);
+  function recoveredView(jobId, extractor) {
+    return {
+      jobId,
+      status: "failed",
+      extractor,
+      fileSize: null,
+      container: null,
+      quality: null,
+      filename: null,
+      errorCode: "PROCESSING_FAILED",
+      // The browser projection of `safeErrorMessage`; see public-job.ts.
+      error: "Worker restarted before the job completed.",
+      stageLabel: "Worker restarted",
+      expiresAt: Date.now() + 60_000,
+    };
+  }
+
   function nextJob(jobId, extractor) {
     const job = jobs.get(jobId);
     const ladder = job.ladder ?? FULL_LADDER;
+    if (live.restarted && (job.recovered || RECOVERABLE.has(ladder[job.index]))) {
+      job.recovered = true;
+      return recoveredView(jobId, extractor);
+    }
     const current = ladder[job.index];
     if (current === "downloading" && job.dwell < DOWNLOADING_POLLS) {
       job.dwell += 1;
@@ -641,7 +779,7 @@ function makeFakeWorld(options = {}) {
     };
   }
 
-  return { runReadOnly, fetch: fetchImpl, calls, env };
+  return { runReadOnly, fetch: fetchImpl, calls, env, live, workerEnvironment };
 }
 
 /** Runs the real CLI against a fake external world. */
@@ -1953,12 +2091,7 @@ describe("case evidence validation", () => {
   const goodPayload = { cancellation: cancellationEvidence({ postSample: [] }) };
 
   it("accepts a record this harness produced for this deployment", () => {
-    const record = buildCaseRecord({
-      caseName: "cancellation",
-      binding,
-      payload: goodPayload,
-      featureState: featureState("enabled"),
-    });
+    const record = caseRecord({ caseName: "cancellation", binding, payload: goodPayload });
     const validated = validateCaseRecord(record, binding);
     assert.equal(validated.ok, true, validated.reason);
     assert.equal(validated.observations.cancellation.measured, true);
@@ -2206,7 +2339,17 @@ describe("secret handling", () => {
 
   it("28b. the allowlist admits exactly the read-only observations needed", () => {
     assert.equal(isReadOnlyCommand("systemctl", ["is-active", "videofetch-worker"]), true);
-    assert.equal(isReadOnlyCommand("docker", ["inspect", "videofetch-worker"]), true);
+    // §4 of CORRECTION-05: `docker inspect` is admitted only with one of the
+    // three named templates — a bare inspect returns the whole container JSON,
+    // environment values included.
+    assert.equal(isReadOnlyCommand("docker", ["inspect", "videofetch-worker"]), false);
+    for (const format of ["{{.Image}}", "{{.HostConfig.NetworkMode}}", "{{.State.Pid}}"]) {
+      assert.equal(
+        isReadOnlyCommand("docker", ["inspect", "--format", format, "videofetch-worker"]),
+        true,
+        format,
+      );
+    }
     assert.equal(isReadOnlyCommand("docker", ["top", "videofetch-worker", "-o", "pid,ppid,pgid,comm"]), true);
     assert.equal(isReadOnlyCommand("/usr/local/sbin/vf-egress-policy-verify", []), true);
     assert.equal(isReadOnlyCommand("docker", ["exec", "videofetch-worker", "node", "--version"]), true);
@@ -2643,9 +2786,16 @@ describe("evidence provenance", () => {
     assert.equal(again.runId, created.runId);
     assert.equal(again.key, created.key);
 
-    // A malformed file does not silently mint a usable run for loadRun.
+    // §23 of CORRECTION-05: a malformed file that EXISTS is an error on both
+    // paths — never `null` (which reads as "no run started"), and never
+    // overwritten. See the dedicated lifecycle suite for the full matrix.
     files.set("/tmp/run.json", "{}");
-    assert.equal(await loadRun("/tmp/run.json", deps), null);
+    assert.match((await loadRun("/tmp/run.json", deps)).error, /does not carry a usable runId/);
+    assert.match(
+      (await loadOrCreateRun("/tmp/run.json", deps)).error,
+      /Refusing to overwrite it/,
+    );
+    assert.equal(files.get("/tmp/run.json"), "{}", "the damaged file is left exactly as it was");
   });
 
   it("24b. the run key never appears in any evidence record", async () => {
@@ -2960,12 +3110,14 @@ describe("exact process-group termination", () => {
       { pid: 100, ppid: 1, pgid: 100, comm: "node" },
       { pid: 200, ppid: 100, pgid: 200, comm: "python3" },
     ]);
-    // A row whose `comm` column carried argv is neither admitted NOR dropped:
-    // the whole listing becomes unmeasured (§22-§24 of CORRECTION-04).
-    const argv = parseHostProcessList("200 100 200 python3 /usr/local/lib/yt-dlp https://x");
-    assert.equal(argv.ok, false);
-    assert.equal(argv.rows, undefined);
-    assert.doesNotMatch(argv.reason, /yt-dlp|https/, "the refusal must not quote the row");
+
+    // A trailing field that does not look like a plain basename is neither
+    // dropped nor copied: the row SURVIVES (it may be the leak) with its name
+    // replaced by a fixed token (§21 of CORRECTION-05).
+    const odd = parseHostProcessList("200 100 200 python3 /usr/local/lib/yt-dlp https://x");
+    assert.equal(odd.ok, true);
+    assert.deepEqual(odd.rows, [{ pid: 200, ppid: 100, pgid: 200, comm: UNCLASSIFIED_COMM }]);
+    assert.doesNotMatch(JSON.stringify(odd), /yt-dlp|https/, "no raw text reaches the evidence");
   });
 });
 
@@ -3799,39 +3951,83 @@ describe("host process parsing", () => {
     assert.equal(evaluateGroupTermination(captured, survivors).terminated, false);
   });
 
-  it("43d. every malformed row shape makes the WHOLE listing unmeasured", () => {
-    for (const [stdout, pattern] of [
-      ["100 1 100\n", /4 the requested format produces|has 3 fields/],
-      ["100 1 100 node extra\n", /has 5 fields/],
-      ["1x0 1 100 node\n", /non-numeric id/],
-      ["100 1 abc node\n", /non-numeric id/],
-      ["100 1 100 (node)\n", /not a plain executable basename/],
-      [`100 1 100 ${"n".repeat(65)}\n`, /not a plain executable basename/],
+  it("43d. an unreadable NUMERIC PREFIX makes the WHOLE listing unmeasured", () => {
+    // The listing answers exactly one question — does the captured PGID still
+    // have members? — so the ids are what must parse. Each of these lines could
+    // be a member of the captured group and cannot be shown not to be.
+    for (const stdout of [
+      "100 1 100\n", // no comm column at all: only two ids and a stray
+      "1x0 1 100 node\n", // non-numeric pid
+      "100 x 100 node\n", // non-numeric ppid
+      "100 1 abc node\n", // non-numeric pgid
+      "  node 1 100 python3\n", // ids missing entirely
+      `${"9".repeat(20)} 1 100 node\n`, // an id outside the safe integer range
     ]) {
       const parsed = parseHostProcessList(stdout);
-      assert.equal(parsed.ok, false, stdout);
-      assert.match(parsed.reason, pattern);
+      assert.equal(parsed.ok, false, JSON.stringify(stdout));
+      assert.equal(parsed.rows, undefined);
+      assert.match(parsed.reason, /line 1 of the host process listing/);
+      assert.doesNotMatch(parsed.reason, /node|python3/, "the refusal must not quote the row");
     }
   });
 
-  it("43e. THE ATTACK: the only survivor is malformed and must not become []", () => {
-    // One process survives the captured group, and its row cannot be parsed.
-    // Dropping it would turn a leak into a clean termination PASS.
-    const parsed = parseHostProcessList("100 1 100 node\n200 100 200 python3 --some-argv\n");
-    assert.equal(parsed.ok, false, "the listing must be refused");
-    assert.equal(parsed.rows, undefined, "no partial row set is offered");
+  it("43d2. a legal `comm` containing spaces is parsed, not refused", () => {
+    // procps derives `comm` from the executable name and permits spaces. One
+    // unrelated process with such a name must not make the host unreadable.
+    const parsed = parseHostProcessList(
+      "100 1 100 node\n300 1 300 some process\n400 1 400 (sd-pam)\n",
+    );
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.rows.length, 3);
+    assert.equal(parsed.rows[0].comm, "node");
+    // Not a plain basename -> kept as a row, reported under the fixed token.
+    assert.equal(parsed.rows[1].comm, UNCLASSIFIED_COMM);
+    assert.equal(parsed.rows[2].comm, UNCLASSIFIED_COMM);
+    assert.deepEqual(parsed.rows[1], { pid: 300, ppid: 1, pgid: 300, comm: UNCLASSIFIED_COMM });
+  });
 
-    // And the observer propagates it as a MEASUREMENT FAILURE.
+  it("43e. THE ATTACK (retained): the only survivor is unusual and must not become []", async () => {
+    // The CORRECTION-04 regression, extended. One process survives the captured
+    // group under a name the harness will not copy verbatim. Dropping it would
+    // turn a leak into a clean termination PASS.
+    //
+    // CORRECTION-04 answered this by refusing the whole listing. CORRECTION-05
+    // answers it better: the SURVIVOR IS RETURNED, under a fixed token, so the
+    // termination proof sees it — and still cannot pass.
+    const stdout = "100 1 100 node\n200 100 200 python3 --some-argv\n";
+    const parsed = parseHostProcessList(stdout);
+    assert.equal(parsed.ok, true);
+
+    const survivors = parsed.rows.filter((row) => row.pgid === 200);
+    assert.equal(survivors.length, 1, "the survivor must not disappear");
+    assert.notDeepEqual(survivors, [], "and must never become an empty set");
+    assert.equal(survivors[0].comm, UNCLASSIFIED_COMM);
+
     const observers = makeSystemObservers({
       runReadOnly: async (file) =>
-        file === "ps"
-          ? { exitCode: 0, stdout: "100 1 100 node\n200 100 200 python3 --some-argv\n", stderr: "" }
-          : { exitCode: 0, stdout: "", stderr: "" },
+        file === "ps" ? { exitCode: 0, stdout, stderr: "" } : { exitCode: 0, stdout: "", stderr: "" },
     });
-    return observers.processGroupMembers(200).then((observed) => {
-      assert.equal(observed.measured, false);
-      assert.match(observed.reason, /cannot be interpreted|non-numeric|basename/);
-    });
+    const observed = await observers.processGroupMembers(200);
+    assert.equal(observed.measured, true);
+    assert.equal(observed.value.length, 1);
+    assert.doesNotMatch(JSON.stringify(observed), /some-argv/);
+
+    // A survivor the harness cannot classify is ambiguous, never terminated.
+    const termination = evaluateGroupTermination(captured, observed.value);
+    assert.equal(termination.measured, false, "an unclassifiable survivor cannot be measured away");
+    assert.equal(termination.ambiguous, true);
+    assert.notEqual(termination.terminated, true);
+
+    const stageB = evaluateStageB(
+      passingStageBObservations({
+        cancellation: measured(
+          cancellationEvidence({ groupMembersMeasured: true, groupSurvivors: observed.value }),
+        ),
+      }),
+      passingStageA(),
+    );
+    const check = stageB.checks.find((c) => c.id === "cancel.processes-gone");
+    assert.equal(check.outcome, OUTCOMES.BLOCKED);
   });
 
   it("43f. a malformed listing BLOCKS termination rather than passing it", () => {
@@ -3850,21 +4046,36 @@ describe("host process parsing", () => {
     }
   });
 
-  it("43g. a clean listing containing one malformed row cannot PASS", async () => {
+  it("43g. an unrelated legal `comm` cannot block the target-group query", async () => {
     const observers = makeSystemObservers({
       runReadOnly: async (file) =>
         file === "ps"
           ? {
               exitCode: 0,
-              // Everything is orderly except one row — which is precisely the
-              // row that would carry a leaked process's unexpected name.
-              stdout: "1 0 1 systemd\n100 1 100 node\n300 1 300 ???\n",
+              // An unrelated process with a spaced/odd name. Under the previous
+              // parser this single line made the whole host unreadable and every
+              // termination check BLOCKED, for a reason with nothing to do with
+              // the captured group.
+              stdout: "1 0 1 systemd\n100 1 100 node\n300 1 300 some odd process\n",
               stderr: "",
             }
           : { exitCode: 0, stdout: "", stderr: "" },
     });
     const observed = await observers.processGroupMembers(200);
-    assert.equal(observed.measured, false);
+    assert.equal(observed.measured, true, "an unrelated oddity is not an unanswerable question");
+    assert.deepEqual(observed.value, [], "and group 200 genuinely has no members");
+    assert.equal(evaluateGroupTermination(captured, observed.value).terminated, true);
+  });
+
+  it("43h. an unreadable row still blocks the target-group query", async () => {
+    const observers = makeSystemObservers({
+      runReadOnly: async (file) =>
+        file === "ps"
+          ? { exitCode: 0, stdout: "1 0 1 systemd\n100 1 100 node\nnot-a-process-row\n", stderr: "" }
+          : { exitCode: 0, stdout: "", stderr: "" },
+    });
+    const observed = await observers.processGroupMembers(200);
+    assert.equal(observed.measured, false, "a row that cannot be assigned to a group blocks");
   });
 });
 
@@ -3989,6 +4200,796 @@ describe("ambiguity policy preserved", () => {
     // the implementation deliberately does not do.
     assert.doesNotMatch(source, /window becomes unusable/);
     assert.match(source, /DISCARDED AND COUNTED/);
+  });
+});
+
+// ── CORRECTION-05 §4-§7: the harness never retrieves a secret value ────────
+
+describe("narrow environment observation", () => {
+  const secretValues = Object.values(SECRET_SENTINELS);
+
+  /** Asserts no secret sentinel appears anywhere in a JSON-serializable thing. */
+  function assertNoSecret(subject, what) {
+    const text = typeof subject === "string" ? subject : JSON.stringify(subject ?? null);
+    for (const secret of secretValues) {
+      assert.equal(text.includes(secret), false, `${what} must not contain a secret value`);
+    }
+  }
+
+  it("46. the three probes are the only environment access, and are exact", () => {
+    // Each probe names its own variable inside a compile-time constant, so the
+    // caller cannot redirect the read.
+    assert.match(ENV_NAMES_PROBE_ARGV[2], /sorted\(os\.environ\)/);
+    assert.match(YTDLP_ENABLED_PROBE_ARGV[2], /"YTDLP_ENABLED"/);
+    assert.match(MAX_FILE_SIZE_PROBE_ARGV[2], /"MAX_FILE_SIZE"/);
+    // No probe reaches a VALUE it was not asked for. Iterating `os.environ`
+    // yields keys, which is exactly what the name probe wants; what must not
+    // appear is any construct that materializes values.
+    for (const probe of [ENV_NAMES_PROBE_ARGV, YTDLP_ENABLED_PROBE_ARGV, MAX_FILE_SIZE_PROBE_ARGV]) {
+      assert.doesNotMatch(probe[2], /\.values\(\)|\.items\(\)|dict\(os\.environ\)|print\(os\.environ\)/);
+      // And nothing joins a name to a value.
+      assert.doesNotMatch(probe[2], /"="|'='/);
+    }
+    // The two value probes read exactly one variable each.
+    for (const probe of [YTDLP_ENABLED_PROBE_ARGV, MAX_FILE_SIZE_PROBE_ARGV]) {
+      assert.equal((probe[2].match(/os\.environ/g) ?? []).length, 1);
+    }
+  });
+
+  it("46b. the full-environment dump is structurally unrepresentable", () => {
+    for (const format of [
+      "{{range .Config.Env}}{{println .}}{{end}}",
+      "{{.Config.Env}}",
+      "{{json .Config}}",
+      "{{.}}",
+    ]) {
+      assert.equal(
+        isReadOnlyCommand("docker", ["inspect", "--format", format, "videofetch-worker"]),
+        false,
+        format,
+      );
+    }
+    assert.equal(isReadOnlyCommand("docker", ["inspect", "videofetch-worker"]), false);
+  });
+
+  it("46c. no probe can be redirected to another variable", () => {
+    for (const source of [
+      'import os;v=os.environ.get("WORKER_CONTROL_SECRET");print("<UNSET>" if v is None else "SET:"+v)',
+      "import os;print(os.environ)",
+      'import os;print(os.environ.get("MAX_FILE_SIZE","<UNSET>"))',
+      "import os;print(dict(os.environ))",
+    ]) {
+      assert.equal(
+        isReadOnlyCommand("docker", ["exec", "videofetch-worker", "/usr/bin/python3", "-c", source]),
+        false,
+        source.slice(0, 48),
+      );
+    }
+  });
+
+  it("47. a secret-bearing container never returns a secret value", async () => {
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      maxFileSize: "123456",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+      extraEnvironment: { SOME_OTHER_SECRET: SECRET_SENTINELS.access },
+    });
+    // The fake container genuinely holds the secrets — otherwise this proves
+    // nothing.
+    assert.equal(world.workerEnvironment.WORKER_CONTROL_SECRET, SECRET_SENTINELS.workerControl);
+
+    const observers = makeSystemObservers({ runReadOnly: world.runReadOnly });
+
+    const names = await observers.environmentNames();
+    assert.equal(names.measured, true);
+    // The NAME is expected; the value never is.
+    assert.ok(names.value.includes("WORKER_CONTROL_SECRET"), "names are still observable");
+    assert.equal(names.value.some((n) => n.includes("=")), false, "no NAME=value pair");
+    assertNoSecret(names, "the environment-name observation");
+
+    const enabled = await observers.ytdlpEnabledRaw();
+    assert.deepEqual(enabled, { measured: true, value: "true" });
+
+    const limit = await observers.effectiveMaxFileSize();
+    assert.deepEqual(limit, { measured: true, value: { bytes: 123456, source: "deployment" } });
+
+    // And nothing secret was ever in a command, a result, or an error.
+    assertNoSecret(world.calls.commands, "the issued commands");
+    assertNoSecret([names, enabled, limit], "the observer results");
+  });
+
+  it("47b. a full live run never carries a secret value anywhere", async () => {
+    const world = makeFakeWorld({
+      extraEnvironment: { ANOTHER_SECRET: SECRET_SENTINELS.workerControl },
+    });
+    const files = seedRun(new Map());
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/a.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    assertNoSecret(run.out, "stdout");
+    assertNoSecret(run.err, "stderr");
+    assertNoSecret(world.calls.commands, "the issued commands");
+    assertNoSecret(files.get("/tmp/a.json"), "the evidence record");
+
+    // The names ARE still recorded — the check that forbids R2 credentials
+    // needs them — so this is a narrowing, not a loss of evidence.
+    const record = JSON.parse(files.get("/tmp/a.json"));
+    assert.ok(record.workerEnvironment, "environment evidence is still produced");
+  });
+
+  it("47c. the probe decoder distinguishes UNSET from a literal <UNSET>", () => {
+    assert.deepEqual(decodeEnvProbe("<UNSET>\n"), { measured: true, present: false, value: null });
+    assert.deepEqual(decodeEnvProbe("SET:true\n"), { measured: true, present: true, value: "true" });
+    // A variable literally set to the sentinel is NOT read as absent.
+    assert.deepEqual(decodeEnvProbe("SET:<UNSET>\n"), {
+      measured: true,
+      present: true,
+      value: "<UNSET>",
+    });
+    // A value containing a newline survives, because the prefix is stripped
+    // from the whole output rather than from a first line.
+    assert.deepEqual(decodeEnvProbe("SET:a\nb\n"), { measured: true, present: true, value: "a\nb" });
+    assert.equal(decodeEnvProbe("something else\n").measured, false);
+    assert.equal(decodeEnvProbe("").measured, false);
+  });
+
+  it("47d. a value-bearing line from the name probe is a measurement failure", async () => {
+    const observers = makeSystemObservers({
+      runReadOnly: async (file, argv) =>
+        file === "docker" && argv[0] === "exec"
+          ? { exitCode: 0, stdout: `WORKER_CONTROL_SECRET=${SECRET_SENTINELS.workerControl}\n`, stderr: "" }
+          : { exitCode: 0, stdout: "", stderr: "" },
+    });
+    const names = await observers.environmentNames();
+    assert.equal(names.measured, false, "a value-bearing line is never parsed into names");
+    assertNoSecret(names, "the refusal");
+  });
+});
+
+// ── CORRECTION-05 §8-§11: image continuity across every Stage-B case ───────
+
+describe("image continuity", () => {
+  const CASE_ENV = (extra = {}) =>
+    LIVE_ENV({
+      VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+      VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+      ...WORKER_ENV,
+      ...extra,
+    });
+
+  const ENABLED = {
+    ytdlpEnabled: "true",
+    sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+  };
+
+  it("48. an ordinary case on one image seals continuity evidence", async () => {
+    const world = makeFakeWorld(ENABLED);
+    const run = await runCli(
+      ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
+      CASE_ENV(),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const record = JSON.parse(run.files.get("/tmp/c.json"));
+    assert.deepEqual(record.imageContinuity, {
+      before: IMAGE_ID,
+      after: IMAGE_ID,
+      taggedImageId: IMAGE_ID,
+      same: true,
+    });
+    assert.equal(record.runningImageId, IMAGE_ID);
+  });
+
+  it("48b. an image change DURING a case BLOCKS and writes no evidence", async () => {
+    const world = makeFakeWorld({ ...ENABLED, imageDriftsAfterReads: 1 });
+    const run = await runCli(
+      ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
+      CASE_ENV(),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /DEPLOYED IMAGE CHANGED DURING CASE 'cancellation'/);
+    assert.equal(run.files.has("/tmp/c.json"), false, "no record may combine two images");
+  });
+
+  it("48c. an unmeasurable post-case image BLOCKS", async () => {
+    let imageReads = 0;
+    const world = makeFakeWorld(ENABLED);
+    const run = await runCli(
+      ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
+      CASE_ENV(),
+      {
+        runReadOnly: async (file, argv) => {
+          if (file === "docker" && argv[0] === "image" && argv[1] === "inspect") {
+            imageReads += 1;
+            // The pre-case resolution succeeds; the post-case one cannot.
+            if (imageReads > 1) return { exitCode: 1, stdout: "", stderr: "no such image" };
+          }
+          return world.runReadOnly(file, argv);
+        },
+        fetch: world.fetch,
+        files: seedRun(),
+      },
+    );
+    assert.equal(run.code, 2);
+    assert.match(run.err, /could not be re-identified after case/);
+    assert.equal(run.files.has("/tmp/c.json"), false);
+  });
+
+  it("48d. a running image that is not the authorized SHA-tagged object BLOCKS", async () => {
+    const world = makeFakeWorld({ ...ENABLED, runningImage: `sha256:${"c".repeat(64)}` });
+    const run = await runCli(
+      ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
+      CASE_ENV(),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+    );
+    assert.equal(run.code, 2);
+    assert.match(run.err, /not the image tagged with the authorized source SHA/);
+    assert.equal(run.files.has("/tmp/c.json"), false);
+  });
+
+  it("48e. the aggregate can never accept a record whose image drifted", () => {
+    const binding = { expectedSha: SHA, runningImageId: IMAGE_ID };
+    const other = `sha256:${"d".repeat(64)}`;
+    for (const continuity of [
+      { before: IMAGE_ID, after: other, taggedImageId: IMAGE_ID, same: true },
+      // `same` is recomputed from the ids, never believed.
+      { before: IMAGE_ID, after: other, taggedImageId: other, same: true },
+      { before: IMAGE_ID, after: IMAGE_ID, taggedImageId: other, same: true },
+      { before: IMAGE_ID, after: IMAGE_ID, taggedImageId: IMAGE_ID, same: false },
+      { before: IMAGE_ID, after: IMAGE_ID, taggedImageId: IMAGE_ID },
+      { before: IMAGE_ID },
+      { before: "not-an-image-id", after: IMAGE_ID, taggedImageId: IMAGE_ID, same: true },
+      null,
+      undefined,
+    ]) {
+      // `buildCaseRecord` directly, so an ABSENT continuity object is genuinely
+      // absent rather than filled in by the test helper's default.
+      const record = buildCaseRecord({
+        caseName: "cancellation",
+        binding,
+        payload: { cancellation: cancellationEvidence({ postSample: [] }) },
+        featureState: featureState("enabled"),
+        imageContinuity: continuity,
+      });
+      const validated = validateCaseRecord(record, binding);
+      assert.equal(validated.ok, false, JSON.stringify(continuity ?? null));
+      assert.match(validated.reason, /image-continuity|different image/);
+    }
+
+    // And a record whose continuity disagrees with the id it binds to.
+    const mismatched = buildCaseRecord({
+      caseName: "cancellation",
+      binding,
+      payload: { cancellation: cancellationEvidence({ postSample: [] }) },
+      featureState: featureState("enabled"),
+      imageContinuity: { before: other, after: other, taggedImageId: other, same: true },
+    });
+    assert.match(
+      validateCaseRecord(mismatched, binding).reason,
+      /different image before the case than it binds to/,
+    );
+  });
+
+  it("48f. continuity evidence is sealed and cannot be edited", () => {
+    const KEY = "f".repeat(64);
+    const sealed = sealRecord(
+      caseRecord({
+        caseName: "cancellation",
+        binding: { expectedSha: SHA, runningImageId: IMAGE_ID },
+        payload: { cancellation: cancellationEvidence({ postSample: [] }) },
+        runId: "0123456789abcdef",
+      }),
+      KEY,
+    );
+    assert.equal(verifySeal(sealed, KEY).ok, true);
+    sealed.imageContinuity.after = `sha256:${"9".repeat(64)}`;
+    assert.equal(verifySeal(sealed, KEY).ok, false);
+  });
+});
+
+// ── CORRECTION-05 §12-§15: the deterministic restart-recovery contract ─────
+
+describe("restart recovery contract", () => {
+  /**
+   * A sampler that needs no Docker, so the only `{{.State.Pid}}` reads in the
+   * shutdown test come from the restart watcher — which makes the simulated
+   * operator restart land at an exactly known point.
+   */
+  const fakeSampler = {
+    async sample() {
+      return {
+        sample: acquisitionSample(),
+        workerPid: 100,
+        ytdlpPid: 200,
+        expectedNetns: "net:[4026532001]",
+      };
+    },
+  };
+
+  async function runShutdown(worldOptions = {}, deps = {}) {
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+      // The watcher reads the PID once for `before`; the restart lands next.
+      restartAfterPidReads: 1,
+      ...worldOptions,
+    });
+    const run = await runCli(
+      ["--stage", "B", "--case", "shutdown", ...LIVE_ARGS, "--evidence", "/tmp/s.json"],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+        ...WORKER_ENV,
+      }),
+      {
+        runReadOnly: world.runReadOnly,
+        fetch: world.fetch,
+        files: seedRun(),
+        sampler: fakeSampler,
+        // `sleep` is a no-op in these tests, so a wall-clock window would spin
+        // for its full duration rather than waiting. Both windows are shrunk to
+        // keep the FAILURE paths bounded; the success paths return immediately.
+        shutdownWindowMs: 2000,
+        recoveryWindowMs: 2000,
+        ...deps,
+      },
+    );
+    return { run, world };
+  }
+
+  it("49. the contract mirrors the Worker's own recover()", () => {
+    assert.deepEqual(RESTART_RECOVERY, {
+      status: "failed",
+      errorCode: "PROCESSING_FAILED",
+      safeErrorMessage: "Worker restarted before the job completed.",
+    });
+  });
+
+  it("49b. a non-empty status is no longer sufficient", () => {
+    // The exact predicate CORRECTION-05 removes: any non-empty string passed.
+    for (const status of ["ready", "queued", "analyzing", "downloading", "processing", "uploading", "cancelled"]) {
+      const result = evaluateStageB(
+        passingStageBObservations({
+          shutdownCase: measured(
+            shutdownEvidence({
+              recoveredStatus: status,
+              recoveredErrorCode: null,
+              recoveredSafeErrorMessage: null,
+              lateReady: status === "ready",
+            }),
+          ),
+        }),
+        passingStageA(),
+      );
+      const check = result.checks.find((c) => c.id === "shutdown.job-recovered");
+      assert.equal(check.outcome, OUTCOMES.FAIL, `${status} must not pass restart recovery`);
+    }
+  });
+
+  it("49c. failed with the wrong errorCode or message FAILS", () => {
+    for (const overrides of [
+      { recoveredErrorCode: "TIMEOUT" },
+      { recoveredErrorCode: null },
+      // The generic PROCESSING_FAILED copy, not the restart sentence: this is
+      // what every ordinary internal acquisition failure produces.
+      { recoveredSafeErrorMessage: "We couldn't process this video. Try another format or source." },
+      { recoveredSafeErrorMessage: null },
+      { recoveredSafeErrorMessage: "worker restarted before the job completed." },
+      { restartObserved: false },
+      { lateReady: true },
+    ]) {
+      const result = evaluateStageB(
+        passingStageBObservations({ shutdownCase: measured(shutdownEvidence(overrides)) }),
+        passingStageA(),
+      );
+      const check = result.checks.find((c) => c.id === "shutdown.job-recovered");
+      assert.equal(check.outcome, OUTCOMES.FAIL, JSON.stringify(overrides));
+    }
+  });
+
+  it("49d. failed + PROCESSING_FAILED + the restart message PASSES", () => {
+    const result = evaluateStageB(
+      passingStageBObservations({ shutdownCase: measured(shutdownEvidence()) }),
+      passingStageA(),
+    );
+    const check = result.checks.find((c) => c.id === "shutdown.job-recovered");
+    assert.equal(check.outcome, OUTCOMES.PASS);
+  });
+
+  it("49e. recovery and PGID termination are independent assertions", () => {
+    // A perfect durable row says nothing about whether the process died.
+    const leaked = evaluateStageB(
+      passingStageBObservations({
+        shutdownCase: measured(
+          shutdownEvidence({ groupSurvivors: [{ pid: 200, ppid: 1, pgid: 200, comm: "python3" }] }),
+        ),
+      }),
+      passingStageA(),
+    );
+    assert.equal(
+      leaked.checks.find((c) => c.id === "shutdown.group-terminated").outcome,
+      OUTCOMES.FAIL,
+    );
+    assert.equal(
+      leaked.checks.find((c) => c.id === "shutdown.job-recovered").outcome,
+      OUTCOMES.PASS,
+      "a dead-process failure must not be laundered by a good durable row",
+    );
+
+    // And a dead process group says nothing about the durable row.
+    const badRow = evaluateStageB(
+      passingStageBObservations({
+        shutdownCase: measured(shutdownEvidence({ recoveredStatus: "ready", lateReady: true })),
+      }),
+      passingStageA(),
+    );
+    assert.equal(
+      badRow.checks.find((c) => c.id === "shutdown.group-terminated").outcome,
+      OUTCOMES.PASS,
+    );
+    assert.equal(
+      badRow.checks.find((c) => c.id === "shutdown.job-recovered").outcome,
+      OUTCOMES.FAIL,
+    );
+  });
+
+  it("50. end to end: the restart is observed and the recovery contract measured", async () => {
+    const { run } = await runShutdown();
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const payload = JSON.parse(run.files.get("/tmp/s.json")).payload.shutdownCase;
+
+    assert.equal(payload.restartObserved, true);
+    assert.notEqual(payload.previousContainerPid, payload.currentContainerPid);
+    assert.equal(payload.recoveredStatus, "failed");
+    assert.equal(payload.recoveredErrorCode, "PROCESSING_FAILED");
+    assert.equal(payload.recoveredSafeErrorMessage, "Worker restarted before the job completed.");
+    assert.equal(payload.lateReady, false);
+    assert.ok(payload.recoveryPolls >= 1, "recovery is polled, not assumed");
+
+    const result = evaluateStageB(
+      passingStageBObservations({ shutdownCase: measured(payload) }),
+      passingStageA(),
+    );
+    assert.equal(
+      result.checks.find((c) => c.id === "shutdown.job-recovered").outcome,
+      OUTCOMES.PASS,
+    );
+  });
+
+  it("50b. the image must be identical across the restart", async () => {
+    // The container PID changes — that is expected. The IMAGE must not.
+    const { run } = await runShutdown();
+    const record = JSON.parse(run.files.get("/tmp/s.json"));
+    assert.equal(record.imageContinuity.before, IMAGE_ID);
+    assert.equal(record.imageContinuity.after, IMAGE_ID);
+    assert.equal(record.imageContinuity.same, true);
+    // Container identity is deliberately NOT the binding.
+    assert.notEqual(
+      record.payload.shutdownCase.previousContainerPid,
+      record.payload.shutdownCase.currentContainerPid,
+    );
+  });
+
+  it("50c. a restart that lands on a DIFFERENT image BLOCKS", async () => {
+    const { run } = await runShutdown({ imageAfterRestart: `sha256:${"b".repeat(64)}` });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /DEPLOYED IMAGE CHANGED DURING CASE 'shutdown'/);
+    assert.equal(run.files.has("/tmp/s.json"), false);
+  });
+
+  it("50d. a Worker that never answers again BLOCKS rather than defaulting", async () => {
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+      restartAfterPidReads: 1,
+    });
+    let restarted = false;
+    const run = await runCli(
+      ["--stage", "B", "--case", "shutdown", ...LIVE_ARGS, "--evidence", "/tmp/s.json"],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+        ...WORKER_ENV,
+      }),
+      {
+        runReadOnly: async (file, argv) => {
+          const result = await world.runReadOnly(file, argv);
+          if (file === "docker" && argv.join(" ").includes(".State.Pid")) restarted = world.live.restarted;
+          return result;
+        },
+        // After the restart, the job view never answers again.
+        fetch: async (target, init) => {
+          if (restarted && String(target).includes("/status")) throw new Error("connection refused");
+          return world.fetch(target, init);
+        },
+        files: seedRun(),
+        sampler: fakeSampler,
+        shutdownWindowMs: 2000,
+        recoveryWindowMs: 2000,
+      },
+    );
+    assert.equal(run.code, 2);
+    assert.match(run.err, /did not report a terminal state|restart-recovery contract/);
+    assert.equal(run.files.has("/tmp/s.json"), false);
+  });
+});
+
+// ── CORRECTION-05 §16-§18: direct-regression sampling gaps ────────────────
+
+describe("direct regression sampling gaps", () => {
+  const directEvidence = (overrides = {}) => ({
+    jobId: "aa".repeat(16),
+    status: "ready",
+    extractor: "direct",
+    processSamplingMeasured: true,
+    samplesTaken: 5,
+    samplingErrors: [],
+    samplingErrorCount: 0,
+    sampledBasenames: ["node"],
+    ...overrides,
+  });
+
+  const verdictFor = (overrides) => {
+    const result = evaluateStageB(
+      passingStageBObservations({ directAfterEnable: measured(directEvidence(overrides)) }),
+      passingStageA(),
+    );
+    return Object.fromEntries(
+      result.checks
+        .filter((c) => c.id.startsWith("direct."))
+        .map((c) => [c.id, c.outcome]),
+    );
+  };
+
+  it("51. five clean samples and no errors is a PASS candidate", () => {
+    const verdicts = verdictFor({});
+    assert.equal(verdicts["direct.process-sampling-available"], OUTCOMES.PASS);
+    assert.equal(verdicts["direct.no-ytdlp-spawned"], OUTCOMES.PASS);
+  });
+
+  it("51b. zero samples and one error is BLOCKED", () => {
+    const verdicts = verdictFor({
+      processSamplingMeasured: false,
+      samplesTaken: 0,
+      samplingErrors: ["docker top exited 1"],
+      samplingErrorCount: 1,
+      sampledBasenames: [],
+    });
+    assert.equal(verdicts["direct.process-sampling-available"], OUTCOMES.BLOCKED);
+    assert.equal(verdicts["direct.no-ytdlp-spawned"], OUTCOMES.BLOCKED);
+  });
+
+  it("51c. clean samples EITHER SIDE of an error are still BLOCKED", () => {
+    // The exact defect: a later successful sample used to erase the gap.
+    const verdicts = verdictFor({
+      samplesTaken: 2,
+      samplingErrors: ["docker top exited 1"],
+      samplingErrorCount: 1,
+    });
+    assert.equal(verdicts["direct.process-sampling-available"], OUTCOMES.BLOCKED);
+    assert.equal(verdicts["direct.no-ytdlp-spawned"], OUTCOMES.BLOCKED);
+
+    const result = evaluateStageB(
+      passingStageBObservations({
+        directAfterEnable: measured(
+          directEvidence({ samplesTaken: 2, samplingErrors: ["x"], samplingErrorCount: 1 }),
+        ),
+      }),
+      passingStageA(),
+    );
+    const blocked = result.checks.find((c) => c.id === "direct.process-sampling-available");
+    assert.match(blocked.detail, /unobserved interval/);
+  });
+
+  it("51d. many clean samples cannot outvote a single gap", () => {
+    const verdicts = verdictFor({ samplesTaken: 500, samplingErrorCount: 1, samplingErrors: ["x"] });
+    assert.equal(verdicts["direct.no-ytdlp-spawned"], OUTCOMES.BLOCKED);
+  });
+
+  it("51e. yt-dlp observed in a clean run still FAILS, not BLOCKS", () => {
+    for (const basename of ["python3", "yt-dlp"]) {
+      const verdicts = verdictFor({ sampledBasenames: ["node", basename] });
+      assert.equal(verdicts["direct.process-sampling-available"], OUTCOMES.PASS);
+      assert.equal(verdicts["direct.no-ytdlp-spawned"], OUTCOMES.FAIL, basename);
+    }
+  });
+
+  it("51f. the gap travels into the sealed record and the aggregate", async () => {
+    // A sampler that fails once, then succeeds — the shape that previously
+    // erased its own evidence.
+    let calls = 0;
+    const flakySampler = {
+      async sample() {
+        calls += 1;
+        if (calls === 1) throw new Error("docker top exited 1");
+        return {
+          sample: [{ pid: 100, ppid: 1, pgid: 100, comm: "node", netns: "net:[4026532001]" }],
+          workerPid: 100,
+          ytdlpPid: null,
+          expectedNetns: "net:[4026532001]",
+        };
+      },
+    };
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const run = await runCli(
+      ["--stage", "B", "--case", "direct-regression", ...LIVE_ARGS, "--evidence", "/tmp/d.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun(), sampler: flakySampler },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+
+    const payload = JSON.parse(run.files.get("/tmp/d.json")).payload.directAfterEnable;
+    assert.equal(payload.samplingErrorCount, 1, "the failed attempt is kept");
+    assert.ok(payload.samplesTaken > 0, "and the successful ones too");
+    assert.match(payload.samplingErrors[0], /docker top exited 1/);
+
+    const result = evaluateStageB(
+      passingStageBObservations({ directAfterEnable: measured(payload) }),
+      passingStageA(),
+    );
+    assert.equal(
+      result.checks.find((c) => c.id === "direct.no-ytdlp-spawned").outcome,
+      OUTCOMES.BLOCKED,
+      "a run with a known gap cannot claim an absence",
+    );
+  });
+});
+
+// ── CORRECTION-05 §23: the run key is never silently replaced ─────────────
+
+describe("run-key lifecycle", () => {
+  const VALID = JSON.stringify({ runId: "a1b2c3d4e5f60718", key: "c".repeat(64) });
+  const enoent = () => Object.assign(new Error("no such file"), { code: "ENOENT" });
+
+  function adapter({ contents = VALID, mode = 0o600, statThrows, readThrows } = {}) {
+    const written = [];
+    return {
+      written,
+      deps: {
+        readFile: async () => {
+          if (readThrows) throw readThrows;
+          return contents;
+        },
+        writeFile: async (path, body) => written.push([path, body]),
+        mkdir: async () => {},
+        chmod: async () => {},
+        stat: async () => {
+          if (statThrows) throw statThrows;
+          return { mode };
+        },
+      },
+    };
+  }
+
+  it("52. ENOENT is the ONLY condition that mints a new run", async () => {
+    const { deps, written } = adapter({ statThrows: enoent() });
+    const created = await loadOrCreateRun("/tmp/run.json", deps);
+    assert.equal(created.created, true);
+    assert.match(created.key, /^[0-9a-f]{64}$/);
+    assert.equal(written.length, 1);
+    // And `loadRun` reports the absence rather than inventing a run.
+    assert.equal(await loadRun("/tmp/run.json", deps), null);
+  });
+
+  it("52b. a valid private file is resumed, never rewritten", async () => {
+    const { deps, written } = adapter();
+    const resumed = await loadOrCreateRun("/tmp/run.json", deps);
+    assert.equal(resumed.created, false);
+    assert.equal(resumed.key, "c".repeat(64));
+    assert.equal(written.length, 0, "an intact key file is never written to");
+  });
+
+  it("52c. every damaged-file condition BLOCKS and preserves the file", async () => {
+    const cases = [
+      ["unsafe permissions", { mode: 0o644 }, /group- or world-accessible/],
+      ["stat failure", { statThrows: Object.assign(new Error("denied"), { code: "EACCES" }) }, /could not be measured/],
+      ["unreadable content", { readThrows: Object.assign(new Error("denied"), { code: "EACCES" }) }, /could not be read/],
+      ["malformed JSON", { contents: "{not json" }, /not valid JSON/],
+      ["truncated JSON", { contents: '{"runId":"abc"' }, /not valid JSON/],
+      ["missing key", { contents: '{"runId":"abc"}' }, /usable runId and 256-bit key/],
+      ["short key", { contents: '{"runId":"abc","key":"aa"}' }, /usable runId and 256-bit key/],
+      ["non-hex key", { contents: `{"runId":"abc","key":"${"z".repeat(64)}"}` }, /usable runId and 256-bit key/],
+      ["missing runId", { contents: `{"key":"${"c".repeat(64)}"}` }, /usable runId and 256-bit key/],
+      ["an empty file", { contents: "" }, /not valid JSON/],
+    ];
+    for (const [what, options, pattern] of cases) {
+      const create = adapter(options);
+      const created = await loadOrCreateRun("/tmp/run.json", create.deps);
+      assert.match(created.error, pattern, `loadOrCreateRun: ${what}`);
+      assert.equal(created.key, undefined, `${what}: no key is handed back`);
+      assert.deepEqual(create.written, [], `${what}: the damaged file must not be overwritten`);
+
+      const load = adapter(options);
+      const loaded = await loadRun("/tmp/run.json", load.deps);
+      assert.match(loaded.error, pattern, `loadRun: ${what}`);
+      assert.notEqual(loaded, null, `${what}: damaged is not the same as absent`);
+    }
+  });
+
+  it("52d. the CLI refuses to run against a damaged key, on both stages", async () => {
+    for (const stage of [["--stage", "A"], ["--stage", "B", "--case", "kill-switch"]]) {
+      const world = makeFakeWorld();
+      const files = new Map([["./.vf-acceptance-run.json", "{not json"]]);
+      const run = await runCli(
+        [...stage, ...LIVE_ARGS, "--evidence", "/tmp/x.json"],
+        LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+        { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+      );
+      assert.equal(run.code, 2, `${stage.join(" ")}: ${run.out}${run.err}`);
+      assert.match(run.err, /Refusing to overwrite it|not valid JSON/);
+      assert.equal(files.get("./.vf-acceptance-run.json"), "{not json", "the file is untouched");
+    }
+  });
+
+  it("52e. no run-key path ever discloses the key", async () => {
+    const results = [
+      await loadOrCreateRun("/tmp/run.json", adapter({ mode: 0o644 }).deps),
+      await loadOrCreateRun("/tmp/run.json", adapter({ contents: "{}" }).deps),
+      await loadRun("/tmp/run.json", adapter({ contents: "{}" }).deps),
+    ];
+    for (const result of results) assert.doesNotMatch(JSON.stringify(result ?? null), /c{32}/);
+  });
+});
+
+// ── CORRECTION-05 §29: a dry run touches nothing at all ───────────────────
+
+describe("dry-run inertness", () => {
+  const COMMANDS = [
+    ["--stage", "A"],
+    ["--stage", "B", "--case", "success"],
+    ["--stage", "B", "--case", "cancellation"],
+    ["--stage", "B", "--case", "byte-limit"],
+    ["--stage", "B", "--case", "shutdown"],
+    ["--stage", "B", "--case", "safe-egress"],
+    ["--stage", "B", "--case", "direct-regression"],
+    ["--stage", "B", "--case", "kill-switch"],
+    ["--stage", "B", "--aggregate"],
+  ];
+
+  it("53. every live-capable command refuses without BOTH gates", async () => {
+    for (const command of COMMANDS) {
+      for (const [argv, env] of [
+        [command, {}],
+        [[...command, "--live"], {}],
+        [command, { [LIVE_ENV_NAME]: "1" }],
+      ]) {
+        const world = makeFakeWorld();
+        const files = new Map();
+        const run = await runCli(
+          [...argv, "--base-url", "https://control.invalid", "--expected-sha", SHA],
+          { VIDEOFETCH_ACCESS_SECRET: "an-actual-access-secret-value", ...env },
+          { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+        );
+        const label = `${argv.join(" ")} / env=${JSON.stringify(env)}`;
+        assert.equal(run.code, 2, label);
+        assert.match(run.out, /LIVE EXECUTION REFUSED/, label);
+        assert.doesNotMatch(run.out, /LIVE ACCEPTANCE/, label);
+
+        // Nothing was touched: no authentication, no run key, no Docker, no
+        // network, no job.
+        assert.equal(world.calls.logins, 0, `${label}: authenticated`);
+        assert.equal(world.calls.commands.length, 0, `${label}: ran a command`);
+        assert.equal(world.calls.fetches.length, 0, `${label}: made a request`);
+        assert.equal(files.size, 0, `${label}: touched the filesystem`);
+      }
+    }
+  });
+
+  it("53b. fail-closed-runtime stays a non-live declaration", async () => {
+    const world = makeFakeWorld();
+    const run = await runCli(
+      ["--stage", "B", "--case", "fail-closed-runtime", "--live", "--base-url", "https://c.invalid", "--expected-sha", SHA],
+      { [LIVE_ENV_NAME]: "1", VIDEOFETCH_ACCESS_SECRET: "s" },
+      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+    );
+    assert.equal(run.code, 3);
+    assert.match(run.err, /not a live case command/);
+    assert.equal(world.calls.commands.length, 0);
   });
 });
 
