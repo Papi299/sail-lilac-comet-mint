@@ -2218,6 +2218,54 @@ The CORRECTION-07 epoch architecture is unchanged: `containerEpoch`,
 bracketed deployment snapshots, image identity as code provenance, feature
 continuity, and container identity as runtime-epoch evidence only.
 
+#### CORRECTION-09 — a positively observed restart epoch is no longer erased
+
+CORRECTION-08 made the container instance the restart authority and required
+each endpoint to be a coherent observation. One case remained wrong.
+
+When the polling loop SUCCESSFULLY MEASURED a different instance and the
+coherent endpoint then settled on a THIRD instance, the watcher recorded the
+transition as old -> endpoint and discarded the instance it had just measured.
+That is not a gap in observation; it is the deletion of one. The harness did not
+merely fail to see an intermediate epoch — it saw one, and then reported a
+transition that skipped it.
+
+The two situations look alike and are not:
+
+  AN UNOBSERVED INTERVAL — the container was unavailable, nothing was measured
+  during the gap, and one coherent endpoint followed. Recording that transition
+  discards no observation, so it remains usable, with the same bounded claim
+  CORRECTION-08 established: polling cannot exclude epochs it never saw.
+
+  A POSITIVELY OBSERVED INTERMEDIATE — a probe successfully measured one
+  instance and the endpoint settled on another. Two distinct post-transition
+  epochs were measured, so no single transition can be attributed to the
+  restart.
+
+The poll's sighting is now retained as `detectedInstanceId`, and the coherent
+endpoint must equal it. If it does not, the case BLOCKS with "AN ADDITIONAL
+WORKER RECREATION WAS OBSERVED WHILE ESTABLISHING THE RESTART ENDPOINT" and no
+record is written. An endpoint-bracket retry does not change that: a later,
+cleaner observation never overwrites an earlier positive one. The finding names
+neither container id, because that two epochs were observed is the whole finding.
+
+One probe establishes that a different container object exists but cannot bind a
+PID to it, so the coherent bracket still runs — the accepted endpoint is the
+instance the poll saw, carrying the PID that observation established. A PID from
+one instance is never attached to another.
+
+This introduces no stronger claim about polling. It only preserves what polling
+actually observed. The schema identifier stays `10c4-correction-08`: the change
+makes the watcher STRICTER, so no artifact becomes acceptable more weakly, and
+the record semantics are unchanged.
+
+Everything CORRECTION-08 established is preserved: the producer-contract schema
+and its rejection of stale Stage-A and case artifacts, the container instance as
+restart authority, the PID as auxiliary evidence, the instance -> PID -> instance
+endpoint bracket with bounded retries, PID reuse being unable to hide a
+recreation, the outer bracketed deployment snapshots, and the absence of any
+continuous-observation claim.
+
 #### What Phase 10D is authorized to do
 
 Nothing yet. Only after this harness has been **independently reviewed and

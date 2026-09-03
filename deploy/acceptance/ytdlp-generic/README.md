@@ -1168,6 +1168,50 @@ The PID stays in the evidence as auxiliary diagnostic data, bound to the instanc
 it was actually read from. It is never the authority for which transition
 occurred.
 
+### An observed epoch is never erased
+
+The poll's own sighting is **evidence**, and the endpoint must be the same
+object it saw:
+
+```
+poll measures a different instance      →  detectedInstanceId
+establish the endpoint coherently       →  after.instanceId
+after.instanceId  MUST EQUAL  detectedInstanceId
+```
+
+This is the line between two things that look alike and are not:
+
+| What happened between the polls | May the record say `A → C`? |
+| :--- | :--- |
+| the container was **unavailable** — nothing was measured | **yes**; nothing is being discarded |
+| an instance **was successfully measured**, and the endpoint settled elsewhere | **no** — `BLOCKED` |
+
+In the second case the harness did not merely fail to see an intermediate epoch;
+it *saw one*. Two distinct post-`A` epochs were positively measured, so no single
+transition can be attributed to the restart, and reporting `A → C` would require
+un-seeing a measurement that was actually made. A retry of the endpoint bracket
+does not change that — a later, cleaner observation never overwrites an earlier
+positive one.
+
+The finding is:
+
+```
+AN ADDITIONAL WORKER RECREATION WAS OBSERVED WHILE ESTABLISHING THE RESTART
+ENDPOINT: two different container epochs were positively measured after the
+case began, so no single transition can be attributed to this restart
+```
+
+It names neither id — that two epochs were observed is the whole finding, and
+printing them adds nothing an operator needs.
+
+This is **not** a stronger claim about polling. The harness still cannot exclude
+epochs it never saw, and does not try to. The rule is only:
+
+```
+an unobserved interval   →  do not claim what was in it
+an observed epoch        →  do not erase it
+```
+
 ### The deployment snapshot
 
 The image, the feature state and the container instance are read as **one

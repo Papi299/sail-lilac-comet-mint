@@ -518,11 +518,17 @@ function makeFakeWorld(options = {}) {
     //   recreateAfterPidReads       …or after N PID reads
     //   instanceAfterRecreation     the object that one brings back
     //   containerIdUnreadable       the epoch cannot be measured at all
+    //   idUnreadableAtReads         the container is DOWN for exactly these
+    //                               `{{.Id}}` reads — a transient stop, which
+    //                               is an UNOBSERVED interval rather than an
+    //                               observed intermediate epoch (§4 of
+    //                               CORRECTION-09)
     instanceAfterRestart: options.instanceAfterRestart ?? null,
     recreateAfterIdReads: options.recreateAfterIdReads ?? null,
     recreateAfterPidReads: options.recreateAfterPidReads ?? null,
     instanceAfterRecreation: options.instanceAfterRecreation ?? CONTAINER_C,
     containerIdUnreadable: options.containerIdUnreadable ?? false,
+    idUnreadableAtReads: options.idUnreadableAtReads ?? [],
     // §15 of CORRECTION-06: a restart may bring the SAME image back with a
     // DIFFERENT deployment feature state. Modelling that explicitly is what
     // proves image continuity does not stand in for feature continuity.
@@ -552,6 +558,7 @@ function makeFakeWorld(options = {}) {
     imageReads: 0,
     pidReads: 0,
     idReads: 0,
+    downReadsServed: 0,
     envReads: 0,
     restarted: false,
     recreated: false,
@@ -692,9 +699,18 @@ function makeFakeWorld(options = {}) {
           return { exitCode: 0, stdout: `${currentContainerPid()}\n`, stderr: "" };
         }
         if (joined.includes("{{.Id}}")) {
-          return env.containerIdUnreadable
-            ? { exitCode: 1, stdout: "", stderr: "no such container" }
-            : { exitCode: 0, stdout: `${currentContainerInstanceId()}\n`, stderr: "" };
+          if (env.containerIdUnreadable) {
+            return { exitCode: 1, stdout: "", stderr: "no such container" };
+          }
+          // The read still ADVANCES the sequence — a stopped container is an
+          // attempt that happened — but reports the container as gone, which is
+          // how the watcher learns the stop half occurred.
+          const id = currentContainerInstanceId();
+          if (env.idUnreadableAtReads.includes(live.idReads)) {
+            live.downReadsServed += 1;
+            return { exitCode: 1, stdout: "", stderr: "no such container" };
+          }
+          return { exitCode: 0, stdout: `${id}\n`, stderr: "" };
         }
       }
       if (argv[0] === "top") {
@@ -6972,36 +6988,97 @@ describe("restart endpoint coherence", () => {
   });
 
   /**
-   * §13, "race around the new endpoint".
+   * THE CORRECTION-09 REGRESSION (§4, §8).
    *
-   * The poll glimpses B, and the container becomes C before the endpoint can be
-   * observed coherently. The endpoint must not be sealed as B carrying C's PID.
+   * The poll SUCCESSFULLY MEASURES B. The container then becomes C, and the
+   * coherent endpoint settles on C.
+   *
+   * CORRECTION-08 recorded that as `A -> C` and asserted B was absent from the
+   * record. That was wrong, and the assertion has been reversed rather than
+   * relaxed: the harness did not merely fail to see an intermediate epoch, it
+   * SAW one. Two distinct post-A epochs were positively measured, so no single
+   * transition can be attributed to this restart — and compressing them to
+   * `A -> C` would require un-seeing a measurement that was actually made.
    */
-  it("77. a moving new endpoint is never sealed as a stale instance", async () => {
-    // Id reads: pre snapshot (1, 2), before bracket (3, 4), poll (5) sees B,
-    // after bracket (6, 7). The second recreation lands on read 6, so the
-    // endpoint bracket resolves entirely against C.
+  it("77. a POSITIVELY OBSERVED intermediate epoch is a finding, not A -> C", async () => {
+    // Id reads: pre snapshot (1, 2), before bracket (3, 4), poll (5) MEASURES
+    // B, endpoint bracket (6, 7). The second recreation lands on read 6, so the
+    // endpoint resolves coherently to C while B has already been observed.
     const { run } = await runShutdown({
       recreateAfterIdReads: 5,
       instanceAfterRecreation: CONTAINER_C,
       pidAfterRecreation: 900,
     });
+
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /AN ADDITIONAL WORKER RECREATION WAS OBSERVED WHILE ESTABLISHING THE RESTART ENDPOINT/);
+    assert.match(run.err, /two different container epochs were positively measured/);
+    assert.equal(run.files.has("/tmp/s.json"), false, "no record is written");
+    assert.doesNotMatch(run.out, /case evidence written/);
+
+    // §10: the finding names no container id — it does not need to.
+    assert.doesNotMatch(run.err, new RegExp(CONTAINER_B));
+    assert.doesNotMatch(run.err, new RegExp(CONTAINER_C));
+  });
+
+  /**
+   * §9, "endpoint bracket itself moves".
+   *
+   * The poll measures B; the endpoint bracket then reads `B -> PID -> C`, which
+   * is ambiguous and retried. The retry settles coherently on C — and that
+   * retry must not erase the successful B probe that preceded it.
+   */
+  it("77c. an endpoint RETRY cannot erase the instance the poll measured", async () => {
+    // Recreation on id read 7, which is the CLOSING read of the first endpoint
+    // bracket attempt: B (open) -> PID -> C (close) is ambiguous, and the retry
+    // then resolves entirely against C.
+    const { run, world } = await runShutdown({
+      recreateAfterIdReads: 6,
+      instanceAfterRecreation: CONTAINER_C,
+      pidAfterRecreation: 900,
+    });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /AN ADDITIONAL WORKER RECREATION WAS OBSERVED/);
+    assert.equal(run.files.has("/tmp/s.json"), false, "no record is written");
+    // The retry genuinely ran: pre snapshot (2) + before bracket (2) + poll (1)
+    // + the AMBIGUOUS first endpoint attempt (2) + the retry (2) = 9. A path
+    // without a retry would have stopped at 7.
+    assert.equal(world.live.idReads, 9, "the endpoint bracket was retried");
+  });
+
+  /**
+   * §9, "temporary down interval" — the other side of the §19 line.
+   *
+   * The container is UNAVAILABLE at the poll, so nothing is measured during the
+   * gap. One coherent endpoint follows. Recording that transition discards no
+   * observation, because none was made, so it remains a usable candidate — and
+   * the harness claims nothing about what may have existed in the interval.
+   */
+  it("77d. an UNOBSERVED interval is not invented into an intermediate epoch", async () => {
+    const { run, world } = await runShutdown({
+      // Id read 5 finds the container gone; the restart has landed by read 6.
+      idUnreadableAtReads: [5],
+      restartAfterIdReads: 5,
+    });
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    // The stop half was genuinely served, and the watcher treated it as
+    // information rather than as a failure — a watcher that threw on an
+    // unmeasurable probe could not have reached a PASS here.
+    assert.equal(world.live.downReadsServed, 1, "the container was observed down");
     const record = JSON.parse(run.files.get("/tmp/s.json"));
     const payload = record.payload.shutdownCase;
 
-    // The endpoint is the instance that was COHERENTLY observed, with its own
-    // PID. B is a glimpse the harness cannot vouch for, and it appears nowhere.
-    assert.equal(payload.currentContainerInstanceId, CONTAINER_C);
-    assert.equal(payload.currentContainerPid, 900);
-    assert.doesNotMatch(JSON.stringify(record), new RegExp(CONTAINER_B), "B is never recorded");
-    assert.doesNotMatch(
-      JSON.stringify(payload),
-      /"currentContainerPid":\s*400/,
-      "and B's PID is never attributed to any instance",
-    );
-    assert.equal(record.containerEpoch.restartTo, CONTAINER_C);
-    assert.equal(record.containerEpoch.after, CONTAINER_C);
+    assert.equal(payload.previousContainerInstanceId, CONTAINER_A);
+    assert.equal(payload.currentContainerInstanceId, CONTAINER_B);
+    assert.deepEqual(record.containerEpoch, {
+      mode: "one-restart",
+      before: CONTAINER_A,
+      restartFrom: CONTAINER_A,
+      restartTo: CONTAINER_B,
+      after: CONTAINER_B,
+    });
+    // The stop half was seen, and that is all the gap is reported as.
+    assert.equal(payload.restartObserved, true);
   });
 
   it("77b. an endpoint that never settles is a measurement failure", async () => {

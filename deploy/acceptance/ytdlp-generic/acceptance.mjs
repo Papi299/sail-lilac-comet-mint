@@ -1394,6 +1394,23 @@ async function observeRuntimeEpochCoherently(ctx, label) {
  * sealing — is BLOCKED by the epoch validator. Proving the stronger "exactly
  * one restart occurred in all possible instants" would require a continuous
  * Docker event observer, which this harness does not have and does not claim.
+ *
+ * ── What polling need not prove, and what it must not discard ──────────────
+ *
+ * §19 of CORRECTION-09 draws the line the previous version blurred:
+ *
+ *     an unobserved interval   ->  do not claim what was in it
+ *     an OBSERVED epoch        ->  do not erase it
+ *
+ * Both halves matter, and they point in opposite directions. Not claiming an
+ * unseen epoch is why a down interval followed by one coherent new endpoint is
+ * still a usable `A -> C`: nothing was measured in between, so nothing is being
+ * discarded. Not erasing an observed one is why a SUCCESSFUL probe of B
+ * followed by a coherent endpoint of C is a FINDING rather than `A -> C`: the
+ * harness measured two distinct post-A epochs, and reporting one transition
+ * would require un-seeing a measurement it actually made.
+ *
+ * A later, cleaner observation never overwrites an earlier positive one.
  */
 function makeRestartWatcher(ctx) {
   return async ({ timeoutMs }) =>
@@ -1411,9 +1428,15 @@ function makeRestartWatcher(ctx) {
           // failure, and it is recorded as such, never as a transition.
           sawDown = true;
         } else if (probe.value !== before.instanceId) {
-          // A DIFFERENT container object is running. Establish the new epoch
-          // COHERENTLY before recording anything about it: the probe's sighting
-          // is one read, and the endpoint must be an observation.
+          // A DIFFERENT container object is running, and this probe MEASURED
+          // it. That measurement is evidence and is retained (§5 of
+          // CORRECTION-09) — the endpoint that follows must be the SAME
+          // object, not merely some object that is not the old one.
+          const detectedInstanceId = probe.value;
+
+          // One successful probe establishes that a different container object
+          // exists; it does not bind a PID to it (§7). So the endpoint is
+          // established coherently, exactly as before.
           const after = await observeRuntimeEpochCoherently(ctx, "post-restart");
           if (!after.ok) throw new Error(after.reason);
           if (after.instanceId === before.instanceId) {
@@ -1421,6 +1444,27 @@ function makeRestartWatcher(ctx) {
             // rather than assumed: an endpoint pair that is not a transition
             // must never be recorded as one.
             throw new Error("the observed transition returned to the original container instance");
+          }
+          if (after.instanceId !== detectedInstanceId) {
+            // TWO different post-A epochs were POSITIVELY MEASURED: the one the
+            // poll saw, and the one the endpoint settled on. Recording the
+            // second alone would compress the observation history into a
+            // transition the harness did not see, discarding a measurement it
+            // actually made.
+            //
+            // This is the distinction the down-branch above turns on. An
+            // interval the harness could not observe permits `A -> C`, because
+            // nothing was seen in between and nothing is being erased. An
+            // interval in which B was SUCCESSFULLY OBSERVED does not, because
+            // the harness would have to un-see B to report it.
+            //
+            // Neither id is named: the finding is that two epochs were
+            // observed, and printing them adds nothing an operator needs.
+            throw new Error(
+              "AN ADDITIONAL WORKER RECREATION WAS OBSERVED WHILE ESTABLISHING THE RESTART " +
+                "ENDPOINT: two different container epochs were positively measured after the " +
+                "case began, so no single transition can be attributed to this restart",
+            );
           }
           return {
             previousPid: before.pid,
