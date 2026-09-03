@@ -84,9 +84,14 @@ No media URL, no hostname, no socket. Both exit non-zero on any deviation.
 | `lib/control-plane.mjs` | the VM host | The authenticated product-surface driver (login, analyze, job, signed GET). |
 | `lib/process-sampler.mjs` | the VM host | The real `docker top` sampler; establishes the owned yt-dlp PID. |
 | `lib/cases.mjs` | the VM host | Stage B case producers and the case-record contract. |
+| `fixtures/server.mjs` | the VM host, loopback only | The controlled acceptance fixture service — all four fixture families. |
+| `fixtures/prepare-media.mjs` | the VM host, via `docker run --network none` | Regenerates the bit-exact fixture MP4 and reports its digest. |
+| `fixtures/README.md` | — | How to run, expose, verify and tear down the fixtures. |
 
-Tests: `scripts/ytdlp-acceptance.test.mjs`, run by `npm test`. They drive the
-real evaluators with fakes; **no test performs a live run.**
+Tests: `scripts/ytdlp-acceptance.test.mjs` and `scripts/ytdlp-fixture.test.mjs`,
+both run by `npm test`. They drive the real evaluators with fakes and the real
+fixture over loopback; **no test performs a live run, and none needs the
+public Internet.**
 
 ---
 
@@ -868,12 +873,26 @@ must:
 An unknown case must answer `404`, not a default. A response whose `caseId` does
 not match, or whose `mediaRequestCount` is not exactly `1`, is `BLOCKED`.
 
+This contract is implemented by `fixtures/server.mjs` — see
+[`fixtures/README.md`](fixtures/README.md). Its `/byte-limit-media.mp4` sends no
+`Content-Length` (so Node frames it `chunked`), streams up to **528 MiB** from
+one reused 64 KiB block under backpressure, and counts `bytesServed` in the
+`res.write` flush callback so the number describes bytes handed to the socket
+rather than bytes queued. A `HEAD` on that route opens no case and increments
+nothing; a second `GET` is reported as `mediaRequestCount: 2` rather than
+clamped, so an ambiguous transfer stays `BLOCKED` instead of passing.
+
 ### Cancellation and shutdown
 
 Cancellation needs a deterministic window while the job is actively
 `downloading`. If the acceptance media completes too quickly, use a
 deliberately small-but-slow public source or fixture. **Do not add a sleep to
 production code** to create the window.
+
+`fixtures/server.mjs` provides that window: `/generic-media.mp4` is served with
+deterministic throttling — a 14 s target in 250 ms ticks — which changes
+transfer timing only. Every byte is sent, in order, unmodified, and a completed
+transfer hashes to the same digest as the file on disk.
 
 Shutdown is destructive to the acceptance job and is ordered **after** the
 normal success case.
@@ -892,6 +911,15 @@ the denial is genuinely the external boundary's.
 
 **Never:** widen the nftables allowlist, add a temporary broad allow, disable
 the watchdog, or bind an internal fixture and call it a public-destination test.
+
+The repository fixture for this is `fixtures/server.mjs`'s `/safe-egress`: a
+generic single-item page, public HTTPS through a temporary Quick Tunnel, whose
+media destination is fixed **in source** at
+`http://10.255.255.1/videofetch-denied.mp4`. It is a literal RFC1918 address
+rather than a hostname, and no query parameter, header or flag can move it — so
+the fixture family is `private-v4` and the run must be invoked with
+`--egress-deny-class deny-v4`, chosen before the run rather than from whichever
+counter moved.
 
 ---
 
