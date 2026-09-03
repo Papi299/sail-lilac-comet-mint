@@ -108,23 +108,76 @@ export function evaluateStageB(obs, stageAResult) {
   const stage = "B";
   const add = (entry) => checks.push(entry);
 
-  // ── §21 the enabled conjunction ────────────────────────────────────────
+  // ── §21 the enabled conjunction, FROM THE ENABLED PHASE ────────────────
+  //
+  // §3-§6 of CORRECTION-04. These two checks used to read the CURRENT
+  // deployment at aggregation time and require it to be enabled — which
+  // contradicted the acceptance sequence the harness itself defines. That
+  // sequence ends with the operator restoring the disabled state and running
+  // the kill-switch case, so by aggregation time generic is expected to be
+  // disabled; the aggregate would then have failed a run that had just
+  // demonstrated everything it exists to demonstrate. Worse, it could be
+  // satisfied the other way: enabling generic immediately before aggregating
+  // would have produced a PASS on the strength of a state that had nothing to
+  // do with when the evidence was captured.
+  //
+  // Both now read the state the `success` case SEALED while it ran. An artifact
+  // recording the wrong state never reaches here — `validateCaseRecord` refuses
+  // it — so an unmeasured enabled phase is BLOCKED rather than substituted for.
   add(
     measuredCheck(
       "capability.generic-usable",
-      obs.capabilities,
+      obs.enabledFeatureState,
       (value) =>
-        value?.ytdlp === true && value?.ytdlpInstalled === true && value?.ytdlpEnabled === true,
-      "/api/sites reports ytdlp:true with all three conjuncts true",
+        value?.sites?.ytdlp === true &&
+        value?.sites?.ytdlpInstalled === true &&
+        value?.sites?.ytdlpEnabled === true,
+      "while the enabled-phase cases ran, /api/sites reported ytdlp:true with all three conjuncts true",
       { stage },
     ),
   );
   add(
     measuredCheck(
       "config.ytdlp-enabled",
-      obs.ytdlpEnabledRaw,
-      (value) => value === "true",
-      "YTDLP_ENABLED is exactly 'true' in the deployed configuration",
+      obs.enabledFeatureState,
+      (value) => value?.state === "enabled" && value?.ytdlpEnabledRaw === "true",
+      "while the enabled-phase cases ran, YTDLP_ENABLED was exactly 'true' in the deployed configuration",
+      { stage },
+    ),
+  );
+  // The DISABLED half of the same sequence, from the kill-switch case's own
+  // sealed record. Together these two assertions are what let the aggregate be
+  // state-neutral: each phase is proven by evidence captured while that phase
+  // existed, and neither is inferred from the other or from the present.
+  add(
+    measuredCheck(
+      "killswitch.disabled-state-proven",
+      obs.disabledFeatureState,
+      (value) =>
+        value?.state === "disabled" &&
+        (value?.ytdlpEnabledRaw === null || value?.ytdlpEnabledRaw === "false") &&
+        value?.sites?.ytdlp === false &&
+        value?.sites?.ytdlpEnabled === false,
+      "while the kill-switch case ran, the deployment reported generic disabled at both the " +
+        "configuration and the application boundary",
+      { stage },
+    ),
+  );
+  // §7: the final state is RECORDED, and the policy is stated rather than
+  // implied. Phase 10D is deployment and acceptance; Phase 10E owns final
+  // product enablement, and the runbook already has Production `YTDLP_ENABLED`
+  // unset. So `disabled` is the preferred terminal condition — but a valid
+  // sequence is proven by its sealed artifacts, not by which state the operator
+  // happens to have left behind, and this check deliberately accepts either.
+  // What it does NOT accept is a final state nobody could measure, or one
+  // outside the deployment's own grammar.
+  add(
+    measuredCheck(
+      "deployment.final-state-recorded",
+      obs.finalFeatureState,
+      (value) => value?.state === "enabled" || value?.state === "disabled",
+      "the deployment state at aggregation time was measured and recorded (either state is a " +
+        "valid terminal condition; Phase 10D prefers disabled, and Phase 10E owns enablement)",
       { stage },
     ),
   );
@@ -448,21 +501,35 @@ export function evaluateStageB(obs, stageAResult) {
   // §17-§21 of CORRECTION-03. The evidence must describe the ACTUAL media GET,
   // must show that GET carried no usable Content-Length (so `--max-filesize`
   // cannot have been the mechanism), and must show the case ran generic.
+  // §14 of CORRECTION-04 adds the two conjuncts that make this an assertion
+  // about the APPLICATION THRESHOLD rather than about a job that happened to
+  // fail: the transfer must be attributable to this exact case, and the bytes
+  // actually served must EXCEED the limit the deployed Worker enforces.
   add(
     measuredCheck(
       "limit.actual-byte-guard",
       obs.byteLimitCase,
       (value) =>
         value?.extractor === "yt-dlp" &&
+        // Causally bound to this case's own media request, and exactly one.
+        typeof value?.caseId === "string" &&
+        value.caseId.length > 0 &&
+        value?.mediaRequestCount === 1 &&
         value?.actualMediaRequestObserved === true &&
         value?.contentLengthPresent === false &&
         value?.declaredLengthUnknown === true &&
+        // The threshold was genuinely crossed, against the DEPLOYED limit.
+        Number.isInteger(value?.bytesServed) &&
+        Number.isInteger(value?.effectiveMaxFileSizeBytes) &&
+        value.effectiveMaxFileSizeBytes > 0 &&
+        value.bytesServed > value.effectiveMaxFileSizeBytes &&
+        value?.exceededLimit === true &&
         value?.outcome === "TOO_LARGE" &&
         value?.beganProcessing === false &&
         value?.uploaded === false &&
         value?.workDirPresent === false,
-      "the actual media GET carried no usable declared length and the application byte watcher " +
-        "aborted it as TOO_LARGE before processing",
+      "this case's own media GET carried no usable declared length, served more bytes than the " +
+        "deployed effective maxFileSizeBytes, and was aborted as TOO_LARGE before processing",
       { stage },
     ),
   );

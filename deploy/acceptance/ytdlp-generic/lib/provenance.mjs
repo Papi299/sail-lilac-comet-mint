@@ -196,11 +196,71 @@ export function bindingAgreesWithRecord(record) {
 // ── The run key ────────────────────────────────────────────────────────────
 
 /**
+ * The permission property both run-key entry points must enforce (§26 of
+ * CORRECTION-04).
+ *
+ * A run key readable by any other local account defeats the seal entirely: that
+ * account could re-seal edited artifacts and the aggregator would accept them.
+ * CORRECTION-03 checked this in `loadRun` only, which left two holes — Stage A
+ * silently RESUMED an already-insecure key, and a `stat` that failed for any
+ * reason was treated as "probably fine".
+ *
+ * Now: three distinct answers, and only one of them is permissive.
+ *
+ *   absent   — nothing to judge; the caller may mint a fresh key
+ *   ok       — the mode was measured and is private
+ *   error    — insecure, OR unmeasurable
+ *
+ * Unmeasurable fails closed because "we could not read the permissions" is not
+ * "the permissions are fine" — that is the same SKIPPED->PASS edge the whole
+ * harness refuses elsewhere.
+ */
+async function inspectRunKeyPermissions(path, statFile) {
+  let stats;
+  try {
+    stats = await statFile(path);
+  } catch (error) {
+    // ENOENT is a genuine answer, not a measurement failure: there is no file,
+    // so there are no permissions to be wrong.
+    if (error?.code === "ENOENT") return { absent: true };
+    return {
+      error:
+        `the permissions of the acceptance run key at ${path} could not be measured ` +
+        `(${String(error?.code ?? error?.message ?? error)}); refusing to use a key whose ` +
+        "privacy is unknown",
+    };
+  }
+
+  const mode = stats?.mode;
+  if (typeof mode !== "number") {
+    return {
+      error:
+        `the acceptance run key at ${path} reported no file mode, so its privacy could not be ` +
+        "established; refusing to use it",
+    };
+  }
+  const permissions = mode & 0o777;
+  if ((permissions & 0o077) !== 0) {
+    return {
+      error:
+        `the acceptance run key at ${path} is mode ${permissions.toString(8).padStart(3, "0")}; ` +
+        "it must not be group- or world-accessible",
+    };
+  }
+  return { ok: true };
+}
+
+/**
  * Creates or loads the acceptance run identity.
  *
  * The file holds a random `runId` and a 256-bit key, is written `0600`, and is
  * never printed, never committed, and never placed in any evidence record. Only
  * the `runId` — which is not secret — travels with the artifacts.
+ *
+ * §26 of CORRECTION-04: an EXISTING key is subject to the same permission
+ * property as `loadRun` enforces. Stage A resuming a world-readable key would
+ * have quietly re-established the exact weakness `loadRun` refuses, from the
+ * one command that is expected to touch the file first.
  *
  * The operator deletes it when acceptance is complete; the README says so.
  */
@@ -209,15 +269,22 @@ export async function loadOrCreateRun(path, deps = {}) {
   const write = deps.writeFile ?? writeFile;
   const makeDir = deps.mkdir ?? mkdir;
   const setMode = deps.chmod ?? chmod;
+  const statFile = deps.stat ?? stat;
 
-  try {
-    const parsed = JSON.parse(await read(path, "utf8"));
-    if (typeof parsed?.runId === "string" && /^[0-9a-f]{64}$/.test(String(parsed?.key ?? ""))) {
-      return { runId: parsed.runId, key: parsed.key, created: false };
+  const permissions = await inspectRunKeyPermissions(path, statFile);
+  if (permissions.error) return { error: permissions.error };
+
+  if (!permissions.absent) {
+    try {
+      const parsed = JSON.parse(await read(path, "utf8"));
+      if (typeof parsed?.runId === "string" && /^[0-9a-f]{64}$/.test(String(parsed?.key ?? ""))) {
+        return { runId: parsed.runId, key: parsed.key, created: false };
+      }
+    } catch {
+      // Present but unusable content -> mint a fresh run over it. The
+      // PERMISSIONS were already measured and are private, so this is a
+      // corrupt file rather than an exposed one.
     }
-    throw new Error("malformed");
-  } catch {
-    // Absent or unusable -> mint a fresh run.
   }
 
   const runId = randomBytes(8).toString("hex");
@@ -244,23 +311,11 @@ export async function loadRun(path, deps = {}) {
   const read = deps.readFile ?? readFile;
   const statFile = deps.stat ?? stat;
 
-  // §25: refuse a key file whose permissions are broader than the private mode
-  // it was written with. A world- or group-readable run key means any local
-  // account could re-seal edited artifacts, which is precisely the property the
-  // seal is meant to provide.
-  try {
-    const stats = await statFile(path);
-    const mode = stats.mode & 0o777;
-    if ((mode & 0o077) !== 0) {
-      return {
-        error: `the acceptance run key at ${path} is mode ${mode.toString(8).padStart(3, "0")}; ` +
-          "it must not be group- or world-accessible",
-      };
-    }
-  } catch {
-    // `stat` unavailable (an injected filesystem in tests, or a platform without
-    // it) is not itself a finding; the content check below still applies.
-  }
+  const permissions = await inspectRunKeyPermissions(path, statFile);
+  if (permissions.error) return { error: permissions.error };
+  // No key file at all is not an error here — the caller reports the missing
+  // run, which is a different and more actionable message.
+  if (permissions.absent) return null;
 
   try {
     const parsed = JSON.parse(await read(path, "utf8"));

@@ -81,6 +81,9 @@ import {
   isReadOnlyCommand,
   durableJobQuery,
   workDirProbeArgv,
+  makeSystemObservers,
+  parseMaxFileSize,
+  DEFAULT_MAX_FILE_SIZE_BYTES,
   EJS_PROBE_ARGV,
 } from "../deploy/acceptance/ytdlp-generic/lib/observers.mjs";
 import {
@@ -100,8 +103,11 @@ import {
   readDenyCounter,
   fingerprintChain,
   attributeDenial,
+  parseDenyClass,
+  DENY_CLASSES,
 } from "../deploy/acceptance/ytdlp-generic/lib/egress-policy.mjs";
 import { parseHostProcessList } from "../deploy/acceptance/ytdlp-generic/lib/observers.mjs";
+import { readFile } from "node:fs/promises";
 import {
   producerFor,
   hasConcreteProducer,
@@ -135,6 +141,8 @@ const unmeasured = (reason) => ({ measured: false, reason });
 const IMAGE_ID = `sha256:${"a".repeat(64)}`;
 const SHA = "90be3d079a26b851c5f7496801647568533e6a2d";
 const JOB_ID = "fb63f3170c2342717c7dd8af11d09418";
+/** The byte-limit case runs its own job, so its ladder cannot disturb the success case. */
+const BYTE_JOB_ID = "bb63f3170c2342717c7dd8af11d09418";
 const FULL_LADDER = [...REQUIRED_TRANSITIONS];
 
 const digestOf = (text) => createHash("sha256").update(text).digest("hex");
@@ -200,6 +208,10 @@ function windowOf(samples, opts = {}) {
     workerPid: opts.workerPid ?? 100,
     expectedNetns: opts.expectedNetns ?? "net:[4026532001]",
     observedDownloading: opts.observedDownloading ?? true,
+    // The two coverage gaps travel WITH the window; they are not equivalent and
+    // the aggregate treats them differently.
+    samplerErrors: opts.samplerErrors ?? [],
+    ambiguousSamples: opts.ambiguousSamples ?? [],
   };
 }
 
@@ -243,20 +255,59 @@ function shutdownEvidence(overrides = {}) {
   };
 }
 
+/** The deployed default, as `MEDIA_DEFAULTS.maxFileSizeBytes` sets it. */
+const DEFAULT_LIMIT_BYTES = 500 * 1024 * 1024;
+const CASE_ID = "9".repeat(32);
+
 function byteLimitEvidence(overrides = {}) {
   return {
     jobId: JOB_ID,
+    // §10-§12 of CORRECTION-04: causally bound to one case, and carrying BOTH
+    // sides of the threshold comparison it asserts.
+    caseId: CASE_ID,
     extractor: "yt-dlp",
     declaredLengthUnknown: true,
     actualMediaRequestObserved: true,
+    mediaRequestCount: 1,
     contentLengthPresent: false,
     transferMode: "chunked",
     bytesServed: 600_000_000,
+    effectiveMaxFileSizeBytes: DEFAULT_LIMIT_BYTES,
+    limitSource: "default",
+    exceededLimit: true,
     outcome: "TOO_LARGE",
     transitions: ["queued", "analyzing", "downloading"],
     beganProcessing: false,
     uploaded: false,
     workDirPresent: false,
+    ...overrides,
+  };
+}
+
+/**
+ * A case record carrying the feature state that case is defined to run in.
+ *
+ * The harness measures this live; the tests fill it from the same registry the
+ * validator consults, so a test record is realistic by construction.
+ */
+function caseRecord({ caseName, binding, payload, state, ...rest }) {
+  return buildCaseRecord({
+    caseName,
+    binding,
+    payload,
+    featureState: featureState(state ?? expectedFeatureStateFor(caseName) ?? "enabled"),
+    ...rest,
+  });
+}
+
+/** A sealed feature state, as the harness measures it when a case runs. */
+function featureState(state = "enabled", overrides = {}) {
+  const enabled = state === "enabled";
+  return {
+    state,
+    ytdlpEnabledRaw: enabled ? "true" : null,
+    sites: { ytdlp: enabled, ytdlpInstalled: true, ytdlpEnabled: enabled },
+    observedAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
   };
 }
@@ -289,6 +340,11 @@ function passingStageBObservations(overrides = {}) {
     runningImageId: measured(IMAGE_ID),
     capabilities: measured({ ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true }),
     ytdlpEnabledRaw: measured("true"),
+    // The two historical phases, each from the case that observed it, plus the
+    // state at aggregation time (recorded, never used to grade a phase).
+    enabledFeatureState: measured(featureState("enabled")),
+    disabledFeatureState: measured(featureState("disabled")),
+    finalFeatureState: measured(featureState("enabled")),
     genericAnalysis: measured({
       extractor: "yt-dlp",
       directControlExtractor: "direct",
@@ -359,14 +415,27 @@ function makeFakeWorld(options = {}) {
     sites: options.sites ?? { ytdlp: false, ytdlpInstalled: true, ytdlpEnabled: false, ffmpeg: true },
     imageIds: options.imageIds ?? { [`videofetch-worker:${SHA}`]: IMAGE_ID, "videofetch-worker:latest": IMAGE_ID },
     runningImage: options.runningImage ?? IMAGE_ID,
+    // The single non-secret deployment variable the byte-limit case reads.
+    // `undefined` means the deployment does not set it and the Worker's own
+    // 500 MiB default applies.
+    maxFileSize: options.maxFileSize,
   };
   const calls = { commands: [], fetches: [], logins: 0 };
+
+  // The controlled byte-limit fixture, as a state machine rather than a static
+  // document: it remembers the case id the submitted URL carried and answers
+  // only for that case (§10-§12 of CORRECTION-04).
+  const fixture = {
+    submittedCaseIds: [],
+    ...options.byteLimitFixture,
+  };
 
   const workerEnvLines = [
     "WORKER_CONTROL_KEY_ID=k",
     "WORKER_CONTROL_SECRET=s",
     "R2_ACCOUNT_ID=a",
     "R2_BUCKET=b",
+    ...(env.maxFileSize === undefined ? [] : [`MAX_FILE_SIZE=${env.maxFileSize}`]),
     ...(env.ytdlpEnabled === null ? [] : [`YTDLP_ENABLED=${env.ytdlpEnabled}`]),
   ].join("\n");
 
@@ -429,16 +498,20 @@ function makeFakeWorld(options = {}) {
   // seconds; a fake that leaves after one poll gives the process sampler no
   // window to complete a snapshot in, and every sample would straddle the close.
   const DOWNLOADING_POLLS = options.downloadingPolls ?? 4;
+  // The byte guard aborts DURING acquisition, so this job never reaches
+  // `processing` — which is exactly what `limit.actual-byte-guard` asserts.
+  const BYTE_LIMIT_LADDER = ["queued", "analyzing", "downloading", "failed"];
   const jobs = new Map();
   function nextJob(jobId, extractor) {
     const job = jobs.get(jobId);
-    const current = FULL_LADDER[job.index];
+    const ladder = job.ladder ?? FULL_LADDER;
+    const current = ladder[job.index];
     if (current === "downloading" && job.dwell < DOWNLOADING_POLLS) {
       job.dwell += 1;
-    } else if (job.index < FULL_LADDER.length - 1) {
+    } else if (job.index < ladder.length - 1) {
       job.index += 1;
     }
-    const status = FULL_LADDER[job.index];
+    const status = ladder[job.index];
     return {
       jobId,
       status,
@@ -447,6 +520,8 @@ function makeFakeWorld(options = {}) {
       container: "mp4",
       quality: "720p",
       filename: "acceptance.mp4",
+      // The durable error code IS the byte-limit outcome.
+      errorCode: status === "failed" && job.ladder ? "TOO_LARGE" : undefined,
       expiresAt: Date.now() + 60_000,
     };
   }
@@ -492,9 +567,37 @@ function makeFakeWorld(options = {}) {
     }
     if (url.pathname === "/api/download") {
       const body = JSON.parse(init.body);
-      const jobId = body.url.includes("generic") ? JOB_ID : "aa".repeat(16);
-      jobs.set(jobId, { index: 0, dwell: 0, extractor: body.url.includes("generic") ? "yt-dlp" : "direct" });
+      const submitted = new URL(body.url);
+      const isByteLimit = submitted.pathname.includes("bytelimit");
+      const isGeneric = body.url.includes("generic");
+      if (isByteLimit) {
+        // The fixture associates the media request it is about to serve with
+        // the case id the submitted URL carried.
+        fixture.submittedCaseIds.push(submitted.searchParams.get("vf_case"));
+      }
+      const jobId = isByteLimit ? BYTE_JOB_ID : isGeneric ? JOB_ID : "aa".repeat(16);
+      jobs.set(jobId, {
+        index: 0,
+        dwell: 0,
+        extractor: isGeneric ? "yt-dlp" : "direct",
+        ladder: isByteLimit ? BYTE_LIMIT_LADDER : undefined,
+      });
       return json({ jobId, status: "queued", extractor: null });
+    }
+    // The controlled fixture's own read-only evidence endpoint.
+    if (url.pathname === "/byte-evidence") {
+      const asked = url.searchParams.get("vf_case");
+      const known = fixture.submittedCaseIds[fixture.submittedCaseIds.length - 1] ?? null;
+      if (fixture.notFound) return json({ error: "unknown case" }, 404);
+      return json({
+        caseId: fixture.caseIdOverride ?? (asked === known ? known : null),
+        actualMediaRequestObserved: fixture.actualMediaRequestObserved ?? true,
+        mediaRequestCount: fixture.mediaRequestCount ?? 1,
+        contentLengthPresent: fixture.contentLengthPresent ?? false,
+        transferMode: fixture.transferMode ?? "chunked",
+        bytesServed: fixture.bytesServed ?? 600_000_000,
+        observedAt: "2026-01-01T00:00:00.000Z",
+      });
     }
     if (url.pathname.endsWith("/status")) {
       const jobId = url.pathname.split("/")[3];
@@ -562,6 +665,18 @@ async function runCli(argv, env, deps = {}) {
     },
     mkdir: async () => {},
     chmod: async (path, mode) => modes.set(path, mode),
+    // §26 of CORRECTION-04: the run-key permission check is now strict — an
+    // unmeasurable mode fails closed on the real filesystem. The controlled
+    // adapter reports the private mode the harness itself writes, and ENOENT
+    // for a file that does not exist, exactly as `node:fs/promises` would.
+    stat: async (path) => {
+      if (!files.has(path)) {
+        const error = new Error(`no such file ${path}`);
+        error.code = "ENOENT";
+        throw error;
+      }
+      return { mode: modes.get(path) ?? 0o600 };
+    },
     sleep: async () => {},
     // A monotonic counter clock. The real harness uses `performance.now()`;
     // the tests need strictly increasing values so a snapshot's interval can be
@@ -840,7 +955,7 @@ describe("real CLI orchestration", () => {
 
     // A case record sealed by a DIFFERENT run's key.
     const foreign = sealRecord(
-      buildCaseRecord({
+      caseRecord({
         caseName: "cancellation",
         binding: { expectedSha: SHA, runningImageId: IMAGE_ID },
         payload: { cancellation: cancellationEvidence({ postSample: [] }) },
@@ -1838,7 +1953,12 @@ describe("case evidence validation", () => {
   const goodPayload = { cancellation: cancellationEvidence({ postSample: [] }) };
 
   it("accepts a record this harness produced for this deployment", () => {
-    const record = buildCaseRecord({ caseName: "cancellation", binding, payload: goodPayload });
+    const record = buildCaseRecord({
+      caseName: "cancellation",
+      binding,
+      payload: goodPayload,
+      featureState: featureState("enabled"),
+    });
     const validated = validateCaseRecord(record, binding);
     assert.equal(validated.ok, true, validated.reason);
     assert.equal(validated.observations.cancellation.measured, true);
@@ -1861,14 +1981,14 @@ describe("case evidence validation", () => {
   });
 
   it("9b. a record bound to another SHA or image is rejected", () => {
-    const wrongSha = buildCaseRecord({
+    const wrongSha = caseRecord({
       caseName: "cancellation",
       binding: { expectedSha: "0".repeat(40), runningImageId: IMAGE_ID },
       payload: goodPayload,
     });
     assert.match(validateCaseRecord(wrongSha, binding).reason, /binds to source/);
 
-    const wrongImage = buildCaseRecord({
+    const wrongImage = caseRecord({
       caseName: "cancellation",
       binding: { expectedSha: SHA, runningImageId: `sha256:${"f".repeat(64)}` },
       payload: goodPayload,
@@ -1877,19 +1997,19 @@ describe("case evidence validation", () => {
   });
 
   it("9c. unknown or missing observations in a payload are rejected", () => {
-    const extra = buildCaseRecord({
+    const extra = caseRecord({
       caseName: "cancellation",
       binding,
       payload: { ...goodPayload, killSwitch: { genericUsableAfterDisable: false, directWorks: true } },
     });
     assert.match(validateCaseRecord(extra, binding).reason, /unexpected observation 'killSwitch'/);
 
-    const missing = buildCaseRecord({ caseName: "cancellation", binding, payload: {} });
+    const missing = caseRecord({ caseName: "cancellation", binding, payload: {} });
     assert.match(validateCaseRecord(missing, binding).reason, /missing observation 'cancellation'/);
   });
 
   it("9d. a malformed payload field is rejected", () => {
-    const malformed = buildCaseRecord({
+    const malformed = caseRecord({
       caseName: "cancellation",
       binding,
       payload: { cancellation: { ...goodPayload.cancellation, lateReady: "no" } },
@@ -1900,7 +2020,7 @@ describe("case evidence validation", () => {
   it("9e. every case name has a payload validator", () => {
     for (const name of caseNames()) {
       const validated = validateCaseRecord(
-        buildCaseRecord({ caseName: name, binding, payload: {} }),
+        caseRecord({ caseName: name, binding, payload: {} }),
         binding,
       );
       // Empty payloads are rejected for a REASON specific to that case, which
@@ -2311,7 +2431,7 @@ describe("evidence provenance", () => {
 
   const genuineCase = () =>
     sealRecord(
-      buildCaseRecord({
+      caseRecord({
         caseName: "cancellation",
         binding: { expectedSha: SHA, runningImageId: IMAGE_ID },
         payload: { cancellation: cancellationEvidence({ postSample: [] }) },
@@ -2503,6 +2623,14 @@ describe("evidence provenance", () => {
       },
       mkdir: async () => {},
       chmod: async (path, mode) => modes.set(path, mode),
+      stat: async (path) => {
+        if (!files.has(path)) {
+          const error = new Error("no such file");
+          error.code = "ENOENT";
+          throw error;
+        }
+        return { mode: modes.get(path) ?? 0o600 };
+      },
     };
     const created = await loadOrCreateRun("/tmp/run.json", deps);
     assert.equal(created.created, true);
@@ -2826,13 +2954,18 @@ describe("exact process-group termination", () => {
   });
 
   it("34g. the host process list carries no command line", () => {
-    const rows = parseHostProcessList("  100     1   100 node\n  200   100   200 python3\n");
-    assert.deepEqual(rows, [
+    const parsed = parseHostProcessList("  100     1   100 node\n  200   100   200 python3\n");
+    assert.equal(parsed.ok, true);
+    assert.deepEqual(parsed.rows, [
       { pid: 100, ppid: 1, pgid: 100, comm: "node" },
       { pid: 200, ppid: 100, pgid: 200, comm: "python3" },
     ]);
-    // A row whose `comm` column carried argv is dropped, not admitted.
-    assert.deepEqual(parseHostProcessList("200 100 200 python3 /usr/local/lib/yt-dlp https://x"), []);
+    // A row whose `comm` column carried argv is neither admitted NOR dropped:
+    // the whole listing becomes unmeasured (§22-§24 of CORRECTION-04).
+    const argv = parseHostProcessList("200 100 200 python3 /usr/local/lib/yt-dlp https://x");
+    assert.equal(argv.ok, false);
+    assert.equal(argv.rows, undefined);
+    assert.doesNotMatch(argv.reason, /yt-dlp|https/, "the refusal must not quote the row");
   });
 });
 
@@ -3186,6 +3319,676 @@ describe("final process evidence JSON", () => {
     const aggregate = aggregateDownloadWindow(result);
     assert.equal(aggregate.usable, true, "a close-straddle alone does not block a healthy run");
     assert.deepEqual(aggregate.forbiddenSeen, [], "the discarded processing FFmpeg is not credited");
+  });
+});
+
+// ── CORRECTION-04 §3-§9: the aggregate is state-neutral ────────────────────
+//
+// The acceptance sequence is Stage A (disabled) -> operator enables ->
+// enabled-state cases -> operator disables -> kill-switch -> aggregate. Its
+// terminal condition is therefore generic DISABLED, and an aggregate that
+// re-graded the current deployment as if generic must be enabled would fail
+// every correctly executed run.
+
+describe("multi-state aggregation", () => {
+  const binding = { expectedSha: SHA, runningImageId: IMAGE_ID };
+
+  it("40. a complete sequence PASSES with the final state disabled", () => {
+    const result = evaluateStageB(
+      passingStageBObservations({
+        // The deployment as it stands AT AGGREGATION TIME: generic disabled,
+        // because the kill-switch case has just run. This is the preferred
+        // Phase-10D terminal condition.
+        ytdlpEnabledRaw: measured(null),
+        capabilities: measured({ ytdlp: false, ytdlpInstalled: true, ytdlpEnabled: false, ffmpeg: true }),
+        finalFeatureState: measured(featureState("disabled")),
+      }),
+      passingStageA(),
+    );
+    assert.equal(result.summary.verdict, OUTCOMES.PASS, result.summary.blocking.join(", "));
+  });
+
+  it("40b. a currently-disabled deployment does not retroactively fail the enabled phase", () => {
+    const result = evaluateStageB(
+      passingStageBObservations({
+        ytdlpEnabledRaw: measured("false"),
+        capabilities: measured({ ytdlp: false, ytdlpInstalled: true, ytdlpEnabled: false, ffmpeg: true }),
+        finalFeatureState: measured(featureState("disabled")),
+      }),
+      passingStageA(),
+    );
+    const byId = Object.fromEntries(result.checks.map((c) => [c.id, c.outcome]));
+    assert.equal(byId["capability.generic-usable"], OUTCOMES.PASS);
+    assert.equal(byId["config.ytdlp-enabled"], OUTCOMES.PASS);
+  });
+
+  it("40c. a currently-enabled deployment does not erase the kill-switch evidence", () => {
+    const result = evaluateStageB(
+      passingStageBObservations({
+        ytdlpEnabledRaw: measured("true"),
+        finalFeatureState: measured(featureState("enabled")),
+      }),
+      passingStageA(),
+    );
+    const byId = Object.fromEntries(result.checks.map((c) => [c.id, c.outcome]));
+    assert.equal(byId["killswitch.disabled-state-proven"], OUTCOMES.PASS);
+    assert.equal(byId["killswitch.rollback"], OUTCOMES.PASS);
+    assert.equal(result.summary.verdict, OUTCOMES.PASS);
+  });
+
+  it("40d. an unproven enabled phase is BLOCKED, never substituted from the present", () => {
+    const result = evaluateStageB(
+      passingStageBObservations({
+        // Generic IS enabled right now — but no `success` artifact proves the
+        // enabled-state case ran while it was.
+        ytdlpEnabledRaw: measured("true"),
+        capabilities: measured({ ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true }),
+        enabledFeatureState: unmeasured("no accepted `success` case evidence"),
+      }),
+      passingStageA(),
+    );
+    const byId = Object.fromEntries(result.checks.map((c) => [c.id, c.outcome]));
+    assert.equal(byId["capability.generic-usable"], OUTCOMES.BLOCKED);
+    assert.equal(byId["config.ytdlp-enabled"], OUTCOMES.BLOCKED);
+  });
+
+  it("40e. an unproven disabled phase is BLOCKED", () => {
+    const result = evaluateStageB(
+      passingStageBObservations({
+        disabledFeatureState: unmeasured("no accepted `kill-switch` case evidence"),
+      }),
+      passingStageA(),
+    );
+    const byId = Object.fromEntries(result.checks.map((c) => [c.id, c.outcome]));
+    assert.equal(byId["killswitch.disabled-state-proven"], OUTCOMES.BLOCKED);
+  });
+
+  it("40f. a `success` artifact recording the DISABLED state is rejected", () => {
+    const record = buildCaseRecord({
+      caseName: "success",
+      binding,
+      payload: { cancellation: cancellationEvidence() },
+      featureState: featureState("disabled"),
+    });
+    const validated = validateCaseRecord(record, binding);
+    assert.equal(validated.ok, false);
+    assert.match(validated.reason, /requires generic enabled.*ran while generic was disabled/s);
+  });
+
+  it("40g. a `kill-switch` artifact recording the ENABLED state is rejected", () => {
+    const record = buildCaseRecord({
+      caseName: "kill-switch",
+      binding,
+      payload: { killSwitch: { genericUsableAfterDisable: false, directWorks: true } },
+      featureState: featureState("enabled"),
+    });
+    const validated = validateCaseRecord(record, binding);
+    assert.equal(validated.ok, false);
+    assert.match(validated.reason, /requires generic disabled.*ran while generic was enabled/s);
+  });
+
+  it("40h. a record with no measured feature state at all is rejected", () => {
+    const none = buildCaseRecord({ caseName: "cancellation", binding, payload: {} });
+    assert.match(validateCaseRecord(none, binding).reason, /no well-formed measured feature state/);
+
+    // Self-contradictory: claims `enabled` beside a raw value that means disabled.
+    const contradictory = buildCaseRecord({
+      caseName: "cancellation",
+      binding,
+      payload: {},
+      featureState: { ...featureState("enabled"), ytdlpEnabledRaw: "false" },
+    });
+    assert.match(
+      validateCaseRecord(contradictory, binding).reason,
+      /no well-formed measured feature state/,
+    );
+  });
+
+  it("40i. the feature state is sealed with the record and cannot be edited", () => {
+    const KEY = "e".repeat(64);
+    const sealed = sealRecord(
+      caseRecord({
+        caseName: "kill-switch",
+        binding,
+        payload: { killSwitch: { genericUsableAfterDisable: false, directWorks: true } },
+        runId: "0123456789abcdef",
+      }),
+      KEY,
+    );
+    assert.equal(verifySeal(sealed, KEY).ok, true);
+    sealed.featureState.state = "enabled";
+    assert.equal(verifySeal(sealed, KEY).ok, false, "editing the sealed state must invalidate it");
+  });
+
+  it("40j. the final deployment state is recorded, and either value is accepted", () => {
+    for (const state of ["enabled", "disabled"]) {
+      const result = evaluateStageB(
+        passingStageBObservations({ finalFeatureState: measured(featureState(state)) }),
+        passingStageA(),
+      );
+      const check = result.checks.find((c) => c.id === "deployment.final-state-recorded");
+      assert.equal(check.outcome, OUTCOMES.PASS, state);
+    }
+    // Unmeasurable is NOT a pass — the policy is explicit either way.
+    const blocked = evaluateStageB(
+      passingStageBObservations({ finalFeatureState: unmeasured("docker inspect failed") }),
+      passingStageA(),
+    );
+    const check = blocked.checks.find((c) => c.id === "deployment.final-state-recorded");
+    assert.equal(check.outcome, OUTCOMES.BLOCKED);
+  });
+
+  it("40k. end to end: enabled success + disabled kill-switch aggregate to PASS", async () => {
+    const files = seedRun();
+
+    // ── Phase 1: generic ENABLED. The success case seals that fact. ────────
+    const enabledWorld = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const success = await runCli(
+      ["--stage", "B", "--case", "success", ...LIVE_ARGS, "--evidence", "/tmp/success.json"],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+        VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+        ...WORKER_ENV,
+      }),
+      { runReadOnly: enabledWorld.runReadOnly, fetch: enabledWorld.fetch, files },
+    );
+    assert.equal(success.code, 0, `${success.out}\n${success.err}`);
+    const successRecord = JSON.parse(files.get("/tmp/success.json"));
+    assert.equal(successRecord.featureState.state, "enabled");
+    assert.equal(successRecord.featureState.ytdlpEnabledRaw, "true");
+
+    // ── Phase 2: the operator disables. The kill-switch case seals THAT. ───
+    const disabledWorld = makeFakeWorld({
+      ytdlpEnabled: null,
+      sites: { ytdlp: false, ytdlpInstalled: true, ytdlpEnabled: false, ffmpeg: true },
+    });
+    const killSwitch = await runCli(
+      ["--stage", "B", "--case", "kill-switch", ...LIVE_ARGS, "--evidence", "/tmp/kill.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: disabledWorld.runReadOnly, fetch: disabledWorld.fetch, files },
+    );
+    assert.equal(killSwitch.code, 0, `${killSwitch.out}\n${killSwitch.err}`);
+    const killRecord = JSON.parse(files.get("/tmp/kill.json"));
+    assert.equal(killRecord.featureState.state, "disabled");
+
+    // ── Phase 3: aggregate while generic is still DISABLED. ────────────────
+    //
+    // Stage A shares the SAME run key and file store as the cases — every
+    // artifact in one acceptance must join one run — and it grades the disabled
+    // deployment, which is the state Stage A requires.
+    const stageA = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/stage-a.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: disabledWorld.runReadOnly, fetch: disabledWorld.fetch, files },
+    );
+    assert.equal(stageA.code, 0, `${stageA.out}\n${stageA.err}`);
+
+    const aggregate = await runCli(
+      [
+        "--stage", "B", "--aggregate", ...LIVE_ARGS,
+        "--stage-a", "/tmp/stage-a.json",
+        "--case-evidence", "/tmp/success.json",
+        "--case-evidence", "/tmp/kill.json",
+        "--evidence", "/tmp/stage-b.json",
+      ],
+      LIVE_ENV(),
+      { runReadOnly: disabledWorld.runReadOnly, fetch: disabledWorld.fetch, files },
+    );
+    // Not every case ran, so the run as a whole is not PASS — but the two
+    // state-dependent claims must be graded from the sealed artifacts, and the
+    // currently-disabled deployment must not have unmade the enabled phase.
+    const record = JSON.parse(files.get("/tmp/stage-b.json"));
+    const byId = Object.fromEntries(record.checks.map((c) => [c.id, c.outcome]));
+    assert.equal(byId["capability.generic-usable"], "PASS", aggregate.out);
+    assert.equal(byId["config.ytdlp-enabled"], "PASS");
+    assert.equal(byId["killswitch.disabled-state-proven"], "PASS");
+    assert.equal(record.stateSequence.enabledPhase.state, "enabled");
+    assert.equal(record.stateSequence.disabledPhase.state, "disabled");
+    assert.equal(record.stateSequence.finalState.state, "disabled");
+  });
+});
+
+// ── CORRECTION-04 §10-§16: byte-limit causal binding ───────────────────────
+
+describe("byte-limit causal binding", () => {
+  const byteLimitEnv = (extra = {}) =>
+    LIVE_ENV({
+      VIDEOFETCH_ACCEPT_BYTELIMIT_URL: "https://media.invalid/generic/bytelimit",
+      VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL: "https://media.invalid/byte-evidence",
+      ...extra,
+    });
+
+  async function runByteLimit(worldOptions = {}, envExtra = {}) {
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+      ...worldOptions,
+    });
+    const files = seedRun();
+    return runCli(
+      ["--stage", "B", "--case", "byte-limit", ...LIVE_ARGS, "--evidence", "/tmp/bl.json"],
+      byteLimitEnv(envExtra),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+  }
+
+  it("41. a correlated over-limit transfer produces a PASS candidate", async () => {
+    const run = await runByteLimit();
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const payload = JSON.parse(run.files.get("/tmp/bl.json")).payload.byteLimitCase;
+    assert.match(payload.caseId, /^[0-9a-f]{32}$/);
+    assert.equal(payload.mediaRequestCount, 1);
+    assert.equal(payload.effectiveMaxFileSizeBytes, 500 * 1024 * 1024);
+    assert.equal(payload.limitSource, "default");
+    assert.equal(payload.exceededLimit, true);
+    assert.equal(payload.outcome, "TOO_LARGE");
+    assert.equal(payload.beganProcessing, false);
+    assert.equal(payload.uploaded, false);
+
+    const stageB = evaluateStageB(
+      passingStageBObservations({ byteLimitCase: measured(payload) }),
+      passingStageA(),
+    );
+    const check = stageB.checks.find((c) => c.id === "limit.actual-byte-guard");
+    assert.equal(check.outcome, OUTCOMES.PASS);
+  });
+
+  it("41b. a FOREIGN case id in the fixture evidence BLOCKS", async () => {
+    const run = await runByteLimit({ byteLimitFixture: { caseIdOverride: "1".repeat(32) } });
+    assert.equal(run.code, 2);
+    assert.match(run.err, /evidence for a different case/);
+    assert.equal(run.files.has("/tmp/bl.json"), false, "no record is written");
+  });
+
+  it("41c. stale/unassociated fixture evidence BLOCKS", async () => {
+    const run = await runByteLimit({ byteLimitFixture: { notFound: true } });
+    assert.equal(run.code, 2);
+    assert.match(run.err, /no media-request evidence for this case/);
+  });
+
+  it("41d. an ambiguous media-request count BLOCKS", async () => {
+    const run = await runByteLimit({ byteLimitFixture: { mediaRequestCount: 3 } });
+    assert.equal(run.code, 2);
+    assert.match(run.err, /attributed 3 media requests/);
+  });
+
+  it("41e. bytes at or below the deployed limit are NOT a pass", async () => {
+    for (const bytesServed of [500 * 1024 * 1024, 400 * 1024 * 1024]) {
+      const run = await runByteLimit({ byteLimitFixture: { bytesServed } });
+      assert.equal(run.code, 2, `${bytesServed}`);
+      assert.match(run.err, /never crossed the deployed threshold/);
+    }
+  });
+
+  it("41f. a deployed MAX_FILE_SIZE override is what the case measures", async () => {
+    // 600 MB served, but the deployment raised the limit to 1 GiB: the transfer
+    // did NOT cross the threshold, and the default would have said it did.
+    const raised = await runByteLimit({
+      maxFileSize: String(1024 * 1024 * 1024),
+      byteLimitFixture: { bytesServed: 600_000_000 },
+    });
+    assert.equal(raised.code, 2);
+    assert.match(raised.err, /1073741824/);
+
+    // Lowered to 1 MiB: a 2 MiB transfer now crosses it, where the default
+    // would have said it did not.
+    const lowered = await runByteLimit({
+      maxFileSize: String(1024 * 1024),
+      byteLimitFixture: { bytesServed: 2 * 1024 * 1024 },
+    });
+    assert.equal(lowered.code, 0, `${lowered.out}\n${lowered.err}`);
+    const payload = JSON.parse(lowered.files.get("/tmp/bl.json")).payload.byteLimitCase;
+    assert.equal(payload.effectiveMaxFileSizeBytes, 1024 * 1024);
+    assert.equal(payload.limitSource, "deployment");
+  });
+
+  it("41g. a declared Content-Length on the actual media GET BLOCKS", async () => {
+    const run = await runByteLimit({ byteLimitFixture: { contentLengthPresent: true } });
+    assert.equal(run.code, 2);
+    assert.match(run.err, /--max-filesize could have/);
+  });
+
+  it("41h. the evaluator refuses evidence that omits the comparison", () => {
+    for (const overrides of [
+      { bytesServed: 400 * 1024 * 1024, exceededLimit: false },
+      { effectiveMaxFileSizeBytes: 0 },
+      { mediaRequestCount: 2 },
+      { caseId: "" },
+    ]) {
+      const result = evaluateStageB(
+        passingStageBObservations({ byteLimitCase: measured(byteLimitEvidence(overrides)) }),
+        passingStageA(),
+      );
+      const check = result.checks.find((c) => c.id === "limit.actual-byte-guard");
+      assert.notEqual(check.outcome, OUTCOMES.PASS, JSON.stringify(overrides));
+    }
+  });
+
+  it("41i. the deployed limit is parsed by the Worker's own grammar", () => {
+    assert.deepEqual(parseMaxFileSize(undefined), {
+      measured: true,
+      bytes: DEFAULT_MAX_FILE_SIZE_BYTES,
+      source: "default",
+    });
+    assert.deepEqual(parseMaxFileSize("  "), {
+      measured: true,
+      bytes: DEFAULT_MAX_FILE_SIZE_BYTES,
+      source: "default",
+    });
+    assert.deepEqual(parseMaxFileSize("1048576"), {
+      measured: true,
+      bytes: 1048576,
+      source: "deployment",
+    });
+    // Out of grammar: the Worker could not have started, so nothing is assumed.
+    for (const raw of ["0", "-1", "12.5", "500MB", "1".repeat(18)]) {
+      assert.equal(parseMaxFileSize(raw).measured, false, raw);
+    }
+  });
+});
+
+// ── CORRECTION-04 §17-§21: the deny-class vocabulary is closed ─────────────
+
+describe("egress deny-class vocabulary", () => {
+  it("42. the enum is exactly the deployed policy's deny rules", () => {
+    assert.deepEqual([...DENY_CLASSES].sort(), ["deny-v4", "deny-v4-broadcast", "deny-v6"]);
+  });
+
+  it("42b. every real deny rule is accepted", () => {
+    for (const name of ["deny-v4", "deny-v6", "deny-v4-broadcast"]) {
+      const parsed = parseDenyClass(name);
+      assert.equal(parsed.ok, true, name);
+      assert.equal(parsed.denyClass, name);
+    }
+  });
+
+  it("42c. an ACCEPT rule can never be selected as the denial counter", () => {
+    for (const name of ["public-http", "established", "designated-dns-udp", "designated-dns-tcp"]) {
+      const parsed = parseDenyClass(name);
+      assert.equal(parsed.ok, false, name);
+      assert.match(parsed.reason, /ACCEPT rule/);
+    }
+  });
+
+  it("42d. the catch-all drop counter cannot be selected either", () => {
+    const parsed = parseDenyClass("fallthrough-drop");
+    assert.equal(parsed.ok, false);
+    assert.match(parsed.reason, /attributes nothing to a rule/);
+  });
+
+  it("42e. an unknown comment is refused", () => {
+    for (const name of ["", "deny-anything", "DENY-V4", "deny-v4 ", "../deny-v4"]) {
+      assert.equal(parseDenyClass(name).ok, false, JSON.stringify(name));
+    }
+  });
+
+  it("42f. the CLI refuses a non-deny class BEFORE any live operation", async () => {
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    for (const name of ["public-http", "established", "fallthrough-drop", "invented"]) {
+      const run = await runCli(
+        [
+          "--stage", "B", "--case", "safe-egress", ...LIVE_ARGS,
+          "--egress-deny-class", name,
+          "--evidence", "/tmp/e.json",
+        ],
+        LIVE_ENV({ VIDEOFETCH_ACCEPT_EGRESS_REDIRECT_URL: "https://media.invalid/generic/egress" }),
+        { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      );
+      assert.equal(run.code, 3, `${name}: ${run.out}${run.err}`);
+      assert.match(run.err, /usage error: --egress-deny-class/);
+      // Refused at PARSE time: no live acceptance banner, no commands run.
+      assert.doesNotMatch(run.out, /LIVE ACCEPTANCE/);
+      assert.equal(world.calls.commands.length, 0);
+      assert.equal(world.calls.fetches.length, 0);
+    }
+  });
+
+  it("42g. a moving ACCEPT counter cannot produce a PASS", () => {
+    // The `public-http` accept counter moves on every ordinary media fetch. It
+    // is not reachable as a deny class at all — which is the point — and the
+    // deny counter it cannot substitute for stays flat.
+    const listing = {
+      nftables: [
+        { rule: { comment: "deny-v4", expr: [{ counter: { packets: 7 } }, { reject: null }] } },
+        { rule: { comment: "public-http", expr: [{ counter: { packets: 900 } }, { accept: null }] } },
+      ],
+    };
+    const after = {
+      nftables: [
+        { rule: { comment: "deny-v4", expr: [{ counter: { packets: 7 } }, { reject: null }] } },
+        { rule: { comment: "public-http", expr: [{ counter: { packets: 1200 } }, { accept: null }] } },
+      ],
+    };
+    const attribution = attributeDenial({
+      before: readDenyCounter(listing, "deny-v4"),
+      after: readDenyCounter(after, "deny-v4"),
+      requestDenied: true,
+    });
+    assert.equal(attribution.attributedToBoundary, false);
+    assert.equal(parseDenyClass("public-http").ok, false);
+  });
+});
+
+// ── CORRECTION-04 §22-§25: host process parsing fails closed ───────────────
+
+describe("host process parsing", () => {
+  const captured = { pgid: 200, pid: 200, comm: "python3" };
+
+  it("43. a well-formed listing is measured", () => {
+    const parsed = parseHostProcessList("100 1 100 node\n200 100 200 python3\n\n");
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.rows.length, 2);
+  });
+
+  it("43b. an absent captured group yields an empty survivor set", () => {
+    const parsed = parseHostProcessList("100 1 100 node\n");
+    assert.deepEqual(parsed.rows.filter((r) => r.pgid === 200), []);
+    assert.equal(evaluateGroupTermination(captured, []).terminated, true);
+  });
+
+  it("43c. a real survivor of the captured group is returned", () => {
+    const parsed = parseHostProcessList("200 1 200 python3\n");
+    const survivors = parsed.rows.filter((r) => r.pgid === 200);
+    assert.equal(survivors.length, 1);
+    assert.equal(evaluateGroupTermination(captured, survivors).terminated, false);
+  });
+
+  it("43d. every malformed row shape makes the WHOLE listing unmeasured", () => {
+    for (const [stdout, pattern] of [
+      ["100 1 100\n", /4 the requested format produces|has 3 fields/],
+      ["100 1 100 node extra\n", /has 5 fields/],
+      ["1x0 1 100 node\n", /non-numeric id/],
+      ["100 1 abc node\n", /non-numeric id/],
+      ["100 1 100 (node)\n", /not a plain executable basename/],
+      [`100 1 100 ${"n".repeat(65)}\n`, /not a plain executable basename/],
+    ]) {
+      const parsed = parseHostProcessList(stdout);
+      assert.equal(parsed.ok, false, stdout);
+      assert.match(parsed.reason, pattern);
+    }
+  });
+
+  it("43e. THE ATTACK: the only survivor is malformed and must not become []", () => {
+    // One process survives the captured group, and its row cannot be parsed.
+    // Dropping it would turn a leak into a clean termination PASS.
+    const parsed = parseHostProcessList("100 1 100 node\n200 100 200 python3 --some-argv\n");
+    assert.equal(parsed.ok, false, "the listing must be refused");
+    assert.equal(parsed.rows, undefined, "no partial row set is offered");
+
+    // And the observer propagates it as a MEASUREMENT FAILURE.
+    const observers = makeSystemObservers({
+      runReadOnly: async (file) =>
+        file === "ps"
+          ? { exitCode: 0, stdout: "100 1 100 node\n200 100 200 python3 --some-argv\n", stderr: "" }
+          : { exitCode: 0, stdout: "", stderr: "" },
+    });
+    return observers.processGroupMembers(200).then((observed) => {
+      assert.equal(observed.measured, false);
+      assert.match(observed.reason, /cannot be interpreted|non-numeric|basename/);
+    });
+  });
+
+  it("43f. a malformed listing BLOCKS termination rather than passing it", () => {
+    for (const key of ["cancellation", "shutdownCase"]) {
+      const evidence =
+        key === "cancellation"
+          ? cancellationEvidence({ groupMembersMeasured: false, groupSurvivors: [] })
+          : shutdownEvidence({ groupMembersMeasured: false, groupSurvivors: [] });
+      const result = evaluateStageB(
+        passingStageBObservations({ [key]: measured(evidence) }),
+        passingStageA(),
+      );
+      const id = key === "cancellation" ? "cancel.processes-gone" : "shutdown.group-terminated";
+      const check = result.checks.find((c) => c.id === id);
+      assert.equal(check.outcome, OUTCOMES.BLOCKED, id);
+    }
+  });
+
+  it("43g. a clean listing containing one malformed row cannot PASS", async () => {
+    const observers = makeSystemObservers({
+      runReadOnly: async (file) =>
+        file === "ps"
+          ? {
+              exitCode: 0,
+              // Everything is orderly except one row — which is precisely the
+              // row that would carry a leaked process's unexpected name.
+              stdout: "1 0 1 systemd\n100 1 100 node\n300 1 300 ???\n",
+              stderr: "",
+            }
+          : { exitCode: 0, stdout: "", stderr: "" },
+    });
+    const observed = await observers.processGroupMembers(200);
+    assert.equal(observed.measured, false);
+  });
+});
+
+// ── CORRECTION-04 §26: run-key permissions fail closed on every path ───────
+
+describe("run-key permission hardening", () => {
+  const KEY_BODY = JSON.stringify({ runId: "a1b2c3d4e5f60718", key: "c".repeat(64) });
+  const enoent = () => {
+    const error = new Error("no such file");
+    error.code = "ENOENT";
+    return error;
+  };
+
+  const adapter = ({ mode, statThrows } = {}) => ({
+    readFile: async () => KEY_BODY,
+    writeFile: async () => {},
+    mkdir: async () => {},
+    chmod: async () => {},
+    stat: async () => {
+      if (statThrows) throw statThrows;
+      return { mode };
+    },
+  });
+
+  it("44. a NEW key is minted 0600 when none exists", async () => {
+    const written = new Map();
+    const created = await loadOrCreateRun("/tmp/new.json", {
+      readFile: async () => { throw enoent(); },
+      writeFile: async (path, body, options) => written.set(path, options?.mode),
+      mkdir: async () => {},
+      chmod: async (path, mode) => written.set(path, mode),
+      stat: async () => { throw enoent(); },
+    });
+    assert.equal(created.created, true);
+    assert.equal(written.get("/tmp/new.json"), 0o600);
+  });
+
+  it("44b. an existing SAFE key is resumed", async () => {
+    const resumed = await loadOrCreateRun("/tmp/run.json", adapter({ mode: 0o600 }));
+    assert.equal(resumed.created, false);
+    assert.equal(resumed.key, "c".repeat(64));
+    assert.equal((await loadRun("/tmp/run.json", adapter({ mode: 0o600 }))).key, "c".repeat(64));
+  });
+
+  it("44c. an existing UNSAFE key is refused on BOTH paths", async () => {
+    for (const mode of [0o644, 0o660, 0o604, 0o777]) {
+      const resumed = await loadOrCreateRun("/tmp/run.json", adapter({ mode }));
+      assert.match(resumed.error, /must not be group- or world-accessible/, `resume ${mode.toString(8)}`);
+      assert.equal(resumed.key, undefined, "no key is handed back");
+
+      const loaded = await loadRun("/tmp/run.json", adapter({ mode }));
+      assert.match(loaded.error, /must not be group- or world-accessible/, `load ${mode.toString(8)}`);
+    }
+  });
+
+  it("44d. a permission measurement FAILURE fails closed", async () => {
+    const denied = new Error("permission denied");
+    denied.code = "EACCES";
+    for (const path of [loadOrCreateRun, loadRun]) {
+      const result = await path("/tmp/run.json", adapter({ statThrows: denied }));
+      assert.match(result.error, /could not be measured/);
+      assert.equal(result.key, undefined);
+    }
+    // A stat that returns no usable mode is equally unmeasured.
+    const noMode = await loadRun("/tmp/run.json", adapter({ mode: undefined }));
+    assert.match(noMode.error, /no file mode/);
+  });
+
+  it("44e. Stage A refuses to resume an insecure key", async () => {
+    const world = makeFakeWorld({});
+    const files = seedRun();
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/sa.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      {
+        runReadOnly: world.runReadOnly,
+        fetch: world.fetch,
+        files,
+        stat: async () => ({ mode: 0o644 }),
+      },
+    );
+    assert.equal(run.code, 2);
+    assert.match(run.err, /must not be group- or world-accessible/);
+    assert.doesNotMatch(`${run.out}${run.err}`, /c{16}/, "the key is never printed");
+  });
+
+  it("44f. no run-key path ever prints the key", async () => {
+    const results = [
+      await loadOrCreateRun("/tmp/run.json", adapter({ mode: 0o644 })),
+      await loadRun("/tmp/run.json", adapter({ mode: 0o644 })),
+      await loadRun("/tmp/run.json", adapter({ statThrows: enoent() })),
+    ];
+    for (const result of results) {
+      assert.doesNotMatch(JSON.stringify(result ?? null), /c{32}/);
+    }
+  });
+});
+
+// ── CORRECTION-04 §27-§28: the accepted ambiguity policy is unchanged ──────
+
+describe("ambiguity policy preserved", () => {
+  it("45. a sampler error still BLOCKS; a close-straddle still only counts", () => {
+    const errored = aggregateDownloadWindow(
+      windowOf([acquisitionSample()], { samplerErrors: ["docker top failed"] }),
+    );
+    assert.equal(errored.usable, false);
+    assert.match(errored.reason, /unobserved interval/);
+
+    const straddled = aggregateDownloadWindow(
+      windowOf([acquisitionSample()], { ambiguousSamples: [{ startedAt: 5, finishedAt: 20, closedAt: 10 }] }),
+    );
+    assert.equal(straddled.usable, true);
+    assert.equal(straddled.ambiguousSamples.length, 1);
+  });
+
+  it("45b. the module's own comment matches the implemented policy", async () => {
+    const source = await readFile(
+      new URL("../deploy/acceptance/ytdlp-generic/lib/download-window.mjs", import.meta.url),
+      "utf8",
+    );
+    // The stale claim said a straddling sample made the window unusable, which
+    // the implementation deliberately does not do.
+    assert.doesNotMatch(source, /window becomes unusable/);
+    assert.match(source, /DISCARDED AND COUNTED/);
   });
 });
 

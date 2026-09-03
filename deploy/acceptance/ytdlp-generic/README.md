@@ -162,17 +162,21 @@ There is no unreviewed layer between Production and the acceptance logic.
 | `--stage A` | **disabled** | Every Stage A gate, including the direct-media regression. Writes the Stage A record and begins the run. |
 | `--stage B --case success` | **enabled** | Generic analysis, job lifecycle, durable evidence, the downloading window, R2, signed GET, sentinel sweep. |
 | `--stage B --case cancellation` | **enabled** | Captures the owned PGID, cancels, proves that exact group died. |
-| `--stage B --case byte-limit` | **enabled** | Unknown-declared-length **actual media GET** aborts as `TOO_LARGE`. |
+| `--stage B --case byte-limit` | **enabled** | This case's own unknown-declared-length **media GET** serves more than the deployed limit and aborts as `TOO_LARGE`. |
 | `--stage B --case shutdown` | **enabled** | Captures the owned PGID, the operator restarts, that exact group must be gone. |
-| `--stage B --case safe-egress` | **enabled** | Forbidden later destination denied, attributed by the **deny counter**. |
+| `--stage B --case safe-egress` | **enabled** | Forbidden later destination denied, attributed by the **deny counter** named with `--egress-deny-class` (a closed deny-only enum). |
 | `--stage B --case direct-regression` | **enabled** | Post-enable direct job with no yt-dlp process. |
 | `--stage B --case kill-switch` | **disabled** | Generic unusable after the operator rolls back; direct still works. |
-| `--stage B --aggregate` | either | Validates every case record and produces the Stage B verdict. |
+| `--stage B --aggregate` | either — **genuinely either** | Validates every case record and produces the Stage B verdict, reading each state-dependent claim from the artifact that observed it. |
 
 Each case declares the deployment state it requires. Running one against the
 wrong state is `BLOCKED`, and — importantly — so is running **any** case while
 `YTDLP_ENABLED` could not be measured: a case graded against an unknown stage
 produces evidence nobody can interpret.
+
+Each case also **seals the state it actually ran in** into its own record, which
+is what lets the aggregation accept `either` above and mean it — see
+[the aggregate judges history](#the-aggregate-judges-history-it-does-not-reconstruct-it).
 
 Each case writes its own record; the aggregation turns records into a verdict.
 Multi-run is deliberate: enabling generic, cancelling a job, stopping the Worker
@@ -204,6 +208,42 @@ kill-switch case            proves generic unusable, direct still works
 The harness performs **none** of those transitions. It measures the state it is
 given, refuses to run a case against the wrong one, and refuses to run any case
 at all when the state is unmeasurable.
+
+#### The aggregate judges history; it does not reconstruct it
+
+Every case record carries a `featureState` the **harness measured while that
+case ran** — the deployment's own `YTDLP_ENABLED` spelling and the application's
+own `/api/sites` answer — and it is sealed with the record, so it cannot be
+edited without invalidating the authenticator.
+
+The aggregation reads the two state-dependent claims from those artifacts:
+
+| Claim | Comes from |
+| :--- | :--- |
+| `capability.generic-usable` | the `success` record's sealed enabled-state facts |
+| `config.ytdlp-enabled` | the `success` record's sealed enabled-state facts |
+| `killswitch.disabled-state-proven` | the `kill-switch` record's sealed disabled-state facts |
+| `deployment.final-state-recorded` | the deployment at aggregation time — **recorded, not graded** |
+
+A `success` artifact recording the disabled state, or a `kill-switch` artifact
+recording the enabled state, is **rejected outright**: the case declares the
+state it is only meaningful in, and evidence captured in the other one proves
+nothing about the claim it is offered for.
+
+**The final state is deliberately not a gate.** A complete acceptance whose
+terminal condition is `disabled` — the preferred Phase-10D outcome, since the
+runbook keeps Production `YTDLP_ENABLED` unset and Phase 10E owns final product
+enablement — aggregates to `PASS` on the strength of its sealed artifacts. An
+aggregate run while generic happens to be enabled does not erase the kill-switch
+evidence either. What the check does require is that the final state was
+**measured** and is inside the deployment's own grammar; an unmeasurable one is
+`BLOCKED`.
+
+This is not a relaxation. The earlier model read the current deployment and
+required it to be enabled, which was strictly worse in both directions: it
+failed every run that had followed the documented sequence to its end, and it
+could be satisfied by enabling generic in the minute before aggregating — a
+state with no connection to when the evidence was captured.
 
 ### Case records cannot be forged
 
@@ -241,8 +281,12 @@ Stage A **begins** a run; Stage B cases and the aggregation **join** it.
   and would make a leak of its own state file a production incident;
 - never printed, never committed (it is in `.gitignore`), never in any evidence
   record — only the non-secret `runId` travels with the artifacts;
-- **refused on load if it is group- or world-readable**: a key any local account
-  can read is a key that can re-seal edited artifacts;
+- **refused if it is group- or world-readable, on every path that touches it** —
+  Stage A resuming an existing key as much as Stage B loading one. A key any
+  local account can read is a key that can re-seal edited artifacts;
+- **refused if its permissions cannot be measured at all.** "We could not read
+  the mode" is not "the mode is fine"; only a missing file is a permissive
+  answer, and that one means *mint a fresh key*, not *use this one*;
 - **deleted by the operator when acceptance is complete.**
 
 Stage B refuses to mint a key: doing so would make every prior artifact
@@ -259,7 +303,9 @@ noticing.
 1. `harness` and `schemaVersion` are exactly this harness's;
 2. `case` is a known case name;
 3. `expectedSha` **and** `runningImageId` match the current run;
-4. the payload passes that case's **strict** validator — required fields of the
+4. its sealed `featureState` records the deployment state that case is defined
+   to run in;
+5. the payload passes that case's **strict** validator — required fields of the
    right type, and **no unknown keys**.
 
 Then the pure evaluator re-judges every field. A hand-written
@@ -656,6 +702,36 @@ LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN
 as `BLOCKED` and **the acceptance is incomplete**. Do not substitute a unit
 test, and do not fabricate evidence. The gap is made explicit on purpose.
 
+#### What the fixture must implement
+
+```
+VIDEOFETCH_ACCEPT_BYTELIMIT_URL=<https URL of the controlled fixture page>
+VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL=<https URL of its evidence endpoint>
+```
+
+The harness appends `?vf_case=<128-bit hex>` to the submitted URL. The fixture
+must:
+
+1. associate the media request it then serves with that `vf_case` value;
+2. serve it with **no usable `Content-Length`** (chunked, or a misdeclared one);
+3. serve **more bytes than the deployed `MAX_FILE_SIZE`** — see below;
+4. answer `GET <evidence endpoint>?vf_case=<id>` with that case's own facts:
+
+```json
+{
+  "caseId": "<the same id>",
+  "actualMediaRequestObserved": true,
+  "mediaRequestCount": 1,
+  "contentLengthPresent": false,
+  "transferMode": "chunked",
+  "bytesServed": 600000000,
+  "observedAt": "<iso timestamp>"
+}
+```
+
+An unknown case must answer `404`, not a default. A response whose `caseId` does
+not match, or whose `mediaRequestCount` is not exactly `1`, is `BLOCKED`.
+
 ### Cancellation and shutdown
 
 Cancellation needs a deterministic window while the job is actively
@@ -718,6 +794,23 @@ The `ps` allowlist admits **one** invocation, `ps -eo pid=,ppid=,pgid=,comm=`.
 `ps -ef` and `ps aux` both print the full command line, whose last element on the
 acquisition process is the submitted media URL.
 
+### An unreadable row is not a skippable row
+
+This is a **negative** proof, and its evidence is the *absence* of matching
+rows. So a line the parser cannot interpret is not noise — it is potentially the
+one leaked survivor, and dropping it turns a real leak into `[]` and therefore
+into a `PASS`.
+
+The parser therefore refuses the **whole listing** on any non-empty line that is
+not exactly four fields, three numeric ids, and a plain executable basename. The
+observation becomes unmeasured and the termination check lands `BLOCKED`.
+
+The refusal message names the line *number* and the defect, never the line's
+content — a malformed line is precisely the case where the content might not be
+a `comm`.
+
+Blank lines are still skipped: they carry no process and hide nothing.
+
 ## Attributing an egress denial to the boundary
 
 Phase 9 established the standard, and `counter.py` states it exactly: *a
@@ -751,6 +844,37 @@ An earlier version combined the policy unit's systemd `InvocationID` and
 activation timestamp — which describe the *unit's lifetime*, not the rules: a
 rule changed by hand while the unit kept running would leave both identical.
 
+### The deny class is a closed enum, not a free-form comment
+
+`--egress-deny-class` is parsed against the deploy-time policy's **actual deny
+rules**, at argument-parse time, before anything live happens:
+
+| Accepted | The rule it names |
+| :--- | :--- |
+| `deny-v4` | `ip daddr @forbidden_v4 counter reject` |
+| `deny-v6` | `ip6 daddr @forbidden_v6 counter reject` |
+| `deny-v4-broadcast` | `ip daddr 255.255.255.255 counter reject` |
+
+Choose the class the **fixture family** is expected to trip — a private-IPv4
+destination trips `deny-v4`, a forbidden IPv6 one `deny-v6`, a broadcast one
+`deny-v4-broadcast` — not whichever counter happens to be moving.
+
+Everything else in the chain is refused with a usage error, including every
+comment that looks plausible:
+
+| Refused | Why |
+| :--- | :--- |
+| `public-http` | an ACCEPT rule; its counter moves on every ordinary media fetch |
+| `established` | an ACCEPT rule; its counter moves on essentially every response |
+| `designated-dns-udp` / `-tcp` | ACCEPT rules for the designated resolver |
+| `fallthrough-drop` | the chain's catch-all policy counter — it attributes nothing to a rule |
+| anything else | not a rule in the deployed policy at all |
+
+The previous list was free-form, and additionally named three classes
+(`deny-v4-mapped`, `deny-multicast`, `deny-link-local`) that do not exist in the
+deployed ruleset — those destinations are *elements inside* `@forbidden_v4` and
+`@forbidden_v6`, and increment `deny-v4` / `deny-v6`.
+
 ## Proving the application byte watcher, not `--max-filesize`
 
 The property is about the **actual progressive media GET** that yt-dlp selected,
@@ -764,19 +888,53 @@ entirely.
 The harness cannot see which media URL yt-dlp chose without breaching the
 private-selector boundary, so the controlled fixture reports the transfer
 semantics of the media GET it actually served, via
-`VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL`:
+`VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL`.
+
+### The evidence must belong to this case
+
+Asking a fixture "did you serve a media request?" is not evidence about *this*
+transfer. A static endpoint answering `{"actualMediaRequestObserved": true}`
+satisfied that question, and so did an answer left over from an earlier run.
+
+So each byte-limit run **mints a 128-bit correlation id**, submits it on the
+fixture URL as `vf_case`, and requests the fixture's evidence for exactly that
+id. The token is not a credential — it grants nothing and authenticates nothing
+— which is why it may appear in the sanitized record.
 
 ```
-actualMediaRequestObserved: true
-contentLengthPresent: false
-transferMode: chunked
-bytesServed: <over the configured limit>
+caseId                     == the id this run minted
+actualMediaRequestObserved == true
+mediaRequestCount          == 1          (zero is not this transfer;
+                                          several cannot be told apart)
+contentLengthPresent       == false
+transferMode               : chunked
+bytesServed                : the bytes the fixture actually served
 ```
+
+### The threshold must actually have been crossed
+
+`TOO_LARGE` alone says a job failed; it does not say the **application byte
+threshold** was reached. So the case also measures the limit the *deployed*
+Worker enforces, and requires the transfer to exceed it:
+
+```
+effectiveMaxFileSizeBytes  : read from the deployment's own MAX_FILE_SIZE
+                             (absent -> the Worker's 500 MiB default)
+bytesServed > effectiveMaxFileSizeBytes
+```
+
+The limit is read from the single non-secret deployment variable via
+`docker inspect`, parsed with the runtime's own grammar — no environment file is
+opened, and no other value is extracted. Inferring the limit from source would
+be wrong whenever a deployment overrides it: a 600 MB transfer proves nothing
+against a 1 GiB limit, and proves everything against a 1 MiB one.
 
 The case fails if `contentLengthPresent` is true (then `--max-filesize` could
-have been the mechanism), fails if the fixture analyzed as `direct`, and is
-`BLOCKED` — `LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN` — if the transfer
-semantics cannot be established at all.
+have been the mechanism), fails if the fixture analyzed as `direct`, fails if
+the bytes served did not exceed the deployed limit (invalid fixture, not
+acceptance evidence), and is `BLOCKED` — `LIVE UNKNOWN-LENGTH BYTE-GUARD CASE
+NOT PROVEN` — if the correlation, the media request, or the effective limit
+cannot be established at all.
 
 ## Generic-specific cases must actually run generic
 
@@ -823,6 +981,11 @@ where they belong.
 | Delivered length == durable `fileSize` == provider `contentLength` | **Live** — `vercel.byte-integrity` |
 | The delivered bytes' SHA-256 | **Live**, recorded |
 | An *independent* digest of the Worker-produced object | **Only for the direct fixture**, whose digest the harness derives itself |
+| Generic worked **while it was enabled** | **Live**, from the `success` record's sealed feature state |
+| The kill switch worked **while it was disabled** | **Live**, from the `kill-switch` record's sealed feature state |
+| This exact transfer crossed the byte threshold | **Live** — case-correlated fixture evidence vs. the deployed `MAX_FILE_SIZE` |
+| The firewall denied this connection | **Live** — one closed, genuine deny-rule counter moved |
+| The old process group has no survivors | **Live** — and only after **every** host process row parsed |
 
 The internal direct→generic fall-through for the generic URL is **not**
 observable at the application boundary, and adding a surface to observe it would

@@ -57,12 +57,12 @@ import {
   REQUIRED_WORKER_ENVIRONMENT,
 } from "./lib/stage-a.mjs";
 import { evaluateStageB } from "./lib/stage-b.mjs";
-import { buildEvidence, renderEvidence, sweepForSentinel } from "./lib/evidence.mjs";
+import { CASE_ID_PATTERN, buildEvidence, renderEvidence, sweepForSentinel } from "./lib/evidence.mjs";
 import { createSafeConsole, describePresence, redactUrl } from "./lib/redact.mjs";
 import { makeSystemObservers, notMeasured, observe, runReadOnly } from "./lib/observers.mjs";
 import { makeControlPlaneSession, makeWorkerControlClient } from "./lib/control-plane.mjs";
 import { makeProcessSampler } from "./lib/process-sampler.mjs";
-import { readDenyCounter } from "./lib/egress-policy.mjs";
+import { parseDenyClass, readDenyCounter } from "./lib/egress-policy.mjs";
 import {
   aggregateDownloadWindow,
   nodeContained,
@@ -73,6 +73,7 @@ import {
   CASE_PRODUCERS,
   buildCaseRecord,
   caseNames,
+  describeFeatureState,
   evaluateCaseFeatureState,
   expectedFeatureStateFor,
   hasExecutableProducer,
@@ -143,6 +144,18 @@ export async function main(argv, env, deps = {}) {
       `usage error: '${caseName}' is not a live case command — ${CASE_PRODUCERS[caseName].summary}. ` +
         `Runnable cases: ${liveCaseNames().join(", ")}`,
     );
+    return EXIT.USAGE;
+  }
+
+  // §17-§19 of CORRECTION-04: the deny class is parsed through the CLOSED enum
+  // BEFORE any live operation. An arbitrary nftables comment must never be
+  // usable as a denial-attribution counter — `public-http` and `established`
+  // are ACCEPT rules whose counters move constantly, and `fallthrough-drop`
+  // attributes nothing to a rule. Refusing here means the case cannot run to
+  // completion and then report a confident PASS from the wrong counter.
+  const denyClass = parseDenyClass(readOption(argv, "--egress-deny-class"));
+  if (!denyClass.ok) {
+    errorLog(`usage error: ${denyClass.reason}`);
     return EXIT.USAGE;
   }
 
@@ -239,6 +252,13 @@ export async function main(argv, env, deps = {}) {
   let acceptanceRun;
   if (stage === "A") {
     acceptanceRun = await loadOrCreateRun(runKeyPath, deps);
+    // §26 of CORRECTION-04: Stage A resuming an already-insecure key would
+    // re-establish exactly the weakness `loadRun` refuses, from the command
+    // expected to touch the file first.
+    if (acceptanceRun?.error) {
+      errorLog(`BLOCKED: ${acceptanceRun.error}`);
+      return EXIT.BLOCKED;
+    }
     log(
       `acceptance run ${runFingerprint(acceptanceRun.runId)} ${acceptanceRun.created ? "created" : "resumed"} ` +
         `(key file ${runKeyPath}, mode 0600 — delete it when acceptance is complete)`,
@@ -278,6 +298,7 @@ export async function main(argv, env, deps = {}) {
     container,
     baseUrl,
     expectedSha,
+    egressDenyClass: denyClass.denyClass,
     startedAt,
     secrets,
     registerSecret,
@@ -487,6 +508,33 @@ async function runStageBCase(ctx, caseName) {
   }
   log(`deployment state: generic ${stateGate.actual} (case '${caseName}' requires ${expectedFeatureStateFor(caseName)})`);
 
+  // §4/§5 of CORRECTION-04: SEAL the state this case actually ran under.
+  //
+  // The enabled-phase cases and the kill-switch case run at different times
+  // against different configurations, and the aggregation runs later still. So
+  // the historical fact is captured HERE, by the harness, while the condition
+  // exists — never reconstructed afterwards from whichever state the deployment
+  // happens to be in at aggregation time, and never taken from an operator.
+  const caseSites = await observe("GET /api/sites", async () => {
+    const body = await ctx.session.sites();
+    return {
+      ytdlp: body.ytdlp === true,
+      ytdlpInstalled: body.ytdlpInstalled === true,
+      ytdlpEnabled: body.ytdlpEnabled === true,
+    };
+  });
+  const featureState = describeFeatureState({
+    ytdlpEnabledRaw,
+    sites: caseSites,
+    observedAt: new Date().toISOString(),
+  });
+  if (featureState.measured !== true) {
+    errorLog(
+      `BLOCKED: the deployment feature state could not be sealed for case '${caseName}': ${featureState.reason}`,
+    );
+    return EXIT.BLOCKED;
+  }
+
   const runningImageId = await system.runningImageId();
   if (runningImageId.measured !== true) {
     errorLog("BLOCKED: the running image could not be identified; a case record cannot be bound to it.");
@@ -510,10 +558,14 @@ async function runStageBCase(ctx, caseName) {
     sweepSurfaces: makeSentinelSweeper(ctx),
     awaitWorkerRestart: makeRestartWatcher(ctx),
     egressPolicyState: () => ctx.system.egressPolicyState(),
-    egressDenyClass: readOption(argv, "--egress-deny-class") ?? "deny-v4",
-    denyCounter: makeDenyCounterReader(ctx, readOption(argv, "--egress-deny-class") ?? "deny-v4"),
+    // Already validated against the closed deny-only enum at parse time.
+    egressDenyClass: ctx.egressDenyClass,
+    denyCounter: makeDenyCounterReader(ctx, ctx.egressDenyClass),
     processGroupMembers: (pgid) => ctx.system.processGroupMembers(pgid),
     mediaTransferEvidence: makeMediaTransferProbe(ctx),
+    // The EFFECTIVE deployed byte limit (§13), read from the single non-secret
+    // deployment variable rather than assumed from the repository default.
+    effectiveMaxFileSize: () => ctx.system.effectiveMaxFileSize(),
     // The MONOTONIC clock used to order a snapshot's interval against the
     // window close. Distinct from the wall clock a producer uses for
     // timestamps — `Date.now()` is the wrong instrument for interval
@@ -556,6 +608,7 @@ async function runStageBCase(ctx, caseName) {
       runId: acceptanceRun.runId,
       startedAt: ctx.startedAt,
       finishedAt: new Date().toISOString(),
+      featureState: featureState.value,
     }),
     acceptanceRun.key,
   );
@@ -617,6 +670,9 @@ async function runStageBAggregate(ctx) {
   // Load and STRUCTURALLY VALIDATE each case record.
   const paths = readOptionList(argv, "--case-evidence");
   const caseObservations = {};
+  // §4-§6 of CORRECTION-04: the state each accepted case ran under, taken from
+  // its own SEALED record. This is what makes the aggregate state-neutral.
+  const caseFeatureStates = {};
   const accepted = [];
   const rejected = [];
   for (const path of paths) {
@@ -644,11 +700,24 @@ async function runStageBAggregate(ctx) {
       continue;
     }
     Object.assign(caseObservations, validated.observations);
+    caseFeatureStates[validated.caseName] = validated.featureState;
     accepted.push(validated.caseName);
   }
 
   for (const line of rejected) errorLog(`rejected case evidence — ${line}`);
   log(`accepted case evidence: ${accepted.length > 0 ? accepted.join(", ") : "none"}`);
+
+  // §6 of CORRECTION-04: the CURRENT deployment state is RECORDED, never used
+  // to decide whether an earlier phase passed. A completed acceptance whose
+  // final state is `disabled` — the preferred Phase-10D terminal condition,
+  // since Phase 10E owns final product enablement — must aggregate to PASS on
+  // the strength of its sealed artifacts, and an aggregate run while generic
+  // happens to be enabled must not erase the kill-switch evidence either.
+  const finalFeatureState = describeFeatureState({
+    ytdlpEnabledRaw,
+    sites: capabilities,
+    observedAt: new Date().toISOString(),
+  });
 
   const obs = {
     expectedSha,
@@ -656,6 +725,20 @@ async function runStageBAggregate(ctx) {
     ytdlpEnabledRaw,
     workerEnvironmentNames,
     capabilities,
+    // The two historical phases, each from the case that observed it.
+    enabledFeatureState: caseFeatureStates.success
+      ? { measured: true, value: caseFeatureStates.success }
+      : notMeasured(
+          "no accepted `success` case evidence, so no artifact proves the enabled phase occurred " +
+            "while generic was actually enabled",
+        ),
+    disabledFeatureState: caseFeatureStates["kill-switch"]
+      ? { measured: true, value: caseFeatureStates["kill-switch"] }
+      : notMeasured(
+          "no accepted `kill-switch` case evidence, so no artifact proves the disabled phase " +
+            "occurred while generic was actually disabled",
+        ),
+    finalFeatureState,
     // Every case-derived observation; anything a case did not supply stays a
     // measurement failure and lands as BLOCKED.
     genericAnalysis: caseObservations.genericAnalysis ?? notMeasured("no accepted `success` case evidence"),
@@ -695,6 +778,14 @@ async function runStageBAggregate(ctx) {
     binding,
     runningImageId: binding.runningImageId,
     capabilities: capabilities.value ?? null,
+    // The multi-state sequence, as the sealed artifacts record it.
+    stateSequence: {
+      enabledPhase: caseFeatureStates.success ?? null,
+      disabledPhase: caseFeatureStates["kill-switch"] ?? null,
+      byCase: caseFeatureStates,
+      finalState: finalFeatureState.measured === true ? finalFeatureState.value : null,
+      finalStateReason: finalFeatureState.measured === true ? null : finalFeatureState.reason,
+    },
     workerEnvironment: summarizeEnvironment(workerEnvironmentNames),
     job: obs.genericJob?.value ?? null,
     processEvidence: summarizeProcess(obs.downloadingWindow),
@@ -865,8 +956,8 @@ function makeCatalogComparator() {
 }
 
 /**
- * The ACTUAL media transfer semantics, from the controlled fixture
- * (§17-§20 of CORRECTION-03).
+ * The ACTUAL media transfer semantics, from the controlled fixture, CORRELATED
+ * TO THIS CASE (§17-§20 of CORRECTION-03; §10-§12 of CORRECTION-04).
  *
  * The previous implementation did `HEAD` on the SUBMITTED URL. That is the
  * wrong request: the submitted URL is a page, and the transfer under test is the
@@ -879,9 +970,19 @@ function makeCatalogComparator() {
  * private-selector boundary, so the controlled fixture reports what it actually
  * served. `VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL` is the fixture's own
  * read-only evidence endpoint.
+ *
+ * ── Why a bare endpoint was not enough ─────────────────────────────────────
+ *
+ * The previous probe asked the fixture "did you serve a media request?" with no
+ * way to tell WHICH one. A static endpoint returning
+ * `{"actualMediaRequestObserved": true}` satisfied it, and so did evidence left
+ * over from a run an hour earlier. The submitted URL now carries a minted
+ * `vf_case` correlation id, the fixture associates the media request it serves
+ * with that id, and this probe requests and re-checks that exact id — so the
+ * evidence is causally bound to this case's transfer or it is BLOCKED.
  */
 function makeMediaTransferProbe(ctx) {
-  return async () =>
+  return async (caseId) =>
     observe("actual media transfer semantics", async () => {
       const endpoint = ctx.env.VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL;
       if (!endpoint) {
@@ -890,20 +991,58 @@ function makeMediaTransferProbe(ctx) {
             "the transfer semantics of the actual media GET cannot be established",
         );
       }
+      if (!CASE_ID_PATTERN.test(String(caseId ?? ""))) {
+        throw new Error("refusing to request fixture evidence without a minted case correlation id");
+      }
+      // §11: ask for THIS case. The fixture returns evidence for the media
+      // request it associated with this id, or nothing.
+      const url = new URL(endpoint);
+      url.searchParams.set("vf_case", caseId);
+
       const fetchImpl = ctx.deps.fetch ?? globalThis.fetch;
-      const response = await fetchImpl(endpoint, { redirect: "follow" });
+      const response = await fetchImpl(url.toString(), { redirect: "follow" });
+      if (response.status === 404) {
+        throw new Error(
+          `the fixture holds no media-request evidence for this case (HTTP 404); the transfer ` +
+            "under test cannot be attributed",
+        );
+      }
       if (!response.ok) throw new Error(`the fixture evidence endpoint returned HTTP ${response.status}`);
       const body = await response.json();
+
+      // §12: the returned evidence must BE this case's.
+      if (body?.caseId !== caseId) {
+        throw new Error(
+          "the fixture returned evidence for a different case than the one this run submitted; " +
+            "it cannot be attributed to this transfer",
+        );
+      }
       if (typeof body?.actualMediaRequestObserved !== "boolean") {
         throw new Error("the fixture evidence is malformed");
+      }
+      // Exactly one media request may be attributed to this case. Zero is not
+      // this case's transfer; several cannot be told apart, and picking one
+      // would be a guess about which bytes the byte watcher actually saw.
+      const mediaRequestCount = body?.mediaRequestCount;
+      if (!Number.isInteger(mediaRequestCount)) {
+        throw new Error("the fixture did not report how many media requests it attributed to this case");
+      }
+      if (body.actualMediaRequestObserved === true && mediaRequestCount !== 1) {
+        throw new Error(
+          `the fixture attributed ${mediaRequestCount} media requests to this case; a single ` +
+            "unambiguous transfer is required to reason about the byte guard",
+        );
       }
       // Only sanitized facts are carried forward: no URL, no selector, no
       // headers beyond the transfer-shape booleans the assertion needs.
       return {
+        caseId,
         actualMediaRequestObserved: body.actualMediaRequestObserved,
+        mediaRequestCount,
         contentLengthPresent: body.contentLengthPresent === true,
         transferMode: typeof body.transferMode === "string" ? body.transferMode : null,
         bytesServed: Number.isInteger(body.bytesServed) ? body.bytesServed : null,
+        observedAt: typeof body.observedAt === "string" ? body.observedAt : null,
       };
     });
 }

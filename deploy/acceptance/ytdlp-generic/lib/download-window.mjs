@@ -268,9 +268,13 @@ export function createDownloadWindowCollector({ workerPid, expectedNetns, now } 
       // asynchronous. If the window closed while the snapshot was in flight,
       // the snapshot cannot be confidently assigned to either side: admitting
       // it could report a legitimate `processing` FFmpeg as an acquisition
-      // failure, and dropping it could discard a real acquisition descendant.
-      // Neither guess is acceptable, so it is recorded as AMBIGUOUS and the
-      // window becomes unusable.
+      // failure, and crediting it as coverage would claim observation of an
+      // interval that was partly outside the window.
+      //
+      // So it is DISCARDED AND COUNTED: excluded from the verdict, recorded in
+      // `ambiguousSamples`, and reported as `ambiguousSampleCount`. It does NOT
+      // make the window unusable — see the gap rule in `aggregateDownloadWindow`
+      // for why the tail straddle is treated differently from a sampler error.
       const { startedAt, finishedAt } = opts;
       if (typeof startedAt === "number" && typeof finishedAt === "number") {
         const straddles = closedAt !== null && startedAt < closedAt && finishedAt > closedAt;

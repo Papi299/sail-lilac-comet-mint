@@ -21,7 +21,7 @@
 // and get a PASS: there is no field called `passed`, and every field that does
 // exist is re-evaluated by the pure Stage B evaluator rather than believed.
 
-import { mintSentinel, withSentinel } from "./evidence.mjs";
+import { CASE_ID_PATTERN, mintCaseId, mintSentinel, withCaseId, withSentinel } from "./evidence.mjs";
 import { classifyTransitionTrace } from "./lifecycle.mjs";
 import { createDownloadWindowCollector } from "./download-window.mjs";
 import { attributeDenial } from "./egress-policy.mjs";
@@ -50,6 +50,7 @@ const isInt = (v) => Number.isInteger(v);
 const isStr = (v) => typeof v === "string" && v.length > 0;
 const isArr = (v) => Array.isArray(v);
 const isDigest = (v) => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
+const isCaseId = (v) => typeof v === "string" && CASE_ID_PATTERN.test(v);
 
 /**
  * Strict per-case payload validators.
@@ -101,9 +102,17 @@ const CASE_PAYLOAD_VALIDATORS = Object.freeze({
     byteLimitCase: (v) =>
       isStr(v?.extractor) &&
       isBool(v?.declaredLengthUnknown) &&
+      // §10-§12 of CORRECTION-04: the evidence must be CAUSALLY BOUND to this
+      // case, and must carry both sides of the comparison it claims.
+      isCaseId(v?.caseId) &&
+      isInt(v?.mediaRequestCount) &&
       // The transfer semantics of the ACTUAL media GET, not of the submitted URL.
       isBool(v?.actualMediaRequestObserved) &&
       isBool(v?.contentLengthPresent) &&
+      isInt(v?.bytesServed) &&
+      isInt(v?.effectiveMaxFileSizeBytes) &&
+      isStr(v?.limitSource) &&
+      isBool(v?.exceededLimit) &&
       isStr(v?.outcome) &&
       isBool(v?.beganProcessing) &&
       isBool(v?.uploaded) &&
@@ -152,8 +161,87 @@ export function caseContributions(caseName) {
   return Object.keys(CASE_PAYLOAD_VALIDATORS[caseName] ?? {});
 }
 
+/**
+ * The deployment feature state a case ran under, as the HARNESS measured it at
+ * the moment the case ran (§4/§5 of CORRECTION-04).
+ *
+ * This is the load-bearing artifact of the multi-state acceptance. The
+ * enabled-phase and disabled-phase cases run at different times against
+ * different deployment configurations, so "generic worked while enabled" and
+ * "the kill switch worked while disabled" are claims about MOMENTS — and the
+ * aggregate, running later against whichever state happens to exist then,
+ * cannot reconstruct either of them.
+ *
+ * It lives on the RECORD rather than in a case payload, because it applies to
+ * every case uniformly and because the record-level seal already authenticates
+ * the whole object: an operator cannot edit `state` without invalidating it.
+ *
+ * `raw` is the deployment's own `YTDLP_ENABLED` spelling; `sites` is the
+ * application's own answer at `/api/sites`. Both are MEASURED, never an
+ * operator-authored boolean.
+ */
+export function describeFeatureState({ ytdlpEnabledRaw, sites, observedAt }) {
+  const raw = ytdlpEnabledRaw?.measured === true ? (ytdlpEnabledRaw.value ?? null) : undefined;
+  if (raw === undefined) {
+    return { measured: false, reason: "YTDLP_ENABLED could not be read at case time" };
+  }
+  const state = raw === "true" ? "enabled" : raw === null || raw === "false" ? "disabled" : null;
+  if (state === null) {
+    return { measured: false, reason: "YTDLP_ENABLED holds an out-of-grammar value at case time" };
+  }
+  if (sites?.measured !== true) {
+    return {
+      measured: false,
+      reason: `the application capability report could not be read at case time: ${sites?.reason ?? "unknown"}`,
+    };
+  }
+  return {
+    measured: true,
+    value: {
+      state,
+      ytdlpEnabledRaw: raw,
+      sites: {
+        ytdlp: sites.value?.ytdlp === true,
+        ytdlpInstalled: sites.value?.ytdlpInstalled === true,
+        ytdlpEnabled: sites.value?.ytdlpEnabled === true,
+      },
+      observedAt: observedAt ?? null,
+    },
+  };
+}
+
+/** The shape a sealed `featureState` must have to be believed at all. */
+export function isWellFormedFeatureState(value) {
+  return (
+    value != null &&
+    typeof value === "object" &&
+    (value.state === "enabled" || value.state === "disabled") &&
+    (value.ytdlpEnabledRaw === null ||
+      value.ytdlpEnabledRaw === "true" ||
+      value.ytdlpEnabledRaw === "false") &&
+    // Internal consistency: the summarized state must follow from the raw value
+    // by the SAME grammar the deployment uses. A record claiming `enabled` next
+    // to `ytdlpEnabledRaw: "false"` is self-contradictory and is refused rather
+    // than resolved in either direction.
+    value.state === (value.ytdlpEnabledRaw === "true" ? "enabled" : "disabled") &&
+    value.sites != null &&
+    typeof value.sites === "object" &&
+    isBool(value.sites.ytdlp) &&
+    isBool(value.sites.ytdlpInstalled) &&
+    isBool(value.sites.ytdlpEnabled)
+  );
+}
+
 /** Wraps a case's produced observations into the on-disk record. */
-export function buildCaseRecord({ caseName, binding, payload, runId, startedAt, finishedAt }) {
+export function buildCaseRecord({
+  caseName,
+  binding,
+  payload,
+  runId,
+  startedAt,
+  finishedAt,
+  featureState,
+}) {
   return {
     harness: HARNESS_ID,
     schemaVersion: CASE_SCHEMA_VERSION,
@@ -162,6 +250,8 @@ export function buildCaseRecord({ caseName, binding, payload, runId, startedAt, 
     case: caseName,
     expectedSha: binding?.expectedSha ?? null,
     runningImageId: binding?.runningImageId ?? null,
+    // Sealed WITH the record; see `describeFeatureState`.
+    featureState: featureState ?? null,
     startedAt: startedAt ?? null,
     finishedAt: finishedAt ?? null,
     payload,
@@ -204,6 +294,33 @@ export function validateCaseRecord(record, binding) {
     };
   }
 
+  // ── §4-§6 of CORRECTION-04: the case must have run in the state it claims ──
+  //
+  // Each case declares the deployment state it is only meaningful in, and the
+  // record carries the state the harness MEASURED when it ran. A `success`
+  // record produced while generic was disabled proves nothing about generic
+  // acquisition; a `kill-switch` record produced while it was enabled proves
+  // nothing about the kill switch. Both are refused HERE, so the aggregate
+  // never has to reconstruct a historical state from the current deployment.
+  const featureState = record.featureState;
+  if (!isWellFormedFeatureState(featureState)) {
+    return {
+      ok: false,
+      reason:
+        `case '${record.case}' carries no well-formed measured feature state; the deployment ` +
+        "state it ran under cannot be established",
+    };
+  }
+  const requiredState = expectedFeatureStateFor(record.case);
+  if (requiredState !== null && featureState.state !== requiredState) {
+    return {
+      ok: false,
+      reason:
+        `case '${record.case}' requires generic ${requiredState}, but the sealed evidence records ` +
+        `that it ran while generic was ${featureState.state}`,
+    };
+  }
+
   const validators = CASE_PAYLOAD_VALIDATORS[record.case];
   const payload = record.payload;
   if (!payload || typeof payload !== "object") {
@@ -230,7 +347,7 @@ export function validateCaseRecord(record, binding) {
   for (const [key, value] of Object.entries(payload)) {
     observations[key] = { measured: true, value };
   }
-  return { ok: true, caseName: record.case, observations };
+  return { ok: true, caseName: record.case, observations, featureState };
 }
 
 // ── The producers ──────────────────────────────────────────────────────────
@@ -619,22 +736,41 @@ function requireGenericStrategy(video, caseName) {
 export async function runByteLimitCase(ctx) {
   const { session, byteLimitUrl } = ctx;
 
+  // 0. Mint the correlation identity and bind the submitted URL to it, so the
+  //    fixture's later evidence is about THIS case's transfer and nothing else.
+  //    Not a secret: it grants nothing and authenticates nothing.
+  const caseId = mintCaseId();
+  const submittedUrl = withCaseId(byteLimitUrl, caseId);
+
   // 1. Establish the fixture is genuinely generic before anything else.
-  const video = await session.analyze(byteLimitUrl);
+  const video = await session.analyze(submittedUrl);
   requireGenericStrategy(video, "byte-limit");
 
   const preset = pickPreset(video?.presets);
   if (!preset) throw new Error("the byte-limit fixture advertised no application preset");
 
-  const created = await session.createJob(byteLimitUrl, preset.formatId);
+  // 2. The EFFECTIVE limit the deployed Worker enforces. Measured BEFORE the
+  //    job runs, so a comparison is possible at all — and measured from the
+  //    deployment rather than assumed from the repository default, because a
+  //    deployment may legitimately override it.
+  const limit = await ctx.effectiveMaxFileSize();
+  if (limit.measured !== true) {
+    throw new Error(
+      `the deployed effective maxFileSizeBytes could not be established: ${limit.reason} ` +
+        "(LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)",
+    );
+  }
+  const effectiveMaxFileSizeBytes = limit.value.bytes;
+
+  const created = await session.createJob(submittedUrl, preset.formatId);
   const jobId = created.jobId;
 
   const { polled } = await driveJobWithWindow(ctx, jobId, created.status);
   const finalJob = polled.final;
 
-  // 2. Ask the fixture what it ACTUALLY served for the media GET. This is the
+  // 3. Ask the fixture what it ACTUALLY served FOR THIS CASE. This is the
   //    request whose semantics the byte watcher had to cope with.
-  const transfer = await ctx.mediaTransferEvidence();
+  const transfer = await ctx.mediaTransferEvidence(caseId);
   if (transfer.measured !== true) {
     throw new Error(
       `the actual media transfer semantics could not be established: ${transfer.reason} ` +
@@ -643,7 +779,7 @@ export async function runByteLimitCase(ctx) {
   }
   if (transfer.value.actualMediaRequestObserved !== true) {
     throw new Error(
-      "the fixture served no media request, so there is no transfer to reason about " +
+      "the fixture served no media request for this case, so there is no transfer to reason about " +
         "(LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)",
     );
   }
@@ -655,6 +791,27 @@ export async function runByteLimitCase(ctx) {
     );
   }
 
+  // 4. The bytes actually transferred must have CROSSED the deployed limit.
+  //
+  //    Without this the case proved only that a job failed with TOO_LARGE — it
+  //    never established that the application threshold was reached, which is
+  //    the entire assertion. A fixture serving less than the limit and a Worker
+  //    reporting TOO_LARGE would have been a PASS while describing a bug.
+  const bytesServed = transfer.value.bytesServed;
+  if (!Number.isInteger(bytesServed)) {
+    throw new Error(
+      "the fixture did not report how many bytes it served, so the byte threshold cannot be " +
+        "shown to have been crossed (LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)",
+    );
+  }
+  if (bytesServed <= effectiveMaxFileSizeBytes) {
+    throw new Error(
+      `the fixture served ${bytesServed} bytes against an effective limit of ` +
+        `${effectiveMaxFileSizeBytes}; the transfer never crossed the deployed threshold, so this ` +
+        "run is invalid fixture evidence rather than acceptance evidence",
+    );
+  }
+
   const workDir = await ctx.workDirPresent(jobId);
   if (workDir.measured !== true) {
     throw new Error("the per-job working directory could not be probed after the byte-limit case");
@@ -663,12 +820,17 @@ export async function runByteLimitCase(ctx) {
   return {
     byteLimitCase: {
       jobId,
+      caseId,
       extractor: video.extractor,
       declaredLengthUnknown: true,
       actualMediaRequestObserved: true,
+      mediaRequestCount: transfer.value.mediaRequestCount,
       contentLengthPresent: false,
       transferMode: transfer.value.transferMode ?? null,
-      bytesServed: transfer.value.bytesServed ?? null,
+      bytesServed,
+      effectiveMaxFileSizeBytes,
+      limitSource: limit.value.source,
+      exceededLimit: bytesServed > effectiveMaxFileSizeBytes,
       // The durable error code IS the outcome. `TOO_LARGE` is classified by the
       // application byte watcher; a user cancellation is a different code.
       outcome: finalJob?.errorCode ?? finalJob?.status ?? "unknown",

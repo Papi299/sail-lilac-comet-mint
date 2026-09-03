@@ -77,8 +77,16 @@ export const CHECK_PRODUCERS = Object.freeze({
     "acceptance.loadStageA + provenance.verifyRecord + stage-b.stageBAuthorization",
     "--stage B --aggregate",
   ),
-  "capability.generic-usable": CONTROL("sites", "--stage B --aggregate"),
-  "config.ytdlp-enabled": SYSTEM("ytdlpEnabledRaw", "--stage B --aggregate"),
+  // §3-§6 of CORRECTION-04: the enabled-phase facts come from the `success`
+  // case's OWN sealed record, measured while generic was actually enabled —
+  // not from the deployment as it stands at aggregation time.
+  "capability.generic-usable": CASE("success", "the feature state sealed with the case record"),
+  "config.ytdlp-enabled": CASE("success", "the feature state sealed with the case record"),
+  "killswitch.disabled-state-proven": CASE(
+    "kill-switch",
+    "the feature state sealed with the case record",
+  ),
+  "deployment.final-state-recorded": SYSTEM("ytdlpEnabledRaw", "--stage B --aggregate"),
 
   "analysis.generic-selected": CASE("success", "the generic source's analysis result"),
   "analysis.direct-still-selected": CASE("success", "a direct control source's analysis result"),

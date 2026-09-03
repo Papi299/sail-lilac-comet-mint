@@ -64,6 +64,40 @@ export function withSentinel(url, sentinel) {
 }
 
 /**
+ * Mints the per-case correlation identity (§10 of CORRECTION-04).
+ *
+ * 128 bits of randomness, and deliberately NOT a secret: it is test correlation
+ * data whose whole purpose is to travel to the controlled fixture and come back
+ * in the fixture's evidence, so it may appear in the sanitized acceptance
+ * record. It is not a credential, grants nothing, and authenticates nothing —
+ * it exists so that "a media request was observed" becomes "THIS case's media
+ * request was observed".
+ *
+ * Distinct from the sentinel, which is the opposite kind of value: the sentinel
+ * must never resurface anywhere, and finding it is a failure.
+ */
+export function mintCaseId() {
+  return randomBytes(16).toString("hex");
+}
+
+/** A minted case id, for validating what the fixture echoes back. */
+export const CASE_ID_PATTERN = /^[0-9a-f]{32}$/;
+
+/**
+ * Binds a submitted fixture URL to one case run.
+ *
+ * The fixture associates the media request it serves with this id, and returns
+ * evidence only for it — so a static endpoint answering
+ * `{"actualMediaRequestObserved": true}`, or a stale answer left over from an
+ * earlier case, cannot satisfy the assertion.
+ */
+export function withCaseId(url, caseId) {
+  const parsed = new URL(url);
+  parsed.searchParams.set("vf_case", caseId);
+  return parsed.toString();
+}
+
+/**
  * Sweeps captured surfaces for the sentinel.
  *
  * Returns the VERDICT and the surface names, never the sentinel and never the
@@ -132,6 +166,7 @@ export function buildEvidence(input) {
     services,
     egressVerifier,
     capabilities,
+    stateSequence,
     workerEnvironment,
     job,
     processEvidence,
@@ -181,6 +216,14 @@ export function buildEvidence(input) {
     safeEgressVerifier: egressVerifier ?? null,
 
     capabilities: capabilities ?? null,
+
+    // The multi-state acceptance sequence (§3-§7 of CORRECTION-04).
+    //
+    // `enabledPhase` and `disabledPhase` are the feature states the harness
+    // MEASURED when those cases ran, carried out of their own sealed records.
+    // `finalState` is the deployment state at aggregation time, RECORDED for
+    // the reviewer and deliberately not used to grade either phase.
+    stateSequence: stateSequence ?? null,
 
     // §16/§17: names and booleans. No values, no lengths, no hashes.
     workerEnvironment: workerEnvironment ?? null,

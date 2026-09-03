@@ -205,6 +205,59 @@ export function workDirProbeArgv(jobId) {
 const WORKDIR_PROBE_PATTERN =
   /^import os;print\(os\.path\.isdir\('\/tmp\/videofetch\/jobs\/[0-9a-f]{32}'\)\)$/;
 
+/**
+ * The Worker's own default when `MAX_FILE_SIZE` is unset, mirroring
+ * `MEDIA_DEFAULTS.maxFileSizeBytes` in `src/worker/runtime/config.server.ts`.
+ */
+export const DEFAULT_MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024;
+
+/**
+ * The EFFECTIVE deployed byte limit, by the Worker's own grammar (§13 of
+ * CORRECTION-04).
+ *
+ * The acceptance assertion is about the limit the DEPLOYED Worker enforces, not
+ * about the repository default — a deployment that sets `MAX_FILE_SIZE=1048576`
+ * has a 1 MiB limit, and a fixture serving 600 MiB would then prove nothing the
+ * default-based reasoning claimed. So the single non-secret variable is read
+ * from the container's bound environment and parsed HERE with exactly the
+ * runtime's rules:
+ *
+ *   `optional()`        — trimmed; empty becomes absent
+ *   absent              — the 500 MiB default
+ *   `boundedInt(1, …)`  — /^[0-9]{1,17}$/ and a safe integer >= 1
+ *
+ * An out-of-grammar value is NOT silently defaulted here even though
+ * `readOptionalField` returns the fallback, because the runtime also pushes the
+ * name onto `invalid` and `loadWorkerRuntimeConfig` then THROWS — the Worker
+ * would not be running at all. A running Worker whose `MAX_FILE_SIZE` does not
+ * parse is a contradiction we cannot resolve, so it is a measurement failure.
+ */
+export function parseMaxFileSize(raw) {
+  if (raw === null || raw === undefined) {
+    return { measured: true, bytes: DEFAULT_MAX_FILE_SIZE_BYTES, source: "default" };
+  }
+  const trimmed = String(raw).trim();
+  if (trimmed.length === 0) {
+    return { measured: true, bytes: DEFAULT_MAX_FILE_SIZE_BYTES, source: "default" };
+  }
+  if (!/^[0-9]{1,17}$/.test(trimmed)) {
+    return {
+      measured: false,
+      reason:
+        "the deployed MAX_FILE_SIZE is not a nonnegative decimal integer; a Worker with this " +
+        "value could not have started, so the effective limit cannot be established",
+    };
+  }
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    return {
+      measured: false,
+      reason: "the deployed MAX_FILE_SIZE is outside the range the Worker accepts",
+    };
+  }
+  return { measured: true, bytes: parsed, source: "deployment" };
+}
+
 export function isReadOnlyCommand(file, argv) {
   const args = Array.isArray(argv) ? argv : [];
   return READ_ONLY_COMMANDS.some(([exe, predicate]) => exe === file && predicate(args) === true);
@@ -377,6 +430,33 @@ export function makeSystemObservers(deps = {}) {
       });
     },
 
+    /**
+     * The EFFECTIVE `maxFileSizeBytes` the deployed Worker enforces (§13).
+     *
+     * Read from the container's bound environment exactly as `ytdlpEnabledRaw`
+     * is, so no environment FILE is opened and no value other than this single
+     * non-secret variable is ever extracted. `environmentNames` remains the
+     * name-only observer; this one deliberately reads one named value, because
+     * the byte-limit assertion is a numeric comparison and cannot be made
+     * against a name.
+     */
+    async effectiveMaxFileSize() {
+      return observe("docker inspect MAX_FILE_SIZE", async () => {
+        const raw = await inspectContainer("{{range .Config.Env}}{{println .}}{{end}}");
+        let value = null;
+        for (const line of raw.split("\n")) {
+          const [name, ...rest] = line.split("=");
+          if (name.trim() === "MAX_FILE_SIZE") {
+            value = rest.join("=").trim();
+            break;
+          }
+        }
+        const parsed = parseMaxFileSize(value);
+        if (parsed.measured !== true) throw new Error(parsed.reason);
+        return { bytes: parsed.bytes, source: parsed.source };
+      });
+    },
+
     async egressVerifier() {
       return observe("vf-egress-policy-verify", async () => {
         const result = await run("/usr/local/sbin/vf-egress-policy-verify", []);
@@ -544,7 +624,12 @@ export function makeSystemObservers(deps = {}) {
         }
         const result = await run("ps", ["-eo", HOST_PS_FORMAT]);
         if (result.exitCode !== 0) throw new Error(`ps exited ${result.exitCode}`);
-        return parseHostProcessList(result.stdout).filter((row) => row.pgid === pgid);
+        // §23: an uninterpretable row makes the WHOLE listing unmeasured. The
+        // absence of survivors is the evidence, so a row we could not read is
+        // indistinguishable from the survivor we are looking for.
+        const parsed = parseHostProcessList(result.stdout);
+        if (!parsed.ok) throw new Error(parsed.reason);
+        return parsed.rows.filter((row) => row.pgid === pgid);
       });
     },
 
@@ -584,23 +669,65 @@ export function makeSystemObservers(deps = {}) {
 }
 
 /**
- * Parses `ps -eo pid=,ppid=,pgid=,comm=` into closed-schema rows.
+ * Parses `ps -eo pid=,ppid=,pgid=,comm=` into closed-schema rows, FAIL-CLOSED
+ * (§22-§24 of CORRECTION-04).
  *
- * `comm` is a basename by definition of the column. A row whose `comm` contains
- * whitespace would mean the format changed under us, so it is dropped rather
- * than admitted — a command line must never enter the evidence path.
+ * ── Why dropping a row is not a safe default here ──────────────────────────
+ *
+ * The termination proof this feeds is a NEGATIVE one: "no member of the
+ * captured process group survives". Its evidence is the ABSENCE of matching
+ * rows. So a row the parser cannot interpret is not noise to be skipped — it is
+ * potentially the one surviving leaked acquisition process, and skipping it
+ * turns a single real survivor into `[]` and therefore into a PASS.
+ *
+ * The previous implementation did exactly that: `continue` on a wrong field
+ * count, on a non-numeric id, and on an unexpected `comm` shape. Every one of
+ * those is now a MEASUREMENT FAILURE for the whole listing.
+ *
+ * The privacy contract is unchanged and is what makes fail-closed affordable:
+ * the command is the single allowlisted `ps -eo pid=,ppid=,pgid=,comm=`, which
+ * has no `args`/`cmd`/`command` column, so an unparseable row cannot be
+ * admitted "just in case" — it is refused, and nothing from it reaches the
+ * evidence path. BLOCKED is the correct verdict for a listing we could not
+ * fully read; it is never traded for a cleaner-looking empty set.
+ *
+ * @returns `{ ok: true, rows }` or `{ ok: false, reason }`. The reason names the
+ *   line NUMBER and the defect, never the line's content — a malformed line is
+ *   exactly the case where the content might not be a `comm`.
  */
 export function parseHostProcessList(stdout) {
   const rows = [];
-  for (const line of String(stdout ?? "").split("\n")) {
-    const trimmed = line.trim();
+  const lines = String(stdout ?? "").split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = lines[index].trim();
+    // A blank line carries no process and hides nothing.
     if (trimmed.length === 0) continue;
+
     const parts = trimmed.split(/\s+/);
-    if (parts.length !== 4) continue;
+    if (parts.length !== 4) {
+      return {
+        ok: false,
+        reason:
+          `line ${index + 1} of the host process listing has ${parts.length} fields, not the 4 the ` +
+          "requested format produces; the listing cannot be interpreted",
+      };
+    }
     const [pid, ppid, pgid, comm] = parts;
-    if (!/^\d+$/.test(pid) || !/^\d+$/.test(ppid) || !/^\d+$/.test(pgid)) continue;
-    if (!/^[\w.:+-]+$/.test(comm)) continue;
+    if (!/^\d+$/.test(pid) || !/^\d+$/.test(ppid) || !/^\d+$/.test(pgid)) {
+      return {
+        ok: false,
+        reason: `line ${index + 1} of the host process listing has a non-numeric id field`,
+      };
+    }
+    if (!/^[\w.:+-]{1,64}$/.test(comm)) {
+      return {
+        ok: false,
+        reason:
+          `line ${index + 1} of the host process listing has a comm field that is not a plain ` +
+          "executable basename; refusing to admit it rather than risk command-line material",
+      };
+    }
     rows.push({ pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), comm: comm.toLowerCase() });
   }
-  return rows;
+  return { ok: true, rows };
 }

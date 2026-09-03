@@ -1819,6 +1819,86 @@ in Phase 10C3. The comment now states that runtime availability and operator
 enablement are distinct and both necessary, while reachability is supplied by the
 reviewed application router and execution path. No diagnostics behaviour changed.
 
+#### CORRECTION-04 — four remaining acceptance-integrity gaps closed
+
+**1. Final aggregation still graded the CURRENT deployment as if generic had to
+be enabled.** CORRECTION-03 documented the multi-state sequence but left the
+aggregate reading `capability.generic-usable` and `config.ytdlp-enabled` from
+the deployment as it stood at aggregation time. That contradicted the sequence
+in both directions: the sequence *ends* with the operator restoring the disabled
+state and running `kill-switch`, so a correctly executed acceptance would have
+failed at the last step — and the same check could be satisfied by enabling
+generic in the minute before aggregating, a state with no connection to when any
+evidence was captured.
+
+Every case record now carries a `featureState` the harness MEASURED while that
+case ran — the deployment's own `YTDLP_ENABLED` spelling and the application's
+own `/api/sites` answer — sealed with the record and therefore uneditable. A
+`success` artifact recording the disabled state, or a `kill-switch` artifact
+recording the enabled state, is rejected outright. The aggregate reads each
+state-dependent claim from the artifact that observed it, adds
+`killswitch.disabled-state-proven` for the disabled half, and RECORDS the state
+at aggregation time under `deployment.final-state-recorded` without grading it.
+
+The terminal-state policy is explicit rather than implied: **either** state
+aggregates successfully, `disabled` is the preferred Phase-10D outcome (this
+runbook keeps Production `YTDLP_ENABLED` unset, and Phase 10E owns final product
+enablement), and an unmeasurable final state is BLOCKED.
+
+**2. Byte-limit fixture evidence was not bound to the case, and never showed the
+threshold was crossed.** The probe asked the fixture "did you serve a media
+request?" with no way to tell which one — a static endpoint answering
+`{"actualMediaRequestObserved": true}` satisfied it, and so did evidence left
+over from an earlier run. Separately, `TOO_LARGE` alone says a job failed; it
+does not say the application byte threshold was reached, so a fixture serving
+less than the limit would have produced a PASS while describing a bug.
+
+Each run now mints a 128-bit correlation id (test data, not a credential),
+submits it as `vf_case` on the fixture URL, and requests the fixture's evidence
+for exactly that id; a foreign id, a missing association, or a media-request
+count other than one is BLOCKED. The case also measures the EFFECTIVE deployed
+limit — the single non-secret `MAX_FILE_SIZE` variable read through
+`docker inspect` and parsed with the runtime's own grammar, defaulting to 500
+MiB — and requires `bytesServed > effectiveMaxFileSizeBytes`. Inferring the
+limit from source would be wrong wherever a deployment overrides it.
+
+**3. Any nftables comment could be named as the deny counter.**
+`--egress-deny-class` took a free-form string, so `public-http` (an ACCEPT rule
+whose counter moves on every ordinary media fetch) or `established` (which moves
+on essentially every response) would have attributed a denial to a counter that
+had nothing to do with one. The list also named three classes that do not exist
+in the deployed ruleset — `deny-v4-mapped`, `deny-multicast`,
+`deny-link-local` — whose destinations are elements inside `@forbidden_v4` and
+`@forbidden_v6` and increment `deny-v4`/`deny-v6`.
+
+The enum is now exactly the deployed policy's deny rules — `deny-v4`, `deny-v6`,
+`deny-v4-broadcast` — parsed at argument-parse time, before any live operation.
+Every accept rule, the catch-all `fallthrough-drop` counter, and any unknown
+value are usage errors. The fixture family determines which class is expected;
+counter-delta, request-failure, verifier and fingerprint requirements are
+unchanged.
+
+**4. Malformed host process rows disappeared from termination evidence.** The
+parser skipped any non-empty line it could not interpret. The termination proof
+is a NEGATIVE one whose evidence is the ABSENCE of matching rows, so a single
+unreadable line — precisely where a leaked process's unexpected name would
+appear — turned one real survivor into `[]` and therefore into a PASS.
+
+Any non-empty line that is not exactly four fields, three numeric ids and a
+plain executable basename now makes the WHOLE listing unmeasured, and the
+termination check lands BLOCKED. The refusal names the line number and the
+defect, never its content — a malformed line is exactly the case where the
+content might not be a `comm`. Blank lines are still skipped.
+
+**Also hardened (two smaller consistency fixes):** the run-key permission check
+now applies on EVERY path that touches the file, so Stage A can no longer
+silently resume an already group- or world-readable key; and a permission
+measurement that fails for any reason other than the file being absent fails
+closed, because "we could not read the mode" is not "the mode is fine". The
+stale comment in `download-window.mjs` claiming a straddling sample makes the
+window unusable was reworded to match the implemented discard-and-count policy.
+The accepted CORRECTION-03 ambiguity policy and monotonic clock are unchanged.
+
 #### What Phase 10D is authorized to do
 
 Nothing yet. Only after this harness has been **independently reviewed and

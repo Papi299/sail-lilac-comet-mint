@@ -19,19 +19,88 @@
 // This module is pure over the nftables JSON that the Phase-9 listing returns.
 
 /**
- * The rule comments the Phase-9 policy attaches to its deny rules.
+ * The EXACT deny-rule comments the deployed Phase-9 policy carries (§17-§19 of
+ * CORRECTION-04).
  *
- * These are the vocabulary `counter.py` already reads. A class named here must
- * exist in the live ruleset; a lookup that finds no such rule is a measurement
- * failure, never a zero.
+ * Reconciled against `deploy/nftables/videofetch-egress.nft.template`, which is
+ * the source the installer renders. The complete rule-comment vocabulary the
+ * live chain actually contains is:
+ *
+ *   established          accept  — replies to inbound connections
+ *   designated-dns-udp   accept  — the one designated resolver, port 53
+ *   designated-dns-tcp   accept  — likewise
+ *   deny-v4-broadcast    reject  — 255.255.255.255/32
+ *   deny-v4              reject  — @forbidden_v4
+ *   deny-v6              reject  — @forbidden_v6
+ *   public-http          accept  — tcp dport { 80, 443 }
+ *   fallthrough-drop     drop    — the chain policy counter
+ *
+ * Only the three `deny-*` rules can attribute a denial to the boundary, and
+ * this list is now exactly those three.
+ *
+ * ── Why the previous list was a defect, not merely untidy ──────────────────
+ *
+ * It named `deny-v4-mapped`, `deny-multicast` and `deny-link-local`, none of
+ * which exist in the deployed ruleset — those classes are elements INSIDE
+ * `@forbidden_v4`/`@forbidden_v6` and increment `deny-v4`/`deny-v6`. Worse, the
+ * value was a free-form string, so `--egress-deny-class public-http` would have
+ * attributed a denial to an ACCEPT rule whose counter moves on every ordinary
+ * media fetch, and `--egress-deny-class established` to a counter that moves on
+ * essentially every response the Worker sends. Either would have produced a
+ * confident PASS from a counter that had nothing to do with a denial.
  */
-export const DENY_CLASSES = Object.freeze([
-  "deny-v4",
-  "deny-v6",
-  "deny-v4-mapped",
-  "deny-multicast",
-  "deny-link-local",
-]);
+export const DENY_CLASSES = Object.freeze(["deny-v4", "deny-v6", "deny-v4-broadcast"]);
+
+/**
+ * Every rule comment in the deployed chain that is NOT a denial.
+ *
+ * Kept explicitly so the refusal message can say *why* a plausible-looking
+ * value is refused, rather than only that it is not on a list.
+ */
+export const NON_DENY_RULE_COMMENTS = Object.freeze({
+  established: "an ACCEPT rule for replies to inbound connections",
+  "designated-dns-udp": "an ACCEPT rule for the designated resolver",
+  "designated-dns-tcp": "an ACCEPT rule for the designated resolver",
+  "public-http": "an ACCEPT rule for ordinary public media egress",
+  "fallthrough-drop": "the chain's catch-all policy counter, which attributes nothing to a rule",
+});
+
+/**
+ * The deny class each controlled fixture family is expected to trip (§19).
+ *
+ * The FIXTURE determines the counter, so an operator cannot point the case at
+ * an unrelated counter that happens to be moving for its own reasons.
+ */
+export const EGRESS_FIXTURE_CLASSES = Object.freeze({
+  "private-v4": "deny-v4",
+  "forbidden-v6": "deny-v6",
+  broadcast: "deny-v4-broadcast",
+});
+
+/**
+ * Parses an operator-supplied deny class through the closed enum.
+ *
+ * Called at ARGUMENT-PARSE time, before any live operation, so an unknown or
+ * non-deny value is a usage error rather than a case that runs to completion
+ * and then reports an unreadable counter.
+ */
+export function parseDenyClass(value) {
+  if (value === undefined || value === null) {
+    return { ok: true, denyClass: DENY_CLASSES[0] };
+  }
+  const candidate = String(value);
+  if (DENY_CLASSES.includes(candidate)) return { ok: true, denyClass: candidate };
+
+  const nonDeny = NON_DENY_RULE_COMMENTS[candidate];
+  return {
+    ok: false,
+    reason: nonDeny
+      ? `--egress-deny-class '${candidate}' is ${nonDeny}; a denial can only be attributed to a ` +
+        `deny rule. Choose one of: ${DENY_CLASSES.join(", ")}`
+      : `--egress-deny-class '${candidate}' is not a deny rule in the deployed policy. ` +
+        `Choose one of: ${DENY_CLASSES.join(", ")}`,
+  };
+}
 
 /**
  * Reads one rule's packet counter out of `nft -j list chain` output.
