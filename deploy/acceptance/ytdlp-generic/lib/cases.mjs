@@ -28,7 +28,16 @@ import { attributeDenial } from "./egress-policy.mjs";
 
 import { EVIDENCE_SCHEMA_VERSION, HARNESS_ID, IMAGE_ID_PATTERN } from "./provenance.mjs";
 
-/** One schema constant governs both record kinds, so they cannot drift apart. */
+/**
+ * ONE schema constant governs every artifact kind — Stage A, Stage B case
+ * records and the Stage B aggregate — so they cannot drift apart (§4 of
+ * CORRECTION-08).
+ *
+ * They describe one producer contract and are consumed together: a Stage B run
+ * that admitted a Stage A record from a different harness revision than the one
+ * that produced its own case records would be joining two contracts. Separate
+ * per-artifact versions would make that expressible; a single alias does not.
+ */
 export const CASE_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION;
 export { HARNESS_ID };
 

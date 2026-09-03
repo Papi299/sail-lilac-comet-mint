@@ -2153,6 +2153,71 @@ CORRECTION-06's positive-finding precedence, exact `docker top` argv boundary,
 header validation, fail-closed row handling, feature continuity and the
 kill-switch value-not-gate rule are unchanged.
 
+#### CORRECTION-08 — two final artifact-integrity defects closed
+
+**1. The evidence schema identifier was stale.** It still read
+`10c4-correction-03`, which was no longer truthful: the acceptance contract has
+changed materially since, even where a record's JSON shape has not.
+
+A valid HMAC proves only that an artifact has not changed since somebody holding
+the run key produced it. It says nothing about WHICH revision of the harness's
+observation semantics produced the contents it authenticates, and only the
+schema version can.
+
+That gap mattered specifically for Stage A. Stage B case records are already
+refused structurally when a required field is absent, so an older case artifact
+cannot pass today's validator. Stage A's record shape has not changed since
+CORRECTION-03, so an artifact produced by a much weaker harness revision could
+carry the same runId, the same key, the same source SHA, the same image binding
+and a PASS verdict — and therefore satisfy `loadStageA()` and AUTHORIZE CURRENT
+STAGE B. What it actually attested was far less: narrow secret-safe environment
+observation, non-zero exits no longer accepted as measurements, fail-closed
+process parsing, state/feature/image/container-epoch continuity, strict run
+identity and atomic key creation all postdate it.
+
+The schema is now `10c4-correction-08`, one constant governing Stage A, case
+records and the aggregate so they cannot drift into describing different
+contracts. `schemaVersion` identifies the acceptance PRODUCER CONTRACT, not
+merely the set of JSON keys, and must be bumped whenever an observer or
+evaluator change could make an old artifact mean something WEAKER under the same
+shape. No live artifact compatibility is broken: Phase 10D has not run.
+
+**2. Restart endpoints were assembled rather than observed.** The watcher read
+the container instance and the PID separately and polled the PID for the
+transition. Both halves were wrong.
+
+Polling the PID produced FALSE NEGATIVES: PIDs are not unique across container
+objects, so a recreated Worker whose main process received the same pid was
+invisible — the watcher timed out and reported that no restart occurred while
+one plainly had. That matters because the unit is `docker run --rm` behind an
+`ExecStartPre=-docker rm -f`, so the container object is what a restart actually
+changes.
+
+Reading the instance around the PID rather than with it produced INCOHERENT
+ENDPOINTS: a transition recorded as A -> C could be assembled from an A instance
+read that preceded a PID from B and a later PID change that preceded a C
+instance read. None of those three observations was of the same runtime, and the
+record would claim "container A had PID X" for a pairing that never existed.
+
+The container instance is now the polling authority, and each endpoint is a
+coherent bracketed observation — instance, PID, instance again, all agreeing on
+the instance. An instance that moves inside the bracket makes the observation
+AMBIGUOUS, retried a bounded number of times, with exhaustion a measurement
+failure rather than a pairing accepted on the last attempt. The PID remains in
+evidence as auxiliary diagnostic data bound to the instance it was read from.
+
+The claim language is bounded accordingly: the watcher observed the transition
+from the recorded old container epoch to the recorded new one, and the case's
+outer bracketed snapshots add that the new epoch remained current through
+sealing. Polling is not claimed to prove that no transient intermediate
+container existed between two polls; an additional recreation that IS observed
+still BLOCKS.
+
+The CORRECTION-07 epoch architecture is unchanged: `containerEpoch`,
+`continuous` mode for ordinary cases, `one-restart` for `shutdown`, the pre/post
+bracketed deployment snapshots, image identity as code provenance, feature
+continuity, and container identity as runtime-epoch evidence only.
+
 #### What Phase 10D is authorized to do
 
 Nothing yet. Only after this harness has been **independently reviewed and

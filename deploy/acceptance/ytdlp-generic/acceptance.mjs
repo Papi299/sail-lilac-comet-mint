@@ -1274,61 +1274,160 @@ function makeMediaTransferProbe(ctx) {
 }
 
 /**
+ * ONE COHERENT observation of the running Worker: which container object, and
+ * what its main PID is (§10 of CORRECTION-08).
+ *
+ * ── Why this is bracketed ──────────────────────────────────────────────────
+ *
+ * The instance id and the PID are two separate `docker inspect` calls, and a
+ * recreation can land between them. Reading them in sequence and reporting the
+ * pair therefore permits
+ *
+ *     instance A   (read first)
+ *     PID from B   (read after the recreation)
+ *
+ * — a record that says "container A had PID X" when no container ever did. The
+ * PID is then attributed to the wrong runtime, and the restart watcher's
+ * endpoints stop being observations of anything.
+ *
+ * So the instance is read, then the PID, then the instance AGAIN, and all three
+ * must agree on the instance. If they do not, the observation is AMBIGUOUS —
+ * not "probably A" — and the caller retries or gives up. Never a pairing the
+ * harness cannot vouch for.
+ *
+ * @returns `{ ok: true, instanceId, pid }` or `{ ok: false, reason }`.
+ */
+export async function observeRuntimeEpoch(system) {
+  const open = await system.containerInstanceId();
+  if (open.measured !== true) {
+    return { ok: false, reason: `the container instance could not be identified: ${open.reason}` };
+  }
+  const pid = await system.containerPid();
+  if (pid.measured !== true) {
+    return { ok: false, reason: `the container PID could not be read: ${pid.reason}` };
+  }
+  const close = await system.containerInstanceId();
+  if (close.measured !== true) {
+    return { ok: false, reason: `the container instance could not be re-checked: ${close.reason}` };
+  }
+  if (open.value !== close.value) {
+    return {
+      ok: false,
+      reason:
+        "the Worker container was recreated while its runtime was being observed, so the PID " +
+        "read cannot be attributed to either container object",
+    };
+  }
+  return { ok: true, instanceId: open.value, pid: pid.value };
+}
+
+/** How many times an ambiguous runtime observation is re-attempted before giving up. */
+const RUNTIME_OBSERVATION_ATTEMPTS = 3;
+
+/**
+ * A coherent runtime observation, retried a bounded number of times.
+ *
+ * A single ambiguous read means a recreation happened to land inside it, which
+ * is transient by nature; retrying is the right response. Retrying FOREVER is
+ * not, so the attempts are bounded and exhaustion is a measurement failure —
+ * BLOCKED — rather than a pairing accepted on the last try.
+ */
+async function observeRuntimeEpochCoherently(ctx, label) {
+  let last = { ok: false, reason: "not attempted" };
+  for (let attempt = 1; attempt <= RUNTIME_OBSERVATION_ATTEMPTS; attempt += 1) {
+    last = await observeRuntimeEpoch(ctx.system);
+    if (last.ok) return last;
+    if (attempt < RUNTIME_OBSERVATION_ATTEMPTS) {
+      await (ctx.deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))))(1000);
+    }
+  }
+  return {
+    ok: false,
+    reason: `the ${label} Worker runtime could not be observed coherently: ${last.reason}`,
+  };
+}
+
+/**
  * Waits for the operator's Worker stop/restart (§9 of CORRECTION-03; §11 of
- * CORRECTION-07).
+ * CORRECTION-07; §8-§12 of CORRECTION-08).
  *
- * The harness observes; it never performs the transition. A restart is detected
- * as the container's main PID changing — `systemctl stop`/`start` are not on the
- * read-only allowlist and are never called from here.
+ * The harness observes; it never performs the transition. `systemctl stop` and
+ * `systemctl start` are not on the read-only allowlist and are never called
+ * from here.
  *
- * ── Why the container OBJECT is identified too ─────────────────────────────
+ * ── The container instance is the AUTHORITY, not the PID ───────────────────
  *
- * A changed PID says a restart HAPPENED. It does not say which container object
- * the evidence after it belongs to, and the unit runs `docker run --rm` behind
- * an `ExecStartPre=-docker rm -f`, so the new Worker is a new object. Recording
- * the instance either side is what lets the case record PIN the transition —
- * old instance, new instance — so a SECOND recreation before the evidence is
- * sealed cannot pass as the first one.
+ * The unit is `docker run --rm` behind an `ExecStartPre=-docker rm -f`, so a
+ * Worker restart recreates the container object. That object id is therefore
+ * the transition being observed, and it is what the poll compares.
  *
- * An unidentifiable instance on either side is a measurement failure, never a
- * transition recorded with a hole in it.
+ * Polling the PID instead was wrong in both directions:
+ *
+ *   FALSE NEGATIVE — PIDs are not unique across container objects. A recreated
+ *     Worker whose main process happens to receive the SAME pid makes a real
+ *     recreation invisible to a PID comparison. The watcher would then time out
+ *     and report that no restart occurred, while one plainly had.
+ *
+ *   INCOHERENT ENDPOINTS — the instance ids were sampled AROUND the PID change
+ *     rather than with it, so the transition recorded as `A -> C` could be
+ *     assembled from an A instance read that preceded a PID from B and a later
+ *     PID change that preceded a C instance read. None of those three
+ *     observations was of the same runtime.
+ *
+ * The PID remains in the evidence as auxiliary diagnostic data, bound to the
+ * instance it was actually read from — never as the authority for which
+ * transition occurred.
+ *
+ * ── What this claims, precisely ────────────────────────────────────────────
+ *
+ * Polling does NOT prove that no transient intermediate container existed
+ * between two polls, and nothing here says it does. The supported claim is:
+ *
+ *     the watcher observed the deployment transition from the recorded old
+ *     container epoch to the recorded new container epoch
+ *
+ * and the case's outer bracketed snapshots then add:
+ *
+ *     and that new epoch remained current through final evidence sealing
+ *
+ * An additional recreation that IS observed — the endpoint moving again before
+ * sealing — is BLOCKED by the epoch validator. Proving the stronger "exactly
+ * one restart occurred in all possible instants" would require a continuous
+ * Docker event observer, which this harness does not have and does not claim.
  */
 function makeRestartWatcher(ctx) {
   return async ({ timeoutMs }) =>
     observe("operator Worker restart", async () => {
-      const beforeInstance = await ctx.system.containerInstanceId();
-      if (beforeInstance.measured !== true) {
-        throw new Error("the container instance could not be identified before the transition");
-      }
-      const before = await ctx.system.containerPid();
-      if (before.measured !== true) {
-        throw new Error("the container PID could not be read before the transition");
-      }
-      const previousPid = before.value;
-      const previousInstanceId = beforeInstance.value;
+      const before = await observeRuntimeEpochCoherently(ctx, "pre-restart");
+      if (!before.ok) throw new Error(before.reason);
 
       const deadline = Date.now() + timeoutMs;
       let sawDown = false;
       while (Date.now() < deadline) {
-        const now = await ctx.system.containerPid();
-        if (now.measured !== true) {
-          sawDown = true; // the container is gone — the stop half happened
-        } else if (now.value !== previousPid) {
-          // A changed PID is a genuine restart whether or not the down window
-          // was caught between polls. Identify the object it came back as
-          // BEFORE returning: an unidentifiable new instance leaves the epoch
-          // unpinnable, which is a measurement failure rather than a restart
-          // observed with an unknown endpoint.
-          const afterInstance = await ctx.system.containerInstanceId();
-          if (afterInstance.measured !== true) {
-            throw new Error("the container instance could not be identified after the transition");
+        const probe = await ctx.system.containerInstanceId();
+        if (probe.measured !== true) {
+          // The container object is gone — the stop half happened. This is the
+          // one place an unmeasurable read is information rather than a
+          // failure, and it is recorded as such, never as a transition.
+          sawDown = true;
+        } else if (probe.value !== before.instanceId) {
+          // A DIFFERENT container object is running. Establish the new epoch
+          // COHERENTLY before recording anything about it: the probe's sighting
+          // is one read, and the endpoint must be an observation.
+          const after = await observeRuntimeEpochCoherently(ctx, "post-restart");
+          if (!after.ok) throw new Error(after.reason);
+          if (after.instanceId === before.instanceId) {
+            // Not reachable through Docker's own id semantics, and asserted
+            // rather than assumed: an endpoint pair that is not a transition
+            // must never be recorded as one.
+            throw new Error("the observed transition returned to the original container instance");
           }
           return {
-            previousPid,
-            currentPid: now.value,
+            previousPid: before.pid,
+            currentPid: after.pid,
             downObserved: sawDown,
-            previousInstanceId,
-            currentInstanceId: afterInstance.value,
+            previousInstanceId: before.instanceId,
+            currentInstanceId: after.instanceId,
           };
         }
         await (ctx.deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))))(1000);

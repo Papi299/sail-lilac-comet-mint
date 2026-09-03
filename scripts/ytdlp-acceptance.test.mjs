@@ -148,7 +148,7 @@ import {
   EVIDENCE_SCHEMA_VERSION,
   RUN_ID_PATTERN,
 } from "../deploy/acceptance/ytdlp-generic/lib/provenance.mjs";
-import { main, loadStageA } from "../deploy/acceptance/ytdlp-generic/acceptance.mjs";
+import { main, loadStageA, observeRuntimeEpoch } from "../deploy/acceptance/ytdlp-generic/acceptance.mjs";
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -495,24 +495,32 @@ function makeFakeWorld(options = {}) {
     // Simulated deployment drift, counted rather than scheduled, because a
     // CLI-shaped test cannot intervene part-way through `main()`.
     //
-    //   imageDriftsAfterReads — the running image changes after this many
-    //                           `{{.Image}}` reads (image redeployed mid-case)
-    //   restartAfterPidReads  — the operator's Worker restart lands after this
-    //                           many `{{.State.Pid}}` reads
+    //   imageDriftsAfterReads      — the running image changes after this many
+    //                                `{{.Image}}` reads (redeployed mid-case)
+    //   restartAfterIdReads        — the operator's Worker restart lands after
+    //                                this many `{{.Id}}` reads
+    //   restartAfterPidReads       — …or after this many `{{.State.Pid}}` reads,
+    //                                which is how a restart is placed INSIDE
+    //                                the watcher's id -> pid -> id bracket
     imageDriftsAfterReads: options.imageDriftsAfterReads ?? null,
     imageAfterDrift: options.imageAfterDrift ?? `sha256:${"e".repeat(64)}`,
+    restartAfterIdReads: options.restartAfterIdReads ?? null,
     restartAfterPidReads: options.restartAfterPidReads ?? null,
     imageAfterRestart: options.imageAfterRestart ?? null,
+    pidAfterRestart: options.pidAfterRestart,
+    pidAfterRecreation: options.pidAfterRecreation,
     // §9-§14 of CORRECTION-07: the RUNTIME EPOCH, modelled independently of
     // the image so a recreation that keeps image and feature state identical —
     // the case endpoint equality cannot see — is representable.
     //
-    //   instanceAfterRestart      the object the observed restart brings back
-    //   recreateAfterIdReads      an UNOBSERVED recreation, after N id reads
-    //   instanceAfterRecreation   the object that one brings back
-    //   containerIdUnreadable     the epoch cannot be measured at all
+    //   instanceAfterRestart        the object the observed restart brings back
+    //   recreateAfterIdReads        a SECOND recreation, after N id reads
+    //   recreateAfterPidReads       …or after N PID reads
+    //   instanceAfterRecreation     the object that one brings back
+    //   containerIdUnreadable       the epoch cannot be measured at all
     instanceAfterRestart: options.instanceAfterRestart ?? null,
     recreateAfterIdReads: options.recreateAfterIdReads ?? null,
+    recreateAfterPidReads: options.recreateAfterPidReads ?? null,
     instanceAfterRecreation: options.instanceAfterRecreation ?? CONTAINER_C,
     containerIdUnreadable: options.containerIdUnreadable ?? false,
     // §15 of CORRECTION-06: a restart may bring the SAME image back with a
@@ -558,40 +566,62 @@ function makeFakeWorld(options = {}) {
     return live.image;
   }
 
-  function currentContainerInstanceId() {
-    live.idReads += 1;
-    if (
-      !live.recreated &&
-      env.recreateAfterIdReads !== null &&
-      live.idReads > env.recreateAfterIdReads
-    ) {
-      live.recreated = true;
-      live.containerInstanceId = env.instanceAfterRecreation;
+  /**
+   * The operator's Worker restart, as ONE atomic event (§13 of CORRECTION-08).
+   *
+   * A real restart changes the container object, the main PID, the resolved
+   * image and the bound environment together — it is not a PID change that the
+   * instance id happens to follow. Modelling it as one mutation is what lets a
+   * test assert that the watcher's endpoints are coherent, because an
+   * incoherent pairing can then only come from the harness, never from the fake.
+   */
+  function applyRestart() {
+    live.restarted = true;
+    live.pid = env.pidAfterRestart ?? 400;
+    // The unit is `docker run --rm` behind an `ExecStartPre=-docker rm -f`,
+    // so a Worker restart is a container RECREATION: a new object id.
+    live.containerInstanceId = env.instanceAfterRestart ?? CONTAINER_B;
+    if (env.imageAfterRestart) live.image = env.imageAfterRestart;
+    // The container comes back with whatever the operator left in the
+    // environment file — which may not be what it went down with.
+    if (env.ytdlpEnabledAfterRestart !== undefined) {
+      if (env.ytdlpEnabledAfterRestart === null) delete workerEnvironment.YTDLP_ENABLED;
+      else workerEnvironment.YTDLP_ENABLED = String(env.ytdlpEnabledAfterRestart);
     }
+    if (env.sitesAfterRestart) env.sites = env.sitesAfterRestart;
+  }
+
+  /** A second, UNOBSERVED recreation — the container moves again, on its own. */
+  function applyRecreation() {
+    live.recreated = true;
+    live.containerInstanceId = env.instanceAfterRecreation;
+    if (env.pidAfterRecreation !== undefined) live.pid = env.pidAfterRecreation;
+  }
+
+  /**
+   * Runtime mutations are hung off a NAMED read, so a test can place an event
+   * at an exact point in the harness's own observation sequence.
+   *
+   * Both `id` and `pid` are available as trigger points because the watcher's
+   * coherence bracket is `id -> pid -> id`: placing a restart on the PID read
+   * is precisely how §13's "race between old instance and old PID" is
+   * reproduced, and it must be impossible to express through an id-only knob.
+   */
+  function noteRuntimeRead(kind) {
+    const count = kind === "id" ? (live.idReads += 1) : (live.pidReads += 1);
+    const restartAfter = kind === "id" ? env.restartAfterIdReads : env.restartAfterPidReads;
+    const recreateAfter = kind === "id" ? env.recreateAfterIdReads : env.recreateAfterPidReads;
+    if (!live.restarted && restartAfter !== null && count > restartAfter) applyRestart();
+    if (!live.recreated && recreateAfter !== null && count > recreateAfter) applyRecreation();
+  }
+
+  function currentContainerInstanceId() {
+    noteRuntimeRead("id");
     return live.containerInstanceId;
   }
 
   function currentContainerPid() {
-    live.pidReads += 1;
-    if (
-      !live.restarted &&
-      env.restartAfterPidReads !== null &&
-      live.pidReads > env.restartAfterPidReads
-    ) {
-      live.restarted = true;
-      live.pid = 400;
-      // The unit is `docker run --rm` behind an `ExecStartPre=-docker rm -f`,
-      // so a Worker restart is a container RECREATION: a new object id.
-      live.containerInstanceId = env.instanceAfterRestart ?? CONTAINER_B;
-      if (env.imageAfterRestart) live.image = env.imageAfterRestart;
-      // The container comes back with whatever the operator left in the
-      // environment file — which may not be what it went down with.
-      if (env.ytdlpEnabledAfterRestart !== undefined) {
-        if (env.ytdlpEnabledAfterRestart === null) delete workerEnvironment.YTDLP_ENABLED;
-        else workerEnvironment.YTDLP_ENABLED = String(env.ytdlpEnabledAfterRestart);
-      }
-      if (env.sitesAfterRestart) env.sites = env.sitesAfterRestart;
-    }
+    noteRuntimeRead("pid");
     return live.pid;
   }
 
@@ -4663,8 +4693,11 @@ describe("restart recovery contract", () => {
     const world = makeFakeWorld({
       ytdlpEnabled: "true",
       sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
-      // The watcher reads the PID once for `before`; the restart lands next.
-      restartAfterPidReads: 1,
+      // Runtime reads for a shutdown case: the pre-case snapshot brackets
+      // (id 1, id 2), then the watcher's own coherence bracket (id 3, pid 1,
+      // id 4). Read 5 is its first POLL, which is where the operator's restart
+      // is placed — the watcher now polls the container INSTANCE, not the PID.
+      restartAfterIdReads: 4,
       ...worldOptions,
     });
     const run = await runCli(
@@ -4833,7 +4866,7 @@ describe("restart recovery contract", () => {
     const world = makeFakeWorld({
       ytdlpEnabled: "true",
       sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
-      restartAfterPidReads: 1,
+      restartAfterIdReads: 4,
     });
     let restarted = false;
     const run = await runCli(
@@ -5544,7 +5577,7 @@ describe("feature-state continuity", () => {
     };
     const shared = {
       ...ENABLED,
-      restartAfterPidReads: 1,
+      restartAfterIdReads: 4,
     };
     const args = ["--stage", "B", "--case", "shutdown", ...LIVE_ARGS, "--evidence", "/tmp/s.json"];
     const deps = (world) => ({
@@ -6272,7 +6305,7 @@ describe("container epoch binding", () => {
   async function runShutdownEpoch(worldOptions = {}) {
     const world = makeFakeWorld({
       ...ENABLED,
-      restartAfterPidReads: 1,
+      restartAfterIdReads: 4,
       ...worldOptions,
     });
     const run = await runCli(
@@ -6358,10 +6391,11 @@ describe("container epoch binding", () => {
   it("69d. a SECOND recreation after the observed restart BLOCKS", async () => {
     // A -> B is observed by the watcher; the Worker is then recreated as C
     // before the evidence is sealed. Image and feature state agree throughout.
-    // Reads: pre open (1), pre close (2), watcher before (3), watcher after
-    // (4), post open (5). Landing it on read 5 leaves the watcher's observed
+    // Id reads: pre snapshot (1, 2), the watcher's before bracket (3, 4), its
+    // first poll (5), its after bracket (6, 7), then the post snapshot (8, 9).
+    // Landing the extra recreation on read 8 leaves the watcher's observed
     // transition intact and moves only what is current at sealing time.
-    const { run, world } = await runShutdownEpoch({ recreateAfterIdReads: 4 });
+    const { run, world } = await runShutdownEpoch({ recreateAfterIdReads: 7 });
     assert.equal(run.code, 2, `${run.out}\n${run.err}`);
     assert.match(run.err, /RECREATED AGAIN AFTER THE OBSERVED RESTART/);
     assert.equal(run.files.has("/tmp/s.json"), false, "no record is written");
@@ -6670,6 +6704,393 @@ describe("atomic run-key creation", () => {
     assert.match(run.err, /created by another process/);
     assert.equal(files.get(RUN_KEY_PATH), winner, "the winner's file is byte-identical");
     assert.equal(files.has("/tmp/a.json"), false, "and no evidence is written");
+  });
+});
+
+
+// ── CORRECTION-08 §3-§7: the schema identifies the PRODUCER CONTRACT ──────
+
+describe("evidence producer contract version", () => {
+  const KEY = "a".repeat(64);
+  const RUN = { runId: "0123456789abcdef", key: KEY };
+  /** The identifier every artifact carried before this correction. */
+  const PREVIOUS_SCHEMA = "10c4-correction-03";
+
+  /**
+   * A Stage-A record that is perfect in EVERY respect except its schema: valid
+   * HMAC under the current run key, `PASS` verdict, current source SHA, current
+   * image binding, same acceptance run.
+   *
+   * This is the artifact the correction exists for. Stage-B case records are
+   * already refused structurally when a required field is missing, but Stage
+   * A's shape has not changed since CORRECTION-03 — so without a version bump
+   * an artifact produced by a materially weaker harness revision still
+   * satisfies `loadStageA()` and AUTHORIZES CURRENT STAGE B.
+   */
+  const stageA = (schemaVersion) =>
+    sealRecord(
+      {
+        harness: HARNESS_ID,
+        schemaVersion,
+        runId: RUN.runId,
+        task: "PHASE-10D",
+        stage: "A",
+        verdict: "PASS",
+        startedAt: "2026-09-03T00:00:00.000Z",
+        expectedSha: SHA,
+        runningImageId: IMAGE_ID,
+        taggedImageId: IMAGE_ID,
+        binding: { expectedSha: SHA, runningImageId: IMAGE_ID, taggedImageId: IMAGE_ID },
+        checks: [{ id: "image.identity", outcome: "PASS", required: true, detail: "" }],
+      },
+      KEY,
+    );
+
+  const load = (record) =>
+    loadStageA("/x", async () => JSON.stringify(record), { run: RUN, expectedSha: SHA });
+
+  it("71. the schema identifier is the final Phase-10C4 contract", () => {
+    assert.equal(EVIDENCE_SCHEMA_VERSION, "10c4-correction-08");
+    assert.notEqual(EVIDENCE_SCHEMA_VERSION, PREVIOUS_SCHEMA);
+    // ONE constant governs Stage A, case records and the aggregate, so they
+    // cannot drift into describing different producer contracts.
+    assert.equal(CASE_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION);
+  });
+
+  it("72. a VALID Stage-A artifact on the previous schema is rejected", async () => {
+    const stale = stageA(PREVIOUS_SCHEMA);
+
+    // The seal is genuinely good — the rejection is not an authenticity
+    // failure in disguise.
+    assert.equal(verifySeal(stale, KEY).ok, true, "precondition: the old artifact is authentic");
+
+    const loaded = await load(stale);
+    assert.equal(loaded.ok, false);
+    assert.match(loaded.reason, new RegExp(`${PREVIOUS_SCHEMA}.*is not.*${EVIDENCE_SCHEMA_VERSION}`));
+    assert.equal(loaded.binding, undefined, "and it authorizes nothing");
+  });
+
+  it("72b. the current Stage-A artifact is still accepted", async () => {
+    const loaded = await load(stageA(EVIDENCE_SCHEMA_VERSION));
+    assert.equal(loaded.ok, true, loaded.reason);
+    assert.equal(loaded.summary.verdict, OUTCOMES.PASS);
+    assert.equal(loaded.binding.runningImageId, IMAGE_ID);
+  });
+
+  it("72c. a valid old seal does not alter the result", async () => {
+    // Sealed under the SAME key, so both records are equally authentic. Only
+    // the producer contract differs, and only that decides.
+    for (const [schema, expected] of [[PREVIOUS_SCHEMA, false], [EVIDENCE_SCHEMA_VERSION, true]]) {
+      const record = stageA(schema);
+      assert.equal(verifySeal(record, KEY).ok, true, `${schema}: authentic`);
+      assert.equal((await load(record)).ok, expected, `${schema}: admitted`);
+    }
+    // Nor does re-sealing an old-schema record with the current key rescue it:
+    // the HMAC proves the artifact is unchanged, never which semantics made it.
+    const resealed = sealRecord({ ...stageA(PREVIOUS_SCHEMA), authenticator: undefined }, KEY);
+    delete resealed.authenticator.undefined;
+    assert.equal((await load(resealed)).ok, false);
+  });
+
+  it("73. a VALID case artifact on the previous schema is rejected", async () => {
+    const binding = { expectedSha: SHA, runningImageId: IMAGE_ID };
+    const payload = { cancellation: cancellationEvidence() };
+    const current = caseRecord({ caseName: "cancellation", binding, payload, runId: RUN.runId });
+
+    // Current: accepted.
+    assert.equal(validateCaseRecord(current, binding).ok, true);
+
+    // The SAME record on the previous schema: refused, with the seal intact.
+    const stale = sealRecord({ ...current, schemaVersion: PREVIOUS_SCHEMA }, KEY);
+    assert.equal(verifySeal(stale, KEY).ok, true, "precondition: authentic");
+    const verdict = validateCaseRecord(stale, binding);
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, new RegExp(`${PREVIOUS_SCHEMA} is not ${EVIDENCE_SCHEMA_VERSION}`));
+
+    // And `verifyRecord` refuses it on the same grounds, before any field of it
+    // is believed.
+    const verified = verifyRecord(stale, KEY, { runId: RUN.runId, expectedSha: SHA, runningImageId: IMAGE_ID });
+    assert.equal(verified.ok, false);
+    assert.match(verified.reason, /is not/);
+  });
+
+  it("73b. the live CLI stamps the current contract on everything it writes", async () => {
+    const world = makeFakeWorld({ ytdlpEnabled: "true", sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true } });
+    const run = await runCli(
+      ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+        VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+        ...WORKER_ENV,
+      }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    assert.equal(JSON.parse(run.files.get("/tmp/c.json")).schemaVersion, "10c4-correction-08");
+  });
+});
+
+// ── CORRECTION-08 §8-§13: restart endpoints are coherent observations ─────
+
+describe("restart endpoint coherence", () => {
+  const ENABLED = {
+    ytdlpEnabled: "true",
+    sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+  };
+  const epochSampler = {
+    async sample() {
+      return {
+        sample: [
+          { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: "net:[4026532001]" },
+          { pid: 200, ppid: 100, pgid: 200, comm: "python3", netns: "net:[4026532001]" },
+        ],
+        workerPid: 100,
+        ytdlpPid: 200,
+        expectedNetns: "net:[4026532001]",
+      };
+    },
+  };
+
+  async function runShutdown(worldOptions = {}) {
+    const world = makeFakeWorld({ ...ENABLED, restartAfterIdReads: 4, ...worldOptions });
+    const run = await runCli(
+      ["--stage", "B", "--case", "shutdown", ...LIVE_ARGS, "--evidence", "/tmp/s.json"],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+        ...WORKER_ENV,
+      }),
+      {
+        runReadOnly: world.runReadOnly,
+        fetch: world.fetch,
+        files: seedRun(),
+        sampler: epochSampler,
+        shutdownWindowMs: 2000,
+        recoveryWindowMs: 2000,
+      },
+    );
+    return { run, world };
+  }
+
+  /** A system stub whose two runtime observers can be driven independently. */
+  function fakeSystem(script) {
+    let idCall = 0;
+    let pidCall = 0;
+    return {
+      async containerInstanceId() {
+        const value = script.ids[Math.min(idCall++, script.ids.length - 1)];
+        return value === null
+          ? { measured: false, reason: "the container is not running" }
+          : { measured: true, value };
+      },
+      async containerPid() {
+        const value = script.pids[Math.min(pidCall++, script.pids.length - 1)];
+        return value === null
+          ? { measured: false, reason: "the container is not running" }
+          : { measured: true, value };
+      },
+    };
+  }
+
+  it("74. a coherent runtime observation brackets the PID with one instance", async () => {
+    const observed = await observeRuntimeEpoch(
+      fakeSystem({ ids: [CONTAINER_A, CONTAINER_A], pids: [100] }),
+    );
+    assert.deepEqual(observed, { ok: true, instanceId: CONTAINER_A, pid: 100 });
+  });
+
+  /**
+   * §13, "race between old instance and old PID".
+   *
+   * The instance is read as A, the container is recreated, and the PID read
+   * belongs to B. The pairing `container A had PID <B's pid>` describes no
+   * container that ever existed.
+   */
+  it("74b. an instance that moves INSIDE the bracket is ambiguous, never paired", async () => {
+    const observed = await observeRuntimeEpoch(
+      fakeSystem({ ids: [CONTAINER_A, CONTAINER_B], pids: [400] }),
+    );
+    assert.equal(observed.ok, false);
+    assert.match(observed.reason, /recreated while its runtime was being observed/);
+    assert.equal(observed.instanceId, undefined, "no instance is reported");
+    assert.equal(observed.pid, undefined, "and no PID is attributed to one");
+  });
+
+  it("74c. an unmeasurable read at any point in the bracket is a failure", async () => {
+    const cases = [
+      ["opening instance", { ids: [null], pids: [100] }, /could not be identified/],
+      ["the PID", { ids: [CONTAINER_A], pids: [null] }, /could not be read/],
+      ["closing instance", { ids: [CONTAINER_A, null], pids: [100] }, /could not be re-checked/],
+    ];
+    for (const [what, script, pattern] of cases) {
+      const observed = await observeRuntimeEpoch(fakeSystem(script));
+      assert.equal(observed.ok, false, what);
+      assert.match(observed.reason, pattern, what);
+    }
+  });
+
+  it("75. the watcher records the transition it actually observed", async () => {
+    const { run } = await runShutdown();
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const payload = JSON.parse(run.files.get("/tmp/s.json")).payload.shutdownCase;
+    assert.equal(payload.previousContainerInstanceId, CONTAINER_A);
+    assert.equal(payload.currentContainerInstanceId, CONTAINER_B);
+    // The PIDs are auxiliary, and each belongs to the instance beside it.
+    assert.equal(payload.previousContainerPid, 100);
+    assert.equal(payload.currentContainerPid, 400);
+  });
+
+  /**
+   * §13, "same PID value on different instance" — the regression that makes the
+   * instance the AUTHORITY rather than the PID.
+   *
+   * PIDs are not unique across container objects. Under PID-primary polling a
+   * recreated Worker whose main process receives the same pid was INVISIBLE:
+   * the watcher compared 100 to 100, saw no change, and timed out reporting
+   * that no restart had happened while one plainly had.
+   */
+  it("76. PID REUSE cannot hide a container recreation", async () => {
+    const { run } = await runShutdown({ pidAfterRestart: 100 });
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const record = JSON.parse(run.files.get("/tmp/s.json"));
+    const payload = record.payload.shutdownCase;
+
+    assert.equal(payload.previousContainerPid, 100);
+    assert.equal(payload.currentContainerPid, 100, "the PID genuinely did not change");
+    assert.notEqual(
+      payload.previousContainerInstanceId,
+      payload.currentContainerInstanceId,
+      "and the recreation is still observed",
+    );
+    assert.equal(payload.restartObserved, true);
+    assert.deepEqual(record.containerEpoch, {
+      mode: "one-restart",
+      before: CONTAINER_A,
+      restartFrom: CONTAINER_A,
+      restartTo: CONTAINER_B,
+      after: CONTAINER_B,
+    });
+  });
+
+  /**
+   * §13, "race around the new endpoint".
+   *
+   * The poll glimpses B, and the container becomes C before the endpoint can be
+   * observed coherently. The endpoint must not be sealed as B carrying C's PID.
+   */
+  it("77. a moving new endpoint is never sealed as a stale instance", async () => {
+    // Id reads: pre snapshot (1, 2), before bracket (3, 4), poll (5) sees B,
+    // after bracket (6, 7). The second recreation lands on read 6, so the
+    // endpoint bracket resolves entirely against C.
+    const { run } = await runShutdown({
+      recreateAfterIdReads: 5,
+      instanceAfterRecreation: CONTAINER_C,
+      pidAfterRecreation: 900,
+    });
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const record = JSON.parse(run.files.get("/tmp/s.json"));
+    const payload = record.payload.shutdownCase;
+
+    // The endpoint is the instance that was COHERENTLY observed, with its own
+    // PID. B is a glimpse the harness cannot vouch for, and it appears nowhere.
+    assert.equal(payload.currentContainerInstanceId, CONTAINER_C);
+    assert.equal(payload.currentContainerPid, 900);
+    assert.doesNotMatch(JSON.stringify(record), new RegExp(CONTAINER_B), "B is never recorded");
+    assert.doesNotMatch(
+      JSON.stringify(payload),
+      /"currentContainerPid":\s*400/,
+      "and B's PID is never attributed to any instance",
+    );
+    assert.equal(record.containerEpoch.restartTo, CONTAINER_C);
+    assert.equal(record.containerEpoch.after, CONTAINER_C);
+  });
+
+  it("77b. an endpoint that never settles is a measurement failure", async () => {
+    // The container is recreated on EVERY id read, so no bracket can ever close
+    // on one instance. Bounded retries, then BLOCKED — never a pairing accepted
+    // on the last attempt.
+    let ids = 0;
+    const world = makeFakeWorld(ENABLED);
+    const run = await runCli(
+      ["--stage", "B", "--case", "shutdown", ...LIVE_ARGS, "--evidence", "/tmp/s.json"],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+        ...WORKER_ENV,
+      }),
+      {
+        runReadOnly: async (file, argv) => {
+          if (file === "docker" && argv[0] === "inspect" && argv.join(" ").includes("{{.Id}}")) {
+            // A fresh, valid, DIFFERENT instance every single time.
+            ids += 1;
+            return { exitCode: 0, stdout: `${ids.toString(16).padStart(64, "0")}\n`, stderr: "" };
+          }
+          return world.runReadOnly(file, argv);
+        },
+        fetch: world.fetch,
+        files: seedRun(),
+        sampler: epochSampler,
+        shutdownWindowMs: 2000,
+        recoveryWindowMs: 2000,
+      },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.equal(run.files.has("/tmp/s.json"), false, "no record is written");
+  });
+
+  it("78. an additional observed recreation after the transition still BLOCKS", async () => {
+    // Unchanged CORRECTION-07 behaviour: the outer bracketed snapshots catch a
+    // recreation that lands after the watcher's accepted transition.
+    const { run, world } = await runShutdown({ recreateAfterIdReads: 7 });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /RECREATED AGAIN AFTER THE OBSERVED RESTART/);
+    assert.equal(run.files.has("/tmp/s.json"), false);
+    assert.equal(world.live.image, IMAGE_ID, "the image never moved");
+  });
+
+  /**
+   * §13, "race between old instance and old PID", in full.
+   *
+   * The restart lands on the FIRST PID read — inside the watcher's
+   * `id -> pid -> id` bracket — so a sequential reader would record
+   * `container A had PID 400`, a pairing describing no container that ever
+   * existed. A second recreation then gives the watcher a transition to
+   * observe, which is what makes the recorded old endpoint visible.
+   *
+   * Id reads: pre snapshot (1, 2); bracket attempt 1 (3 = A, then PID → the
+   * restart, then 4 = B → AMBIGUOUS); retry (5, 6 = B → coherent); poll (7).
+   */
+  it("79. a restart inside the before-bracket cannot pair A with B's PID", async () => {
+    const { run } = await runShutdown({
+      restartAfterIdReads: null,
+      restartAfterPidReads: 0,
+      recreateAfterIdReads: 6,
+      instanceAfterRecreation: CONTAINER_C,
+      pidAfterRecreation: 900,
+    });
+
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.equal(run.files.has("/tmp/s.json"), false, "no record is written");
+
+    // THE PROOF. The bracket retried and settled coherently on B, so the
+    // watcher's old endpoint is B — not A, and never A carrying B's PID. The
+    // outer epoch check then catches that the case did not BEGIN in that epoch,
+    // which is the honest description of what happened.
+    assert.match(
+      run.err,
+      /the container instance the case began on is not the instance the observed restart replaced/,
+    );
+    assert.match(run.err, /an unobserved recreation happened before the transition/);
+    assert.doesNotMatch(run.out, /case evidence written/);
+  });
+
+  it("79b. an ambiguous bracket that never settles times out rather than pairing", async () => {
+    // The same opening race, with no second transition to observe. The watcher
+    // retries, settles on B, and finds no further change — so it reports that
+    // no restart was observed rather than inventing the A -> B one it never saw
+    // coherently from A's side.
+    const { run } = await runShutdown({ restartAfterIdReads: null, restartAfterPidReads: 0 });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /no Worker restart was observed/);
+    assert.equal(run.files.has("/tmp/s.json"), false);
   });
 });
 

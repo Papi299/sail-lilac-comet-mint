@@ -33,11 +33,58 @@ import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 /**
- * Bumped by CORRECTION-03: the authenticated material changed from a named
- * subset to the whole record, so artifacts from the previous schema are not
- * interchangeable with these and must not be silently accepted.
+ * The ACCEPTANCE PRODUCER CONTRACT this harness implements — not merely the set
+ * of JSON keys its records carry (§3-§7 of CORRECTION-08).
+ *
+ * ── What a valid seal does and does not prove ──────────────────────────────
+ *
+ * A valid HMAC proves only:
+ *
+ *     this artifact has not changed since somebody holding this run key
+ *     produced it
+ *
+ * It says nothing about WHICH revision of the harness's observation semantics
+ * produced the contents it authenticates. That is this constant's job, and it
+ * is the only field that can do it.
+ *
+ * ── Why it had to move, even though the JSON shape did not ─────────────────
+ *
+ * Stage B case records are rejected structurally when a required field is
+ * absent, so an older case artifact cannot pass today's `validateCaseRecord`.
+ * STAGE A IS DIFFERENT. Its record's shape has not changed since
+ * CORRECTION-03, so an artifact produced by an older harness revision could
+ * carry the same runId, the same key, the same source SHA, the same image
+ * binding, a `PASS` verdict and this exact identifier — and therefore still
+ * satisfy `loadStageA()` and AUTHORIZE CURRENT STAGE B.
+ *
+ * What that artifact would actually attest is much weaker, because the
+ * semantics behind those same fields have changed materially since:
+ *
+ *   CORRECTION-04  effective deployed MAX_FILE_SIZE; closed deny-class enum;
+ *                  fail-closed host process parsing; state-neutral aggregation
+ *   CORRECTION-05  narrow secret-safe environment probes (the previous Stage A
+ *                  retrieved the COMPLETE environment, values and all);
+ *                  image continuity; deterministic restart recovery
+ *   CORRECTION-06  positive findings outranking observation gaps; the exact
+ *                  `docker top` argv boundary; feature-state continuity
+ *   CORRECTION-07  raw evidence validated before normalization; successful exit
+ *                  required before stdout is a measurement; container-epoch
+ *                  continuity; type-strict run identity; atomic key creation
+ *
+ * A Stage A `PASS` from before those is not the Stage A `PASS` this harness
+ * means, and nothing in the record itself distinguishes them.
+ *
+ * ── When to bump it again ──────────────────────────────────────────────────
+ *
+ * Whenever an observer or evaluator change could make an OLD artifact mean
+ * something WEAKER under the same shape. A field added or removed is the
+ * obvious case; a field whose measurement became stricter is the case that
+ * matters, because nothing else catches it.
+ *
+ * No live artifact compatibility is being broken: Phase 10D has not run, so no
+ * acceptance artifact exists anywhere that this invalidates.
  */
-export const EVIDENCE_SCHEMA_VERSION = "10c4-correction-03";
+export const EVIDENCE_SCHEMA_VERSION = "10c4-correction-08";
 export const HARNESS_ID = "deploy/acceptance/ytdlp-generic/acceptance.mjs";
 export const AUTHENTICATOR_ALG = "HMAC-SHA256";
 

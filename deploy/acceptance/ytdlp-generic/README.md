@@ -329,6 +329,46 @@ local can be. It is a defence against an artifact being **edited**, **mixed
 between runs**, or **carried over from a different image** without anyone
 noticing.
 
+### `schemaVersion` identifies the producer contract
+
+**`schemaVersion` names the acceptance producer contract, not merely the set of
+JSON keys.** It is the current value or the artifact is refused.
+
+A valid HMAC proves exactly one thing:
+
+```
+this artifact has not changed since somebody holding this run key produced it
+```
+
+It says nothing about *which revision of the harness's observation semantics*
+produced the contents it authenticates. That is the schema version's job, and it
+is the only field that can do it.
+
+**Why that matters most for Stage A.** A Stage B case record is already refused
+structurally when a required field is absent, so an older case artifact cannot
+pass today's validator. Stage A's record *shape* has not changed since
+`10c4-correction-03` — so without a version bump an artifact produced by a much
+weaker harness revision could carry the same `runId`, the same key, the same
+source SHA, the same image binding and a `PASS` verdict, satisfy `loadStageA()`,
+and **authorize current Stage B**. What it actually attested would be far less:
+
+| Since | The same fields came to mean |
+| :--- | :--- |
+| CORRECTION-04 | effective deployed `MAX_FILE_SIZE`; closed deny-class enum; fail-closed host process parsing; state-neutral aggregation |
+| CORRECTION-05 | narrow secret-safe environment probes — the older Stage A retrieved the **complete** environment, values and all; image continuity; deterministic restart recovery |
+| CORRECTION-06 | positive findings outranking observation gaps; the exact `docker top` argv boundary; feature-state continuity |
+| CORRECTION-07 | raw evidence validated before normalization; successful exit required before stdout is a measurement; container-epoch continuity; type-strict run identity; atomic key creation |
+
+**Bump it whenever an observer or evaluator change could make an old artifact
+mean something *weaker* under the same shape.** A field added or removed is the
+obvious case; a field whose *measurement* became stricter is the case that
+matters, because nothing else catches it.
+
+One constant governs Stage A, case records and the aggregate, so they cannot
+drift into describing different contracts. No live artifact compatibility is
+broken by this: Phase 10D has not run, so no acceptance artifact exists anywhere
+that it invalidates.
+
 
 `--stage B --aggregate` admits a case record only if:
 
@@ -1072,13 +1112,13 @@ require before == after
 | a different instance after | `BLOCKED — THE WORKER CONTAINER WAS RECREATED DURING THE CASE`, no record |
 | the instance cannot be identified | `BLOCKED`, no record |
 
-### `shutdown`: exactly one pinned transition
+### `shutdown`: one pinned observed transition
 
 `shutdown` exists to span an operator stop/restart, so one recreation is
 intentional — and it is **pinned end to end** rather than merely permitted:
 
 ```
-preCase instance      ==  the instance the restart watcher saw go away
+preCase instance      ==  the restart watcher's recorded old instance
 restart new instance  !=  restart old instance
 postCase instance     ==  the restart's new instance
 ```
@@ -1094,6 +1134,39 @@ postCase instance     ==  the restart's new instance
 The transition the epoch pins must be the transition the case's **own** restart
 evidence reports; two internally disagreeing copies of one observation are
 refused rather than resolved in either direction.
+
+### The restart watcher: the instance is the authority
+
+The watcher polls the **container object id**, not the PID. Polling the PID was
+wrong in both directions:
+
+- **False negatives.** PIDs are not unique across container objects. A recreated
+  Worker whose main process happens to receive the *same* pid was invisible to a
+  PID comparison — the watcher timed out and reported that no restart occurred
+  while one plainly had.
+- **Incoherent endpoints.** The instance ids were sampled *around* the PID
+  change rather than *with* it, so a transition recorded as `A → C` could be
+  assembled from an A instance read that preceded a PID from B, and a later PID
+  change that preceded a C instance read. None of those three observations was
+  of the same runtime.
+
+Each endpoint is therefore a **coherent runtime observation**, bracketed the same
+way the deployment snapshot is:
+
+```
+containerInstanceId          ← open
+containerPid
+containerInstanceId          ← close; must equal the open value
+```
+
+If the instance moves inside the bracket the observation is **ambiguous** — not
+"probably A". It is retried a bounded number of times, and exhaustion is a
+measurement failure, never a pairing accepted on the last attempt. The record can
+only ever say *container A had PID X* when one observation established both.
+
+The PID stays in the evidence as auxiliary diagnostic data, bound to the instance
+it was actually read from. It is never the authority for which transition
+occurred.
 
 ### The deployment snapshot
 
@@ -1121,8 +1194,16 @@ evidence language says only what is true:
 
 - for an ordinary case — *the same container epoch surrounded the producer, and
   no recreation was observed within it*;
-- for `shutdown` — *the one observed restart ran from the recorded old instance
-  to the recorded new instance, which remained current through sealing*.
+- for `shutdown` — *the watcher observed the deployment transition from the
+  recorded old container epoch to the recorded new container epoch, and that
+  epoch remained current through final evidence sealing*.
+
+Polling does **not** prove that no transient intermediate container existed
+between two polls, and nothing here says it does. An additional recreation that
+*is* observed — the endpoint moving again before sealing — is `BLOCKED`. Proving
+the stronger *"exactly one restart occurred in all possible instants"* would
+require a continuous Docker event observer, which this harness does not have and
+does not claim.
 
 The **image** binding remains what ties the evidence to reviewed code. The epoch
 only bounds the interval that evidence describes. A container id is non-secret —
