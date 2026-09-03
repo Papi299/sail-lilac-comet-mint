@@ -96,6 +96,7 @@ const SELECTIONS = {
     container: "mp4" as const,
     hasVideo: true,
     hasAudio: true,
+    videoConstraint: "codec-present" as const,
     fileSize: null,
   },
 };

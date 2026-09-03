@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   GENERIC_AUDIO_SOURCE_CONTAINERS,
   GENERIC_FORMAT_SELECTOR_ATOM,
+  GENERIC_VIDEO_CONSTRAINTS,
   GENERIC_SOURCE_PROTOCOLS,
   GENERIC_VIDEO_SOURCE_CONTAINERS,
   GenericSourceSelectionSchema,
@@ -28,7 +29,23 @@ const MUXED: GenericSourceSelection = {
   container: "mp4",
   hasVideo: true,
   hasAudio: true,
+  videoConstraint: "codec-present",
   fileSize: 1024,
+};
+
+/**
+ * The REAL pinned Generic HTML5 shape: a muxed mp4 whose video codec identity
+ * the extractor never reported. See `ytdlp-analysis.server.test.ts` for the
+ * captured document this mirrors.
+ */
+const UNKNOWN_VIDEO: GenericSourceSelection = {
+  formatId: "0",
+  protocol: "https",
+  container: "mp4",
+  hasVideo: true,
+  hasAudio: true,
+  videoConstraint: "video-ext",
+  fileSize: null,
 };
 
 describe("generic source: safe raw format id grammar (§11)", () => {
@@ -195,6 +212,7 @@ describe("generic source: format selector construction (§12/§13/§14)", () => 
         container: "m4a",
         hasVideo: false,
         hasAudio: true,
+        videoConstraint: "absent",
         fileSize: null,
       }),
       'b*[format_id="140"][protocol="https"][ext="m4a"][vcodec="none"][acodec!="none"]',
@@ -227,7 +245,8 @@ describe("generic source: format selector construction (§12/§13/§14)", () => 
   it("never emits a choice, merge or list operator", () => {
     for (const shape of [
       MUXED,
-      { ...MUXED, hasVideo: false, container: "m4a" as const },
+      UNKNOWN_VIDEO,
+      { ...MUXED, hasVideo: false, container: "m4a" as const, videoConstraint: "absent" as const },
       { ...MUXED, hasAudio: false },
     ]) {
       const selector = buildGenericFormatSelector(shape);
@@ -255,6 +274,7 @@ describe("generic source: format selector construction (§12/§13/§14)", () => 
       ...MUXED,
       container: "m4a",
       hasVideo: false,
+      videoConstraint: "absent",
     });
     assert.match(audioOnly, /\[vcodec="none"\]/);
     assert.match(audioOnly, /\[acodec!="none"\]/);
@@ -280,7 +300,277 @@ describe("generic source: format selector construction (§12/§13/§14)", () => 
     // Whole-expression assertion: whatever the inputs, the emitted string is
     // built only from the atom, bracket/quote delimiters, known keys, and
     // grammar-checked values.
+    for (const shape of [MUXED, UNKNOWN_VIDEO]) {
+      const selector = buildGenericFormatSelector(shape);
+      assert.match(selector, /^b\*(\[[a-z_]+(?:!=\?|!=|=)"[A-Za-z0-9._-]{1,128}"\])+$/);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE-10D-GENERIC-REAL-OUTPUT-COMPATIBILITY-001 — §16/§28
+//
+// Analysis and acquisition are ONE contract. It is not enough for analysis to
+// advertise a preset: the exact format it approved must still be selectable by
+// the constrained acquisition subprocess. Before this correction the Generic
+// HTML5 format that analysis (now) accepts was REJECTED by the selector, and
+// the job would have failed FORMAT_UNAVAILABLE after the user chose a preset.
+//
+// These tests therefore evaluate the built selector against format documents,
+// not against expected strings.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A yt-dlp format document as the pinned runtime would hand it to a filter. */
+type PinnedFormat = Record<string, string | null | undefined>;
+
+/**
+ * A faithful model of yt-dlp 2026.08.19's `_build_format_filter` predicate,
+ * restricted to the closed grammar this module actually emits.
+ *
+ * The whole point is the `None` branch. Verbatim from the pinned release:
+ *
+ *     def _filter(f):
+ *         actual_value = f.get(m.group('key'))
+ *         if actual_value is None:
+ *             return m.group('none_inclusive')
+ *         return op(actual_value, comparison_value)
+ *
+ * A field that is Python `None` — a missing key or an explicit null — never
+ * reaches the operator. It matches ONLY when the filter carried the
+ * none-inclusive `?`, whose position the string-operator regex fixes as
+ * `key` `!`? `op` `?`? `value`.
+ *
+ * This model was checked against the real pinned artifact: `[vcodec!="none"]`
+ * does not select a `vcodec: null` format, `[vcodec!=?"none"]` does, and
+ * neither selects a `vcodec: "none"` one. `deploy/acceptance/ytdlp-generic/
+ * verify-selector.py` re-proves the same expectations inside the Worker image
+ * against the actual binary; this exists so the contract is also covered by the
+ * ordinary unit suite, which runs everywhere and on every change.
+ */
+function selectsFormat(selector: string, format: PinnedFormat): boolean {
+  assert.ok(selector.startsWith(GENERIC_FORMAT_SELECTOR_ATOM), "selector must open with the atom");
+  const body = selector.slice(GENERIC_FORMAT_SELECTOR_ATOM.length);
+
+  const FILTER = /\[([a-z_]+)(!?)=(\??)"([A-Za-z0-9._-]+)"\]/g;
+  const matches = [...body.matchAll(FILTER)];
+  // Totality: every character of the emitted expression must be accounted for,
+  // so a future selector change cannot slip past this model unnoticed.
+  assert.equal(
+    matches.map((m) => m[0]).join(""),
+    body,
+    "the model must parse the whole selector, not part of it",
+  );
+  assert.ok(matches.length > 0, "a selector with no filters would bind nothing");
+
+  return matches.every(([, key, negation, noneInclusive, value]) => {
+    const actual = format[key!];
+    if (actual === null || actual === undefined) return noneInclusive === "?";
+    return negation === "!" ? actual !== value : actual === value;
+  });
+}
+
+describe("unknown-codec video selection against pinned filter semantics (§16/§28)", () => {
+  const selector = buildGenericFormatSelector(UNKNOWN_VIDEO);
+
+  /** The format the pinned runtime actually produces for the fixture page. */
+  const REAL: PinnedFormat = {
+    format_id: "0",
+    protocol: "https",
+    ext: "mp4",
+    vcodec: null,
+    acodec: "mp4a.40.2",
+    video_ext: "mp4",
+    audio_ext: "none",
+  };
+
+  it("MUST match the exact format analysis approved", () => {
+    assert.equal(
+      selectsFormat(selector, REAL),
+      true,
+      "analysis accepting a format acquisition then rejects is still a defect",
+    );
+  });
+
+  it("MAY match once the codec becomes known, with the same approved shape", () => {
+    // Re-extraction giving MORE specific video information is not a change of
+    // source shape, so it must not fail the job (§19).
+    assert.equal(selectsFormat(selector, { ...REAL, vcodec: "avc1.42E01E" }), true);
+  });
+
+  it("MUST reject an explicitly absent video stream", () => {
+    assert.equal(
+      selectsFormat(selector, { ...REAL, vcodec: "none" }),
+      false,
+      "a source that became audio-only must never be silently substituted",
+    );
+  });
+
+  it("MUST reject a video_ext that no longer names the approved container", () => {
+    for (const video_ext of ["none", "webm", "m4a"]) {
+      assert.equal(selectsFormat(selector, { ...REAL, video_ext }), false, video_ext);
+    }
+    // An absent video_ext is not the approved evidence either: the filter is
+    // the plain `=` form, so a null field matches nothing.
+    assert.equal(selectsFormat(selector, { ...REAL, video_ext: null }), false);
+  });
+
+  it("MUST reject a changed id, protocol, container or audio shape", () => {
+    assert.equal(selectsFormat(selector, { ...REAL, format_id: "1" }), false);
+    assert.equal(selectsFormat(selector, { ...REAL, protocol: "http" }), false);
+    assert.equal(selectsFormat(selector, { ...REAL, ext: "webm" }), false);
+    assert.equal(selectsFormat(selector, { ...REAL, acodec: "none" }), false);
+    assert.equal(selectsFormat(selector, { ...REAL, acodec: null }), false);
+  });
+
+  it("SELECTOR MUTATION: dropping the none-inclusive marker breaks acquisition", () => {
+    // The precise defect this correction exists to close. The strict form is
+    // what the merged code emitted for every video source.
+    const strict = selector.replace('[vcodec!=?"none"]', '[vcodec!="none"]');
+    assert.notEqual(strict, selector, "the selector must actually carry the marker");
+    assert.equal(
+      selectsFormat(strict, REAL),
+      false,
+      "the strict form cannot select the real pinned format — that WAS the bug",
+    );
+  });
+
+  it("SELECTOR MUTATION: weakening it so vcodec='none' matches must fail", () => {
+    // If the video constraint were dropped altogether, an audio-only rendition
+    // sharing the id would satisfy the rest of the expression.
+    const weakened = selector.replace('[vcodec!=?"none"]', "");
+    assert.equal(
+      selectsFormat(weakened, { ...REAL, vcodec: "none" }),
+      true,
+      "a weakened selector really does admit the absent-video format",
+    );
+    assert.equal(
+      selectsFormat(selector, { ...REAL, vcodec: "none" }),
+      false,
+      "the shipped selector must not",
+    );
+  });
+});
+
+describe("known and absent video selection stay strict (§14/§15/§28)", () => {
+  it("a KNOWN video codec keeps the strict constraint", () => {
     const selector = buildGenericFormatSelector(MUXED);
-    assert.match(selector, /^b\*(\[[a-z_]+!?="[A-Za-z0-9._-]{1,128}"\])+$/);
+    assert.match(selector, /\[vcodec!="none"\]/);
+    assert.doesNotMatch(selector, /\[vcodec!=\?"none"\]/, "known video is not weakened");
+    assert.doesNotMatch(selector, /video_ext/, "no video_ext binding is added to the known case");
+
+    const base: PinnedFormat = {
+      format_id: "22", protocol: "https", ext: "mp4",
+      vcodec: "avc1.640028", acodec: "mp4a.40.2",
+    };
+    assert.equal(selectsFormat(selector, base), true);
+    assert.equal(selectsFormat(selector, { ...base, vcodec: "none" }), false);
+    // A source that LOST its codec identity is no longer the approved shape.
+    assert.equal(selectsFormat(selector, { ...base, vcodec: null }), false);
+  });
+
+  it("proven ABSENT video keeps requiring absence", () => {
+    const selector = buildGenericFormatSelector({
+      formatId: "140", protocol: "https", container: "m4a",
+      hasVideo: false, hasAudio: true, videoConstraint: "absent", fileSize: null,
+    });
+    const base: PinnedFormat = {
+      format_id: "140", protocol: "https", ext: "m4a",
+      vcodec: "none", acodec: "mp4a.40.2",
+    };
+    assert.equal(selectsFormat(selector, base), true);
+    assert.equal(
+      selectsFormat(selector, { ...base, vcodec: "avc1.640028" }),
+      false,
+      "a format that gained video must not silently match an audio-only approval",
+    );
+    assert.equal(selectsFormat(selector, { ...base, vcodec: null }), false);
+  });
+});
+
+describe("audio selection uses acodec, never audio_ext (§17)", () => {
+  it("no generic selector ever constrains audio_ext", () => {
+    for (const shape of [
+      MUXED,
+      UNKNOWN_VIDEO,
+      { ...MUXED, hasAudio: false },
+      {
+        formatId: "140", protocol: "https" as const, container: "m4a" as const,
+        hasVideo: false, hasAudio: true, videoConstraint: "absent" as const, fileSize: null,
+      },
+    ]) {
+      assert.doesNotMatch(
+        buildGenericFormatSelector(shape),
+        /audio_ext/,
+        "`_fill_sorting_fields` sets audio_ext='none' on every video-bearing " +
+          "format, so binding it would match nothing for a real muxed source",
+      );
+    }
+  });
+
+  it("audio_ext='none' on a real muxed format does not prevent selection", () => {
+    // The D1 defect, at the acquisition end.
+    assert.equal(
+      selectsFormat(buildGenericFormatSelector(UNKNOWN_VIDEO), {
+        format_id: "0", protocol: "https", ext: "mp4",
+        vcodec: null, acodec: "mp4a.40.2", video_ext: "mp4", audio_ext: "none",
+      }),
+      true,
+    );
+  });
+});
+
+describe("private selection consistency rules (§12)", () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["hasVideo=false with codec-present", { hasVideo: false, videoConstraint: "codec-present" }],
+    ["hasVideo=false with video-ext", { hasVideo: false, videoConstraint: "video-ext" }],
+    ["hasVideo=true with absent", { hasVideo: true, videoConstraint: "absent" }],
+  ];
+  for (const [label, override] of cases) {
+    it(`rejects ${label}`, () => {
+      assert.equal(GenericSourceSelectionSchema.safeParse({ ...MUXED, ...override }).success, false);
+    });
+  }
+
+  it("rejects an unknown constraint value, including 'unknown' itself", () => {
+    for (const videoConstraint of ["unknown", "codec_present", "videoExt", "", null, undefined]) {
+      assert.equal(
+        GenericSourceSelectionSchema.safeParse({ ...MUXED, videoConstraint }).success,
+        false,
+        String(videoConstraint),
+      );
+    }
+    assert.deepEqual([...GENERIC_VIDEO_CONSTRAINTS], ["codec-present", "video-ext", "absent"]);
+  });
+
+  it("rejects a video-bearing selection carrying an audio-only container", () => {
+    for (const container of ["m4a", "mp3", "ogg", "opus", "aac", "flac", "wav"]) {
+      assert.equal(
+        GenericSourceSelectionSchema.safeParse({ ...UNKNOWN_VIDEO, container }).success,
+        false,
+        container,
+      );
+    }
+  });
+
+  it("rejects a selection that carries neither stream", () => {
+    assert.equal(
+      GenericSourceSelectionSchema.safeParse({
+        ...MUXED, container: "m4a", hasVideo: false, hasAudio: false, videoConstraint: "absent",
+      }).success,
+      false,
+    );
+  });
+
+  it("accepts the three coherent shapes", () => {
+    for (const shape of [
+      MUXED,
+      UNKNOWN_VIDEO,
+      {
+        formatId: "140", protocol: "https" as const, container: "m4a" as const,
+        hasVideo: false, hasAudio: true, videoConstraint: "absent" as const, fileSize: null,
+      },
+    ]) {
+      assert.equal(GenericSourceSelectionSchema.safeParse(shape).success, true);
+    }
   });
 });

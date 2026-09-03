@@ -145,6 +145,47 @@ export function toGenericSourceContainer(
   return parsed.success ? parsed.data : null;
 }
 
+// ── How video presence was established (§11) ─────────────────────────────────
+
+/**
+ * The closed set of ways generic analysis may establish that a source carries
+ * video — and therefore the closed set of acquisition constraints that can
+ * re-select it.
+ *
+ * This exists because `hasVideo: true` alone is NOT enough to rebuild the
+ * selector. Pinned yt-dlp 2026.08.19 reports two materially different
+ * video-bearing shapes, and one strict filter cannot serve both:
+ *
+ *   `codec-present`  the extractor named a real video codec. The strongest
+ *                    evidence there is, and the only one that may be bound
+ *                    with the strict `[vcodec!="none"]` constraint.
+ *
+ *   `video-ext`      the extractor reported NO codec identity (`vcodec: null`)
+ *                    but did report a coherent normalized source shape:
+ *                    `video_ext` is a real container, equals `ext`, and that
+ *                    container is in the generic VIDEO allowlist. This is the
+ *                    plain HTML5 `<video><source>` case, where
+ *                    `_parse_html5_media_entries` builds the plain-media dict
+ *                    with `'vcodec': None` and then `f.update(formats[0])`
+ *                    overwrites whatever the `type=` attribute had parsed.
+ *
+ *   `absent`         the extractor said `vcodec == "none"` — video is proven
+ *                    ABSENT, not merely unknown.
+ *
+ * `unknown` is deliberately NOT a member. A source whose video shape cannot be
+ * established as one of the three above is not executable at all: there is no
+ * closed selector that could honestly re-select it, so analysis must refuse it
+ * rather than advertise a preset acquisition would fail on (§49).
+ */
+export const GENERIC_VIDEO_CONSTRAINTS = Object.freeze([
+  "codec-present",
+  "video-ext",
+  "absent",
+] as const);
+
+export const GenericVideoConstraintSchema = z.enum(GENERIC_VIDEO_CONSTRAINTS);
+export type GenericVideoConstraint = z.infer<typeof GenericVideoConstraintSchema>;
+
 // ── The private execution source descriptor ──────────────────────────────────
 
 /**
@@ -165,10 +206,56 @@ export const GenericSourceSelectionSchema = z
     container: GenericSourceContainerSchema,
     hasVideo: z.boolean(),
     hasAudio: z.boolean(),
+    /**
+     * HOW video presence was established, so acquisition can rebuild the exact
+     * constraint analysis approved rather than assuming every video source can
+     * be bound with `[vcodec!="none"]` (§11/§16).
+     *
+     * This is an application-owned closed enum. It never carries, encodes or
+     * paraphrases the upstream codec string, and it is private to exactly the
+     * same extent the rest of this structure is.
+     */
+    videoConstraint: GenericVideoConstraintSchema,
     /** Known upstream size, when the extractor reported one. Never trusted alone. */
     fileSize: z.number().int().positive().nullable(),
   })
-  .strict();
+  .strict()
+  .superRefine((selection, ctx) => {
+    // §12: the two video fields are one fact stated twice, so they may never
+    // disagree. A runtime check rather than a comment, because a drifting pair
+    // is exactly how a selector stops describing the source it approved.
+    const claimsVideo = selection.videoConstraint !== "absent";
+    if (selection.hasVideo !== claimsVideo) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["videoConstraint"],
+        message: "hasVideo must agree with videoConstraint",
+      });
+    }
+
+    // A video-bearing source's container must be one this product can actually
+    // deliver verbatim; an absent-video source's must be an audio container.
+    // Both mirror `toGenericSourceContainer`, which is what produced the value.
+    const allowed = claimsVideo
+      ? (GENERIC_VIDEO_SOURCE_CONTAINERS as readonly string[])
+      : (GENERIC_AUDIO_SOURCE_CONTAINERS as readonly string[]);
+    if (!allowed.includes(selection.container)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["container"],
+        message: "container is not allowed for this stream shape",
+      });
+    }
+
+    // A descriptor carrying neither stream describes nothing acquirable.
+    if (!selection.hasVideo && !selection.hasAudio) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["hasAudio"],
+        message: "a selection must carry video, audio, or both",
+      });
+    }
+  });
 
 export type GenericSourceSelection = z.infer<typeof GenericSourceSelectionSchema>;
 
@@ -265,11 +352,58 @@ export function buildGenericFormatSelector(selection: GenericSourceSelection): s
     `[format_id=${quoteFilterValue(parsed.formatId)}]`,
     `[protocol=${quoteFilterValue(parsed.protocol)}]`,
     `[ext=${quoteFilterValue(parsed.container)}]`,
-    // Stream shape. `vcodec`/`acodec` are compared against the literal string
-    // "none", which is exactly how yt-dlp itself marks an absent stream.
-    parsed.hasVideo ? `[vcodec!=${quoteFilterValue("none")}]` : `[vcodec=${quoteFilterValue("none")}]`,
+    ...videoShapeFilters(parsed),
+    // Audio shape. `acodec` is the ONLY audio-presence authority here.
+    // `audio_ext` is deliberately absent: `_fill_sorting_fields` sets it to
+    // "none" on every format whose `vcodec != "none"`, so `[audio_ext!="none"]`
+    // would match NOTHING for a real muxed source (§17, §D1).
     parsed.hasAudio ? `[acodec!=${quoteFilterValue("none")}]` : `[acodec=${quoteFilterValue("none")}]`,
   ];
 
   return `${GENERIC_FORMAT_SELECTOR_ATOM}${filters.join("")}`;
+}
+
+/**
+ * The video half of the selector, chosen by HOW analysis established video.
+ *
+ * The distinction is load-bearing against the pinned runtime, because
+ * `_build_format_filter`'s inner predicate is:
+ *
+ *     def _filter(f):
+ *         actual_value = f.get(m.group('key'))
+ *         if actual_value is None:
+ *             return m.group('none_inclusive')
+ *         return op(actual_value, comparison_value)
+ *
+ * A field that is Python `None` — which is exactly what the Generic HTML5 path
+ * leaves in `vcodec` — never reaches the operator at all. It matches only when
+ * the filter carried the none-inclusive `?`, whose position the string-operator
+ * regex fixes as `key` `!`? `op` `?`? `value`; `vcodec?!=` and `vcodec!?=` are
+ * both `SyntaxError`. Verified against 2026.08.19:
+ *
+ *     [vcodec!="none"]   vcodec=None -> NO MATCH   vcodec="avc1" -> match
+ *     [vcodec!=?"none"]  vcodec=None -> match      vcodec="avc1" -> match
+ *     [vcodec!=?"none"]  vcodec="none" -> NO MATCH
+ *
+ * So `codec-present` keeps the strict form (§14) — a known video codec is not
+ * weakened merely because an unknown-codec state now exists — while `video-ext`
+ * uses the none-inclusive form AND additionally binds `video_ext` to the exact
+ * approved container, so the shape evidence analysis actually relied on has to
+ * still hold at acquisition time (§16).
+ */
+function videoShapeFilters(parsed: GenericSourceSelection): string[] {
+  switch (parsed.videoConstraint) {
+    case "codec-present":
+      return [`[vcodec!=${quoteFilterValue("none")}]`];
+    case "video-ext":
+      return [
+        // Accepts an absent/unknown codec and a subsequently KNOWN one; rejects
+        // an explicit "none". Video may become better described, never absent.
+        `[vcodec!=?${quoteFilterValue("none")}]`,
+        // The evidence the approval rested on must still hold.
+        `[video_ext=${quoteFilterValue(parsed.container)}]`,
+      ];
+    case "absent":
+      return [`[vcodec=${quoteFilterValue("none")}]`];
+  }
 }
