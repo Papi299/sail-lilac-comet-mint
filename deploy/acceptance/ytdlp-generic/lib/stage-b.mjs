@@ -8,7 +8,7 @@
 
 import { OUTCOMES, assertCheck, check, measuredCheck, summarize } from "./verdict.mjs";
 import { classifyTransitionTrace, classifyCancellationTrace } from "./lifecycle.mjs";
-import { evaluateTerminationCleanliness, validateSampleShape } from "./process-tree.mjs";
+import { evaluateGroupTermination } from "./process-tree.mjs";
 import {
   aggregateDownloadWindow,
   nodeContained,
@@ -279,12 +279,30 @@ export function evaluateStageB(obs, stageAResult) {
   for (const entry of evaluateProcessEvidence(obs, stage)) add(entry);
 
   // ── §33/§34 safe-egress negative case ──────────────────────────────────
+  // §12 of CORRECTION-03: the Phase-9 attribution standard. A flat counter can
+  // never pass — a connection that fails while every counter stays flat was
+  // stopped by something else, most often a missing route.
+  add(
+    measuredCheck(
+      "safe-egress.generic-path-established",
+      obs.egressNegative,
+      (value) => value?.genericPathEstablished === true && value?.extractor === "yt-dlp",
+      "the forbidden destination was reached through the generic yt-dlp path, not the direct layer",
+      { stage },
+    ),
+  );
   add(
     measuredCheck(
       "safe-egress.forbidden-destination-denied",
       obs.egressNegative,
-      (value) => value?.denied === true && value?.attributedToBoundary === true,
-      "a later forbidden destination was denied by the external boundary",
+      (value) =>
+        value?.denied === true &&
+        value?.attributedToBoundary === true &&
+        Number.isInteger(value?.denyCounterDelta) &&
+        value.denyCounterDelta > 0 &&
+        value?.policyVerifiedBefore === true &&
+        value?.policyVerifiedAfter === true,
+      "the connection failed AND the nftables deny counter moved, attributing it to the boundary",
       { stage },
     ),
   );
@@ -395,43 +413,10 @@ export function evaluateStageB(obs, stageAResult) {
         { stage },
       ),
     );
-    // §14 of CORRECTION-02: three distinct states. An unmeasurable post-sample
-    // must not look process-clean, which the previous `postSample: []` /
-    // `workerPid: 0` fallback made it do.
-    if (cancellation?.postSampleMeasured !== true) {
-      add(
-        check(
-          "cancel.processes-gone",
-          OUTCOMES.BLOCKED,
-          `the post-cancellation process tree could not be sampled${
-            cancellation?.postSampleReason ? `: ${cancellation.postSampleReason}` : ""
-          }`,
-          { stage },
-        ),
-      );
-    } else {
-      const shape = validateSampleShape(cancellation.postSample);
-      const cleanliness = shape.ok
-        ? evaluateTerminationCleanliness(cancellation.postSample, cancellation.workerPid)
-        : null;
-      add(
-        shape.ok
-          ? assertCheck(
-              "cancel.processes-gone",
-              cleanliness.clean === true,
-              cleanliness.clean === true
-                ? "no yt-dlp or Node descendant survived cancellation"
-                : `survivors observed: ${cleanliness.survivors.map((r) => r.comm).join(", ")}`,
-              { stage },
-            )
-          : check(
-              "cancel.processes-gone",
-              OUTCOMES.BLOCKED,
-              `the post-cancellation sample violates the closed schema: ${shape.violations[0]}`,
-              { stage },
-            ),
-      );
-    }
+    // §8 of CORRECTION-03: the proof is about the EXACT captured group, at host
+    // level. An ancestry check against the current Worker cannot answer it — a
+    // leaked acquisition is orphaned and re-parented, so it would look clean.
+    add(groupTerminationCheck("cancel.processes-gone", cancellation, stage, "cancellation"));
 
     // §17 of CORRECTION-02: `workDirPresent` is now a tri-state. A probe that
     // could not read the container is BLOCKED — a measurement failure and a
@@ -460,34 +445,53 @@ export function evaluateStageB(obs, stageAResult) {
   }
 
   // ── §38 actual-byte limit ──────────────────────────────────────────────
+  // §17-§21 of CORRECTION-03. The evidence must describe the ACTUAL media GET,
+  // must show that GET carried no usable Content-Length (so `--max-filesize`
+  // cannot have been the mechanism), and must show the case ran generic.
   add(
     measuredCheck(
       "limit.actual-byte-guard",
       obs.byteLimitCase,
       (value) =>
+        value?.extractor === "yt-dlp" &&
+        value?.actualMediaRequestObserved === true &&
+        value?.contentLengthPresent === false &&
         value?.declaredLengthUnknown === true &&
         value?.outcome === "TOO_LARGE" &&
         value?.beganProcessing === false &&
         value?.uploaded === false &&
         value?.workDirPresent === false,
-      "an over-limit source with an unknown declared length aborted as TOO_LARGE before processing",
+      "the actual media GET carried no usable declared length and the application byte watcher " +
+        "aborted it as TOO_LARGE before processing",
       { stage },
     ),
   );
 
   // ── §40 shutdown during acquisition ────────────────────────────────────
-  add(
-    measuredCheck(
-      "shutdown.group-terminated",
-      obs.shutdownCase,
-      (value) =>
-        value?.descendantsGone === true &&
-        typeof value?.recoveredStatus === "string" &&
-        value.recoveredStatus.length > 0,
-      "a Worker stop during acquisition terminated the owned group and recovered the job",
-      { stage },
-    ),
-  );
+  // §9 of CORRECTION-03. Two independent assertions, because "the new Worker
+  // has no descendants" is NOT "the old acquisition group died".
+  if (obs.shutdownCase?.measured !== true) {
+    add(
+      check(
+        "shutdown.group-terminated",
+        OUTCOMES.BLOCKED,
+        `the shutdown case was not performed${obs.shutdownCase?.reason ? `: ${obs.shutdownCase.reason}` : ""}`,
+        { stage },
+      ),
+    );
+  } else {
+    add(groupTerminationCheck("shutdown.group-terminated", obs.shutdownCase.value, stage, "the Worker restart"));
+    add(
+      assertCheck(
+        "shutdown.job-recovered",
+        obs.shutdownCase.value?.restartObserved === true &&
+          typeof obs.shutdownCase.value?.recoveredStatus === "string" &&
+          obs.shutdownCase.value.recoveredStatus.length > 0,
+        "the Worker restart was observed and the job was recovered per the restart policy",
+        { stage },
+      ),
+    );
+  }
 
   // ── §41 direct still works after enablement ────────────────────────────
   add(
@@ -636,6 +640,41 @@ export function stageBAuthorization(obs, stageAResult) {
   }
 
   return { permitted: true, reason: "Stage A passed and binds to this deployment" };
+}
+
+/**
+ * The exact-group termination check, shared by cancellation and shutdown.
+ *
+ * Three outcomes, kept distinct: the group is gone (PASS), a plausible member
+ * survives (FAIL), or the host could not be queried / the survivor set is
+ * ambiguous under PID reuse (BLOCKED).
+ */
+function groupTerminationCheck(id, evidence, stage, what) {
+  if (evidence?.groupMembersMeasured !== true) {
+    return check(
+      id,
+      OUTCOMES.BLOCKED,
+      `the host could not be queried for survivors of the captured acquisition group${
+        evidence?.groupQueryReason ? `: ${evidence.groupQueryReason}` : ""
+      }`,
+      { stage },
+    );
+  }
+  const termination = evaluateGroupTermination(
+    { pgid: evidence.capturedPgid, pid: evidence.capturedYtdlpPid, comm: evidence.capturedComm },
+    evidence.groupSurvivors,
+  );
+  if (termination.measured !== true) {
+    return check(id, OUTCOMES.BLOCKED, termination.reason, { stage });
+  }
+  return assertCheck(
+    id,
+    termination.terminated === true,
+    termination.terminated === true
+      ? `the captured acquisition group (pgid ${evidence.capturedPgid}) has no surviving members after ${what}`
+      : `group ${evidence.capturedPgid} still has members: ${termination.survivors.map((r) => r.comm).join(", ")}`,
+    { stage },
+  );
 }
 
 /**

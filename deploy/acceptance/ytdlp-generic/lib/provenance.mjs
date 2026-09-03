@@ -4,15 +4,15 @@
 // right field names and types passed the previous aggregator, which violates the
 // governing rule that no arbitrary operator JSON assertion may create a PASS.
 //
-// Every Stage A record and every Stage B case record is now sealed with an
-// HMAC-SHA256 over a canonical encoding of the fields that matter:
+// Every Stage A record and every Stage B case record is sealed with an
+// HMAC-SHA256 over a canonical encoding of the COMPLETE record, excluding only
+// the authenticator field itself.
 //
-//   harness · schemaVersion · runId · stage · case · expectedSha
-//   · runningImageId · payload
-//
-// Editing ANY of them — a boolean, a digest, a PID, a transition, the case name,
-// the binding — invalidates the seal, and an unverifiable record is rejected
-// outright rather than partially consumed.
+// Editing anything — a check outcome, a runtime version, a digest, a PID, a
+// transition, the case name, the nested binding, a timestamp — invalidates the
+// seal, and an unverifiable record is rejected outright rather than partially
+// consumed. Excluding one field rather than enumerating many also means a field
+// added to the record later is authenticated automatically.
 //
 // ── The key ────────────────────────────────────────────────────────────────
 //
@@ -29,10 +29,15 @@
 // or carried over from a different image without anyone noticing.
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export const EVIDENCE_SCHEMA_VERSION = "10c4-correction-02";
+/**
+ * Bumped by CORRECTION-03: the authenticated material changed from a named
+ * subset to the whole record, so artifacts from the previous schema are not
+ * interchangeable with these and must not be silently accepted.
+ */
+export const EVIDENCE_SCHEMA_VERSION = "10c4-correction-03";
 export const HARNESS_ID = "deploy/acceptance/ytdlp-generic/acceptance.mjs";
 export const AUTHENTICATOR_ALG = "HMAC-SHA256";
 
@@ -56,20 +61,27 @@ export function canonicalize(value) {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalize(value[k])}`).join(",")}}`;
 }
 
-/** The exact material the authenticator covers. */
+/**
+ * The material the authenticator covers: the COMPLETE record, minus only the
+ * authenticator itself (§22 of CORRECTION-03).
+ *
+ * The previous version enumerated a subset — harness, schema, run, stage, case,
+ * identity, verdict, payload — which left `checks[]`, `runtime`, `services`,
+ * `delivery`, `process`, the nested `binding` and every timestamp OUTSIDE the
+ * seal. All of those are acceptance-relevant, and an editable `checks[0].outcome`
+ * is exactly the kind of field the seal exists to protect.
+ *
+ * Enumerating is also the wrong shape: a field added to the record later would
+ * silently fall outside the authenticator. Excluding one field instead means
+ * every future field is authenticated by default.
+ */
 export function authenticatedMaterial(record) {
-  return canonicalize({
-    harness: record.harness ?? null,
-    schemaVersion: record.schemaVersion ?? null,
-    runId: record.runId ?? null,
-    stage: record.stage ?? null,
-    case: record.case ?? null,
-    expectedSha: record.expectedSha ?? null,
-    runningImageId: record.runningImageId ?? null,
-    taggedImageId: record.taggedImageId ?? null,
-    verdict: record.verdict ?? null,
-    payload: record.payload ?? null,
-  });
+  const material = {};
+  for (const [key, value] of Object.entries(record ?? {})) {
+    if (key === "authenticator") continue;
+    material[key] = value;
+  }
+  return canonicalize(material);
 }
 
 /** Seals a record. Returns a NEW object; the input is not mutated. */
@@ -156,6 +168,31 @@ export function verifyRecord(record, key, expected) {
   return { ok: true };
 }
 
+/**
+ * §23 of CORRECTION-03 — the top-level identity and the nested binding must
+ * AGREE.
+ *
+ * Both are inside the authenticated material, so neither can be edited without
+ * invalidating the seal. This check catches the remaining case: a record sealed
+ * with two internally inconsistent copies of the same identity, where a reader
+ * looking at one and a verifier looking at the other would disagree.
+ */
+export function bindingAgreesWithRecord(record) {
+  const binding = record?.binding;
+  if (!binding || typeof binding !== "object") {
+    return { ok: false, reason: "the record carries no deployment binding" };
+  }
+  for (const field of ["expectedSha", "runningImageId", "taggedImageId"]) {
+    if (record[field] !== binding[field]) {
+      return {
+        ok: false,
+        reason: `record.${field} disagrees with binding.${field}`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
 // ── The run key ────────────────────────────────────────────────────────────
 
 /**
@@ -205,6 +242,26 @@ export async function loadOrCreateRun(path, deps = {}) {
  */
 export async function loadRun(path, deps = {}) {
   const read = deps.readFile ?? readFile;
+  const statFile = deps.stat ?? stat;
+
+  // §25: refuse a key file whose permissions are broader than the private mode
+  // it was written with. A world- or group-readable run key means any local
+  // account could re-seal edited artifacts, which is precisely the property the
+  // seal is meant to provide.
+  try {
+    const stats = await statFile(path);
+    const mode = stats.mode & 0o777;
+    if ((mode & 0o077) !== 0) {
+      return {
+        error: `the acceptance run key at ${path} is mode ${mode.toString(8).padStart(3, "0")}; ` +
+          "it must not be group- or world-accessible",
+      };
+    }
+  } catch {
+    // `stat` unavailable (an injected filesystem in tests, or a platform without
+    // it) is not itself a finding; the content check below still applies.
+  }
+
   try {
     const parsed = JSON.parse(await read(path, "utf8"));
     if (typeof parsed?.runId === "string" && /^[0-9a-f]{64}$/.test(String(parsed?.key ?? ""))) {

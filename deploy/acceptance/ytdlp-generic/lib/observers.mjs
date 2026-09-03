@@ -18,9 +18,11 @@
 //      change YTDLP_ENABLED (§10). The harness measures the deployment state it
 //      is given; changing that state is the Phase-10D operator's own step.
 
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { redactText } from "./redact.mjs";
+import { fingerprintChain } from "./egress-policy.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -36,6 +38,33 @@ export const WORKER_STATE_DB = "/var/lib/videofetch/videofetch.db";
  * the sentinel test, in the one place where the data is at its most raw.
  */
 export const DURABLE_SAFE_COLUMNS = Object.freeze(["job_id", "status", "format_id", "extractor"]);
+
+/**
+ * The ONLY `ps` output format this harness may request.
+ *
+ * `=` suffixes suppress the headers, so the output is pure data. There is no
+ * `args`, `cmd` or `command` column and there cannot be one: the allowlist
+ * admits this exact string and nothing else.
+ */
+export const HOST_PS_FORMAT = "pid=,ppid=,pgid=,comm=";
+
+/**
+ * The nftables chain the Phase-9 policy installs, as one argv token.
+ *
+ * `nft list chain inet videofetch_egress output` — table family, table name and
+ * chain are fixed here so the allowlist admits exactly this listing and nothing
+ * else.
+ */
+export const EGRESS_TABLE = "videofetch_egress";
+export const EGRESS_CHAIN = "output";
+
+/** Builds the one admissible listing argv for a validated namespace PID. */
+export function egressChainListArgv(netnsPid) {
+  if (!Number.isInteger(netnsPid) || netnsPid <= 0) {
+    throw new Error("refusing to enter a namespace by a malformed pid");
+  }
+  return ["-t", String(netnsPid), "-n", "nft", "-j", "list", "chain", "inet", EGRESS_TABLE, EGRESS_CHAIN];
+}
 
 /** A durable job id, as the Worker's own schema defines it. */
 const JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
@@ -74,8 +103,35 @@ const READ_ONLY_COMMANDS = Object.freeze([
   // The existing read-only safe-egress verifier. It never repairs.
   ["/usr/local/sbin/vf-egress-policy-verify", (a) => a.length === 0],
   // Read-only process/namespace metadata.
-  ["ps", () => true],
+  //
+  // ONE exact invocation (§7 of CORRECTION-03). `ps -ef` and `ps aux` both
+  // print the full command line, whose last element on the acquisition process
+  // is the operator-supplied media URL — and, during the sentinel case, the
+  // sentinel. Selecting the four safe columns by name means the URL is never
+  // read, rather than being read and then redacted.
+  ["ps", (a) => a.length === 2 && a[0] === "-eo" && a[1] === HOST_PS_FORMAT],
   ["readlink", (a) => a.length === 1 && a[0].startsWith("/proc/")],
+  // The Phase-9 deny-counter instrument, read-only.
+  //
+  // ONE exact shape: `nsenter -t <pid> -n nft -j list chain inet
+  // videofetch_egress output`. No mutation verb, no arbitrary nft expression,
+  // no shell pipeline. The JSON is parsed in reviewed code, exactly as
+  // deploy/acceptance/safe-egress/counter.py does.
+  [
+    "nsenter",
+    (a) =>
+      a.length === 10 &&
+      a[0] === "-t" &&
+      /^\d+$/.test(a[1]) &&
+      a[2] === "-n" &&
+      a[3] === "nft" &&
+      a[4] === "-j" &&
+      a[5] === "list" &&
+      a[6] === "chain" &&
+      a[7] === "inet" &&
+      a[8] === EGRESS_TABLE &&
+      a[9] === EGRESS_CHAIN,
+  ],
   // Durable state, read-only, projecting only the safe column list.
   [
     "sqlite3",
@@ -409,27 +465,86 @@ export function makeSystemObservers(deps = {}) {
     },
 
     /**
-     * The accepted safe-egress policy state, from the EXISTING read-only
-     * verifier plus the fingerprints the policy unit records under /run.
+     * The media namespace holder's PID, which `nsenter -n` needs.
      *
-     * This is an adapter over the Phase-9 instrument, not a second firewall
-     * framework: the harness reads what that tooling already publishes and
-     * never mutates the ruleset.
+     * The namespace is owned by `videofetch-media-netns`, and the Worker joins
+     * it; entering by PID is how the Phase-9 tooling already reads counters.
+     */
+    async mediaNetnsPid() {
+      return observe("media namespace holder pid", async () => {
+        const result = await run("docker", [
+          "inspect",
+          "--format",
+          "{{.State.Pid}}",
+          "videofetch-media-netns",
+        ]);
+        const pid = Number(String(result.stdout ?? "").trim());
+        if (!Number.isInteger(pid) || pid <= 0) throw new Error("the media namespace holder is not running");
+        return pid;
+      });
+    },
+
+    /**
+     * The live egress chain, as nftables JSON.
+     *
+     * Read-only, through the one allowlisted listing shape. This is the same
+     * instrument `deploy/acceptance/safe-egress/counter.py` consumes.
+     */
+    async egressChainListing() {
+      return observe("nftables egress chain listing", async () => {
+        const netnsPid = await observers.mediaNetnsPid();
+        if (netnsPid.measured !== true) throw new Error(netnsPid.reason);
+        const result = await run("nsenter", egressChainListArgv(netnsPid.value));
+        if (result.exitCode !== 0) throw new Error(`nft listing exited ${result.exitCode}`);
+        return JSON.parse(String(result.stdout ?? ""));
+      });
+    },
+
+    /**
+     * The safe-egress policy state: the read-only verifier's verdict PLUS a
+     * fingerprint of the actual rules (§16 of CORRECTION-03).
+     *
+     * The previous fingerprint was the policy unit's systemd InvocationID and
+     * activation timestamp, which describe the unit's lifetime rather than the
+     * ruleset — a rule changed by hand while the unit kept running would leave
+     * both identical. This hashes the normalized chain JSON with the mutable
+     * counters stripped, so the rules are what is compared.
      */
     async egressPolicyState() {
       return observe("safe-egress policy state", async () => {
         const verify = await run("/usr/local/sbin/vf-egress-policy-verify", []);
-        const show = await run("systemctl", ["show", "videofetch-egress-policy"]);
-        // The verifier's own exit status plus the policy unit's invocation
-        // identity form the comparable fingerprint. Neither is a secret.
-        const props = String(show.stdout ?? "");
-        const invocation = /^InvocationID=(\S+)$/m.exec(props)?.[1] ?? "";
-        const activeEnter = /^ActiveEnterTimestampMonotonic=(\d+)$/m.exec(props)?.[1] ?? "";
+        const listing = await observers.egressChainListing();
+        if (listing.measured !== true) throw new Error(listing.reason);
+        const fingerprinted = fingerprintChain(listing.value);
+        if (fingerprinted.measured !== true) throw new Error(fingerprinted.reason);
         return {
           capturedAt: new Date().toISOString(),
           verifierExit: verify.exitCode,
-          fingerprint: `${verify.exitCode}:${invocation}:${activeEnter}`,
+          fingerprint: createHash("sha256").update(fingerprinted.normalized, "utf8").digest("hex"),
+          listing: listing.value,
         };
+      });
+    },
+
+    /**
+     * Host-level survivors of an EXACT process group (§7 of CORRECTION-03).
+     *
+     * After a cancellation or a Worker restart the old acquisition process may
+     * be orphaned or re-parented, so it is no longer a descendant of the
+     * current Worker. `descendantsOf(currentWorkerPid)` therefore cannot answer
+     * "did the group I captured actually die?" — a leaked, re-parented yt-dlp
+     * would look clean. This asks the host directly.
+     *
+     * Collects only pid/ppid/pgid/comm. No command line, ever.
+     */
+    async processGroupMembers(pgid) {
+      return observe(`host process group ${pgid}`, async () => {
+        if (!Number.isInteger(pgid) || pgid <= 0) {
+          throw new Error("refusing to query a malformed process group id");
+        }
+        const result = await run("ps", ["-eo", HOST_PS_FORMAT]);
+        if (result.exitCode !== 0) throw new Error(`ps exited ${result.exitCode}`);
+        return parseHostProcessList(result.stdout).filter((row) => row.pgid === pgid);
       });
     },
 
@@ -466,4 +581,26 @@ export function makeSystemObservers(deps = {}) {
   };
 
   return observers;
+}
+
+/**
+ * Parses `ps -eo pid=,ppid=,pgid=,comm=` into closed-schema rows.
+ *
+ * `comm` is a basename by definition of the column. A row whose `comm` contains
+ * whitespace would mean the format changed under us, so it is dropped rather
+ * than admitted — a command line must never enter the evidence path.
+ */
+export function parseHostProcessList(stdout) {
+  const rows = [];
+  for (const line of String(stdout ?? "").split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    const parts = trimmed.split(/\s+/);
+    if (parts.length !== 4) continue;
+    const [pid, ppid, pgid, comm] = parts;
+    if (!/^\d+$/.test(pid) || !/^\d+$/.test(ppid) || !/^\d+$/.test(pgid)) continue;
+    if (!/^[\w.:+-]+$/.test(comm)) continue;
+    rows.push({ pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), comm: comm.toLowerCase() });
+  }
+  return rows;
 }

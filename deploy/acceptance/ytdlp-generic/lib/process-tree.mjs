@@ -402,3 +402,66 @@ export function evaluateTerminationCleanliness(sample, rootPid) {
     survivors: Object.freeze(survivors),
   });
 }
+
+/**
+ * §6-§10 of CORRECTION-03 — did the EXACT captured acquisition group die?
+ *
+ * `captured` is the pre-transition identity: `{ pgid, pid, comm, startedAt }`.
+ * `members` is the host-level survivor list for that pgid, or `null` when the
+ * host could not be queried.
+ *
+ * This is deliberately independent of the CURRENT Worker's ancestry. After a
+ * cancellation or a restart the old acquisition process may be orphaned or
+ * re-parented, so "the new Worker has no descendants" and "the old group is
+ * gone" are different assertions — and only the second is the one being made.
+ */
+export function evaluateGroupTermination(captured, members) {
+  if (!captured || !Number.isInteger(captured.pgid) || captured.pgid <= 0) {
+    return Object.freeze({
+      measured: false,
+      reason: "the owned acquisition process group was never captured",
+    });
+  }
+  if (!Array.isArray(members)) {
+    return Object.freeze({
+      measured: false,
+      reason: `the host could not be queried for survivors of group ${captured.pgid}`,
+    });
+  }
+
+  const survivors = members.map((row) => ({ pid: row.pid, comm: basenameOf(row.comm) }));
+  if (survivors.length === 0) {
+    return Object.freeze({ measured: true, terminated: true, survivors: Object.freeze([]) });
+  }
+
+  // PID/PGID REUSE (§10). A surviving member whose executable is not one the
+  // acquisition group could contain is far more likely to be an unrelated
+  // process that inherited a recycled group id than a leaked descendant. The
+  // harness cannot tell the two apart, and guessing in either direction is
+  // wrong: claiming a leak would be a false FAIL, and dismissing it would be
+  // the silent PASS this whole correction exists to prevent. So it is
+  // AMBIGUOUS, which the caller reports as BLOCKED.
+  const plausible = survivors.filter(
+    (row) =>
+      YTDLP_RUNTIME_BASENAMES.includes(row.comm) ||
+      ALLOWED_ACQUISITION_DESCENDANTS.includes(row.comm) ||
+      FORBIDDEN_DOWNLOADING_DESCENDANTS.includes(row.comm),
+  );
+  if (plausible.length === 0) {
+    return Object.freeze({
+      measured: false,
+      ambiguous: true,
+      reason:
+        `group ${captured.pgid} has ${survivors.length} surviving member(s), none of which could ` +
+        "belong to an acquisition group; this is most likely process-group id reuse and cannot be " +
+        "distinguished from a leak",
+      survivors: Object.freeze(survivors),
+    });
+  }
+
+  return Object.freeze({
+    measured: true,
+    terminated: false,
+    survivors: Object.freeze(plausible),
+  });
+}

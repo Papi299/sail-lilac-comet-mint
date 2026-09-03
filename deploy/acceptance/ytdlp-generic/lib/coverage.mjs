@@ -92,9 +92,9 @@ export const CHECK_PRODUCERS = Object.freeze({
   "durable.extractor-is-ytdlp": CASE("success", "observers.durableJobRow"),
   "durable.application-format-id": CASE("success", "observers.durableJobRow"),
   "durable.no-raw-selector-fields": CASE("success", "observers.durableJobRow"),
-  "delivery.matches-advertised-preset": CASE("success", "the delivered container vs the accepted preset"),
 
   "process.window-observed": CASE("success", "download-window collector, scoped to durable downloading"),
+  "delivery.matches-advertised-preset": CASE("success", "the delivered container vs the accepted preset"),
   "process.sample-shape": CASE("success", "process-tree.validateSampleShape over every window sample"),
   "process.ytdlp-identified": CASE("success", "process-sampler.establishYtdlpPid + evaluateYtdlpIdentity"),
   "process.no-ffmpeg-during-downloading": CASE("success", "aggregateDownloadWindow over every window sample"),
@@ -102,8 +102,9 @@ export const CHECK_PRODUCERS = Object.freeze({
   "process.namespace-identity": CASE("success", "per-PID readlink /proc/<pid>/ns/net"),
   "process.node-ejs-containment": CASE("success", "per-sample containment anchored to the owned PID"),
 
-  "safe-egress.forbidden-destination-denied": CASE("safe-egress", "Phase-9 fixture adapter + watchdog attribution"),
-  "safe-egress.policy-unchanged": CASE("safe-egress", "observers.egressPolicyState before/after"),
+  "safe-egress.generic-path-established": CASE("safe-egress", "the fixture's own analysis result"),
+  "safe-egress.forbidden-destination-denied": CASE("safe-egress", "egress-policy.readDenyCounter before/after (Phase-9 rule comments)"),
+  "safe-egress.policy-unchanged": CASE("safe-egress", "egress-policy.fingerprintChain over the nft chain JSON"),
 
   "r2.delegated-write": CASE("success", "the authenticated Worker job view's objectKey"),
   "r2.worker-holds-no-credential": SYSTEM("environmentNames", "--stage B --aggregate"),
@@ -115,11 +116,12 @@ export const CHECK_PRODUCERS = Object.freeze({
 
   "cancel.durable-cancelled": CASE("cancellation", "cases.runCancellationCase"),
   "cancel.no-late-ready": CASE("cancellation", "cases.runCancellationCase"),
-  "cancel.processes-gone": CASE("cancellation", "post-cancellation sampler.sample"),
+  "cancel.processes-gone": CASE("cancellation", "observers.processGroupMembers over the captured pgid"),
   "cancel.no-upload-no-workdir": CASE("cancellation", "observers.workDirPresent"),
 
-  "limit.actual-byte-guard": CASE("byte-limit", "cases.runByteLimitCase with a measured unknown length"),
-  "shutdown.group-terminated": CASE("shutdown", "cases.runShutdownCase + observers.containerPid"),
+  "limit.actual-byte-guard": CASE("byte-limit", "the fixture's own actual-media-GET transfer evidence"),
+  "shutdown.group-terminated": CASE("shutdown", "observers.processGroupMembers over the captured pgid"),
+  "shutdown.job-recovered": CASE("shutdown", "observers.containerPid + the durable job view"),
 
   "direct.process-sampling-available": CASE("direct-regression", "cases.runDirectRegressionCase"),
   "direct.after-enable": CASE("direct-regression", "cases.runDirectRegressionCase"),

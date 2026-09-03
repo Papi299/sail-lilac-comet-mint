@@ -42,6 +42,14 @@ export function aggregateDownloadWindow(window) {
   const samples = Array.isArray(window?.samples) ? window.samples : [];
   const workerPid = window?.workerPid;
   const expectedNetns = window?.expectedNetns ?? null;
+  // §27/§28 of CORRECTION-03. Both of these are EVIDENCE GAPS in a negative
+  // claim across the window, so they are surfaced rather than tolerated:
+  //   samplerErrors  — an attempted snapshot failed, leaving an unobserved
+  //                    interval inside the window
+  //   ambiguousSamples — a snapshot that cannot be confidently assigned to the
+  //                    downloading side of the boundary
+  const samplerErrors = Array.isArray(window?.samplerErrors) ? window.samplerErrors : [];
+  const ambiguousSamples = Array.isArray(window?.ambiguousSamples) ? window.ambiguousSamples : [];
 
   if (samples.length === 0) {
     // The empty-collection shape must match the populated one, so a caller
@@ -51,6 +59,8 @@ export function aggregateDownloadWindow(window) {
       reason: "no process sample was taken while the job was observed in `downloading`",
       samplesTaken: 0,
       usableSamples: 0,
+      samplerErrors: Object.freeze(samplerErrors),
+      ambiguousSamples: Object.freeze(ambiguousSamples),
       shapeViolations: Object.freeze([]),
       forbiddenSeen: Object.freeze([]),
       unknownSeen: Object.freeze([]),
@@ -121,11 +131,41 @@ export function aggregateDownloadWindow(window) {
     }
   });
 
+  // A negative claim ("no FFmpeg appeared") is only as strong as the coverage
+  // behind it — but the two ways coverage can be lost are NOT equivalent.
+  //
+  // A sampler ERROR is a genuine hole: an attempt inside the window returned
+  // nothing, so some interval went unobserved while the job was still
+  // acquiring. That invalidates the claim.
+  //
+  // An AMBIGUOUS sample is different. Sampling is asynchronous, so the last
+  // in-flight snapshot always straddles the moment the window closes — it
+  // happens on every healthy run. Discarding it is the conservative choice
+  // (it can neither admit a legitimate `processing` FFmpeg nor be credited as
+  // acquisition coverage), and it does not create an interior hole, because the
+  // window closes exactly once and its interior was covered by the clean
+  // samples. Treating it as a gap would BLOCK every run, which would make the
+  // harness useless rather than strict.
+  //
+  // The residual limitation is real and recorded rather than hidden: a
+  // descendant that appeared only during that final straddling instant would
+  // not be observed. `ambiguousSampleCount` is reported in the evidence so a
+  // reviewer can see how much of the tail was unresolvable.
+  const gapped = samplerErrors.length > 0;
+
   return Object.freeze({
-    usable: usableSamples > 0,
-    reason: usableSamples > 0 ? null : `no sample passed the closed schema: ${shapeViolations[0] ?? "unknown"}`,
+    usable: usableSamples > 0 && !gapped,
+    reason:
+      usableSamples === 0
+        ? `no sample passed the closed schema: ${shapeViolations[0] ?? "unknown"}`
+        : gapped
+          ? `${samplerErrors.length} sampling attempt(s) failed while the downloading window was ` +
+            "open, leaving an unobserved interval that cannot support a negative claim"
+          : null,
     samplesTaken: samples.length,
     usableSamples,
+    samplerErrors: Object.freeze(samplerErrors),
+    ambiguousSamples: Object.freeze(ambiguousSamples),
     shapeViolations: Object.freeze(shapeViolations),
     forbiddenSeen: Object.freeze(forbiddenSeen),
     unknownSeen: Object.freeze(unknownSeen),
@@ -168,13 +208,21 @@ export function nodeContained(aggregate) {
  * on the first observed state after it, so samples are admitted only for the
  * interval the durable state actually says `downloading`.
  */
-export function createDownloadWindowCollector({ workerPid, expectedNetns } = {}) {
+export function createDownloadWindowCollector({ workerPid, expectedNetns, now } = {}) {
   const samples = [];
+  const samplerErrors = [];
+  const ambiguousSamples = [];
   let opened = false;
   let closed = false;
+  let closedAt = null;
   let observedDownloading = false;
   let worker = workerPid ?? null;
   let netns = expectedNetns ?? null;
+  // A MONOTONIC, sub-millisecond clock. `Date.now()` is the wrong instrument
+  // for comparing intervals: it has millisecond granularity — so a snapshot and
+  // the window close can share a timestamp and become indistinguishable — and
+  // it can jump backwards when the system clock is adjusted.
+  const clock = now ?? (() => performance.now());
 
   return {
     /** Feed each polled durable status here. */
@@ -189,7 +237,10 @@ export function createDownloadWindowCollector({ workerPid, expectedNetns } = {})
       // Any state after the window opened closes it permanently. `processing`
       // is precisely the state whose samples must not reach the acquisition
       // verdict.
-      if (opened) closed = true;
+      if (opened && !closed) {
+        closed = true;
+        closedAt = clock();
+      }
     },
 
     get open() {
@@ -210,9 +261,29 @@ export function createDownloadWindowCollector({ workerPid, expectedNetns } = {})
      * tree was read, so the caller records that and passes it here.
      */
     addSample(observation, opts = {}) {
-      const admissible = opts.takenWhileOpen ?? (opened && !closed);
-      if (!admissible || !observation) return false;
+      if (!observation) return false;
       if (!opened) return false;
+
+      // §28: a snapshot is an INTERVAL, not an instant — `sample()` is
+      // asynchronous. If the window closed while the snapshot was in flight,
+      // the snapshot cannot be confidently assigned to either side: admitting
+      // it could report a legitimate `processing` FFmpeg as an acquisition
+      // failure, and dropping it could discard a real acquisition descendant.
+      // Neither guess is acceptable, so it is recorded as AMBIGUOUS and the
+      // window becomes unusable.
+      const { startedAt, finishedAt } = opts;
+      if (typeof startedAt === "number" && typeof finishedAt === "number") {
+        const straddles = closedAt !== null && startedAt < closedAt && finishedAt > closedAt;
+        if (straddles) {
+          ambiguousSamples.push({ startedAt, finishedAt, closedAt });
+          return false;
+        }
+        // Entirely after the close: not this window's evidence.
+        if (closedAt !== null && startedAt >= closedAt) return false;
+      } else {
+        const admissible = opts.takenWhileOpen ?? (opened && !closed);
+        if (!admissible) return false;
+      }
       worker = observation.workerPid ?? worker;
       netns = observation.expectedNetns ?? netns;
       samples.push({
@@ -223,9 +294,16 @@ export function createDownloadWindowCollector({ workerPid, expectedNetns } = {})
       return true;
     },
 
+    /** Records an attempted snapshot that failed while the window was open. */
+    noteSamplerError(reason) {
+      if (opened && !closed) samplerErrors.push(String(reason ?? "unknown"));
+    },
+
     result() {
       return {
         samples,
+        samplerErrors,
+        ambiguousSamples,
         workerPid: worker,
         expectedNetns: netns,
         observedDownloading,

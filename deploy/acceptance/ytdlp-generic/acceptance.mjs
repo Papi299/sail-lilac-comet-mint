@@ -62,10 +62,19 @@ import { createSafeConsole, describePresence, redactUrl } from "./lib/redact.mjs
 import { makeSystemObservers, notMeasured, observe, runReadOnly } from "./lib/observers.mjs";
 import { makeControlPlaneSession, makeWorkerControlClient } from "./lib/control-plane.mjs";
 import { makeProcessSampler } from "./lib/process-sampler.mjs";
+import { readDenyCounter } from "./lib/egress-policy.mjs";
+import {
+  aggregateDownloadWindow,
+  nodeContained,
+  nodeExercised,
+  ytdlpIdentified,
+} from "./lib/download-window.mjs";
 import {
   CASE_PRODUCERS,
   buildCaseRecord,
   caseNames,
+  evaluateCaseFeatureState,
+  expectedFeatureStateFor,
   hasExecutableProducer,
   liveCaseNames,
   validateCaseRecord,
@@ -76,6 +85,7 @@ import {
   loadRun,
   runFingerprint,
   sealRecord,
+  bindingAgreesWithRecord,
   validateDeploymentBinding,
   verifyRecord,
 } from "./lib/provenance.mjs";
@@ -235,6 +245,10 @@ export async function main(argv, env, deps = {}) {
     );
   } else {
     acceptanceRun = await loadRun(runKeyPath, deps);
+    if (acceptanceRun?.error) {
+      errorLog(`BLOCKED: ${acceptanceRun.error}`);
+      return EXIT.BLOCKED;
+    }
     if (!acceptanceRun) {
       errorLog(
         `BLOCKED: no acceptance run key at ${runKeyPath}. Stage B artifacts must join the run ` +
@@ -460,14 +474,18 @@ export async function runDirectRegression(ctx, directUrl, declaredDigest) {
 async function runStageBCase(ctx, caseName) {
   const { argv, log, errorLog, write, secrets, env, system, expectedSha, run: acceptanceRun } = ctx;
 
+  // §3/§4 of CORRECTION-03: the required deployment state is PER CASE. The
+  // previous global guard demanded YTDLP_ENABLED=true for every Stage B case,
+  // which made `kill-switch` — whose whole purpose is to run with generic
+  // disabled — impossible. An UNMEASURED state blocks every case: running one
+  // while the deployment stage is unknown produces uninterpretable evidence.
   const ytdlpEnabledRaw = await system.ytdlpEnabledRaw();
-  if (ytdlpEnabledRaw.measured === true && ytdlpEnabledRaw.value !== "true") {
-    errorLog(
-      "STAGE MISMATCH: YTDLP_ENABLED is not 'true' in the deployed configuration, " +
-        "so this is a Stage A deployment. Refusing to run a Stage B case against it.",
-    );
+  const stateGate = evaluateCaseFeatureState(caseName, ytdlpEnabledRaw);
+  if (!stateGate.ok) {
+    errorLog(`BLOCKED: ${stateGate.reason}`);
     return EXIT.BLOCKED;
   }
+  log(`deployment state: generic ${stateGate.actual} (case '${caseName}' requires ${expectedFeatureStateFor(caseName)})`);
 
   const runningImageId = await system.runningImageId();
   if (runningImageId.measured !== true) {
@@ -490,10 +508,17 @@ async function runStageBCase(ctx, caseName) {
     workDirPresent: makeWorkDirProbe(ctx),
     catalogPromoted: makeCatalogComparator(ctx),
     sweepSurfaces: makeSentinelSweeper(ctx),
-    probeDeclaredLength: makeDeclaredLengthProbe(ctx),
     awaitWorkerRestart: makeRestartWatcher(ctx),
     egressPolicyState: () => ctx.system.egressPolicyState(),
-    egressDenialAttribution: makeEgressAttribution(ctx),
+    egressDenyClass: readOption(argv, "--egress-deny-class") ?? "deny-v4",
+    denyCounter: makeDenyCounterReader(ctx, readOption(argv, "--egress-deny-class") ?? "deny-v4"),
+    processGroupMembers: (pgid) => ctx.system.processGroupMembers(pgid),
+    mediaTransferEvidence: makeMediaTransferProbe(ctx),
+    // The MONOTONIC clock used to order a snapshot's interval against the
+    // window close. Distinct from the wall clock a producer uses for
+    // timestamps — `Date.now()` is the wrong instrument for interval
+    // comparison, and sharing one name for both confused the two.
+    monotonicNow: ctx.deps.monotonicNow,
   };
 
   // Every input a case declares is required before anything is submitted.
@@ -744,6 +769,12 @@ export async function loadStageA(path, read, { run, expectedSha } = {}) {
   const bindingCheck = validateDeploymentBinding(parsed.binding, expectedSha);
   if (!bindingCheck.ok) return { ok: false, reason: bindingCheck.reason };
 
+  // 4. The top-level identity and the nested binding must AGREE (§23). Both are
+  //    inside the seal, so this catches a record sealed with two internally
+  //    inconsistent copies of the same identity.
+  const agreement = bindingAgreesWithRecord(parsed);
+  if (!agreement.ok) return { ok: false, reason: agreement.reason };
+
   return { ok: true, summary: { verdict: parsed.verdict }, binding: parsed.binding };
 }
 
@@ -834,39 +865,51 @@ function makeCatalogComparator() {
 }
 
 /**
- * The byte-limit fixture's declared length, MEASURED (§5 of CORRECTION-02).
+ * The ACTUAL media transfer semantics, from the controlled fixture
+ * (§17-§20 of CORRECTION-03).
  *
- * The unknown-length property is the whole point of the case, so it is probed
- * rather than asserted by the operator. A fixture that declares a usable
- * `Content-Length` would be caught by `--max-filesize`, and a pass from it would
- * be evidence for the wrong gate entirely.
+ * The previous implementation did `HEAD` on the SUBMITTED URL. That is the
+ * wrong request: the submitted URL is a page, and the transfer under test is the
+ * progressive media GET that yt-dlp selected from it. A page with no
+ * `Content-Length` whose media resource declared one would have passed — while
+ * being caught by `--max-filesize`, which is the gate this case exists to rule
+ * out.
+ *
+ * The harness cannot learn which media URL yt-dlp chose without breaching the
+ * private-selector boundary, so the controlled fixture reports what it actually
+ * served. `VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL` is the fixture's own
+ * read-only evidence endpoint.
  */
-function makeDeclaredLengthProbe(ctx) {
-  return async (url) =>
-    observe("byte-limit fixture declared length", async () => {
+function makeMediaTransferProbe(ctx) {
+  return async () =>
+    observe("actual media transfer semantics", async () => {
+      const endpoint = ctx.env.VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL;
+      if (!endpoint) {
+        throw new Error(
+          "no fixture evidence endpoint was supplied (VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL); " +
+            "the transfer semantics of the actual media GET cannot be established",
+        );
+      }
       const fetchImpl = ctx.deps.fetch ?? globalThis.fetch;
-      const response = await fetchImpl(url, { method: "HEAD", redirect: "follow" });
-      const length = response.headers.get("content-length");
-      const encoding = response.headers.get("content-encoding");
-      const chunked = (response.headers.get("transfer-encoding") ?? "").includes("chunked");
-      // "Unknown" means yt-dlp's `data_len` will be None or untrustworthy:
-      // absent Content-Length, chunked transfer, or a compressed body whose
-      // declared length describes the encoded stream rather than the media.
-      const declaredLengthUnknown =
-        length === null || chunked || (encoding !== null && encoding !== "identity");
+      const response = await fetchImpl(endpoint, { redirect: "follow" });
+      if (!response.ok) throw new Error(`the fixture evidence endpoint returned HTTP ${response.status}`);
+      const body = await response.json();
+      if (typeof body?.actualMediaRequestObserved !== "boolean") {
+        throw new Error("the fixture evidence is malformed");
+      }
+      // Only sanitized facts are carried forward: no URL, no selector, no
+      // headers beyond the transfer-shape booleans the assertion needs.
       return {
-        declaredLengthUnknown,
-        summary: {
-          contentLength: length,
-          contentEncoding: encoding,
-          chunked,
-        },
+        actualMediaRequestObserved: body.actualMediaRequestObserved,
+        contentLengthPresent: body.contentLengthPresent === true,
+        transferMode: typeof body.transferMode === "string" ? body.transferMode : null,
+        bytesServed: Number.isInteger(body.bytesServed) ? body.bytesServed : null,
       };
     });
 }
 
 /**
- * Waits for the operator's Worker stop/restart (§6 of CORRECTION-02).
+ * Waits for the operator's Worker stop/restart (§9 of CORRECTION-03).
  *
  * The harness observes; it never performs the transition. A restart is detected
  * as the container's main PID changing — `systemctl stop`/`start` are not on the
@@ -876,7 +919,9 @@ function makeRestartWatcher(ctx) {
   return async ({ timeoutMs }) =>
     observe("operator Worker restart", async () => {
       const before = await ctx.system.containerPid();
-      if (before.measured !== true) throw new Error("the container PID could not be read before the transition");
+      if (before.measured !== true) {
+        throw new Error("the container PID could not be read before the transition");
+      }
       const previousPid = before.value;
 
       const deadline = Date.now() + timeoutMs;
@@ -885,11 +930,10 @@ function makeRestartWatcher(ctx) {
         const now = await ctx.system.containerPid();
         if (now.measured !== true) {
           sawDown = true; // the container is gone — the stop half happened
-        } else if (sawDown && now.value !== previousPid) {
-          return { previousPid, currentPid: now.value };
         } else if (now.value !== previousPid) {
-          // Recreated between polls; still a genuine restart.
-          return { previousPid, currentPid: now.value };
+          // A changed PID is a genuine restart whether or not the down window
+          // was caught between polls.
+          return { previousPid, currentPid: now.value, downObserved: sawDown };
         }
         await (ctx.deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))))(1000);
       }
@@ -898,29 +942,14 @@ function makeRestartWatcher(ctx) {
 }
 
 /**
- * Attributes an egress denial to the EXTERNAL boundary (§7 of CORRECTION-02).
+ * Reads one Phase-9 deny counter out of a chain listing.
  *
- * Composes with the accepted Phase-9 instrument rather than re-deriving it: the
- * read-only verifier plus the watchdog's journal are what already own this
- * question. A denial the harness cannot attribute is a measurement failure, not
- * a pass — "the connection failed" alone could mean "no route".
+ * The listing itself is captured alongside the policy fingerprint, so before
+ * and after share one read and cannot drift between them.
  */
-function makeEgressAttribution(ctx) {
-  return async ({ since }) =>
-    observe("safe-egress denial attribution", async () => {
-      const journal = await ctx.system.unitJournal("videofetch-egress-watchdog", since);
-      if (journal.measured !== true) {
-        throw new Error("the watchdog journal could not be read");
-      }
-      const verifier = await ctx.system.egressPolicyState();
-      if (verifier.measured !== true) throw new Error("the policy verifier could not be run");
-      // The boundary is intact AND the watchdog did not report a breach: the
-      // denial came from the policy rather than from the policy being gone.
-      return {
-        attributedToBoundary: verifier.value.verifierExit === 0,
-        summary: { verifierExit: verifier.value.verifierExit },
-      };
-    });
+function makeDenyCounterReader(ctx, denyClass) {
+  void ctx;
+  return async (listing) => readDenyCounter(listing, denyClass);
 }
 
 /**
@@ -1059,14 +1088,47 @@ function summarizeEnvironment(observation) {
 }
 
 /** Basenames and namespace ids only (§29). Never a pid-to-command-line map. */
+/**
+ * Final process evidence, from the SAME aggregate the evaluator judged
+ * (§26 of CORRECTION-03).
+ *
+ * The previous serializer read `observation.value.sample` — the obsolete
+ * single-sample shape — so against the current multi-sample window it emitted
+ * empty basenames and empty namespaces regardless of what was actually
+ * observed. Deriving both the verdict and the report from one aggregate is what
+ * keeps the record honest: a transient Node solver or a transient forbidden
+ * executable appears in the JSON precisely because it appeared in the verdict.
+ *
+ * Basenames, counts and namespace ids only. No command line, no argv, no URL.
+ */
 function summarizeProcess(observation) {
-  if (observation?.measured !== true) return { measured: false, reason: observation?.reason ?? null };
-  const { sample, expectedNetns } = observation.value;
+  if (observation?.measured !== true) {
+    return { measured: false, reason: observation?.reason ?? null };
+  }
+  const aggregate = aggregateDownloadWindow(observation.value);
   return {
     measured: true,
-    expectedNetns: expectedNetns ?? null,
-    basenames: [...new Set((sample ?? []).map((row) => String(row.comm ?? "").toLowerCase()))].sort(),
-    namespaces: [...new Set((sample ?? []).map((row) => row.netns ?? null))],
+    usable: aggregate.usable,
+    reason: aggregate.reason,
+    observedDownloading: observation.value?.observedDownloading === true,
+    samplesTaken: aggregate.samplesTaken,
+    usableSamples: aggregate.usableSamples,
+    samplerErrorCount: aggregate.samplerErrors.length,
+    ambiguousSampleCount: aggregate.ambiguousSamples.length,
+    shapeViolationCount: aggregate.shapeViolations.length,
+    basenamesSeen: aggregate.basenamesSeen,
+    ownedYtdlpIdentified: ytdlpIdentified(aggregate),
+    ownedYtdlpIdentityCount: aggregate.ytdlpIdentities.length,
+    nodeExercised: nodeExercised(aggregate),
+    nodeContained: nodeExercised(aggregate) ? nodeContained(aggregate) : null,
+    nodeObservationCount: aggregate.nodeObservations.length,
+    // Basenames only — enough to act on, and safe to record.
+    forbiddenSeen: [...new Set(aggregate.forbiddenSeen.map((r) => r.comm))].sort(),
+    forbiddenSeenCount: aggregate.forbiddenSeen.length,
+    unknownSeen: [...new Set(aggregate.unknownSeen.map((r) => r.comm))].sort(),
+    unknownSeenCount: aggregate.unknownSeen.length,
+    namespaceViolationCount: aggregate.namespaceViolations.length,
+    expectedNetns: aggregate.expectedNetns,
   };
 }
 

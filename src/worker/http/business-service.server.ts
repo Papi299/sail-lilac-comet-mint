@@ -196,8 +196,13 @@ export class WorkerService implements WorkerBusinessService {
       binaries: { ffmpeg: binaries.ffmpeg, ytdlp: binaries.ytdlp },
       runtime: { ytdlpVersion: binaries.ytdlpVersion },
       // "The operator enabled the feature", which is independent of the above.
-      // Both being true still does not mean a user URL can reach yt-dlp: no
-      // such path exists in this phase.
+      //
+      // Runtime availability and operator enablement remain DISTINCT facts, and
+      // both are necessary for generic usability. Actual reachability is
+      // supplied by the reviewed application router and execution path, which
+      // has existed since Phase 10C3 — the earlier note here asserting that no
+      // such path exists described the Phase-10C1 source and was reconciled by
+      // PHASE-10C4-YTDLP-PRODUCTION-ACCEPTANCE-HARNESS-001.
       features: { ytdlpEnabled: this.ytdlpEnabled },
       safeEgress: {
         // Enforcement is external and this container cannot inspect it, so the

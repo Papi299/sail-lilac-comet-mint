@@ -1714,6 +1714,111 @@ measured — durable `fileSize`, provider `contentLength`, delivered bytes and
 their SHA-256 — without implying an independent digest of the Worker-produced
 object, which only the direct fixture case genuinely has.
 
+#### CORRECTION-03 — six acceptance-integrity defects closed
+
+**1. The kill-switch case was impossible, and the state gate was not
+fail-closed.** Every Stage B case was guarded by a single global requirement
+that `YTDLP_ENABLED=true`, so `kill-switch` — whose entire purpose is to prove
+generic becomes unusable when the operator turns it off — could never run. The
+guard was also silent when the state could not be measured at all.
+
+The required deployment state is now declared PER CASE: `enabled` for `success`,
+`cancellation`, `byte-limit`, `shutdown`, `safe-egress` and `direct-regression`;
+`disabled` for `kill-switch`, using the accepted grammar (absent or exactly
+`"false"`). An UNMEASURED state blocks every case, because a case graded against
+an unknown stage produces evidence nobody can interpret. The ordered sequence —
+Stage A disabled, operator enables, enabled-state cases, operator disables,
+kill-switch, operator restores the chosen final state, aggregate — is documented
+rather than left implicit.
+
+**2. Termination proved the wrong thing.** Cancellation and shutdown checked the
+CURRENT Worker's descendant tree. A cancelled or restart-orphaned acquisition
+process is re-parented away from the Worker, so an ancestry check sees a clean
+tree while the process is still running — and after a restart the new Worker
+never had those descendants at all. "The new Worker is clean" and "the old
+acquisition group died" are different assertions.
+
+Both cases now capture the exact owned yt-dlp PID/PGID while the job is in
+durable `downloading` — established by the detached-spawn invariant, `pgid ===
+pid` — and afterwards ask the HOST whether that group has any surviving members,
+through one allowlisted `ps -eo pid=,ppid=,pgid=,comm=`. (`ps -ef` and `ps aux`
+print the full command line, whose last element is the submitted media URL, so
+the allowlist was tightened to that single invocation.) Survivors that could not
+belong to an acquisition group are treated as PID/PGID reuse and reported
+BLOCKED rather than guessed either way.
+
+**3. Safe-egress attribution did not use the Phase-9 standard.** A request
+failure plus `vf-egress-policy-verify == 0` proves the policy is intact; it
+proves nothing about what stopped that particular connection. Phase 9 already
+settled this: a connection that fails while the deny counter increments was
+denied by the firewall, while one that fails with every counter flat was denied
+by something else — most often a missing route.
+
+The case now reads the actual nftables deny counter before and after, through
+one read-only listing (`nsenter -t <netns pid> -n nft -j list chain inet
+videofetch_egress output`), using the same rule-comment vocabulary
+`deploy/acceptance/safe-egress/counter.py` already consumes. A flat counter can
+never pass; an unreadable counter is BLOCKED. The case also proves the forbidden
+destination was reached through the GENERIC path, because a submitted URL that
+merely redirects to a private address is rejected by the control plane's own
+SSRF guard long before generic is reached — such a case would "pass" while
+proving only that the direct layer works.
+
+The policy fingerprint is now a hash of the normalized chain JSON with counters
+stripped. The previous fingerprint combined the policy unit's systemd
+`InvocationID` and activation timestamp, which describe the unit's lifetime
+rather than the rules: a rule changed by hand while the unit kept running would
+have left both identical.
+
+**4. The byte-limit case measured the wrong request.** It did `HEAD` on the
+SUBMITTED URL. The property under test is the transfer semantics of the
+progressive media GET yt-dlp selected from that page — so a page with no
+`Content-Length` whose media resource declared one would have passed while being
+caught by `--max-filesize`, which is precisely the gate this case exists to rule
+out.
+
+The harness cannot learn which media URL yt-dlp chose without breaching the
+private-selector boundary, so the controlled fixture reports what it actually
+served. The case fails if the actual media GET declared a usable length, fails if
+the fixture analyzed as `direct`, and remains BLOCKED — `LIVE UNKNOWN-LENGTH
+BYTE-GUARD CASE NOT PROVEN` — when the transfer semantics cannot be established.
+Every generic-specific case (`success`, `cancellation`, `byte-limit`,
+`shutdown`, `safe-egress`) now asserts `extractor === "yt-dlp"` rather than
+assuming an operator-supplied "generic URL" caused generic execution.
+
+**5. Only part of the evidence was authenticated.** The HMAC covered a named
+subset, leaving `checks[]`, `runtime`, `services`, `delivery`, `process`, the
+nested `binding` and every timestamp outside the seal — an editable
+`checks[0].outcome` being the clearest example of what that misses. Enumerating
+was also the wrong shape, since a field added later would silently fall outside.
+
+The seal now covers the complete record minus only the authenticator itself, so
+future fields are authenticated by default. The top-level identity and the
+nested binding must additionally agree, and an existing run-key file is refused
+on load if it is group- or world-readable.
+
+**6. Final process evidence used the obsolete single-sample shape.** The
+serializer still read `observation.value.sample`, which the multi-sample window
+does not have, so the record emitted empty basenames and empty namespaces
+regardless of what was observed. It now derives from the same aggregate the
+evaluator judges, reporting sample counts, basenames seen, owned-PID
+identification, Node exercise/containment and violation counts.
+
+Relatedly, a sampling attempt that FAILED while the downloading window was open
+now blocks the negative claim — it leaves a real unobserved interval. A sample
+that straddles the window close is discarded and counted rather than blocking:
+sampling is asynchronous, so the final in-flight snapshot straddles the close on
+every healthy run, and treating that as a gap would block every run. The residual
+limitation is reported in the evidence as `ambiguousSampleCount` rather than
+hidden.
+
+**Also reconciled, comment-only:** `src/worker/http/business-service.server.ts`
+still asserted that runtime availability plus operator enablement does not mean a
+user URL can reach yt-dlp "because no such path exists". That ceased to be true
+in Phase 10C3. The comment now states that runtime availability and operator
+enablement are distinct and both necessary, while reachability is supplied by the
+reviewed application router and execution path. No diagnostics behaviour changed.
+
 #### What Phase 10D is authorized to do
 
 Nothing yet. Only after this harness has been **independently reviewed and

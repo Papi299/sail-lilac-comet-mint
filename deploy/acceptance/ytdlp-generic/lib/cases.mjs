@@ -24,7 +24,7 @@
 import { mintSentinel, withSentinel } from "./evidence.mjs";
 import { classifyTransitionTrace } from "./lifecycle.mjs";
 import { createDownloadWindowCollector } from "./download-window.mjs";
-import { evaluateTerminationCleanliness } from "./process-tree.mjs";
+import { attributeDenial } from "./egress-policy.mjs";
 
 import { EVIDENCE_SCHEMA_VERSION, HARNESS_ID } from "./provenance.mjs";
 
@@ -61,12 +61,20 @@ const isDigest = (v) => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
 const CASE_PAYLOAD_VALIDATORS = Object.freeze({
   success: {
     genericAnalysis: (v) =>
-      isStr(v?.directControlExtractor) && isArr(v?.formats) && isArr(v?.presets) && "thumbnail" in v,
+      isStr(v?.extractor) &&
+      isStr(v?.directControlExtractor) &&
+      isArr(v?.formats) &&
+      isArr(v?.presets) &&
+      "thumbnail" in v,
     genericJob: (v) => isArr(v?.transitions) && isStr(v?.requestedFormatId) && isStr(v?.jobId),
     durableJobRow: (v) => isStr(v?.jobId) && isStr(v?.status) && "formatId" in v && "extractor" in v,
     selectorConstraints: (v) => isBool(v?.containerMatches),
     // The complete downloading window, not one sample (§9-§12 of CORRECTION-02).
-    downloadingWindow: (v) => isArr(v?.samples) && isBool(v?.observedDownloading),
+    downloadingWindow: (v) =>
+      isArr(v?.samples) &&
+      isBool(v?.observedDownloading) &&
+      isArr(v?.samplerErrors) &&
+      isArr(v?.ambiguousSamples),
     r2Evidence: (v) => isBool(v?.objectExists) && isInt(v?.contentLength),
     vercelDelivery: (v) =>
       isInt(v?.redirectStatus) && isBool(v?.presigned) && isDigest(v?.clientDigest),
@@ -76,30 +84,50 @@ const CASE_PAYLOAD_VALIDATORS = Object.freeze({
     cancellation: (v) =>
       isArr(v?.transitions) &&
       isBool(v?.lateReady) &&
-      isArr(v?.postSample) &&
-      // Tri-state measurement flags are REQUIRED fields, so a record cannot
-      // omit them and have the evaluator read `undefined !== true` as BLOCKED
-      // by accident rather than by construction.
-      isBool(v?.postSampleMeasured) &&
+      // The EXACT captured acquisition group, and the host-level survivor set.
+      // Tri-state measurement flags are REQUIRED fields, so a record cannot omit
+      // them and have the evaluator read `undefined !== true` as BLOCKED by
+      // accident rather than by construction.
+      isInt(v?.capturedPgid) &&
+      isInt(v?.capturedYtdlpPid) &&
+      isBool(v?.groupMembersMeasured) &&
+      isArr(v?.groupSurvivors) &&
       isBool(v?.workDirMeasured) &&
-      isInt(v?.workerPid) &&
       isBool(v?.beganProcessing) &&
       isBool(v?.uploaded) &&
       isBool(v?.workDirPresent),
   },
   "byte-limit": {
     byteLimitCase: (v) =>
+      isStr(v?.extractor) &&
       isBool(v?.declaredLengthUnknown) &&
+      // The transfer semantics of the ACTUAL media GET, not of the submitted URL.
+      isBool(v?.actualMediaRequestObserved) &&
+      isBool(v?.contentLengthPresent) &&
       isStr(v?.outcome) &&
       isBool(v?.beganProcessing) &&
       isBool(v?.uploaded) &&
       isBool(v?.workDirPresent),
   },
   shutdown: {
-    shutdownCase: (v) => isBool(v?.descendantsGone) && isStr(v?.recoveredStatus),
+    shutdownCase: (v) =>
+      isInt(v?.capturedPgid) &&
+      isBool(v?.restartObserved) &&
+      isBool(v?.groupMembersMeasured) &&
+      isArr(v?.groupSurvivors) &&
+      isStr(v?.recoveredStatus),
   },
   "safe-egress": {
-    egressNegative: (v) => isBool(v?.denied) && isBool(v?.attributedToBoundary),
+    egressNegative: (v) =>
+      isBool(v?.genericPathEstablished) &&
+      isStr(v?.extractor) &&
+      isBool(v?.denied) &&
+      isBool(v?.attributedToBoundary) &&
+      isInt(v?.denyCounterBefore) &&
+      isInt(v?.denyCounterAfter) &&
+      isInt(v?.denyCounterDelta) &&
+      isBool(v?.policyVerifiedBefore) &&
+      isBool(v?.policyVerifiedAfter),
     egressPolicyFingerprint: (v) => isBool(v?.beforeMatchesAfter),
   },
   "direct-regression": {
@@ -226,23 +254,24 @@ export function validateCaseRecord(record, binding) {
  */
 async function driveJobWithWindow(ctx, jobId, initialStatus, opts = {}) {
   const { session, sampler } = ctx;
-  const collector = createDownloadWindowCollector({});
+  const collector = createDownloadWindowCollector({ now: ctx.monotonicNow });
   let settled = false;
-  let samplerFailure = null;
 
   const samplingLoop = (async () => {
     const sleep = ctx.sleep;
+    const clock = ctx.monotonicNow ?? (() => performance.now());
     while (!settled) {
-      // The window state is captured BEFORE the await. `sampler.sample()` takes
-      // several ticks, during which the job can legitimately move on to
-      // `processing`; judging admission by the state at landing time discarded
-      // every sample of a fast job.
-      const takenWhileOpen = collector.open;
-      if (takenWhileOpen) {
+      if (collector.open) {
+        // A snapshot is an INTERVAL, not an instant. Both ends are recorded so
+        // the collector can tell whether it sits cleanly inside the window,
+        // cleanly outside it, or straddles the close — and refuse to guess in
+        // the last case.
+        const startedAt = clock();
         try {
-          collector.addSample(await sampler.sample(), { takenWhileOpen });
+          const observed = await sampler.sample();
+          collector.addSample(observed, { startedAt, finishedAt: clock() });
         } catch (error) {
-          samplerFailure = String(error?.message ?? error);
+          collector.noteSamplerError(String(error?.message ?? error));
         }
       }
       await sleep(opts.sampleIntervalMs ?? 200);
@@ -260,8 +289,7 @@ async function driveJobWithWindow(ctx, jobId, initialStatus, opts = {}) {
   settled = true;
   await samplingLoop;
 
-  const window = collector.result();
-  return { polled, window: { ...window, samplerFailure } };
+  return { polled, window: collector.result() };
 }
 
 /**
@@ -286,6 +314,10 @@ export async function runSuccessCase(ctx) {
   const directProbe = await session.analyze(directUrl);
 
   const video = await session.analyze(submittedUrl);
+  // §29: an operator-supplied "generic URL" that resolved as direct would
+  // exercise the pre-existing direct path and prove nothing about generic
+  // acquisition. Assert it, never assume it.
+  requireGenericStrategy(video, "success");
   const preset = pickPreset(video?.presets);
   if (!preset) throw new Error("the generic source advertised no application preset to accept");
 
@@ -346,10 +378,13 @@ export async function runSuccessCase(ctx) {
     },
     downloadingWindow: {
       samples: window.samples,
+      // §27/§28: gaps travel WITH the window, so the evaluator can refuse a
+      // negative claim that rests on an unobserved interval.
+      samplerErrors: window.samplerErrors,
+      ambiguousSamples: window.ambiguousSamples,
       workerPid: window.workerPid,
       expectedNetns: window.expectedNetns,
       observedDownloading: window.observedDownloading,
-      samplerFailure: window.samplerFailure,
     },
     r2Evidence: r2,
     vercelDelivery: {
@@ -391,75 +426,66 @@ export function pickPreset(presets) {
 }
 
 /**
- * The cancellation case (§39).
+ * The cancellation case (§8 of CORRECTION-03).
  *
  * Cancels through the Worker's own authenticated route — the control plane
  * implements no cancellation surface — while the job is genuinely in
- * `downloading`, then re-samples to prove the owned group is gone.
+ * `downloading`, having FIRST captured the exact owned process group.
+ *
+ * The termination proof is about that captured group, queried at host level.
+ * `descendantsOf(currentWorkerPid)` cannot answer it: a cancelled acquisition
+ * that leaked would be orphaned and re-parented away from the Worker, so it
+ * would look clean under an ancestry check while still running.
  */
 export async function runCancellationCase(ctx) {
-  const { session, worker, sampler, genericUrl } = ctx;
+  const { session, worker, genericUrl } = ctx;
 
   const video = await session.analyze(genericUrl);
+  requireGenericStrategy(video, "cancellation");
   const preset = pickPreset(video?.presets);
   if (!preset) throw new Error("the cancellation source advertised no application preset");
 
   const created = await session.createJob(genericUrl, preset.formatId);
   const jobId = created.jobId;
 
-  const transitions = [];
-  let last = null;
-  let cancelled = false;
-  if (typeof created.status === "string") {
-    transitions.push(created.status);
-    last = created.status;
-  }
-  const deadline = Date.now() + 5 * 60 * 1000;
+  // 1. Reach durable `downloading` AND capture the exact owned group first.
+  const captured = await awaitAcquisitionGroup(ctx, jobId, created.status);
+  const transitions = [...captured.transitions];
+  let last = transitions[transitions.length - 1] ?? null;
 
+  // 2. Cancel through the real Worker surface.
+  await worker.cancelJob(jobId);
+
+  // 3. Settle.
+  const deadline = Date.now() + 2 * 60 * 1000;
   while (Date.now() < deadline) {
     const job = await session.jobStatus(jobId);
     if (job.status !== last) {
       transitions.push(job.status);
       last = job.status;
     }
-    if (job.status === "downloading" && !cancelled) {
-      await worker.cancelJob(jobId);
-      cancelled = true;
-    }
     if (["ready", "failed", "cancelled"].includes(job.status)) break;
     await ctx.sleep(150);
   }
-
-  // Settle, then look for survivors and for a late `ready`.
   await ctx.sleep(2000);
 
-  // §14 of CORRECTION-02: a failed post-sample is BLOCKED, never "clean".
-  let postSample = [];
-  let workerPid = 0;
-  let postSampleMeasured = false;
-  let postSampleReason = null;
-  try {
-    const after = await sampler.sample();
-    postSample = after.sample;
-    workerPid = after.workerPid;
-    postSampleMeasured = true;
-  } catch (error) {
-    postSampleReason = String(error?.message ?? error);
-  }
-
-  // §17: tri-state workDir evidence.
+  // 4. The CAPTURED group must have no surviving members, at host level.
+  const survivors = await ctx.processGroupMembers(captured.pgid);
   const workDir = await ctx.workDirPresent(jobId);
   const finalJob = await session.jobStatus(jobId);
 
   return {
     cancellation: {
       jobId,
+      extractor: video.extractor,
       transitions,
       lateReady: finalJob.status === "ready",
-      postSample,
-      postSampleMeasured,
-      postSampleReason,
-      workerPid,
+      capturedPgid: captured.pgid,
+      capturedYtdlpPid: captured.pid,
+      capturedComm: captured.comm,
+      groupMembersMeasured: survivors.measured === true,
+      groupSurvivors: survivors.measured === true ? survivors.value : [],
+      groupQueryReason: survivors.measured === true ? null : survivors.reason,
       beganProcessing: transitions.includes("processing"),
       uploaded: transitions.includes("uploading"),
       workDirMeasured: workDir.measured === true,
@@ -550,36 +576,53 @@ export async function runKillSwitchCase(ctx) {
 }
 
 /**
- * The actual-byte-limit case (§5 of CORRECTION-02).
+ * Asserts that a case genuinely reached the GENERIC path (§19/§29 of
+ * CORRECTION-03).
+ *
+ * A case whose fixture unexpectedly analyzes as `direct` proves nothing about
+ * generic acquisition — it exercised the pre-existing direct path, which was
+ * already accepted in Phase 9/§11c. Silently passing on that would let the
+ * whole generic acceptance be satisfied by the direct implementation.
+ */
+function requireGenericStrategy(video, caseName) {
+  const extractor = video?.extractor ?? null;
+  if (extractor !== "yt-dlp") {
+    throw new Error(
+      `case '${caseName}' requires the generic path, but the fixture analyzed as ` +
+        `extractor=${String(extractor)}; it cannot serve as generic acceptance evidence`,
+    );
+  }
+  return extractor;
+}
+
+/**
+ * The actual-byte-limit case (§17-§21 of CORRECTION-03).
  *
  * Proves the APPLICATION byte watcher, not `--max-filesize`. The pinned
  * `HttpFD.real_download` checks that option only inside `if data_len is not
  * None`, so a source whose length is unknown or misdeclared streams straight
  * past it — which is exactly the fixture this case requires.
  *
- * The unknown-length property is MEASURED, not asserted by the operator: the
- * harness probes the fixture itself and reads the response headers.
+ * ── Why the fixture reports its own transfer ───────────────────────────────
+ *
+ * An earlier draft did `HEAD` on the SUBMITTED URL. That is the wrong request:
+ * the submitted URL is a page, and the transfer under test is the *progressive
+ * media GET that yt-dlp selected from it*. A page with no `Content-Length` whose
+ * media resource declares one would have passed, while being caught by
+ * `--max-filesize` — evidence for the wrong gate entirely.
+ *
+ * The harness cannot see which media URL yt-dlp chose without breaching the
+ * private-selector boundary, so the controlled fixture reports the transfer
+ * semantics of the media GET it actually served. That keeps the raw selector
+ * private while making the claim about the right request.
  */
 export async function runByteLimitCase(ctx) {
   const { session, byteLimitUrl } = ctx;
 
-  // 1. Measure the fixture's declared length. A fixture that DOES declare a
-  //    usable length would be caught by --max-filesize, and a pass from it
-  //    would be evidence for the wrong gate.
-  const declared = await ctx.probeDeclaredLength(byteLimitUrl);
-  if (declared.measured !== true) {
-    throw new Error(`the byte-limit fixture's declared length could not be probed: ${declared.reason}`);
-  }
-  if (declared.value.declaredLengthUnknown !== true) {
-    throw new Error(
-      "the byte-limit fixture declares a usable Content-Length, so it would be caught by " +
-        "--max-filesize and cannot serve as evidence for the application byte watcher " +
-        "(LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)",
-    );
-  }
-
-  // 2. Submit through the real application path.
+  // 1. Establish the fixture is genuinely generic before anything else.
   const video = await session.analyze(byteLimitUrl);
+  requireGenericStrategy(video, "byte-limit");
+
   const preset = pickPreset(video?.presets);
   if (!preset) throw new Error("the byte-limit fixture advertised no application preset");
 
@@ -589,6 +632,29 @@ export async function runByteLimitCase(ctx) {
   const { polled } = await driveJobWithWindow(ctx, jobId, created.status);
   const finalJob = polled.final;
 
+  // 2. Ask the fixture what it ACTUALLY served for the media GET. This is the
+  //    request whose semantics the byte watcher had to cope with.
+  const transfer = await ctx.mediaTransferEvidence();
+  if (transfer.measured !== true) {
+    throw new Error(
+      `the actual media transfer semantics could not be established: ${transfer.reason} ` +
+        "(LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)",
+    );
+  }
+  if (transfer.value.actualMediaRequestObserved !== true) {
+    throw new Error(
+      "the fixture served no media request, so there is no transfer to reason about " +
+        "(LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)",
+    );
+  }
+  if (transfer.value.contentLengthPresent === true) {
+    throw new Error(
+      "the actual media GET declared a usable Content-Length, so --max-filesize could have " +
+        "stopped this job; it cannot serve as evidence for the application byte watcher " +
+        "(LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)",
+    );
+  }
+
   const workDir = await ctx.workDirPresent(jobId);
   if (workDir.measured !== true) {
     throw new Error("the per-job working directory could not be probed after the byte-limit case");
@@ -597,8 +663,12 @@ export async function runByteLimitCase(ctx) {
   return {
     byteLimitCase: {
       jobId,
+      extractor: video.extractor,
       declaredLengthUnknown: true,
-      declaredHeaders: declared.value.summary,
+      actualMediaRequestObserved: true,
+      contentLengthPresent: false,
+      transferMode: transfer.value.transferMode ?? null,
+      bytesServed: transfer.value.bytesServed ?? null,
       // The durable error code IS the outcome. `TOO_LARGE` is classified by the
       // application byte watcher; a user cancellation is a different code.
       outcome: finalJob?.errorCode ?? finalJob?.status ?? "unknown",
@@ -611,48 +681,32 @@ export async function runByteLimitCase(ctx) {
 }
 
 /**
- * The shutdown-during-acquisition case (§6 of CORRECTION-02).
+ * The shutdown-during-acquisition case (§9 of CORRECTION-03).
  *
  * The harness must remain non-mutating, so it COORDINATES rather than performs:
- * it starts a job, proves it is genuinely acquiring, prints a sanitized prompt,
- * and then waits for the operator's separately authorized Worker stop/restart.
- * `systemctl stop` is not on the read-only allowlist and is never called here.
+ * it starts a job, proves it is genuinely acquiring, CAPTURES THE EXACT OWNED
+ * PROCESS GROUP, prints a sanitized prompt, and then waits for the operator's
+ * separately authorized Worker stop/restart. `systemctl stop` is not on the
+ * read-only allowlist and is never called here.
  *
- * If the transition never happens inside the bounded window the case throws,
- * which the CLI turns into BLOCKED — never a pass.
+ * The post-restart proof is about the CAPTURED group, queried at host level.
+ * "The new Worker has no descendants" is a different assertion: after a restart
+ * a leaked acquisition process is orphaned and re-parented, so it would not be
+ * a descendant of the new Worker even while it was still running.
  */
 export async function runShutdownCase(ctx) {
-  const { session, sampler, genericUrl, log } = ctx;
+  const { session, genericUrl, log } = ctx;
 
   const video = await session.analyze(genericUrl);
+  requireGenericStrategy(video, "shutdown");
   const preset = pickPreset(video?.presets);
   if (!preset) throw new Error("the shutdown source advertised no application preset");
 
   const created = await session.createJob(genericUrl, preset.formatId);
   const jobId = created.jobId;
 
-  // 1. Prove the job is genuinely acquiring before prompting.
-  const deadline = Date.now() + 5 * 60 * 1000;
-  const transitions = [];
-  let last = null;
-  let reachedDownloading = false;
-  if (typeof created.status === "string") {
-    transitions.push(created.status);
-    last = created.status;
-  }
-  while (Date.now() < deadline && !reachedDownloading) {
-    const job = await session.jobStatus(jobId);
-    if (job.status !== last) {
-      transitions.push(job.status);
-      last = job.status;
-    }
-    if (job.status === "downloading") reachedDownloading = true;
-    if (["ready", "failed", "cancelled"].includes(job.status)) break;
-    await ctx.sleep(150);
-  }
-  if (!reachedDownloading) {
-    throw new Error("the shutdown fixture never reached durable `downloading`; no window to interrupt");
-  }
+  // 1. Reach durable `downloading` AND capture the exact owned group.
+  const captured = await awaitAcquisitionGroup(ctx, jobId, created.status);
 
   // 2. Hand the transition to the operator. Nothing here mutates.
   log("");
@@ -668,93 +722,168 @@ export async function runShutdownCase(ctx) {
     throw new Error(`no Worker restart was observed within the window: ${observed.reason}`);
   }
 
-  // 4. Descendants must be gone, and the job must be recovered.
-  let descendantsGone = false;
-  let postSampleMeasured = false;
-  try {
-    const after = await sampler.sample();
-    postSampleMeasured = true;
-    descendantsGone = evaluateTerminationCleanliness(after.sample, after.workerPid).clean === true;
-  } catch (error) {
-    throw new Error(`the post-restart process tree could not be sampled: ${String(error?.message ?? error)}`);
-  }
-
+  // 4. The CAPTURED group must be gone, at host level.
+  const survivors = await ctx.processGroupMembers(captured.pgid);
   const finalJob = await session.jobStatus(jobId);
 
   return {
     shutdownCase: {
       jobId,
-      transitions,
+      extractor: video.extractor,
+      transitions: captured.transitions,
+      capturedPgid: captured.pgid,
+      capturedYtdlpPid: captured.pid,
+      capturedComm: captured.comm,
       restartObserved: true,
       previousContainerPid: observed.value.previousPid,
       currentContainerPid: observed.value.currentPid,
-      postSampleMeasured,
-      descendantsGone,
+      groupMembersMeasured: survivors.measured === true,
+      groupSurvivors: survivors.measured === true ? survivors.value : [],
+      groupQueryReason: survivors.measured === true ? null : survivors.reason,
       recoveredStatus: finalJob?.status ?? "unknown",
     },
   };
 }
 
 /**
- * The safe-egress negative case (§7 of CORRECTION-02).
+ * Drives a job to durable `downloading` and captures the exact owned yt-dlp
+ * process identity (§6 of CORRECTION-03).
  *
- * An ADAPTER around the accepted Phase-9 machinery, not a second firewall
- * framework. The forbidden-destination fixture, its redirect and the policy
- * fingerprint all come from `deploy/acceptance/safe-egress/` and the existing
- * read-only verifier.
+ * The PGID is the load-bearing value: `process-runner.server.ts` spawns
+ * acquisition detached, so the owned process leads its own group, and every
+ * termination proof downstream is expressed in terms of that group. If it
+ * cannot be established the case aborts — a termination claim about a group
+ * nobody identified is not evidence.
+ */
+async function awaitAcquisitionGroup(ctx, jobId, initialStatus) {
+  const { session, sampler } = ctx;
+  const transitions = [];
+  let last = null;
+  if (typeof initialStatus === "string") {
+    transitions.push(initialStatus);
+    last = initialStatus;
+  }
+
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const job = await session.jobStatus(jobId);
+    if (job.status !== last) {
+      transitions.push(job.status);
+      last = job.status;
+    }
+    if (job.status === "downloading") {
+      const observed = await sampler.sample().catch(() => null);
+      if (observed?.ytdlpPid != null) {
+        const row = observed.sample.find((entry) => entry.pid === observed.ytdlpPid);
+        if (row) {
+          return {
+            transitions,
+            pid: row.pid,
+            pgid: row.pgid,
+            comm: row.comm,
+            netns: row.netns ?? null,
+            nodeMembers: observed.sample
+              .filter((entry) => entry.pgid === row.pgid && entry.comm === "node")
+              .map((entry) => entry.pid),
+          };
+        }
+      }
+    }
+    if (["ready", "failed", "cancelled"].includes(job.status)) break;
+    await ctx.sleep(150);
+  }
+  throw new Error(
+    "the owned yt-dlp process group could not be established while the job was in `downloading`",
+  );
+}
+
+/**
+ * The safe-egress negative case (§11-§15 of CORRECTION-03).
  *
- * The harness never widens the policy, adds a temporary allow, or disables the
- * watchdog — none of those commands are on the read-only allowlist.
+ * An ADAPTER around the accepted Phase-9 instrument, not a second firewall
+ * framework: the deny counters and the chain listing come from the same
+ * nftables rule-comment vocabulary `deploy/acceptance/safe-egress/counter.py`
+ * already reads.
+ *
+ * ── The required path ──────────────────────────────────────────────────────
+ *
+ *   public submitted generic source
+ *     -> direct returns EXTRACTOR_UNAVAILABLE
+ *     -> yt-dlp generic path
+ *     -> yt-dlp later attempts the controlled forbidden destination
+ *     -> the external nftables boundary denies it
+ *
+ * A submitted URL that simply redirects to a private address is NOT this: the
+ * control plane's own SSRF guard rejects it long before generic is reached, so
+ * the case would "pass" while proving only that the direct layer works.
  */
 export async function runSafeEgressCase(ctx) {
   const { session, egressRedirectUrl } = ctx;
 
-  // 1. Policy state BEFORE. The read-only verifier is the accepted instrument.
+  // 1. Policy state BEFORE — verifier verdict plus a real ruleset fingerprint.
   const before = await ctx.egressPolicyState();
   if (before.measured !== true) {
     throw new Error(`the safe-egress policy state could not be captured: ${before.reason}`);
   }
-
-  // 2. A generic request whose LATER destination is forbidden. The submitted
-  //    URL is public; the redirect target is the private/reserved address the
-  //    Phase-9 fixture serves.
-  let denied = false;
-  let deniedReason = null;
-  try {
-    await session.analyze(egressRedirectUrl);
-    // Reaching a successful analysis means the forbidden destination was
-    // REACHED, which is the failure this case exists to detect.
-  } catch (error) {
-    denied = true;
-    deniedReason = String(error?.message ?? error);
+  const beforeCounter = await ctx.denyCounter(before.value.listing);
+  if (beforeCounter.measured !== true) {
+    throw new Error(`the deny counter could not be read before the attempt: ${beforeCounter.reason}`);
   }
 
-  // 3. Attribute the denial to the external boundary using the existing
-  //    counter/verifier tooling rather than inferring it from a timeout.
-  const attribution = await ctx.egressDenialAttribution({ since: before.value.capturedAt });
-  if (attribution.measured !== true) {
-    throw new Error(`the denial could not be attributed to the boundary: ${attribution.reason}`);
-  }
+  // 2. Prove the fixture genuinely reaches the GENERIC path. If it analyzes as
+  //    direct, or the direct layer rejects it outright, this case cannot be
+  //    generic egress evidence.
+  const video = await session.analyze(egressRedirectUrl);
+  requireGenericStrategy(video, "safe-egress");
+  const preset = pickPreset(video?.presets);
+  if (!preset) throw new Error("the safe-egress fixture advertised no application preset");
 
-  // 4. Policy state AFTER — it must be byte-identical.
+  // 3. Run the acquisition, whose selected media destination is forbidden.
+  const created = await session.createJob(egressRedirectUrl, preset.formatId);
+  const polled = await session.pollTrace(created.jobId, {
+    intervalMs: 200,
+    initialStatus: created.status,
+  });
+  const finalJob = polled.final;
+  const requestDenied = finalJob?.status === "failed";
+
+  // 4. Attribute the denial to the boundary via the COUNTER, not the verdict.
   const after = await ctx.egressPolicyState();
   if (after.measured !== true) {
     throw new Error(`the safe-egress policy state could not be re-captured: ${after.reason}`);
   }
+  const afterCounter = await ctx.denyCounter(after.value.listing);
+  if (afterCounter.measured !== true) {
+    throw new Error(`the deny counter could not be read after the attempt: ${afterCounter.reason}`);
+  }
+
+  const attribution = attributeDenial({
+    before: beforeCounter,
+    after: afterCounter,
+    requestDenied,
+  });
+  if (attribution.measured !== true) throw new Error(attribution.reason);
 
   return {
     egressNegative: {
-      denied,
-      deniedReason,
-      attributedToBoundary: attribution.value.attributedToBoundary === true,
-      attribution: attribution.value.summary ?? null,
+      jobId: created.jobId,
+      genericPathEstablished: true,
+      extractor: video.extractor,
+      forbiddenClass: ctx.egressDenyClass,
+      denied: requestDenied,
+      attributedToBoundary: attribution.attributedToBoundary,
+      denyCounterBefore: attribution.denyCounterBefore,
+      denyCounterAfter: attribution.denyCounterAfter,
+      denyCounterDelta: attribution.denyCounterDelta,
+      policyVerifiedBefore: before.value.verifierExit === 0,
+      policyVerifiedAfter: after.value.verifierExit === 0,
     },
     egressPolicyFingerprint: {
       beforeMatchesAfter: before.value.fingerprint === after.value.fingerprint,
+      rulesetFingerprintStable: before.value.fingerprint === after.value.fingerprint,
     },
   };
 }
-
 
 // ── The case registry — the single source of truth ─────────────────────────
 //
@@ -771,6 +900,7 @@ export const CASE_PRODUCERS = Object.freeze({
   success: Object.freeze({
     run: runSuccessCase,
     live: true,
+    expectedFeatureState: "enabled",
     // The Worker control credential is REQUIRED, not optional: R2 evidence and
     // the object-metadata sentinel surface both come from the authenticated
     // Worker job view, which is the only place `objectKey` exists.
@@ -781,6 +911,7 @@ export const CASE_PRODUCERS = Object.freeze({
   cancellation: Object.freeze({
     run: runCancellationCase,
     live: true,
+    expectedFeatureState: "enabled",
     needs: ["genericUrl", "workerControl"],
     operatorTransition: false,
     summary: "cancel during downloading; survivors and cleanup",
@@ -788,6 +919,7 @@ export const CASE_PRODUCERS = Object.freeze({
   "byte-limit": Object.freeze({
     run: runByteLimitCase,
     live: true,
+    expectedFeatureState: "enabled",
     needs: ["byteLimitUrl"],
     operatorTransition: false,
     summary: "unknown-declared-length over-limit source aborts as TOO_LARGE",
@@ -795,6 +927,7 @@ export const CASE_PRODUCERS = Object.freeze({
   shutdown: Object.freeze({
     run: runShutdownCase,
     live: true,
+    expectedFeatureState: "enabled",
     needs: ["genericUrl"],
     // The harness proves the window and observes the result; the operator
     // performs the stop/restart. `systemctl stop` is not on the allowlist.
@@ -804,6 +937,7 @@ export const CASE_PRODUCERS = Object.freeze({
   "safe-egress": Object.freeze({
     run: runSafeEgressCase,
     live: true,
+    expectedFeatureState: "enabled",
     needs: ["egressRedirectUrl"],
     operatorTransition: false,
     summary: "public submission whose later destination is forbidden; denial attributed to the boundary",
@@ -811,6 +945,7 @@ export const CASE_PRODUCERS = Object.freeze({
   "direct-regression": Object.freeze({
     run: runDirectRegressionCase,
     live: true,
+    expectedFeatureState: "enabled",
     needs: ["directUrl"],
     operatorTransition: false,
     summary: "direct still succeeds as direct, with no yt-dlp process",
@@ -818,6 +953,11 @@ export const CASE_PRODUCERS = Object.freeze({
   "kill-switch": Object.freeze({
     run: runKillSwitchCase,
     live: true,
+    // The ONLY case that runs with generic DISABLED. The previous global guard
+    // required YTDLP_ENABLED=true for every Stage B case, which made this case
+    // — whose entire purpose is to prove the kill switch works — impossible to
+    // run at all.
+    expectedFeatureState: "disabled",
     needs: ["directUrl"],
     operatorTransition: true,
     summary: "generic unusable after the operator restores the disabled state",
@@ -835,12 +975,69 @@ export const CASE_PRODUCERS = Object.freeze({
   "fail-closed-runtime": Object.freeze({
     run: null,
     live: false,
+    expectedFeatureState: null,
     needs: [],
     operatorTransition: true,
     summary:
       "separately executed optional negative test against a disposable container; not a live case command",
   }),
 });
+
+
+/**
+ * The per-case deployment-state gate (§3/§4 of CORRECTION-03).
+ *
+ * `observed` is the `ytdlpEnabledRaw` observation. Three outcomes, and the
+ * unmeasured one is BLOCKED for every case: running a case while the deployment
+ * stage itself is unknown produces evidence nobody can interpret.
+ */
+export function evaluateCaseFeatureState(caseName, observed) {
+  const entry = CASE_PRODUCERS[caseName];
+  if (!entry) return { ok: false, reason: `unknown case '${caseName}'` };
+  const expected = entry.expectedFeatureState;
+  if (expected == null) {
+    return { ok: false, reason: `case '${caseName}' is not a live case command` };
+  }
+
+  if (observed?.measured !== true) {
+    return {
+      ok: false,
+      blocked: true,
+      reason:
+        "YTDLP_ENABLED could not be measured, so the deployment stage is unknown; " +
+        `refusing to run case '${caseName}'`,
+    };
+  }
+
+  const raw = observed.value;
+  // The accepted disabled grammar, unchanged: absent, or exactly "false".
+  const isEnabled = raw === "true";
+  const isDisabled = raw === null || raw === undefined || raw === "false";
+  const actual = isEnabled ? "enabled" : isDisabled ? "disabled" : "malformed";
+
+  if (actual === "malformed") {
+    return {
+      ok: false,
+      blocked: true,
+      reason: `YTDLP_ENABLED holds an out-of-grammar value; refusing to run case '${caseName}'`,
+    };
+  }
+  if (actual !== expected) {
+    return {
+      ok: false,
+      blocked: true,
+      reason:
+        `STAGE MISMATCH: case '${caseName}' requires generic ${expected}, ` +
+        `but the deployment is ${actual}. Refusing to run it against the wrong state.`,
+    };
+  }
+  return { ok: true, actual };
+}
+
+/** The state a case needs, for the README and the aggregation's ordering check. */
+export function expectedFeatureStateFor(caseName) {
+  return CASE_PRODUCERS[caseName]?.expectedFeatureState ?? null;
+}
 
 /** The names that can actually be run as `--stage B --case <name>`. */
 export function liveCaseNames() {

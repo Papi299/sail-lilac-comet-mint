@@ -77,6 +77,7 @@ No media URL, no hostname, no socket. Both exit non-zero on any deviation.
 | `lib/redact.mjs` | — | The single redaction implementation and the console safety boundary. |
 | `lib/evidence.mjs` | — | The sanitized machine-readable record, and the sentinel. |
 | `lib/download-window.mjs` | — | The durable-`downloading` sampling window and its complete aggregate. |
+| `lib/egress-policy.mjs` | — | Phase-9 deny-counter reading and the nftables ruleset fingerprint. |
 | `lib/provenance.mjs` | — | Tamper-evident artifacts: run identity, HMAC seal, deployment binding. |
 | `lib/coverage.mjs` | — | Which concrete producer obtains each check. Walked by the test suite. |
 | `lib/observers.mjs` | the VM host | Read-only system observers. Hard command allowlist. |
@@ -156,36 +157,70 @@ There is no unreviewed layer between Production and the acceptance logic.
 
 ### Commands
 
-| Command | Produces |
-| :--- | :--- |
-| `--stage A` | Every Stage A gate, including the direct-media regression. Writes the Stage A record. |
-| `--stage B --case success` | Generic analysis, job lifecycle, durable evidence, process sample, R2, signed GET, sentinel sweep. |
-| `--stage B --case cancellation` | Cancel-during-`downloading`, survivors, cleanup. |
-| `--stage B --case direct-regression` | Post-enable direct job with no yt-dlp process. |
-| `--stage B --case kill-switch` | Generic unusable after rollback; direct still works. |
-| `--stage B --case byte-limit` | Unknown-declared-length over-limit source aborts as `TOO_LARGE`. |
-| `--stage B --case shutdown` | Worker stop during acquisition — the harness coordinates, the operator acts. |
-| `--stage B --case safe-egress` | Forbidden later destination denied, attributed to the boundary. |
-| `--stage B --aggregate` | Validates every case record and produces the Stage B verdict. |
+| Command | Required generic state | Produces |
+| :--- | :--- | :--- |
+| `--stage A` | **disabled** | Every Stage A gate, including the direct-media regression. Writes the Stage A record and begins the run. |
+| `--stage B --case success` | **enabled** | Generic analysis, job lifecycle, durable evidence, the downloading window, R2, signed GET, sentinel sweep. |
+| `--stage B --case cancellation` | **enabled** | Captures the owned PGID, cancels, proves that exact group died. |
+| `--stage B --case byte-limit` | **enabled** | Unknown-declared-length **actual media GET** aborts as `TOO_LARGE`. |
+| `--stage B --case shutdown` | **enabled** | Captures the owned PGID, the operator restarts, that exact group must be gone. |
+| `--stage B --case safe-egress` | **enabled** | Forbidden later destination denied, attributed by the **deny counter**. |
+| `--stage B --case direct-regression` | **enabled** | Post-enable direct job with no yt-dlp process. |
+| `--stage B --case kill-switch` | **disabled** | Generic unusable after the operator rolls back; direct still works. |
+| `--stage B --aggregate` | either | Validates every case record and produces the Stage B verdict. |
+
+Each case declares the deployment state it requires. Running one against the
+wrong state is `BLOCKED`, and — importantly — so is running **any** case while
+`YTDLP_ENABLED` could not be measured: a case graded against an unknown stage
+produces evidence nobody can interpret.
 
 Each case writes its own record; the aggregation turns records into a verdict.
 Multi-run is deliberate: enabling generic, cancelling a job, stopping the Worker
 mid-acquisition and rolling the switch back are separate operator transitions
 that cannot share one process.
 
+### The ordered acceptance sequence
+
+Generic cannot be simultaneously enabled and disabled, so the cases are ordered
+around the two operator transitions:
+
+```
+Stage A                     generic DISABLED, must PASS
+   │
+   ▼  OPERATOR ENABLES GENERIC
+   │
+enabled-state cases         success · cancellation · byte-limit
+                            shutdown · safe-egress · direct-regression
+   │
+   ▼  OPERATOR DISABLES GENERIC
+   │
+kill-switch case            proves generic unusable, direct still works
+   │
+   ▼  OPERATOR RESTORES THE CHOSEN FINAL STATE
+   │
+--stage B --aggregate       consumes the sealed evidence from BOTH states
+```
+
+The harness performs **none** of those transitions. It measures the state it is
+given, refuses to run a case against the wrong one, and refuses to run any case
+at all when the state is unmeasurable.
+
 ### Case records cannot be forged
 
 Every Stage A record and every Stage B case record is **sealed** with an
-HMAC-SHA256 over a canonical encoding of:
+HMAC-SHA256 over a canonical encoding of the **complete record**, excluding only
+the authenticator field itself.
 
-```
-harness · schemaVersion · runId · stage · case · expectedSha
-· runningImageId · taggedImageId · verdict · payload
-```
+That covers `checks[]`, `runtime`, `services`, `delivery`, `process`, the nested
+`binding`, every timestamp, and any field added later — an enumerated subset
+would have left a future field silently outside the seal, and an editable
+`checks[0].outcome` is exactly what the seal exists to protect. Editing anything
+invalidates it, and an unverifiable record is **rejected outright rather than
+partially consumed**.
 
-Editing any of them — a boolean, a digest, a PID, a transition, the case name,
-the binding — invalidates the seal, and an unverifiable record is **rejected
-outright rather than partially consumed**. Authenticity is checked *before* any
+The top-level identity and the nested `binding` must also **agree**; both are
+inside the seal, so this catches a record sealed with two internally
+inconsistent copies of the same identity. Authenticity is checked *before* any
 field is read, because comparing binding fields out of an unverified record
 would be trusting the thing under test.
 
@@ -206,6 +241,8 @@ Stage A **begins** a run; Stage B cases and the aggregation **join** it.
   and would make a leak of its own state file a production incident;
 - never printed, never committed (it is in `.gitignore`), never in any evidence
   record — only the non-secret `runId` travels with the artifacts;
+- **refused on load if it is group- or world-readable**: a key any local account
+  can read is a key that can re-seal edited artifacts;
 - **deleted by the operator when acceptance is complete.**
 
 Stage B refuses to mint a key: doing so would make every prior artifact
@@ -488,6 +525,19 @@ If no sample was taken while the job was observed in `downloading`:
 BLOCKED
 ```
 
+**A sampling attempt that FAILED while the window was open is also `BLOCKED`** —
+it leaves a real interval nobody observed, and a negative claim cannot rest on
+that.
+
+**A sample that straddles the window close** is discarded and counted, not
+credited. Sampling is asynchronous, so the final in-flight snapshot straddles the
+close on every healthy run; treating that as a gap would block every run. It can
+neither admit a legitimate `processing` FFmpeg nor be counted as acquisition
+coverage. The residual limitation is real and is reported rather than hidden: a
+descendant appearing *only* during that final unresolvable instant would not be
+observed, and `ambiguousSampleCount` in the evidence shows how much of the tail
+was unresolvable.
+
 ### Proving the exact yt-dlp process
 
 `process.ytdlp-identified` requires a specific PID, not "a Python process
@@ -632,6 +682,109 @@ the denial is genuinely the external boundary's.
 the watchdog, or bind an internal fixture and call it a public-destination test.
 
 ---
+
+## Proving termination of the exact acquisition group
+
+`process group terminated` is a claim about **one specific group**, so the
+harness captures that group before the transition and asks the host about it
+afterwards.
+
+```
+job reaches durable `downloading`
+   │
+   ▼  capture pid, PGID, comm, netns of the OWNED yt-dlp process
+   │   (established by the detached-spawn invariant: pgid === pid)
+   │
+   ▼  cancellation, or the operator's Worker restart
+   │
+   ▼  ps -eo pid=,ppid=,pgid=,comm=  →  survivors of THAT pgid
+```
+
+`descendantsOf(currentWorkerPid)` cannot answer this. A cancelled or
+restart-orphaned acquisition process is re-parented away from the Worker, so an
+ancestry check sees a clean tree while the process is still running — and after
+a restart the new Worker never had those descendants in the first place.
+"The new Worker is clean" and "the old group died" are different assertions, and
+only the second is the one being made.
+
+| Observation | Outcome |
+| :--- | :--- |
+| No members of the captured PGID survive | `PASS` |
+| A plausible acquisition member survives | `FAIL` |
+| Host could not be queried, or the PGID was never captured | `BLOCKED` |
+| Survivors exist but none could belong to an acquisition group | `BLOCKED` — PID/PGID reuse is not distinguishable from a leak |
+
+The `ps` allowlist admits **one** invocation, `ps -eo pid=,ppid=,pgid=,comm=`.
+`ps -ef` and `ps aux` both print the full command line, whose last element on the
+acquisition process is the submitted media URL.
+
+## Attributing an egress denial to the boundary
+
+Phase 9 established the standard, and `counter.py` states it exactly: *a
+connection that fails while `deny-v4` increments was denied BY THE FIREWALL,
+whereas a connection that fails while every counter stays flat was denied by
+something else — most often a missing route.*
+
+So the safe-egress case reads the **actual nftables deny counter** before and
+after, through one allowlisted read-only listing:
+
+```
+nsenter -t <media-netns pid> -n nft -j list chain inet videofetch_egress output
+```
+
+| Observation | Outcome |
+| :--- | :--- |
+| Request failed **and** the deny counter moved | `PASS` candidate |
+| Request failed, counter flat | `FAIL` — something other than the boundary stopped it |
+| Counter unreadable | `BLOCKED` |
+| Ruleset fingerprint changed across the run | `FAIL` |
+
+The case also proves the forbidden destination was reached through the
+**generic** path (`extractor: yt-dlp`). A submitted URL that simply redirects to
+a private address is not this test: the control plane's own SSRF guard rejects it
+long before generic is reached, so the case would "pass" while proving only that
+the direct layer works. The fixture's *secondary media destination* is the
+forbidden one.
+
+The policy fingerprint hashes the normalized chain JSON with counters stripped.
+An earlier version combined the policy unit's systemd `InvocationID` and
+activation timestamp — which describe the *unit's lifetime*, not the rules: a
+rule changed by hand while the unit kept running would leave both identical.
+
+## Proving the application byte watcher, not `--max-filesize`
+
+The property is about the **actual progressive media GET** that yt-dlp selected,
+not about the page that was submitted.
+
+An earlier version did `HEAD` on the submitted URL. That is the wrong request: a
+page with no `Content-Length` whose media resource declared one would have
+passed, while being caught by `--max-filesize` — evidence for the wrong gate
+entirely.
+
+The harness cannot see which media URL yt-dlp chose without breaching the
+private-selector boundary, so the controlled fixture reports the transfer
+semantics of the media GET it actually served, via
+`VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL`:
+
+```
+actualMediaRequestObserved: true
+contentLengthPresent: false
+transferMode: chunked
+bytesServed: <over the configured limit>
+```
+
+The case fails if `contentLengthPresent` is true (then `--max-filesize` could
+have been the mechanism), fails if the fixture analyzed as `direct`, and is
+`BLOCKED` — `LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN` — if the transfer
+semantics cannot be established at all.
+
+## Generic-specific cases must actually run generic
+
+`success`, `cancellation`, `byte-limit`, `shutdown` and `safe-egress` each assert
+`extractor === "yt-dlp"` before producing evidence. An operator-supplied
+"generic URL" that resolves as `direct` would exercise the pre-existing direct
+path — already accepted in Phase 9 and runbook §11c — and prove nothing about
+generic acquisition.
 
 ## Measurement failure is not a finding
 
