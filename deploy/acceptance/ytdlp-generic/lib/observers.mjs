@@ -99,7 +99,14 @@ const READ_ONLY_COMMANDS = Object.freeze([
   ["docker", (a) => a[0] === "image" && a[1] === "inspect" && isAllowedImageInspect(a)],
   ["docker", (a) => a[0] === "logs"],
   // Process listing with an EXPLICIT safe column set — never a command line.
-  ["docker", (a) => a[0] === "top"],
+  //
+  // §6 of CORRECTION-06: ONE exact shape. Admitting `top` on argv[0] alone let
+  // `docker top <c> -o args`, `-o pid,args`, `-o command` and a bare
+  // `docker top <c>` (whose default format includes CMD) through the boundary
+  // the architecture claims makes command lines structurally unavailable. The
+  // column set is now part of the predicate, so an argv column cannot be
+  // requested at all.
+  ["docker", (a) => a[0] === "top" && isSafeProcessTop(a)],
   // Version probes inside the running container. Read-only by argument shape:
   // the allowlist admits exactly the known version invocations and nothing
   // else, so `docker exec` cannot become a general remote shell.
@@ -149,6 +156,28 @@ const READ_ONLY_COMMANDS = Object.freeze([
       DURABLE_QUERY_PATTERN.test(a[2]),
   ],
 ]);
+
+/**
+ * The ONLY process-listing column set this harness may request.
+ *
+ * There is no `args`, `cmd` or `command` column and there cannot be one: the
+ * acquisition argv's last element is the operator-supplied media URL — and,
+ * during the sentinel case, the sentinel itself.
+ */
+export const DOCKER_TOP_COLUMNS = "pid,ppid,pgid,comm";
+
+/** Docker's own container-name grammar, so the one dynamic token is still bounded. */
+const CONTAINER_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
+
+/** `docker top <container> -o pid,ppid,pgid,comm` and nothing else. */
+function isSafeProcessTop(argv) {
+  return (
+    argv.length === 4 &&
+    CONTAINER_NAME_PATTERN.test(String(argv[1])) &&
+    argv[2] === "-o" &&
+    argv[3] === DOCKER_TOP_COLUMNS
+  );
+}
 
 /**
  * The only container templates the allowlist admits.

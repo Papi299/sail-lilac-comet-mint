@@ -47,6 +47,24 @@ export const IMAGE_ID_PATTERN = /^sha256:[0-9a-f]{64}$/;
 export const SHA_PATTERN = /^[0-9a-f]{7,40}$/;
 
 /**
+ * The EXACT run-id grammar this harness produces (§16 of CORRECTION-06).
+ *
+ * `loadOrCreateRun` mints `randomBytes(8).toString("hex")` — sixteen lowercase
+ * hex characters — so that is what an existing run identity must be. The
+ * previous admission test was `typeof runId === "string"`, which accepted `""`,
+ * `"abc"`, and anything else a damaged or hand-edited file happened to carry.
+ *
+ * That mattered beyond tidiness: `runId` is inside the authenticated material
+ * and is compared across artifacts to prove they belong to one acceptance run.
+ * An identity the harness could never have generated is not a run identity, and
+ * accepting one lets a malformed file continue as though it were intact.
+ */
+export const RUN_ID_PATTERN = /^[0-9a-f]{16}$/;
+
+/** The acceptance-only HMAC key: 256 bits, lowercase hex. */
+export const RUN_KEY_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
  * Deterministic JSON encoding.
  *
  * Object keys are sorted at every depth, so a record that round-trips through a
@@ -285,11 +303,13 @@ async function readExistingRun(path, read) {
     };
   }
 
-  if (typeof parsed?.runId !== "string" || !/^[0-9a-f]{64}$/.test(String(parsed?.key ?? ""))) {
+  // BOTH fields must match the exact grammar the harness itself produces.
+  if (!RUN_ID_PATTERN.test(String(parsed?.runId ?? "")) || !RUN_KEY_PATTERN.test(String(parsed?.key ?? ""))) {
     return {
       error:
-        `the acceptance run key at ${path} exists but does not carry a usable runId and 256-bit ` +
-        "key. Refusing to overwrite it; archive or delete it deliberately, then re-run Stage A.",
+        `the acceptance run key at ${path} exists but does not carry a usable runId (16 lowercase ` +
+        "hex characters) and 256-bit key (64 lowercase hex characters). Refusing to overwrite it; " +
+        "archive or delete it deliberately, then re-run Stage A.",
     };
   }
 

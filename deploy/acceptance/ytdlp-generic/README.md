@@ -302,6 +302,15 @@ Stage A **begins** a run; Stage B cases and the aggregation **join** it.
 | malformed JSON | `BLOCKED` |
 | no usable `runId` / 256-bit key | `BLOCKED` |
 
+A run identity is admitted only in the **exact grammar the harness itself
+produces** — `runId` is 16 lowercase hex characters (`randomBytes(8)`), `key` is
+64 (`randomBytes(32)`). The previous test was `typeof runId === "string"`, which
+accepted `""`, `"abc"`, uppercase, and anything else a damaged or hand-edited
+file happened to carry. That matters beyond tidiness: `runId` is inside the
+authenticated material and is compared across artifacts to prove they belong to
+one acceptance run, so an identity the harness could never have generated is not
+a run identity.
+
 An earlier version fell through to "mint a fresh run" on unreadable or malformed
 content — which **overwrote** the file, destroying the only key that could ever
 verify the artifacts already sealed under it, and doing so silently at the exact
@@ -697,6 +706,65 @@ sentinel case, the sentinel — into evidence that must stay clean.
 `command` or `url`, so an observer that grows such a field fails the harness
 loudly instead of leaking quietly.
 
+#### The one admissible process listing
+
+That guarantee is only as strong as the command the allowlist admits. It used to
+check `argv[0] === "top"` alone, which left the argv one flag away:
+
+```
+docker top <container> -o pid,ppid,pgid,comm      ← the only admissible form
+```
+
+| Refused | Why |
+| :--- | :--- |
+| `docker top <c>` | the default format includes `CMD` |
+| `-o args` · `-o pid,args` · `-o command` · `-o cmd` | argv columns |
+| `-o pid,ppid,pgid,comm,args` | argv appended to the safe set |
+| `aux` · `-ef` · `-eo args` | full-listing forms |
+| any extra argument | shape must be exact |
+| a container name outside Docker's own grammar | the one dynamic token stays bounded |
+
+Refusal happens **before a process is spawned**, so an argv-bearing listing is
+never executed rather than executed and then filtered.
+
+#### An unreadable row cannot be skipped here either
+
+The downloading window's assertions are negative — no FFmpeg during
+acquisition, no unknown descendants, no namespace escape — and their evidence is
+the *absence* of matching rows. The previous parser did `continue` on a short row
+and on a non-numeric id, so one unreadable line left the rest looking clean and
+the window `PASSING`. The row most likely to be unusual is exactly the one those
+checks exist to catch.
+
+| Line | Outcome |
+| :--- | :--- |
+| header is `PID PPID PGID COMMAND` | required — see below |
+| three numeric ids parse | row kept, whatever follows |
+| numeric prefix unreadable | **whole sample unmeasured → sampler error → `BLOCKED`** |
+| `comm` is a plain basename | kept verbatim |
+| `comm` is anything else | kept, reported as `<unclassified>` |
+
+An unclassified descendant inside the Worker container is not an approved
+acquisition executable, so it lands in `unknownSeen` and **fails**
+`process.no-unknown-descendants` rather than vanishing into a clean result.
+
+**The header is validated, not skipped.** Blindly dropping the first line means
+an output whose header is missing or unexpected silently loses its first process
+row — and column positions that cannot be confirmed are positions that cannot be
+parsed by. The expected header was verified against the pinned image on this
+Docker/procps combination:
+
+```
+PID                 PPID                PGID                COMMAND
+```
+
+procps titles the `comm` column `COMMAND`; that is the column *name*, not the
+command line — `-o args` would be needed for argv, and the allowlist forbids it.
+
+This parser is kept separate from the host-level PGID parser. Both are
+fail-closed, but they read different commands with different output contracts,
+and collapsing them would couple parsers that are only incidentally similar.
+
 ### The actual-byte limit case (§38)
 
 The property to prove:
@@ -900,6 +968,64 @@ The aggregate re-checks the continuity object rather than trusting it, including
 recomputing `same` from the three ids, so it can state on its own authority that
 no accepted record combines evidence from two images.
 
+## One deployment state, start to finish
+
+Image continuity is not enough for a case that spans a restart. The **same
+authorized image** can come back with a different `YTDLP_ENABLED`:
+
+```
+pre-case          YTDLP_ENABLED=true
+acquisition starts; operator restarts the SAME image
+Worker returns with YTDLP_ENABLED=false
+restart recovery succeeds · image continuity holds
+   → an earlier version sealed `featureState: enabled`
+```
+
+That record combined two deployment states while claiming one, and nothing in
+the image binding could catch it.
+
+So every executable Stage B case measures the feature state on **both sides** of
+the producer and refuses to seal unless it held:
+
+```
+measure pre-case state · validate it is the state this case requires
+measure the authorized image
+   │
+   ▼  run the producer
+   │
+re-measure the image      → require the same object
+re-measure the state      → require the same required state
+   │
+   ▼  only then seal
+```
+
+| Gate | Enabled cases | `kill-switch` |
+| :--- | :--- | :--- |
+| `YTDLP_ENABLED` semantic state, both sides | `enabled` | `disabled` |
+| capability report, both sides | must not change | must not change |
+
+The disabled *spelling* may differ between the two measurements — absent and
+`"false"` are both disabled — because the semantic state is what the case
+requires.
+
+### What is deliberately **not** gated
+
+A particular capability *value*. For `kill-switch`, `/api/sites` still reporting
+`ytdlp: true` while the configuration is disabled is **not** a precondition
+failure — it is the single most important finding that case can produce.
+Refusing to run would convert *"the kill switch does not work"* into *"we did not
+look"*, which is the exact inversion the harness exists to prevent. The
+evaluator grades that conjunction from this same sealed evidence, as a `FAIL`.
+
+So the gate asks two questions the case cannot be interpreted without — *was the
+configuration the required one?* and *did the deployment move underneath us?* —
+and leaves every value judgement to the evaluator.
+
+`featureContinuity { before, after, sameRequiredState }` is sealed with the
+record, and `validateCaseRecord` **recomputes** it: `sameRequiredState` is never
+believed, and the canonical `featureState` must agree with the continuity it
+claims.
+
 ## The restart-recovery contract
 
 `shutdown` makes two independent claims, and neither may stand in for the other:
@@ -1077,17 +1203,41 @@ unobserved interval  !=  clean interval
 ```
 
 Every failed sampling attempt is accumulated in `samplingErrors`, and **one is
-enough** to make both direct sampling checks `BLOCKED` — even with hundreds of
-clean samples on either side of it. Clean samples do not describe the gap
-between them.
+enough** to make the coverage claim `BLOCKED` — even with hundreds of clean
+samples on either side of it. Clean samples do not describe the gap between
+them.
 
 The previous code held a single nullable `samplingFailure` that the next
 successful sample overwrote with nothing, so a run that lost an interval looked
 identical to one that never did. The successful samples stay in the evidence;
 they simply cannot support a continuous absence.
 
-A yt-dlp process actually *observed* in a clean run is still a `FAIL`, not a
-`BLOCKED` — that is a measured finding, not a gap.
+### A gap must not erase a finding
+
+The case makes **two independent claims**, and they are graded separately:
+
+```
+A. was the run continuously observable?      -> coverage
+B. did any observed sample contain yt-dlp?   -> the finding
+```
+
+|  | no gap | gap |
+| :--- | :--- | :--- |
+| **no yt-dlp seen** | `PASS` + `PASS` | `BLOCKED` + `BLOCKED` |
+| **yt-dlp seen** | `PASS` + `FAIL` | `BLOCKED` + **`FAIL`** |
+
+An earlier version routed both through one gate, so a single failed attempt
+downgraded a positively observed yt-dlp process to `BLOCKED` — turning the
+strongest evidence the case can produce into uncertainty. A process seen in a
+successful sample *was seen*, whatever happened in some other interval.
+
+`FAIL` outranks `BLOCKED` in the summary, so the bottom-right cell fails the
+run, which is the honest reading: something bad happened **and** we could not
+see all of it.
+
+The finding is derived only from **successful samples**. An error message is
+never mined for evidence of a process — a failed attempt observed nothing by
+definition.
 
 ## Generic-specific cases must actually run generic
 
@@ -1141,6 +1291,7 @@ where they belong.
 | The old process group has no survivors | **Live** — and only after every host process row was assigned to a group |
 | The interrupted job was recovered per the restart policy | **Live** — `failed` / `PROCESSING_FAILED` / the deterministic restart message |
 | The case ran against one image, start to finish | **Live** — image resolved before and after the producer |
+| The case ran in one deployment state, start to finish | **Live** — feature state measured before and after the producer |
 | No yt-dlp appeared during the direct job | **Live** — and only across a run with zero sampling gaps |
 
 The internal direct→generic fall-through for the generic URL is **not**

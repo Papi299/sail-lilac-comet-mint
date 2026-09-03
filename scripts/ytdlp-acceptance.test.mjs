@@ -46,10 +46,12 @@ import {
   validateSampleShape,
   descendantsOf,
   ALLOWED_SAMPLE_FIELDS,
+  YTDLP_RUNTIME_BASENAMES,
 } from "../deploy/acceptance/ytdlp-generic/lib/process-tree.mjs";
 import {
   establishYtdlpPid,
   parseDockerTop,
+  UNCLASSIFIED_COMM,
 } from "../deploy/acceptance/ytdlp-generic/lib/process-sampler.mjs";
 import {
   evaluateTransitionTrace,
@@ -85,6 +87,7 @@ import {
   makeSystemObservers,
   parseMaxFileSize,
   decodeEnvProbe,
+  DOCKER_TOP_COLUMNS,
   DEFAULT_MAX_FILE_SIZE_BYTES,
   EJS_PROBE_ARGV,
   ENV_NAMES_PROBE_ARGV,
@@ -94,6 +97,7 @@ import {
 import {
   buildCaseRecord,
   validateCaseRecord,
+  evaluateFeatureContinuity,
   pickPreset,
   caseNames,
   liveCaseNames,
@@ -111,7 +115,7 @@ import {
   parseDenyClass,
   DENY_CLASSES,
 } from "../deploy/acceptance/ytdlp-generic/lib/egress-policy.mjs";
-import { parseHostProcessList, UNCLASSIFIED_COMM } from "../deploy/acceptance/ytdlp-generic/lib/observers.mjs";
+import { parseHostProcessList } from "../deploy/acceptance/ytdlp-generic/lib/observers.mjs";
 import { readFile } from "node:fs/promises";
 import {
   producerFor,
@@ -135,6 +139,7 @@ import {
   loadOrCreateRun,
   loadRun,
   EVIDENCE_SCHEMA_VERSION,
+  RUN_ID_PATTERN,
 } from "../deploy/acceptance/ytdlp-generic/lib/provenance.mjs";
 import { main, loadStageA } from "../deploy/acceptance/ytdlp-generic/acceptance.mjs";
 
@@ -312,15 +317,18 @@ function byteLimitEvidence(overrides = {}) {
  * The harness measures this live; the tests fill it from the same registry the
  * validator consults, so a test record is realistic by construction.
  */
-function caseRecord({ caseName, binding, payload, state, imageContinuity, ...rest }) {
+function caseRecord({ caseName, binding, payload, state, imageContinuity, featureContinuity, ...rest }) {
   const imageId = binding?.runningImageId ?? IMAGE_ID;
+  const phase = featureState(state ?? expectedFeatureStateFor(caseName) ?? "enabled");
   return buildCaseRecord({
     caseName,
     binding,
     payload,
-    featureState: featureState(state ?? expectedFeatureStateFor(caseName) ?? "enabled"),
-    // The producing CLI measures the image on both sides of the producer; a
-    // realistic test record carries the same evidence.
+    featureState: phase,
+    // The producing CLI measures BOTH the image and the feature state on either
+    // side of the producer; a realistic test record carries the same evidence.
+    featureContinuity:
+      featureContinuity ?? { before: phase, after: phase, sameRequiredState: true },
     imageContinuity:
       imageContinuity ?? { before: imageId, after: imageId, taggedImageId: imageId, same: true },
     ...rest,
@@ -456,6 +464,17 @@ function makeFakeWorld(options = {}) {
     imageAfterDrift: options.imageAfterDrift ?? `sha256:${"e".repeat(64)}`,
     restartAfterPidReads: options.restartAfterPidReads ?? null,
     imageAfterRestart: options.imageAfterRestart ?? null,
+    // §15 of CORRECTION-06: a restart may bring the SAME image back with a
+    // DIFFERENT deployment feature state. Modelling that explicitly is what
+    // proves image continuity does not stand in for feature continuity.
+    ytdlpEnabledAfterRestart: options.ytdlpEnabledAfterRestart,
+    sitesAfterRestart: options.sitesAfterRestart,
+    // A restart is not the only way the deployment state can move under a
+    // case. This flips it after N reads of the YTDLP_ENABLED probe, which is a
+    // deterministic point for cases that never touch the container PID.
+    featureFlipsAfterEnvReads: options.featureFlipsAfterEnvReads ?? null,
+    ytdlpEnabledAfterFlip: options.ytdlpEnabledAfterFlip,
+    sitesAfterFlip: options.sitesAfterFlip,
     // The single non-secret deployment variable the byte-limit case reads.
     // `undefined` means the deployment does not set it and the Worker's own
     // 500 MiB default applies.
@@ -470,7 +489,9 @@ function makeFakeWorld(options = {}) {
     pid: 100,
     imageReads: 0,
     pidReads: 0,
+    envReads: 0,
     restarted: false,
+    flipped: false,
   };
 
   function currentImage() {
@@ -491,6 +512,13 @@ function makeFakeWorld(options = {}) {
       live.restarted = true;
       live.pid = 400;
       if (env.imageAfterRestart) live.image = env.imageAfterRestart;
+      // The container comes back with whatever the operator left in the
+      // environment file — which may not be what it went down with.
+      if (env.ytdlpEnabledAfterRestart !== undefined) {
+        if (env.ytdlpEnabledAfterRestart === null) delete workerEnvironment.YTDLP_ENABLED;
+        else workerEnvironment.YTDLP_ENABLED = String(env.ytdlpEnabledAfterRestart);
+      }
+      if (env.sitesAfterRestart) env.sites = env.sitesAfterRestart;
     }
     return live.pid;
   }
@@ -509,6 +537,9 @@ function makeFakeWorld(options = {}) {
   // retrieve them, so the fake models a container that genuinely holds them and
   // the tests assert they never come back. A fake that simply had no secrets
   // could not catch a regression to a full-environment dump.
+  //
+  // Mutable, because a restart can legitimately change it — see
+  // `ytdlpEnabledAfterRestart`.
   const workerEnvironment = {
     WORKER_CONTROL_KEY_ID: "acceptance-key-id",
     WORKER_CONTROL_SECRET: SECRET_SENTINELS.workerControl,
@@ -562,7 +593,11 @@ function makeFakeWorld(options = {}) {
       if (argv[0] === "top") {
         return {
           exitCode: 0,
-          stdout: "PID PPID PGID COMMAND\n100 1 100 node\n200 100 200 python3\n",
+          // Overridable so a test can present the exact listing that would
+          // defeat the downloading-window assertions.
+          stdout:
+            options.dockerTopStdout ??
+            "PID PPID PGID COMMAND\n100 1 100 node\n200 100 200 python3\n",
           stderr: "",
         };
       }
@@ -576,7 +611,23 @@ function makeFakeWorld(options = {}) {
         }
         if (probe === YTDLP_ENABLED_PROBE_ARGV.join(" ")) {
           const value = workerEnvironment.YTDLP_ENABLED;
-          return { exitCode: 0, stdout: `${value === undefined ? "<UNSET>" : `SET:${value}`}\n`, stderr: "" };
+          const answer = value === undefined ? "<UNSET>" : `SET:${value}`;
+          live.envReads += 1;
+          if (
+            env.featureFlipsAfterEnvReads !== null &&
+            live.envReads >= env.featureFlipsAfterEnvReads &&
+            !live.flipped
+          ) {
+            live.flipped = true;
+            if (env.ytdlpEnabledAfterFlip === null) delete workerEnvironment.YTDLP_ENABLED;
+            else if (env.ytdlpEnabledAfterFlip !== undefined) {
+              workerEnvironment.YTDLP_ENABLED = String(env.ytdlpEnabledAfterFlip);
+            }
+            if (env.sitesAfterFlip) env.sites = env.sitesAfterFlip;
+          }
+          // The answer is the state BEFORE this read's flip took effect, which
+          // is what a real read at that instant would have returned.
+          return { exitCode: 0, stdout: `${answer}\n`, stderr: "" };
         }
         if (probe === MAX_FILE_SIZE_PROBE_ARGV.join(" ")) {
           const value = workerEnvironment.MAX_FILE_SIZE;
@@ -1670,12 +1721,21 @@ describe("process sample schema", () => {
   });
 
   it("26. the real sampler parses docker top into closed-schema rows", () => {
-    const rows = parseDockerTop("PID PPID PGID COMMAND\n100 1 100 node\n200 100 200 python3\n");
-    assert.deepEqual(rows, [
+    const parsed = parseDockerTop("PID PPID PGID COMMAND\n100 1 100 node\n200 100 200 python3\n");
+    assert.equal(parsed.ok, true, parsed.reason);
+    assert.deepEqual(parsed.rows, [
       { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: null },
       { pid: 200, ppid: 100, pgid: 200, comm: "python3", netns: null },
     ]);
-    assert.equal(establishYtdlpPid(rows, 100).pid, 200);
+    assert.equal(establishYtdlpPid(parsed.rows, 100).pid, 200);
+
+    // The real header is space-padded, exactly as `docker top` emits it.
+    const padded = parseDockerTop(
+      "PID                 PPID                PGID                COMMAND\n" +
+        "66545               66520               66545               sh\n",
+    );
+    assert.equal(padded.ok, true, padded.reason);
+    assert.deepEqual(padded.rows, [{ pid: 66545, ppid: 66520, pgid: 66545, comm: "sh", netns: null }]);
   });
 
   it("26b. ambiguity is a measurement failure, never a guess", () => {
@@ -3366,8 +3426,10 @@ describe("complete-record provenance", () => {
   });
 
   it("25. a group- or world-readable run key is refused", async () => {
+    // A run id of the exact shape the harness itself mints (§16 of
+    // CORRECTION-06); the permission check is what is under test here.
     const deps = {
-      readFile: async () => JSON.stringify({ runId: "abc", key: "d".repeat(64) }),
+      readFile: async () => JSON.stringify({ runId: "a1b2c3d4e5f60718", key: "d".repeat(64) }),
       stat: async () => ({ mode: 0o644 }),
     };
     const loaded = await loadRun("/tmp/run.json", deps);
@@ -3375,7 +3437,7 @@ describe("complete-record provenance", () => {
     assert.match(loaded.error, /must not be group- or world-accessible/);
 
     const safe = await loadRun("/tmp/run.json", { ...deps, stat: async () => ({ mode: 0o600 }) });
-    assert.equal(safe.runId, "abc");
+    assert.equal(safe.runId, "a1b2c3d4e5f60718");
   });
 });
 
@@ -4448,11 +4510,13 @@ describe("image continuity", () => {
     ]) {
       // `buildCaseRecord` directly, so an ABSENT continuity object is genuinely
       // absent rather than filled in by the test helper's default.
+      const phase = featureState("enabled");
       const record = buildCaseRecord({
         caseName: "cancellation",
         binding,
         payload: { cancellation: cancellationEvidence({ postSample: [] }) },
-        featureState: featureState("enabled"),
+        featureState: phase,
+        featureContinuity: { before: phase, after: phase, sameRequiredState: true },
         imageContinuity: continuity,
       });
       const validated = validateCaseRecord(record, binding);
@@ -4461,11 +4525,10 @@ describe("image continuity", () => {
     }
 
     // And a record whose continuity disagrees with the id it binds to.
-    const mismatched = buildCaseRecord({
+    const mismatched = caseRecord({
       caseName: "cancellation",
       binding,
       payload: { cancellation: cancellationEvidence({ postSample: [] }) },
-      featureState: featureState("enabled"),
       imageContinuity: { before: other, after: other, taggedImageId: other, same: true },
     });
     assert.match(
@@ -4891,10 +4954,10 @@ describe("run-key lifecycle", () => {
       ["unreadable content", { readThrows: Object.assign(new Error("denied"), { code: "EACCES" }) }, /could not be read/],
       ["malformed JSON", { contents: "{not json" }, /not valid JSON/],
       ["truncated JSON", { contents: '{"runId":"abc"' }, /not valid JSON/],
-      ["missing key", { contents: '{"runId":"abc"}' }, /usable runId and 256-bit key/],
-      ["short key", { contents: '{"runId":"abc","key":"aa"}' }, /usable runId and 256-bit key/],
-      ["non-hex key", { contents: `{"runId":"abc","key":"${"z".repeat(64)}"}` }, /usable runId and 256-bit key/],
-      ["missing runId", { contents: `{"key":"${"c".repeat(64)}"}` }, /usable runId and 256-bit key/],
+      ["missing key", { contents: '{"runId":"a1b2c3d4e5f60718"}' }, /usable runId/],
+      ["short key", { contents: '{"runId":"a1b2c3d4e5f60718","key":"aa"}' }, /usable runId/],
+      ["non-hex key", { contents: `{"runId":"a1b2c3d4e5f60718","key":"${"z".repeat(64)}"}` }, /usable runId/],
+      ["missing runId", { contents: `{"key":"${"c".repeat(64)}"}` }, /usable runId/],
       ["an empty file", { contents: "" }, /not valid JSON/],
     ];
     for (const [what, options, pattern] of cases) {
@@ -4990,6 +5053,677 @@ describe("dry-run inertness", () => {
     assert.equal(run.code, 3);
     assert.match(run.err, /not a live case command/);
     assert.equal(world.calls.commands.length, 0);
+  });
+});
+
+// ── CORRECTION-06 §3-§5: a positive finding outranks an observation gap ───
+
+describe("direct regression: finding vs coverage", () => {
+  const directEvidence = (overrides = {}) => ({
+    jobId: "aa".repeat(16),
+    status: "ready",
+    extractor: "direct",
+    processSamplingMeasured: true,
+    samplesTaken: 5,
+    samplingErrors: [],
+    samplingErrorCount: 0,
+    sampledBasenames: ["node"],
+    ...overrides,
+  });
+
+  const verdicts = (overrides) => {
+    const result = evaluateStageB(
+      passingStageBObservations({ directAfterEnable: measured(directEvidence(overrides)) }),
+      passingStageA(),
+    );
+    return {
+      summary: result.summary.verdict,
+      ...Object.fromEntries(
+        result.checks.filter((c) => c.id.startsWith("direct.")).map((c) => [c.id, c.outcome]),
+      ),
+    };
+  };
+
+  const GAP = { samplingErrors: ["docker top exited 1"], samplingErrorCount: 1 };
+  const FOUND = { sampledBasenames: ["node", "python3"] };
+
+  it("54. clean run, no gap, no finding -> PASS + PASS", () => {
+    const v = verdicts({});
+    assert.equal(v["direct.process-sampling-available"], OUTCOMES.PASS);
+    assert.equal(v["direct.no-ytdlp-spawned"], OUTCOMES.PASS);
+  });
+
+  it("54b. gap, no finding -> BLOCKED + BLOCKED", () => {
+    const v = verdicts({ ...GAP });
+    assert.equal(v["direct.process-sampling-available"], OUTCOMES.BLOCKED);
+    assert.equal(v["direct.no-ytdlp-spawned"], OUTCOMES.BLOCKED);
+  });
+
+  it("54c. finding, no gap -> PASS + FAIL", () => {
+    const v = verdicts({ ...FOUND });
+    assert.equal(v["direct.process-sampling-available"], OUTCOMES.PASS);
+    assert.equal(v["direct.no-ytdlp-spawned"], OUTCOMES.FAIL);
+  });
+
+  it("54d. THE DEFECT: finding AND gap -> BLOCKED coverage, FAIL finding", () => {
+    // A gap in one interval must not erase a process positively observed in
+    // another. The previous code routed both through one gate and downgraded
+    // this to BLOCKED — losing the strongest evidence the case can produce.
+    const v = verdicts({ ...FOUND, ...GAP });
+    assert.equal(v["direct.process-sampling-available"], OUTCOMES.BLOCKED);
+    assert.equal(v["direct.no-ytdlp-spawned"], OUTCOMES.FAIL);
+    assert.equal(v.summary, OUTCOMES.FAIL, "FAIL outranks BLOCKED in the summary");
+  });
+
+  it("54e. 500 clean samples cannot outvote a gap, nor bury a finding", () => {
+    const many = { samplesTaken: 500 };
+    assert.equal(
+      verdicts({ ...many, ...GAP })["direct.no-ytdlp-spawned"],
+      OUTCOMES.BLOCKED,
+      "no finding + gap stays BLOCKED",
+    );
+    const withFinding = verdicts({ ...many, ...GAP, ...FOUND });
+    assert.equal(withFinding["direct.no-ytdlp-spawned"], OUTCOMES.FAIL);
+    assert.equal(withFinding.summary, OUTCOMES.FAIL);
+  });
+
+  it("54f. every approved yt-dlp runtime basename is a finding", () => {
+    for (const name of [...YTDLP_RUNTIME_BASENAMES, "yt-dlp"]) {
+      assert.equal(
+        verdicts({ sampledBasenames: ["node", name] })["direct.no-ytdlp-spawned"],
+        OUTCOMES.FAIL,
+        name,
+      );
+    }
+    // An ordinary descendant is not a finding.
+    for (const name of ["node", "sh", UNCLASSIFIED_COMM]) {
+      assert.notEqual(
+        verdicts({ sampledBasenames: ["node", name] })["direct.no-ytdlp-spawned"],
+        OUTCOMES.FAIL,
+        name,
+      );
+    }
+  });
+
+  it("54g. a finding is never inferred from an error message", () => {
+    // The error text mentions python3; only SUCCESSFUL samples may produce the
+    // positive finding, so this is a gap, not a finding.
+    const v = verdicts({
+      samplingErrors: ["docker top exited 1 while python3 was running"],
+      samplingErrorCount: 1,
+    });
+    assert.equal(v["direct.no-ytdlp-spawned"], OUTCOMES.BLOCKED);
+    assert.notEqual(v["direct.no-ytdlp-spawned"], OUTCOMES.FAIL);
+  });
+
+  it("55. CLI-shaped: a finding survives a sampling gap into the aggregate", async () => {
+    // One failed attempt, then successful samples that DO contain yt-dlp.
+    let calls = 0;
+    const flakySampler = {
+      async sample() {
+        calls += 1;
+        if (calls === 1) throw new Error("docker top exited 1");
+        return {
+          sample: [
+            { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: "net:[4026532001]" },
+            { pid: 200, ppid: 100, pgid: 200, comm: "python3", netns: "net:[4026532001]" },
+          ],
+          workerPid: 100,
+          ytdlpPid: 200,
+          expectedNetns: "net:[4026532001]",
+        };
+      },
+    };
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const run = await runCli(
+      ["--stage", "B", "--case", "direct-regression", ...LIVE_ARGS, "--evidence", "/tmp/d.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun(), sampler: flakySampler },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+
+    const payload = JSON.parse(run.files.get("/tmp/d.json")).payload.directAfterEnable;
+    assert.equal(payload.samplingErrorCount, 1, "the gap is sealed");
+    assert.ok(payload.sampledBasenames.includes("python3"), "and so is the finding");
+
+    const result = evaluateStageB(
+      passingStageBObservations({ directAfterEnable: measured(payload) }),
+      passingStageA(),
+    );
+    assert.equal(
+      result.checks.find((c) => c.id === "direct.process-sampling-available").outcome,
+      OUTCOMES.BLOCKED,
+    );
+    assert.equal(
+      result.checks.find((c) => c.id === "direct.no-ytdlp-spawned").outcome,
+      OUTCOMES.FAIL,
+    );
+    assert.equal(result.summary.verdict, OUTCOMES.FAIL);
+  });
+});
+
+// ── CORRECTION-06 §6-§10: the docker top boundary and parser ─────────────
+
+describe("docker top boundary", () => {
+  const SAFE = ["top", "videofetch-worker", "-o", "pid,ppid,pgid,comm"];
+
+  it("56. exactly one process-listing shape is admissible", () => {
+    assert.equal(isReadOnlyCommand("docker", SAFE), true);
+    assert.equal(DOCKER_TOP_COLUMNS, "pid,ppid,pgid,comm");
+  });
+
+  it("56b. every command-line-bearing form is structurally refused", () => {
+    for (const argv of [
+      ["top", "videofetch-worker"],
+      ["top", "videofetch-worker", "-eo", "args"],
+      ["top", "videofetch-worker", "-o", "args"],
+      ["top", "videofetch-worker", "-o", "pid,args"],
+      ["top", "videofetch-worker", "-o", "command"],
+      ["top", "videofetch-worker", "-o", "cmd"],
+      ["top", "videofetch-worker", "-o", "pid,ppid,pgid,comm,args"],
+      ["top", "videofetch-worker", "aux"],
+      ["top", "videofetch-worker", "-ef"],
+      ["top", "videofetch-worker", "-o", "pid,ppid,pgid,comm", "extra"],
+      ["top", "videofetch-worker", "-O", "pid,ppid,pgid,comm"],
+      // The one dynamic token is still bounded by Docker's own name grammar.
+      ["top", "../etc", "-o", "pid,ppid,pgid,comm"],
+      ["top", "-x", "-o", "pid,ppid,pgid,comm"],
+      ["top", "", "-o", "pid,ppid,pgid,comm"],
+    ]) {
+      assert.equal(isReadOnlyCommand("docker", argv), false, argv.join(" "));
+    }
+  });
+
+  it("57. the real space-padded header is accepted; an unknown one is refused", () => {
+    const real =
+      "PID                 PPID                PGID                COMMAND\n" +
+      "66545               66520               66545               sh\n";
+    assert.equal(parseDockerTop(real).ok, true);
+
+    for (const [stdout, what] of [
+      ["", "no output at all"],
+      ["100 1 100 node\n", "no header"],
+      ["PID PPID COMMAND\n100 1 node\n", "wrong column count"],
+      ["PID PPID PGID CMD\n100 1 100 node\n", "an unexpected title"],
+      ["UID PID PPID COMMAND\n1 2 3 node\n", "a different column set"],
+      ["PID PPID PGID COMMAND\n", "a header with no rows"],
+    ]) {
+      const parsed = parseDockerTop(stdout);
+      assert.equal(parsed.ok, false, what);
+      assert.equal(parsed.rows, undefined, what);
+    }
+  });
+
+  it("57b. a headerless listing does not lose its first row to the header slot", () => {
+    // The previous parser dropped line 1 unconditionally. Here line 1 is a real
+    // process, and losing it silently is exactly the failure mode.
+    const parsed = parseDockerTop("100 1 100 node\n200 100 200 ffmpeg\n");
+    assert.equal(parsed.ok, false, "unrecognized format is refused, not partially parsed");
+    assert.doesNotMatch(parsed.reason, /ffmpeg/);
+  });
+
+  it("58. an unreadable numeric prefix makes the WHOLE sample unmeasured", () => {
+    for (const stdout of [
+      "PID PPID PGID COMMAND\nxxx 100 300 ffmpeg\n",
+      "PID PPID PGID COMMAND\n100 x 100 node\n",
+      "PID PPID PGID COMMAND\n100 1 abc node\n",
+      "PID PPID PGID COMMAND\n100 1 100\n",
+      `PID PPID PGID COMMAND\n${"9".repeat(20)} 1 100 node\n`,
+    ]) {
+      const parsed = parseDockerTop(stdout);
+      assert.equal(parsed.ok, false, stdout);
+      assert.equal(parsed.rows, undefined);
+      assert.doesNotMatch(parsed.reason, /ffmpeg|node/, "the refusal must not quote the row");
+    }
+  });
+
+  it("58b. THE ATTACK: the only forbidden descendant is the malformed row", () => {
+    // Under the previous parser this row was silently skipped and the remaining
+    // rows looked clean — a PASS built on the absence of the very process the
+    // check exists to catch.
+    const parsed = parseDockerTop(
+      "PID PPID PGID COMMAND\n100 1 100 node\nxxx 100 300 ffmpeg\n200 100 200 python3\n",
+    );
+    assert.equal(parsed.ok, false, "the sample must be refused, not silently cleaned");
+  });
+
+  it("58c. a malformed row between two valid rows cannot disappear", () => {
+    const clean = parseDockerTop("PID PPID PGID COMMAND\n100 1 100 node\n200 100 200 python3\n");
+    assert.equal(clean.rows.length, 2);
+    const withHole = parseDockerTop(
+      "PID PPID PGID COMMAND\n100 1 100 node\nBAD ROW HERE\n200 100 200 python3\n",
+    );
+    assert.equal(withHole.ok, false);
+    assert.equal(withHole.rows, undefined, "no partial row set is offered");
+  });
+
+  it("59. a valid row with an unusual comm is RETAINED under a safe token", () => {
+    const parsed = parseDockerTop(
+      "PID PPID PGID COMMAND\n100 1 100 node\n300 100 300 some odd thing\n",
+    );
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.rows.length, 2, "the odd row must not disappear");
+    assert.equal(parsed.rows[1].comm, UNCLASSIFIED_COMM);
+    assert.doesNotMatch(JSON.stringify(parsed), /odd thing/, "no raw text reaches the evidence");
+  });
+
+  it("59b. an unclassified descendant FAILS the unknown-descendant check", () => {
+    // Inside the Worker container it is not an approved acquisition executable,
+    // so it must be a finding rather than a clean result.
+    const NS = "net:[4026532001]";
+    const window = windowOf([
+      acquisitionSample([{ pid: 300, ppid: 200, pgid: 200, comm: UNCLASSIFIED_COMM, netns: NS }]),
+    ]);
+    const aggregate = aggregateDownloadWindow(window);
+    assert.ok(
+      aggregate.unknownSeen.some((row) => row.comm === UNCLASSIFIED_COMM),
+      "an unclassified descendant is an unknown descendant",
+    );
+    const result = evaluateStageB(
+      passingStageBObservations({ downloadingWindow: measured(window) }),
+      passingStageA(),
+    );
+    assert.equal(
+      result.checks.find((c) => c.id === "process.no-unknown-descendants").outcome,
+      OUTCOMES.FAIL,
+    );
+  });
+
+  it("59c. a retained ffmpeg row FAILS the downloading boundary", () => {
+    const NS = "net:[4026532001]";
+    const parsed = parseDockerTop(
+      "PID PPID PGID COMMAND\n100 1 100 node\n200 100 200 python3\n300 200 200 ffmpeg\n",
+    );
+    assert.equal(parsed.ok, true);
+    const window = windowOf([parsed.rows.map((row) => ({ ...row, netns: NS }))]);
+    const result = evaluateStageB(
+      passingStageBObservations({ downloadingWindow: measured(window) }),
+      passingStageA(),
+    );
+    assert.equal(
+      result.checks.find((c) => c.id === "process.no-ffmpeg-during-downloading").outcome,
+      OUTCOMES.FAIL,
+    );
+  });
+
+  it("60. CLI-shaped attack: a malformed forbidden row BLOCKS the window", async () => {
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+      // The FFmpeg that would defeat the acquisition assertion is the one row
+      // that cannot be parsed.
+      dockerTopStdout:
+        "PID PPID PGID COMMAND\n100 1 100 node\n200 100 200 python3\nxxx 200 200 ffmpeg\n",
+    });
+    const run = await runCli(
+      ["--stage", "B", "--case", "success", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+        VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+        ...WORKER_ENV,
+      }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+
+    const window = JSON.parse(run.files.get("/tmp/c.json")).payload.downloadingWindow;
+    assert.ok(window.samplerErrors.length > 0, "the unreadable row became a sampler error");
+    assert.doesNotMatch(JSON.stringify(window), /ffmpeg/, "and did not leak into the evidence");
+
+    const result = evaluateStageB(
+      passingStageBObservations({ downloadingWindow: measured(window) }),
+      passingStageA(),
+    );
+    assert.equal(
+      result.checks.find((c) => c.id === "process.window-observed").outcome,
+      OUTCOMES.BLOCKED,
+      "a window with an unobserved interval cannot support the negative claims",
+    );
+    // And the negative claims are not emitted as PASS on the strength of the
+    // rows that DID parse.
+    for (const id of ["process.no-ffmpeg-during-downloading", "process.no-unknown-descendants"]) {
+      const emitted = result.checks.find((c) => c.id === id);
+      assert.notEqual(emitted?.outcome, OUTCOMES.PASS, `${id} must not PASS`);
+    }
+    assert.equal(result.summary.verdict, OUTCOMES.BLOCKED);
+  });
+});
+
+// ── CORRECTION-06 §12-§15: feature-state continuity ──────────────────────
+
+describe("feature-state continuity", () => {
+  const binding = { expectedSha: SHA, runningImageId: IMAGE_ID };
+
+  const ENABLED = {
+    ytdlpEnabled: "true",
+    sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+  };
+  const DISABLED_SITES = { ytdlp: false, ytdlpInstalled: true, ytdlpEnabled: false, ffmpeg: true };
+
+  const CASE_ENV = (extra = {}) =>
+    LIVE_ENV({
+      VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+      VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+      ...WORKER_ENV,
+      ...extra,
+    });
+
+  it("61. an ordinary enabled case seals both sides", async () => {
+    const world = makeFakeWorld(ENABLED);
+    const run = await runCli(
+      ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
+      CASE_ENV(),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const record = JSON.parse(run.files.get("/tmp/c.json"));
+    assert.equal(record.featureContinuity.before.state, "enabled");
+    assert.equal(record.featureContinuity.after.state, "enabled");
+    assert.equal(record.featureContinuity.sameRequiredState, true);
+    assert.match(run.out, /deployment state held: generic enabled/);
+  });
+
+  it("61b. an enabled case that ends DISABLED BLOCKS and writes nothing", async () => {
+    // The environment flips mid-case; the image never changes. The flip lands
+    // after the pre-case read, so the post-case read sees the new state.
+    const world = makeFakeWorld({
+      ...ENABLED,
+      featureFlipsAfterEnvReads: 1,
+      ytdlpEnabledAfterFlip: null,
+      sitesAfterFlip: DISABLED_SITES,
+    });
+    const run = await runCli(
+      ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
+      CASE_ENV(),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /DEPLOYMENT FEATURE STATE CHANGED DURING THE CASE/);
+    assert.equal(run.files.has("/tmp/c.json"), false, "no record may span two states");
+  });
+
+  it("62. THE ATTACK: shutdown, same image, feature state flipped by the restart", async () => {
+    const fakeSampler = {
+      async sample() {
+        return {
+          sample: acquisitionSample(),
+          workerPid: 100,
+          ytdlpPid: 200,
+          expectedNetns: "net:[4026532001]",
+        };
+      },
+    };
+    const shared = {
+      ...ENABLED,
+      restartAfterPidReads: 1,
+    };
+    const args = ["--stage", "B", "--case", "shutdown", ...LIVE_ARGS, "--evidence", "/tmp/s.json"];
+    const deps = (world) => ({
+      runReadOnly: world.runReadOnly,
+      fetch: world.fetch,
+      files: seedRun(),
+      sampler: fakeSampler,
+      shutdownWindowMs: 2000,
+      recoveryWindowMs: 2000,
+    });
+
+    // Control: the restart brings back the same image AND the same state.
+    const ok = makeFakeWorld(shared);
+    const good = await runCli(args, CASE_ENV(), deps(ok));
+    assert.equal(good.code, 0, `${good.out}\n${good.err}`);
+    const record = JSON.parse(good.files.get("/tmp/s.json"));
+    assert.equal(record.imageContinuity.same, true);
+    assert.equal(record.featureContinuity.after.state, "enabled");
+
+    // The attack: SAME authorized image, but generic is now disabled. Image
+    // continuity holds and restart recovery succeeds — only feature continuity
+    // catches it.
+    const attacked = makeFakeWorld({
+      ...shared,
+      ytdlpEnabledAfterRestart: null,
+      sitesAfterRestart: DISABLED_SITES,
+    });
+    const bad = await runCli(args, CASE_ENV(), deps(attacked));
+    assert.equal(bad.code, 2, `${bad.out}\n${bad.err}`);
+    assert.match(bad.err, /DEPLOYMENT FEATURE STATE CHANGED DURING THE CASE/);
+    assert.equal(bad.files.has("/tmp/s.json"), false);
+    assert.equal(attacked.live.image, IMAGE_ID, "the image genuinely never changed");
+  });
+
+  it("63. kill-switch must stay disabled on both sides", async () => {
+    const disabled = makeFakeWorld({ ytdlpEnabled: null, sites: DISABLED_SITES });
+    const good = await runCli(
+      ["--stage", "B", "--case", "kill-switch", ...LIVE_ARGS, "--evidence", "/tmp/k.json"],
+      CASE_ENV(),
+      { runReadOnly: disabled.runReadOnly, fetch: disabled.fetch, files: seedRun() },
+    );
+    assert.equal(good.code, 0, `${good.out}\n${good.err}`);
+    assert.equal(JSON.parse(good.files.get("/tmp/k.json")).featureContinuity.after.state, "disabled");
+
+    // Re-enabled mid-case.
+    const flipped = makeFakeWorld({
+      ytdlpEnabled: null,
+      sites: DISABLED_SITES,
+      featureFlipsAfterEnvReads: 1,
+      ytdlpEnabledAfterFlip: "true",
+      sitesAfterFlip: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const bad = await runCli(
+      ["--stage", "B", "--case", "kill-switch", ...LIVE_ARGS, "--evidence", "/tmp/k2.json"],
+      CASE_ENV(),
+      { runReadOnly: flipped.runReadOnly, fetch: flipped.fetch, files: seedRun() },
+    );
+    assert.equal(bad.code, 2, `${bad.out}\n${bad.err}`);
+    assert.match(bad.err, /FEATURE STATE CHANGED|CAPABILITY CHANGED/);
+    assert.equal(bad.files.has("/tmp/k2.json"), false);
+  });
+
+  it("63b. an unmeasurable post-case state BLOCKS", async () => {
+    for (const breaks of ["env", "sites"]) {
+      const world = makeFakeWorld(ENABLED);
+      let envReads = 0;
+      let siteReads = 0;
+      const run = await runCli(
+        ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
+        CASE_ENV(),
+        {
+          runReadOnly: async (file, argv) => {
+            if (breaks === "env" && argv.join(" ").includes("YTDLP_ENABLED")) {
+              envReads += 1;
+              if (envReads > 1) return { exitCode: 1, stdout: "", stderr: "boom" };
+            }
+            return world.runReadOnly(file, argv);
+          },
+          fetch: async (target, init) => {
+            if (breaks === "sites" && String(target).endsWith("/api/sites")) {
+              siteReads += 1;
+              if (siteReads > 1) throw new Error("connection refused");
+            }
+            return world.fetch(target, init);
+          },
+          files: seedRun(),
+        },
+      );
+      assert.equal(run.code, 2, `${breaks}: ${run.out}${run.err}`);
+      assert.match(run.err, /could not be re-measured after case/);
+      assert.equal(run.files.has("/tmp/c.json"), false);
+    }
+  });
+
+  it("64. the validator recomputes continuity rather than trusting it", () => {
+    const enabled = featureState("enabled");
+    const disabled = featureState("disabled");
+    const cases = [
+      ["a flipped after-state", { before: enabled, after: disabled, sameRequiredState: true }],
+      ["a flipped before-state", { before: disabled, after: enabled, sameRequiredState: true }],
+      ["a moved capability report", {
+        before: enabled,
+        after: { ...enabled, sites: { ...enabled.sites, ytdlpInstalled: false } },
+        sameRequiredState: true,
+      }],
+      ["a false flag", { before: enabled, after: enabled, sameRequiredState: false }],
+      ["a missing after", { before: enabled, sameRequiredState: true }],
+      ["a missing before", { after: enabled, sameRequiredState: true }],
+      ["nothing at all", null],
+      ["a malformed measurement", {
+        before: { ...enabled, ytdlpEnabledRaw: "false" },
+        after: enabled,
+        sameRequiredState: true,
+      }],
+    ];
+    for (const [what, continuity] of cases) {
+      // `buildCaseRecord` directly, so an ABSENT continuity object is genuinely
+      // absent rather than filled in by the test helper's default.
+      const record = buildCaseRecord({
+        caseName: "cancellation",
+        binding,
+        payload: { cancellation: cancellationEvidence({ postSample: [] }) },
+        featureState: enabled,
+        featureContinuity: continuity,
+        imageContinuity: { before: IMAGE_ID, after: IMAGE_ID, taggedImageId: IMAGE_ID, same: true },
+      });
+      const validated = validateCaseRecord(record, binding);
+      assert.equal(validated.ok, false, what);
+      assert.match(validated.reason, /continuity|contradicts/, what);
+    }
+  });
+
+  it("64b. featureState must agree with the continuity it claims", () => {
+    const enabled = featureState("enabled");
+    const record = buildCaseRecord({
+      caseName: "cancellation",
+      binding,
+      payload: { cancellation: cancellationEvidence({ postSample: [] }) },
+      // Claims the enabled phase while its continuity describes a different
+      // capability report.
+      featureState: enabled,
+      featureContinuity: {
+        before: { ...enabled, sites: { ...enabled.sites, ytdlpInstalled: false } },
+        after: { ...enabled, sites: { ...enabled.sites, ytdlpInstalled: false } },
+        sameRequiredState: true,
+      },
+      imageContinuity: { before: IMAGE_ID, after: IMAGE_ID, taggedImageId: IMAGE_ID, same: true },
+    });
+    assert.match(validateCaseRecord(record, binding).reason, /contradicts/);
+  });
+
+  it("64c. continuity is sealed and cannot be edited", () => {
+    const KEY = "b".repeat(64);
+    const sealed = sealRecord(
+      caseRecord({
+        caseName: "cancellation",
+        binding,
+        payload: { cancellation: cancellationEvidence({ postSample: [] }) },
+        runId: "0123456789abcdef",
+      }),
+      KEY,
+    );
+    assert.equal(verifySeal(sealed, KEY).ok, true);
+    sealed.featureContinuity.after.state = "disabled";
+    assert.equal(verifySeal(sealed, KEY).ok, false);
+  });
+
+  it("64d. a kill-switch capability finding is NOT converted into a refusal", () => {
+    // /api/sites still reporting ytdlp:true while the configuration is disabled
+    // is the most important finding this case can produce. It must reach the
+    // evaluator as a FAIL, not be swallowed by a precondition gate.
+    const broken = {
+      state: "disabled",
+      ytdlpEnabledRaw: null,
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true },
+      observedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const continuity = evaluateFeatureContinuity(broken, broken, "disabled");
+    assert.equal(continuity.ok, true, "the gate is about the configuration, not the finding");
+
+    const result = evaluateStageB(
+      passingStageBObservations({
+        killSwitch: measured({ genericUsableAfterDisable: true, directWorks: true }),
+        disabledFeatureState: measured(broken),
+      }),
+      passingStageA(),
+    );
+    assert.equal(
+      result.checks.find((c) => c.id === "killswitch.rollback").outcome,
+      OUTCOMES.FAIL,
+      "a broken kill switch must FAIL, never BLOCK",
+    );
+    assert.equal(
+      result.checks.find((c) => c.id === "killswitch.disabled-state-proven").outcome,
+      OUTCOMES.FAIL,
+    );
+  });
+});
+
+// ── CORRECTION-06 §16-§17: the run identity has one exact grammar ────────
+
+describe("run identity grammar", () => {
+  const KEY = "c".repeat(64);
+  const enoent = () => Object.assign(new Error("no such file"), { code: "ENOENT" });
+
+  function adapter(contents) {
+    const written = [];
+    return {
+      written,
+      deps: {
+        readFile: async () => contents,
+        writeFile: async (path, body) => written.push([path, body]),
+        mkdir: async () => {},
+        chmod: async () => {},
+        stat: async () => ({ mode: 0o600 }),
+      },
+    };
+  }
+
+  it("65. the pattern is exactly what the harness mints", async () => {
+    assert.equal(RUN_ID_PATTERN.source, "^[0-9a-f]{16}$");
+    const { deps } = adapter(null);
+    const created = await loadOrCreateRun("/tmp/run.json", {
+      ...deps,
+      stat: async () => { throw enoent(); },
+    });
+    assert.match(created.runId, RUN_ID_PATTERN, "the minted id matches the admitted grammar");
+  });
+
+  it("65b. every invalid runId shape BLOCKS both paths and preserves the file", async () => {
+    const invalid = [
+      ["empty", '""'],
+      ["too short", '"abc"'],
+      ["15 hex", `"${"a".repeat(15)}"`],
+      ["17 hex", `"${"a".repeat(17)}"`],
+      ["uppercase", '"A1B2C3D4E5F60718"'],
+      ["non-hex", '"a1b2c3d4e5f6071g"'],
+      ["null", "null"],
+      ["a number", "12345678"],
+    ];
+    for (const [what, literal] of invalid) {
+      const contents = `{"runId":${literal},"key":"${KEY}"}`;
+      const create = adapter(contents);
+      const created = await loadOrCreateRun("/tmp/run.json", create.deps);
+      assert.match(created.error, /usable runId/, `loadOrCreateRun: ${what}`);
+      assert.equal(created.key, undefined, what);
+      assert.deepEqual(create.written, [], `${what}: the file must not be overwritten`);
+
+      const load = adapter(contents);
+      const loaded = await loadRun("/tmp/run.json", load.deps);
+      assert.match(loaded.error, /usable runId/, `loadRun: ${what}`);
+    }
+
+    // A missing runId entirely.
+    const missing = adapter(`{"key":"${KEY}"}`);
+    assert.match((await loadOrCreateRun("/tmp/run.json", missing.deps)).error, /usable runId/);
+    assert.deepEqual(missing.written, []);
+  });
+
+  it("65c. the exact shape the harness produces is still accepted", async () => {
+    const { deps, written } = adapter(`{"runId":"a1b2c3d4e5f60718","key":"${KEY}"}`);
+    const resumed = await loadOrCreateRun("/tmp/run.json", deps);
+    assert.equal(resumed.created, false);
+    assert.equal(resumed.runId, "a1b2c3d4e5f60718");
+    assert.deepEqual(written, [], "an intact file is never written to");
   });
 });
 

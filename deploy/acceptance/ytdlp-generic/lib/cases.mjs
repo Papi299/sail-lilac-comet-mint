@@ -244,6 +244,88 @@ export function isWellFormedFeatureState(value) {
 }
 
 /**
+ * Whether the deployment feature state HELD across the whole case (§12-§14 of
+ * CORRECTION-06).
+ *
+ * ── The gap this closes ────────────────────────────────────────────────────
+ *
+ * A case measured its feature state ONCE, before the producer. `shutdown`
+ * exists to span an operator restart, so the concrete attack is:
+ *
+ *     pre-case          YTDLP_ENABLED=true
+ *     acquisition starts, operator restarts the SAME authorized image
+ *     the Worker comes back with YTDLP_ENABLED=false
+ *     restart recovery succeeds, image continuity holds
+ *     -> the record sealed `featureState: enabled`
+ *
+ * That record combines two deployment states while claiming one. Image
+ * continuity cannot catch it: the image genuinely did not change.
+ *
+ * ── What is required, and what deliberately is not ─────────────────────────
+ *
+ * Two things are gated:
+ *
+ *   1. the CONFIGURATION state (`YTDLP_ENABLED`, by the deployment's own
+ *      grammar) is the case's required state on BOTH sides; and
+ *   2. the application's capability report did not CHANGE across the producer.
+ *
+ * A particular capability VALUE is deliberately not gated. For `kill-switch`,
+ * `/api/sites` still reporting `ytdlp: true` while the configuration is
+ * disabled is not a precondition failure — it is the single most important
+ * finding that case can produce, and refusing to run would convert "the kill
+ * switch does not work" into "we did not look". The evaluator grades the
+ * conjunction from this same sealed evidence, which is where a finding belongs.
+ */
+export function evaluateFeatureContinuity(before, after, requiredState) {
+  if (!isWellFormedFeatureState(before) || !isWellFormedFeatureState(after)) {
+    return { ok: false, reason: "the feature state was not measured on both sides of the case" };
+  }
+  if (requiredState !== "enabled" && requiredState !== "disabled") {
+    return { ok: false, reason: "the case declares no required deployment state" };
+  }
+  if (before.state !== requiredState) {
+    return {
+      ok: false,
+      reason: `the case requires generic ${requiredState}, but it began while generic was ${before.state}`,
+    };
+  }
+  if (after.state !== requiredState) {
+    return {
+      ok: false,
+      reason:
+        `DEPLOYMENT FEATURE STATE CHANGED DURING THE CASE: it began with generic ${before.state} ` +
+        `and ended with generic ${after.state}. The evidence spans two deployment states.`,
+    };
+  }
+  // The capability report is compared, not required to hold a value — see the
+  // docblock. A report that MOVED mid-case means the two halves of the evidence
+  // describe different deployments even though the configuration matched.
+  for (const field of ["ytdlp", "ytdlpInstalled", "ytdlpEnabled"]) {
+    if (before.sites[field] !== after.sites[field]) {
+      return {
+        ok: false,
+        reason:
+          `DEPLOYMENT CAPABILITY CHANGED DURING THE CASE: /api/sites ${field} moved from ` +
+          `${before.sites[field]} to ${after.sites[field]}`,
+      };
+    }
+  }
+  return { ok: true, state: requiredState };
+}
+
+/**
+ * The shape a sealed `featureContinuity` must have to be believed.
+ *
+ * `sameRequiredState` is recomputed rather than trusted, so a record asserting
+ * it beside two disagreeing measurements is refused rather than believed.
+ */
+export function isWellFormedFeatureContinuity(value, requiredState) {
+  if (value == null || typeof value !== "object") return false;
+  const evaluated = evaluateFeatureContinuity(value.before, value.after, requiredState);
+  return evaluated.ok === true && value.sameRequiredState === true;
+}
+
+/**
  * The shape a sealed `imageContinuity` must have to be believed.
  *
  * `same` is not taken on trust — it is recomputed from the two ids, so a record
@@ -267,6 +349,7 @@ export function buildCaseRecord({
   startedAt,
   finishedAt,
   featureState,
+  featureContinuity,
   imageContinuity,
 }) {
   return {
@@ -277,8 +360,11 @@ export function buildCaseRecord({
     case: caseName,
     expectedSha: binding?.expectedSha ?? null,
     runningImageId: binding?.runningImageId ?? null,
-    // Sealed WITH the record; see `describeFeatureState`.
+    // The canonical phase state, PROVEN to have held across the whole case by
+    // `featureContinuity` below — not a pre-case-only snapshot.
     featureState: featureState ?? null,
+    // §12-§14 of CORRECTION-06: the state on BOTH sides of the producer.
+    featureContinuity: featureContinuity ?? null,
     // §8-§10 of CORRECTION-05: the image object on BOTH sides of the producer.
     // Image ids are not secrets, and recording both is what lets a reviewer see
     // that a restart-spanning case stayed on one image.
@@ -350,6 +436,36 @@ export function validateCaseRecord(record, binding) {
         `case '${record.case}' requires generic ${requiredState}, but the sealed evidence records ` +
         `that it ran while generic was ${featureState.state}`,
     };
+  }
+
+  // §14 of CORRECTION-06: the state must have held for the WHOLE case, and the
+  // aggregate recomputes that rather than trusting the record's own boolean —
+  // a claim the aggregator cannot verify itself is a claim it should not make.
+  if (requiredState !== null) {
+    const continuity = record.featureContinuity;
+    if (!isWellFormedFeatureContinuity(continuity, requiredState)) {
+      const why = evaluateFeatureContinuity(continuity?.before, continuity?.after, requiredState);
+      return {
+        ok: false,
+        reason:
+          `case '${record.case}' carries no valid feature-state continuity: ` +
+          `${why.ok ? "its sameRequiredState flag disagrees with its own measurements" : why.reason}`,
+      };
+    }
+    // `featureState` is the canonical phase state, so it must BE the state the
+    // continuity proves rather than a separate, potentially divergent claim.
+    if (
+      featureState.state !== continuity.before.state ||
+      featureState.ytdlpEnabledRaw !== continuity.before.ytdlpEnabledRaw ||
+      ["ytdlp", "ytdlpInstalled", "ytdlpEnabled"].some(
+        (field) => featureState.sites[field] !== continuity.before.sites[field],
+      )
+    ) {
+      return {
+        ok: false,
+        reason: `case '${record.case}' declares a phase state its own continuity evidence contradicts`,
+      };
+    }
   }
 
   // ── §9/§11 of CORRECTION-05: one image object, start to finish ────────────

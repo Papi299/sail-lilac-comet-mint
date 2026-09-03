@@ -75,6 +75,7 @@ import {
   caseNames,
   describeFeatureState,
   evaluateCaseFeatureState,
+  evaluateFeatureContinuity,
   expectedFeatureStateFor,
   hasExecutableProducer,
   liveCaseNames,
@@ -515,19 +516,7 @@ async function runStageBCase(ctx, caseName) {
   // the historical fact is captured HERE, by the harness, while the condition
   // exists — never reconstructed afterwards from whichever state the deployment
   // happens to be in at aggregation time, and never taken from an operator.
-  const caseSites = await observe("GET /api/sites", async () => {
-    const body = await ctx.session.sites();
-    return {
-      ytdlp: body.ytdlp === true,
-      ytdlpInstalled: body.ytdlpInstalled === true,
-      ytdlpEnabled: body.ytdlpEnabled === true,
-    };
-  });
-  const featureState = describeFeatureState({
-    ytdlpEnabledRaw,
-    sites: caseSites,
-    observedAt: new Date().toISOString(),
-  });
+  const featureState = await measureFeatureState(ctx, ytdlpEnabledRaw);
   if (featureState.measured !== true) {
     errorLog(
       `BLOCKED: the deployment feature state could not be sealed for case '${caseName}': ${featureState.reason}`,
@@ -654,6 +643,37 @@ async function runStageBCase(ctx, caseName) {
     same: true,
   };
 
+  // ── §12-§14 of CORRECTION-06: feature-state continuity ─────────────────
+  //
+  // Image continuity is not enough for a case that spans a restart. The same
+  // authorized image can come back with a DIFFERENT `YTDLP_ENABLED`, and a
+  // record sealed from the pre-case measurement would then claim one deployment
+  // state while carrying evidence from two.
+  const postEnabledRaw = await system.ytdlpEnabledRaw();
+  const postFeatureState = await measureFeatureState(ctx, postEnabledRaw);
+  if (postFeatureState.measured !== true) {
+    errorLog(
+      `BLOCKED: the deployment feature state could not be re-measured after case '${caseName}': ` +
+        `${postFeatureState.reason}. Refusing to seal evidence whose deployment state cannot be confirmed.`,
+    );
+    return EXIT.BLOCKED;
+  }
+  const continuity = evaluateFeatureContinuity(
+    featureState.value,
+    postFeatureState.value,
+    expectedFeatureStateFor(caseName),
+  );
+  if (!continuity.ok) {
+    errorLog(`BLOCKED: ${continuity.reason}`);
+    return EXIT.BLOCKED;
+  }
+  const featureContinuity = {
+    before: featureState.value,
+    after: postFeatureState.value,
+    sameRequiredState: true,
+  };
+  log(`deployment state held: generic ${continuity.state} across the whole case`);
+
   const record = sealRecord(
     buildCaseRecord({
       caseName,
@@ -663,6 +683,7 @@ async function runStageBCase(ctx, caseName) {
       startedAt: ctx.startedAt,
       finishedAt: new Date().toISOString(),
       featureState: featureState.value,
+      featureContinuity,
       imageContinuity,
     }),
     acceptanceRun.key,
@@ -687,6 +708,30 @@ async function runStageBCase(ctx, caseName) {
   log(`case evidence written: ${evidencePath}`);
   log("Run `--stage B --aggregate` with every case record to obtain the Stage B verdict.");
   return EXIT.PASS;
+}
+
+/**
+ * One complete feature-state measurement: the deployment's own `YTDLP_ENABLED`
+ * spelling plus the application's own capability report.
+ *
+ * Shared by the pre- and post-case measurements so both sides are taken the
+ * same way — a continuity check between two differently-derived observations
+ * would compare the derivations as much as the deployment.
+ */
+async function measureFeatureState(ctx, ytdlpEnabledRaw) {
+  const sites = await observe("GET /api/sites", async () => {
+    const body = await ctx.session.sites();
+    return {
+      ytdlp: body.ytdlp === true,
+      ytdlpInstalled: body.ytdlpInstalled === true,
+      ytdlpEnabled: body.ytdlpEnabled === true,
+    };
+  });
+  return describeFeatureState({
+    ytdlpEnabledRaw,
+    sites,
+    observedAt: new Date().toISOString(),
+  });
 }
 
 // ── Stage B: aggregation ───────────────────────────────────────────────────

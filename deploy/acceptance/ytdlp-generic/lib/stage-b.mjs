@@ -8,7 +8,7 @@
 
 import { OUTCOMES, assertCheck, check, measuredCheck, summarize } from "./verdict.mjs";
 import { classifyTransitionTrace, classifyCancellationTrace } from "./lifecycle.mjs";
-import { evaluateGroupTermination } from "./process-tree.mjs";
+import { basenameOf, evaluateGroupTermination, YTDLP_RUNTIME_BASENAMES } from "./process-tree.mjs";
 import {
   aggregateDownloadWindow,
   nodeContained,
@@ -630,48 +630,96 @@ export function evaluateStageB(obs, stageAResult) {
   // which one could have appeared unobserved. Clean samples either side of a
   // gap do not describe the gap. They stay in the evidence; they simply cannot
   // support a continuous negative assertion.
+  //
+  // §3/§4 of CORRECTION-06: coverage and the FINDING are separate questions.
+  //
+  //     A. was the run continuously observable?   -> coverage
+  //     B. did any observed sample contain yt-dlp? -> the finding
+  //
+  // A gap damages (A). It does NOT erase (B): a yt-dlp process positively seen
+  // in a successful sample was seen, whatever happened in some other interval.
+  // The previous code routed both through one `samplingRan` gate, so a single
+  // failed attempt downgraded a real, measured security finding to BLOCKED —
+  // turning the strongest evidence the case can produce into uncertainty.
   const directSampling = obs.directAfterEnable;
   const samplingErrorCount = directSampling?.value?.samplingErrorCount ?? 0;
-  const samplingRan =
+  const observedBasenames = Array.isArray(directSampling?.value?.sampledBasenames)
+    ? directSampling.value.sampledBasenames
+    : [];
+
+  // Derived ONLY from successful samples. An error message is never mined for
+  // evidence of a process: a failed attempt observed nothing by definition.
+  const ytdlpObserved = observedBasenames.some(
+    (name) => YTDLP_RUNTIME_BASENAMES.includes(basenameOf(name)) || basenameOf(name) === "yt-dlp",
+  );
+
+  const coverageComplete =
     directSampling?.measured === true &&
     directSampling.value?.processSamplingMeasured === true &&
     directSampling.value?.samplesTaken > 0 &&
     samplingErrorCount === 0;
 
-  if (!samplingRan) {
-    const why =
-      directSampling?.measured !== true
-        ? (directSampling?.reason ?? "the direct regression was not performed")
-        : samplingErrorCount > 0
-          ? `${samplingErrorCount} sampling attempt(s) failed while the direct job ran, leaving ` +
-            "unobserved interval(s) that cannot support a negative claim"
-          : "no process sample was taken during the direct job";
-    add(check("direct.process-sampling-available", OUTCOMES.BLOCKED, why, { stage }));
+  // ── (A) coverage ───────────────────────────────────────────────────────
+  if (coverageComplete) {
+    add(
+      assertCheck(
+        "direct.process-sampling-available",
+        true,
+        `${directSampling.value.samplesTaken} process sample(s) were taken during the direct job, ` +
+          "with no failed attempts",
+        { stage },
+      ),
+    );
+  } else {
+    add(
+      check(
+        "direct.process-sampling-available",
+        OUTCOMES.BLOCKED,
+        directSampling?.measured !== true
+          ? (directSampling?.reason ?? "the direct regression was not performed")
+          : samplingErrorCount > 0
+            ? `${samplingErrorCount} sampling attempt(s) failed while the direct job ran, leaving ` +
+              "unobserved interval(s) that cannot support a negative claim"
+            : "no process sample was taken during the direct job",
+        { stage },
+      ),
+    );
+  }
+
+  // ── (B) the finding ────────────────────────────────────────────────────
+  //
+  // FAIL outranks BLOCKED in `summarize`, so a positive finding alongside a
+  // coverage gap still fails the run — which is the correct reading: we know
+  // something bad happened AND we could not see all of it.
+  if (ytdlpObserved) {
+    add(
+      check(
+        "direct.no-ytdlp-spawned",
+        OUTCOMES.FAIL,
+        "a yt-dlp runtime process was observed in a successful sample taken while the direct " +
+          "job ran; generic enablement is pushing direct media through yt-dlp",
+        { stage },
+      ),
+    );
+  } else if (!coverageComplete) {
     add(
       check(
         "direct.no-ytdlp-spawned",
         OUTCOMES.BLOCKED,
-        "no process observation exists, so the absence of yt-dlp is unproven",
+        directSampling?.measured !== true
+          ? "no process observation exists, so the absence of yt-dlp is unproven"
+          : "no yt-dlp process was seen, but the run contains unobserved interval(s), so its " +
+            "absence across the whole direct job is unproven",
         { stage },
       ),
     );
   } else {
     add(
       assertCheck(
-        "direct.process-sampling-available",
-        true,
-        `${directSampling.value.samplesTaken} process sample(s) were taken during the direct job`,
-        { stage },
-      ),
-    );
-    add(
-      assertCheck(
         "direct.no-ytdlp-spawned",
-        Array.isArray(directSampling.value.sampledBasenames) &&
-          !directSampling.value.sampledBasenames.some(
-            (name) => name.startsWith("python") || name === "yt-dlp",
-          ),
-        "no yt-dlp process appeared in any sample taken while the direct job ran",
+        true,
+        "no yt-dlp process appeared in any sample taken while the direct job ran, and every " +
+          "sampling attempt succeeded",
         { stage },
       ),
     );

@@ -20,6 +20,7 @@
 // Nothing here mutates anything. Every command is on the read-only allowlist.
 
 import { basenameOf, YTDLP_RUNTIME_BASENAMES } from "./process-tree.mjs";
+import { DOCKER_TOP_COLUMNS } from "./observers.mjs";
 
 /**
  * How the owned yt-dlp process is ESTABLISHED (as distinct from verified).
@@ -74,35 +75,131 @@ export function establishYtdlpPid(sample, workerPid) {
   };
 }
 
-/** Parses `docker top` output into closed-schema rows. */
+/**
+ * The header `docker top <c> -o pid,ppid,pgid,comm` actually emits.
+ *
+ * Verified against the pinned image on this Docker/procps combination:
+ *
+ *     PID                 PPID                PGID                COMMAND
+ *
+ * procps titles the `comm` column `COMMAND` — which is the column NAME, not the
+ * command line; `-o comm` selects the executable name and `-o args` would be
+ * needed for argv. That distinction is why the allowlist pins the column set.
+ */
+export const DOCKER_TOP_HEADER = Object.freeze(["PID", "PPID", "PGID", "COMMAND"]);
+
+/**
+ * The fixed token that stands in for a `comm` this sampler will not copy.
+ *
+ * Shared shape with the host PGID parser's `UNCLASSIFIED_COMM`, but kept as its
+ * own constant: the two surfaces read different commands with different output
+ * contracts, and collapsing them would couple parsers that are only incidentally
+ * similar (§11 of CORRECTION-06).
+ */
+export const UNCLASSIFIED_COMM = "<unclassified>";
+
+/** A plain executable basename, safe to carry into evidence verbatim. */
+const SAFE_COMM_PATTERN = /^[\w.:+-]{1,64}$/;
+
+/**
+ * Parses `docker top` output into closed-schema rows, FAIL-CLOSED (§7-§9 of
+ * CORRECTION-06).
+ *
+ * ── Why dropping a row is not survivable here ─────────────────────────────
+ *
+ * This feeds the downloading window, whose assertions are NEGATIVE: no FFmpeg
+ * during acquisition, no unknown descendants, no namespace escape. Their
+ * evidence is the ABSENCE of matching rows. A row that silently disappears is
+ * therefore indistinguishable from a row that was never there — and the row
+ * most likely to be unusual is exactly the one those checks exist to catch: an
+ * external downloader, a shell, an FFmpeg invoked out of band.
+ *
+ * The previous parser did `continue` on a short row and on a non-numeric id, so
+ * one unreadable line left the remaining rows looking clean and the window
+ * PASSING.
+ *
+ * ── What is fail-closed, and what is not ───────────────────────────────────
+ *
+ * The numeric prefix is what must parse: a row whose pid/ppid/pgid cannot be
+ * read cannot be placed in the tree at all, so the whole SAMPLE is unmeasured.
+ * The caller turns that into a sampler error, and the window's gap rule turns
+ * that into BLOCKED.
+ *
+ * A valid row with an unusual `comm` is different — it is structurally
+ * understood and stays in the tree, reported as `UNCLASSIFIED_COMM`. Inside the
+ * Worker container an unclassified descendant is not an approved acquisition
+ * executable, so it lands in `unknownSeen` and FAILS `process.no-unknown-
+ * descendants` rather than vanishing into a clean result.
+ *
+ * ── The header ─────────────────────────────────────────────────────────────
+ *
+ * It is VALIDATED, not skipped. Blindly dropping the first line means an output
+ * whose header is missing or unexpected silently loses its first process row —
+ * and column positions we cannot confirm are positions we cannot parse by.
+ *
+ * @returns `{ ok: true, rows }` or `{ ok: false, reason }`. The reason names the
+ *   line NUMBER and the defect, never the line's content.
+ */
 export function parseDockerTop(stdout) {
   const lines = String(stdout ?? "")
     .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  if (lines.length < 2) return [];
+    .filter((line) => line.trim().length > 0);
 
-  // The first line is the header emitted by `docker top`; the requested column
-  // order is what we asked for, so positions are known rather than guessed.
+  if (lines.length === 0) {
+    return { ok: false, reason: "docker top returned no output at all" };
+  }
+
+  const header = lines[0].trim().split(/\s+/);
+  if (
+    header.length !== DOCKER_TOP_HEADER.length ||
+    !header.every((title, index) => title.toUpperCase() === DOCKER_TOP_HEADER[index])
+  ) {
+    return {
+      ok: false,
+      reason:
+        `docker top did not return the expected ${DOCKER_TOP_HEADER.join("/")} header, so the ` +
+        "column positions cannot be trusted and no row may be interpreted",
+    };
+  }
+
   const rows = [];
-  for (const line of lines.slice(1)) {
-    const parts = line.split(/\s+/);
-    if (parts.length < 4) continue;
-    const [pid, ppid, pgid, ...rest] = parts;
-    const comm = rest.join(" ");
-    if (!/^\d+$/.test(pid) || !/^\d+$/.test(ppid) || !/^\d+$/.test(pgid)) continue;
+  for (let index = 1; index < lines.length; index += 1) {
+    // Three numeric columns, then the remainder as `comm`. The remainder is NOT
+    // re-split: it is one field, because the command selected one field.
+    const matched = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S.*?)\s*$/.exec(lines[index]);
+    if (!matched) {
+      return {
+        ok: false,
+        reason:
+          `line ${index + 1} of the docker top listing does not begin with the three numeric ids ` +
+          "the requested columns produce, so it cannot be placed in the process tree; the sample " +
+          "cannot be interpreted",
+      };
+    }
+
+    const numbers = [Number(matched[1]), Number(matched[2]), Number(matched[3])];
+    if (!numbers.every((value) => Number.isSafeInteger(value))) {
+      return {
+        ok: false,
+        reason: `line ${index + 1} of the docker top listing has an out-of-range id field`,
+      };
+    }
+
+    const comm = basenameOf(matched[4]);
     rows.push({
-      pid: Number(pid),
-      ppid: Number(ppid),
-      pgid: Number(pgid),
-      // Basename only. If `comm` ever arrives with spaces (it should not, given
-      // the selected column), the closed-schema validator rejects the sample
-      // rather than letting a command line through.
-      comm: basenameOf(comm),
+      pid: numbers[0],
+      ppid: numbers[1],
+      pgid: numbers[2],
+      // Kept verbatim only when it is a plain basename. Never dropped.
+      comm: SAFE_COMM_PATTERN.test(comm) ? comm : UNCLASSIFIED_COMM,
       netns: null,
     });
   }
-  return rows;
+
+  if (rows.length === 0) {
+    return { ok: false, reason: "docker top returned a header but no process rows" };
+  }
+  return { ok: true, rows };
 }
 
 /**
@@ -144,9 +241,13 @@ export function makeProcessSampler(deps = {}) {
      */
     async sample() {
       const worker = await workerPid();
-      const top = await run("docker", ["top", container, "-o", "pid,ppid,pgid,comm"]);
-      const rows = parseDockerTop(top.stdout);
-      if (rows.length === 0) throw new Error("docker top returned no usable process rows");
+      const top = await run("docker", ["top", container, "-o", DOCKER_TOP_COLUMNS]);
+      // §7: an uninterpretable row makes the WHOLE sample unmeasured. The
+      // caller records that as a sampler error, and the downloading window's
+      // gap rule refuses to rest a negative claim on it.
+      const parsed = parseDockerTop(top.stdout);
+      if (!parsed.ok) throw new Error(parsed.reason);
+      const rows = parsed.rows;
 
       const expectedNetns = await netnsOf(worker);
 

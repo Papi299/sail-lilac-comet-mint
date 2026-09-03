@@ -1988,6 +1988,77 @@ JSON or an invalid structure each BLOCK. A damaged file is an error rather than 
 `null`, because `null` means "no run has been started" and would send the
 operator to re-run Stage A over the very file that needed attention.
 
+#### CORRECTION-06 — four residual acceptance-integrity gaps closed
+
+**1. An observation gap could erase a positive finding.** The direct regression
+routed two independent questions — *was the run continuously observable?* and
+*did any observed sample contain yt-dlp?* — through a single gate, so one failed
+sampling attempt downgraded a positively observed yt-dlp process from FAIL to
+BLOCKED. That is the strongest evidence the case can produce, turned into
+uncertainty because some other interval was uncertain.
+
+The two are now graded separately. Coverage is BLOCKED whenever a sampling
+attempt failed; the finding is FAIL whenever an approved yt-dlp runtime basename
+appears in a SUCCESSFUL sample, gap or no gap. FAIL already outranks BLOCKED in
+the summary, so a finding alongside a gap fails the run — the honest reading:
+something bad happened and we could not see all of it. A finding is never
+inferred from an error message, because a failed attempt observed nothing.
+
+**2. `docker top` was neither structurally bounded nor fail-closed.** The
+allowlist checked `argv[0] === "top"` alone, so `docker top <c> -o args`,
+`-o pid,args`, `-o command` and a bare `docker top <c>` (whose default format
+includes CMD) all passed the boundary the architecture claims makes command
+lines structurally unavailable. The allowlist now admits exactly
+`docker top <container> -o pid,ppid,pgid,comm`, with the container name checked
+against Docker's own name grammar; every argv-bearing form is refused before a
+process is spawned.
+
+The parser also did `continue` on a short row and on a non-numeric id. The
+downloading window's assertions are NEGATIVE and their evidence is the absence
+of matching rows, so one unreadable line left the remaining rows looking clean
+and the window PASSING — and the row most likely to be unusual is exactly the
+one those checks exist to catch. An unreadable numeric prefix now makes the whole
+SAMPLE unmeasured, which the collector records as a sampler error and the window
+gap rule turns into BLOCKED. A valid row with an unusual `comm` keeps its row
+under the fixed token `<unclassified>`, which is not an approved acquisition
+executable and therefore FAILS `process.no-unknown-descendants` rather than
+vanishing. The header is validated rather than skipped, because blindly dropping
+the first line loses a real process row when the header is absent; the expected
+`PID PPID PGID COMMAND` was verified against the pinned image on this
+Docker/procps combination. The host-level PGID parser stays a separate
+implementation: both are fail-closed, but they read different commands with
+different output contracts.
+
+**3. Cases proved image continuity but not feature-state continuity.** The
+deployment state was measured once, before the producer. `shutdown` exists to
+span an operator restart, so the same authorized image could come back with
+`YTDLP_ENABLED=false` — restart recovery succeeding, image continuity holding —
+and the record would still seal `featureState: enabled`, combining two
+deployment states while claiming one.
+
+Every executable Stage B case now measures the feature state on both sides of
+the producer and refuses to seal unless the case's required configuration state
+held and the capability report did not move. `featureContinuity` is sealed with
+the record, and `validateCaseRecord` recomputes it rather than trusting its own
+boolean; the canonical `featureState` must agree with the continuity it claims.
+
+A particular capability VALUE is deliberately not gated. For `kill-switch`,
+`/api/sites` still reporting `ytdlp: true` while the configuration is disabled is
+not a precondition failure — it is the most important finding that case can
+produce, and refusing to run would convert "the kill switch does not work" into
+"we did not look". The evaluator grades that conjunction from the same sealed
+evidence, as a FAIL.
+
+**4. A malformed `runId` was still accepted.** The run-key admission test was
+`typeof runId === "string"`, so a file carrying `""`, `"abc"`, or uppercase hex
+passed with an otherwise valid key. `runId` is inside the authenticated material
+and is compared across artifacts to prove they belong to one acceptance run, so
+an identity the harness could never have generated is not a run identity. Both
+fields are now matched against the exact grammar `loadOrCreateRun` produces —
+16 and 64 lowercase hex characters. Every invalid shape BLOCKS on both entry
+points and leaves the existing file untouched; ENOENT remains the only condition
+that mints a run.
+
 #### What Phase 10D is authorized to do
 
 Nothing yet. Only after this harness has been **independently reviewed and
