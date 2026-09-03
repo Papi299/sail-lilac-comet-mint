@@ -2266,6 +2266,97 @@ endpoint bracket with bounded retries, PID reuse being unable to hide a
 recreation, the outer bracketed deployment snapshots, and the absence of any
 continuous-observation claim.
 
+#### PHASE-10D-BLOCKER-REMEDIATION-01 — the durable-state observer could not address Production
+
+Phase 10D's live preflight found that the acceptance harness's durable observer
+named three things and was wrong about all three:
+
+```
+database   videofetch.db   ->  worker.sqlite   (WORKER_DATABASE_FILENAME,
+                                                 state-directory.server.ts)
+table      jobs            ->  worker_jobs     (CREATE TABLE worker_jobs,
+                                                 migrations.server.ts)
+access     `sqlite3` CLI   ->  node:sqlite     (not installed on the Lima VM)
+```
+
+Nothing about this was subtle in effect: `durable.extractor-is-ytdlp`,
+`durable.application-format-id`, `durable.no-raw-selector-fields` and the
+sentinel sweep's `durable-row` surface could only ever have reported `BLOCKED`,
+against any deployment, for a reason describing the instrument rather than the
+system under test. That inverts what `BLOCKED` is supposed to mean — *we could
+not measure this deployment*, not *this tool has never been able to measure
+one* — and it is the precise failure mode the harness's own fail-closed design
+exists to make visible rather than silent.
+
+The correction is to the OBSERVER, not to Production. The Worker's contract is
+authoritative; a measuring instrument that disagrees with it is the thing that
+is wrong.
+
+- the reader uses `node:sqlite` — the Worker's own driver — opened explicitly
+  with `readOnly: true`, so no external executable is required and a missing
+  database cannot be created by the act of looking for it;
+- the projection is unchanged (`job_id, status, format_id, extractor`), and
+  `url` is still never selected — a projection, not a post-filter, because the
+  column carries the acceptance URL and, during the sentinel case, the sentinel;
+- the job id is now a BOUND parameter rather than interpolated into SQL;
+- `sqlite3` is REMOVED from the read-only allowlist rather than left dormant;
+- the `node:sqlite` import is dynamic, so an older Node runtime costs one
+  unmeasured observation instead of making the whole harness unloadable;
+- the filename and table are restated in the acceptance layer (it is standalone
+  `.mjs` on the VM host and cannot import the Worker's TypeScript constants) and
+  cross-checked by the test suite against the sources that define them.
+
+**Evidence schema bumped to `10d-remediation-01`.** The producer contract
+changed materially: "durable state was measured" now comes from a producer that
+can address the deployment at all. No live artifact is invalidated — Phase 10D
+has still not produced one.
+
+**CORRECTION-01 — the read moved INSIDE the Worker container.** The first draft
+of this remediation read the database from the host with `node:sqlite`. That
+removed the `sqlite3` dependency and introduced two worse ones: the Lima host
+runs Node v18.19.1, which has no `node:sqlite` at all, and `/var/lib/videofetch`
+is `0700` owned by uid 1000, so the host would also have needed filesystem
+privilege. Trading one unmet host prerequisite for another is not remediation —
+a tool that needs the deployment changed before it can measure it has not
+measured it.
+
+The runtime that can already do this ships with the deployment: the reviewed
+Worker image carries `/usr/local/bin/node` v22.23.2, whose `node:sqlite` needs
+no flag, and the container already has the durable volume mounted under the
+Worker's own uid. The observer therefore spawns exactly one allowlisted probe:
+
+```
+docker exec videofetch-worker /usr/local/bin/node -e <fixed probe> <32-hex job id>
+```
+
+The probe source is a compile-time constant matched WHOLE by the allowlist, so
+`docker exec ... node -e` is one fixed question rather than a general execution
+capability. A different script, interpreter, database, table, column list or
+argument count is refused before a process is spawned. The probe catches its own
+failures and answers with a closed, size-bounded JSON response — `row`, `absent`
+or one of three named error classes — so no raw SQLite text, stack, path, SQL or
+argv crosses the boundary.
+
+**The Phase-10D host now needs nothing new**: no `node:sqlite`, no `sqlite3`, no
+database permission, no `sudo`, and no Node newer than the VM's v18.19.1. The
+harness still loads and still refuses a live run there, verified on the VM.
+
+**An absent durable row is a FAIL, not a BLOCKED.** A query that ran and proved
+the row is not there is a MEASUREMENT, and the durable ladder is the Worker's
+own record of a job the harness watched reach `ready`. Row presence is graded on
+its own by the new `durable.row-present` check; the three content checks are
+claims about a row, so when the row is provably absent they report that there is
+nothing to judge rather than each restating the same finding. `FAIL` outranks
+`BLOCKED`, so the case verdict is `FAIL`.
+
+**Still recorded, still not fixed here.** `/var/lib/videofetch` remains `0700`
+and is deliberately unchanged; the acceptance operator no longer needs to
+traverse it.
+
+**No Production mutation.** No deployment, image retag, `worker.env` edit,
+systemd, network-policy, DNS, Cloudflare, R2 or Vercel change was made, and
+`YTDLP_ENABLED` remains absent.
+
 #### What Phase 10D is authorized to do
 
 Nothing yet. Only after this harness has been **independently reviewed and

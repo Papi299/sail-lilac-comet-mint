@@ -358,6 +358,7 @@ and **authorize current Stage B**. What it actually attested would be far less:
 | CORRECTION-05 | narrow secret-safe environment probes — the older Stage A retrieved the **complete** environment, values and all; image continuity; deterministic restart recovery |
 | CORRECTION-06 | positive findings outranking observation gaps; the exact `docker top` argv boundary; feature-state continuity |
 | CORRECTION-07 | raw evidence validated before normalization; successful exit required before stdout is a measurement; container-epoch continuity; type-strict run identity; atomic key creation |
+| 10D-REM-01 | the durable observer can address the deployment **at all** — see [Durable state is read inside the Worker](#durable-state-is-read-inside-the-worker). Before it, every `durable.*` check and the sentinel's `durable-row` surface could only ever have been `BLOCKED`, because the producer named a database file, a table and an executable that do not exist |
 
 **Bump it whenever an observer or evaluator change could make an old artifact
 mean something *weaker* under the same shape.** A field added or removed is the
@@ -1276,7 +1277,9 @@ proof to the wrong process tree.
 | `readlink /proc/<pid>/ns/net` | the namespace is `null`, which the evaluator reads as a **mismatch** |
 | `python3 --version`, `node --version`, the EJS probe | the version is unmeasured |
 | the `workDir` probe | presence is unmeasured — never "absent" |
-| `sqlite3 -readonly …` | the durable row is unmeasured |
+
+The durable row is no longer in that table because it is no longer a command —
+see [Durable state is read inside the Worker](#durable-state-is-read-inside-the-worker).
 
 ### Where a non-zero exit is the finding
 
@@ -1632,6 +1635,152 @@ be the debug endpoint this design forbids. So no check says it was observed.
 Likewise, a container comparison is not proof of the private selector, and a
 digest of the client's bytes is not an independent measurement at the Worker
 boundary. The check names say which is which.
+
+## Durable state is read inside the Worker
+
+The durable observer used to shell out to `sqlite3`. It named three things, and
+was wrong about all three:
+
+| | It said | The deployment says |
+| :--- | :--- | :--- |
+| database | `/var/lib/videofetch/videofetch.db` | `/var/lib/videofetch/worker.sqlite` |
+| table | `jobs` | `worker_jobs` |
+| access | the `sqlite3` executable | not installed on the VM |
+
+That is worse than a bug in a check, because of what it looks like from the
+outside. Every `durable.*` claim and the sentinel's `durable-row` surface would
+have reported `BLOCKED` on a perfectly healthy deployment, and the reason would
+have described the instrument rather than the system under test — which is the
+one confusion the whole fail-closed design exists to prevent. `BLOCKED` is
+supposed to mean *we could not measure this deployment*, not *we were never
+able to measure any deployment*.
+
+### Why the read does not happen on the host
+
+The first correction read the database from the host with `node:sqlite`. That
+removed the `sqlite3` dependency and quietly introduced two worse ones:
+
+```
+the Phase-10D Lima host runs Node v18.19.1  ->  no node:sqlite at all
+/var/lib/videofetch is 0700, owned by uid 1000  ->  host needs privilege
+```
+
+Trading one unmet host prerequisite for another is not remediation. **A tool
+that needs the deployment changed before it can measure it has not measured
+it.**
+
+The runtime that can already do this ships *with* the deployment:
+
+```
+/usr/local/bin/node    in the reviewed Worker image     Node v22.23.2
+node:sqlite            present, and needs no flag
+/var/lib/videofetch    already mounted, already owned by the Worker's uid
+```
+
+So the read happens there, under the Worker's own runtime identity, and the
+host is left needing nothing it does not already have: no SQLite, no database
+permission, no `sudo`, and no Node newer than the VM's.
+
+### One fixed question, not a shell
+
+```
+docker exec videofetch-worker /usr/local/bin/node -e <fixed probe> <32-hex job id>
+```
+
+```js
+new DatabaseSync("/var/lib/videofetch/worker.sqlite", { readOnly: true })
+  .prepare("SELECT job_id, status, format_id, extractor FROM worker_jobs WHERE job_id = ?")
+  .get(jobId)
+```
+
+The probe source is a **compile-time constant matched whole** by the allowlist —
+the same discipline CORRECTION-05 applied to the environment probes. `docker
+exec … node -e` is therefore not a general execution capability; it is one
+question with one dynamic token.
+
+| Refused | Why |
+| :--- | :--- |
+| any other `-e` script, including the probe plus one statement | not the constant |
+| `--eval` instead of `-e` | shape must be exact |
+| `node` instead of `/usr/local/bin/node`, or a traversal path | the interpreter is fixed |
+| `/bin/sh`, `/usr/bin/env` | no shell, no indirection |
+| a different database, table, or column list | all three are inside the constant |
+| `SELECT *` or a projection containing `url` | same |
+| a job id that is not 32 lowercase hex | the one dynamic token stays bounded |
+| any extra argument | shape must be exact |
+
+Refusal happens before a process is spawned.
+
+- **The filename and table are the deployment's, not the harness's.** They are
+  restated here because the harness is standalone `.mjs` on the VM host and
+  cannot import the Worker's TypeScript constants — so the test suite
+  cross-checks each restatement against the source that defines it
+  (`WORKER_DATABASE_FILENAME` in `state-directory.server.ts`, `CREATE TABLE
+  worker_jobs` in `migrations.server.ts`). A restated constant with a
+  cross-check is a contract; without one it is the defect above.
+- **The job id is bound, not interpolated.**
+- **`url` is never selected.** That is a projection, not a post-filter: the
+  column holds the acceptance URL and, during the sentinel case, the sentinel.
+  Fetching the row and deleting the field afterwards is the "fetched, then
+  sanitized" pattern CORRECTION-05 removed from the environment probes.
+- **`readOnly: true` is explicit.** Not because the probe only runs a `SELECT`,
+  but because an open writable handle to the live Production database is a
+  capability whether or not it is used — and SQLite *creates* a missing file
+  when opened writable, which would fabricate an empty durable database at the
+  exact path the acceptance is trying to measure.
+- **`sqlite3` is gone from the allowlist**, not merely unused.
+
+### The closed response
+
+The probe answers with one of exactly three shapes, and catches its own
+failures so that no raw SQLite message, stack, path, SQL or argv can cross the
+`docker exec` boundary at all:
+
+```json
+{"kind":"row","jobId":"…","status":"…","formatId":"…","extractor":"…"}
+{"kind":"absent","jobId":"…"}
+{"kind":"error","code":"database-open-failed|query-failed|probe-runtime-failed"}
+```
+
+Stdout is size-bounded, and anything the parser cannot fully account for — an
+unknown `kind`, an unexpected key, a mismatched job id, unparseable JSON — is a
+measurement failure. Nothing is partially trusted.
+
+The probe exits `0` whenever it produced a closed response, *including* its
+error kinds. That keeps CORRECTION-07's rule intact rather than bending it: a
+non-zero exit means the probe did not run, and its stdout is not evidence of
+anything. The outcome lives in `kind`, inside a response the process
+successfully produced.
+
+### An absent row is a measurement
+
+| Observation | Result |
+| :--- | :--- |
+| the probe ran and the row matched | **measured** — `durable.row-present` `PASS` |
+| the probe ran and proved the row absent | **measured** — `durable.row-present` **`FAIL`** |
+| the database could not be opened | unmeasured → `BLOCKED` |
+| the query failed | unmeasured → `BLOCKED` |
+| the response could not be interpreted | unmeasured → `BLOCKED` |
+
+The second row is the one worth stating plainly. A successful query that proves
+the expected row is not there **is a measurement**, and the durable ladder is
+the Worker's own record of a job the harness watched reach `ready` — so its
+absence is a defect in the deployment, not a gap in observation. Reporting it as
+`BLOCKED` would say *we could not look* about the one case where we looked and
+found something wrong.
+
+Row **presence** is therefore graded on its own, by `durable.row-present`. The
+three content checks — `durable.extractor-is-ytdlp`,
+`durable.application-format-id`, `durable.no-raw-selector-fields` — are claims
+*about a row*, so when the row is provably absent they report that there is
+nothing to judge rather than each manufacturing its own version of the same
+finding. `FAIL` outranks `BLOCKED`, so the case verdict is `FAIL`, which is the
+honest reading: something is wrong, and it is named once.
+
+An unreadable database and an absent row never share a story. The old CLI
+parser could not tell them apart at all — empty stdout became "no row", so a
+missing table and a missing job looked identical.
+
 
 ## Privacy controls
 

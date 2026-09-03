@@ -26,8 +26,38 @@ import { fingerprintChain } from "./egress-policy.mjs";
 
 const execFileAsync = promisify(execFile);
 
-/** The durable state file the Worker owns on the VM. Read-only, and never copied. */
-export const WORKER_STATE_DB = "/var/lib/videofetch/videofetch.db";
+/**
+ * The durable state the Worker owns on the VM. Read-only, and never copied.
+ *
+ * These three names are the DEPLOYMENT CONTRACT, not harness inventions. The
+ * harness previously carried its own parallel guesses for all three and was
+ * wrong about every one of them:
+ *
+ *   database   videofetch.db  ->  worker.sqlite   (WORKER_DATABASE_FILENAME in
+ *                                  src/worker/runtime/state-directory.server.ts)
+ *   table      jobs           ->  worker_jobs     (CREATE TABLE worker_jobs in
+ *                                  src/worker/state/migrations.server.ts)
+ *   access     `sqlite3` CLI  ->  node:sqlite     (the Worker's own driver)
+ *
+ * None of that could ever have measured Production: the file does not exist,
+ * the table does not exist, and the executable is not installed on the VM. The
+ * durable checks would have reported BLOCKED for a reason that had nothing to
+ * do with the deployment under test.
+ *
+ * The harness cannot IMPORT the Worker's constants: it is a standalone `.mjs`
+ * tool that runs on the VM host with no TypeScript loader, while the Worker's
+ * constants live in `.ts` behind the repository's alias/type-stripping setup.
+ * So the values are restated here exactly once, and a regression in
+ * `scripts/ytdlp-acceptance.test.mjs` cross-checks each of them against the
+ * Worker source that defines it. A restated constant with a cross-check is a
+ * contract; a restated constant without one is the defect above.
+ */
+export const WORKER_STATE_DIRECTORY = "/var/lib/videofetch";
+export const WORKER_DATABASE_FILENAME = "worker.sqlite";
+export const WORKER_STATE_DB = `${WORKER_STATE_DIRECTORY}/${WORKER_DATABASE_FILENAME}`;
+
+/** The durable table the Worker's own migration creates. */
+export const WORKER_JOBS_TABLE = "worker_jobs";
 
 /**
  * The ONLY durable columns the harness may project.
@@ -69,16 +99,34 @@ export function egressChainListArgv(netnsPid) {
 /** A durable job id, as the Worker's own schema defines it. */
 const JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
 
-/** The exact SQL this harness may ever run. Built here, never assembled from input. */
-export function durableJobQuery(jobId) {
-  if (!JOB_ID_PATTERN.test(String(jobId))) throw new Error("refusing to query a malformed job id");
-  return `SELECT ${DURABLE_SAFE_COLUMNS.join(", ")} FROM jobs WHERE job_id = '${jobId}';`;
+/** Refuses a job id outside the Worker's own durable grammar. */
+export function assertDurableJobId(jobId) {
+  if (typeof jobId !== "string" || !JOB_ID_PATTERN.test(jobId)) {
+    throw new Error("refusing to query a malformed job id");
+  }
+  return jobId;
 }
 
-/** The fixed shape a durable read must have, so `sqlite3` cannot become a SQL console. */
-const DURABLE_QUERY_PATTERN = new RegExp(
-  `^SELECT ${DURABLE_SAFE_COLUMNS.join(", ")} FROM jobs WHERE job_id = '[0-9a-f]{32}';$`,
-);
+/**
+ * The ONE statement this harness may ever run against durable state.
+ *
+ * A module-level constant with a BOUND parameter, not a string built per call.
+ * The previous form interpolated the job id into the SQL after validating it,
+ * which was safe only for as long as the validator and the interpolation stayed
+ * in agreement — a coupling that has to be re-proven every time either moves.
+ * A placeholder removes the question: the id is data to SQLite, and the
+ * statement text is a constant no caller can influence.
+ *
+ * The projection is the safe column list, and `url` is not in it. That is a
+ * PROJECTION, not a post-filter: the column holds the operator-supplied
+ * acceptance URL and, during the sentinel case, the sentinel itself, so it must
+ * never enter this process at all. Reading the row and deleting the field
+ * afterwards would be the "fetched, then sanitized" pattern CORRECTION-05
+ * removed from the environment probes for exactly the same reason.
+ */
+export const DURABLE_JOB_QUERY = `SELECT ${DURABLE_SAFE_COLUMNS.join(
+  ", ",
+)} FROM ${WORKER_JOBS_TABLE} WHERE job_id = ?`;
 
 /**
  * The complete set of shapes this harness may execute.
@@ -111,6 +159,12 @@ const READ_ONLY_COMMANDS = Object.freeze([
   // the allowlist admits exactly the known version invocations and nothing
   // else, so `docker exec` cannot become a general remote shell.
   ["docker", (a) => a[0] === "exec" && isVersionProbe(a)],
+  // The durable read, as ONE fixed in-container question. Separate from the
+  // version probes because it is a different contract: a different executable
+  // (`/usr/local/bin/node`), a different argument shape, and one dynamic token
+  // — the validated 32-hex job id. Folding it into `isVersionProbe` would have
+  // widened a predicate whose whole value is that it is narrow.
+  ["docker", (a) => a[0] === "exec" && isDurableProbe(a)],
   // Read-only unit state.
   ["systemctl", (a) => a[0] === "is-active" || a[0] === "show" || a[0] === "status"],
   ["journalctl", () => true],
@@ -146,15 +200,14 @@ const READ_ONLY_COMMANDS = Object.freeze([
       a[8] === EGRESS_TABLE &&
       a[9] === EGRESS_CHAIN,
   ],
-  // Durable state, read-only, projecting only the safe column list.
-  [
-    "sqlite3",
-    (a) =>
-      a.length === 3 &&
-      a[0] === "-readonly" &&
-      a[1] === WORKER_STATE_DB &&
-      DURABLE_QUERY_PATTERN.test(a[2]),
-  ],
+  // `sqlite3` is DELIBERATELY ABSENT from this allowlist.
+  //
+  // It is not installed on the Phase-10D VM, so the retired entry could never
+  // have produced a measurement there — and an allowlisted `sqlite3` shape is a
+  // SQL-console-shaped hole kept open by a regex. The durable read is now the
+  // fixed in-container probe above, so the CLI boundary is GONE rather than
+  // dormant. `scripts/ytdlp-acceptance.test.mjs` asserts that no `sqlite3`
+  // command is admissible here in any shape.
 ]);
 
 /**
@@ -454,6 +507,191 @@ export function notMeasured(reason) {
   return Object.freeze({ measured: false, reason });
 }
 
+// ── Durable state, read INSIDE the Worker container ────────────────────────
+//
+// The first remediation read the database from the host with `node:sqlite`.
+// That removed the `sqlite3` dependency and replaced it with a worse one: the
+// Phase-10D Lima host runs Node v18.19.1, which has no `node:sqlite` at all, so
+// the observer still could not measure the deployment — and it now also needed
+// filesystem privilege to traverse the Worker's `0700` state directory.
+//
+// Trading one unmet host prerequisite for another is not remediation. The
+// runtime that can already do this ships WITH the deployment:
+//
+//   /usr/local/bin/node   in the reviewed Worker image   Node v22.23.2
+//   node:sqlite           present, no flag required
+//   /var/lib/videofetch   already mounted, already owned by the Worker's uid
+//
+// So the probe runs there, under the Worker's own runtime identity, and the
+// host only has to spawn one exactly-allowlisted command and parse a small
+// closed response. The host needs no SQLite, no database permission, and no
+// Node newer than the one the VM already has.
+
+/** The Worker image's own Node. Fixed: this is the reviewed runtime, not a lookup. */
+export const WORKER_NODE_PATH = "/usr/local/bin/node";
+
+/** Stdout ceiling for the probe. The closed response is a couple of hundred bytes. */
+export const DURABLE_PROBE_MAX_STDOUT = 8 * 1024;
+
+/**
+ * The complete in-container durable probe, as a COMPILE-TIME CONSTANT.
+ *
+ * This is the same discipline CORRECTION-05 applied to the environment probes:
+ * the allowlist matches this exact string, so `docker exec … node -e <script>`
+ * is not a general execution capability — it is one fixed question. A different
+ * script, a different database, a different table, an extra column or an extra
+ * argument is refused before a process is spawned.
+ *
+ * What it may emit is equally closed (§7 of CORRECTION-01):
+ *
+ *   {"kind":"row","jobId":…,"status":…,"formatId":…,"extractor":…}
+ *   {"kind":"absent","jobId":…}
+ *   {"kind":"error","code":"database-open-failed"|"query-failed"|"probe-runtime-failed"}
+ *
+ * No URL, no SQL, no path, no raw SQLite message, no stack, no argv, no
+ * environment. The script catches its own failures precisely so that none of
+ * that text can cross the `docker exec` boundary in the first place — the same
+ * "never fetched" rather than "fetched, then sanitized" rule used everywhere
+ * else here.
+ *
+ * It exits 0 whenever it produced a closed response, INCLUDING its error kinds.
+ * That keeps CORRECTION-07's rule intact rather than bending it: a non-zero
+ * exit means the probe itself did not run, and its stdout is not evidence of
+ * anything. The outcome lives in `kind`, which is inside the response the
+ * process successfully produced.
+ */
+export const DURABLE_PROBE_SOURCE = [
+  'const out=(o)=>process.stdout.write(JSON.stringify(o));',
+  'const run=()=>{',
+  'const j=process.argv[1];',
+  'if(!/^[0-9a-f]{32}$/.test(String(j||"")))return{kind:"error",code:"probe-runtime-failed"};',
+  'let D;',
+  'try{D=require("node:sqlite").DatabaseSync;}catch{return{kind:"error",code:"probe-runtime-failed"};}',
+  'let db;',
+  'try{db=new D("/var/lib/videofetch/worker.sqlite",{readOnly:true});}',
+  'catch{return{kind:"error",code:"database-open-failed"};}',
+  'try{',
+  'const r=db.prepare("SELECT job_id, status, format_id, extractor FROM worker_jobs WHERE job_id = ?").get(j);',
+  'if(!r)return{kind:"absent",jobId:j};',
+  'return{kind:"row",jobId:r.job_id,status:r.status,formatId:r.format_id??null,extractor:r.extractor??null};',
+  '}catch{return{kind:"error",code:"query-failed"};}',
+  'finally{try{db.close();}catch{}}',
+  '};',
+  'try{out(run());}catch{out({kind:"error",code:"probe-runtime-failed"});}',
+].join("");
+
+/** The closed set of failure classes the probe may name. */
+export const DURABLE_PROBE_ERROR_CODES = Object.freeze({
+  "database-open-failed": "the durable database could not be opened read-only",
+  "query-failed": "the durable query failed",
+  "probe-runtime-failed": "the durable probe could not run inside the Worker",
+});
+
+/** The one admissible durable-probe argv, for a validated container and job id. */
+export function durableProbeArgv(container, jobId) {
+  if (!CONTAINER_NAME_PATTERN.test(String(container))) {
+    throw new Error("refusing to probe a malformed container name");
+  }
+  assertDurableJobId(jobId);
+  return ["exec", container, WORKER_NODE_PATH, "-e", DURABLE_PROBE_SOURCE, jobId];
+}
+
+/** `docker exec <container> /usr/local/bin/node -e <fixed probe> <32-hex>` and nothing else. */
+function isDurableProbe(argv) {
+  return (
+    argv.length === 6 &&
+    CONTAINER_NAME_PATTERN.test(String(argv[1])) &&
+    argv[2] === WORKER_NODE_PATH &&
+    argv[3] === "-e" &&
+    argv[4] === DURABLE_PROBE_SOURCE &&
+    typeof argv[5] === "string" &&
+    JOB_ID_PATTERN.test(argv[5])
+  );
+}
+
+/**
+ * A failure to READ, as opposed to a row that is provably not there.
+ *
+ * These are different findings and must never share a story: one indicts the
+ * instrument, the other the deployment. Only this one is unmeasured.
+ */
+export class DurableReadError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "DurableReadError";
+  }
+}
+
+/**
+ * Interprets the probe's closed response.
+ *
+ * Nothing here is partially trusted. An unknown `kind`, an unexpected key, a
+ * mismatched job id, oversized output or unparseable JSON is a measurement
+ * failure — because a response the harness cannot fully account for is not a
+ * response it can grade a security-relevant claim from.
+ */
+export function parseDurableProbeResponse(stdout, jobId) {
+  const text = String(stdout ?? "").trim();
+  if (text.length === 0) throw new DurableReadError("the durable probe produced no response");
+  if (text.length > DURABLE_PROBE_MAX_STDOUT) {
+    throw new DurableReadError("the durable probe response exceeded its size bound");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // The text is NOT quoted back. A response the parser could not read is
+    // exactly the one whose content cannot be assumed safe to echo.
+    throw new DurableReadError("the durable probe response was not valid JSON");
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new DurableReadError("the durable probe response was not an object");
+  }
+
+  const keys = Object.keys(parsed).sort().join(",");
+  if (parsed.kind === "row") {
+    if (keys !== "extractor,formatId,jobId,kind,status") {
+      throw new DurableReadError("the durable probe row did not match the projected columns");
+    }
+    if (parsed.jobId !== jobId) {
+      throw new DurableReadError("the durable probe answered about a different job");
+    }
+    if (typeof parsed.status !== "string") {
+      throw new DurableReadError("the durable probe row carried no status");
+    }
+    return {
+      present: true,
+      jobId,
+      status: parsed.status,
+      formatId: parsed.formatId ?? null,
+      extractor: parsed.extractor ?? null,
+    };
+  }
+
+  if (parsed.kind === "absent") {
+    if (keys !== "jobId,kind") {
+      throw new DurableReadError("the durable probe absence response carried unknown fields");
+    }
+    if (parsed.jobId !== jobId) {
+      throw new DurableReadError("the durable probe answered about a different job");
+    }
+    // A MEASUREMENT (§12 of CORRECTION-01). The query ran and proved the row is
+    // not there. Calling that "unmeasured" would report a deployment defect as
+    // an inability to look, which is the inversion this harness exists to stop.
+    return { present: false, jobId, status: null, formatId: null, extractor: null };
+  }
+
+  if (parsed.kind === "error") {
+    const reason = DURABLE_PROBE_ERROR_CODES[parsed.code];
+    if (!reason) throw new DurableReadError("the durable probe reported an unknown failure class");
+    throw new DurableReadError(reason);
+  }
+
+  throw new DurableReadError("the durable probe response had an unknown kind");
+}
+
+
 // ── System observers ───────────────────────────────────────────────────────
 
 export function makeSystemObservers(deps = {}) {
@@ -689,16 +927,16 @@ export function makeSystemObservers(deps = {}) {
      */
     async durableJobRow(jobId) {
       return observe(`durable job ${jobId}`, async () => {
-        const result = await run("sqlite3", ["-readonly", WORKER_STATE_DB, durableJobQuery(jobId)]);
-        if (result.exitCode !== 0) throw new Error("durable state could not be read");
-        const line = String(result.stdout ?? "").trim();
-        if (!line) throw new Error("no durable row exists for this job");
-        const parts = line.split("|");
-        if (parts.length !== DURABLE_SAFE_COLUMNS.length) {
-          throw new Error("durable row shape did not match the projected columns");
+        const result = await run("docker", durableProbeArgv(container, jobId), {
+          maxBuffer: DURABLE_PROBE_MAX_STDOUT,
+        });
+        // §7 of CORRECTION-07: a non-zero exit means the probe did not run, so
+        // whatever is in the buffer beside it was not measured. stderr is never
+        // read — the probe is written so nothing worth reading is ever there.
+        if (result.exitCode !== 0) {
+          throw new DurableReadError("the durable probe did not run inside the Worker container");
         }
-        const [jobIdValue, status, formatId, extractor] = parts;
-        return { jobId: jobIdValue, status, formatId, extractor };
+        return parseDurableProbeResponse(result.stdout, jobId);
       });
     },
 

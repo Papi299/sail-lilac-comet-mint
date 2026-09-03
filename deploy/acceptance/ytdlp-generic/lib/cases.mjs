@@ -79,7 +79,16 @@ const CASE_PAYLOAD_VALIDATORS = Object.freeze({
       isArr(v?.presets) &&
       "thumbnail" in v,
     genericJob: (v) => isArr(v?.transitions) && isStr(v?.requestedFormatId) && isStr(v?.jobId),
-    durableJobRow: (v) => isStr(v?.jobId) && isStr(v?.status) && "formatId" in v && "extractor" in v,
+    // `present` is required, and `status` may be null: a probe that RAN and
+    // proved the row absent is a measurement the record must be able to carry.
+    // Requiring a status string here would have forced the producer to either
+    // fabricate one or throw the finding away.
+    durableJobRow: (v) =>
+      isBool(v?.present) &&
+      isStr(v?.jobId) &&
+      "status" in v &&
+      "formatId" in v &&
+      "extractor" in v,
     selectorConstraints: (v) => isBool(v?.containerMatches),
     // The complete downloading window, not one sample (§9-§12 of CORRECTION-02).
     downloadingWindow: (v) =>
@@ -794,6 +803,10 @@ export async function runSuccessCase(ctx) {
   const { polled, window } = await driveJobWithWindow(ctx, jobId, created.status);
   const finalJob = polled.final;
 
+  // An UNMEASURED durable read still aborts: a record whose durable checks
+  // could not be graded is not acceptance evidence. A measured ABSENCE does
+  // not abort — it is a finding, and it belongs in the sealed record so
+  // `durable.row-present` can report it as a FAIL.
   const durable = await system.durableJobRow(jobId);
   if (durable.measured !== true) {
     throw new Error(`durable job evidence unavailable: ${durable.reason}`);

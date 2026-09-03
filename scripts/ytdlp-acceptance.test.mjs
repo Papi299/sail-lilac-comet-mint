@@ -9,9 +9,21 @@
 // orchestration run against them. They deliberately do NOT hand the evaluators
 // finished truth objects, because that is exactly the gap CORRECTION-01 closes.
 
-import { describe, it } from "node:test";
+import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import {
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   evaluateLiveGate,
@@ -69,6 +81,7 @@ import {
   REQUIRED_SERVICES,
 } from "../deploy/acceptance/ytdlp-generic/lib/stage-a.mjs";
 import {
+  rowContentObservation,
   evaluateStageB,
   stageBAuthorization,
   presetsAreApplicationOwned,
@@ -85,13 +98,25 @@ import {
 } from "../deploy/acceptance/ytdlp-generic/lib/evidence.mjs";
 import {
   isReadOnlyCommand,
-  durableJobQuery,
+  assertDurableJobId,
+  durableProbeArgv,
+  parseDurableProbeResponse,
+  DURABLE_PROBE_SOURCE,
+  DURABLE_PROBE_ERROR_CODES,
+  DURABLE_PROBE_MAX_STDOUT,
+  WORKER_NODE_PATH,
   workDirProbeArgv,
   makeSystemObservers,
   parseMaxFileSize,
   decodeEnvProbe,
   DOCKER_TOP_COLUMNS,
   DEFAULT_MAX_FILE_SIZE_BYTES,
+  DURABLE_JOB_QUERY,
+  DURABLE_SAFE_COLUMNS,
+  WORKER_STATE_DB,
+  WORKER_STATE_DIRECTORY,
+  WORKER_DATABASE_FILENAME,
+  WORKER_JOBS_TABLE,
   EJS_PROBE_ARGV,
   ENV_NAMES_PROBE_ARGV,
   YTDLP_ENABLED_PROBE_ARGV,
@@ -432,6 +457,7 @@ function passingStageBObservations(overrides = {}) {
       requestedFormatId: "preset:720",
     }),
     durableJobRow: measured({
+      present: true,
       jobId: JOB_ID,
       status: "ready",
       formatId: "preset:720",
@@ -482,6 +508,80 @@ function passingStageBObservations(overrides = {}) {
 // Substitutes the SYSTEMS (command runner, fetch), never the observations. The
 // CLI, the observers, the control-plane driver, the sampler, the case producers
 // and the evaluators all run for real against it.
+
+// ── Disposable durable databases ───────────────────────────────────────────
+//
+// The durable observer is no longer a fake-able external command, so these
+// tests do not fake it. They build a REAL SQLite database using the Worker's
+// OWN `CREATE TABLE worker_jobs` statement — extracted from the migration
+// source rather than retyped — and run the real read-only reader against it.
+//
+// Extracting the DDL is the point. A retyped schema is a third parallel
+// description of the deployment, and a third thing that can drift out of
+// agreement with Production; that drift is the entire defect this change
+// exists to correct, so reintroducing it here would be self-defeating.
+
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const MIGRATIONS_SOURCE = readFileSync(
+  join(REPO_ROOT, "src/worker/state/migrations.server.ts"),
+  "utf8",
+);
+const STATE_DIRECTORY_SOURCE = readFileSync(
+  join(REPO_ROOT, "src/worker/runtime/state-directory.server.ts"),
+  "utf8",
+);
+
+/** The Worker's own `worker_jobs` DDL, taken verbatim from its migration. */
+const WORKER_JOBS_DDL = (() => {
+  const match = MIGRATIONS_SOURCE.match(/CREATE TABLE worker_jobs \([\s\S]*?\) STRICT;/);
+  assert.ok(match, "the Worker migration must define CREATE TABLE worker_jobs");
+  return match[0];
+})();
+
+const DURABLE_TMP_ROOT = mkdtempSync(join(tmpdir(), "vf-durable-"));
+let durableDbSeq = 0;
+
+after(() => {
+  rmSync(DURABLE_TMP_ROOT, { recursive: true, force: true });
+});
+
+/**
+ * Creates a disposable durable database carrying the Worker's real schema.
+ *
+ * `url` is seeded with a sentinel on purpose: the projection must leave it in
+ * the database, and every assertion about "the sentinel did not leak" is
+ * meaningless unless the sentinel was genuinely there to leak.
+ */
+function makeDurableDatabase(rows = [], opts = {}) {
+  const dir = join(DURABLE_TMP_ROOT, `db-${durableDbSeq++}`);
+  mkdirSync(dir, { recursive: true });
+  const databasePath = join(dir, WORKER_DATABASE_FILENAME);
+
+  const db = new DatabaseSync(databasePath);
+  db.exec(WORKER_JOBS_DDL);
+  if (opts.wal === true) db.exec("PRAGMA journal_mode = WAL");
+  const insert = db.prepare(
+    `INSERT INTO ${WORKER_JOBS_TABLE}
+       (job_id, url, format_id, principal_id, status, extractor,
+        created_at_ms, updated_at_ms, expires_at_ms)
+     VALUES (?, ?, ?, 'private-access-user', ?, ?, 1, 1, 2)`,
+  );
+  for (const row of rows) {
+    insert.run(
+      row.jobId,
+      row.url ?? "https://example.invalid/watch?v=x",
+      row.formatId ?? "preset:720",
+      row.status ?? "ready",
+      row.extractor ?? "yt-dlp",
+    );
+  }
+  // A WAL database is left OPEN when the caller asks for one, so the `-wal` and
+  // `-shm` sidecars are present and uncheckpointed while it is read — which is
+  // the state the live Worker's database is always in.
+  if (opts.keepOpen === true) return { databasePath, db, dir };
+  db.close();
+  return { databasePath, db: null, dir };
+}
 
 function makeFakeWorld(options = {}) {
   const env = {
@@ -766,10 +866,46 @@ function makeFakeWorld(options = {}) {
         if (joined.includes("os.path.isdir")) return { exitCode: 0, stdout: "False\n", stderr: "" };
       }
     }
-    if (file === "journalctl") return { exitCode: 0, stdout: "no errors\n", stderr: "" };
-    if (file === "sqlite3") {
-      return { exitCode: 0, stdout: `${JOB_ID}|ready|preset:720|yt-dlp\n`, stderr: "" };
+    // The durable read is now ONE fixed in-container probe. The fake answers
+    // it with the same closed response contract the real probe emits, so the
+    // command boundary and the response parser are both exercised for real.
+    if (file === "docker" && argv[0] === "exec" && argv[3] === "-e") {
+      if (options.durableProbe === "process-failed") {
+        return { exitCode: 1, stdout: JSON.stringify({ kind: "row" }), stderr: "boom" };
+      }
+      if (options.durableProbe === "malformed") {
+        return { exitCode: 0, stdout: "{not json", stderr: "" };
+      }
+      if (options.durableProbe) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ kind: "error", code: options.durableProbe }),
+          stderr: "",
+        };
+      }
+      const jobId = argv[5];
+      if (jobId !== JOB_ID) {
+        return { exitCode: 0, stdout: JSON.stringify({ kind: "absent", jobId }), stderr: "" };
+      }
+      if (options.durableRowAbsent === true) {
+        return { exitCode: 0, stdout: JSON.stringify({ kind: "absent", jobId }), stderr: "" };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          kind: "row",
+          jobId,
+          status: options.durableStatus ?? "ready",
+          formatId: options.durableFormatId ?? "preset:720",
+          extractor: options.durableExtractor ?? "yt-dlp",
+        }),
+        stderr: "",
+      };
     }
+    if (file === "journalctl") return { exitCode: 0, stdout: "no errors\n", stderr: "" };
+    // There is deliberately NO `sqlite3` branch: `isReadOnlyCommand` no longer
+    // admits that command in any shape, so a stub could only describe a path
+    // that cannot run.
     return { exitCode: 0, stdout: "", stderr: "" };
   }
 
@@ -1614,7 +1750,7 @@ describe("durable format evidence", () => {
     const result = evaluateStageB(
       passingStageBObservations({
         genericJob: measured({ jobId: JOB_ID, transitions: FULL_LADDER, requestedFormatId: "preset:1080" }),
-        durableJobRow: measured({ jobId: JOB_ID, status: "ready", formatId: "preset:1080", extractor: "yt-dlp" }),
+        durableJobRow: measured({ present: true, jobId: JOB_ID, status: "ready", formatId: "preset:1080", extractor: "yt-dlp" }),
       }),
       passingStageA(),
     );
@@ -1626,7 +1762,7 @@ describe("durable format evidence", () => {
   it('21b. a durable formatId of "22" cannot satisfy the application-format check', () => {
     const result = evaluateStageB(
       passingStageBObservations({
-        durableJobRow: measured({ jobId: JOB_ID, status: "ready", formatId: "22", extractor: "yt-dlp" }),
+        durableJobRow: measured({ present: true, jobId: JOB_ID, status: "ready", formatId: "22", extractor: "yt-dlp" }),
       }),
       passingStageA(),
     );
@@ -1639,7 +1775,7 @@ describe("durable format evidence", () => {
     const result = evaluateStageB(
       passingStageBObservations({
         genericJob: measured({ jobId: JOB_ID, transitions: FULL_LADDER, requestedFormatId: "preset:720" }),
-        durableJobRow: measured({ jobId: JOB_ID, status: "ready", formatId: "preset:360", extractor: "yt-dlp" }),
+        durableJobRow: measured({ present: true, jobId: JOB_ID, status: "ready", formatId: "preset:360", extractor: "yt-dlp" }),
       }),
       passingStageA(),
     );
@@ -1655,6 +1791,7 @@ describe("durable format evidence", () => {
       const result = evaluateStageB(
         passingStageBObservations({
           durableJobRow: measured({
+            present: true,
             jobId: JOB_ID,
             status: "ready",
             formatId: "preset:720",
@@ -1689,16 +1826,36 @@ describe("durable format evidence", () => {
     assert.equal(presetsAreApplicationOwned(["preset:720"]), false, "bare strings are not the contract");
   });
 
-  it("the durable reader projects only safe columns — never the URL", () => {
-    const sql = durableJobQuery(JOB_ID);
-    assert.match(sql, /^SELECT job_id, status, format_id, extractor FROM jobs/);
-    assert.doesNotMatch(sql, /\burl\b/, "the submitted URL must never be selected");
-    assert.throws(() => durableJobQuery("'; DROP TABLE jobs;--"), /malformed job id/);
-    assert.equal(isReadOnlyCommand("sqlite3", ["-readonly", "/var/lib/videofetch/videofetch.db", sql]), true);
+  it("the durable statement projects only safe columns — never the URL", () => {
     assert.equal(
-      isReadOnlyCommand("sqlite3", ["-readonly", "/var/lib/videofetch/videofetch.db", "SELECT url FROM jobs;"]),
-      false,
+      DURABLE_JOB_QUERY,
+      "SELECT job_id, status, format_id, extractor FROM worker_jobs WHERE job_id = ?",
     );
+    assert.doesNotMatch(DURABLE_JOB_QUERY, /\burl\b/, "the submitted URL must never be selected");
+    // The id is BOUND, so it is data to SQLite and cannot close the statement.
+    assert.match(DURABLE_JOB_QUERY, /WHERE job_id = \?$/);
+    assert.doesNotMatch(DURABLE_JOB_QUERY, /'/, "no quoted literal is interpolated any more");
+    assert.equal(assertDurableJobId(JOB_ID), JOB_ID);
+    assert.throws(() => assertDurableJobId("'; DROP TABLE worker_jobs;--"), /malformed job id/);
+    assert.throws(() => assertDurableJobId(JOB_ID.toUpperCase()), /malformed job id/);
+    // §1 of CORRECTION-07's rule, applied here: admission is by TYPE first.
+    assert.throws(() => assertDurableJobId(0), /malformed job id/);
+    assert.throws(() => assertDurableJobId(null), /malformed job id/);
+  });
+
+  it("no `sqlite3` command is admissible in any shape", () => {
+    // The durable read is in-process now, so the CLI boundary that used to
+    // guard it is GONE rather than dormant. A dormant allowlist entry is a
+    // SQL-console-shaped hole that a future caller only has to widen.
+    for (const argv of [
+      ["-readonly", WORKER_STATE_DB, DURABLE_JOB_QUERY],
+      ["-readonly", "/var/lib/videofetch/videofetch.db", "SELECT job_id FROM jobs;"],
+      ["-readonly", WORKER_STATE_DB, "SELECT url FROM worker_jobs;"],
+      [WORKER_STATE_DB, ".dump"],
+      [],
+    ]) {
+      assert.equal(isReadOnlyCommand("sqlite3", argv), false, `sqlite3 ${argv.join(" ")}`);
+    }
   });
 });
 
@@ -6179,7 +6336,6 @@ describe("measurement requires successful completion", () => {
       ["environmentNames", (o) => o.environmentNames(), (f, a) => f === "docker" && a[0] === "exec" && a.slice(2).join(" ") === ENV_NAMES_PROBE_ARGV.join(" "), "PATH\nYTDLP_ENABLED\n"],
       ["ytdlpEnabledRaw", (o) => o.ytdlpEnabledRaw(), (f, a) => f === "docker" && a[0] === "exec" && a.slice(2).join(" ") === YTDLP_ENABLED_PROBE_ARGV.join(" "), "SET:true\n"],
       ["effectiveMaxFileSize", (o) => o.effectiveMaxFileSize(), (f, a) => f === "docker" && a[0] === "exec" && a.slice(2).join(" ") === MAX_FILE_SIZE_PROBE_ARGV.join(" "), "SET:104857600\n"],
-      ["durableJobRow", (o) => o.durableJobRow(JOB_ID), (f) => f === "sqlite3", `${JOB_ID}|ready|preset:720|yt-dlp\n`],
       ["processGroupMembers", (o) => o.processGroupMembers(300), (f) => f === "ps", "100 1 100 node\n"],
       ["workerLogs", (o) => o.workerLogs(), (f, a) => f === "docker" && a[0] === "logs", "worker started\n"],
       ["unitJournal", (o) => o.unitJournal("videofetch-worker"), (f) => f === "journalctl", "no errors\n"],
@@ -6766,7 +6922,7 @@ describe("evidence producer contract version", () => {
     loadStageA("/x", async () => JSON.stringify(record), { run: RUN, expectedSha: SHA });
 
   it("71. the schema identifier is the final Phase-10C4 contract", () => {
-    assert.equal(EVIDENCE_SCHEMA_VERSION, "10c4-correction-08");
+    assert.equal(EVIDENCE_SCHEMA_VERSION, "10d-remediation-01");
     assert.notEqual(EVIDENCE_SCHEMA_VERSION, PREVIOUS_SCHEMA);
     // ONE constant governs Stage A, case records and the aggregate, so they
     // cannot drift into describing different producer contracts.
@@ -6842,7 +6998,7 @@ describe("evidence producer contract version", () => {
       { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
-    assert.equal(JSON.parse(run.files.get("/tmp/c.json")).schemaVersion, "10c4-correction-08");
+    assert.equal(JSON.parse(run.files.get("/tmp/c.json")).schemaVersion, "10d-remediation-01");
   });
 });
 
@@ -7192,5 +7348,393 @@ describe("test-suite safety", () => {
       "b.json",
     ]);
     assert.deepEqual(readOptionList([], "--case-evidence"), []);
+  });
+});
+
+// ── PHASE-10D-BLOCKER-REMEDIATION-01: the durable-state observer ───────────
+//
+// The original observer named a database file, a table and an executable the
+// deployment does not have. CORRECTION-01 then found that reading from the
+// HOST with `node:sqlite` traded one unmet prerequisite for another — the Lima
+// host is Node v18.19.1 — so the read now happens inside the Worker container,
+// on the runtime that ships with the reviewed image.
+//
+// Two properties are load-bearing and are tested structurally, not by fake:
+// `docker exec` must not become general remote execution, and a row that is
+// PROVABLY ABSENT is a measurement, not an inability to look.
+
+describe("durable-state observer (10D-REM-01)", () => {
+  const OTHER_JOB_ID = "ab".repeat(16);
+
+  it("70. the database identity is the Worker's, cross-checked against its source", () => {
+    assert.equal(WORKER_STATE_DB, "/var/lib/videofetch/worker.sqlite");
+    assert.equal(WORKER_STATE_DIRECTORY, "/var/lib/videofetch");
+    assert.equal(WORKER_DATABASE_FILENAME, "worker.sqlite");
+    assert.equal(WORKER_JOBS_TABLE, "worker_jobs");
+
+    // PROVEN against the contracts that define them. The harness cannot import
+    // these constants (standalone `.mjs`, no TypeScript loader), so every
+    // restatement is checked rather than trusted.
+    assert.match(STATE_DIRECTORY_SOURCE, /export const WORKER_DATABASE_FILENAME = "worker\.sqlite";/);
+    assert.ok(STATE_DIRECTORY_SOURCE.includes(`"${WORKER_DATABASE_FILENAME}"`));
+    assert.match(MIGRATIONS_SOURCE, new RegExp(`CREATE TABLE ${WORKER_JOBS_TABLE} \\(`));
+    for (const column of DURABLE_SAFE_COLUMNS) {
+      assert.match(WORKER_JOBS_DDL, new RegExp(`\\b${column}\\b`), `${column} must exist in the schema`);
+    }
+    // The column that must never be projected has to exist for its omission to
+    // mean anything.
+    assert.match(WORKER_JOBS_DDL, /\burl\b/);
+  });
+
+  it("70a. the retired identifiers survive only as history, never as code", () => {
+    const harnessDir = join(REPO_ROOT, "deploy/acceptance/ytdlp-generic");
+    const sources = [
+      "acceptance.mjs",
+      ...["observers", "cases", "coverage", "stage-a", "stage-b", "evidence", "provenance"].map(
+        (name) => `lib/${name}.mjs`,
+      ),
+    ];
+    const isCommentLine = (line) => /^\s*(\/\/|\*|\/\*)/.test(line);
+    for (const relative of sources) {
+      readFileSync(join(harnessDir, relative), "utf8")
+        .split("\n")
+        .forEach((line, index) => {
+          for (const [pattern, what] of [
+            [/videofetch\.db/, "the retired videofetch.db path"],
+            [/\bFROM jobs\b/, "the retired bare jobs table"],
+          ]) {
+            if (!pattern.test(line)) continue;
+            assert.ok(isCommentLine(line), `${relative}:${index + 1} references ${what} in code`);
+          }
+        });
+    }
+  });
+
+  // ── The host requires nothing new ────────────────────────────────────────
+
+  it("71. the production observer never imports node:sqlite on the host", () => {
+    const observerSource = readFileSync(
+      join(REPO_ROOT, "deploy/acceptance/ytdlp-generic/lib/observers.mjs"),
+      "utf8",
+    );
+    // The ONLY `node:sqlite` outside a comment is inside the probe source
+    // string, which runs in the container. A host-side import would reintroduce
+    // the Node >= 22.5 prerequisite this correction exists to remove.
+    for (const [index, line] of observerSource.split("\n").entries()) {
+      if (!/node:sqlite/.test(line)) continue;
+      const isComment = /^\s*(\/\/|\*|\/\*)/.test(line);
+      const isProbeString = /^\s*'/.test(line);
+      assert.ok(isComment || isProbeString, `observers.mjs:${index + 1} imports node:sqlite on the host`);
+    }
+    assert.doesNotMatch(observerSource, /^import .*node:sqlite/m);
+    assert.doesNotMatch(observerSource, /await import\("node:sqlite"\)/);
+  });
+
+  it("71a. the harness exposes no host database path and opens no database", () => {
+    // §11: the production CLI must carry no operator- or test-selectable
+    // database seam. A path that can be pointed somewhere is a path an operator
+    // can point at an answer they prefer.
+    for (const relative of ["acceptance.mjs", "lib/observers.mjs", "lib/cases.mjs"]) {
+      const text = readFileSync(join(REPO_ROOT, "deploy/acceptance/ytdlp-generic", relative), "utf8");
+      assert.ok(!/databasePath/.test(text), `${relative} must expose no databasePath seam`);
+    }
+  });
+
+  // ── The command boundary is structural ───────────────────────────────────
+
+  it("72. exactly one durable-probe command shape is admissible", () => {
+    const argv = durableProbeArgv("videofetch-worker", JOB_ID);
+    assert.deepEqual(argv, [
+      "exec",
+      "videofetch-worker",
+      "/usr/local/bin/node",
+      "-e",
+      DURABLE_PROBE_SOURCE,
+      JOB_ID,
+    ]);
+    assert.equal(isReadOnlyCommand("docker", argv), true);
+    assert.equal(WORKER_NODE_PATH, "/usr/local/bin/node");
+  });
+
+  it("72a. every neighbouring shape is refused before a process is spawned", () => {
+    const ok = durableProbeArgv("videofetch-worker", JOB_ID);
+    const refused = [
+      // Arbitrary Node execution — the whole point of matching the source whole.
+      ["exec", "videofetch-worker", WORKER_NODE_PATH, "-e", "require('fs').readFileSync('/etc/videofetch/worker.env')", JOB_ID],
+      ["exec", "videofetch-worker", WORKER_NODE_PATH, "--eval", DURABLE_PROBE_SOURCE, JOB_ID],
+      ["exec", "videofetch-worker", WORKER_NODE_PATH, "-e", `${DURABLE_PROBE_SOURCE};process.stdout.write("x")`, JOB_ID],
+      ["exec", "videofetch-worker", WORKER_NODE_PATH, "-e", DURABLE_PROBE_SOURCE.replace("worker_jobs", "jobs"), JOB_ID],
+      ["exec", "videofetch-worker", WORKER_NODE_PATH, "-e", DURABLE_PROBE_SOURCE.replace("worker.sqlite", "videofetch.db"), JOB_ID],
+      ["exec", "videofetch-worker", WORKER_NODE_PATH, "-e", DURABLE_PROBE_SOURCE.replace("job_id, status, format_id, extractor", "*"), JOB_ID],
+      ["exec", "videofetch-worker", WORKER_NODE_PATH, "-e", DURABLE_PROBE_SOURCE.replace("job_id, status, format_id, extractor", "job_id, url"), JOB_ID],
+      // A different interpreter, or a shell.
+      ["exec", "videofetch-worker", "/bin/sh", "-c", DURABLE_PROBE_SOURCE, JOB_ID],
+      ["exec", "videofetch-worker", "node", "-e", DURABLE_PROBE_SOURCE, JOB_ID],
+      ["exec", "videofetch-worker", "/usr/bin/env", WORKER_NODE_PATH, "-e", DURABLE_PROBE_SOURCE],
+      ["exec", "videofetch-worker", "../../usr/local/bin/node", "-e", DURABLE_PROBE_SOURCE, JOB_ID],
+      // Argument-shape drift.
+      [...ok, "--extra"],
+      ok.slice(0, 5),
+      ["exec", "videofetch-worker", WORKER_NODE_PATH, "-e", DURABLE_PROBE_SOURCE, JOB_ID.toUpperCase()],
+      ["exec", "videofetch-worker", WORKER_NODE_PATH, "-e", DURABLE_PROBE_SOURCE, "'; DROP TABLE worker_jobs;--"],
+      ["exec", "videofetch-worker", WORKER_NODE_PATH, "-e", DURABLE_PROBE_SOURCE, "../../etc/passwd"],
+      ["exec", "videofetch worker", WORKER_NODE_PATH, "-e", DURABLE_PROBE_SOURCE, JOB_ID],
+    ];
+    for (const argv of refused) {
+      assert.equal(isReadOnlyCommand("docker", argv), false, `must refuse: ${argv[2]} ${argv[3]}`);
+    }
+    // And the constructor refuses to build a bad one at all.
+    assert.throws(() => durableProbeArgv("videofetch-worker", "nope"), /malformed job id/);
+    assert.throws(() => durableProbeArgv("bad name", JOB_ID), /malformed container name/);
+  });
+
+  it("72b. the probe source is the fixed, safe question", () => {
+    assert.ok(DURABLE_PROBE_SOURCE.includes('"/var/lib/videofetch/worker.sqlite"'));
+    assert.ok(DURABLE_PROBE_SOURCE.includes("SELECT job_id, status, format_id, extractor FROM worker_jobs WHERE job_id = ?"));
+    assert.ok(DURABLE_PROBE_SOURCE.includes("readOnly:true"));
+    assert.doesNotMatch(DURABLE_PROBE_SOURCE, /SELECT \*/);
+    assert.doesNotMatch(DURABLE_PROBE_SOURCE, /\burl\b/, "the URL is never selected");
+    assert.doesNotMatch(DURABLE_PROBE_SOURCE, /child_process|readFileSync|process\.env|require\("fs"\)/);
+    // No raw error text may cross the boundary: every catch is bare.
+    assert.doesNotMatch(DURABLE_PROBE_SOURCE, /catch\s*\(/, "the probe must not bind an error object");
+    assert.doesNotMatch(DURABLE_PROBE_SOURCE, /e\.message|\.stack/);
+  });
+
+  // ── The response contract ────────────────────────────────────────────────
+
+  it("73. a present row is measured, and an absent row is measured too", async () => {
+    const present = await makeSystemObservers({
+      runReadOnly: makeFakeWorld().runReadOnly,
+    }).durableJobRow(JOB_ID);
+    assert.equal(present.measured, true);
+    assert.deepEqual(present.value, {
+      present: true,
+      jobId: JOB_ID,
+      status: "ready",
+      formatId: "preset:720",
+      extractor: "yt-dlp",
+    });
+
+    // The probe RAN and proved the row is not there. That is a measurement.
+    const absent = await makeSystemObservers({
+      runReadOnly: makeFakeWorld({ durableRowAbsent: true }).runReadOnly,
+    }).durableJobRow(JOB_ID);
+    assert.equal(absent.measured, true, "a proven absence is a measurement, not a gap");
+    assert.deepEqual(absent.value, {
+      present: false,
+      jobId: JOB_ID,
+      status: null,
+      formatId: null,
+      extractor: null,
+    });
+  });
+
+  it("73a. every unreadable condition is unmeasured, and they stay distinguishable", async () => {
+    const cases = [
+      ["database-open-failed", /could not be opened read-only/],
+      ["query-failed", /the durable query failed/],
+      ["probe-runtime-failed", /could not run inside the Worker/],
+      ["malformed", /was not valid JSON/],
+      ["process-failed", /did not run inside the Worker container/],
+    ];
+    for (const [durableProbe, expected] of cases) {
+      const observed = await makeSystemObservers({
+        runReadOnly: makeFakeWorld({ durableProbe }).runReadOnly,
+      }).durableJobRow(JOB_ID);
+      assert.equal(observed.measured, false, `${durableProbe} must be unmeasured`);
+      assert.match(observed.reason, expected);
+      // None of them may be confused with a proven absence.
+      assert.ok(!/row is absent|no worker_jobs row/.test(observed.reason), durableProbe);
+    }
+  });
+
+  it("73b. the parser refuses anything it cannot fully account for", () => {
+    const good = { kind: "row", jobId: JOB_ID, status: "ready", formatId: "preset:720", extractor: "yt-dlp" };
+    assert.equal(parseDurableProbeResponse(JSON.stringify(good), JOB_ID).present, true);
+    assert.equal(parseDurableProbeResponse(JSON.stringify({ kind: "absent", jobId: JOB_ID }), JOB_ID).present, false);
+
+    const refused = [
+      ["", /produced no response/],
+      ["not json", /not valid JSON/],
+      ["[]", /not an object/],
+      ["null", /not an object/],
+      [JSON.stringify({ kind: "mystery" }), /unknown kind/],
+      [JSON.stringify({ ...good, url: "https://leak" }), /did not match the projected columns/],
+      [JSON.stringify({ kind: "row", jobId: JOB_ID, status: "ready", formatId: "p" }), /did not match the projected columns/],
+      [JSON.stringify({ ...good, jobId: OTHER_JOB_ID }), /a different job/],
+      [JSON.stringify({ ...good, status: 7 }), /carried no status/],
+      [JSON.stringify({ kind: "absent", jobId: OTHER_JOB_ID }), /a different job/],
+      [JSON.stringify({ kind: "absent", jobId: JOB_ID, extra: 1 }), /unknown fields/],
+      [JSON.stringify({ kind: "error", code: "made-up" }), /unknown failure class/],
+      ["x".repeat(DURABLE_PROBE_MAX_STDOUT + 1), /exceeded its size bound/],
+    ];
+    for (const [stdout, expected] of refused) {
+      assert.throws(() => parseDurableProbeResponse(stdout, JOB_ID), expected, stdout.slice(0, 40));
+    }
+    // Every advertised failure class maps to a sanitized reason.
+    for (const code of Object.keys(DURABLE_PROBE_ERROR_CODES)) {
+      assert.throws(
+        () => parseDurableProbeResponse(JSON.stringify({ kind: "error", code }), JOB_ID),
+        new RegExp(DURABLE_PROBE_ERROR_CODES[code].slice(0, 20).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      );
+    }
+  });
+
+  // ── Row absence is a FAIL, not a BLOCKED ─────────────────────────────────
+
+  it("74. a proven-absent row FAILS row-presence and BLOCKS only the content claims", () => {
+    const absent = measured({ present: false, jobId: JOB_ID, status: null, formatId: null, extractor: null });
+
+    const presence = measuredCheck("durable.row-present", absent, (v) => v?.present === true, "row", {});
+    assert.equal(presence.outcome, OUTCOMES.FAIL, "a measured absence is a FAIL");
+
+    // The content claims report that there is no row to judge — one finding,
+    // stated once, rather than three derived restatements of it.
+    const content = rowContentObservation(absent);
+    assert.equal(content.measured, false);
+    assert.match(content.reason, /the durable row is absent/);
+    assert.equal(
+      measuredCheck("durable.extractor-is-ytdlp", content, (v) => v?.extractor === "yt-dlp", "x", {}).outcome,
+      OUTCOMES.BLOCKED,
+    );
+
+    // A present row passes straight through unchanged.
+    const present = measured({ present: true, jobId: JOB_ID, status: "ready", formatId: "preset:720", extractor: "yt-dlp" });
+    assert.equal(rowContentObservation(present), present);
+    assert.equal(
+      measuredCheck("durable.row-present", present, (v) => v?.present === true, "row", {}).outcome,
+      OUTCOMES.PASS,
+    );
+
+    // An unmeasured observation stays unmeasured — never upgraded to a finding.
+    const gap = unmeasured("the durable probe did not run inside the Worker container");
+    assert.equal(rowContentObservation(gap), gap);
+    assert.equal(
+      measuredCheck("durable.row-present", gap, (v) => v?.present === true, "row", {}).outcome,
+      OUTCOMES.BLOCKED,
+    );
+  });
+
+  it("74a. a Stage B run with an absent durable row is FAIL, not BLOCKED", () => {
+    const base = passingStageBObservations();
+    const result = evaluateStageB(
+      {
+        ...base,
+        durableJobRow: measured({ present: false, jobId: JOB_ID, status: null, formatId: null, extractor: null }),
+      },
+      passingStageA(),
+    );
+    const byId = (id) => result.checks.find((entry) => entry.id === id);
+    assert.equal(byId("durable.row-present").outcome, OUTCOMES.FAIL);
+    // The content claims report "no row to judge" rather than three derived
+    // restatements of the same finding.
+    for (const id of [
+      "durable.extractor-is-ytdlp",
+      "durable.application-format-id",
+      "durable.no-raw-selector-fields",
+    ]) {
+      assert.equal(byId(id).outcome, OUTCOMES.BLOCKED, id);
+      assert.match(byId(id).detail, /the durable row is absent/);
+    }
+    assert.equal(result.summary.verdict, OUTCOMES.FAIL, "FAIL outranks the BLOCKED content checks");
+
+    // The control: the same run with the row present passes all four.
+    const clean = evaluateStageB(base, passingStageA());
+    for (const id of [
+      "durable.row-present",
+      "durable.extractor-is-ytdlp",
+      "durable.application-format-id",
+      "durable.no-raw-selector-fields",
+    ]) {
+      assert.equal(clean.checks.find((e) => e.id === id).outcome, OUTCOMES.PASS, id);
+    }
+  });
+
+  // ── Privacy ──────────────────────────────────────────────────────────────
+
+  it("75. a sentinel in the durable URL reaches no surface the harness produces", async () => {
+    const sentinel = "VF_ACCEPT_SECRET_durable_url_must_not_leak";
+    // The projection excludes `url` at SQL time, so a compliant probe never has
+    // the sentinel to emit. Prove that against a REAL database, using the exact
+    // statement the probe runs.
+    const { databasePath } = makeDurableDatabase([
+      {
+        jobId: JOB_ID,
+        status: "ready",
+        formatId: "preset:720",
+        extractor: "yt-dlp",
+        url: `https://example.invalid/watch?token=${sentinel}`,
+      },
+    ]);
+    const db = new DatabaseSync(databasePath, { readOnly: true });
+    const projected = db.prepare(DURABLE_JOB_QUERY).get(JOB_ID);
+    const stored = db.prepare("SELECT url FROM worker_jobs WHERE job_id = ?").get(JOB_ID);
+    db.close();
+    assert.ok(String(stored.url).includes(sentinel), "the fixture must genuinely carry the sentinel");
+    assert.ok(!JSON.stringify(projected).includes(sentinel), "the projection must not carry it");
+    assert.ok(!("url" in projected));
+
+    // And nothing downstream reintroduces it: observation, record and evidence.
+    const world = makeFakeWorld();
+    const observed = await makeSystemObservers({ runReadOnly: world.runReadOnly }).durableJobRow(JOB_ID);
+    assert.ok(!JSON.stringify(observed).includes(sentinel));
+
+    const enabled = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const run = await runCli(
+      ["--stage", "B", "--case", "success", ...LIVE_ARGS, "--evidence", "/tmp/case-success.json"],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+        VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+        ...WORKER_ENV,
+      }),
+      { runReadOnly: enabled.runReadOnly, fetch: enabled.fetch, files: seedRun() },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const everything = [run.out, run.err, ...run.files.values()].join("\n");
+    assert.ok(!everything.includes(sentinel), "no console, error, record or evidence surface may carry it");
+  });
+
+  // ── SQLite semantics, against real databases ─────────────────────────────
+  //
+  // These exercise the exact statement and open options the in-container probe
+  // uses. The helper is test-only and unreachable from the production CLI.
+
+  it("76. the read-only open rejects writes and never creates a missing database", () => {
+    const { databasePath, dir } = makeDurableDatabase([
+      { jobId: JOB_ID, status: "ready", formatId: "preset:720", extractor: "yt-dlp" },
+    ]);
+    const db = new DatabaseSync(databasePath, { readOnly: true });
+    assert.equal(db.prepare(DURABLE_JOB_QUERY).get(JOB_ID).status, "ready");
+    assert.throws(() => db.exec("UPDATE worker_jobs SET status = 'cancelled'"), /readonly|read-only/i);
+    db.close();
+
+    const missing = join(dir, "absent.sqlite");
+    assert.throws(() => new DatabaseSync(missing, { readOnly: true }));
+    assert.equal(existsSync(missing), false, "a missing durable database must not be created");
+  });
+
+  it("77. a live WAL database is read without copying it", () => {
+    const { databasePath, db, dir } = makeDurableDatabase(
+      [{ jobId: JOB_ID, status: "downloading", formatId: "preset:720", extractor: "yt-dlp" }],
+      { wal: true, keepOpen: true },
+    );
+    try {
+      assert.equal(db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
+      assert.ok(existsSync(`${databasePath}-wal`), "the -wal sidecar must be present");
+
+      // A committed write from the still-open writer must be what the reader sees.
+      db.prepare("UPDATE worker_jobs SET status = ? WHERE job_id = ?").run("ready", JOB_ID);
+      const reader = new DatabaseSync(databasePath, { readOnly: true });
+      assert.equal(reader.prepare(DURABLE_JOB_QUERY).get(JOB_ID).status, "ready");
+      reader.close();
+
+      const stray = readdirSync(dir).filter((name) => !name.startsWith(WORKER_DATABASE_FILENAME));
+      assert.deepEqual(stray, [], "the reader must not copy the database anywhere");
+    } finally {
+      db.close();
+    }
   });
 });

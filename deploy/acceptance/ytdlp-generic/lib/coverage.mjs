@@ -97,6 +97,7 @@ export const CHECK_PRODUCERS = Object.freeze({
   "job.lifecycle-complete": CASE("success", "control-plane.pollTrace, seeded from the create response"),
   "job.requested-preset-owned": CASE("success", "the preset the job was created with"),
 
+  "durable.row-present": CASE("success", "observers.durableJobRow"),
   "durable.extractor-is-ytdlp": CASE("success", "observers.durableJobRow"),
   "durable.application-format-id": CASE("success", "observers.durableJobRow"),
   "durable.no-raw-selector-fields": CASE("success", "observers.durableJobRow"),
