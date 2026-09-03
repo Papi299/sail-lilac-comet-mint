@@ -741,8 +741,12 @@ checks exist to catch.
 | header is `PID PPID PGID COMMAND` | required — see below |
 | three numeric ids parse | row kept, whatever follows |
 | numeric prefix unreadable | **whole sample unmeasured → sampler error → `BLOCKED`** |
-| `comm` is a plain basename | kept verbatim |
-| `comm` is anything else | kept, reported as `<unclassified>` |
+| the **raw** `comm` is a plain basename | lowercased, kept verbatim |
+| the **raw** `comm` is anything else | kept, reported as `<unclassified>` |
+
+The raw field is what is judged — see
+[Raw evidence is validated before it is normalized](#raw-evidence-is-validated-before-it-is-normalized).
+`foo/python3` is not `python3`.
 
 An unclassified descendant inside the Worker container is not an approved
 acquisition executable, so it lands in `unknownSeen` and **fails**
@@ -960,9 +964,11 @@ event: the container that comes back could be running a different object than th
 one the case began against, and a record sealed against the pre-restart id would
 describe only the first half of its own evidence.
 
-**Container identity is deliberately not the binding.** A restart legitimately
-recreates the container from the same image — the PID changes and must be allowed
-to. The image object is what must not.
+**Container identity is not the *image* binding, and does not replace it.** A
+restart legitimately recreates the container from the same image — the PID
+changes and must be allowed to. The image object is what must not. Which
+*running instance* produced the evidence is a separate question, answered
+separately: see [One container epoch, start to finish](#one-container-epoch-start-to-finish).
 
 The aggregate re-checks the continuity object rather than trusting it, including
 recomputing `same` from the three ids, so it can state on its own authority that
@@ -1025,6 +1031,206 @@ and leaves every value judgement to the evaluator.
 record, and `validateCaseRecord` **recomputes** it: `sameRequiredState` is never
 believed, and the canonical `featureState` must agree with the continuity it
 claims.
+
+## One container epoch, start to finish
+
+Image continuity answers *which reviewed image?* Feature continuity answers
+*which deployment configuration?* Neither answers **which running instance
+produced this evidence** — and the unit is
+
+```
+ExecStartPre=-/usr/bin/docker rm -f videofetch-worker
+ExecStart=/usr/bin/docker run --rm --name videofetch-worker … videofetch-worker:latest
+```
+
+so a Worker restart is a container **recreation**: a new container object, from
+the same image, with the same environment file. Two endpoint measurements that
+agree on image *and* feature state are therefore fully consistent with an
+unnoticed restart having happened between them.
+
+That is not a hypothetical. A `success` or `cancellation` case whose acquisition
+window spanned one is two half-observations of two runtimes, reported as one
+observation of one — and every negative claim it makes (no FFmpeg, no unknown
+descendants, containment) was measured against a process tree that no longer
+exists.
+
+So every case is bound to a **container epoch**, recorded as `containerEpoch` on
+the sealed record and recomputed by `validateCaseRecord`.
+
+### Ordinary cases: one instance
+
+```
+docker inspect --format {{.Id}} videofetch-worker      ← before
+   ▼  run the case producer
+docker inspect --format {{.Id}} videofetch-worker      ← after
+require before == after
+```
+
+| Outcome | Result |
+| :--- | :--- |
+| same instance before and after | sealed as `mode: "continuous"` |
+| a different instance after | `BLOCKED — THE WORKER CONTAINER WAS RECREATED DURING THE CASE`, no record |
+| the instance cannot be identified | `BLOCKED`, no record |
+
+### `shutdown`: exactly one pinned transition
+
+`shutdown` exists to span an operator stop/restart, so one recreation is
+intentional — and it is **pinned end to end** rather than merely permitted:
+
+```
+preCase instance      ==  the instance the restart watcher saw go away
+restart new instance  !=  restart old instance
+postCase instance     ==  the restart's new instance
+```
+
+| Outcome | Result |
+| :--- | :--- |
+| A → B, still B at sealing | sealed as `mode: "one-restart"` |
+| A → B, then recreated as C | `BLOCKED — RECREATED AGAIN AFTER THE OBSERVED RESTART` |
+| an unobserved recreation before the transition | `BLOCKED` |
+| the watcher reports the same instance twice | `BLOCKED` — that is not a restart |
+| any ordinary case recording a restart | `BLOCKED` — only `shutdown` may span one |
+
+The transition the epoch pins must be the transition the case's **own** restart
+evidence reports; two internally disagreeing copies of one observation are
+refused rather than resolved in either direction.
+
+### The deployment snapshot
+
+The image, the feature state and the container instance are read as **one
+bracketed snapshot** on each side of the producer:
+
+```
+containerInstanceId          ← open
+imageShaTag
+YTDLP_ENABLED + /api/sites
+containerInstanceId          ← close; must equal the open value
+```
+
+Reading the three properties at three separate moments could not exclude the
+sequence this exists to catch — the watcher observes B, the Worker is later
+recreated as C, and the post-state is read from C while the record claims B. If
+the bracket does not close on the instance it opened on, the snapshot itself
+straddled a recreation and is a measurement failure, not a snapshot with one
+stale field in it.
+
+### What this does and does not claim
+
+Endpoint equality is **not** continuous observation of every instant, and the
+evidence language says only what is true:
+
+- for an ordinary case — *the same container epoch surrounded the producer, and
+  no recreation was observed within it*;
+- for `shutdown` — *the one observed restart ran from the recorded old instance
+  to the recorded new instance, which remained current through sealing*.
+
+The **image** binding remains what ties the evidence to reviewed code. The epoch
+only bounds the interval that evidence describes. A container id is non-secret —
+a content-addressed object name carrying no environment, no argv and no
+configuration — which is why it is safe to record.
+
+## Measured means the command succeeded
+
+A measurement-producing command's stdout is evidence **only if the command
+exited zero**. A non-zero exit means the command failed, and a well-formed
+buffer beside it was not measured — it is stale, truncated, or from a different
+question entirely.
+
+This is load-bearing rather than tidy, because the harness's assertions are
+mostly **negative**. A `docker top` that fails while emitting a syntactically
+perfect listing looks exactly like a clean one; a `workDir` probe that prints
+`False` beside a non-zero exit fabricates the single most favourable answer it
+could give; a `docker inspect` that prints a stale PID sends every containment
+proof to the wrong process tree.
+
+| Command | Non-zero exit means |
+| :--- | :--- |
+| `docker top … -o pid,ppid,pgid,comm` | the sample is unmeasured → sampler error → window `BLOCKED` |
+| `docker inspect --format {{.State.Pid}}` | the Worker PID is unmeasured |
+| `docker inspect --format {{.Id}}` / `{{.Image}}` / `{{.HostConfig.NetworkMode}}` | the scalar is unmeasured |
+| `readlink /proc/<pid>/ns/net` | the namespace is `null`, which the evaluator reads as a **mismatch** |
+| `python3 --version`, `node --version`, the EJS probe | the version is unmeasured |
+| the `workDir` probe | presence is unmeasured — never "absent" |
+| `sqlite3 -readonly …` | the durable row is unmeasured |
+
+### Where a non-zero exit is the finding
+
+Two commands are **status-as-data** and are deliberately unchanged:
+
+- `systemctl is-active <unit>` — it exits non-zero *because* the unit is
+  inactive, and inactive is the property under test;
+- `/usr/local/sbin/vf-egress-policy-verify` — the exit code **is** the verdict.
+
+Turning either into `BLOCKED` would convert a finding into a refusal, which is
+the inversion the harness exists to prevent.
+
+## Raw evidence is validated before it is normalized
+
+A `comm` field is judged **as it arrived**. The check is *"is this already a
+plain basename?"*, not *"does it reduce to one?"*
+
+```
+raw matches ^[\w.:+-]{1,64}$   →  lowercase it, keep it
+otherwise                      →  keep the row, name it <unclassified>
+```
+
+Normalizing first was a laundering step. `basenameOf("suspicious/python3")` is
+`"python3"`, which is an **approved yt-dlp runtime shape** — so an executable the
+harness had never approved acquired the identity of one it had, stopped being an
+unknown descendant, and became a candidate to be graded as the owned acquisition
+process. The check that exists to catch an out-of-band executable was the check
+that gave it cover.
+
+| Raw `comm` | Recorded as | Effect |
+| :--- | :--- | :--- |
+| `python3`, `node` | verbatim | approved |
+| `ffmpeg` | verbatim | **FAIL** `process.no-ffmpeg-during-downloading` |
+| `foo/python3` | `<unclassified>` | **FAIL** `process.no-unknown-descendants` — never `python3` |
+| `/usr/bin/ffmpeg` | `<unclassified>` | **FAIL** unknown — never `ffmpeg` |
+| `foo/node` | `<unclassified>` | **FAIL** unknown — never `node` |
+| `python3 --something` | `<unclassified>` | **FAIL** unknown |
+| `some odd thing` | `<unclassified>` | **FAIL** unknown |
+
+Paths are not stripped, unusual names are not trimmed into approved ones, and the
+row is **never dropped**. The raw text is not copied into evidence either.
+
+## The acceptance run key is created atomically
+
+`stat` → `ENOENT` → `writeFile` is a check followed by an unguarded write, and
+everything the harness guarantees about never replacing an existing run key lives
+in the gap between the two. Two Stage A invocations started together both see
+`ENOENT`, both write, and the second silently destroys the key the first has
+already begun sealing artifacts with.
+
+Creation therefore uses `flag: "wx"` — an exclusive create that **fails rather
+than truncates**.
+
+| Outcome | Result |
+| :--- | :--- |
+| the path is free | minted, `0600`, `runId` 16 hex, key 64 hex |
+| another process won the race | `BLOCKED`; the winner's file is untouched and un-`chmod`ed |
+| any other creation failure | `BLOCKED`, no key handed back |
+
+Losing the race is `BLOCKED`, **not** "load the winner instead": the winner's
+`runId` is the identity of a run this invocation did not begin and whose Stage A
+binding it has not verified. Adopting it silently would be exactly the resumption
+the operator is required to make deliberately. Inspect the existing run identity
+and re-run Stage A if it is the one you want.
+
+### The run identity is admitted by type
+
+`runId` must **be a string** of 16 lowercase hex characters, and `key` must **be
+a string** of 64. Coercion is never a route in:
+
+```
+{ "runId": 1234567890123456, "key": "<64 hex>" }
+```
+
+Its string form matches the grammar exactly, so a coercing test admitted it — and
+`verifyRecord` then compares a string against a number, making every artifact of
+the run unverifiable for a reason nothing reports. The harness mints
+`randomBytes(…).toString("hex")`, so requiring the type is requiring what it
+actually produces.
 
 ## The restart-recovery contract
 

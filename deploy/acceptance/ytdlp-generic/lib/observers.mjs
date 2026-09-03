@@ -189,6 +189,16 @@ const ALLOWED_INSPECT_FORMATS = Object.freeze([
   "{{.Image}}",
   "{{.HostConfig.NetworkMode}}",
   "{{.State.Pid}}",
+  // §9 of CORRECTION-07: the container's own object id — the RUNTIME EPOCH.
+  //
+  // Not a secret: a 64-hex content-addressed name for a container object, in
+  // the same family as an image id, carrying no environment, no argv and no
+  // configuration. It is added because image identity answers "which reviewed
+  // image?" and cannot answer "which running instance produced this
+  // evidence?", and the unit runs `docker run --rm` with an
+  // `ExecStartPre=-docker rm -f`, so a Worker restart genuinely creates a new
+  // container object rather than reusing one.
+  "{{.Id}}",
 ]);
 
 function isAllowedInspect(argv) {
@@ -451,9 +461,25 @@ export function makeSystemObservers(deps = {}) {
   const container = deps.container ?? "videofetch-worker";
   const imageRepo = deps.imageRepo ?? "videofetch-worker";
 
-  /** `docker inspect --format` on the container, returning a trimmed scalar. */
+  /**
+   * `docker inspect --format` on the container, returning a trimmed scalar.
+   *
+   * §6/§7 of CORRECTION-07: a non-zero exit means the command FAILED, and its
+   * stdout is not a measurement. This one helper backs `runningImageId`,
+   * `imageShaTag`, `networkMode` and `containerPid` — four claims of the form
+   * "this scalar was measured" — so consuming a failed command's buffer here
+   * would have propagated a fabricated measurement to all of them at once.
+   *
+   * Throwing (rather than returning "") is what turns it into `measured:
+   * false`, because every caller runs inside `observe`.
+   */
   async function inspectContainer(format) {
     const result = await run("docker", ["inspect", "--format", format, container]);
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `docker inspect ${format} exited ${result.exitCode}; the value was not measured`,
+      );
+    }
     return String(result.stdout ?? "").trim();
   }
 
@@ -466,11 +492,19 @@ export function makeSystemObservers(deps = {}) {
   }
 
   const observers = {
+    /**
+     * STATUS-AS-DATA, deliberately preserved through the §7 audit.
+     *
+     * `is-active` exits non-zero precisely BECAUSE the unit is inactive, and
+     * inactive is the property under test. Making a non-zero exit BLOCKED here
+     * would convert the finding "the unit is not running" into the refusal "we
+     * could not tell", which is the inverse of the harness's model. The same
+     * reasoning preserves `egressVerifier` and the `verifierExit` field of
+     * `egressPolicyState`.
+     */
     async serviceState(unit) {
       return observe(`systemctl is-active ${unit}`, async () => {
         const result = await run("systemctl", ["is-active", unit]);
-        // `is-active` exits non-zero for an inactive unit; the STATE is the
-        // measurement, so a non-zero exit is data rather than a failure.
         return { unit, activeState: String(result.stdout ?? "").trim() || "unknown" };
       });
     },
@@ -592,17 +626,26 @@ export function makeSystemObservers(deps = {}) {
       });
     },
 
+    /** STATUS-AS-DATA (see `serviceState`). Reported, never repaired (§50). */
     async egressVerifier() {
       return observe("vf-egress-policy-verify", async () => {
         const result = await run("/usr/local/sbin/vf-egress-policy-verify", []);
-        // Reported, never repaired (§50).
         return { exitCode: result.exitCode };
       });
     },
 
+    /**
+     * §7 of CORRECTION-07: a version is a MEASUREMENT, so the probe must have
+     * succeeded. `python3 --version` writes to stdout on modern CPython and to
+     * stderr on older ones, which is why both streams are read — but a
+     * non-zero exit means neither stream is an answer.
+     */
     async pythonVersion() {
       return observe("python3 --version", async () => {
         const result = await run("docker", ["exec", container, "/usr/bin/python3", "--version"]);
+        if (result.exitCode !== 0) {
+          throw new Error(`the python3 version probe exited ${result.exitCode}`);
+        }
         return String(result.stdout || result.stderr || "").trim().replace(/^Python\s+/i, "");
       });
     },
@@ -610,6 +653,9 @@ export function makeSystemObservers(deps = {}) {
     async nodeVersion() {
       return observe("node --version", async () => {
         const result = await run("docker", ["exec", container, "node", "--version"]);
+        if (result.exitCode !== 0) {
+          throw new Error(`the node version probe exited ${result.exitCode}`);
+        }
         return String(result.stdout ?? "").trim();
       });
     },
@@ -618,6 +664,13 @@ export function makeSystemObservers(deps = {}) {
     async bundledEjsVersion() {
       return observe("bundled yt_dlp_ejs version", async () => {
         const result = await run("docker", ["exec", container, ...EJS_PROBE_ARGV]);
+        // §7 of CORRECTION-07. The probe's own failure path prints the fixed
+        // token `UNAVAILABLE` and exits 0, so a NON-ZERO exit is something else
+        // entirely — the exec never ran, or the interpreter died — and a
+        // version-shaped buffer beside it was not measured from this image.
+        if (result.exitCode !== 0) {
+          throw new Error(`the EJS version probe exited ${result.exitCode}`);
+        }
         const value = String(result.stdout ?? "").trim();
         // The probe prints a version or the fixed token. Anything else is a
         // measurement failure, never a reported value.
@@ -658,6 +711,13 @@ export function makeSystemObservers(deps = {}) {
     async workDirPresent(jobId) {
       return observe(`workDir for job ${jobId}`, async () => {
         const result = await run("docker", ["exec", container, ...workDirProbeArgv(jobId)]);
+        // §7 of CORRECTION-07: `False` is the load-bearing answer here — it is
+        // what proves the working directory was CLEANED UP — so a `False`
+        // printed beside a non-zero exit is the single most favourable string
+        // this probe could fabricate.
+        if (result.exitCode !== 0) {
+          throw new Error(`the workDir probe exited ${result.exitCode}`);
+        }
         const value = String(result.stdout ?? "").trim();
         if (value !== "True" && value !== "False") {
           throw new Error("the workDir probe did not return a boolean");
@@ -680,6 +740,36 @@ export function makeSystemObservers(deps = {}) {
     },
 
     /**
+     * The RUNTIME EPOCH: which container object is currently running (§9 of
+     * CORRECTION-07).
+     *
+     * ── Why this is not the same question as the image ────────────────────
+     *
+     * `imageShaTag` answers "is the reviewed, authorized image running?" and
+     * that binding is not replaced by anything here. What it cannot answer is
+     * "did ONE running instance produce this evidence?", because a restart
+     * legitimately brings the same image back as a different container. A case
+     * whose evidence straddles an unnoticed recreation is two half-observations
+     * of two runtimes reported as one observation of one.
+     *
+     * Named `containerInstanceId` rather than anything suggesting provenance:
+     * the CODE's provenance is the image id and the source SHA, and this is
+     * only a correlation token for the interval an observation covers.
+     *
+     * Non-secret — a content-addressed object name, carrying no environment, no
+     * argv, no configuration.
+     */
+    async containerInstanceId() {
+      return observe("docker inspect container id", async () => {
+        const id = await inspectContainer("{{.Id}}");
+        if (!/^[0-9a-f]{64}$/.test(id)) {
+          throw new Error("the container reported no usable instance id");
+        }
+        return id;
+      });
+    },
+
+    /**
      * The media namespace holder's PID, which `nsenter -n` needs.
      *
      * The namespace is owned by `videofetch-media-netns`, and the Worker joins
@@ -693,6 +783,13 @@ export function makeSystemObservers(deps = {}) {
           "{{.State.Pid}}",
           "videofetch-media-netns",
         ]);
+        // §7 of CORRECTION-07. This PID is handed to `nsenter -t <pid> -n`; a
+        // fabricated one would read the deny counters of whatever namespace
+        // that PID happens to be in, which is a wrong measurement rather than a
+        // missing one.
+        if (result.exitCode !== 0) {
+          throw new Error(`docker inspect exited ${result.exitCode}; the namespace holder PID was not measured`);
+        }
         const pid = Number(String(result.stdout ?? "").trim());
         if (!Number.isInteger(pid) || pid <= 0) throw new Error("the media namespace holder is not running");
         return pid;

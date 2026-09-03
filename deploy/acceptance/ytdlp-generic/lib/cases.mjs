@@ -51,6 +51,8 @@ const isStr = (v) => typeof v === "string" && v.length > 0;
 const isArr = (v) => Array.isArray(v);
 const isDigest = (v) => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
 const isCaseId = (v) => typeof v === "string" && CASE_ID_PATTERN.test(v);
+/** A Docker container object id, as a STRING — never a coerced value (§27). */
+const isInstanceId = (v) => typeof v === "string" && CONTAINER_INSTANCE_PATTERN.test(v);
 
 /**
  * Strict per-case payload validators.
@@ -122,6 +124,11 @@ const CASE_PAYLOAD_VALIDATORS = Object.freeze({
     shutdownCase: (v) =>
       isInt(v?.capturedPgid) &&
       isBool(v?.restartObserved) &&
+      // §11 of CORRECTION-07: the observed transition's two container objects.
+      // REQUIRED fields, so a record cannot omit one and have the epoch check
+      // compare `undefined` against `undefined` and find them consistent.
+      isInstanceId(v?.previousContainerInstanceId) &&
+      isInstanceId(v?.currentContainerInstanceId) &&
       isBool(v?.groupMembersMeasured) &&
       isArr(v?.groupSurvivors) &&
       // §14 of CORRECTION-05: the deterministic recovery result, in full. All
@@ -326,6 +333,139 @@ export function isWellFormedFeatureContinuity(value, requiredState) {
 }
 
 /**
+ * A Docker container object id — the RUNTIME EPOCH token (§9 of CORRECTION-07).
+ */
+export const CONTAINER_INSTANCE_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * Whether a case's evidence came from the container epoch(s) it claims (§9-§14
+ * of CORRECTION-07).
+ *
+ * ── The gap this closes ────────────────────────────────────────────────────
+ *
+ * Image continuity answers "which reviewed image?" and feature continuity
+ * answers "which deployment configuration?". Neither answers "which RUNNING
+ * INSTANCE?", and the unit runs `docker run --rm` behind an
+ * `ExecStartPre=-docker rm -f`, so a Worker recreation produces a new container
+ * object from the same image with the same environment file. Two endpoint
+ * measurements that agree on image and feature state are therefore fully
+ * consistent with an unnoticed restart having happened between them — and a
+ * `success` or `cancellation` record whose acquisition window spanned one is
+ * two half-observations of two runtimes reported as one.
+ *
+ * ── Two modes, because one restart is intentional ──────────────────────────
+ *
+ * `continuous` — every case except `shutdown`. One instance, start to finish.
+ *
+ * `one-restart` — `shutdown`, whose entire purpose is to span an operator
+ * stop/restart. The transition is not merely permitted, it is PINNED: the
+ * instance the case began on must be the instance the restart watcher saw go
+ * away, the watcher's new instance must genuinely be a different object, and
+ * the instance still current when the evidence is sealed must be that same new
+ * one. A SECOND recreation before sealing therefore fails, even though image
+ * and feature state would still agree at both endpoints.
+ *
+ * ── What this does NOT claim ───────────────────────────────────────────────
+ *
+ * Endpoint equality is not continuous observation of every instant. What is
+ * proven is bounded and stated as such: for `continuous`, that the same
+ * container object surrounded the producer and no recreation was ever observed
+ * within it; for `one-restart`, that the ONE observed transition ran from the
+ * recorded old instance to the recorded new instance and that instance remained
+ * current through sealing. The image binding is what ties the evidence to
+ * reviewed code; this only bounds the interval it describes.
+ */
+export function evaluateContainerEpoch(value, restartExpected) {
+  if (value == null || typeof value !== "object") {
+    return { ok: false, reason: "the case carries no container-epoch evidence" };
+  }
+  const { mode, before, after, restartFrom, restartTo } = value;
+  const wellFormed = (id) => typeof id === "string" && CONTAINER_INSTANCE_PATTERN.test(id);
+
+  if (!wellFormed(before) || !wellFormed(after)) {
+    return {
+      ok: false,
+      reason: "the running container instance was not identified on both sides of the case",
+    };
+  }
+
+  if (restartExpected === true) {
+    if (mode !== "one-restart") {
+      return { ok: false, reason: "this case spans an operator restart and must record it as one" };
+    }
+    if (!wellFormed(restartFrom) || !wellFormed(restartTo)) {
+      return { ok: false, reason: "the observed restart did not identify both container instances" };
+    }
+    if (before !== restartFrom) {
+      return {
+        ok: false,
+        reason:
+          "the container instance the case began on is not the instance the observed restart " +
+          "replaced; an unobserved recreation happened before the transition",
+      };
+    }
+    if (restartTo === restartFrom) {
+      return {
+        ok: false,
+        reason: "the observed restart reported the same container instance on both sides",
+      };
+    }
+    if (after !== restartTo) {
+      return {
+        ok: false,
+        reason:
+          "THE WORKER WAS RECREATED AGAIN AFTER THE OBSERVED RESTART: the evidence was sealed " +
+          "against a container instance the restart watcher never saw",
+      };
+    }
+    return { ok: true, mode: "one-restart" };
+  }
+
+  if (mode !== "continuous") {
+    return { ok: false, reason: "this case must run within a single container instance" };
+  }
+  if (restartFrom != null || restartTo != null) {
+    return { ok: false, reason: "this case records a restart it is not permitted to span" };
+  }
+  if (before !== after) {
+    return {
+      ok: false,
+      reason:
+        "THE WORKER CONTAINER WAS RECREATED DURING THE CASE: the evidence spans two runtime " +
+        "epochs and cannot be attributed to either",
+    };
+  }
+  return { ok: true, mode: "continuous" };
+}
+
+/** The shape a sealed `containerEpoch` must have to be believed. */
+export function isWellFormedContainerEpoch(value, restartExpected) {
+  return evaluateContainerEpoch(value, restartExpected).ok === true;
+}
+
+/** Whether a case is permitted to span exactly one Worker recreation. */
+export function spansOneRestart(caseName) {
+  return CASE_PRODUCERS[caseName]?.spansOneRestart === true;
+}
+
+/**
+ * The container instances the `shutdown` producer's own restart observation
+ * recorded.
+ *
+ * Kept here, beside the payload contract that defines them, so the orchestrator
+ * assembles the epoch object without reaching into a case payload's shape.
+ * Every other case has no observed transition and returns nulls.
+ */
+export function restartEndpointsOf(caseName, payload) {
+  if (caseName !== "shutdown") return { restartFrom: null, restartTo: null };
+  const shutdownCase = payload?.shutdownCase;
+  return {
+    restartFrom: shutdownCase?.previousContainerInstanceId ?? null,
+    restartTo: shutdownCase?.currentContainerInstanceId ?? null,
+  };
+}
+
+/**
  * The shape a sealed `imageContinuity` must have to be believed.
  *
  * `same` is not taken on trust — it is recomputed from the two ids, so a record
@@ -351,6 +491,7 @@ export function buildCaseRecord({
   featureState,
   featureContinuity,
   imageContinuity,
+  containerEpoch,
 }) {
   return {
     harness: HARNESS_ID,
@@ -369,6 +510,9 @@ export function buildCaseRecord({
     // Image ids are not secrets, and recording both is what lets a reviewer see
     // that a restart-spanning case stayed on one image.
     imageContinuity: imageContinuity ?? null,
+    // §9-§14 of CORRECTION-07: WHICH RUNNING INSTANCE produced this evidence.
+    // Distinct from, and additional to, the image binding above.
+    containerEpoch: containerEpoch ?? null,
     startedAt: startedAt ?? null,
     finishedAt: finishedAt ?? null,
     payload,
@@ -489,6 +633,33 @@ export function validateCaseRecord(record, binding) {
       ok: false,
       reason: `case '${record.case}' records a different image before the case than it binds to`,
     };
+  }
+
+  // ── §9-§14 of CORRECTION-07: one runtime epoch, or one pinned transition ──
+  //
+  // Recomputed rather than trusted, for the same reason the two continuity
+  // objects are: the aggregate must be able to state that no accepted record
+  // silently spans an unobserved Worker recreation, and a claim it cannot
+  // verify itself is a claim it should not make.
+  const epoch = record.containerEpoch;
+  const epochVerdict = evaluateContainerEpoch(epoch, spansOneRestart(record.case));
+  if (!epochVerdict.ok) {
+    return {
+      ok: false,
+      reason: `case '${record.case}' carries no valid container-epoch evidence: ${epochVerdict.reason}`,
+    };
+  }
+  // For `shutdown`, the transition the epoch pins must be the transition the
+  // PAYLOAD itself reports. Two internally disagreeing copies of one
+  // observation would let a reader looking at either reach a different answer.
+  const endpoints = restartEndpointsOf(record.case, record.payload);
+  if (spansOneRestart(record.case)) {
+    if (epoch.restartFrom !== endpoints.restartFrom || epoch.restartTo !== endpoints.restartTo) {
+      return {
+        ok: false,
+        reason: `case '${record.case}' pins a container transition its own restart evidence contradicts`,
+      };
+    }
   }
 
   const validators = CASE_PAYLOAD_VALIDATORS[record.case];
@@ -1080,6 +1251,13 @@ export async function runShutdownCase(ctx) {
       restartObserved: true,
       previousContainerPid: observed.value.previousPid,
       currentContainerPid: observed.value.currentPid,
+      // §11 of CORRECTION-07: the RUNTIME EPOCH either side of the one
+      // intentional transition. The PID pair above detects that a restart
+      // happened; these two identify WHICH container objects it ran between, so
+      // the record can be pinned to the instance that was still current when
+      // the evidence was sealed.
+      previousContainerInstanceId: observed.value.previousInstanceId,
+      currentContainerInstanceId: observed.value.currentInstanceId,
       groupMembersMeasured: survivors.measured === true,
       groupSurvivors: survivors.measured === true ? survivors.value : [],
       groupQueryReason: survivors.measured === true ? null : survivors.reason,
@@ -1312,6 +1490,7 @@ export const CASE_PRODUCERS = Object.freeze({
     // Worker job view, which is the only place `objectKey` exists.
     needs: ["genericUrl", "directUrl", "workerControl"],
     operatorTransition: false,
+    spansOneRestart: false,
     summary: "generic analysis, lifecycle, process window, R2, signed GET, sentinel sweep",
   }),
   cancellation: Object.freeze({
@@ -1320,6 +1499,7 @@ export const CASE_PRODUCERS = Object.freeze({
     expectedFeatureState: "enabled",
     needs: ["genericUrl", "workerControl"],
     operatorTransition: false,
+    spansOneRestart: false,
     summary: "cancel during downloading; survivors and cleanup",
   }),
   "byte-limit": Object.freeze({
@@ -1328,6 +1508,7 @@ export const CASE_PRODUCERS = Object.freeze({
     expectedFeatureState: "enabled",
     needs: ["byteLimitUrl"],
     operatorTransition: false,
+    spansOneRestart: false,
     summary: "unknown-declared-length over-limit source aborts as TOO_LARGE",
   }),
   shutdown: Object.freeze({
@@ -1338,6 +1519,9 @@ export const CASE_PRODUCERS = Object.freeze({
     // The harness proves the window and observes the result; the operator
     // performs the stop/restart. `systemctl stop` is not on the allowlist.
     operatorTransition: true,
+    // §11 of CORRECTION-07: the ONLY case permitted to span a Worker
+    // recreation — and it must span EXACTLY one, pinned end to end.
+    spansOneRestart: true,
     summary: "Worker stop during acquisition; owned group terminated and job recovered",
   }),
   "safe-egress": Object.freeze({
@@ -1346,6 +1530,7 @@ export const CASE_PRODUCERS = Object.freeze({
     expectedFeatureState: "enabled",
     needs: ["egressRedirectUrl"],
     operatorTransition: false,
+    spansOneRestart: false,
     summary: "public submission whose later destination is forbidden; denial attributed to the boundary",
   }),
   "direct-regression": Object.freeze({
@@ -1354,6 +1539,7 @@ export const CASE_PRODUCERS = Object.freeze({
     expectedFeatureState: "enabled",
     needs: ["directUrl"],
     operatorTransition: false,
+    spansOneRestart: false,
     summary: "direct still succeeds as direct, with no yt-dlp process",
   }),
   "kill-switch": Object.freeze({
@@ -1366,6 +1552,7 @@ export const CASE_PRODUCERS = Object.freeze({
     expectedFeatureState: "disabled",
     needs: ["directUrl"],
     operatorTransition: true,
+    spansOneRestart: false,
     summary: "generic unusable after the operator restores the disabled state",
   }),
   /**
@@ -1384,6 +1571,7 @@ export const CASE_PRODUCERS = Object.freeze({
     expectedFeatureState: null,
     needs: [],
     operatorTransition: true,
+    spansOneRestart: false,
     summary:
       "separately executed optional negative test against a disposable container; not a live case command",
   }),

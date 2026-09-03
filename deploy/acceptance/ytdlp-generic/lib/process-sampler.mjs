@@ -98,7 +98,37 @@ export const DOCKER_TOP_HEADER = Object.freeze(["PID", "PPID", "PGID", "COMMAND"
  */
 export const UNCLASSIFIED_COMM = "<unclassified>";
 
-/** A plain executable basename, safe to carry into evidence verbatim. */
+/**
+ * A plain executable basename, safe to carry into evidence verbatim.
+ *
+ * It is matched against the RAW `comm` field, never against a normalized
+ * substitute (§4 of CORRECTION-07). The pattern admits no `/` and no
+ * whitespace, so "is this already a bare basename?" is exactly the question it
+ * answers — and a field that is not one fails it.
+ *
+ * ── Why normalizing first was a laundering step ────────────────────────────
+ *
+ * The previous parser computed `basenameOf(raw)` and validated THAT, so
+ *
+ *     suspicious/python3   ->   python3
+ *     /usr/bin/ffmpeg      ->   ffmpeg
+ *     foo/node             ->   node
+ *
+ * and an executable the harness had never approved acquired the identity of one
+ * it had. `python3` is an APPROVED yt-dlp runtime shape: an unknown descendant
+ * called `foo/python3` stopped being an unknown descendant, became a candidate
+ * for `establishYtdlpPid`, and could be graded as the owned acquisition process.
+ * The check that exists to catch an out-of-band executable was the check that
+ * gave it cover.
+ *
+ * The rule is therefore: a raw field that is ALREADY a plain basename is
+ * lowercased and kept; anything else keeps its row but loses its name to
+ * `UNCLASSIFIED_COMM`. Paths are not stripped, unusual names are not trimmed
+ * into approved ones, and the row is never dropped — inside the Worker an
+ * unclassified descendant is not on the approved list, so it lands in
+ * `unknown` and FAILS `process.no-unknown-descendants`, which is the honest
+ * reading of "something we do not recognize was running".
+ */
 const SAFE_COMM_PATTERN = /^[\w.:+-]{1,64}$/;
 
 /**
@@ -185,13 +215,14 @@ export function parseDockerTop(stdout) {
       };
     }
 
-    const comm = basenameOf(matched[4]);
+    // §4 of CORRECTION-07: the RAW field decides, and nothing is normalized
+    // before that decision. See `SAFE_COMM_PATTERN` for why.
+    const raw = matched[4];
     rows.push({
       pid: numbers[0],
       ppid: numbers[1],
       pgid: numbers[2],
-      // Kept verbatim only when it is a plain basename. Never dropped.
-      comm: SAFE_COMM_PATTERN.test(comm) ? comm : UNCLASSIFIED_COMM,
+      comm: SAFE_COMM_PATTERN.test(raw) ? raw.toLowerCase() : UNCLASSIFIED_COMM,
       netns: null,
     });
   }
@@ -213,17 +244,37 @@ export function makeProcessSampler(deps = {}) {
   const container = deps.container ?? "videofetch-worker";
   if (typeof run !== "function") throw new Error("makeProcessSampler requires a runReadOnly");
 
-  /** The container's main PID on the host — the Worker's own node process. */
+  /**
+   * The container's main PID on the host — the Worker's own node process.
+   *
+   * §6 of CORRECTION-07: a non-zero exit is a FAILED command, and its stdout is
+   * not a measurement however well-formed it looks. `docker inspect` writes its
+   * diagnostics to stderr, so a partial or stale stdout beside a non-zero
+   * status is precisely the case where the buffer can still parse as an
+   * integer — and every containment proof downstream is expressed relative to
+   * this PID.
+   */
   async function workerPid() {
     const result = await run("docker", ["inspect", "--format", "{{.State.Pid}}", container]);
+    if (result.exitCode !== 0) {
+      throw new Error(`docker inspect exited ${result.exitCode}; the Worker PID was not measured`);
+    }
     const pid = Number(String(result.stdout ?? "").trim());
     if (!Number.isInteger(pid) || pid <= 0) throw new Error("the Worker container is not running");
     return pid;
   }
 
-  /** `net:[<inode>]` for one PID, read from the host procfs. Read-only. */
+  /**
+   * `net:[<inode>]` for one PID, read from the host procfs. Read-only.
+   *
+   * §6: a failed `readlink` returns `null`, which the evaluator reads as a
+   * namespace MISMATCH rather than as agreement — so consuming a non-zero
+   * exit's stdout would turn an unmeasured namespace into a positive
+   * containment claim.
+   */
   async function netnsOf(pid) {
     const result = await run("readlink", [`/proc/${pid}/ns/net`]);
+    if (result.exitCode !== 0) return null;
     const value = String(result.stdout ?? "").trim();
     return /^net:\[\d+\]$/.test(value) ? value : null;
   }
@@ -242,9 +293,20 @@ export function makeProcessSampler(deps = {}) {
     async sample() {
       const worker = await workerPid();
       const top = await run("docker", ["top", container, "-o", DOCKER_TOP_COLUMNS]);
-      // §7: an uninterpretable row makes the WHOLE sample unmeasured. The
-      // caller records that as a sampler error, and the downloading window's
-      // gap rule refuses to rest a negative claim on it.
+      // §6 of CORRECTION-07: a non-zero `docker top` is not a process listing.
+      // A syntactically perfect listing beside a failed command is the most
+      // dangerous shape this sampler can meet: the window's assertions are
+      // NEGATIVE, so a truncated-but-parseable listing looks exactly like a
+      // clean one. The exit status is checked BEFORE the bytes are read.
+      if (top.exitCode !== 0) {
+        throw new Error(
+          `docker top exited ${top.exitCode}; the process listing was not measured and no ` +
+            "absence may be inferred from it",
+        );
+      }
+      // §7 of CORRECTION-06: an uninterpretable row makes the WHOLE sample
+      // unmeasured. The caller records that as a sampler error, and the
+      // downloading window's gap rule refuses to rest a negative claim on it.
       const parsed = parseDockerTop(top.stdout);
       if (!parsed.ok) throw new Error(parsed.reason);
       const rows = parsed.rows;
@@ -267,45 +329,24 @@ export function makeProcessSampler(deps = {}) {
       };
     },
 
-    /**
-     * Samples repeatedly while `predicate()` holds, returning the sample richest
-     * in descendants.
-     *
-     * A single sample taken at an arbitrary instant can miss a short-lived Node
-     * solver entirely, and "we did not see it" would then be recorded as "it
-     * never ran". Sampling across the acquisition window and keeping the widest
-     * observation is what makes the no-FFmpeg and containment claims meaningful
-     * rather than lucky.
-     */
-    async sampleWhile(predicate, opts = {}) {
-      const intervalMs = opts.intervalMs ?? 250;
-      const maxSamples = opts.maxSamples ?? 400;
-      const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-
-      let best = null;
-      let taken = 0;
-      const seenBasenames = new Set();
-
-      while (taken < maxSamples && (await predicate())) {
-        taken += 1;
-        let current = null;
-        try {
-          current = await this.sample();
-        } catch {
-          // A transient failure mid-acquisition is not fatal on its own; the
-          // caller raises BLOCKED only if NO sample was ever obtained.
-          await sleep(intervalMs);
-          continue;
-        }
-        for (const row of current.sample) seenBasenames.add(row.comm);
-        if (best === null || current.sample.length > best.sample.length) best = current;
-        // Once the owned process is established, prefer a sample that has it.
-        if (best.ytdlpPid == null && current.ytdlpPid != null) best = current;
-        await sleep(intervalMs);
-      }
-
-      if (best === null) return null;
-      return { ...best, samplesTaken: taken, basenamesSeenAcrossRun: [...seenBasenames].sort() };
-    },
+    // ── §17 of CORRECTION-07: `sampleWhile` is GONE ───────────────────────
+    //
+    // It sampled in a loop, swallowed an individual `sample()` failure with a
+    // bare `catch { continue }`, and returned the richest successful sample
+    // whenever ANY sample had succeeded. That is the exact gap policy every
+    // other surface of this harness has now had removed — a failed observation
+    // interval erased by a later successful one — and it contradicts the
+    // governing model that a property which could not be fully observed is
+    // BLOCKED rather than PASS.
+    //
+    // No live acceptance path called it: the downloading window is driven by
+    // `download-window.mjs`, which accumulates `samplingErrors` and gaps the
+    // window instead. So it was a loaded exported helper whose only remaining
+    // effect would have been to let a future caller reintroduce the defect by
+    // reaching for the obvious-looking name. Deleting it is cheaper than
+    // documenting it, and leaves nothing to reach for.
+    //
+    // A caller that needs repeated sampling composes `sample()` with the
+    // window collector's `noteSamplerError`, which is what the real cases do.
   };
 }

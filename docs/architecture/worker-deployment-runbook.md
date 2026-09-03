@@ -2059,6 +2059,100 @@ fields are now matched against the exact grammar `loadOrCreateRun` produces —
 points and leaves the existing file untouched; ENOENT remains the only condition
 that mints a run.
 
+#### CORRECTION-07 — five residual evidence-boundary gaps closed
+
+The governing rule for all five: **never transform raw evidence into a more
+favourable identity before deciding whether that raw evidence was valid.**
+
+**1. Run identity was admitted by coercion.** Admission tested
+`RUN_ID_PATTERN.test(String(parsed.runId))`, so the value was transformed into a
+more admissible shape and the transformed shape was then judged. A JSON NUMBER
+escapes that test — `String(1234567890123456)` matches `/^[0-9a-f]{16}$/`
+exactly — and it would have been admitted, carried into `verifyRecord`, and
+compared against a string, making every artifact of the run unverifiable for a
+reason nothing reports. Both fields now require `typeof === "string"` before the
+grammar is applied. `loadOrCreateRun` mints `randomBytes(…).toString("hex")`, so
+requiring the type is requiring what the harness actually produces. Every invalid
+shape BLOCKS on both entry points and leaves the existing file untouched.
+
+**2. `comm` was normalized before it was validated.** The `docker top` parser
+computed `basenameOf(raw)` and validated THAT, so `suspicious/python3` became
+`python3` — an APPROVED yt-dlp runtime shape. An executable the harness had never
+approved acquired the identity of one it had: it stopped being an unknown
+descendant, became a candidate for `establishYtdlpPid`, and could be graded as
+the owned acquisition process. The check that exists to catch an out-of-band
+executable was the check that gave it cover.
+
+The RAW field now decides. A raw `comm` that is already a plain basename is
+lowercased and kept; anything else keeps its row and loses its name to
+`<unclassified>`, which is not on the approved list and therefore FAILS
+`process.no-unknown-descendants`. Paths are not stripped, unusual names are not
+trimmed into approved ones, and no row is ever dropped. The host-level PGID
+parser already validated its raw field and is unchanged.
+
+**3. Favourable stdout could come from a failed command.** Several observers
+consumed a command's buffer without checking its exit status, so a well-formed
+value beside a non-zero exit became a measurement. That matters because the
+harness's assertions are mostly NEGATIVE: a `docker top` that fails while
+emitting a syntactically perfect listing looks exactly like a clean one, a
+`workDir` probe printing `False` beside a failure fabricates the most favourable
+answer it could give, and a stale `docker inspect` PID sends every containment
+proof to the wrong process tree.
+
+Successful completion is now required before stdout may support a measurement
+claim, across `docker top`, the four container `docker inspect` templates,
+`readlink /proc/<pid>/ns/net`, the Python/Node/EJS version probes, the `workDir`
+probe and the media-namespace holder PID. Two commands are STATUS-AS-DATA and
+are deliberately unchanged: `systemctl is-active` exits non-zero BECAUSE the unit
+is inactive, and `vf-egress-policy-verify`'s exit code IS the verdict. Turning
+either into BLOCKED would convert a finding into a refusal.
+
+**4. Evidence was not bound to a container epoch.** Image identity answers which
+reviewed image; feature state answers which configuration. Neither answers which
+RUNNING INSTANCE produced the evidence — and the unit is `docker run --rm` behind
+an `ExecStartPre=-docker rm -f`, so a restart is a container RECREATION from the
+same image with the same environment file. Two endpoint measurements agreeing on
+image and feature state are fully consistent with an unnoticed restart between
+them, and a case whose acquisition window spanned one is two half-observations of
+two runtimes reported as one.
+
+`docker inspect --format {{.Id}}` is added to the allowlist — a non-secret
+content-addressed object name — and every case now seals a `containerEpoch`.
+Ordinary cases require one instance start to finish. `shutdown` pins its one
+intentional transition end to end: the instance the case began on must be the
+one the restart watcher saw go away, the new instance must genuinely differ, and
+the instance current at sealing must be that same new one, so a SECOND
+recreation cannot pass as the first. The image, feature state and instance are
+read as one BRACKETED snapshot on each side — instance first and last, and they
+must match — so the post-case properties cannot describe a container the watcher
+never saw. `validateCaseRecord` recomputes the epoch and requires it to agree
+with the case's own restart evidence.
+
+The image binding is NOT replaced: it remains what ties evidence to reviewed
+code. The epoch only bounds the interval that evidence describes, and the
+documented claim says exactly that rather than asserting continuous observation
+of every instant.
+
+**5. The run key was created non-atomically.** `stat` → ENOENT → `writeFile` is a
+check followed by an unguarded write, and everything CORRECTION-05 established
+about never replacing an existing run key lived in the gap between them: two
+Stage A invocations both see ENOENT, both write, and the second destroys the key
+the first has already begun sealing artifacts with. Creation now uses
+`flag: "wx"`. Losing the race is BLOCKED — not "load the winner instead", since
+the winner's `runId` identifies a run this invocation did not begin and whose
+Stage A binding it has not verified — and the winner's file is neither
+overwritten nor `chmod`ed.
+
+Separately, the unused `sampleWhile` helper was REMOVED. It swallowed individual
+sampling failures and returned the richest successful sample whenever any had
+succeeded — the exact gap policy removed everywhere else. No live path called it;
+leaving it exported would only have let a future caller reintroduce the defect by
+reaching for the obvious name.
+
+CORRECTION-06's positive-finding precedence, exact `docker top` argv boundary,
+header validation, fail-closed row handling, feature continuity and the
+kill-switch value-not-gate rule are unchanged.
+
 #### What Phase 10D is authorized to do
 
 Nothing yet. Only after this harness has been **independently reviewed and

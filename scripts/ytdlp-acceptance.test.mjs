@@ -47,12 +47,15 @@ import {
   descendantsOf,
   ALLOWED_SAMPLE_FIELDS,
   YTDLP_RUNTIME_BASENAMES,
+  ALLOWED_ACQUISITION_DESCENDANTS,
 } from "../deploy/acceptance/ytdlp-generic/lib/process-tree.mjs";
 import {
   establishYtdlpPid,
+  makeProcessSampler,
   parseDockerTop,
   UNCLASSIFIED_COMM,
 } from "../deploy/acceptance/ytdlp-generic/lib/process-sampler.mjs";
+import * as processSamplerModule from "../deploy/acceptance/ytdlp-generic/lib/process-sampler.mjs";
 import {
   evaluateTransitionTrace,
   classifyTransitionTrace,
@@ -103,7 +106,11 @@ import {
   liveCaseNames,
   hasExecutableProducer,
   evaluateCaseFeatureState,
+  evaluateContainerEpoch,
   expectedFeatureStateFor,
+  restartEndpointsOf,
+  spansOneRestart,
+  CONTAINER_INSTANCE_PATTERN,
   CASE_PRODUCERS,
   CASE_SCHEMA_VERSION,
   HARNESS_ID,
@@ -149,6 +156,15 @@ const measured = (value) => ({ measured: true, value });
 const unmeasured = (reason) => ({ measured: false, reason });
 
 const IMAGE_ID = `sha256:${"a".repeat(64)}`;
+/**
+ * Container OBJECT ids — the runtime epoch tokens (§9 of CORRECTION-07).
+ *
+ * Deliberately unlike the image id: the whole point of the epoch model is that
+ * these two identities answer different questions and can move independently.
+ */
+const CONTAINER_A = "c".repeat(64);
+const CONTAINER_B = "b".repeat(64);
+const CONTAINER_C = "d".repeat(64);
 const SHA = "90be3d079a26b851c5f7496801647568533e6a2d";
 const JOB_ID = "fb63f3170c2342717c7dd8af11d09418";
 /** The byte-limit case runs its own job, so its ladder cannot disturb the success case. */
@@ -317,7 +333,16 @@ function byteLimitEvidence(overrides = {}) {
  * The harness measures this live; the tests fill it from the same registry the
  * validator consults, so a test record is realistic by construction.
  */
-function caseRecord({ caseName, binding, payload, state, imageContinuity, featureContinuity, ...rest }) {
+function caseRecord({
+  caseName,
+  binding,
+  payload,
+  state,
+  imageContinuity,
+  featureContinuity,
+  containerEpoch,
+  ...rest
+}) {
   const imageId = binding?.runningImageId ?? IMAGE_ID;
   const phase = featureState(state ?? expectedFeatureStateFor(caseName) ?? "enabled");
   return buildCaseRecord({
@@ -331,8 +356,22 @@ function caseRecord({ caseName, binding, payload, state, imageContinuity, featur
       featureContinuity ?? { before: phase, after: phase, sameRequiredState: true },
     imageContinuity:
       imageContinuity ?? { before: imageId, after: imageId, taggedImageId: imageId, same: true },
+    // §9-§14 of CORRECTION-07: which running instance produced the evidence.
+    // `shutdown` is the one case that pins a transition rather than one epoch.
+    containerEpoch: containerEpoch ?? defaultEpochFor(caseName, payload),
     ...rest,
   });
+}
+
+/** The container epoch a truthful record for this case would carry. */
+function defaultEpochFor(caseName, payload) {
+  if (caseName !== "shutdown") {
+    return { mode: "continuous", before: CONTAINER_A, restartFrom: null, restartTo: null, after: CONTAINER_A };
+  }
+  const shutdownCase = payload?.shutdownCase ?? {};
+  const from = shutdownCase.previousContainerInstanceId ?? CONTAINER_A;
+  const to = shutdownCase.currentContainerInstanceId ?? CONTAINER_B;
+  return { mode: "one-restart", before: from, restartFrom: from, restartTo: to, after: to };
 }
 
 /** A sealed feature state, as the harness measures it when a case runs. */
@@ -464,6 +503,18 @@ function makeFakeWorld(options = {}) {
     imageAfterDrift: options.imageAfterDrift ?? `sha256:${"e".repeat(64)}`,
     restartAfterPidReads: options.restartAfterPidReads ?? null,
     imageAfterRestart: options.imageAfterRestart ?? null,
+    // §9-§14 of CORRECTION-07: the RUNTIME EPOCH, modelled independently of
+    // the image so a recreation that keeps image and feature state identical —
+    // the case endpoint equality cannot see — is representable.
+    //
+    //   instanceAfterRestart      the object the observed restart brings back
+    //   recreateAfterIdReads      an UNOBSERVED recreation, after N id reads
+    //   instanceAfterRecreation   the object that one brings back
+    //   containerIdUnreadable     the epoch cannot be measured at all
+    instanceAfterRestart: options.instanceAfterRestart ?? null,
+    recreateAfterIdReads: options.recreateAfterIdReads ?? null,
+    instanceAfterRecreation: options.instanceAfterRecreation ?? CONTAINER_C,
+    containerIdUnreadable: options.containerIdUnreadable ?? false,
     // §15 of CORRECTION-06: a restart may bring the SAME image back with a
     // DIFFERENT deployment feature state. Modelling that explicitly is what
     // proves image continuity does not stand in for feature continuity.
@@ -482,15 +533,20 @@ function makeFakeWorld(options = {}) {
   };
   const calls = { commands: [], fetches: [], logins: 0 };
 
-  // Mutable container identity. A restart changes the PID; whether it changes
-  // the IMAGE is exactly what the continuity checks exist to detect.
+  // Mutable container identity. A restart changes the PID AND the container
+  // object; whether it changes the IMAGE is exactly what the continuity checks
+  // exist to detect, and whether it changes the FEATURE STATE is what the
+  // CORRECTION-06 checks exist to detect.
   const live = {
     image: env.runningImage,
     pid: 100,
+    containerInstanceId: options.containerInstanceId ?? CONTAINER_A,
     imageReads: 0,
     pidReads: 0,
+    idReads: 0,
     envReads: 0,
     restarted: false,
+    recreated: false,
     flipped: false,
   };
 
@@ -502,6 +558,19 @@ function makeFakeWorld(options = {}) {
     return live.image;
   }
 
+  function currentContainerInstanceId() {
+    live.idReads += 1;
+    if (
+      !live.recreated &&
+      env.recreateAfterIdReads !== null &&
+      live.idReads > env.recreateAfterIdReads
+    ) {
+      live.recreated = true;
+      live.containerInstanceId = env.instanceAfterRecreation;
+    }
+    return live.containerInstanceId;
+  }
+
   function currentContainerPid() {
     live.pidReads += 1;
     if (
@@ -511,6 +580,9 @@ function makeFakeWorld(options = {}) {
     ) {
       live.restarted = true;
       live.pid = 400;
+      // The unit is `docker run --rm` behind an `ExecStartPre=-docker rm -f`,
+      // so a Worker restart is a container RECREATION: a new object id.
+      live.containerInstanceId = env.instanceAfterRestart ?? CONTAINER_B;
       if (env.imageAfterRestart) live.image = env.imageAfterRestart;
       // The container comes back with whatever the operator left in the
       // environment file — which may not be what it went down with.
@@ -588,6 +660,11 @@ function makeFakeWorld(options = {}) {
         }
         if (joined.includes(".State.Pid")) {
           return { exitCode: 0, stdout: `${currentContainerPid()}\n`, stderr: "" };
+        }
+        if (joined.includes("{{.Id}}")) {
+          return env.containerIdUnreadable
+            ? { exitCode: 1, stdout: "", stderr: "no such container" }
+            : { exitCode: 0, stdout: `${currentContainerInstanceId()}\n`, stderr: "" };
         }
       }
       if (argv[0] === "top") {
@@ -839,13 +916,22 @@ async function runCli(argv, env, deps = {}) {
   const errors = [];
   const files = deps.files ?? new Map();
   const modes = new Map();
+  const writeOptions = new Map();
   const code = await main(argv, env, {
     log: (line) => lines.push(String(line)),
     errorLog: (line) => errors.push(String(line)),
     // The filesystem is a SUBSTITUTED EXTERNAL SYSTEM, like the command runner
     // and fetch. The CLI's own provenance logic still runs for real against it.
+    //
+    // §15 of CORRECTION-07: `flag: "wx"` is honoured exactly as `node:fs` would
+    // honour it — an exclusive create against an existing path fails EEXIST.
+    // Modelling it is what lets a CLI-level test observe the race at all.
     writeFile: async (path, contents, options) => {
+      if (options?.flag === "wx" && files.has(path)) {
+        throw Object.assign(new Error(`file already exists: ${path}`), { code: "EEXIST" });
+      }
       files.set(path, contents);
+      if (options) writeOptions.set(path, options);
       if (options?.mode) modes.set(path, options.mode);
     },
     readFile: async (path) => {
@@ -876,7 +962,7 @@ async function runCli(argv, env, deps = {}) {
     })(),
     ...deps,
   });
-  return { code, out: lines.join("\n"), err: errors.join("\n"), files, modes };
+  return { code, out: lines.join("\n"), err: errors.join("\n"), files, modes, writeOptions };
 }
 
 const LIVE_ENV = (extra = {}) => ({
@@ -4477,7 +4563,7 @@ describe("image continuity", () => {
       },
     );
     assert.equal(run.code, 2);
-    assert.match(run.err, /could not be re-identified after case/);
+    assert.match(run.err, /could not be re-identified after the case/);
     assert.equal(run.files.has("/tmp/c.json"), false);
   });
 
@@ -5724,6 +5810,866 @@ describe("run identity grammar", () => {
     assert.equal(resumed.created, false);
     assert.equal(resumed.runId, "a1b2c3d4e5f60718");
     assert.deepEqual(written, [], "an intact file is never written to");
+  });
+});
+
+
+// ── CORRECTION-07 §3: run identity is admitted by TYPE, not by string form ─
+
+describe("run identity type strictness", () => {
+  const KEY = "c".repeat(64);
+  const enoent = () => Object.assign(new Error("no such file"), { code: "ENOENT" });
+
+  function adapter(contents) {
+    const written = [];
+    return {
+      written,
+      deps: {
+        readFile: async () => contents,
+        writeFile: async (path, body, opts) => written.push([path, body, opts]),
+        mkdir: async () => {},
+        chmod: async () => {},
+        stat: async () => ({ mode: 0o600 }),
+      },
+    };
+  }
+
+  /**
+   * THE regression this correction exists for.
+   *
+   * `String(1234567890123456)` is `"1234567890123456"`, which matches
+   * /^[0-9a-f]{16}$/ exactly. The old coercing test therefore admitted a JSON
+   * NUMBER as a run identity — and `verifyRecord` then compares
+   * `record.runId !== expected.runId`, a string against a number, so every
+   * artifact of the run becomes unverifiable for a reason nothing reports.
+   */
+  it("66. a 16-DIGIT JSON number is not a runId", async () => {
+    const contents = `{"runId":1234567890123456,"key":"${KEY}"}`;
+    assert.match(
+      String(1234567890123456),
+      RUN_ID_PATTERN,
+      "precondition: its string form is what the grammar admits",
+    );
+
+    const create = adapter(contents);
+    const created = await loadOrCreateRun("/tmp/run.json", create.deps);
+    assert.match(created.error, /usable runId/);
+    assert.equal(created.key, undefined, "no key is handed back");
+    assert.equal(created.runId, undefined);
+    assert.deepEqual(create.written, [], "the existing file is not overwritten");
+
+    const load = adapter(contents);
+    const loaded = await loadRun("/tmp/run.json", load.deps);
+    assert.match(loaded.error, /usable runId/);
+    assert.deepEqual(load.written, []);
+  });
+
+  it("66b. every non-string runId BLOCKS both paths, however it stringifies", async () => {
+    const invalid = [
+      ["empty string", '""'],
+      ["too short", '"abc"'],
+      ["15 hex", `"${"a".repeat(15)}"`],
+      ["17 hex", `"${"a".repeat(17)}"`],
+      ["uppercase", '"A1B2C3D4E5F60718"'],
+      ["non-hex", '"a1b2c3d4e5f6071g"'],
+      ["null", "null"],
+      ["an 8-digit number", "12345678"],
+      ["a 16-digit number", "1234567890123456"],
+      ["a boolean", "true"],
+      ["an array", '["a1b2c3d4e5f60718"]'],
+      ["an object", '{"toString":"a1b2c3d4e5f60718"}'],
+    ];
+    for (const [what, literal] of invalid) {
+      const contents = `{"runId":${literal},"key":"${KEY}"}`;
+      const create = adapter(contents);
+      const created = await loadOrCreateRun("/tmp/run.json", create.deps);
+      assert.match(created.error, /usable runId/, `loadOrCreateRun: ${what}`);
+      assert.equal(created.created, undefined, `${what}: no fresh run is minted`);
+      assert.deepEqual(create.written, [], `${what}: the file must not be overwritten`);
+
+      const load = adapter(contents);
+      const loaded = await loadRun("/tmp/run.json", load.deps);
+      assert.match(loaded.error, /usable runId/, `loadRun: ${what}`);
+      assert.deepEqual(load.written, [], `${what}: loadRun never writes`);
+    }
+
+    // A missing runId entirely.
+    const missing = adapter(`{"key":"${KEY}"}`);
+    assert.match((await loadOrCreateRun("/tmp/run.json", missing.deps)).error, /usable runId/);
+    assert.deepEqual(missing.written, []);
+  });
+
+  it("66c. the KEY must be an actual string too", async () => {
+    const invalid = [
+      ["null", "null"],
+      ["a number", "12345678901234567890"],
+      ["a boolean", "false"],
+      ["an array", `["${KEY}"]`],
+      ["short", '"aa"'],
+      ["uppercase", `"${"C".repeat(64)}"`],
+      ["non-hex", `"${"z".repeat(64)}"`],
+    ];
+    for (const [what, literal] of invalid) {
+      const contents = `{"runId":"a1b2c3d4e5f60718","key":${literal}}`;
+      const create = adapter(contents);
+      const created = await loadOrCreateRun("/tmp/run.json", create.deps);
+      assert.match(created.error, /usable runId/, `loadOrCreateRun: ${what}`);
+      assert.deepEqual(create.written, [], `${what}: the file must not be overwritten`);
+
+      const load = adapter(contents);
+      assert.match((await loadRun("/tmp/run.json", load.deps)).error, /usable runId/, what);
+    }
+  });
+
+  it("66d. the exact shape the harness mints is still admitted", async () => {
+    const { deps, written } = adapter(`{"runId":"a1b2c3d4e5f60718","key":"${KEY}"}`);
+    const resumed = await loadOrCreateRun("/tmp/run.json", deps);
+    assert.equal(resumed.created, false);
+    assert.equal(resumed.runId, "a1b2c3d4e5f60718");
+    assert.equal(typeof resumed.runId, "string");
+    assert.equal(resumed.key, KEY);
+    assert.deepEqual(written, [], "an intact file is never written to");
+
+    // And a freshly minted one satisfies its own admission rule, by type.
+    const mint = adapter(null);
+    const created = await loadOrCreateRun("/tmp/new.json", {
+      ...mint.deps,
+      stat: async () => { throw enoent(); },
+    });
+    assert.equal(typeof created.runId, "string");
+    assert.equal(typeof created.key, "string");
+    assert.match(created.runId, RUN_ID_PATTERN);
+  });
+});
+
+// ── CORRECTION-07 §4-§5: raw `comm` is validated before normalization ─────
+
+describe("raw comm classification", () => {
+  const top = (...rows) => parseDockerTop(["PID PPID PGID COMMAND", ...rows].join("\n") + "\n");
+
+  it("67. a plain basename survives verbatim", () => {
+    const parsed = top("100 1 100 node", "200 100 200 python3", "300 200 300 ffmpeg");
+    assert.equal(parsed.ok, true);
+    assert.deepEqual(parsed.rows.map((r) => r.comm), ["node", "python3", "ffmpeg"]);
+  });
+
+  /**
+   * §5: the laundering table. Each of these WAS silently normalized into an
+   * approved or classified executable by the previous parser.
+   */
+  it("67b. a path-like comm can never acquire an approved identity", () => {
+    const cases = [
+      ["foo/python3", "python3"],
+      ["/usr/bin/ffmpeg", "ffmpeg"],
+      ["foo/node", "node"],
+      ["suspicious/python3", "python3"],
+      ["../../bin/aria2c", "aria2c"],
+      ["a/b/c/yt-dlp", "yt-dlp"],
+    ];
+    for (const [raw, laundered] of cases) {
+      const parsed = top(`100 1 100 ${raw}`);
+      assert.equal(parsed.ok, true, `${raw}: the row is still parsed`);
+      assert.equal(parsed.rows.length, 1, `${raw}: the row is never dropped`);
+      assert.equal(parsed.rows[0].comm, UNCLASSIFIED_COMM, `${raw} must not be classified`);
+      assert.notEqual(parsed.rows[0].comm, laundered, `${raw} must not become ${laundered}`);
+      // And the raw text itself is not copied into evidence either.
+      assert.doesNotMatch(parsed.rows[0].comm, /\//);
+    }
+  });
+
+  it("67c. an argv-looking or spaced comm is unclassified, never split", () => {
+    for (const raw of ["python3 --something", "some odd thing", "node -e x", "ffmpeg -i in.mp4"]) {
+      const parsed = top(`100 1 100 ${raw}`);
+      assert.equal(parsed.ok, true, raw);
+      assert.equal(parsed.rows.length, 1, `${raw}: one row, not several`);
+      assert.equal(parsed.rows[0].comm, UNCLASSIFIED_COMM, raw);
+    }
+  });
+
+  it("67d. an unclassified row is an UNKNOWN descendant, never an approved runtime", () => {
+    // The only suspicious descendant is `foo/python3`.
+    const parsed = top("100 1 100 node", "200 100 200 python3", "300 200 300 foo/python3");
+    assert.equal(parsed.ok, true);
+
+    const sample = parsed.rows.map((row) => ({ ...row, netns: "net:[1]" }));
+    assert.equal(validateSampleShape(sample).ok, true, "an unclassified comm is still schema-valid");
+
+    const classified = classifyAcquisitionTree(sample, 100);
+    assert.deepEqual(
+      classified.unknown.map((r) => r.pid),
+      [300],
+      "the suspicious descendant is reported, not tolerated",
+    );
+    assert.equal(classified.forbidden.length, 0);
+    assert.equal(
+      classified.basenames.includes(UNCLASSIFIED_COMM),
+      true,
+      "and it is visible in the evidence as unclassified",
+    );
+
+    // It must not be eligible to BE the owned acquisition process. Both
+    // suspicious rows lead their own group, so under the old normalization
+    // there would have been two `python3` candidates and the establishment
+    // would have gone ambiguous — or worse, picked one.
+    const detached = [
+      { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: "net:[1]" },
+      { pid: 300, ppid: 100, pgid: 300, comm: UNCLASSIFIED_COMM, netns: "net:[1]" },
+    ];
+    const established = establishYtdlpPid(detached, 100);
+    assert.equal(established.established, false);
+    assert.match(established.reason, /no descendant matched/);
+
+    // …and it is not on the approved list under either name.
+    assert.equal(ALLOWED_ACQUISITION_DESCENDANTS.includes(UNCLASSIFIED_COMM), false);
+    assert.equal(YTDLP_RUNTIME_BASENAMES.includes(UNCLASSIFIED_COMM), false);
+
+    // The whole chain, parser to verdict: a listing whose ONLY suspicious
+    // descendant is `foo/python3` must FAIL the unknown-descendant check. Under
+    // the previous normalization this listing produced a clean PASS.
+    const NS = "net:[4026532001]";
+    const window = windowOf([
+      parseDockerTop(
+        "PID PPID PGID COMMAND\n100 1 100 node\n200 100 200 python3\n300 200 200 foo/python3\n",
+      ).rows.map((row) => ({ ...row, netns: NS })),
+    ]);
+    const result = evaluateStageB(
+      passingStageBObservations({ downloadingWindow: measured(window) }),
+      passingStageA(),
+    );
+    assert.equal(
+      result.checks.find((c) => c.id === "process.no-unknown-descendants").outcome,
+      OUTCOMES.FAIL,
+      "a path-like python3 is an unknown descendant, not an approved runtime",
+    );
+    assert.doesNotMatch(
+      JSON.stringify(window),
+      /foo/,
+      "and its raw name never reaches the evidence",
+    );
+  });
+
+  it("67e. a forbidden executable named plainly is still a forbidden finding", () => {
+    const parsed = top("100 1 100 node", "300 100 300 ffmpeg");
+    const sample = parsed.rows.map((row) => ({ ...row, netns: "net:[1]" }));
+    const classified = classifyAcquisitionTree(sample, 100);
+    assert.deepEqual(classified.forbidden.map((r) => r.comm), ["ffmpeg"]);
+  });
+});
+
+
+// ── CORRECTION-07 §6-§8: favourable stdout requires a successful command ──
+
+describe("measurement requires successful completion", () => {
+  /**
+   * A runner that answers a chosen command with a NON-ZERO exit AND the stdout
+   * that would otherwise have produced a PASS. That pairing is the whole point:
+   * an empty failure is easy to reject, and a failure carrying a perfect answer
+   * is what the old code consumed.
+   */
+  function failing(match, stdout, base) {
+    return async (file, argv) => {
+      if (match(file, argv)) return { exitCode: 1, stdout, stderr: "" };
+      return base(file, argv);
+    };
+  }
+
+  it("68. a non-zero `docker top` cannot produce a measured sample", async () => {
+    const world = makeFakeWorld();
+    const perfect = "PID PPID PGID COMMAND\n100 1 100 node\n200 100 200 python3\n";
+    // Precondition: this listing IS valid, so only the exit code can reject it.
+    assert.equal(parseDockerTop(perfect).ok, true);
+
+    const sampler = makeProcessSampler({
+      runReadOnly: failing((file, argv) => file === "docker" && argv[0] === "top", perfect, world.runReadOnly),
+    });
+    await assert.rejects(() => sampler.sample(), /docker top exited 1/);
+  });
+
+  it("68b. a non-zero `docker inspect` cannot produce a Worker PID", async () => {
+    const world = makeFakeWorld();
+    const sampler = makeProcessSampler({
+      runReadOnly: failing(
+        (file, argv) => file === "docker" && argv[0] === "inspect" && argv.join(" ").includes("State.Pid"),
+        "1234\n",
+        world.runReadOnly,
+      ),
+    });
+    await assert.rejects(() => sampler.sample(), /docker inspect exited 1/);
+  });
+
+  it("68c. a failed `readlink` cannot produce a namespace measurement", async () => {
+    const world = makeFakeWorld();
+    const sampler = makeProcessSampler({
+      runReadOnly: failing((file) => file === "readlink", "net:[4026532001]\n", world.runReadOnly),
+    });
+    const result = await sampler.sample();
+    // The namespace is EXPLICITLY null, which the evaluator reads as a
+    // mismatch — never as agreement with the Worker's namespace.
+    assert.equal(result.expectedNetns, null);
+    for (const row of result.sample) assert.equal(row.netns, null);
+    const identity = evaluateNamespaceIdentity(
+      classifyAcquisitionTree(result.sample, result.workerPid),
+      result.expectedNetns,
+    );
+    assert.equal(identity.measured, false, "an unmeasured namespace is never containment");
+  });
+
+  it("68d. every audited scalar observer refuses a favourable non-zero result", async () => {
+    const world = makeFakeWorld({ ytdlpEnabled: "true" });
+    const cases = [
+      ["runningImageId", (o) => o.runningImageId(), (f, a) => f === "docker" && a[0] === "inspect" && a.join(" ").includes("{{.Image}}"), `${IMAGE_ID}\n`],
+      ["containerPid", (o) => o.containerPid(), (f, a) => f === "docker" && a[0] === "inspect" && a.join(" ").includes("State.Pid"), "100\n"],
+      ["containerInstanceId", (o) => o.containerInstanceId(), (f, a) => f === "docker" && a[0] === "inspect" && a.join(" ").includes("{{.Id}}"), `${CONTAINER_A}\n`],
+      ["networkMode", (o) => o.networkMode(), (f, a) => f === "docker" && a[0] === "inspect" && a.join(" ").includes("NetworkMode"), "container:videofetch-media-netns\n"],
+      ["imageShaTag", (o) => o.imageShaTag(SHA), (f, a) => f === "docker" && a[0] === "inspect" && a.join(" ").includes("{{.Image}}"), `${IMAGE_ID}\n`],
+      ["mediaNetnsPid", (o) => o.mediaNetnsPid(), (f, a) => f === "docker" && a[0] === "inspect" && a.includes("videofetch-media-netns"), "4242\n"],
+      ["pythonVersion", (o) => o.pythonVersion(), (f, a) => f === "docker" && a[0] === "exec" && a.join(" ").endsWith("/usr/bin/python3 --version"), "Python 3.11.2\n"],
+      ["nodeVersion", (o) => o.nodeVersion(), (f, a) => f === "docker" && a[0] === "exec" && a.join(" ").includes("node --version"), "v22.23.2\n"],
+      ["bundledEjsVersion", (o) => o.bundledEjsVersion(), (f, a) => f === "docker" && a[0] === "exec" && a.slice(2).join(" ") === EJS_PROBE_ARGV.join(" "), "0.8.0\n"],
+      ["workDirPresent", (o) => o.workDirPresent(JOB_ID), (f, a) => f === "docker" && a[0] === "exec" && a.join(" ").includes("os.path.isdir"), "False\n"],
+      ["environmentNames", (o) => o.environmentNames(), (f, a) => f === "docker" && a[0] === "exec" && a.slice(2).join(" ") === ENV_NAMES_PROBE_ARGV.join(" "), "PATH\nYTDLP_ENABLED\n"],
+      ["ytdlpEnabledRaw", (o) => o.ytdlpEnabledRaw(), (f, a) => f === "docker" && a[0] === "exec" && a.slice(2).join(" ") === YTDLP_ENABLED_PROBE_ARGV.join(" "), "SET:true\n"],
+      ["effectiveMaxFileSize", (o) => o.effectiveMaxFileSize(), (f, a) => f === "docker" && a[0] === "exec" && a.slice(2).join(" ") === MAX_FILE_SIZE_PROBE_ARGV.join(" "), "SET:104857600\n"],
+      ["durableJobRow", (o) => o.durableJobRow(JOB_ID), (f) => f === "sqlite3", `${JOB_ID}|ready|preset:720|yt-dlp\n`],
+      ["processGroupMembers", (o) => o.processGroupMembers(300), (f) => f === "ps", "100 1 100 node\n"],
+      ["workerLogs", (o) => o.workerLogs(), (f, a) => f === "docker" && a[0] === "logs", "worker started\n"],
+      ["unitJournal", (o) => o.unitJournal("videofetch-worker"), (f) => f === "journalctl", "no errors\n"],
+    ];
+
+    for (const [name, call, match, favourable] of cases) {
+      // First: the observer genuinely PASSES on this stdout with exit 0, so the
+      // negative result below is attributable to the exit code alone.
+      const clean = makeSystemObservers({ runReadOnly: world.runReadOnly });
+      const cleanResult = await call(clean);
+      assert.equal(cleanResult.measured, true, `${name}: precondition — exit 0 measures`);
+
+      const observers = makeSystemObservers({
+        runReadOnly: failing(match, favourable, world.runReadOnly),
+      });
+      const result = await call(observers);
+      assert.equal(result.measured, false, `${name}: a failed command is not a measurement`);
+      assert.equal(result.value, undefined, `${name}: no value is handed back`);
+    }
+  });
+
+  it("68e. status-as-data observers keep reporting the status", async () => {
+    const world = makeFakeWorld({ services: "inactive", egressExit: 1 });
+    const observers = makeSystemObservers({ runReadOnly: world.runReadOnly });
+
+    // `systemctl is-active` exits non-zero BECAUSE the unit is inactive, and
+    // inactive is the property under test. Turning that into BLOCKED would
+    // convert the finding into a refusal.
+    const state = await observers.serviceState("videofetch-worker");
+    assert.equal(state.measured, true);
+    assert.equal(state.value.activeState, "inactive");
+
+    // Same for the egress verifier: the exit code IS the verdict.
+    const verifier = await observers.egressVerifier();
+    assert.equal(verifier.measured, true);
+    assert.equal(verifier.value.exitCode, 1);
+  });
+
+  it("68f. exit-0 behaviour is unchanged across the whole observer surface", async () => {
+    const world = makeFakeWorld({ ytdlpEnabled: "true", maxFileSize: 104857600 });
+    const observers = makeSystemObservers({ runReadOnly: world.runReadOnly });
+    assert.equal((await observers.runningImageId()).value, IMAGE_ID);
+    assert.equal((await observers.containerPid()).value, 100);
+    assert.equal((await observers.containerInstanceId()).value, CONTAINER_A);
+    assert.equal((await observers.pythonVersion()).value, "3.11.2");
+    assert.equal((await observers.nodeVersion()).value, "v22.23.2");
+    assert.equal((await observers.bundledEjsVersion()).value, "0.8.0");
+    assert.equal((await observers.workDirPresent(JOB_ID)).value, false);
+    assert.equal((await observers.ytdlpEnabledRaw()).value, "true");
+    assert.equal((await observers.effectiveMaxFileSize()).value.bytes, 104857600);
+    assert.equal((await observers.imageShaTag(SHA)).value.taggedImageId, IMAGE_ID);
+  });
+
+  it("68g. a failed sampler interval gaps the window rather than being averaged away", async () => {
+    // The end-to-end shape: a `docker top` that fails mid-acquisition makes the
+    // WHOLE window unusable, and no number of clean samples repairs it.
+    const NS = "net:[4026532001]";
+    const collector = createDownloadWindowCollector({});
+    collector.noteState("downloading");
+    // One clean sample succeeds…
+    collector.addSample({
+      sample: [
+        { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: NS },
+        { pid: 200, ppid: 100, pgid: 200, comm: "python3", netns: NS },
+      ],
+      workerPid: 100,
+      ytdlpPid: 200,
+      expectedNetns: NS,
+    });
+    // …and one interval fails outright.
+    collector.noteSamplerError("docker top exited 1; the process listing was not measured");
+    collector.noteState("ready");
+
+    const window = collector.result();
+    assert.equal(window.samples.length, 1, "the clean sample was admitted");
+    assert.deepEqual(window.samplerErrors.length, 1, "and the failure is retained, not averaged away");
+    const aggregate = aggregateDownloadWindow(window);
+    assert.equal(
+      aggregate.usable,
+      false,
+      "a successful sample does not repair an interval that could not be observed",
+    );
+  });
+
+  it("68h. `sampleWhile` is gone, not merely unused (§17)", () => {
+    const world = makeFakeWorld();
+    const sampler = makeProcessSampler({ runReadOnly: world.runReadOnly });
+    assert.equal(
+      "sampleWhile" in sampler,
+      false,
+      "the permissive best-sample helper must not be reachable at all",
+    );
+    assert.equal("sampleWhile" in processSamplerModule, false, "and it is not exported");
+    assert.equal(typeof sampler.sample, "function", "the fail-closed primitive remains");
+  });
+});
+
+
+// ── CORRECTION-07 §9-§14: every case is bound to a container EPOCH ────────
+
+describe("container epoch binding", () => {
+  const ENABLED = {
+    ytdlpEnabled: "true",
+    sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+  };
+  const CASE_ENV = (extra = {}) =>
+    LIVE_ENV({
+      VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+      VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+      ...WORKER_ENV,
+      ...extra,
+    });
+
+  async function runOrdinary(worldOptions = {}) {
+    const world = makeFakeWorld({ ...ENABLED, ...worldOptions });
+    const run = await runCli(
+      ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
+      CASE_ENV(),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+    );
+    return { run, world };
+  }
+
+  /** The same acquisition sampler the restart-recovery suite drives. */
+  const epochSampler = {
+    async sample() {
+      return {
+        sample: [
+          { pid: 100, ppid: 1, pgid: 100, comm: "node", netns: "net:[4026532001]" },
+          { pid: 200, ppid: 100, pgid: 200, comm: "python3", netns: "net:[4026532001]" },
+        ],
+        workerPid: 100,
+        ytdlpPid: 200,
+        expectedNetns: "net:[4026532001]",
+      };
+    },
+  };
+
+  async function runShutdownEpoch(worldOptions = {}) {
+    const world = makeFakeWorld({
+      ...ENABLED,
+      restartAfterPidReads: 1,
+      ...worldOptions,
+    });
+    const run = await runCli(
+      ["--stage", "B", "--case", "shutdown", ...LIVE_ARGS, "--evidence", "/tmp/s.json"],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+        ...WORKER_ENV,
+      }),
+      {
+        runReadOnly: world.runReadOnly,
+        fetch: world.fetch,
+        files: seedRun(),
+        sampler: epochSampler,
+        shutdownWindowMs: 2000,
+        recoveryWindowMs: 2000,
+      },
+    );
+    return { run, world };
+  }
+
+  it("69. an ordinary case bound to ONE container instance is accepted", async () => {
+    const { run } = await runOrdinary();
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const record = JSON.parse(run.files.get("/tmp/c.json"));
+    assert.deepEqual(record.containerEpoch, {
+      mode: "continuous",
+      before: CONTAINER_A,
+      restartFrom: null,
+      restartTo: null,
+      after: CONTAINER_A,
+    });
+    assert.match(run.out, /one container instance surrounded the whole case/);
+    // The IMAGE binding is unchanged and still present — the epoch is
+    // additional evidence, never a replacement for it.
+    assert.equal(record.runningImageId, IMAGE_ID);
+    assert.equal(record.imageContinuity.same, true);
+  });
+
+  /**
+   * THE regression this correction exists for.
+   *
+   * The image is identical at both endpoints, the feature state is identical at
+   * both endpoints, and the Worker was nonetheless recreated in between. Every
+   * pre-CORRECTION-07 gate passes.
+   */
+  it("69b. the SAME image on a NEW container instance BLOCKS", async () => {
+    // Reads: pre-snapshot open (1), pre-snapshot close (2), post-snapshot open
+    // (3). Landing the recreation on read 3 means both snapshots are internally
+    // consistent and only the ENDPOINT COMPARISON can refuse it.
+    const { run, world } = await runOrdinary({ recreateAfterIdReads: 2 });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /RECREATED DURING THE CASE/);
+    assert.equal(run.files.has("/tmp/c.json"), false, "no record is written");
+    // Prove the image genuinely never moved, so the BLOCK is attributable to
+    // the epoch alone.
+    assert.equal(world.live.image, IMAGE_ID);
+    assert.equal(world.live.containerInstanceId, CONTAINER_C);
+  });
+
+  it("69c. shutdown pins old -> new and accepts when that instance is still current", async () => {
+    const { run } = await runShutdownEpoch();
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const record = JSON.parse(run.files.get("/tmp/s.json"));
+    assert.deepEqual(record.containerEpoch, {
+      mode: "one-restart",
+      before: CONTAINER_A,
+      restartFrom: CONTAINER_A,
+      restartTo: CONTAINER_B,
+      after: CONTAINER_B,
+    });
+    // The payload's own restart evidence agrees with the pinned transition.
+    const payload = record.payload.shutdownCase;
+    assert.equal(payload.previousContainerInstanceId, CONTAINER_A);
+    assert.equal(payload.currentContainerInstanceId, CONTAINER_B);
+    assert.notEqual(payload.previousContainerInstanceId, payload.currentContainerInstanceId);
+    // And the image is the SAME across the restart — the two identities are
+    // independent, and both are required.
+    assert.equal(record.imageContinuity.before, IMAGE_ID);
+    assert.equal(record.imageContinuity.after, IMAGE_ID);
+    assert.match(run.out, /pinned end to end/);
+  });
+
+  it("69d. a SECOND recreation after the observed restart BLOCKS", async () => {
+    // A -> B is observed by the watcher; the Worker is then recreated as C
+    // before the evidence is sealed. Image and feature state agree throughout.
+    // Reads: pre open (1), pre close (2), watcher before (3), watcher after
+    // (4), post open (5). Landing it on read 5 leaves the watcher's observed
+    // transition intact and moves only what is current at sealing time.
+    const { run, world } = await runShutdownEpoch({ recreateAfterIdReads: 4 });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /RECREATED AGAIN AFTER THE OBSERVED RESTART/);
+    assert.equal(run.files.has("/tmp/s.json"), false, "no record is written");
+    assert.equal(world.live.image, IMAGE_ID, "the image never moved");
+    assert.equal(world.live.containerInstanceId, CONTAINER_C);
+  });
+
+  it("69d2. a recreation DURING a snapshot makes the snapshot itself unusable", async () => {
+    // Read 2 is the pre-snapshot's closing check. If the instance moved between
+    // the opening and closing reads, the image and feature state in that
+    // snapshot do not all describe one running instance.
+    const { run } = await runOrdinary({ recreateAfterIdReads: 1 });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /SNAPSHOT WAS BEING TAKEN/);
+    assert.equal(run.files.has("/tmp/c.json"), false);
+  });
+
+  it("69e. an unidentifiable container instance BLOCKS", async () => {
+    const { run } = await runOrdinary({ containerIdUnreadable: true });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /container instance could not be identified before the case/);
+    assert.equal(run.files.has("/tmp/c.json"), false);
+  });
+
+  it("69f. the image binding is still what BLOCKS an image change", async () => {
+    // The epoch model must not have displaced the SHA binding: an image change
+    // on a stable container instance is still refused.
+    const { run } = await runOrdinary({ imageDriftsAfterReads: 1 });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /DEPLOYED IMAGE CHANGED/);
+    assert.equal(run.files.has("/tmp/c.json"), false);
+  });
+
+  it("69i. a correct transition with the WRONG feature state on the new instance BLOCKS", async () => {
+    // The transition itself is exactly right — A -> B, same authorized image —
+    // and the Worker comes back with generic disabled. Epoch and image
+    // continuity both hold; feature continuity is the only thing that can see
+    // it, and it must still be checked when the epoch is satisfied.
+    const { run, world } = await runShutdownEpoch({
+      ytdlpEnabledAfterRestart: null,
+      sitesAfterRestart: { ytdlp: false, ytdlpInstalled: true, ytdlpEnabled: false, ffmpeg: true },
+    });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /DEPLOYMENT FEATURE STATE CHANGED DURING THE CASE/);
+    assert.equal(run.files.has("/tmp/s.json"), false, "no record is written");
+    assert.equal(world.live.image, IMAGE_ID, "the image never moved");
+    assert.equal(world.live.containerInstanceId, CONTAINER_B, "and the transition was the expected one");
+  });
+
+  it("69j. an image change across the restart still BLOCKS, epoch notwithstanding", async () => {
+    const { run } = await runShutdownEpoch({ imageAfterRestart: `sha256:${"e".repeat(64)}` });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /DEPLOYED IMAGE CHANGED/);
+    assert.equal(run.files.has("/tmp/s.json"), false);
+  });
+
+  it("69g. the epoch algebra, exhaustively", () => {
+    const A = CONTAINER_A;
+    const B = CONTAINER_B;
+    const C = CONTAINER_C;
+    const cont = (before, after) => ({ mode: "continuous", before, after, restartFrom: null, restartTo: null });
+    const one = (before, from, to, after) => ({ mode: "one-restart", before, restartFrom: from, restartTo: to, after });
+
+    // Ordinary cases.
+    assert.equal(evaluateContainerEpoch(cont(A, A), false).ok, true);
+    assert.equal(evaluateContainerEpoch(cont(A, B), false).ok, false);
+    assert.match(evaluateContainerEpoch(cont(A, B), false).reason, /RECREATED DURING THE CASE/);
+    assert.equal(evaluateContainerEpoch(one(A, A, B, B), false).ok, false, "an ordinary case may not span a restart");
+    assert.equal(evaluateContainerEpoch(null, false).ok, false);
+    assert.equal(evaluateContainerEpoch({}, false).ok, false);
+    assert.equal(evaluateContainerEpoch(cont("nope", "nope"), false).ok, false, "the id grammar is enforced");
+
+    // Shutdown.
+    assert.equal(evaluateContainerEpoch(one(A, A, B, B), true).ok, true);
+    assert.equal(evaluateContainerEpoch(one(A, A, B, C), true).ok, false, "a later recreation fails");
+    assert.match(evaluateContainerEpoch(one(A, A, B, C), true).reason, /RECREATED AGAIN/);
+    assert.equal(evaluateContainerEpoch(one(A, B, C, C), true).ok, false, "an unobserved recreation BEFORE the transition fails");
+    assert.equal(evaluateContainerEpoch(one(A, A, A, A), true).ok, false, "a no-op transition is not a restart");
+    assert.equal(evaluateContainerEpoch(cont(A, A), true).ok, false, "shutdown must record its restart");
+    assert.equal(evaluateContainerEpoch(one(A, A, B, null), true).ok, false);
+
+    // Coercion is never a route in: a number that stringifies correctly is not
+    // an instance id (§27).
+    assert.equal(evaluateContainerEpoch({ mode: "continuous", before: 1, after: 1, restartFrom: null, restartTo: null }, false).ok, false);
+    assert.equal(CONTAINER_INSTANCE_PATTERN.source, "^[0-9a-f]{64}$");
+    assert.equal(spansOneRestart("shutdown"), true);
+    for (const name of caseNames().filter((n) => n !== "shutdown")) {
+      assert.equal(spansOneRestart(name), false, `${name} may not span a restart`);
+    }
+  });
+
+  it("69h. a sealed record whose epoch contradicts its own restart evidence is refused", async () => {
+    const binding = { expectedSha: SHA, runningImageId: IMAGE_ID };
+    const payload = {
+      shutdownCase: {
+        jobId: JOB_ID,
+        extractor: "yt-dlp",
+        transitions: ["queued", "analyzing", "downloading"],
+        capturedPgid: 200,
+        capturedYtdlpPid: 200,
+        capturedComm: "python3",
+        restartObserved: true,
+        previousContainerPid: 100,
+        currentContainerPid: 400,
+        previousContainerInstanceId: CONTAINER_A,
+        currentContainerInstanceId: CONTAINER_B,
+        groupMembersMeasured: true,
+        groupSurvivors: [],
+        groupQueryReason: null,
+        recoveredStatus: "failed",
+        recoveredErrorCode: "PROCESSING_FAILED",
+        recoveredSafeErrorMessage: "Worker restarted before the job completed.",
+        recoveryPolls: 1,
+        lateReady: false,
+      },
+    };
+
+    // Truthful: accepted.
+    const honest = caseRecord({ caseName: "shutdown", binding, payload });
+    assert.equal(validateCaseRecord(honest, binding).ok, true);
+
+    // The epoch claims a transition the payload does not report.
+    const forged = buildCaseRecord({
+      ...honest,
+      caseName: "shutdown",
+      binding,
+      payload,
+      featureState: honest.featureState,
+      featureContinuity: honest.featureContinuity,
+      imageContinuity: honest.imageContinuity,
+      containerEpoch: {
+        mode: "one-restart",
+        before: CONTAINER_A,
+        restartFrom: CONTAINER_A,
+        restartTo: CONTAINER_C,
+        after: CONTAINER_C,
+      },
+    });
+    const verdict = validateCaseRecord(forged, binding);
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, /contradicts/);
+
+    // And a record with no epoch at all is refused rather than defaulted.
+    const missing = buildCaseRecord({
+      caseName: "shutdown",
+      binding,
+      payload,
+      featureState: honest.featureState,
+      featureContinuity: honest.featureContinuity,
+      imageContinuity: honest.imageContinuity,
+    });
+    assert.equal(validateCaseRecord(missing, binding).ok, false);
+    assert.match(validateCaseRecord(missing, binding).reason, /container-epoch/);
+
+    assert.deepEqual(restartEndpointsOf("cancellation", payload), {
+      restartFrom: null,
+      restartTo: null,
+    });
+  });
+});
+
+// ── CORRECTION-07 §15-§16: the run key is created ATOMICALLY ─────────────
+
+describe("atomic run-key creation", () => {
+  const enoent = () => Object.assign(new Error("no such file"), { code: "ENOENT" });
+  const eexist = () => Object.assign(new Error("file already exists"), { code: "EEXIST" });
+
+  /**
+   * A filesystem in which the run key does NOT exist at `stat` time but DOES
+   * exist by the time the exclusive write lands — the race the check-then-write
+   * sequence could not see.
+   */
+  function racingAdapter({ winner } = {}) {
+    const written = [];
+    const chmodded = [];
+    let contents = null;
+    return {
+      written,
+      chmodded,
+      get contents() {
+        return contents;
+      },
+      deps: {
+        readFile: async () => contents,
+        writeFile: async (path, body, opts) => {
+          written.push({ path, body, opts });
+          if (opts?.flag === "wx" && contents !== null) throw eexist();
+          contents = body;
+        },
+        mkdir: async () => {},
+        chmod: async (path, mode) => chmodded.push([path, mode]),
+        stat: async () => {
+          if (contents === null) {
+            // The loser observes ENOENT — and the winner writes immediately
+            // afterwards, before this process reaches its own write.
+            if (winner !== undefined) contents = winner;
+            throw enoent();
+          }
+          return { mode: 0o600 };
+        },
+      },
+    };
+  }
+
+  it("70. creation uses an exclusive-create flag", async () => {
+    const adapter = racingAdapter();
+    const created = await loadOrCreateRun("/tmp/run.json", adapter.deps);
+    assert.equal(created.created, true);
+    assert.equal(adapter.written.length, 1);
+    assert.equal(
+      adapter.written[0].opts.flag,
+      "wx",
+      "the create must fail rather than truncate",
+    );
+    assert.equal(adapter.written[0].opts.mode, 0o600);
+    // The minted identity still satisfies its own admission rule.
+    assert.match(created.runId, RUN_ID_PATTERN);
+    assert.match(created.key, /^[0-9a-f]{64}$/);
+    assert.equal(typeof created.runId, "string");
+    assert.deepEqual(adapter.chmodded, [["/tmp/run.json", 0o600]], "0600 is asserted after the write");
+  });
+
+  it("70b. losing the race BLOCKS and leaves the winner byte-identical", async () => {
+    const winner = `${JSON.stringify({ runId: "a1b2c3d4e5f60718", key: "c".repeat(64) }, null, 2)}\n`;
+    const adapter = racingAdapter({ winner });
+
+    const result = await loadOrCreateRun("/tmp/run.json", adapter.deps);
+    assert.match(result.error, /created by another process/);
+    assert.equal(result.key, undefined, "no key is handed back");
+    assert.equal(result.runId, undefined, "and no run identity either");
+    assert.equal(result.created, undefined, "no fresh run is reported");
+    assert.equal(adapter.contents, winner, "the winner's file is byte-identical");
+    assert.deepEqual(adapter.chmodded, [], "somebody else's file is never chmodded");
+    assert.equal(adapter.written.length, 1, "exactly one refused attempt");
+    assert.equal(adapter.written[0].opts.flag, "wx");
+    // The loser must NOT silently adopt the winner's identity in the same
+    // invocation: the operator inspects it and re-runs deliberately.
+    assert.doesNotMatch(JSON.stringify(result), /a1b2c3d4e5f60718/);
+    assert.doesNotMatch(JSON.stringify(result), /c{32}/);
+  });
+
+  it("70c. a non-EEXIST creation failure also BLOCKS, without a key", async () => {
+    const result = await loadOrCreateRun("/tmp/run.json", {
+      readFile: async () => null,
+      writeFile: async () => {
+        throw Object.assign(new Error("read-only fs"), { code: "EROFS" });
+      },
+      mkdir: async () => {},
+      chmod: async () => {},
+      stat: async () => {
+        throw enoent();
+      },
+    });
+    assert.match(result.error, /could not be created/);
+    assert.match(result.error, /EROFS/);
+    assert.equal(result.key, undefined);
+  });
+
+  it("70d. a run key created through the real CLI is exclusive and 0600", async () => {
+    const world = makeFakeWorld();
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/a.json"],
+      LIVE_ENV(),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+    );
+    assert.notEqual(run.code, 3, `usage error: ${run.out}\n${run.err}`);
+    const opts = run.writeOptions.get(RUN_KEY_PATH);
+    assert.ok(opts, "the run key was created");
+    assert.equal(opts.flag, "wx", "through an exclusive create");
+    assert.equal(opts.mode, 0o600);
+    assert.equal(run.modes.get(RUN_KEY_PATH), 0o600, "and 0600 is asserted after the write");
+    const minted = JSON.parse(run.files.get(RUN_KEY_PATH));
+    assert.equal(typeof minted.runId, "string");
+    assert.match(minted.runId, RUN_ID_PATTERN);
+    assert.match(minted.key, /^[0-9a-f]{64}$/);
+  });
+
+  it("70e. the CLI refuses to overwrite a run key that appears mid-run", async () => {
+    // The exclusive create is what makes this observable at CLI level: the
+    // `stat` reports ENOENT, and the file exists by the time the write lands.
+    const world = makeFakeWorld();
+    const files = new Map();
+    const winner = `${JSON.stringify({ runId: "a1b2c3d4e5f60718", key: "c".repeat(64) }, null, 2)}\n`;
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/a.json"],
+      LIVE_ENV(),
+      {
+        runReadOnly: world.runReadOnly,
+        fetch: world.fetch,
+        files,
+        stat: async (path) => {
+          if (path === RUN_KEY_PATH) {
+            // Another process wins the race between this answer and the write.
+            files.set(RUN_KEY_PATH, winner);
+            const error = new Error(`no such file ${path}`);
+            error.code = "ENOENT";
+            throw error;
+          }
+          const error = new Error(`no such file ${path}`);
+          error.code = "ENOENT";
+          throw error;
+        },
+      },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /created by another process/);
+    assert.equal(files.get(RUN_KEY_PATH), winner, "the winner's file is byte-identical");
+    assert.equal(files.has("/tmp/a.json"), false, "and no evidence is written");
   });
 });
 

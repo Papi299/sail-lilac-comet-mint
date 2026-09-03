@@ -269,6 +269,21 @@ async function inspectRunKeyPermissions(path, statFile) {
 }
 
 /**
+ * The one message a structurally unusable run-key file produces.
+ *
+ * Deliberately identical for a bad `runId` and a bad `key`: the operator's
+ * action is the same either way, and naming which field was wrong would invite
+ * hand-editing the file back into admissibility rather than archiving it.
+ */
+function malformedRunKeyMessage(path) {
+  return (
+    `the acceptance run key at ${path} exists but does not carry a usable runId (a STRING of 16 ` +
+    "lowercase hex characters) and 256-bit key (a STRING of 64 lowercase hex characters). " +
+    "Refusing to overwrite it; archive or delete it deliberately, then re-run Stage A."
+  );
+}
+
+/**
  * Reads and structurally validates an EXISTING run-key file (§23 of
  * CORRECTION-05).
  *
@@ -303,14 +318,29 @@ async function readExistingRun(path, read) {
     };
   }
 
-  // BOTH fields must match the exact grammar the harness itself produces.
-  if (!RUN_ID_PATTERN.test(String(parsed?.runId ?? "")) || !RUN_KEY_PATTERN.test(String(parsed?.key ?? ""))) {
-    return {
-      error:
-        `the acceptance run key at ${path} exists but does not carry a usable runId (16 lowercase ` +
-        "hex characters) and 256-bit key (64 lowercase hex characters). Refusing to overwrite it; " +
-        "archive or delete it deliberately, then re-run Stage A.",
-    };
+  // BOTH fields must match the exact grammar the harness itself produces, AND
+  // must actually BE strings (§3 of CORRECTION-07).
+  //
+  // The previous test coerced through `String(...)` first, which is the same
+  // laundering mistake as normalizing a `comm` before validating it: the value
+  // was transformed into a more admissible shape and the transformed shape was
+  // then judged. The concrete escape is a JSON NUMBER —
+  //
+  //     { "runId": 1234567890123456, "key": "<64 hex>" }
+  //
+  // — whose string form matches /^[0-9a-f]{16}$/ exactly. It would have been
+  // admitted, and then carried into `verifyRecord`, where `record.runId !==
+  // expected.runId` compares a string against a number and every artifact of
+  // the run becomes unverifiable for a reason nothing reports.
+  //
+  // `loadOrCreateRun` mints `randomBytes(...).toString("hex")`, so both fields
+  // are strings by construction. Requiring the type is requiring what this
+  // harness actually produces.
+  if (typeof parsed?.runId !== "string" || !RUN_ID_PATTERN.test(parsed.runId)) {
+    return { error: malformedRunKeyMessage(path) };
+  }
+  if (typeof parsed?.key !== "string" || !RUN_KEY_PATTERN.test(parsed.key)) {
+    return { error: malformedRunKeyMessage(path) };
   }
 
   return { runId: parsed.runId, key: parsed.key };
@@ -327,7 +357,9 @@ async function readExistingRun(path, read) {
  * property as `loadRun` enforces. §23 of CORRECTION-05: a file that EXISTS is
  * never replaced, whatever is wrong with it.
  *
- * ENOENT is the only condition that mints a new run.
+ * ENOENT is the only condition that mints a new run, and §15 of CORRECTION-07
+ * makes the mint itself exclusive, so ENOENT is a reason to ATTEMPT creation
+ * rather than a permission to overwrite whatever exists at write time.
  *
  * The operator deletes it when acceptance is complete; the README says so.
  */
@@ -354,8 +386,46 @@ export async function loadOrCreateRun(path, deps = {}) {
   } catch {
     /* the directory already exists */
   }
-  await write(path, `${JSON.stringify({ runId, key }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+
+  // ── §15 of CORRECTION-07: creation is EXCLUSIVE ────────────────────────
+  //
+  // `stat` -> ENOENT -> `writeFile` is a check followed by an unguarded write,
+  // and everything CORRECTION-05 established about never replacing an existing
+  // run key lives in the gap between the two. Two Stage A invocations started
+  // together — or one started beside a rerun the operator thought had exited —
+  // both see ENOENT, both write, and the second silently destroys the key the
+  // first has already begun sealing artifacts with.
+  //
+  // `flag: "wx"` makes the create fail rather than truncate, so the check and
+  // the write are one decision. Losing the race is BLOCKED, not "load the
+  // winner instead": the winner's `runId` is now the identity of a run this
+  // invocation did not begin and whose Stage A binding it has not verified, and
+  // adopting it silently would be exactly the resumption CORRECTION-05 requires
+  // the operator to make deliberately.
+  try {
+    await write(path, `${JSON.stringify({ runId, key }, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      return {
+        error:
+          `the acceptance run key at ${path} was created by another process while this run was ` +
+          "starting. Refusing to overwrite it, and refusing to adopt it silently: inspect the " +
+          "existing run identity and re-run Stage A deliberately if it is the one you want.",
+      };
+    }
+    return {
+      error:
+        `the acceptance run key at ${path} could not be created ` +
+        `(${String(error?.code ?? error?.message ?? error)})`,
+    };
+  }
   // `mode` on write is masked by the process umask, so it is asserted after.
+  // Only ever on the file this call created — a lost race returns above,
+  // without touching the winner's permissions.
   await setMode(path, 0o600);
   return { runId, key, created: true };
 }

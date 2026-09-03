@@ -75,10 +75,13 @@ import {
   caseNames,
   describeFeatureState,
   evaluateCaseFeatureState,
+  evaluateContainerEpoch,
   evaluateFeatureContinuity,
   expectedFeatureStateFor,
   hasExecutableProducer,
   liveCaseNames,
+  restartEndpointsOf,
+  spansOneRestart,
   validateCaseRecord,
 } from "./lib/cases.mjs";
 import {
@@ -494,15 +497,26 @@ export async function runDirectRegression(ctx, directUrl, declaredDigest) {
 // ── Stage B: one case ──────────────────────────────────────────────────────
 
 async function runStageBCase(ctx, caseName) {
-  const { argv, log, errorLog, write, secrets, env, system, expectedSha, run: acceptanceRun } = ctx;
+  const { argv, log, errorLog, write, secrets, env, expectedSha, run: acceptanceRun } = ctx;
+
+  // ── §12 of CORRECTION-07: ONE pre-case deployment snapshot ─────────────
+  //
+  // The image, the feature state and the container instance are taken together
+  // and bracketed by the instance id, so all three describe the same running
+  // instance rather than three separately-timed reads that a recreation could
+  // have fallen between.
+  const pre = await takeDeploymentSnapshot(ctx, "before");
+  if (!pre.ok) {
+    errorLog(`BLOCKED: ${pre.reason}`);
+    return EXIT.BLOCKED;
+  }
 
   // §3/§4 of CORRECTION-03: the required deployment state is PER CASE. The
   // previous global guard demanded YTDLP_ENABLED=true for every Stage B case,
   // which made `kill-switch` — whose whole purpose is to run with generic
   // disabled — impossible. An UNMEASURED state blocks every case: running one
   // while the deployment stage is unknown produces uninterpretable evidence.
-  const ytdlpEnabledRaw = await system.ytdlpEnabledRaw();
-  const stateGate = evaluateCaseFeatureState(caseName, ytdlpEnabledRaw);
+  const stateGate = evaluateCaseFeatureState(caseName, pre.ytdlpEnabledRaw);
   if (!stateGate.ok) {
     errorLog(`BLOCKED: ${stateGate.reason}`);
     return EXIT.BLOCKED;
@@ -516,7 +530,7 @@ async function runStageBCase(ctx, caseName) {
   // the historical fact is captured HERE, by the harness, while the condition
   // exists — never reconstructed afterwards from whichever state the deployment
   // happens to be in at aggregation time, and never taken from an operator.
-  const featureState = await measureFeatureState(ctx, ytdlpEnabledRaw);
+  const featureState = pre.featureState;
   if (featureState.measured !== true) {
     errorLog(
       `BLOCKED: the deployment feature state could not be sealed for case '${caseName}': ${featureState.reason}`,
@@ -534,22 +548,17 @@ async function runStageBCase(ctx, caseName) {
   // first half.
   //
   // So the authorized image is established before, re-established after, and
-  // the two must be the same object. The container id is deliberately not the
-  // binding: a restart legitimately recreates the container from the same
-  // image, and that is the case this must permit.
-  const preCase = await system.imageShaTag(expectedSha);
-  if (preCase.measured !== true) {
-    errorLog(`BLOCKED: the running image could not be identified before the case: ${preCase.reason}`);
-    return EXIT.BLOCKED;
-  }
-  if (preCase.value.runningImageId !== preCase.value.taggedImageId) {
+  // the two must be the same object. The container instance is NOT a substitute
+  // for this binding — it answers a different question (§9 of CORRECTION-07),
+  // and both are now required.
+  if (pre.runningImageId !== pre.taggedImageId) {
     errorLog(
       "BLOCKED: the running image is not the image tagged with the authorized source SHA; " +
         "a case run against an unauthorized image is not acceptance evidence.",
     );
     return EXIT.BLOCKED;
   }
-  const authorizedImageId = preCase.value.taggedImageId;
+  const authorizedImageId = pre.taggedImageId;
   const binding = { expectedSha, runningImageId: authorizedImageId };
 
   const producer = CASE_PRODUCERS[caseName];
@@ -615,21 +624,25 @@ async function runStageBCase(ctx, caseName) {
     return EXIT.BLOCKED;
   }
 
-  // §9: re-establish the image AFTER the producer, before anything is sealed.
-  // An unmeasurable or changed image means no record at all — a record that
-  // combined evidence from two images must not exist to be accepted later.
-  const postCase = await system.imageShaTag(expectedSha);
-  if (postCase.measured !== true) {
+  // ── §12 of CORRECTION-07: ONE post-case deployment snapshot ────────────
+  //
+  // Same instrument as the pre-case one, so the image, the feature state and
+  // the container instance after the producer all describe the SAME instance.
+  // Measuring them separately would allow the sequence the correction names
+  // explicitly: the restart watcher observes B, the Worker is later recreated
+  // as C, and the post-state is read from C while the record claims B.
+  const post = await takeDeploymentSnapshot(ctx, "after");
+  if (!post.ok) {
     errorLog(
-      `BLOCKED: the deployed image could not be re-identified after case '${caseName}': ${postCase.reason}. ` +
-        "Refusing to seal evidence whose deployment cannot be confirmed.",
+      `BLOCKED: ${post.reason} Refusing to seal evidence whose deployment cannot be confirmed.`,
     );
     return EXIT.BLOCKED;
   }
-  if (
-    postCase.value.runningImageId !== authorizedImageId ||
-    postCase.value.taggedImageId !== authorizedImageId
-  ) {
+
+  // §9 of CORRECTION-05: an unmeasurable or changed image means no record at
+  // all — a record that combined evidence from two images must not exist to be
+  // accepted later.
+  if (post.runningImageId !== authorizedImageId || post.taggedImageId !== authorizedImageId) {
     errorLog(
       `BLOCKED — DEPLOYED IMAGE CHANGED DURING CASE '${caseName}'. The evidence spans two ` +
         "different image objects and cannot be attributed to either.",
@@ -638,10 +651,40 @@ async function runStageBCase(ctx, caseName) {
   }
   const imageContinuity = {
     before: authorizedImageId,
-    after: postCase.value.runningImageId,
-    taggedImageId: postCase.value.taggedImageId,
+    after: post.runningImageId,
+    taggedImageId: post.taggedImageId,
     same: true,
   };
+
+  // ── §9-§14 of CORRECTION-07: container-epoch continuity ────────────────
+  //
+  // Image and feature state can BOTH agree at the two endpoints while an
+  // unobserved Worker recreation happened between them: `docker run --rm` from
+  // the same tag with the same env file produces exactly that. So the running
+  // INSTANCE is pinned as well — one instance for an ordinary case, and for
+  // `shutdown` the exact old->new transition its own watcher recorded, still
+  // current at sealing time.
+  const restartEndpoints = restartEndpointsOf(caseName, payload);
+  const containerEpoch = spansOneRestart(caseName)
+    ? {
+        mode: "one-restart",
+        before: pre.containerInstanceId,
+        restartFrom: restartEndpoints.restartFrom,
+        restartTo: restartEndpoints.restartTo,
+        after: post.containerInstanceId,
+      }
+    : {
+        mode: "continuous",
+        before: pre.containerInstanceId,
+        restartFrom: null,
+        restartTo: null,
+        after: post.containerInstanceId,
+      };
+  const epochVerdict = evaluateContainerEpoch(containerEpoch, spansOneRestart(caseName));
+  if (!epochVerdict.ok) {
+    errorLog(`BLOCKED: ${epochVerdict.reason}`);
+    return EXIT.BLOCKED;
+  }
 
   // ── §12-§14 of CORRECTION-06: feature-state continuity ─────────────────
   //
@@ -649,8 +692,7 @@ async function runStageBCase(ctx, caseName) {
   // authorized image can come back with a DIFFERENT `YTDLP_ENABLED`, and a
   // record sealed from the pre-case measurement would then claim one deployment
   // state while carrying evidence from two.
-  const postEnabledRaw = await system.ytdlpEnabledRaw();
-  const postFeatureState = await measureFeatureState(ctx, postEnabledRaw);
+  const postFeatureState = post.featureState;
   if (postFeatureState.measured !== true) {
     errorLog(
       `BLOCKED: the deployment feature state could not be re-measured after case '${caseName}': ` +
@@ -673,6 +715,11 @@ async function runStageBCase(ctx, caseName) {
     sameRequiredState: true,
   };
   log(`deployment state held: generic ${continuity.state} across the whole case`);
+  log(
+    epochVerdict.mode === "one-restart"
+      ? "container epoch: the one observed restart is pinned end to end and is still current"
+      : "container epoch: one container instance surrounded the whole case",
+  );
 
   const record = sealRecord(
     buildCaseRecord({
@@ -685,6 +732,7 @@ async function runStageBCase(ctx, caseName) {
       featureState: featureState.value,
       featureContinuity,
       imageContinuity,
+      containerEpoch,
     }),
     acceptanceRun.key,
   );
@@ -708,6 +756,84 @@ async function runStageBCase(ctx, caseName) {
   log(`case evidence written: ${evidencePath}`);
   log("Run `--stage B --aggregate` with every case record to obtain the Stage B verdict.");
   return EXIT.PASS;
+}
+
+/**
+ * ONE deployment snapshot: which instance, which image, which feature state
+ * (§12 of CORRECTION-07).
+ *
+ * ── Why these four are taken together ──────────────────────────────────────
+ *
+ * The correction's concrete failure is a post-case measurement that describes a
+ * container the restart watcher never saw:
+ *
+ *     restart watcher observes A -> B
+ *     the Worker is recreated again as C
+ *     image / YTDLP_ENABLED / /api/sites are read from C
+ *     the record claims evidence from B
+ *
+ * Reading the three properties at three separate moments cannot exclude that,
+ * because a recreation can fall between any two of them. So the snapshot is
+ * BRACKETED: the container instance is identified first and again last, and the
+ * two must be the same object. If they are not, the snapshot itself straddled a
+ * recreation and is a measurement failure — not a snapshot with one stale field
+ * in it.
+ *
+ * What that proves is bounded, and is stated as such elsewhere: the properties
+ * were read within an interval in which no recreation was observed. It is not a
+ * claim about every instant.
+ *
+ * `ytdlpEnabledRaw` and `featureState` are returned as OBSERVATIONS rather than
+ * values, because the caller grades them with case-specific messages — the
+ * state gate and the sealing gate say different things about the same failure.
+ */
+async function takeDeploymentSnapshot(ctx, when) {
+  const { system, expectedSha } = ctx;
+  // The post-case failures say "re-identified", because the property WAS
+  // established before the producer and the news is that it no longer can be.
+  const found = when === "after" ? "re-identified" : "identified";
+
+  const openInstance = await system.containerInstanceId();
+  if (openInstance.measured !== true) {
+    return {
+      ok: false,
+      reason: `the running container instance could not be ${found} ${when} the case: ${openInstance.reason}`,
+    };
+  }
+
+  const image = await system.imageShaTag(expectedSha);
+  if (image.measured !== true) {
+    return { ok: false, reason: `the deployed image could not be ${found} ${when} the case: ${image.reason}` };
+  }
+
+  const ytdlpEnabledRaw = await system.ytdlpEnabledRaw();
+  const featureState = await measureFeatureState(ctx, ytdlpEnabledRaw);
+
+  const closeInstance = await system.containerInstanceId();
+  if (closeInstance.measured !== true) {
+    return {
+      ok: false,
+      reason: `the running container instance could not be re-checked ${when} the case: ${closeInstance.reason}`,
+    };
+  }
+  if (openInstance.value !== closeInstance.value) {
+    return {
+      ok: false,
+      reason:
+        `THE WORKER CONTAINER WAS RECREATED WHILE THE ${when.toUpperCase()}-CASE DEPLOYMENT ` +
+        "SNAPSHOT WAS BEING TAKEN, so its image and feature state do not all describe one " +
+        "running instance.",
+    };
+  }
+
+  return {
+    ok: true,
+    containerInstanceId: openInstance.value,
+    runningImageId: image.value.runningImageId,
+    taggedImageId: image.value.taggedImageId,
+    ytdlpEnabledRaw,
+    featureState,
+  };
 }
 
 /**
@@ -1148,20 +1274,38 @@ function makeMediaTransferProbe(ctx) {
 }
 
 /**
- * Waits for the operator's Worker stop/restart (§9 of CORRECTION-03).
+ * Waits for the operator's Worker stop/restart (§9 of CORRECTION-03; §11 of
+ * CORRECTION-07).
  *
  * The harness observes; it never performs the transition. A restart is detected
  * as the container's main PID changing — `systemctl stop`/`start` are not on the
  * read-only allowlist and are never called from here.
+ *
+ * ── Why the container OBJECT is identified too ─────────────────────────────
+ *
+ * A changed PID says a restart HAPPENED. It does not say which container object
+ * the evidence after it belongs to, and the unit runs `docker run --rm` behind
+ * an `ExecStartPre=-docker rm -f`, so the new Worker is a new object. Recording
+ * the instance either side is what lets the case record PIN the transition —
+ * old instance, new instance — so a SECOND recreation before the evidence is
+ * sealed cannot pass as the first one.
+ *
+ * An unidentifiable instance on either side is a measurement failure, never a
+ * transition recorded with a hole in it.
  */
 function makeRestartWatcher(ctx) {
   return async ({ timeoutMs }) =>
     observe("operator Worker restart", async () => {
+      const beforeInstance = await ctx.system.containerInstanceId();
+      if (beforeInstance.measured !== true) {
+        throw new Error("the container instance could not be identified before the transition");
+      }
       const before = await ctx.system.containerPid();
       if (before.measured !== true) {
         throw new Error("the container PID could not be read before the transition");
       }
       const previousPid = before.value;
+      const previousInstanceId = beforeInstance.value;
 
       const deadline = Date.now() + timeoutMs;
       let sawDown = false;
@@ -1171,8 +1315,21 @@ function makeRestartWatcher(ctx) {
           sawDown = true; // the container is gone — the stop half happened
         } else if (now.value !== previousPid) {
           // A changed PID is a genuine restart whether or not the down window
-          // was caught between polls.
-          return { previousPid, currentPid: now.value, downObserved: sawDown };
+          // was caught between polls. Identify the object it came back as
+          // BEFORE returning: an unidentifiable new instance leaves the epoch
+          // unpinnable, which is a measurement failure rather than a restart
+          // observed with an unknown endpoint.
+          const afterInstance = await ctx.system.containerInstanceId();
+          if (afterInstance.measured !== true) {
+            throw new Error("the container instance could not be identified after the transition");
+          }
+          return {
+            previousPid,
+            currentPid: now.value,
+            downObserved: sawDown,
+            previousInstanceId,
+            currentInstanceId: afterInstance.value,
+          };
         }
         await (ctx.deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))))(1000);
       }
