@@ -228,7 +228,14 @@ export async function main(argv, env, deps = {}) {
 
   // ── Collaborators ──────────────────────────────────────────────────────
   const run = deps.runReadOnly ?? runReadOnly;
-  const system = deps.system ?? makeSystemObservers({ container, runReadOnly: run });
+  // `databasePath` exists so the test suite can point the REAL read-only
+  // `node:sqlite` reader at a disposable database. It is not a CLI option and
+  // never will be: the durable path is a deployment contract, not an operator
+  // choice, and an operator-selectable database is an operator-selectable
+  // answer.
+  const system =
+    deps.system ??
+    makeSystemObservers({ container, runReadOnly: run, databasePath: deps.databasePath });
   const session =
     deps.session ?? makeControlPlaneSession({ baseUrl, fetch: deps.fetch, sleep: deps.sleep });
   const sampler = deps.sampler ?? makeProcessSampler({ container, runReadOnly: run, sleep: deps.sleep });

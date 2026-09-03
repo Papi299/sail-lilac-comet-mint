@@ -70,6 +70,14 @@ import { dirname } from "node:path";
  *   CORRECTION-07  raw evidence validated before normalization; successful exit
  *                  required before stdout is a measurement; container-epoch
  *                  continuity; type-strict run identity; atomic key creation
+ *   10D-REM-01     the durable observer can address the deployment AT ALL. The
+ *                  producer behind every `durable.*` claim and the sentinel's
+ *                  `durable-row` surface previously named a database file that
+ *                  does not exist, a table that does not exist, and an
+ *                  executable that is not installed on the VM. Any artifact
+ *                  from before this could only ever have carried those checks
+ *                  as BLOCKED, for a reason describing the instrument rather
+ *                  than the deployment.
  *
  * A Stage A `PASS` from before those is not the Stage A `PASS` this harness
  * means, and nothing in the record itself distinguishes them.
@@ -84,7 +92,7 @@ import { dirname } from "node:path";
  * No live artifact compatibility is being broken: Phase 10D has not run, so no
  * acceptance artifact exists anywhere that this invalidates.
  */
-export const EVIDENCE_SCHEMA_VERSION = "10c4-correction-08";
+export const EVIDENCE_SCHEMA_VERSION = "10d-remediation-01";
 export const HARNESS_ID = "deploy/acceptance/ytdlp-generic/acceptance.mjs";
 export const AUTHENTICATOR_ALG = "HMAC-SHA256";
 

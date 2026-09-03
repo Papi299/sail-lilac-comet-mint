@@ -9,9 +9,22 @@
 // orchestration run against them. They deliberately do NOT hand the evaluators
 // finished truth objects, because that is exactly the gap CORRECTION-01 closes.
 
-import { describe, it } from "node:test";
+import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import {
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   evaluateLiveGate,
@@ -85,13 +98,20 @@ import {
 } from "../deploy/acceptance/ytdlp-generic/lib/evidence.mjs";
 import {
   isReadOnlyCommand,
-  durableJobQuery,
+  assertDurableJobId,
+  readDurableJobRow,
   workDirProbeArgv,
   makeSystemObservers,
   parseMaxFileSize,
   decodeEnvProbe,
   DOCKER_TOP_COLUMNS,
   DEFAULT_MAX_FILE_SIZE_BYTES,
+  DURABLE_JOB_QUERY,
+  DURABLE_SAFE_COLUMNS,
+  WORKER_STATE_DB,
+  WORKER_STATE_DIRECTORY,
+  WORKER_DATABASE_FILENAME,
+  WORKER_JOBS_TABLE,
   EJS_PROBE_ARGV,
   ENV_NAMES_PROBE_ARGV,
   YTDLP_ENABLED_PROBE_ARGV,
@@ -483,6 +503,83 @@ function passingStageBObservations(overrides = {}) {
 // CLI, the observers, the control-plane driver, the sampler, the case producers
 // and the evaluators all run for real against it.
 
+// ── Disposable durable databases ───────────────────────────────────────────
+//
+// The durable observer is no longer a fake-able external command, so these
+// tests do not fake it. They build a REAL SQLite database using the Worker's
+// OWN `CREATE TABLE worker_jobs` statement — extracted from the migration
+// source rather than retyped — and run the real read-only reader against it.
+//
+// Extracting the DDL is the point. A retyped schema is a third parallel
+// description of the deployment, and a third thing that can drift out of
+// agreement with Production; that drift is the entire defect this change
+// exists to correct, so reintroducing it here would be self-defeating.
+
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const MIGRATIONS_SOURCE = readFileSync(
+  join(REPO_ROOT, "src/worker/state/migrations.server.ts"),
+  "utf8",
+);
+const STATE_DIRECTORY_SOURCE = readFileSync(
+  join(REPO_ROOT, "src/worker/runtime/state-directory.server.ts"),
+  "utf8",
+);
+
+/** The Worker's own `worker_jobs` DDL, taken verbatim from its migration. */
+const WORKER_JOBS_DDL = (() => {
+  const match = MIGRATIONS_SOURCE.match(/CREATE TABLE worker_jobs \([\s\S]*?\) STRICT;/);
+  assert.ok(match, "the Worker migration must define CREATE TABLE worker_jobs");
+  return match[0];
+})();
+
+/** Lives in the durable `url` column of every fake world, and must never surface. */
+const SENTINEL_IN_DURABLE_URL = "VF_ACCEPT_SECRET_durable_url_must_not_leak";
+
+const DURABLE_TMP_ROOT = mkdtempSync(join(tmpdir(), "vf-durable-"));
+let durableDbSeq = 0;
+
+after(() => {
+  rmSync(DURABLE_TMP_ROOT, { recursive: true, force: true });
+});
+
+/**
+ * Creates a disposable durable database carrying the Worker's real schema.
+ *
+ * `url` is seeded with a sentinel on purpose: the projection must leave it in
+ * the database, and every assertion about "the sentinel did not leak" is
+ * meaningless unless the sentinel was genuinely there to leak.
+ */
+function makeDurableDatabase(rows = [], opts = {}) {
+  const dir = join(DURABLE_TMP_ROOT, `db-${durableDbSeq++}`);
+  mkdirSync(dir, { recursive: true });
+  const databasePath = join(dir, WORKER_DATABASE_FILENAME);
+
+  const db = new DatabaseSync(databasePath);
+  db.exec(WORKER_JOBS_DDL);
+  if (opts.wal === true) db.exec("PRAGMA journal_mode = WAL");
+  const insert = db.prepare(
+    `INSERT INTO ${WORKER_JOBS_TABLE}
+       (job_id, url, format_id, principal_id, status, extractor,
+        created_at_ms, updated_at_ms, expires_at_ms)
+     VALUES (?, ?, ?, 'private-access-user', ?, ?, 1, 1, 2)`,
+  );
+  for (const row of rows) {
+    insert.run(
+      row.jobId,
+      row.url ?? "https://example.invalid/watch?v=x",
+      row.formatId ?? "preset:720",
+      row.status ?? "ready",
+      row.extractor ?? "yt-dlp",
+    );
+  }
+  // A WAL database is left OPEN when the caller asks for one, so the `-wal` and
+  // `-shm` sidecars are present and uncheckpointed while it is read — which is
+  // the state the live Worker's database is always in.
+  if (opts.keepOpen === true) return { databasePath, db, dir };
+  db.close();
+  return { databasePath, db: null, dir };
+}
+
 function makeFakeWorld(options = {}) {
   const env = {
     ytdlpEnabled: options.ytdlpEnabled ?? null,
@@ -767,9 +864,10 @@ function makeFakeWorld(options = {}) {
       }
     }
     if (file === "journalctl") return { exitCode: 0, stdout: "no errors\n", stderr: "" };
-    if (file === "sqlite3") {
-      return { exitCode: 0, stdout: `${JOB_ID}|ready|preset:720|yt-dlp\n`, stderr: "" };
-    }
+    // There is deliberately NO `sqlite3` branch. Durable state is read
+    // in-process from a real disposable database (see `makeDurableDatabase`),
+    // and `isReadOnlyCommand` no longer admits a `sqlite3` command in any
+    // shape — so a stub here could only ever describe a path that cannot run.
     return { exitCode: 0, stdout: "", stderr: "" };
   }
 
@@ -953,7 +1051,33 @@ function makeFakeWorld(options = {}) {
     };
   }
 
-  return { runReadOnly, fetch: fetchImpl, calls, env, live, workerEnvironment };
+  // A REAL disposable durable database, carrying the Worker's own schema.
+  //
+  // The generic success case is the only producer that reads durable state, and
+  // it always creates `JOB_ID`. Seeding exactly that row — and nothing else —
+  // keeps the old blanket fake's convenience without its dishonesty: the old
+  // `sqlite3` stub answered the SAME row for EVERY job id it was ever asked
+  // about, so a case reading the wrong job's durable state would have been
+  // indistinguishable from one reading the right job's.
+  const durable = makeDurableDatabase([
+    {
+      jobId: JOB_ID,
+      status: options.durableStatus ?? "ready",
+      formatId: options.durableFormatId ?? "preset:720",
+      extractor: options.durableExtractor ?? "yt-dlp",
+      url: `https://example.invalid/generic?probe=${SENTINEL_IN_DURABLE_URL}`,
+    },
+  ]);
+
+  return {
+    runReadOnly,
+    fetch: fetchImpl,
+    calls,
+    env,
+    live,
+    workerEnvironment,
+    databasePath: durable.databasePath,
+  };
 }
 
 /** Runs the real CLI against a fake external world. */
@@ -1110,7 +1234,7 @@ describe("real CLI orchestration", () => {
       LIVE_ENV({
         VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
       }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch },
     );
 
     assert.equal(run.code, 0, `expected PASS, got:\n${run.out}\n${run.err}`);
@@ -1156,7 +1280,7 @@ describe("real CLI orchestration", () => {
     const run = await runCli(
       ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/stage-a.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch },
     );
     const record = JSON.parse(run.files.get("/tmp/stage-a.json"));
     assert.equal(record.verdict, "PASS");
@@ -1177,7 +1301,7 @@ describe("real CLI orchestration", () => {
         VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
         ...WORKER_ENV,
       }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
 
@@ -1205,7 +1329,7 @@ describe("real CLI orchestration", () => {
     const stageA = await runCli(
       ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/stage-a.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: stageAWorld.runReadOnly, fetch: stageAWorld.fetch, files },
+      { runReadOnly: stageAWorld.runReadOnly, databasePath: stageAWorld.databasePath, fetch: stageAWorld.fetch, files },
     );
     assert.equal(stageA.code, 0, `${stageA.out}\n${stageA.err}`);
     assert.ok(files.has(RUN_KEY_PATH), "Stage A must create the acceptance run key");
@@ -1219,7 +1343,7 @@ describe("real CLI orchestration", () => {
       VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
       ...WORKER_ENV,
     });
-    const shared = { runReadOnly: world.runReadOnly, fetch: world.fetch, files };
+    const shared = { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files };
 
     const success = await runCli(
       ["--stage", "B", "--case", "success", ...LIVE_ARGS, "--evidence", "/tmp/c-success.json"],
@@ -1270,7 +1394,7 @@ describe("real CLI orchestration", () => {
     const stageA = await runCli(
       ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/stage-a.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: stageAWorld.runReadOnly, fetch: stageAWorld.fetch, files },
+      { runReadOnly: stageAWorld.runReadOnly, databasePath: stageAWorld.databasePath, fetch: stageAWorld.fetch, files },
     );
     assert.equal(stageA.code, 0);
 
@@ -1297,7 +1421,7 @@ describe("real CLI orchestration", () => {
         "--case-evidence", "/tmp/foreign.json",
       ],
       LIVE_ENV(),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files },
     );
     assert.match(aggregate.err, /rejected case evidence/);
     assert.match(aggregate.out, /accepted case evidence: none/);
@@ -1312,7 +1436,7 @@ describe("control-plane authentication", () => {
     const run = await runCli(
       ["--stage", "A", ...LIVE_ARGS],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch },
     );
     assert.equal(run.code, 0);
     assert.equal(world.calls.logins, 1, "login must be invoked exactly once per run");
@@ -1322,7 +1446,7 @@ describe("control-plane authentication", () => {
   it("5b. a missing access secret is a USAGE failure, not a capability failure", async () => {
     const world = makeFakeWorld();
     const run = await runCli(["--stage", "A", ...LIVE_ARGS], { [LIVE_ENV_NAME]: "1" }, {
-      runReadOnly: world.runReadOnly,
+      runReadOnly: world.runReadOnly, databasePath: world.databasePath,
       fetch: world.fetch,
     });
     assert.equal(run.code, 3, "usage failure, never a graded run");
@@ -1337,7 +1461,7 @@ describe("control-plane authentication", () => {
     const run = await runCli(
       ["--stage", "A", ...LIVE_ARGS],
       LIVE_ENV(),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch },
     );
     assert.equal(run.code, 2);
     assert.match(run.err, /BLOCKED/);
@@ -1357,7 +1481,7 @@ describe("control-plane authentication", () => {
         VIDEOFETCH_ACCESS_SECRET: secret,
         VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
       }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch },
     );
     assert.doesNotMatch(run.out, new RegExp(secret));
     assert.doesNotMatch(run.err, new RegExp(secret));
@@ -1369,7 +1493,7 @@ describe("control-plane authentication", () => {
     const run = await runCli(
       ["--stage", "A", "--live", "--base-url", "https://control.invalid"],
       LIVE_ENV(),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch },
     );
     assert.equal(run.code, 3);
     assert.match(run.err, /--expected-sha is required/);
@@ -1689,16 +1813,36 @@ describe("durable format evidence", () => {
     assert.equal(presetsAreApplicationOwned(["preset:720"]), false, "bare strings are not the contract");
   });
 
-  it("the durable reader projects only safe columns — never the URL", () => {
-    const sql = durableJobQuery(JOB_ID);
-    assert.match(sql, /^SELECT job_id, status, format_id, extractor FROM jobs/);
-    assert.doesNotMatch(sql, /\burl\b/, "the submitted URL must never be selected");
-    assert.throws(() => durableJobQuery("'; DROP TABLE jobs;--"), /malformed job id/);
-    assert.equal(isReadOnlyCommand("sqlite3", ["-readonly", "/var/lib/videofetch/videofetch.db", sql]), true);
+  it("the durable statement projects only safe columns — never the URL", () => {
     assert.equal(
-      isReadOnlyCommand("sqlite3", ["-readonly", "/var/lib/videofetch/videofetch.db", "SELECT url FROM jobs;"]),
-      false,
+      DURABLE_JOB_QUERY,
+      "SELECT job_id, status, format_id, extractor FROM worker_jobs WHERE job_id = ?",
     );
+    assert.doesNotMatch(DURABLE_JOB_QUERY, /\burl\b/, "the submitted URL must never be selected");
+    // The id is BOUND, so it is data to SQLite and cannot close the statement.
+    assert.match(DURABLE_JOB_QUERY, /WHERE job_id = \?$/);
+    assert.doesNotMatch(DURABLE_JOB_QUERY, /'/, "no quoted literal is interpolated any more");
+    assert.equal(assertDurableJobId(JOB_ID), JOB_ID);
+    assert.throws(() => assertDurableJobId("'; DROP TABLE worker_jobs;--"), /malformed job id/);
+    assert.throws(() => assertDurableJobId(JOB_ID.toUpperCase()), /malformed job id/);
+    // §1 of CORRECTION-07's rule, applied here: admission is by TYPE first.
+    assert.throws(() => assertDurableJobId(0), /malformed job id/);
+    assert.throws(() => assertDurableJobId(null), /malformed job id/);
+  });
+
+  it("no `sqlite3` command is admissible in any shape", () => {
+    // The durable read is in-process now, so the CLI boundary that used to
+    // guard it is GONE rather than dormant. A dormant allowlist entry is a
+    // SQL-console-shaped hole that a future caller only has to widen.
+    for (const argv of [
+      ["-readonly", WORKER_STATE_DB, DURABLE_JOB_QUERY],
+      ["-readonly", "/var/lib/videofetch/videofetch.db", "SELECT job_id FROM jobs;"],
+      ["-readonly", WORKER_STATE_DB, "SELECT url FROM worker_jobs;"],
+      [WORKER_STATE_DB, ".dump"],
+      [],
+    ]) {
+      assert.equal(isReadOnlyCommand("sqlite3", argv), false, `sqlite3 ${argv.join(" ")}`);
+    }
   });
 });
 
@@ -2268,7 +2412,7 @@ describe("Stage A record binding", () => {
       const run = await runCli(
         ["--stage", "B", "--aggregate", ...LIVE_ARGS, "--stage-a", "/tmp/sa.json"],
         LIVE_ENV(),
-        { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+        { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files },
       );
       assert.equal(run.code, 2, body.slice(0, 40));
       assert.match(run.err, /the Stage A record is not usable/);
@@ -2428,7 +2572,7 @@ describe("sentinel", () => {
         VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
         ...WORKER_ENV,
       }),
-      { runReadOnly: world.runReadOnly, fetch: spyFetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: spyFetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
 
@@ -2682,7 +2826,7 @@ describe("stage separation", () => {
   it("4. Stage A is refused against an enabled deployment", async () => {
     const world = makeFakeWorld({ ytdlpEnabled: "true" });
     const run = await runCli(["--stage", "A", ...LIVE_ARGS], LIVE_ENV(), {
-      runReadOnly: world.runReadOnly,
+      runReadOnly: world.runReadOnly, databasePath: world.databasePath,
       fetch: world.fetch,
     });
     assert.equal(run.code, 2);
@@ -2695,7 +2839,7 @@ describe("stage separation", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "success", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic", VIDEOFETCH_ACCEPT_DIRECT_URL: "https://f.invalid/c.mp4" }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 2);
     assert.match(run.err, /STAGE MISMATCH/);
@@ -2996,7 +3140,7 @@ describe("evidence provenance", () => {
     const run = await runCli(
       ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/a.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files },
     );
     assert.equal(run.code, 0);
     const key = JSON.parse(files.get(RUN_KEY_PATH)).key;
@@ -3195,7 +3339,7 @@ describe("per-case deployment state", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "kill-switch", ...LIVE_ARGS, "--evidence", "/tmp/ks.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
     assert.match(run.out, /deployment state: generic disabled/);
@@ -3582,7 +3726,7 @@ describe("final process evidence JSON", () => {
       sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
     });
     const files = seedRun();
-    const shared = { runReadOnly: world.runReadOnly, fetch: world.fetch, files };
+    const shared = { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files };
     const liveEnv = LIVE_ENV({
       VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
       VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
@@ -3839,7 +3983,7 @@ describe("multi-state aggregation", () => {
         VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
         ...WORKER_ENV,
       }),
-      { runReadOnly: enabledWorld.runReadOnly, fetch: enabledWorld.fetch, files },
+      { runReadOnly: enabledWorld.runReadOnly, databasePath: enabledWorld.databasePath, fetch: enabledWorld.fetch, files },
     );
     assert.equal(success.code, 0, `${success.out}\n${success.err}`);
     const successRecord = JSON.parse(files.get("/tmp/success.json"));
@@ -3854,7 +3998,7 @@ describe("multi-state aggregation", () => {
     const killSwitch = await runCli(
       ["--stage", "B", "--case", "kill-switch", ...LIVE_ARGS, "--evidence", "/tmp/kill.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: disabledWorld.runReadOnly, fetch: disabledWorld.fetch, files },
+      { runReadOnly: disabledWorld.runReadOnly, databasePath: disabledWorld.databasePath, fetch: disabledWorld.fetch, files },
     );
     assert.equal(killSwitch.code, 0, `${killSwitch.out}\n${killSwitch.err}`);
     const killRecord = JSON.parse(files.get("/tmp/kill.json"));
@@ -3868,7 +4012,7 @@ describe("multi-state aggregation", () => {
     const stageA = await runCli(
       ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/stage-a.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: disabledWorld.runReadOnly, fetch: disabledWorld.fetch, files },
+      { runReadOnly: disabledWorld.runReadOnly, databasePath: disabledWorld.databasePath, fetch: disabledWorld.fetch, files },
     );
     assert.equal(stageA.code, 0, `${stageA.out}\n${stageA.err}`);
 
@@ -3881,7 +4025,7 @@ describe("multi-state aggregation", () => {
         "--evidence", "/tmp/stage-b.json",
       ],
       LIVE_ENV(),
-      { runReadOnly: disabledWorld.runReadOnly, fetch: disabledWorld.fetch, files },
+      { runReadOnly: disabledWorld.runReadOnly, databasePath: disabledWorld.databasePath, fetch: disabledWorld.fetch, files },
     );
     // Not every case ran, so the run as a whole is not PASS — but the two
     // state-dependent claims must be graded from the sealed artifacts, and the
@@ -3917,7 +4061,7 @@ describe("byte-limit causal binding", () => {
     return runCli(
       ["--stage", "B", "--case", "byte-limit", ...LIVE_ARGS, "--evidence", "/tmp/bl.json"],
       byteLimitEnv(envExtra),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files },
     );
   }
 
@@ -4084,7 +4228,7 @@ describe("egress deny-class vocabulary", () => {
           "--evidence", "/tmp/e.json",
         ],
         LIVE_ENV({ VIDEOFETCH_ACCEPT_EGRESS_REDIRECT_URL: "https://media.invalid/generic/egress" }),
-        { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+        { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
       );
       assert.equal(run.code, 3, `${name}: ${run.out}${run.err}`);
       assert.match(run.err, /usage error: --egress-deny-class/);
@@ -4345,7 +4489,7 @@ describe("run-key permission hardening", () => {
       ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/sa.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
       {
-        runReadOnly: world.runReadOnly,
+        runReadOnly: world.runReadOnly, databasePath: world.databasePath,
         fetch: world.fetch,
         files,
         stat: async () => ({ mode: 0o644 }),
@@ -4472,7 +4616,7 @@ describe("narrow environment observation", () => {
     // nothing.
     assert.equal(world.workerEnvironment.WORKER_CONTROL_SECRET, SECRET_SENTINELS.workerControl);
 
-    const observers = makeSystemObservers({ runReadOnly: world.runReadOnly });
+    const observers = makeSystemObservers({ runReadOnly: world.runReadOnly, databasePath: world.databasePath });
 
     const names = await observers.environmentNames();
     assert.equal(names.measured, true);
@@ -4500,7 +4644,7 @@ describe("narrow environment observation", () => {
     const run = await runCli(
       ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/a.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
     assertNoSecret(run.out, "stdout");
@@ -4564,7 +4708,7 @@ describe("image continuity", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
       CASE_ENV(),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
     const record = JSON.parse(run.files.get("/tmp/c.json"));
@@ -4582,7 +4726,7 @@ describe("image continuity", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
       CASE_ENV(),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 2, `${run.out}\n${run.err}`);
     assert.match(run.err, /DEPLOYED IMAGE CHANGED DURING CASE 'cancellation'/);
@@ -4618,7 +4762,7 @@ describe("image continuity", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
       CASE_ENV(),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 2);
     assert.match(run.err, /not the image tagged with the authorized source SHA/);
@@ -4723,7 +4867,7 @@ describe("restart recovery contract", () => {
         ...WORKER_ENV,
       }),
       {
-        runReadOnly: world.runReadOnly,
+        runReadOnly: world.runReadOnly, databasePath: world.databasePath,
         fetch: world.fetch,
         files: seedRun(),
         sampler: fakeSampler,
@@ -5017,7 +5161,7 @@ describe("direct regression sampling gaps", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "direct-regression", ...LIVE_ARGS, "--evidence", "/tmp/d.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun(), sampler: flakySampler },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun(), sampler: flakySampler },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
 
@@ -5116,7 +5260,7 @@ describe("run-key lifecycle", () => {
       const run = await runCli(
         [...stage, ...LIVE_ARGS, "--evidence", "/tmp/x.json"],
         LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-        { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+        { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files },
       );
       assert.equal(run.code, 2, `${stage.join(" ")}: ${run.out}${run.err}`);
       assert.match(run.err, /Refusing to overwrite it|not valid JSON/);
@@ -5161,7 +5305,7 @@ describe("dry-run inertness", () => {
         const run = await runCli(
           [...argv, "--base-url", "https://control.invalid", "--expected-sha", SHA],
           { VIDEOFETCH_ACCESS_SECRET: "an-actual-access-secret-value", ...env },
-          { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+          { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files },
         );
         const label = `${argv.join(" ")} / env=${JSON.stringify(env)}`;
         assert.equal(run.code, 2, label);
@@ -5183,7 +5327,7 @@ describe("dry-run inertness", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "fail-closed-runtime", "--live", "--base-url", "https://c.invalid", "--expected-sha", SHA],
       { [LIVE_ENV_NAME]: "1", VIDEOFETCH_ACCESS_SECRET: "s" },
-      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch },
     );
     assert.equal(run.code, 3);
     assert.match(run.err, /not a live case command/);
@@ -5316,7 +5460,7 @@ describe("direct regression: finding vs coverage", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "direct-regression", ...LIVE_ARGS, "--evidence", "/tmp/d.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun(), sampler: flakySampler },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun(), sampler: flakySampler },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
 
@@ -5500,7 +5644,7 @@ describe("docker top boundary", () => {
         VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
         ...WORKER_ENV,
       }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
 
@@ -5551,7 +5695,7 @@ describe("feature-state continuity", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
       CASE_ENV(),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
     const record = JSON.parse(run.files.get("/tmp/c.json"));
@@ -5573,7 +5717,7 @@ describe("feature-state continuity", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
       CASE_ENV(),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 2, `${run.out}\n${run.err}`);
     assert.match(run.err, /DEPLOYMENT FEATURE STATE CHANGED DURING THE CASE/);
@@ -5597,7 +5741,7 @@ describe("feature-state continuity", () => {
     };
     const args = ["--stage", "B", "--case", "shutdown", ...LIVE_ARGS, "--evidence", "/tmp/s.json"];
     const deps = (world) => ({
-      runReadOnly: world.runReadOnly,
+      runReadOnly: world.runReadOnly, databasePath: world.databasePath,
       fetch: world.fetch,
       files: seedRun(),
       sampler: fakeSampler,
@@ -6179,7 +6323,6 @@ describe("measurement requires successful completion", () => {
       ["environmentNames", (o) => o.environmentNames(), (f, a) => f === "docker" && a[0] === "exec" && a.slice(2).join(" ") === ENV_NAMES_PROBE_ARGV.join(" "), "PATH\nYTDLP_ENABLED\n"],
       ["ytdlpEnabledRaw", (o) => o.ytdlpEnabledRaw(), (f, a) => f === "docker" && a[0] === "exec" && a.slice(2).join(" ") === YTDLP_ENABLED_PROBE_ARGV.join(" "), "SET:true\n"],
       ["effectiveMaxFileSize", (o) => o.effectiveMaxFileSize(), (f, a) => f === "docker" && a[0] === "exec" && a.slice(2).join(" ") === MAX_FILE_SIZE_PROBE_ARGV.join(" "), "SET:104857600\n"],
-      ["durableJobRow", (o) => o.durableJobRow(JOB_ID), (f) => f === "sqlite3", `${JOB_ID}|ready|preset:720|yt-dlp\n`],
       ["processGroupMembers", (o) => o.processGroupMembers(300), (f) => f === "ps", "100 1 100 node\n"],
       ["workerLogs", (o) => o.workerLogs(), (f, a) => f === "docker" && a[0] === "logs", "worker started\n"],
       ["unitJournal", (o) => o.unitJournal("videofetch-worker"), (f) => f === "journalctl", "no errors\n"],
@@ -6188,7 +6331,7 @@ describe("measurement requires successful completion", () => {
     for (const [name, call, match, favourable] of cases) {
       // First: the observer genuinely PASSES on this stdout with exit 0, so the
       // negative result below is attributable to the exit code alone.
-      const clean = makeSystemObservers({ runReadOnly: world.runReadOnly });
+      const clean = makeSystemObservers({ runReadOnly: world.runReadOnly, databasePath: world.databasePath });
       const cleanResult = await call(clean);
       assert.equal(cleanResult.measured, true, `${name}: precondition — exit 0 measures`);
 
@@ -6203,7 +6346,7 @@ describe("measurement requires successful completion", () => {
 
   it("68e. status-as-data observers keep reporting the status", async () => {
     const world = makeFakeWorld({ services: "inactive", egressExit: 1 });
-    const observers = makeSystemObservers({ runReadOnly: world.runReadOnly });
+    const observers = makeSystemObservers({ runReadOnly: world.runReadOnly, databasePath: world.databasePath });
 
     // `systemctl is-active` exits non-zero BECAUSE the unit is inactive, and
     // inactive is the property under test. Turning that into BLOCKED would
@@ -6220,7 +6363,7 @@ describe("measurement requires successful completion", () => {
 
   it("68f. exit-0 behaviour is unchanged across the whole observer surface", async () => {
     const world = makeFakeWorld({ ytdlpEnabled: "true", maxFileSize: 104857600 });
-    const observers = makeSystemObservers({ runReadOnly: world.runReadOnly });
+    const observers = makeSystemObservers({ runReadOnly: world.runReadOnly, databasePath: world.databasePath });
     assert.equal((await observers.runningImageId()).value, IMAGE_ID);
     assert.equal((await observers.containerPid()).value, 100);
     assert.equal((await observers.containerInstanceId()).value, CONTAINER_A);
@@ -6266,7 +6409,7 @@ describe("measurement requires successful completion", () => {
 
   it("68h. `sampleWhile` is gone, not merely unused (§17)", () => {
     const world = makeFakeWorld();
-    const sampler = makeProcessSampler({ runReadOnly: world.runReadOnly });
+    const sampler = makeProcessSampler({ runReadOnly: world.runReadOnly, databasePath: world.databasePath });
     assert.equal(
       "sampleWhile" in sampler,
       false,
@@ -6298,7 +6441,7 @@ describe("container epoch binding", () => {
     const run = await runCli(
       ["--stage", "B", "--case", "cancellation", ...LIVE_ARGS, "--evidence", "/tmp/c.json"],
       CASE_ENV(),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
     );
     return { run, world };
   }
@@ -6331,7 +6474,7 @@ describe("container epoch binding", () => {
         ...WORKER_ENV,
       }),
       {
-        runReadOnly: world.runReadOnly,
+        runReadOnly: world.runReadOnly, databasePath: world.databasePath,
         fetch: world.fetch,
         files: seedRun(),
         sampler: epochSampler,
@@ -6675,7 +6818,7 @@ describe("atomic run-key creation", () => {
     const run = await runCli(
       ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/a.json"],
       LIVE_ENV(),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch },
     );
     assert.notEqual(run.code, 3, `usage error: ${run.out}\n${run.err}`);
     const opts = run.writeOptions.get(RUN_KEY_PATH);
@@ -6699,7 +6842,7 @@ describe("atomic run-key creation", () => {
       ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/a.json"],
       LIVE_ENV(),
       {
-        runReadOnly: world.runReadOnly,
+        runReadOnly: world.runReadOnly, databasePath: world.databasePath,
         fetch: world.fetch,
         files,
         stat: async (path) => {
@@ -6766,7 +6909,7 @@ describe("evidence producer contract version", () => {
     loadStageA("/x", async () => JSON.stringify(record), { run: RUN, expectedSha: SHA });
 
   it("71. the schema identifier is the final Phase-10C4 contract", () => {
-    assert.equal(EVIDENCE_SCHEMA_VERSION, "10c4-correction-08");
+    assert.equal(EVIDENCE_SCHEMA_VERSION, "10d-remediation-01");
     assert.notEqual(EVIDENCE_SCHEMA_VERSION, PREVIOUS_SCHEMA);
     // ONE constant governs Stage A, case records and the aggregate, so they
     // cannot drift into describing different producer contracts.
@@ -6839,10 +6982,10 @@ describe("evidence producer contract version", () => {
         VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
         ...WORKER_ENV,
       }),
-      { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      { runReadOnly: world.runReadOnly, databasePath: world.databasePath, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
-    assert.equal(JSON.parse(run.files.get("/tmp/c.json")).schemaVersion, "10c4-correction-08");
+    assert.equal(JSON.parse(run.files.get("/tmp/c.json")).schemaVersion, "10d-remediation-01");
   });
 });
 
@@ -6876,7 +7019,7 @@ describe("restart endpoint coherence", () => {
         ...WORKER_ENV,
       }),
       {
-        runReadOnly: world.runReadOnly,
+        runReadOnly: world.runReadOnly, databasePath: world.databasePath,
         fetch: world.fetch,
         files: seedRun(),
         sampler: epochSampler,
@@ -7192,5 +7335,293 @@ describe("test-suite safety", () => {
       "b.json",
     ]);
     assert.deepEqual(readOptionList([], "--case-evidence"), []);
+  });
+});
+
+// ── PHASE-10D-BLOCKER-REMEDIATION-01: the durable-state observer ───────────
+//
+// The observer named a database file, a table and an executable that the
+// deployment does not have. Every `durable.*` check and the sentinel sweep's
+// `durable-row` surface rested on it, so all of them could only ever have
+// reported BLOCKED — for a reason describing the instrument rather than the
+// system under test.
+//
+// These tests are deliberately NOT built on a fake. The reader is exercised
+// against real SQLite databases carrying the Worker's own DDL, because a fake
+// durable reader is exactly what let three wrong identifiers survive review.
+
+describe("durable-state observer (10D-REM-01)", () => {
+  it("70. the database identity is the Worker's, cross-checked against its source", () => {
+    // Path identity, stated.
+    assert.equal(WORKER_STATE_DB, "/var/lib/videofetch/worker.sqlite");
+    assert.equal(WORKER_STATE_DIRECTORY, "/var/lib/videofetch");
+    assert.equal(WORKER_DATABASE_FILENAME, "worker.sqlite");
+    assert.equal(WORKER_JOBS_TABLE, "worker_jobs");
+
+    // Path identity, PROVEN against the contracts that actually define it. The
+    // harness cannot import these constants (it is standalone `.mjs` with no
+    // TypeScript loader), so the restatement is checked instead of trusted.
+    assert.match(
+      STATE_DIRECTORY_SOURCE,
+      /export const WORKER_DATABASE_FILENAME = "worker\.sqlite";/,
+      "the Worker's own filename constant must still be worker.sqlite",
+    );
+    assert.ok(
+      STATE_DIRECTORY_SOURCE.includes(`"${WORKER_DATABASE_FILENAME}"`),
+      "the harness filename must appear verbatim in the Worker's state-directory source",
+    );
+    assert.match(
+      MIGRATIONS_SOURCE,
+      new RegExp(`CREATE TABLE ${WORKER_JOBS_TABLE} \\(`),
+      "the harness table must be the one the Worker's migration creates",
+    );
+    // Every projected column must exist in that DDL.
+    for (const column of DURABLE_SAFE_COLUMNS) {
+      assert.match(
+        WORKER_JOBS_DDL,
+        new RegExp(`\\b${column}\\b`),
+        `${column} must exist in the Worker's worker_jobs schema`,
+      );
+    }
+    // And the column that must never be projected must genuinely be there to
+    // omit — otherwise the projection proves nothing.
+    assert.match(WORKER_JOBS_DDL, /\burl\b/, "url must exist in the schema for its omission to mean anything");
+  });
+
+  it("70a. the retired identifiers survive only as history, never as code", () => {
+    const harnessDir = join(REPO_ROOT, "deploy/acceptance/ytdlp-generic");
+    const sources = [
+      "acceptance.mjs",
+      ...["observers", "cases", "coverage", "stage-a", "stage-b", "evidence", "provenance"].map(
+        (name) => `lib/${name}.mjs`,
+      ),
+    ];
+
+    // A comment line, by the shapes this codebase actually uses. Anything else
+    // holding a retired identifier is an OPERATIVE reference.
+    const isCommentLine = (line) => /^\s*(\/\/|\*|\/\*)/.test(line);
+
+    for (const relative of sources) {
+      const lines = readFileSync(join(harnessDir, relative), "utf8").split("\n");
+      lines.forEach((line, index) => {
+        for (const [pattern, what] of [
+          [/videofetch\.db/, "the retired videofetch.db path"],
+          [/\bFROM jobs\b/, "the retired bare jobs table"],
+        ]) {
+          if (!pattern.test(line)) continue;
+          assert.ok(
+            isCommentLine(line),
+            `${relative}:${index + 1} references ${what} in code, not in history`,
+          );
+        }
+      });
+    }
+
+    // The prose is allowed — and required — to say what changed, but it must
+    // document the CURRENT contract too.
+    const readme = readFileSync(join(harnessDir, "README.md"), "utf8");
+    assert.ok(readme.includes(WORKER_STATE_DB), "the README must name the real durable database");
+    assert.ok(
+      !/`sqlite3 -readonly/.test(readme),
+      "the README must not still describe a sqlite3 CLI read",
+    );
+  });
+
+  it("71. the reader needs no `sqlite3` executable on the host", async () => {
+    // The success path spawns NOTHING. A runner that throws on every command
+    // proves it: if any external process were required, this would fail.
+    const { databasePath } = makeDurableDatabase([
+      { jobId: JOB_ID, status: "ready", formatId: "preset:1080", extractor: "yt-dlp" },
+    ]);
+    const observers = makeSystemObservers({
+      databasePath,
+      runReadOnly: async (file) => {
+        throw new Error(`no external command may be spawned to read durable state (got ${file})`);
+      },
+    });
+    const observed = await observers.durableJobRow(JOB_ID);
+    assert.equal(observed.measured, true);
+    assert.deepEqual(observed.value, {
+      jobId: JOB_ID,
+      status: "ready",
+      formatId: "preset:1080",
+      extractor: "yt-dlp",
+    });
+  });
+
+  it("72. the projection returns only the safe columns, and never the URL", async () => {
+    const sentinel = "VF_ACCEPT_SECRET_projection_probe";
+    const { databasePath } = makeDurableDatabase([
+      {
+        jobId: JOB_ID,
+        status: "ready",
+        formatId: "preset:720",
+        extractor: "yt-dlp",
+        url: `https://example.invalid/watch?token=${sentinel}`,
+      },
+    ]);
+
+    const row = await readDurableJobRow(JOB_ID, { databasePath });
+    assert.deepEqual(Object.keys(row).sort(), ["extractor", "formatId", "jobId", "status"]);
+    assert.ok(!("url" in row), "the URL column must not be projected");
+
+    // The sentinel is genuinely IN the database — so its absence is evidence.
+    const proof = new DatabaseSync(databasePath, { readOnly: true });
+    const stored = proof.prepare("SELECT url FROM worker_jobs WHERE job_id = ?").get(JOB_ID);
+    proof.close();
+    assert.ok(String(stored.url).includes(sentinel), "the fixture must actually carry the sentinel");
+
+    assert.ok(!JSON.stringify(row).includes(sentinel), "the sentinel must not reach the result");
+
+    // Nor may it reach an ERROR. A malformed-id refusal names no content.
+    await assert.rejects(
+      () => readDurableJobRow("not-a-job-id", { databasePath }),
+      (error) => !String(error.message).includes(sentinel) && /malformed job id/.test(error.message),
+    );
+
+    // Nor the observation envelope on a failure path.
+    const observers = makeSystemObservers({ databasePath: join(databasePath, "nope") });
+    const observed = await observers.durableJobRow(JOB_ID);
+    assert.equal(observed.measured, false);
+    assert.ok(!JSON.stringify(observed).includes(sentinel));
+  });
+
+  it("73. the connection is read-only, and a missing database is never created", async () => {
+    const { databasePath, dir } = makeDurableDatabase([
+      { jobId: JOB_ID, status: "ready", formatId: "preset:720", extractor: "yt-dlp" },
+    ]);
+
+    // Read works.
+    assert.equal((await readDurableJobRow(JOB_ID, { databasePath })).status, "ready");
+
+    // A write through a connection opened exactly as the reader opens it is
+    // rejected by SQLite itself, not merely unused by our code.
+    const readOnly = new DatabaseSync(databasePath, { readOnly: true });
+    assert.throws(
+      () => readOnly.exec("UPDATE worker_jobs SET status = 'cancelled'"),
+      /readonly|read-only/i,
+    );
+    readOnly.close();
+
+    // The row is untouched.
+    assert.equal((await readDurableJobRow(JOB_ID, { databasePath })).status, "ready");
+
+    // A missing database is a MEASUREMENT FAILURE and is not brought into
+    // existence. Opening writable would have created an empty database at the
+    // exact path the acceptance is trying to measure.
+    const missing = join(dir, "absent.sqlite");
+    await assert.rejects(
+      () => readDurableJobRow(JOB_ID, { databasePath: missing }),
+      /could not be opened read-only/,
+    );
+    assert.equal(existsSync(missing), false, "a missing durable database must not be created");
+  });
+
+  it("73a. the production observer exposes no way to write", async () => {
+    const { databasePath } = makeDurableDatabase([
+      { jobId: JOB_ID, status: "ready", formatId: "preset:720", extractor: "yt-dlp" },
+    ]);
+    const observers = makeSystemObservers({ databasePath });
+    // The durable surface is exactly one read. There is no exec/prepare/write
+    // method to reach, and the observer set never hands back a connection.
+    assert.deepEqual(
+      Object.keys(observers).filter((name) => /durable/i.test(name)),
+      ["durableJobRow"],
+    );
+    const before = statSync(databasePath).size;
+    await observers.durableJobRow(JOB_ID);
+    assert.equal(statSync(databasePath).size, before, "reading must not change the database size");
+  });
+
+  it("74. a live WAL database is read without copying it", async () => {
+    // The Worker's database is always in WAL mode with an open writer. The
+    // reader must work against that state, not against a quiesced copy.
+    const { databasePath, db, dir } = makeDurableDatabase(
+      [{ jobId: JOB_ID, status: "downloading", formatId: "preset:720", extractor: "yt-dlp" }],
+      { wal: true, keepOpen: true },
+    );
+    try {
+      assert.equal(
+        db.prepare("PRAGMA journal_mode").get().journal_mode,
+        "wal",
+        "the fixture must genuinely be in WAL mode",
+      );
+      assert.ok(existsSync(`${databasePath}-wal`), "the -wal sidecar must be present");
+
+      // A concurrent, COMMITTED writer update must be what the reader sees.
+      db.prepare("UPDATE worker_jobs SET status = ? WHERE job_id = ?").run("ready", JOB_ID);
+
+      const row = await readDurableJobRow(JOB_ID, { databasePath });
+      assert.equal(row.status, "ready", "the reader must see committed WAL state");
+
+      // Nothing was copied: the only files in the fixture directory are the
+      // database and its own SQLite sidecars.
+      const stray = readdirSync(dir).filter((name) => !name.startsWith(WORKER_DATABASE_FILENAME));
+      assert.deepEqual(stray, [], "the reader must not copy the database anywhere");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("75. measurement failure and row absence are distinguishable, and neither is clean", async () => {
+    const { databasePath, dir } = makeDurableDatabase([
+      { jobId: JOB_ID, status: "ready", formatId: "preset:720", extractor: "yt-dlp" },
+    ]);
+    const observers = makeSystemObservers({ databasePath });
+
+    // 1. Measured, matching row.
+    const hit = await observers.durableJobRow(JOB_ID);
+    assert.equal(hit.measured, true);
+    assert.equal(hit.value.extractor, "yt-dlp");
+
+    // 2. The read SUCCEEDED and there is no such row. Its reason says so, and
+    //    it is never a clean durable result.
+    const other = "ab".repeat(16);
+    const absent = await observers.durableJobRow(other);
+    assert.equal(absent.measured, false, "an absent row is never a durable measurement");
+    assert.match(absent.reason, /no worker_jobs row exists/);
+    assert.ok(!/could not be opened|query failed/.test(absent.reason));
+
+    // 3. The database could not be read at all. A DIFFERENT reason — a query
+    //    error must never be reported as an absent row.
+    const broken = makeSystemObservers({ databasePath: join(dir, "gone.sqlite") });
+    const unreadable = await broken.durableJobRow(JOB_ID);
+    assert.equal(unreadable.measured, false);
+    assert.match(unreadable.reason, /could not be opened read-only/);
+    assert.ok(!/no worker_jobs row exists/.test(unreadable.reason));
+
+    // 4. A database that opens but whose table is missing is a QUERY failure,
+    //    not an absent row — the distinction the old `sqlite3` parser lost by
+    //    treating empty stdout as "no row".
+    const emptyDir = join(DURABLE_TMP_ROOT, `empty-${Date.now()}`);
+    mkdirSync(emptyDir, { recursive: true });
+    const emptyPath = join(emptyDir, WORKER_DATABASE_FILENAME);
+    const blank = new DatabaseSync(emptyPath);
+    blank.exec("CREATE TABLE unrelated (x TEXT)");
+    blank.close();
+    const noTable = await makeSystemObservers({ databasePath: emptyPath }).durableJobRow(JOB_ID);
+    assert.equal(noTable.measured, false);
+    assert.match(noTable.reason, /the durable query failed/);
+    assert.ok(!/no worker_jobs row exists/.test(noTable.reason));
+  });
+
+  it("76. every durable-dependent check is BLOCKED when the read is unmeasured", () => {
+    // The point of keeping all three unmeasured outcomes is that they land as
+    // BLOCKED rather than silently passing.
+    for (const reason of [
+      "durable job: the durable database could not be opened read-only: ENOENT",
+      "durable job: the durable read succeeded and no worker_jobs row exists for this job",
+      "durable job: node:sqlite is unavailable in this Node runtime, so durable state cannot be read",
+    ]) {
+      const observation = { measured: false, reason };
+      for (const predicate of [
+        (v) => v?.extractor === "yt-dlp",
+        (v) => v != null && typeof v === "object",
+      ]) {
+        const result = measuredCheck("durable.probe", observation, predicate, "durable", {});
+        assert.equal(result.outcome, OUTCOMES.BLOCKED);
+        assert.match(result.detail, /NOT MEASURABLE/);
+      }
+    }
   });
 });

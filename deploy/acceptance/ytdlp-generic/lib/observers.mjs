@@ -26,8 +26,38 @@ import { fingerprintChain } from "./egress-policy.mjs";
 
 const execFileAsync = promisify(execFile);
 
-/** The durable state file the Worker owns on the VM. Read-only, and never copied. */
-export const WORKER_STATE_DB = "/var/lib/videofetch/videofetch.db";
+/**
+ * The durable state the Worker owns on the VM. Read-only, and never copied.
+ *
+ * These three names are the DEPLOYMENT CONTRACT, not harness inventions. The
+ * harness previously carried its own parallel guesses for all three and was
+ * wrong about every one of them:
+ *
+ *   database   videofetch.db  ->  worker.sqlite   (WORKER_DATABASE_FILENAME in
+ *                                  src/worker/runtime/state-directory.server.ts)
+ *   table      jobs           ->  worker_jobs     (CREATE TABLE worker_jobs in
+ *                                  src/worker/state/migrations.server.ts)
+ *   access     `sqlite3` CLI  ->  node:sqlite     (the Worker's own driver)
+ *
+ * None of that could ever have measured Production: the file does not exist,
+ * the table does not exist, and the executable is not installed on the VM. The
+ * durable checks would have reported BLOCKED for a reason that had nothing to
+ * do with the deployment under test.
+ *
+ * The harness cannot IMPORT the Worker's constants: it is a standalone `.mjs`
+ * tool that runs on the VM host with no TypeScript loader, while the Worker's
+ * constants live in `.ts` behind the repository's alias/type-stripping setup.
+ * So the values are restated here exactly once, and a regression in
+ * `scripts/ytdlp-acceptance.test.mjs` cross-checks each of them against the
+ * Worker source that defines it. A restated constant with a cross-check is a
+ * contract; a restated constant without one is the defect above.
+ */
+export const WORKER_STATE_DIRECTORY = "/var/lib/videofetch";
+export const WORKER_DATABASE_FILENAME = "worker.sqlite";
+export const WORKER_STATE_DB = `${WORKER_STATE_DIRECTORY}/${WORKER_DATABASE_FILENAME}`;
+
+/** The durable table the Worker's own migration creates. */
+export const WORKER_JOBS_TABLE = "worker_jobs";
 
 /**
  * The ONLY durable columns the harness may project.
@@ -69,16 +99,34 @@ export function egressChainListArgv(netnsPid) {
 /** A durable job id, as the Worker's own schema defines it. */
 const JOB_ID_PATTERN = /^[0-9a-f]{32}$/;
 
-/** The exact SQL this harness may ever run. Built here, never assembled from input. */
-export function durableJobQuery(jobId) {
-  if (!JOB_ID_PATTERN.test(String(jobId))) throw new Error("refusing to query a malformed job id");
-  return `SELECT ${DURABLE_SAFE_COLUMNS.join(", ")} FROM jobs WHERE job_id = '${jobId}';`;
+/** Refuses a job id outside the Worker's own durable grammar. */
+export function assertDurableJobId(jobId) {
+  if (typeof jobId !== "string" || !JOB_ID_PATTERN.test(jobId)) {
+    throw new Error("refusing to query a malformed job id");
+  }
+  return jobId;
 }
 
-/** The fixed shape a durable read must have, so `sqlite3` cannot become a SQL console. */
-const DURABLE_QUERY_PATTERN = new RegExp(
-  `^SELECT ${DURABLE_SAFE_COLUMNS.join(", ")} FROM jobs WHERE job_id = '[0-9a-f]{32}';$`,
-);
+/**
+ * The ONE statement this harness may ever run against durable state.
+ *
+ * A module-level constant with a BOUND parameter, not a string built per call.
+ * The previous form interpolated the job id into the SQL after validating it,
+ * which was safe only for as long as the validator and the interpolation stayed
+ * in agreement — a coupling that has to be re-proven every time either moves.
+ * A placeholder removes the question: the id is data to SQLite, and the
+ * statement text is a constant no caller can influence.
+ *
+ * The projection is the safe column list, and `url` is not in it. That is a
+ * PROJECTION, not a post-filter: the column holds the operator-supplied
+ * acceptance URL and, during the sentinel case, the sentinel itself, so it must
+ * never enter this process at all. Reading the row and deleting the field
+ * afterwards would be the "fetched, then sanitized" pattern CORRECTION-05
+ * removed from the environment probes for exactly the same reason.
+ */
+export const DURABLE_JOB_QUERY = `SELECT ${DURABLE_SAFE_COLUMNS.join(
+  ", ",
+)} FROM ${WORKER_JOBS_TABLE} WHERE job_id = ?`;
 
 /**
  * The complete set of shapes this harness may execute.
@@ -146,15 +194,20 @@ const READ_ONLY_COMMANDS = Object.freeze([
       a[8] === EGRESS_TABLE &&
       a[9] === EGRESS_CHAIN,
   ],
-  // Durable state, read-only, projecting only the safe column list.
-  [
-    "sqlite3",
-    (a) =>
-      a.length === 3 &&
-      a[0] === "-readonly" &&
-      a[1] === WORKER_STATE_DB &&
-      DURABLE_QUERY_PATTERN.test(a[2]),
-  ],
+  // Durable state is DELIBERATELY ABSENT from this allowlist.
+  //
+  // It is read in-process through `node:sqlite` (see `readDurableJobRow`), not
+  // by spawning a database CLI. Two things follow, and both are structural:
+  //
+  //   - `sqlite3` is not installed on the Phase-10D VM, so the old entry could
+  //     never have produced a measurement there at all;
+  //   - an allowlisted `sqlite3` shape is a SQL-console-shaped hole kept open
+  //     by a regex. The regex was correct, but the boundary it guarded no
+  //     longer needs to exist, and a dormant one only invites a future caller
+  //     to widen it.
+  //
+  // `scripts/ytdlp-acceptance.test.mjs` asserts that no `sqlite3` command is
+  // admissible here in any shape.
 ]);
 
 /**
@@ -454,12 +507,146 @@ export function notMeasured(reason) {
   return Object.freeze({ measured: false, reason });
 }
 
+// ── Durable state, read in-process and read-only ───────────────────────────
+//
+// The Worker opens this same file with `node:sqlite`. The harness now does too,
+// which removes an external executable the VM does not have AND removes the
+// second, drifting description of the deployment: one driver, one filename, one
+// table, cross-checked against the Worker source by the test suite.
+
+/**
+ * A distinguishable failure to READ, as opposed to a row that is not there.
+ *
+ * §10 of the remediation brief: a query error must never become "row absent",
+ * and a missing database must never become a clean durable result. Both land as
+ * unmeasured — `BLOCKED` where the check is required — but they must not land
+ * with the same story, because one indicts the deployment and the other indicts
+ * the instrument.
+ */
+export class DurableReadError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "DurableReadError";
+  }
+}
+
+/** Raised when the read SUCCEEDED and the row simply does not exist. */
+export class DurableRowAbsentError extends Error {
+  constructor(jobId) {
+    super(`the durable read succeeded and no ${WORKER_JOBS_TABLE} row exists for this job`);
+    this.name = "DurableRowAbsentError";
+    this.jobId = jobId;
+  }
+}
+
+/**
+ * Loads `node:sqlite`, or explains that this runtime cannot measure durable
+ * state at all.
+ *
+ * The import is DYNAMIC and deliberately so. `node:sqlite` landed in Node 22.5;
+ * a static import would make this whole module unloadable on an older runtime,
+ * taking Stage A, the process sampler and even the dry-run refusal down with it
+ * — turning "one check cannot be measured" into "the harness will not start".
+ * Failing here instead keeps the loss proportional: the durable observation is
+ * unmeasured, everything else still runs, and the reason names the cause.
+ */
+async function loadDatabaseSync() {
+  let module;
+  try {
+    module = await import("node:sqlite");
+  } catch {
+    throw new DurableReadError(
+      "node:sqlite is unavailable in this Node runtime, so durable state cannot be read",
+    );
+  }
+  const DatabaseSync = module?.DatabaseSync;
+  if (typeof DatabaseSync !== "function") {
+    throw new DurableReadError("node:sqlite exposes no DatabaseSync constructor");
+  }
+  return DatabaseSync;
+}
+
+/**
+ * Reads the safe durable projection for exactly one validated job id.
+ *
+ * Read-only is requested EXPLICITLY (`readOnly: true`) rather than assumed from
+ * the fact that this code only ever runs a SELECT. The distinction matters: an
+ * opened writable handle to the live Production database is a capability that
+ * exists whether or not today's code uses it, and SQLite will happily create a
+ * missing file when opened writable — which would fabricate an empty durable
+ * database at the exact path the acceptance is trying to measure.
+ *
+ * There is no fallback to a writable open. If read-only is unavailable, the
+ * observation is unmeasured.
+ */
+export async function readDurableJobRow(jobId, opts = {}) {
+  assertDurableJobId(jobId);
+  const databasePath = typeof opts.databasePath === "string" ? opts.databasePath : WORKER_STATE_DB;
+  const DatabaseSync = opts.DatabaseSync ?? (await loadDatabaseSync());
+
+  let db;
+  try {
+    db = new DatabaseSync(databasePath, { readOnly: true });
+  } catch (error) {
+    // Covers a missing file, an unreadable one, and a directory the harness
+    // user cannot traverse. All are "we could not look", never "it was clean".
+    throw new DurableReadError(
+      `the durable database could not be opened read-only: ${redactText(
+        String(error?.message ?? error),
+      )}`,
+    );
+  }
+
+  try {
+    let row;
+    try {
+      row = db.prepare(DURABLE_JOB_QUERY).get(jobId);
+    } catch (error) {
+      // A failed query is a failed MEASUREMENT. Returning "no row" here is the
+      // precise conflation §10 forbids: a missing table and an absent row would
+      // become the same finding, and only one of them is about the job.
+      throw new DurableReadError(
+        `the durable query failed: ${redactText(String(error?.message ?? error))}`,
+      );
+    }
+
+    if (row === undefined || row === null) throw new DurableRowAbsentError(jobId);
+
+    const projected = {
+      jobId: row.job_id,
+      status: row.status,
+      formatId: row.format_id ?? null,
+      extractor: row.extractor ?? null,
+    };
+    if (typeof projected.jobId !== "string" || typeof projected.status !== "string") {
+      throw new DurableReadError("the durable row shape did not match the projected columns");
+    }
+    if (projected.jobId !== jobId) {
+      throw new DurableReadError("the durable row did not belong to the requested job");
+    }
+    return projected;
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // Closing is best-effort cleanup; a close failure never changes a value
+      // that was already read, and must not mask the finding above.
+    }
+  }
+}
+
 // ── System observers ───────────────────────────────────────────────────────
 
 export function makeSystemObservers(deps = {}) {
   const run = deps.runReadOnly ?? runReadOnly;
   const container = deps.container ?? "videofetch-worker";
   const imageRepo = deps.imageRepo ?? "videofetch-worker";
+  // The durable reader is in-process, so it gets its own seam rather than going
+  // through `runReadOnly`. The default is the real read-only `node:sqlite`
+  // reader; the tests point `databasePath` at a disposable database and never
+  // substitute a fake that could fabricate a row shape the real one cannot.
+  const readDurable = deps.readDurableJobRow ?? readDurableJobRow;
+  const databasePath = deps.databasePath ?? WORKER_STATE_DB;
 
   /**
    * `docker inspect --format` on the container, returning a trimmed scalar.
@@ -688,18 +875,7 @@ export function makeSystemObservers(deps = {}) {
      * `DURABLE_SAFE_COLUMNS`.
      */
     async durableJobRow(jobId) {
-      return observe(`durable job ${jobId}`, async () => {
-        const result = await run("sqlite3", ["-readonly", WORKER_STATE_DB, durableJobQuery(jobId)]);
-        if (result.exitCode !== 0) throw new Error("durable state could not be read");
-        const line = String(result.stdout ?? "").trim();
-        if (!line) throw new Error("no durable row exists for this job");
-        const parts = line.split("|");
-        if (parts.length !== DURABLE_SAFE_COLUMNS.length) {
-          throw new Error("durable row shape did not match the projected columns");
-        }
-        const [jobIdValue, status, formatId, extractor] = parts;
-        return { jobId: jobIdValue, status, formatId, extractor };
-      });
+      return observe(`durable job ${jobId}`, () => readDurable(jobId, { databasePath }));
     },
 
     /**

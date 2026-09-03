@@ -2266,6 +2266,63 @@ endpoint bracket with bounded retries, PID reuse being unable to hide a
 recreation, the outer bracketed deployment snapshots, and the absence of any
 continuous-observation claim.
 
+#### PHASE-10D-BLOCKER-REMEDIATION-01 — the durable-state observer could not address Production
+
+Phase 10D's live preflight found that the acceptance harness's durable observer
+named three things and was wrong about all three:
+
+```
+database   videofetch.db   ->  worker.sqlite   (WORKER_DATABASE_FILENAME,
+                                                 state-directory.server.ts)
+table      jobs            ->  worker_jobs     (CREATE TABLE worker_jobs,
+                                                 migrations.server.ts)
+access     `sqlite3` CLI   ->  node:sqlite     (not installed on the Lima VM)
+```
+
+Nothing about this was subtle in effect: `durable.extractor-is-ytdlp`,
+`durable.application-format-id`, `durable.no-raw-selector-fields` and the
+sentinel sweep's `durable-row` surface could only ever have reported `BLOCKED`,
+against any deployment, for a reason describing the instrument rather than the
+system under test. That inverts what `BLOCKED` is supposed to mean — *we could
+not measure this deployment*, not *this tool has never been able to measure
+one* — and it is the precise failure mode the harness's own fail-closed design
+exists to make visible rather than silent.
+
+The correction is to the OBSERVER, not to Production. The Worker's contract is
+authoritative; a measuring instrument that disagrees with it is the thing that
+is wrong.
+
+- the reader uses `node:sqlite` — the Worker's own driver — opened explicitly
+  with `readOnly: true`, so no external executable is required and a missing
+  database cannot be created by the act of looking for it;
+- the projection is unchanged (`job_id, status, format_id, extractor`), and
+  `url` is still never selected — a projection, not a post-filter, because the
+  column carries the acceptance URL and, during the sentinel case, the sentinel;
+- the job id is now a BOUND parameter rather than interpolated into SQL;
+- `sqlite3` is REMOVED from the read-only allowlist rather than left dormant;
+- the `node:sqlite` import is dynamic, so an older Node runtime costs one
+  unmeasured observation instead of making the whole harness unloadable;
+- the filename and table are restated in the acceptance layer (it is standalone
+  `.mjs` on the VM host and cannot import the Worker's TypeScript constants) and
+  cross-checked by the test suite against the sources that define them.
+
+**Evidence schema bumped to `10d-remediation-01`.** The producer contract
+changed materially: "durable state was measured" now comes from a producer that
+can address the deployment at all. No live artifact is invalidated — Phase 10D
+has still not produced one.
+
+**Recorded runtime prerequisite, not fixed here.** The Lima host runs Node
+v18.19.1, which has no `node:sqlite`; durable state is unmeasurable there and
+every dependent check reports `BLOCKED` with that exact reason until the harness
+runs on Node >= 22.5. Separately, `/var/lib/videofetch` is mode `0700` owned by
+uid 1000, so the acceptance operator must run the harness with sufficient
+privilege to read the durable database. Both are deployment conditions for
+Phase 10D and neither was changed by this task.
+
+**No Production mutation.** No deployment, image retag, `worker.env` edit,
+systemd, network-policy, DNS, Cloudflare, R2 or Vercel change was made, and
+`YTDLP_ENABLED` remains absent.
+
 #### What Phase 10D is authorized to do
 
 Nothing yet. Only after this harness has been **independently reviewed and

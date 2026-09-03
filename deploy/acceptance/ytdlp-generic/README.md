@@ -358,6 +358,7 @@ and **authorize current Stage B**. What it actually attested would be far less:
 | CORRECTION-05 | narrow secret-safe environment probes — the older Stage A retrieved the **complete** environment, values and all; image continuity; deterministic restart recovery |
 | CORRECTION-06 | positive findings outranking observation gaps; the exact `docker top` argv boundary; feature-state continuity |
 | CORRECTION-07 | raw evidence validated before normalization; successful exit required before stdout is a measurement; container-epoch continuity; type-strict run identity; atomic key creation |
+| 10D-REM-01 | the durable observer can address the deployment **at all** — see [Durable state is read in-process](#durable-state-is-read-in-process). Before it, every `durable.*` check and the sentinel's `durable-row` surface could only ever have been `BLOCKED`, because the producer named a database file, a table and an executable that do not exist |
 
 **Bump it whenever an observer or evaluator change could make an old artifact
 mean something *weaker* under the same shape.** A field added or removed is the
@@ -1276,7 +1277,9 @@ proof to the wrong process tree.
 | `readlink /proc/<pid>/ns/net` | the namespace is `null`, which the evaluator reads as a **mismatch** |
 | `python3 --version`, `node --version`, the EJS probe | the version is unmeasured |
 | the `workDir` probe | presence is unmeasured — never "absent" |
-| `sqlite3 -readonly …` | the durable row is unmeasured |
+
+The durable row is no longer in that table because it is no longer a command —
+see [Durable state is read in-process](#durable-state-is-read-in-process).
 
 ### Where a non-zero exit is the finding
 
@@ -1632,6 +1635,86 @@ be the debug endpoint this design forbids. So no check says it was observed.
 Likewise, a container comparison is not proof of the private selector, and a
 digest of the client's bytes is not an independent measurement at the Worker
 boundary. The check names say which is which.
+
+## Durable state is read in-process
+
+The durable observer used to shell out to `sqlite3`. It named three things, and
+was wrong about all three:
+
+| | It said | The deployment says |
+| :--- | :--- | :--- |
+| database | `/var/lib/videofetch/videofetch.db` | `/var/lib/videofetch/worker.sqlite` |
+| table | `jobs` | `worker_jobs` |
+| access | the `sqlite3` executable | not installed on the VM |
+
+That is worse than a bug in a check, because of what it looks like from the
+outside. Every `durable.*` claim and the sentinel's `durable-row` surface would
+have reported `BLOCKED` on a perfectly healthy deployment, and the reason would
+have described the instrument rather than the system under test — which is the
+one confusion the whole fail-closed design exists to prevent. `BLOCKED` is
+supposed to mean *we could not measure this deployment*, not *we were never
+able to measure any deployment*.
+
+The reader now uses `node:sqlite` — **the Worker's own driver** — opened
+explicitly read-only:
+
+```js
+new DatabaseSync("/var/lib/videofetch/worker.sqlite", { readOnly: true })
+```
+
+```
+SELECT job_id, status, format_id, extractor FROM worker_jobs WHERE job_id = ?
+```
+
+- **The filename and table are the deployment's, not the harness's.** They are
+  restated here because the harness is standalone `.mjs` on the VM host and
+  cannot import the Worker's TypeScript constants — so the test suite
+  cross-checks each restatement against the source that defines it
+  (`WORKER_DATABASE_FILENAME` in `state-directory.server.ts`, `CREATE TABLE
+  worker_jobs` in `migrations.server.ts`). A restated constant with a
+  cross-check is a contract; without one it is the defect above.
+- **The job id is bound, not interpolated.** The previous form was safe only
+  while the validator and the string concatenation stayed in agreement. A
+  placeholder removes the question entirely, and the statement text becomes a
+  module constant no caller can influence.
+- **`url` is never selected.** That is a projection, not a post-filter: the
+  column holds the acceptance URL and, during the sentinel case, the sentinel.
+  Fetching the row and deleting the field afterwards is the "fetched, then
+  sanitized" pattern CORRECTION-05 removed from the environment probes.
+- **`readOnly: true` is explicit.** Not because today's code only runs a
+  `SELECT`, but because an open writable handle to the live Production database
+  is a capability whether or not it is used — and SQLite *creates* a missing
+  file when opened writable, which would fabricate an empty durable database at
+  the exact path the acceptance is trying to measure. There is no fallback to a
+  writable open.
+- **`sqlite3` is gone from the allowlist**, not merely unused. A dormant
+  entry is a SQL-console-shaped hole that only needs widening.
+- **The import is dynamic.** `node:sqlite` landed in Node 22.5; a static import
+  would make the whole observer module unloadable on an older runtime, taking
+  Stage A, the process sampler and even the dry-run refusal down with it. An
+  unsupported runtime now costs one unmeasured observation instead of the
+  harness.
+
+### Three outcomes, still distinguishable
+
+| Observation | Result |
+| :--- | :--- |
+| the read succeeded and the row matched | measured |
+| the read succeeded and no row exists | unmeasured — *"no `worker_jobs` row exists for this job"* |
+| the database could not be opened, or the query failed | unmeasured — *"could not be opened read-only"* / *"the durable query failed"* |
+
+The last two are both `BLOCKED` where the check is required, but they never
+share a story: one indicts the deployment, the other the instrument. The old
+CLI parser could not tell them apart at all — empty stdout became "no row",
+so a missing table and an absent job looked identical.
+
+> **Runtime prerequisite.** The Phase-10D VM host currently runs Node
+> v18.19.1, which has no `node:sqlite`. Durable state is unmeasurable there,
+> and every dependent check will report `BLOCKED` with that exact reason until
+> the harness runs on Node ≥ 22.5. This is a deployment prerequisite, not a
+> harness defect, and it fails closed rather than silently.
+
+---
 
 ## Privacy controls
 
