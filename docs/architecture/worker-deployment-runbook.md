@@ -2311,13 +2311,47 @@ changed materially: "durable state was measured" now comes from a producer that
 can address the deployment at all. No live artifact is invalidated — Phase 10D
 has still not produced one.
 
-**Recorded runtime prerequisite, not fixed here.** The Lima host runs Node
-v18.19.1, which has no `node:sqlite`; durable state is unmeasurable there and
-every dependent check reports `BLOCKED` with that exact reason until the harness
-runs on Node >= 22.5. Separately, `/var/lib/videofetch` is mode `0700` owned by
-uid 1000, so the acceptance operator must run the harness with sufficient
-privilege to read the durable database. Both are deployment conditions for
-Phase 10D and neither was changed by this task.
+**CORRECTION-01 — the read moved INSIDE the Worker container.** The first draft
+of this remediation read the database from the host with `node:sqlite`. That
+removed the `sqlite3` dependency and introduced two worse ones: the Lima host
+runs Node v18.19.1, which has no `node:sqlite` at all, and `/var/lib/videofetch`
+is `0700` owned by uid 1000, so the host would also have needed filesystem
+privilege. Trading one unmet host prerequisite for another is not remediation —
+a tool that needs the deployment changed before it can measure it has not
+measured it.
+
+The runtime that can already do this ships with the deployment: the reviewed
+Worker image carries `/usr/local/bin/node` v22.23.2, whose `node:sqlite` needs
+no flag, and the container already has the durable volume mounted under the
+Worker's own uid. The observer therefore spawns exactly one allowlisted probe:
+
+```
+docker exec videofetch-worker /usr/local/bin/node -e <fixed probe> <32-hex job id>
+```
+
+The probe source is a compile-time constant matched WHOLE by the allowlist, so
+`docker exec ... node -e` is one fixed question rather than a general execution
+capability. A different script, interpreter, database, table, column list or
+argument count is refused before a process is spawned. The probe catches its own
+failures and answers with a closed, size-bounded JSON response — `row`, `absent`
+or one of three named error classes — so no raw SQLite text, stack, path, SQL or
+argv crosses the boundary.
+
+**The Phase-10D host now needs nothing new**: no `node:sqlite`, no `sqlite3`, no
+database permission, no `sudo`, and no Node newer than the VM's v18.19.1. The
+harness still loads and still refuses a live run there, verified on the VM.
+
+**An absent durable row is a FAIL, not a BLOCKED.** A query that ran and proved
+the row is not there is a MEASUREMENT, and the durable ladder is the Worker's
+own record of a job the harness watched reach `ready`. Row presence is graded on
+its own by the new `durable.row-present` check; the three content checks are
+claims about a row, so when the row is provably absent they report that there is
+nothing to judge rather than each restating the same finding. `FAIL` outranks
+`BLOCKED`, so the case verdict is `FAIL`.
+
+**Still recorded, still not fixed here.** `/var/lib/videofetch` remains `0700`
+and is deliberately unchanged; the acceptance operator no longer needs to
+traverse it.
 
 **No Production mutation.** No deployment, image retag, `worker.env` edit,
 systemd, network-policy, DNS, Cloudflare, R2 or Vercel change was made, and

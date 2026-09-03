@@ -118,6 +118,29 @@ export function presetsAreApplicationOwned(presets) {
   );
 }
 
+/**
+ * Narrows a durable observation to the row CONTENT it carries.
+ *
+ * Three inputs, three outputs, and the middle one is the point:
+ *
+ *   unmeasured        -> unmeasured (unchanged; the probe could not look)
+ *   measured, present -> measured, the row
+ *   measured, absent  -> NOT EVALUABLE — there is no row to judge
+ *
+ * The last is deliberately not a content `FAIL`. "The extractor is not yt-dlp"
+ * is a false statement about a row that does not exist, and three checks each
+ * reporting their own version of one missing row reads as three defects.
+ * `durable.row-present` states the finding once, as a measured FAIL.
+ */
+export function rowContentObservation(observation) {
+  if (!observation || observation.measured !== true) return observation;
+  if (observation.value?.present === true) return observation;
+  return {
+    measured: false,
+    reason: "the durable row is absent, so its contents cannot be evaluated",
+  };
+}
+
 export function evaluateStageB(obs, stageAResult) {
   // ── §11/§20/§29 the authorization edge ──────────────────────────────────
   const authorization = stageBAuthorization(obs, stageAResult);
@@ -294,10 +317,35 @@ export function evaluateStageB(obs, stageAResult) {
   }
 
   // ── §27 strategy persistence, and the corrected durable-format contract ──
+  //
+  // Row PRESENCE is graded first, and separately, because it is a different
+  // claim from anything about the row's contents.
+  //
+  // A probe that ran and proved the row is not there is a MEASUREMENT, and a
+  // measured absence is a `FAIL` — the durable ladder is the Worker's own
+  // record of a job the harness watched reach `ready`. Reporting that as
+  // `BLOCKED` would say "we could not look" about the one case where we looked
+  // and found something wrong, which is the exact inversion this harness
+  // exists to prevent.
+  add(
+    measuredCheck(
+      "durable.row-present",
+      obs.durableJobRow,
+      (value) => value?.present === true,
+      "a durable worker_jobs row exists for the acceptance job",
+      { stage },
+    ),
+  );
+  // The CONTENT checks below are about a row. When the row is provably absent
+  // there is nothing for them to judge, so they report that rather than
+  // manufacturing a second failure from the same finding — `durable.row-present`
+  // already carries it as a positive FAIL, and FAIL outranks BLOCKED, so the
+  // case verdict is FAIL either way.
+  const durableRowContent = rowContentObservation(obs.durableJobRow);
   add(
     measuredCheck(
       "durable.extractor-is-ytdlp",
-      obs.durableJobRow,
+      durableRowContent,
       (value) => value?.extractor === "yt-dlp",
       "durable evidence records extractor=yt-dlp after analysis",
       { stage },
@@ -308,7 +356,7 @@ export function evaluateStageB(obs, stageAResult) {
   add(
     measuredCheck(
       "durable.application-format-id",
-      obs.durableJobRow,
+      durableRowContent,
       (value) => {
         if (!isApplicationOwnedFormatId(value?.formatId)) return false;
         const requested = obs.genericJob?.measured === true
@@ -325,7 +373,7 @@ export function evaluateStageB(obs, stageAResult) {
   add(
     measuredCheck(
       "durable.no-raw-selector-fields",
-      obs.durableJobRow,
+      durableRowContent,
       (value) =>
         value != null &&
         typeof value === "object" &&
