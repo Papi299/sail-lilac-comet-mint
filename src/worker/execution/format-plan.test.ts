@@ -356,6 +356,7 @@ describe("generic execution plan (§18)", () => {
     container: "mp4" as const,
     hasVideo: true,
     hasAudio: true,
+    videoConstraint: "codec-present" as const,
     fileSize: 1000,
   };
   const AUDIO_M4A = {
@@ -364,6 +365,7 @@ describe("generic execution plan (§18)", () => {
     container: "m4a" as const,
     hasVideo: false,
     hasAudio: true,
+    videoConstraint: "absent" as const,
     fileSize: 500,
   };
 

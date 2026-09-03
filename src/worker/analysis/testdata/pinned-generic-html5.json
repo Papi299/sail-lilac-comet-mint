@@ -1,0 +1,24 @@
+{
+  "_type": "video",
+  "title": "VideoFetch acceptance \u2014 generic progressive fixture",
+  "duration": null,
+  "is_live": null,
+  "live_status": null,
+  "formats": [
+    {
+      "format_id": "0",
+      "ext": "mp4",
+      "protocol": "http",
+      "vcodec": null,
+      "acodec": "mp4a.40.2",
+      "video_ext": "mp4",
+      "audio_ext": "none",
+      "height": null,
+      "width": null,
+      "filesize_approx": null,
+      "resolution": null,
+      "tbr": null
+    }
+  ],
+  "ext": "mp4"
+}

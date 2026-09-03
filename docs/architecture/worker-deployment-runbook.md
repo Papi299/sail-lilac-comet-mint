@@ -1162,6 +1162,18 @@ because acquisition re-runs extraction and the site may have changed in between:
 b*[format_id="<safe-id>"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!="none"]
 ```
 
+When analysis established video from the normalized source shape rather than
+from a reported codec (`videoConstraint: "video-ext"` — the Generic HTML5 case,
+where the pinned extractor reports `vcodec: null`), the video half instead reads:
+
+```
+[vcodec!=?"none"][video_ext="mp4"]
+```
+
+which accepts an unknown or later-known codec, rejects an explicit `"none"`, and
+keeps the shape evidence the approval rested on bound. `audio_ext` is never
+constrained. See the Phase-10D fixture notes below for why.
+
 If the same id then resolves to a different protocol, container or stream shape,
 the selector matches nothing and the job fails `FORMAT_UNAVAILABLE` — never a
 silent substitution. There is no `/` fallback and no `+` merge.
@@ -3798,13 +3810,21 @@ below the transfer **did not stop it**, confirming against the pinned binary
 that the fixture genuinely defeats `--max-filesize` and leaves the application
 byte watcher as the only gate.
 
-### ⚠ Contract mismatch — generic presets are currently unreachable
+### Contract mismatch found during fixture provisioning — CORRECTED IN SOURCE
 
-Running the pinned extractor against the fixtures surfaced a defect in
-`src/worker/analysis/ytdlp-analysis.server.ts`. It is **not** a fixture problem
-and it cannot be fixed in the fixture or the harness without fabricating codec
-metadata or weakening acceptance, so it is recorded here and left to its own
-task and review.
+Running the pinned extractor against the fixtures surfaced a real defect in
+`src/worker/analysis/ytdlp-analysis.server.ts`. It was **not** a fixture problem,
+and it could not be fixed in the fixture or the harness without fabricating codec
+metadata or weakening acceptance, so it was left to its own task and review.
+
+> **Status.** Corrected in source by
+> `PHASE-10D-GENERIC-REAL-OUTPUT-COMPATIBILITY-001`, which reconciles generic
+> analysis AND acquisition with the pinned runtime's real output. The defect is
+> recorded here as it was found, because it is the reason the fixture suite
+> merged before the live phase could run — not rewritten as though it had never
+> existed. **Live Phase 10D has still not been executed:** Stage A, enabling
+> generic, and Stage B all remain outstanding, and nothing below is a claim
+> about Production.
 
 **D1 — `hasAudio` is unreachable for any video-bearing format.**
 `selectCandidates` requires `audio_ext !== "none"`, but yt-dlp 2026.08.19's
@@ -3821,8 +3841,8 @@ declaration into `vcodec`/`acodec` and then overwrites it with
 `f.update(formats[0])`, where `formats[0]` carries `'vcodec': None`. So `vcodec`
 comes back `null` and `hasVideo` is false as well; `acodec` survives.
 
-Reproduced by calling the Worker's own `selectCandidates` and
-`buildGenericPresets` on the captured documents:
+Reproduced **as the defect stood** by calling the Worker's own
+`selectCandidates` and `buildGenericPresets` on the captured documents:
 
 | format shape | candidates | presets |
 | :--- | :--- | :--- |
@@ -3831,10 +3851,57 @@ Reproduced by calling the Worker's own `selectCandidates` and
 | real HTML5 (`vcodec: null`) | **none** | **none** |
 | real audio-only (`vcodec: "none"`) | `hasAudio` only | `preset:audio`, `preset:mp3` |
 
-**This blocks the live `success`, `byte-limit`, `cancellation`, `shutdown` and
+**This blocked the live `success`, `byte-limit`, `cancellation`, `shutdown` and
 `safe-egress` cases**, all of which call `pickPreset` and fail without one. The
-direct regression and the kill-switch case are unaffected. Fix the analysis
-layer under its own task before Stage B is attempted.
+direct regression and the kill-switch case were unaffected.
+
+#### The corrected semantics
+
+The fix is a three-state codec model — the governing rule being that **unknown
+is not absent**. `vcodec = null` says the codec identity was not reported;
+`vcodec = "none"` says there is no video stream. Only the second proves absence.
+
+| field | `"none"` | a real codec string | `null` / absent / `"null"` |
+| :--- | :--- | :--- | :--- |
+| `acodec` | audio ABSENT | audio PRESENT | audio UNKNOWN |
+| `vcodec` | video ABSENT | video PRESENT | video UNKNOWN |
+
+- **Audio presence is decided by `acodec` alone.** `audio_ext` is retained in
+  the raw schema for regression coverage but has no presence authority in either
+  direction, because the pinned runtime sets it to `"none"` on every
+  video-bearing format.
+- **An UNKNOWN `vcodec` may establish video only from coherent source-shape
+  evidence**: `video_ext` must be a real container, must equal `ext`, and that
+  container must be in the generic VIDEO allowlist. No codec is ever invented —
+  `WorkerQualityPreset.videoCodec` stays `null`.
+- **Contradictions fail closed.** `vcodec = "none"` with a real `video_ext`, or
+  a present `vcodec` with `video_ext = "none"`, make the format non-executable
+  rather than being resolved in whichever direction would make it usable.
+- **Unknown audio never becomes a muxed claim**, so split streams still produce
+  no video preset and generic v1 still never merges.
+
+Analysis and acquisition were corrected **together**, because a preset analysis
+advertises must remain selectable by the constrained acquisition subprocess. The
+private `GenericSourceSelection` gained an application-owned `videoConstraint`
+enum (`codec-present` | `video-ext` | `absent`) recording HOW video presence was
+established, and the selector's video half follows it:
+
+```
+codec-present   [vcodec!="none"]                          (unchanged, strict)
+video-ext       [vcodec!=?"none"][video_ext="<container>"]
+absent          [vcodec="none"]                           (unchanged, strict)
+```
+
+The `?` is load-bearing. `_build_format_filter`'s predicate returns the
+`none_inclusive` group without ever consulting the operator when the field is
+Python `None`, so the strict form silently matches **nothing** for an ordinary
+muxed mp4 whose codec was not reported. The none-inclusive form accepts an
+unknown codec and a later-known one, and still rejects an explicit `"none"`.
+`verify-selector.py` proves all of this against the actual pinned binary inside
+the image, and `audio_ext` is never constrained by any generic selector.
+
+The enum is Worker-private: it never reaches the browser, Vercel, SQLite, an
+HTTP response, a log or an error, and it carries no upstream codec string.
 
 ### Temporary Quick-Tunnel verification
 

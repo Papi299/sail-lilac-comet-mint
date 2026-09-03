@@ -13,6 +13,7 @@ import {
   type WorkerVideoMetadata,
 } from "../../shared/worker/contracts.ts";
 import {
+  GENERIC_VIDEO_SOURCE_CONTAINERS,
   GenericSourceSelectionSchema,
   isSafeFormatId,
   toGenericSourceContainer,
@@ -20,6 +21,7 @@ import {
   type GenericSourceProtocol,
   type GenericSourceSelection,
   type GenericSourceSelections,
+  type GenericVideoConstraint,
 } from "../execution/generic-source.ts";
 import {
   YTDLP_PROBE_TIMEOUT_MS,
@@ -405,7 +407,25 @@ const RawFormatSchema = z.object({
   filesize_approx: z.number().finite().nullish(),
   protocol: z.string().nullish(),
   format_note: z.string().nullish(),
+  /**
+   * A yt-dlp SORTING helper, not a stream-presence flag.
+   *
+   * `_fill_sorting_fields` sets `audio_ext = "none"` on EVERY format whose
+   * `vcodec != "none"`, so a perfectly ordinary muxed video arrives carrying
+   * `audio_ext: "none"`. It is parsed here only so regressions can assert that
+   * classification is unaffected by it; nothing may read it as evidence about
+   * whether a format carries audio, in either direction (§5).
+   */
   audio_ext: z.string().nullish(),
+  /**
+   * The normalized source SHAPE the same function derives: `video_ext = ext`
+   * unless the format is explicitly audio-only, in which case `"none"`.
+   *
+   * Unlike `audio_ext` this one IS load-bearing, but only as corroborating
+   * shape evidence — never as a codec. It is what lets an UNKNOWN `vcodec`
+   * establish a video-bearing source (§6), and what makes a contradiction
+   * against a stated `vcodec` fail closed (§7).
+   */
   video_ext: z.string().nullish(),
 });
 type RawFormat = z.infer<typeof RawFormatSchema>;
@@ -520,6 +540,11 @@ type Candidate = {
   readonly formatId: string;
   /** PRIVATE. The acquisition protocol this candidate was approved on. */
   readonly protocol: GenericSourceProtocol;
+  /**
+   * PRIVATE. HOW video presence was established, so the acquisition selector
+   * can bind the same evidence rather than assuming a known codec (§11).
+   */
+  readonly videoConstraint: GenericVideoConstraint;
   /** Position in the upstream list. The final, fully deterministic tiebreak. */
   readonly index: number;
 };
@@ -532,12 +557,57 @@ function toSelection(c: Candidate): GenericSourceSelection {
     container: c.container,
     hasVideo: c.hasVideo,
     hasAudio: c.hasAudio,
+    videoConstraint: c.videoConstraint,
     fileSize: c.fileSize,
   });
 }
 
+/**
+ * The three states a yt-dlp codec field can actually be in.
+ *
+ * Collapsing these to a boolean is the root of both Phase-10D generic defects,
+ * so they are named explicitly and never conflated (§4/§49):
+ *
+ *   PRESENT   a real codec string. The stream is proven to exist.
+ *   ABSENT    the exact marker `"none"`. yt-dlp is stating that the stream is
+ *             NOT there. This is the ONLY value that proves absence.
+ *   UNKNOWN   `null`, `undefined`, `""` or the string `"null"`. The extractor
+ *             did not tell us the codec identity. It is emphatically NOT a
+ *             statement that the stream is missing — the Generic HTML5 path
+ *             reaches exactly this state for a perfectly ordinary muxed mp4.
+ *
+ * "unknown is not absent" is the whole point: `vcodec = null` says we do not
+ * know the codec; `vcodec = "none"` says there is no video stream.
+ */
+export type CodecState = "present" | "absent" | "unknown";
+
+/**
+ * Classifies one raw codec field.
+ *
+ * Surrounding whitespace and letter case are folded before comparison. The
+ * pinned runtime emits exactly lowercase `none`, so folding changes nothing for
+ * real output; it exists so an odd upstream variant such as `"NONE"` is read as
+ * the absence marker it plainly is rather than as a codec literally named
+ * "NONE". Both directions of that fold are the conservative one: it can only
+ * ever withdraw a stream-presence claim, never manufacture one.
+ */
+export function classifyCodecState(codec: string | null | undefined): CodecState {
+  if (typeof codec !== "string") return "unknown";
+  const normalized = codec.trim().toLowerCase();
+  if (normalized.length === 0 || normalized === "null") return "unknown";
+  if (normalized === "none") return "absent";
+  return "present";
+}
+
 function isPresentCodec(codec: string | null | undefined): boolean {
-  return typeof codec === "string" && codec.length > 0 && codec !== "none" && codec !== "null";
+  return classifyCodecState(codec) === "present";
+}
+
+/** Folds a raw container/extension field for comparison, or null when absent. */
+function normalizeExtField(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return normalized.length === 0 ? null : normalized;
 }
 
 /** Normalizes a codec string to a small closed vocabulary, or null. */
@@ -572,13 +642,24 @@ export function normalizeCodecName(codec: string | null | undefined): string | n
  *   2. its upstream `format_id` satisfies the safe literal grammar (§11);
  *   3. its container is in the closed source allowlist for its stream shape (§15);
  *   4. it carries video, audio, or both — an empty format describes nothing;
- *   5. any KNOWN size is within the configured maximum.
+ *   5. its VIDEO shape is establishable as exactly one of the three approved
+ *      constraints, with no contradiction between `vcodec` and `video_ext`;
+ *   6. any KNOWN size is within the configured maximum.
  *
  * Requirement 1 is deliberately strict about ABSENCE too: a format with no
  * `protocol` field is not eligible. yt-dlp derives a missing protocol from the
  * media URL at download time, which analysis cannot do without trusting an
  * upstream URL, and an unknown acquisition mode is exactly the ambiguity the
  * single-item/native-acquisition rules say to refuse rather than guess.
+ *
+ * Requirement 5 is the Phase-10D correction. Codec fields are read as three
+ * states rather than two (see `classifyCodecState`), because the pinned runtime
+ * distinguishes "there is no video stream" (`vcodec == "none"`) from "we did
+ * not report the codec" (`vcodec == null`) — and conflating them made every
+ * real Generic HTML5 source ineligible. An unestablishable or self-contradicting
+ * video shape makes the whole format ineligible rather than being downgraded to
+ * a weaker claim, because a claim the acquisition selector cannot re-select is
+ * a preset that fails after the user has already chosen it.
  */
 export function selectCandidates(
   formats: readonly RawFormat[],
@@ -601,8 +682,70 @@ export function selectCandidates(
     const note = (raw.format_note ?? "").toLowerCase();
     if (note.includes("storyboard") || note.includes("preview image")) return;
 
-    const hasVideo = isPresentCodec(raw.vcodec) && raw.video_ext !== "none";
-    const hasAudio = isPresentCodec(raw.acodec) && raw.audio_ext !== "none";
+    // ── Audio presence ───────────────────────────────────────────────────
+    //
+    // `acodec` is the SOLE authority (§5). `audio_ext` takes no part, in either
+    // direction, because `_fill_sorting_fields` in the pinned release sets it
+    // to "none" on EVERY format whose `vcodec != "none"`:
+    //
+    //     else:
+    //         format['video_ext'] = format['ext']
+    //         format['audio_ext'] = 'none'
+    //
+    // It is a sorting/container helper, not a muxed-audio-presence flag. Gating
+    // on it made `hasVideo && hasAudio` structurally impossible for real output
+    // from ANY site, so no generic video preset could ever be built (§D1).
+    const audioState = classifyCodecState(raw.acodec);
+    const hasAudio = audioState === "present";
+
+    // ── Video presence ───────────────────────────────────────────────────
+    //
+    // Three inputs, in decreasing order of authority: the codec state, the
+    // normalized `video_ext` shape, and the source `ext`. A candidate becomes
+    // executable only when they agree; where they contradict each other the
+    // format is refused outright rather than resolved in whichever direction
+    // happens to make it usable (§7).
+    const videoState = classifyCodecState(raw.vcodec);
+    const sourceExt = normalizeExtField(raw.ext);
+    const videoExt = normalizeExtField(raw.video_ext);
+
+    let videoConstraint: GenericVideoConstraint;
+    if (videoState === "present") {
+      // A named video codec alongside `video_ext: "none"` is a contradiction:
+      // one field says the stream exists, the other says the normalized shape
+      // has no video part. Neither may be preferred over the other.
+      if (videoExt === "none") return;
+      videoConstraint = "codec-present";
+    } else if (videoState === "absent") {
+      // Proven audio-only. `video_ext` may be absent (hand-written documents)
+      // or "none" (real pinned output); anything else contradicts `vcodec`.
+      if (videoExt !== null && videoExt !== "none") return;
+      videoConstraint = "absent";
+    } else {
+      // UNKNOWN codec identity. Do NOT invent a codec, and do NOT read this as
+      // absence. Video may be established here only from coherent source-shape
+      // evidence (§6): `video_ext` must be a real container, it must equal the
+      // source `ext`, and that container must be in the generic VIDEO
+      // allowlist. This is the pinned Generic HTML5 case, where
+      // `_parse_html5_media_entries` clobbers the parsed `vcodec` with `None`
+      // via `f.update(formats[0])` (§D2).
+      const coherent =
+        videoExt !== null &&
+        videoExt !== "none" &&
+        sourceExt !== null &&
+        videoExt === sourceExt &&
+        (GENERIC_VIDEO_SOURCE_CONTAINERS as readonly string[]).includes(sourceExt);
+      // Without that evidence the video shape is simply not established. It is
+      // NOT downgraded to `absent`: claiming absence would emit a
+      // `[vcodec="none"]` constraint that the real (null-vcodec) format could
+      // never satisfy, so the Worker would advertise a preset acquisition is
+      // guaranteed to fail on. Refusing the candidate is the honest outcome
+      // and keeps "advertise only what can actually be acquired" true (§8).
+      if (!coherent) return;
+      videoConstraint = "video-ext";
+    }
+
+    const hasVideo = videoConstraint !== "absent";
     if (!hasVideo && !hasAudio) return;
 
     // §15: the source container comes from a closed allowlist, chosen by stream
@@ -637,6 +780,7 @@ export function selectCandidates(
       fileSize,
       formatId,
       protocol: protocol as GenericSourceProtocol,
+      videoConstraint,
       index,
     });
   });

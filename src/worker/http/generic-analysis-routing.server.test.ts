@@ -262,6 +262,7 @@ describe("routing: YTDLP_ENABLED=true (§53)", () => {
             container: "mp4" as const,
             hasVideo: true,
             hasAudio: true,
+            videoConstraint: "codec-present" as const,
             fileSize: null,
           },
         },

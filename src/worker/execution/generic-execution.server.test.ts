@@ -18,7 +18,7 @@ import type { DurableWorkerJob } from "@/worker/state/job-store";
 import type { ObjectStoreWriter, ObjectStorePutInput } from "@/worker/storage/writer.ts";
 import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
 import type { ExecutionAnalysis } from "../analysis/media-analyzer.server.ts";
-import type { GenericSourceSelections } from "./generic-source.ts";
+import type { GenericSourceSelections, GenericVideoConstraint } from "./generic-source.ts";
 import { downloadGenericOriginal, type GenericDownloadLimits } from "./ytdlp-download.server.ts";
 import type { GenericExecutionPlan } from "./format-plan.ts";
 
@@ -72,12 +72,17 @@ function genericMeta(presets: PresetSpec[]): WorkerVideoMetadata {
 }
 
 function selection(over: Partial<GenericSourceSelections[string]> = {}) {
+  // `videoConstraint` must agree with `hasVideo` or the schema refuses the
+  // selection outright (§12), so the default follows whatever the caller asked
+  // for and can still be overridden explicitly.
+  const hasVideo = over.hasVideo ?? true;
   return {
     formatId: "22",
     protocol: "https" as const,
     container: "mp4" as const,
     hasVideo: true,
     hasAudio: true,
+    videoConstraint: (hasVideo ? "codec-present" : "absent") as GenericVideoConstraint,
     fileSize: null,
     ...over,
   };

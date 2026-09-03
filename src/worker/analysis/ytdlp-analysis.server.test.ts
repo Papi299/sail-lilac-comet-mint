@@ -17,8 +17,10 @@ import {
   YTDLP_V1_NATIVE_PROTOCOLS,
   buildYtdlpAnalysisEnvironment,
   analyzeGenericMedia,
+  buildGenericPresets,
   buildYtdlpAnalysisArgv,
   classifyAnalysisFailure,
+  classifyCodecState,
   parseAnalysisInfo,
   sanitizeUpstreamText,
   selectCandidates,
@@ -1519,5 +1521,479 @@ describe("generic analysis: FFmpeg/ffprobe descendant isolation", () => {
       if (key === "PATH") continue;
       assert.equal(analysis[key], base[key], `${key} must be inherited from the base policy`);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE-10D-GENERIC-REAL-OUTPUT-COMPATIBILITY-001
+//
+// Everything below is anchored to what yt-dlp 2026.08.19 ACTUALLY emits, not to
+// an idealized format document. The merged Phase-10D fixture suite found that
+// the two disagreed badly enough that no generic video preset could ever be
+// built from real output, for any site:
+//
+//   D1  audio presence was gated on `audio_ext !== "none"`, but
+//       `_fill_sorting_fields` sets `audio_ext = "none"` on EVERY format whose
+//       `vcodec != "none"`. `audio_ext` is a sorting helper, not a statement
+//       that a format carries no audio.
+//
+//   D2  video presence required a non-null `vcodec`, but the Generic HTML5 path
+//       ends with `f.update(formats[0])`, which overwrites the codec parsed out
+//       of the `<source type="…; codecs=…">` attribute with `None`.
+//
+// The governing distinction is that UNKNOWN IS NOT ABSENT: `vcodec = null` says
+// the codec identity was not reported; `vcodec = "none"` says there is no video
+// stream. Only the second may ever be read as absence.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("codec state model (§4)", () => {
+  it("treats only the exact absence marker as ABSENT", () => {
+    assert.equal(classifyCodecState("none"), "absent");
+    // Case and surrounding whitespace fold, because an upstream "NONE" is
+    // plainly the absence marker rather than a codec named "NONE" — and this
+    // fold can only ever WITHDRAW a stream-presence claim, never invent one.
+    assert.equal(classifyCodecState("NONE"), "absent");
+    assert.equal(classifyCodecState(" none "), "absent");
+  });
+
+  it("treats missing codec identity as UNKNOWN, never as absent", () => {
+    for (const value of [null, undefined, "", "   ", "null", "NULL"]) {
+      assert.equal(
+        classifyCodecState(value),
+        "unknown",
+        `${JSON.stringify(value)} means "we do not know", not "there is none"`,
+      );
+    }
+  });
+
+  it("treats any real codec string as PRESENT", () => {
+    for (const value of ["avc1.42E01E", "mp4a.40.2", "vp09.00.40.08", "opus", "h264"]) {
+      assert.equal(classifyCodecState(value), "present");
+    }
+  });
+});
+
+describe("real pinned output: the captured /generic document (§20/§21)", () => {
+  // The document is a SANITIZED capture of `yt-dlp 2026.08.19` run with the
+  // Worker's own analysis argv against the merged fixture page. Its provenance
+  // and the reason each decisive field looks the way it does are recorded in
+  // `testdata/README.md`. Reading it from disk rather than inlining a literal
+  // is deliberate: a future edit cannot quietly "tidy" the awkward fields.
+  const CAPTURED = readFileSync(
+    join(import.meta.dirname, "testdata", "pinned-generic-html5.json"),
+    "utf8",
+  );
+
+  function capturedFormat(): Record<string, unknown> {
+    return { ...(JSON.parse(CAPTURED).formats[0] as Record<string, unknown>) };
+  }
+
+  it("the capture still has the exact shape the defect was about", () => {
+    // If this ever fails, the fixture has drifted back toward the false world
+    // in which `audio_ext` was simply absent and the bug was invisible.
+    const f = capturedFormat();
+    assert.equal(f.format_id, "0");
+    assert.equal(f.ext, "mp4");
+    assert.equal(f.protocol, "http");
+    assert.equal(f.vcodec, null, "the HTML5 path reports NO video codec identity");
+    assert.equal(f.acodec, "mp4a.40.2");
+    assert.equal(f.video_ext, "mp4");
+    assert.equal(f.audio_ext, "none", "a muxed format really is emitted with audio_ext=none");
+  });
+
+  it("produces exactly one executable muxed video candidate", () => {
+    const candidates = selectCandidates([capturedFormat()], LIMITS);
+    assert.equal(candidates.length, 1);
+    const c = candidates[0]!;
+    assert.equal(c.hasVideo, true, "D2: a null vcodec must not mean 'no video'");
+    assert.equal(c.hasAudio, true, "D1: audio_ext=none must not mean 'no audio'");
+    assert.equal(c.container, "mp4");
+    assert.equal(c.protocol, "http");
+    assert.equal(c.videoConstraint, "video-ext");
+    // §10: the codec was never measured, so it is not invented.
+    assert.equal(c.videoCodec, null);
+    assert.equal(c.audioCodec, "aac");
+    // §10: no height, fps or size is fabricated either.
+    assert.equal(c.height, null);
+    assert.equal(c.fps, null);
+    assert.equal(c.fileSize, null);
+  });
+
+  it("reaches a generic video preset with an honest unknown codec", () => {
+    const { presets, selections } = buildGenericPresets(
+      selectCandidates([capturedFormat()], LIMITS),
+      { ffmpegAvailable: false },
+    );
+    const best = presets.find((p) => p.id === "preset:best");
+    assert.ok(best, "the pinned document must reach preset:best");
+    assert.equal(best.hasVideo, true);
+    assert.equal(best.hasAudio, true);
+    assert.equal(best.container, "mp4");
+    assert.equal(best.videoCodec, null, "an unknown codec stays null; it is never synthesized");
+    assert.equal(best.audioCodec, "aac");
+    // The browser-facing id is application-owned; the raw upstream id "0" is
+    // reachable only through the PRIVATE selection.
+    assert.equal(best.formatId, "preset:best");
+    assert.equal(selections["preset:best"]?.formatId, "0");
+    assert.equal(JSON.stringify(presets).includes('"0"'), false);
+  });
+
+  it("survives the whole parse -> candidates -> presets path", () => {
+    const parsed = parseAnalysisInfo(CAPTURED);
+    assert.equal(parsed.ok, true);
+    if (!parsed.ok) return;
+    const { presets } = buildGenericPresets(
+      selectCandidates(parsed.info.formats ?? [], LIMITS),
+      { ffmpegAvailable: false },
+    );
+    assert.ok(presets.some((p) => p.id === "preset:best" && p.hasVideo && p.hasAudio));
+  });
+
+  it("D1 MUTATION: gating audio on audio_ext again breaks this document (§22)", () => {
+    // The discriminating property. `selectCandidates` must NOT consult
+    // `audio_ext`; this asserts the captured format really does carry the
+    // combination that would fail under the old rule, so restoring
+    // `&& raw.audio_ext !== "none"` turns the assertions above red.
+    const f = capturedFormat();
+    assert.equal(classifyCodecState(f.acodec as string), "present");
+    assert.equal(f.audio_ext, "none");
+
+    const underOldRule = classifyCodecState(f.acodec as string) === "present" && f.audio_ext !== "none";
+    assert.equal(underOldRule, false, "the old rule really did refuse this audio");
+    assert.equal(selectCandidates([f], LIMITS)[0]?.hasAudio, true, "the new rule accepts it");
+
+    // And removing `audio_ext` entirely must change NOTHING, which is what
+    // proves the field has no authority left in either direction.
+    const withoutAudioExt = capturedFormat();
+    delete withoutAudioExt.audio_ext;
+    assert.deepEqual(
+      selectCandidates([withoutAudioExt], LIMITS).map((c) => c.hasAudio),
+      selectCandidates([f], LIMITS).map((c) => c.hasAudio),
+    );
+  });
+
+  it("D2 MUTATION: requiring a non-null vcodec again breaks this document (§23)", () => {
+    const f = capturedFormat();
+    assert.equal(f.vcodec, null);
+    assert.equal(f.video_ext, "mp4");
+
+    const underOldRule = classifyCodecState(f.vcodec as null) === "present";
+    assert.equal(underOldRule, false, "the old rule really did refuse this video");
+    assert.equal(selectCandidates([f], LIMITS)[0]?.hasVideo, true, "the new rule accepts it");
+
+    // The acceptance is driven by the SHAPE evidence, not by leniency: strip
+    // `video_ext` and the unknown codec no longer establishes video at all.
+    const withoutVideoExt = capturedFormat();
+    delete withoutVideoExt.video_ext;
+    assert.deepEqual(
+      selectCandidates([withoutVideoExt], LIMITS),
+      [],
+      "an unknown codec with no coherent shape evidence is not executable",
+    );
+  });
+});
+
+describe("unknown-codec video: the evidence required (§6)", () => {
+  /** The real pinned shape, parameterized. */
+  function html5(overrides: Record<string, unknown> = {}) {
+    return {
+      format_id: "0",
+      ext: "mp4",
+      protocol: "https",
+      vcodec: null,
+      acodec: "mp4a.40.2",
+      video_ext: "mp4",
+      audio_ext: "none",
+      ...overrides,
+    };
+  }
+
+  it("accepts the coherent case", () => {
+    const c = selectCandidates([html5()], LIMITS);
+    assert.equal(c.length, 1);
+    assert.equal(c[0]!.videoConstraint, "video-ext");
+  });
+
+  it("refuses when video_ext does not equal ext", () => {
+    // A normalized shape that disagrees with the source container is not
+    // evidence about this format; it is a reason to stop.
+    assert.deepEqual(selectCandidates([html5({ video_ext: "webm" })], LIMITS), []);
+  });
+
+  it("refuses when the container is outside the generic VIDEO allowlist", () => {
+    // `_fill_sorting_fields` sets `video_ext = ext` for ANY format whose vcodec
+    // is not "none", including audio containers. That is not a video claim.
+    for (const ext of ["m4a", "mp3", "ogg", "opus", "aac", "flac", "wav"]) {
+      assert.deepEqual(
+        selectCandidates([html5({ ext, video_ext: ext })], LIMITS),
+        [],
+        `${ext} must never become an unknown-codec VIDEO source`,
+      );
+    }
+  });
+
+  it("refuses when video_ext is missing or itself 'none'", () => {
+    assert.deepEqual(selectCandidates([html5({ video_ext: null })], LIMITS), []);
+    assert.deepEqual(selectCandidates([html5({ video_ext: "none" })], LIMITS), []);
+    const bare = html5();
+    delete (bare as Record<string, unknown>).video_ext;
+    assert.deepEqual(selectCandidates([bare], LIMITS), []);
+  });
+
+  it("never invents a codec, a height, an fps or a size for it", async () => {
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: [html5()] }))));
+    const meta = await analyze(SAFE_URL, { runner });
+    const best = meta.presets.find((p) => p.id === "preset:best");
+    assert.ok(best);
+    assert.equal(best.videoCodec, null);
+    assert.equal(best.resolution, null);
+    assert.equal(best.fps, null);
+    assert.equal(best.fileSize, null);
+  });
+});
+
+describe("unknown audio never becomes a muxed claim (§8/§27)", () => {
+  it("a proven-video format with an unknown acodec produces no video preset", async () => {
+    for (const acodec of [null, undefined, "", "null"]) {
+      const format: Record<string, unknown> = {
+        format_id: "v-only",
+        ext: "mp4",
+        protocol: "https",
+        height: 1080,
+        vcodec: "avc1.640028",
+        video_ext: "mp4",
+        audio_ext: "none",
+        acodec,
+      };
+      const candidates = selectCandidates([format], LIMITS);
+      assert.equal(candidates.length, 1, "the format is still describable");
+      assert.equal(candidates[0]!.hasAudio, false, "unknown audio is not proven audio");
+      assert.equal(candidates[0]!.audioCodec, null);
+
+      const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: [format] }))));
+      const meta = await analyze(SAFE_URL, { runner });
+      assert.deepEqual(
+        meta.presets.filter((p) => p.hasVideo),
+        [],
+        "an mp4 container is not evidence of an audio stream",
+      );
+    }
+  });
+
+  it("an unknown-codec video with unknown audio produces nothing at all", async () => {
+    const format = {
+      format_id: "0",
+      ext: "mp4",
+      protocol: "https",
+      vcodec: null,
+      acodec: null,
+      video_ext: "mp4",
+      audio_ext: "none",
+    };
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: [format] }))));
+    const meta = await analyze(SAFE_URL, { runner });
+    assert.deepEqual(meta.presets, []);
+  });
+});
+
+describe("contradictory upstream metadata fails closed (§7/§26)", () => {
+  it("refuses vcodec='none' alongside a real video_ext", () => {
+    const format = {
+      format_id: "contra-1",
+      ext: "mp4",
+      protocol: "https",
+      vcodec: "none",
+      acodec: "mp4a.40.2",
+      video_ext: "mp4",
+      audio_ext: "none",
+    };
+    assert.deepEqual(
+      selectCandidates([format], LIMITS),
+      [],
+      "one field says there is no video, the other names a video container",
+    );
+  });
+
+  it("refuses a present vcodec alongside video_ext='none'", () => {
+    const format = {
+      format_id: "contra-2",
+      ext: "mp4",
+      protocol: "https",
+      height: 1080,
+      vcodec: "avc1.640028",
+      acodec: "mp4a.40.2",
+      video_ext: "none",
+      audio_ext: "none",
+    };
+    assert.deepEqual(selectCandidates([format], LIMITS), []);
+  });
+
+  it("does not silently pick whichever field makes the format usable", async () => {
+    // Both contradictions above would be "fixable" by preferring one field.
+    // Neither may produce a preset of ANY kind — not a video one, and not an
+    // audio one salvaged from the same document.
+    for (const vcodec of ["none", "avc1.640028"]) {
+      const format = {
+        format_id: "contra-3",
+        ext: "mp4",
+        protocol: "https",
+        vcodec,
+        acodec: "mp4a.40.2",
+        video_ext: vcodec === "none" ? "mp4" : "none",
+        audio_ext: "none",
+      };
+      const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: [format] }))));
+      const meta = await analyze(SAFE_URL, { runner });
+      assert.deepEqual(meta.presets, [], `contradiction with vcodec=${vcodec} must be refused`);
+    }
+  });
+});
+
+describe("real-shaped audio-only and split-stream regressions (§24/§25)", () => {
+  /** The pinned shape of a genuine audio-only rendition. */
+  const AUDIO_ONLY = {
+    format_id: "140",
+    ext: "m4a",
+    protocol: "https",
+    vcodec: "none",
+    acodec: "mp4a.40.2",
+    video_ext: "none",
+    audio_ext: "m4a",
+  };
+
+  it("classifies a real audio-only format correctly", () => {
+    const c = selectCandidates([AUDIO_ONLY], LIMITS);
+    assert.equal(c.length, 1);
+    assert.equal(c[0]!.hasVideo, false, "vcodec='none' really is proven absence");
+    assert.equal(c[0]!.hasAudio, true);
+    assert.equal(c[0]!.videoConstraint, "absent");
+    assert.equal(c[0]!.container, "m4a");
+  });
+
+  it("audio-only never becomes video through the new video_ext logic", async () => {
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: [AUDIO_ONLY] }))));
+    const meta = await analyze(SAFE_URL, { runner });
+    assert.deepEqual(meta.presets.filter((p) => p.hasVideo), []);
+    assert.ok(meta.presets.some((p) => p.id === "preset:audio"));
+  });
+
+  it("split streams still produce NO merged video preset", async () => {
+    // Both halves carry the real `*_ext` fields this time, so the refusal is
+    // proven against the pinned shape rather than against an omission.
+    const videoOnly = {
+      format_id: "137",
+      ext: "mp4",
+      protocol: "https",
+      height: 1080,
+      vcodec: "avc1.640028",
+      acodec: "none",
+      video_ext: "mp4",
+      audio_ext: "none",
+    };
+    const { runner } = fakeRunner(
+      ok(JSON.stringify(singleVideoInfo({ formats: [videoOnly, AUDIO_ONLY] }))),
+    );
+    const meta = await analyze(SAFE_URL, { runner });
+    assert.deepEqual(
+      meta.presets.filter((p) => p.hasVideo),
+      [],
+      "unknown-video support must not become a way to recombine split streams",
+    );
+    assert.equal(meta.capabilities.merge, false);
+    assert.ok(meta.presets.some((p) => p.id === "preset:audio"));
+  });
+
+  it("an unknown-codec video source and a separate audio source do not merge", async () => {
+    const unknownVideo = {
+      format_id: "0",
+      ext: "mp4",
+      protocol: "https",
+      vcodec: null,
+      acodec: "none",
+      video_ext: "mp4",
+      audio_ext: "none",
+    };
+    const { runner } = fakeRunner(
+      ok(JSON.stringify(singleVideoInfo({ formats: [unknownVideo, AUDIO_ONLY] }))),
+    );
+    const meta = await analyze(SAFE_URL, { runner });
+    assert.deepEqual(meta.presets.filter((p) => p.hasVideo), []);
+  });
+});
+
+describe("the private execution descriptor stays private (§11/§34)", () => {
+  /** The real pinned shape, whose approval depends on the new private field. */
+  const HTML5 = {
+    format_id: "0",
+    ext: "mp4",
+    protocol: "https",
+    vcodec: null,
+    acodec: "mp4a.40.2",
+    video_ext: "mp4",
+    audio_ext: "none",
+  };
+
+  it("neither the raw id nor videoConstraint reaches the browser surface", async () => {
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: [HTML5] }))));
+    const meta = await analyze(SAFE_URL, { runner });
+
+    const serialized = JSON.stringify(meta);
+    // The raw upstream id "0" must not appear as a value anywhere in the
+    // browser-facing document, and neither may the private constraint enum.
+    assert.equal(serialized.includes('"0"'), false, "the raw upstream id must stay private");
+    assert.equal(serialized.includes("videoConstraint"), false);
+    assert.equal(serialized.includes("video-ext"), false);
+    assert.equal(serialized.includes("codec-present"), false);
+    // Generic analysis still advertises no concrete formats at all.
+    assert.deepEqual(meta.formats, []);
+    for (const preset of meta.presets) {
+      assert.equal(preset.id, preset.formatId, "the preset id is application-owned");
+      assert.match(preset.id, GENERIC_PRESET_ID_PATTERN);
+    }
+  });
+
+  it("the private selection carries it, and carries no codec string", () => {
+    const { selections } = buildGenericPresets(selectCandidates([HTML5], LIMITS), {
+      ffmpegAvailable: false,
+    });
+    const selection = selections["preset:best"];
+    assert.ok(selection);
+    assert.equal(selection.videoConstraint, "video-ext");
+    assert.equal(selection.formatId, "0");
+    // The enum is application-owned: it must never paraphrase or embed the
+    // upstream codec field it was derived from.
+    assert.equal(JSON.stringify(selection).includes("mp4a.40.2"), false);
+    assert.deepEqual(Object.keys(selection).sort(), [
+      "container",
+      "fileSize",
+      "formatId",
+      "hasAudio",
+      "hasVideo",
+      "protocol",
+      "videoConstraint",
+    ]);
+  });
+
+  it("no media URL is parsed into the Worker's generic format schema (§35)", () => {
+    // Solving codec classification must not have widened the application
+    // boundary: yt-dlp remains responsible for resolving the selected media URL
+    // inside the constrained acquisition subprocess.
+    const withUrls = {
+      ...HTML5,
+      url: `https://attacker.invalid/media.mp4?t=${SENTINEL}`,
+      manifest_url: "https://attacker.invalid/manifest.m3u8",
+      fragment_base_url: "https://attacker.invalid/frag/",
+      http_headers: { Cookie: SENTINEL, Referer: "https://attacker.invalid/" },
+    };
+    const candidates = selectCandidates([withUrls], LIMITS);
+    assert.equal(candidates.length, 1);
+    const serialized = JSON.stringify(candidates);
+    assert.equal(serialized.includes(SENTINEL), false);
+    assert.equal(serialized.includes("attacker.invalid"), false);
+    assert.equal(serialized.includes("url"), false);
+    assert.equal(serialized.includes("http_headers"), false);
+
+    const { selections } = buildGenericPresets(candidates, { ffmpegAvailable: false });
+    assert.equal(JSON.stringify(selections).includes("attacker.invalid"), false);
   });
 });

@@ -283,13 +283,20 @@ below the transfer **did not stop it** — confirming, against the pinned binary
 that the fixture genuinely defeats `--max-filesize` and leaves the application
 byte watcher as the only gate.
 
-### ⚠ Worker contract mismatch found during this verification
+### Worker contract mismatch found during this verification — CORRECTED IN SOURCE
 
-The pinned extractor's output **cannot currently produce a generic video preset**
-in the merged Worker, for two independent reasons. This is a defect in
+The pinned extractor's output **could not produce a generic video preset** in the
+Worker as merged, for two independent reasons. This was a defect in
 `src/worker/analysis/ytdlp-analysis.server.ts`, not in the fixture, and it
-blocks the live generic, byte-limit and safe-egress cases — all three call
+blocked the live generic, byte-limit and safe-egress cases — all three call
 `pickPreset` and fail without one.
+
+> **Status.** Discovered here, during fixture provisioning, and corrected in
+> source by `PHASE-10D-GENERIC-REAL-OUTPUT-COMPATIBILITY-001`. The defect is
+> left recorded as it was found rather than edited away, because it is why this
+> suite merged ahead of the live phase. **Live Phase 10D has still not been
+> executed** — Stage A, enabling generic, and Stage B all remain outstanding,
+> and nothing here claims Production acceptance.
 
 **D1 — `hasAudio` is unreachable for any video-bearing format.**
 `selectCandidates` requires `audio_ext !== "none"`, but `_fill_sorting_fields` in
@@ -324,8 +331,8 @@ f.update(formats[0])          # clobbers the parsed vcodec with None
 so `vcodec` comes back `null` and `hasVideo` is false as well. `acodec` survives
 (`mp4a.40.2`), which is why the fixture still declares the true codec pair.
 
-Reproduced against the real captured documents by calling the Worker's own
-`selectCandidates` and `buildGenericPresets`:
+Reproduced **as the defect stood** against the real captured documents, by
+calling the Worker's own `selectCandidates` and `buildGenericPresets`:
 
 | format shape | candidates | presets |
 | :--- | :--- | :--- |
@@ -334,10 +341,39 @@ Reproduced against the real captured documents by calling the Worker's own
 | real HTML5 (`vcodec: null`) | **none** | **none** |
 | real audio-only (`vcodec: "none"`) | `hasAudio` only | `preset:audio`, `preset:mp3` |
 
-Neither the fixture nor the acceptance harness can be changed to paper over
-this: doing so would mean fabricating codec metadata, and the evidence-schema
-contract is deliberately not ours to weaken. **Fix the Worker analysis layer
-under its own task and review before Stage B is attempted.**
+Neither the fixture nor the acceptance harness could be changed to paper over
+this: doing so would have meant fabricating codec metadata, and the
+evidence-schema contract is deliberately not ours to weaken. The Worker was
+fixed instead.
+
+#### What the correction changed
+
+Audio presence is now decided by `acodec` alone — `audio_ext` keeps no presence
+authority in either direction. Video presence distinguishes three codec states,
+the governing rule being that **unknown is not absent**: only the exact marker
+`"none"` proves a stream is missing, while `null` merely means the codec
+identity was not reported. An unknown `vcodec` can establish video only from
+coherent shape evidence (`video_ext` a real container, equal to `ext`, and in
+the generic VIDEO allowlist), and no codec, height, fps or size is ever
+invented — `videoCodec` stays `null` for this fixture.
+
+Acquisition was corrected with analysis, because the strict `[vcodec!="none"]`
+filter would otherwise have rejected the very format analysis had just approved:
+`_build_format_filter` never passes a `None` field to its operator. The private
+selection now records HOW video was established, and the selector's video half
+follows it:
+
+| how video was established | selector |
+| :--- | :--- |
+| a reported codec | `[vcodec!="none"]` |
+| coherent `video_ext` (this fixture) | `[vcodec!=?"none"][video_ext="mp4"]` |
+| proven absent | `[vcodec="none"]` |
+
+Re-verified end to end against this suite with the pinned binary: `/generic`
+reaches `preset:best`, the selector re-selects format `0`, and the acquired file
+is byte-identical to the served fixture with no merge and no FFmpeg.
+`verify-selector.py` covers the same expectations against the real runtime
+inside the image.
 
 ## Tests
 
