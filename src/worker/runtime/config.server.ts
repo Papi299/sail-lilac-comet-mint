@@ -234,9 +234,15 @@ export type WorkerRuntimeConfig = {
      * reported separately. It is the operator's explicit intent to allow
      * generic extraction, and it is fail-closed: absent means disabled.
      *
-     * As of Phase 10C1 this flag gates nothing yet, because no user-URL yt-dlp
-     * execution path exists in the Worker at all. It is the foundation the
-     * later, separately authorized integration phase will gate on.
+     * Since Phase 10C3 this flag gates a path that genuinely exists: generic
+     * acquisition is implemented and reads this value. The Phase-10C1 note that
+     * it gated nothing was reconciled by
+     * PHASE-10C4-YTDLP-PRODUCTION-ACCEPTANCE-HARNESS-001; it described the
+     * Phase-10C1 source and would now read as a false statement about the
+     * current one.
+     *
+     * Enabling it remains a separate deployment decision, and shipping the
+     * runtime still never sets it.
      */
     readonly ytdlp: {
       readonly enabled: boolean;

@@ -1328,6 +1328,950 @@ because an existing execution path does not guarantee any given URL satisfies
 the public-source, progressive-HTTP(S), muxed-single-stream, safe-format-id and
 no-live policies.
 
+### 4i. Phase 10C4 — Production acceptance harness, NOT EXECUTED
+
+*`PHASE-10C4-YTDLP-PRODUCTION-ACCEPTANCE-HARNESS-001` added acceptance tooling
+and reconciled stale deployment prose. It changed no Worker execution code, no
+safe-egress policy and no functional systemd behaviour, and it touched nothing
+in Production.*
+
+```
+harness exists:            YES
+live generic acceptance:   NO
+Production deployment:     NO
+Production enablement:     NO
+```
+
+| Property | State after Phase 10C4 |
+| :--- | :--- |
+| Generic execution code | unchanged since §4h |
+| `GENERIC_YTDLP_EXECUTION_IMPLEMENTED` | `true`, unchanged |
+| `YTDLP_ENABLED` in Production | **unset — unchanged by this phase** |
+| Production deployment | **NOT performed** |
+| Production enablement | **NOT performed** |
+| Live generic media request | **NONE** |
+| Provider mutation (Cloudflare / R2 / Vercel) | **NONE** |
+| Lima VM | **not started for this phase** |
+
+#### Why the phase exists
+
+Phase 10C3 connected generic execution in source. Enabling it in Production is a
+different act, and the failure mode this phase exists to prevent is designing
+the test inside Production — improvising `docker`, `systemctl` and `curl`
+commands at the moment of enablement, then reporting whatever they happened to
+show. That produces evidence nobody reviewed the shape of beforehand.
+
+The ordering is therefore:
+
+```
+reviewed generic implementation  (10C3, merged)
+        +
+reviewed acceptance harness      (10C4, this phase)
+        |
+        v
+staged live deployment           (10D, not yet authorized)
+```
+
+#### What was added
+
+`deploy/acceptance/ytdlp-generic/` gains a live-acceptance layer beside the two
+existing offline verifiers, which are retained unchanged:
+
+| File | Kind |
+| :--- | :--- |
+| `verify-selector.py` | offline / static — **retained** |
+| `verify-download-policy.py` | offline / static — **retained** |
+| `README.md` | the Phase-10D specification |
+| `acceptance.mjs` | the live orchestrator |
+| `lib/{gate,verdict,stage-a,stage-b,process-tree,redact,evidence,observers}.mjs` | small single-purpose modules |
+| `scripts/ytdlp-acceptance.test.mjs` | 84 tests, run by `npm test` |
+
+The two kinds of evidence are kept explicitly separate. The offline verifiers
+prove pinned-runtime **semantics** without a network; the orchestrator proves
+the behaviour of a **deployed system**. Offline evidence is never labelled
+Production acceptance.
+
+#### Accidental live execution
+
+The default invocation is a dry run that exits `BLOCKED`:
+
+```
+live execution         : REFUSED
+Production mutation    : NONE
+network media request  : NONE
+job created            : NONE
+```
+
+A live run requires **both** `--live` and an exact `VIDEOFETCH_ACCEPT_LIVE=1`.
+Neither is inferred from anything: there is no "live if a Production host is
+reachable" heuristic, and a Production-shaped environment with no flag still
+produces a dry run.
+
+#### The harness does not change what it measures
+
+It never writes `/etc/videofetch/worker.env`, never restarts the Worker to
+enable generic execution, never repairs a failed service or policy, and never
+creates or rotates a credential. `lib/observers.mjs` enforces this
+structurally: a hard read-only command allowlist means `systemctl restart`,
+`nft`, `ip route add`, `docker run` and `sh -c` throw before a process is
+spawned, rather than being merely discouraged.
+
+Enablement, repair and rollback are Phase-10D operator steps.
+
+#### The two-stage procedure Phase 10D must follow
+
+```
+STAGE A — reviewed image deployed, generic DISABLED
+   │   17 gates: exact image identity, seven active services, the read-only
+   │   vf-egress-policy-verify, media-namespace placement, exact runtime
+   │   identity, truthful generic-disabled diagnostics, a forbidden-variable
+   │   audit by NAME, and a full direct-media regression proven to the byte.
+   │
+   │   ALL must PASS. There is no warn-and-continue.
+   ▼
+   OPERATOR sets YTDLP_ENABLED=true, restarts only what is required
+   ▼
+STAGE B — generic ENABLED
+       capability truthfulness, generic analysis, a real durable job through
+       queued→ready, process-descendant sampling, the no-FFmpeg rule, Node/EJS
+       containment, namespace identity, a safe-egress negative case, delegated
+       R2 write, a Vercel signed GET validated by digest, cancellation,
+       shutdown, the actual-byte guard, post-enable direct regression and the
+       kill switch.
+```
+
+The harness **refuses to grade the wrong stage**: Stage A assertions against an
+enabled deployment, or Stage B against a disabled one, exit `BLOCKED` with
+`STAGE MISMATCH`. Stage B additionally requires a Stage A evidence record whose
+verdict is literally `PASS`; there is no override flag.
+
+#### Stop gates
+
+Stage B is unreachable if any of these is not proven in Stage A:
+
+```
+exact image identity      required service chain     safe-egress verifier
+exact runtime identity    generic-disabled truth     direct regression
+R2 path                   Vercel delivery
+```
+
+A security-relevant property that **could not be measured** is `BLOCKED`, not
+skipped, and `BLOCKED` stops the run exactly as `FAIL` does. Optional
+site-specific coverage reports `NOT_EXERCISED`, which proves nothing and can
+never satisfy a required check — so a source that never invokes the Node/EJS
+runtime records that fact rather than claiming the containment case passed.
+
+#### Known evidence gap, recorded in advance
+
+The actual-byte-limit case (unknown or misdeclared `Content-Length`) requires a
+safe, reproducible live fixture. `--max-filesize` does **not** prove it: the
+pinned `HttpFD.real_download` checks that option only inside
+`if data_len is not None`. If no such fixture exists at Phase 10D time, the run
+must report
+
+```
+LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN
+```
+
+and the acceptance is **incomplete**. Substituting a unit test for it is
+explicitly forbidden, and the harness fails a case whose declared length was
+known — so a `--max-filesize` catch cannot be submitted as evidence for the
+application byte watcher.
+
+#### Deployment prose reconciled
+
+Three comments asserted a Phase-10C1 fact that Phase 10C3 falsified — that no
+user-URL yt-dlp execution path exists:
+
+- `deploy/systemd/videofetch-worker.service`
+- `src/shared/worker/contracts.ts` (the `features.ytdlpEnabled` contract)
+- `src/worker/runtime/config.server.ts` (the `ytdlp.enabled` config field)
+
+All three are **comment-only** changes; no functional systemd directive, schema
+or code path was altered. The unit's `YTDLP_ENABLED` block now states the
+three-value grammar (absent / `"false"` / `"true"`), records that the image may
+contain the reviewed execution path while enabling it remains a separate
+deployment decision, and reiterates that safe egress is the external
+systemd/netns/nftables boundary rather than anything this variable controls.
+
+The unit still sets **no** `Environment=YTDLP_ENABLED`. The deployed value comes
+only from `/etc/videofetch/worker.env`, so the operator disables generic
+execution by removing the variable there — or setting the approved disabled
+value — with no edit to the committed unit.
+
+`src/worker/runtime/worker-unit-ytdlp-policy.test.ts` asserts both halves: that
+the retired claim is absent from the unit's comments in any wording, and that
+the accepted functional controls are unchanged — the safe-egress and broker
+`Requires`/`After`/`BindsTo` edges, both fatal `ExecStartPre` gates, the media
+namespace with no fallback, `--cap-drop=ALL`, `no-new-privileges`, the read-only
+root, the 2 GiB `noexec,nosuid` tmpfs, the read-only broker socket directory,
+the numeric `--group-add`, and the absence of any Docker socket mount.
+
+#### Privacy contract of the harness
+
+One redaction implementation covers console output, the JSON record, errors and
+command summaries. Query strings are removed wholesale rather than
+per-parameter, because the acceptance URL is third-party test data and the
+per-run sentinel deliberately lives in a query parameter — a "safe parameter"
+allowlist would make the sentinel test unfalsifiable.
+
+Process sampling collects `pid`, `ppid`, `pgid`, executable **basename** and
+network-namespace inode. It never collects command lines: the acquisition argv
+ends in the submitted URL. A sample carrying `cmdline`, `argv`, `exe`, `command`
+or `url` is rejected outright rather than redacted.
+
+The evidence record is assembled from an allowlist, redacted at every depth,
+then stripped of forbidden keys. `/etc/videofetch/worker.env` is never dumped or
+read — `YTDLP_ENABLED` is observed from the container's bound environment, and
+every other variable is reported as a bare name or a boolean.
+
+#### CORRECTION-01 — review findings closed
+
+Four findings were raised in review of the Phase-10C4 draft and corrected on the
+same branch. Each falsified something the phase claimed, so they are recorded
+rather than folded silently into the description above.
+
+**1. The live CLI depended on test-only observation injection.** The evaluators
+were sound, but most observations reached them through `deps.<name>` seams that
+only a test populated. A Phase-10D operator would have had to write a script
+importing `main()` and fabricating those objects — recreating precisely the
+improvised live layer this phase exists to eliminate.
+
+The harness now owns the acquisition path end to end:
+
+| Added | Obtains |
+| :--- | :--- |
+| `lib/control-plane.mjs` | authenticated login, analyze, job creation, status polling, the 303 signed GET, and byte digests |
+| `lib/process-sampler.mjs` | `docker top -o pid,ppid,pgid,comm`, per-PID namespace identity, and the owned yt-dlp PID |
+| `lib/cases.mjs` | Stage B case choreography and the case-record contract |
+| `lib/coverage.mjs` | the check → producer registry the test suite walks |
+| concrete observers | image-SHA and `latest` tag identity, the bundled-EJS version, durable job rows, workDir presence, log capture |
+
+`VIDEOFETCH_ACCESS_SECRET` is now genuinely used: a live run calls the existing
+`POST /api/access/login` exactly once and holds the cookie in memory. A missing
+secret is a **usage failure** (an unauthenticated probe would 401 and be recorded
+as a capability failure — a false finding); a failed login is `BLOCKED`, never a
+silent fall-through to unauthenticated observation. `--expected-sha` became
+mandatory for the same reason: a live run that cannot say which image it is
+grading should not start.
+
+Stage B became multi-run, because enabling generic, cancelling a job, stopping
+the Worker mid-acquisition and rolling the switch back are separate operator
+transitions. Each case is its own reviewed command emitting a sanitized record;
+`--stage B --aggregate` produces the verdict. A record is admitted only if its
+harness id, schema version, case name, expected SHA and image object all match
+and its payload passes a **strict** validator with no unknown keys — then every
+field is re-judged by the pure evaluator. A hand-written `{"passed": true}`
+cannot produce a PASS.
+
+A structural test walks `lib/coverage.mjs` against both evaluators and fails if
+any emitted check lacks a concrete, non-test producer, so the same incompleteness
+cannot return when a check is added.
+
+**2. `["ready"]` satisfied the lifecycle contract.** The old ordering predicate
+accepted any ordered subsequence, which made "the poller only ever saw the final
+state" indistinguishable from "the job passed through the ladder" — the very
+thing the evidence exists to show.
+
+All six states are now required, and the outcome is three-way: complete and
+ordered is `PASS`, a backwards trace is `FAIL`, and an **incomplete** trace is
+`BLOCKED` — an evidence gap, never proof. Observation was strengthened to meet
+the contract rather than the contract weakened to fit observation: the poller
+runs at 200 ms, and the trace is seeded from the `POST /api/download` response,
+which is the only observation that can witness `queued` for a job that leaves the
+queue before the first poll.
+
+**3. The legitimate durable `formatId` was mistaken for a raw selector.** Phase
+10C3 persists the application-owned preset in the `format_id` column on purpose;
+forbidding it would have rejected every real durable row, under both the
+snake_case column name and the camelCase projection.
+
+`formatId` / `format_id` were removed from the forbidden list and replaced with
+positive evidence: `durable.application-format-id` proves the durable value is a
+`preset:*` rung **and** equals the preset the job was created with. The forbidden
+list now names only fields that could carry the private upstream selection —
+`source_format_id`, `rawFormatId`, `selector`, `format_selector`, `ytdlpFormat`,
+`sourceUrl` and their variants — which have no column at all. The durable reader
+projects only `job_id, status, format_id, extractor`; the `url` column is never
+selected, because it holds the acceptance URL and, during the sentinel case, the
+sentinel.
+
+**4. Process proof accepted any Python process, and the sample schema was a
+blacklist.** `process.ytdlp-present` merely looked for a Python descendant, and
+`validateSampleShape` rejected a list of known-bad field names — which only
+catches the leaks somebody already thought of.
+
+`process.ytdlp-identified` now proves a specific PID: a descendant of the Worker,
+with an approved runtime basename, **its own process-group leader**, in the media
+namespace. Group leadership is the discriminator — `process-runner.server.ts`
+spawns acquisition with `detached: true`, so the owned process necessarily leads
+its group while an unrelated Python descendant inherits the Worker's — and it is
+the property every containment and termination proof is expressed in terms of.
+Zero or several candidates is a measurement failure, not a guess. Node
+containment is anchored to that verified PID, and is `BLOCKED` without an anchor
+rather than reported as contained.
+
+The sample schema became a true allowlist — exactly `pid`, `ppid`, `pgid`,
+`comm`, `netns`, with type validation and a `comm` that must be a bare basename.
+`docker top -o pid,ppid,pgid,comm` is used precisely because it cannot return a
+command line: `ps -ef` and `/proc/<pid>/cmdline` would each hand back the
+acquisition argv, whose last element is the submitted media URL.
+
+Also corrected while closing these: the sentinel is now minted and swept by the
+real CLI code path rather than only specified, and console output crosses the
+central redaction/scrub boundary structurally instead of relying on each call
+site.
+
+#### CORRECTION-02 — five acceptance-integrity gaps closed
+
+**1. Four advertised Stage-B cases had no producer.** `byte-limit`, `shutdown`,
+`safe-egress` and `fail-closed-runtime` were listed as case names and counted as
+concrete producers, while the CLI dispatch implemented only four of the eight. A
+description string is not an implementation.
+
+`byte-limit`, `shutdown` and `safe-egress` are now real producers.
+`fail-closed-runtime` is declared **non-live** — it cannot be run as a case
+command, is refused at parse time with what it actually is, and its check is
+optional in the evaluator so it can never satisfy a required assertion. One
+registry (`CASE_PRODUCERS`) is now the single source of truth for the CLI, the
+coverage map and the tests, so a name cannot be advertised without a callable
+`run`.
+
+The `byte-limit` producer **measures** the unknown-declared-length property
+itself rather than accepting an operator boolean: a fixture that declares a
+usable `Content-Length` would be caught by `--max-filesize`, and a pass from it
+would be evidence for the wrong gate. The `shutdown` producer proves the job is
+genuinely acquiring, prints a sanitized prompt, and waits for the operator's
+separately authorized stop/restart — `systemctl stop` is not on the read-only
+allowlist and is never called. The `safe-egress` producer is an adapter over the
+accepted Phase-9 instrument, not a second firewall framework.
+
+**2. Process evidence was not scoped to `downloading`, and lost observations.**
+Sampling ran from job creation until the job settled, so `processing` samples fed
+a check named "no FFmpeg during downloading" — and Worker FFmpeg is *legitimate*
+during `processing` (`preset:mp3`, and `preset:audio` from a muxed source). A
+correct deployment would have failed it. The sampler also kept one "best" sample
+and discarded the rest, so a transient `ffmpeg` visible in one 250 ms sample was
+simply not in the retained evidence.
+
+The window now opens on the first observed `downloading` and closes permanently
+on the first state after it, and **every** sample in it contributes: one
+appearance of a forbidden or unknown executable, or one namespace mismatch,
+fails; a Node solver appearing in one sample is EXERCISED and judged rather than
+reported as never having run. Admission depends on when a sample was *taken*, not
+when it landed — sampling is asynchronous, and judging by landing time discarded
+every sample of a fast job.
+
+**3. Unavailable measurements were converted into clean-looking values.** The R2
+producer returned `objectExists: true` when the authenticated Worker job view
+could not be read, on the grounds that the job was `ready`. The workDir probe
+collapsed "could not measure" into "present". The post-cancellation sampler
+returned `postSample: []`, and the direct-regression sampler
+`sampledBasenames: []` — both of which *passed* their checks. The sentinel sweep
+substituted `""` for an unreadable surface, turning "could not read the logs"
+into "the sentinel is absent from the logs".
+
+Each is now a measurement with three distinct outcomes: unavailable is BLOCKED,
+measured-negative is FAIL, measured-positive is PASS. The sweep additionally
+covers six surfaces each with a real observer — including a cloudflared journal
+reader and a **genuine 404 error body** rather than a successful status response
+relabelled as an error surface — and the final record is checked before writing:
+if the scrubber had to act, the run is BLOCKED, because the scrubber is a
+disclosure backstop and not evidence of clean handling.
+
+**4. Local evidence artifacts were not tamper-evident, and the Stage-A image
+binding could be null.** Strict schema validation is not provenance: a
+hand-written record with the right field names was accepted, which violated the
+rule that no arbitrary operator JSON assertion may create a PASS.
+
+Every Stage A and case record is now sealed with an HMAC-SHA256 over a canonical
+encoding of harness, schema version, run id, stage, case, expected SHA, image
+ids, verdict and payload. Authenticity is verified **before** any field is read.
+The key is a per-run, acceptance-only random value in a `0600` local file,
+gitignored, never printed and never recorded — deliberately **not** any
+application credential, so a leak of the harness's own state is not a production
+incident. Stage A begins a run; Stage B joins it and refuses to mint one.
+`loadStageA` now requires a complete, self-consistent binding: valid
+`expectedSha`, `runningImageId` and `taggedImageId` matching each other and the
+current deployment. A `runningImageId: null` record can no longer authorize
+anything.
+
+**5. Two live checks overstated what they observed.**
+`analysis.routed-to-generic` claimed direct was observed falling through for the
+generic URL. It was not — nothing at the application boundary can observe that,
+and adding a surface that could would be the debug endpoint this design forbids.
+It is now two honest checks: `analysis.generic-selected` and
+`analysis.direct-still-selected`, with the direct-first router remaining a
+**source-reviewed invariant** tied to the observations by the exact-image
+binding.
+
+`selector.constraints-satisfied` presented a container comparison as proof of the
+private selector's internal constraints. Those are proven **offline** by
+`verify-selector.py` against the pinned parser; the live check is renamed
+`delivery.matches-advertised-preset` and claims only that. `vercel.byte-digest`
+became `vercel.byte-integrity` and now states exactly which boundaries it
+measured — durable `fileSize`, provider `contentLength`, delivered bytes and
+their SHA-256 — without implying an independent digest of the Worker-produced
+object, which only the direct fixture case genuinely has.
+
+#### CORRECTION-03 — six acceptance-integrity defects closed
+
+**1. The kill-switch case was impossible, and the state gate was not
+fail-closed.** Every Stage B case was guarded by a single global requirement
+that `YTDLP_ENABLED=true`, so `kill-switch` — whose entire purpose is to prove
+generic becomes unusable when the operator turns it off — could never run. The
+guard was also silent when the state could not be measured at all.
+
+The required deployment state is now declared PER CASE: `enabled` for `success`,
+`cancellation`, `byte-limit`, `shutdown`, `safe-egress` and `direct-regression`;
+`disabled` for `kill-switch`, using the accepted grammar (absent or exactly
+`"false"`). An UNMEASURED state blocks every case, because a case graded against
+an unknown stage produces evidence nobody can interpret. The ordered sequence —
+Stage A disabled, operator enables, enabled-state cases, operator disables,
+kill-switch, operator restores the chosen final state, aggregate — is documented
+rather than left implicit.
+
+**2. Termination proved the wrong thing.** Cancellation and shutdown checked the
+CURRENT Worker's descendant tree. A cancelled or restart-orphaned acquisition
+process is re-parented away from the Worker, so an ancestry check sees a clean
+tree while the process is still running — and after a restart the new Worker
+never had those descendants at all. "The new Worker is clean" and "the old
+acquisition group died" are different assertions.
+
+Both cases now capture the exact owned yt-dlp PID/PGID while the job is in
+durable `downloading` — established by the detached-spawn invariant, `pgid ===
+pid` — and afterwards ask the HOST whether that group has any surviving members,
+through one allowlisted `ps -eo pid=,ppid=,pgid=,comm=`. (`ps -ef` and `ps aux`
+print the full command line, whose last element is the submitted media URL, so
+the allowlist was tightened to that single invocation.) Survivors that could not
+belong to an acquisition group are treated as PID/PGID reuse and reported
+BLOCKED rather than guessed either way.
+
+**3. Safe-egress attribution did not use the Phase-9 standard.** A request
+failure plus `vf-egress-policy-verify == 0` proves the policy is intact; it
+proves nothing about what stopped that particular connection. Phase 9 already
+settled this: a connection that fails while the deny counter increments was
+denied by the firewall, while one that fails with every counter flat was denied
+by something else — most often a missing route.
+
+The case now reads the actual nftables deny counter before and after, through
+one read-only listing (`nsenter -t <netns pid> -n nft -j list chain inet
+videofetch_egress output`), using the same rule-comment vocabulary
+`deploy/acceptance/safe-egress/counter.py` already consumes. A flat counter can
+never pass; an unreadable counter is BLOCKED. The case also proves the forbidden
+destination was reached through the GENERIC path, because a submitted URL that
+merely redirects to a private address is rejected by the control plane's own
+SSRF guard long before generic is reached — such a case would "pass" while
+proving only that the direct layer works.
+
+The policy fingerprint is now a hash of the normalized chain JSON with counters
+stripped. The previous fingerprint combined the policy unit's systemd
+`InvocationID` and activation timestamp, which describe the unit's lifetime
+rather than the rules: a rule changed by hand while the unit kept running would
+have left both identical.
+
+**4. The byte-limit case measured the wrong request.** It did `HEAD` on the
+SUBMITTED URL. The property under test is the transfer semantics of the
+progressive media GET yt-dlp selected from that page — so a page with no
+`Content-Length` whose media resource declared one would have passed while being
+caught by `--max-filesize`, which is precisely the gate this case exists to rule
+out.
+
+The harness cannot learn which media URL yt-dlp chose without breaching the
+private-selector boundary, so the controlled fixture reports what it actually
+served. The case fails if the actual media GET declared a usable length, fails if
+the fixture analyzed as `direct`, and remains BLOCKED — `LIVE UNKNOWN-LENGTH
+BYTE-GUARD CASE NOT PROVEN` — when the transfer semantics cannot be established.
+Every generic-specific case (`success`, `cancellation`, `byte-limit`,
+`shutdown`, `safe-egress`) now asserts `extractor === "yt-dlp"` rather than
+assuming an operator-supplied "generic URL" caused generic execution.
+
+**5. Only part of the evidence was authenticated.** The HMAC covered a named
+subset, leaving `checks[]`, `runtime`, `services`, `delivery`, `process`, the
+nested `binding` and every timestamp outside the seal — an editable
+`checks[0].outcome` being the clearest example of what that misses. Enumerating
+was also the wrong shape, since a field added later would silently fall outside.
+
+The seal now covers the complete record minus only the authenticator itself, so
+future fields are authenticated by default. The top-level identity and the
+nested binding must additionally agree, and an existing run-key file is refused
+on load if it is group- or world-readable.
+
+**6. Final process evidence used the obsolete single-sample shape.** The
+serializer still read `observation.value.sample`, which the multi-sample window
+does not have, so the record emitted empty basenames and empty namespaces
+regardless of what was observed. It now derives from the same aggregate the
+evaluator judges, reporting sample counts, basenames seen, owned-PID
+identification, Node exercise/containment and violation counts.
+
+Relatedly, a sampling attempt that FAILED while the downloading window was open
+now blocks the negative claim — it leaves a real unobserved interval. A sample
+that straddles the window close is discarded and counted rather than blocking:
+sampling is asynchronous, so the final in-flight snapshot straddles the close on
+every healthy run, and treating that as a gap would block every run. The residual
+limitation is reported in the evidence as `ambiguousSampleCount` rather than
+hidden.
+
+**Also reconciled, comment-only:** `src/worker/http/business-service.server.ts`
+still asserted that runtime availability plus operator enablement does not mean a
+user URL can reach yt-dlp "because no such path exists". That ceased to be true
+in Phase 10C3. The comment now states that runtime availability and operator
+enablement are distinct and both necessary, while reachability is supplied by the
+reviewed application router and execution path. No diagnostics behaviour changed.
+
+#### CORRECTION-04 — four remaining acceptance-integrity gaps closed
+
+**1. Final aggregation still graded the CURRENT deployment as if generic had to
+be enabled.** CORRECTION-03 documented the multi-state sequence but left the
+aggregate reading `capability.generic-usable` and `config.ytdlp-enabled` from
+the deployment as it stood at aggregation time. That contradicted the sequence
+in both directions: the sequence *ends* with the operator restoring the disabled
+state and running `kill-switch`, so a correctly executed acceptance would have
+failed at the last step — and the same check could be satisfied by enabling
+generic in the minute before aggregating, a state with no connection to when any
+evidence was captured.
+
+Every case record now carries a `featureState` the harness MEASURED while that
+case ran — the deployment's own `YTDLP_ENABLED` spelling and the application's
+own `/api/sites` answer — sealed with the record and therefore uneditable. A
+`success` artifact recording the disabled state, or a `kill-switch` artifact
+recording the enabled state, is rejected outright. The aggregate reads each
+state-dependent claim from the artifact that observed it, adds
+`killswitch.disabled-state-proven` for the disabled half, and RECORDS the state
+at aggregation time under `deployment.final-state-recorded` without grading it.
+
+The terminal-state policy is explicit rather than implied: **either** state
+aggregates successfully, `disabled` is the preferred Phase-10D outcome (this
+runbook keeps Production `YTDLP_ENABLED` unset, and Phase 10E owns final product
+enablement), and an unmeasurable final state is BLOCKED.
+
+**2. Byte-limit fixture evidence was not bound to the case, and never showed the
+threshold was crossed.** The probe asked the fixture "did you serve a media
+request?" with no way to tell which one — a static endpoint answering
+`{"actualMediaRequestObserved": true}` satisfied it, and so did evidence left
+over from an earlier run. Separately, `TOO_LARGE` alone says a job failed; it
+does not say the application byte threshold was reached, so a fixture serving
+less than the limit would have produced a PASS while describing a bug.
+
+Each run now mints a 128-bit correlation id (test data, not a credential),
+submits it as `vf_case` on the fixture URL, and requests the fixture's evidence
+for exactly that id; a foreign id, a missing association, or a media-request
+count other than one is BLOCKED. The case also measures the EFFECTIVE deployed
+limit — the single non-secret `MAX_FILE_SIZE` variable read through
+`docker inspect` and parsed with the runtime's own grammar, defaulting to 500
+MiB — and requires `bytesServed > effectiveMaxFileSizeBytes`. Inferring the
+limit from source would be wrong wherever a deployment overrides it.
+
+**3. Any nftables comment could be named as the deny counter.**
+`--egress-deny-class` took a free-form string, so `public-http` (an ACCEPT rule
+whose counter moves on every ordinary media fetch) or `established` (which moves
+on essentially every response) would have attributed a denial to a counter that
+had nothing to do with one. The list also named three classes that do not exist
+in the deployed ruleset — `deny-v4-mapped`, `deny-multicast`,
+`deny-link-local` — whose destinations are elements inside `@forbidden_v4` and
+`@forbidden_v6` and increment `deny-v4`/`deny-v6`.
+
+The enum is now exactly the deployed policy's deny rules — `deny-v4`, `deny-v6`,
+`deny-v4-broadcast` — parsed at argument-parse time, before any live operation.
+Every accept rule, the catch-all `fallthrough-drop` counter, and any unknown
+value are usage errors. The fixture family determines which class is expected;
+counter-delta, request-failure, verifier and fingerprint requirements are
+unchanged.
+
+**4. Malformed host process rows disappeared from termination evidence.** The
+parser skipped any non-empty line it could not interpret. The termination proof
+is a NEGATIVE one whose evidence is the ABSENCE of matching rows, so a single
+unreadable line — precisely where a leaked process's unexpected name would
+appear — turned one real survivor into `[]` and therefore into a PASS.
+
+Any non-empty line that is not exactly four fields, three numeric ids and a
+plain executable basename now makes the WHOLE listing unmeasured, and the
+termination check lands BLOCKED. The refusal names the line number and the
+defect, never its content — a malformed line is exactly the case where the
+content might not be a `comm`. Blank lines are still skipped.
+
+**Also hardened (two smaller consistency fixes):** the run-key permission check
+now applies on EVERY path that touches the file, so Stage A can no longer
+silently resume an already group- or world-readable key; and a permission
+measurement that fails for any reason other than the file being absent fails
+closed, because "we could not read the mode" is not "the mode is fine". The
+stale comment in `download-window.mjs` claiming a straddling sample makes the
+window unusable was reworded to match the implemented discard-and-count policy.
+The accepted CORRECTION-03 ambiguity policy and monotonic clock are unchanged.
+
+#### CORRECTION-05 — six acceptance-integrity gaps closed
+
+**1. The observer retrieved every Worker environment VALUE before discarding the
+unwanted ones.** `environmentNames`, `ytdlpEnabledRaw` and `effectiveMaxFileSize`
+all rendered `{{range .Config.Env}}{{println .}}{{end}}`, which emits the
+complete `NAME=value` environment — `WORKER_CONTROL_SECRET` included — and then
+split the values off in JavaScript. For a harness whose subject holds secrets
+that is the wrong order of operations: the value crossed into the harness
+process, lived in a Node string and in a child process's stdout buffer, and was
+discarded only afterwards. Fetched-then-sanitized is not never-fetched.
+
+Environment observation is now three fixed probes, each answering one question:
+names only (no `=`, no value, no length, no hash), `YTDLP_ENABLED` alone, and
+`MAX_FILE_SIZE` alone — the two non-secret deployment variables the numeric and
+grammatical assertions genuinely need. Each probe's source is a compile-time
+constant matched whole by the `docker exec` allowlist, so the caller cannot
+redirect a read to a different variable, and no general Python execution
+capability exists. `docker inspect` is additionally restricted to three named
+templates (`{{.Image}}`, `{{.HostConfig.NetworkMode}}`, `{{.State.Pid}}`), which
+makes retrieving the environment that way unrepresentable rather than unused.
+
+**2. A case could be sealed against the pre-restart image.** The record bound to
+the image measured BEFORE the producer ran. `shutdown` exists to span an operator
+restart, and systemd starts `videofetch-worker:latest` — so a restart is an
+image-resolution event, and a record could combine pre-restart and post-restart
+evidence under an id that only ever described the first half.
+
+Every Stage B case now resolves the authorized SHA-tagged image before the
+producer, requires the running image to BE that object, resolves it again after,
+and requires exact equality before anything is sealed. An image that changed, or
+that could not be re-measured, is BLOCKED with no record written. Container
+identity is deliberately not the binding: a restart legitimately recreates the
+container from the same image, and the PID is expected to change.
+
+**3. Shutdown accepted any non-empty recovered status.** The predicate was
+`typeof recoveredStatus === "string" && length > 0`, under which `ready`,
+`cancelled`, and a job still sitting in `downloading` all passed a check named
+`job-recovered`. The Worker's policy is deterministic: `recover()` in
+`src/worker/state/sqlite-job-store.server.ts` moves every job left in
+`analyzing`, `downloading`, `processing` or `uploading` to exactly `failed` /
+`PROCESSING_FAILED` / `Worker restarted before the job completed.`
+
+Acceptance now asserts that result. The safe message is asserted rather than
+skipped as brittle, because it is a literal in the Worker's own SQL and is the
+only field separating "the restart path recovered this job" from "the job failed
+on its own and was classified PROCESSING_FAILED" — which every internal
+acquisition failure is. It is read through the browser projection `error`, which
+`src/web/jobs/public-job.ts` documents as where `safeErrorMessage` surfaces.
+Recovery is polled within a bounded window rather than read once, because the
+restart is detected the instant the new container's PID appears — before the
+Worker has opened its database, run `recover()`, or begun answering HTTP. The
+PGID-termination proof remains an independent requirement; neither substitutes
+for the other.
+
+**4. Direct-regression sampling errors could be erased by a later success.** The
+producer held a single nullable `samplingFailure` that the next successful sample
+overwrote with nothing, so a run that lost an observation interval looked
+identical to one that never did — while the check it fed claims that no yt-dlp
+process appeared across the whole run. Failed attempts are now accumulated, and
+one is enough to BLOCK both direct sampling checks regardless of how many clean
+samples surround it. This is the rule the generic downloading window already
+applied. A yt-dlp process actually observed remains a FAIL, not a BLOCKED.
+
+**5. The host `comm` parser was stricter than procps.** It split on whitespace
+and demanded exactly four tokens, but procps permits a `comm` containing spaces
+— it derives from the executable name. One unrelated host process with such a
+name made the entire listing unmeasurable and every termination check BLOCKED,
+for a reason with nothing to do with the captured group: a fail-closed rule
+misapplied, turning an irrelevant oddity into an unanswerable question.
+
+The three numeric ids are now parsed structurally and the remainder taken as the
+single `comm` field it is by the format's own definition. The fail-closed part is
+the numeric prefix — a line whose ids cannot be read might belong to the captured
+group — while an unusual `comm` keeps its row under the fixed token
+`<unclassified>` rather than being dropped or copied verbatim. An unclassifiable
+survivor inside the captured group is reported as ambiguous and BLOCKS; it can
+never become an empty survivor set. The `ps` invocation, and its absence of any
+argv column, is unchanged.
+
+**6. A present-but-malformed run-key file was silently overwritten.**
+`loadOrCreateRun` fell through to "mint a fresh run" on unreadable content or
+malformed JSON, which replaced the file — destroying the only key that could
+verify the artifacts already sealed under it, and doing so silently at the exact
+moment something was already wrong. `ENOENT` is now the only condition that mints
+a run; a file that exists is never replaced, and unreadable content, malformed
+JSON or an invalid structure each BLOCK. A damaged file is an error rather than a
+`null`, because `null` means "no run has been started" and would send the
+operator to re-run Stage A over the very file that needed attention.
+
+#### CORRECTION-06 — four residual acceptance-integrity gaps closed
+
+**1. An observation gap could erase a positive finding.** The direct regression
+routed two independent questions — *was the run continuously observable?* and
+*did any observed sample contain yt-dlp?* — through a single gate, so one failed
+sampling attempt downgraded a positively observed yt-dlp process from FAIL to
+BLOCKED. That is the strongest evidence the case can produce, turned into
+uncertainty because some other interval was uncertain.
+
+The two are now graded separately. Coverage is BLOCKED whenever a sampling
+attempt failed; the finding is FAIL whenever an approved yt-dlp runtime basename
+appears in a SUCCESSFUL sample, gap or no gap. FAIL already outranks BLOCKED in
+the summary, so a finding alongside a gap fails the run — the honest reading:
+something bad happened and we could not see all of it. A finding is never
+inferred from an error message, because a failed attempt observed nothing.
+
+**2. `docker top` was neither structurally bounded nor fail-closed.** The
+allowlist checked `argv[0] === "top"` alone, so `docker top <c> -o args`,
+`-o pid,args`, `-o command` and a bare `docker top <c>` (whose default format
+includes CMD) all passed the boundary the architecture claims makes command
+lines structurally unavailable. The allowlist now admits exactly
+`docker top <container> -o pid,ppid,pgid,comm`, with the container name checked
+against Docker's own name grammar; every argv-bearing form is refused before a
+process is spawned.
+
+The parser also did `continue` on a short row and on a non-numeric id. The
+downloading window's assertions are NEGATIVE and their evidence is the absence
+of matching rows, so one unreadable line left the remaining rows looking clean
+and the window PASSING — and the row most likely to be unusual is exactly the
+one those checks exist to catch. An unreadable numeric prefix now makes the whole
+SAMPLE unmeasured, which the collector records as a sampler error and the window
+gap rule turns into BLOCKED. A valid row with an unusual `comm` keeps its row
+under the fixed token `<unclassified>`, which is not an approved acquisition
+executable and therefore FAILS `process.no-unknown-descendants` rather than
+vanishing. The header is validated rather than skipped, because blindly dropping
+the first line loses a real process row when the header is absent; the expected
+`PID PPID PGID COMMAND` was verified against the pinned image on this
+Docker/procps combination. The host-level PGID parser stays a separate
+implementation: both are fail-closed, but they read different commands with
+different output contracts.
+
+**3. Cases proved image continuity but not feature-state continuity.** The
+deployment state was measured once, before the producer. `shutdown` exists to
+span an operator restart, so the same authorized image could come back with
+`YTDLP_ENABLED=false` — restart recovery succeeding, image continuity holding —
+and the record would still seal `featureState: enabled`, combining two
+deployment states while claiming one.
+
+Every executable Stage B case now measures the feature state on both sides of
+the producer and refuses to seal unless the case's required configuration state
+held and the capability report did not move. `featureContinuity` is sealed with
+the record, and `validateCaseRecord` recomputes it rather than trusting its own
+boolean; the canonical `featureState` must agree with the continuity it claims.
+
+A particular capability VALUE is deliberately not gated. For `kill-switch`,
+`/api/sites` still reporting `ytdlp: true` while the configuration is disabled is
+not a precondition failure — it is the most important finding that case can
+produce, and refusing to run would convert "the kill switch does not work" into
+"we did not look". The evaluator grades that conjunction from the same sealed
+evidence, as a FAIL.
+
+**4. A malformed `runId` was still accepted.** The run-key admission test was
+`typeof runId === "string"`, so a file carrying `""`, `"abc"`, or uppercase hex
+passed with an otherwise valid key. `runId` is inside the authenticated material
+and is compared across artifacts to prove they belong to one acceptance run, so
+an identity the harness could never have generated is not a run identity. Both
+fields are now matched against the exact grammar `loadOrCreateRun` produces —
+16 and 64 lowercase hex characters. Every invalid shape BLOCKS on both entry
+points and leaves the existing file untouched; ENOENT remains the only condition
+that mints a run.
+
+#### CORRECTION-07 — five residual evidence-boundary gaps closed
+
+The governing rule for all five: **never transform raw evidence into a more
+favourable identity before deciding whether that raw evidence was valid.**
+
+**1. Run identity was admitted by coercion.** Admission tested
+`RUN_ID_PATTERN.test(String(parsed.runId))`, so the value was transformed into a
+more admissible shape and the transformed shape was then judged. A JSON NUMBER
+escapes that test — `String(1234567890123456)` matches `/^[0-9a-f]{16}$/`
+exactly — and it would have been admitted, carried into `verifyRecord`, and
+compared against a string, making every artifact of the run unverifiable for a
+reason nothing reports. Both fields now require `typeof === "string"` before the
+grammar is applied. `loadOrCreateRun` mints `randomBytes(…).toString("hex")`, so
+requiring the type is requiring what the harness actually produces. Every invalid
+shape BLOCKS on both entry points and leaves the existing file untouched.
+
+**2. `comm` was normalized before it was validated.** The `docker top` parser
+computed `basenameOf(raw)` and validated THAT, so `suspicious/python3` became
+`python3` — an APPROVED yt-dlp runtime shape. An executable the harness had never
+approved acquired the identity of one it had: it stopped being an unknown
+descendant, became a candidate for `establishYtdlpPid`, and could be graded as
+the owned acquisition process. The check that exists to catch an out-of-band
+executable was the check that gave it cover.
+
+The RAW field now decides. A raw `comm` that is already a plain basename is
+lowercased and kept; anything else keeps its row and loses its name to
+`<unclassified>`, which is not on the approved list and therefore FAILS
+`process.no-unknown-descendants`. Paths are not stripped, unusual names are not
+trimmed into approved ones, and no row is ever dropped. The host-level PGID
+parser already validated its raw field and is unchanged.
+
+**3. Favourable stdout could come from a failed command.** Several observers
+consumed a command's buffer without checking its exit status, so a well-formed
+value beside a non-zero exit became a measurement. That matters because the
+harness's assertions are mostly NEGATIVE: a `docker top` that fails while
+emitting a syntactically perfect listing looks exactly like a clean one, a
+`workDir` probe printing `False` beside a failure fabricates the most favourable
+answer it could give, and a stale `docker inspect` PID sends every containment
+proof to the wrong process tree.
+
+Successful completion is now required before stdout may support a measurement
+claim, across `docker top`, the four container `docker inspect` templates,
+`readlink /proc/<pid>/ns/net`, the Python/Node/EJS version probes, the `workDir`
+probe and the media-namespace holder PID. Two commands are STATUS-AS-DATA and
+are deliberately unchanged: `systemctl is-active` exits non-zero BECAUSE the unit
+is inactive, and `vf-egress-policy-verify`'s exit code IS the verdict. Turning
+either into BLOCKED would convert a finding into a refusal.
+
+**4. Evidence was not bound to a container epoch.** Image identity answers which
+reviewed image; feature state answers which configuration. Neither answers which
+RUNNING INSTANCE produced the evidence — and the unit is `docker run --rm` behind
+an `ExecStartPre=-docker rm -f`, so a restart is a container RECREATION from the
+same image with the same environment file. Two endpoint measurements agreeing on
+image and feature state are fully consistent with an unnoticed restart between
+them, and a case whose acquisition window spanned one is two half-observations of
+two runtimes reported as one.
+
+`docker inspect --format {{.Id}}` is added to the allowlist — a non-secret
+content-addressed object name — and every case now seals a `containerEpoch`.
+Ordinary cases require one instance start to finish. `shutdown` pins its one
+intentional transition end to end: the instance the case began on must be the
+one the restart watcher saw go away, the new instance must genuinely differ, and
+the instance current at sealing must be that same new one, so a SECOND
+recreation cannot pass as the first. The image, feature state and instance are
+read as one BRACKETED snapshot on each side — instance first and last, and they
+must match — so the post-case properties cannot describe a container the watcher
+never saw. `validateCaseRecord` recomputes the epoch and requires it to agree
+with the case's own restart evidence.
+
+The image binding is NOT replaced: it remains what ties evidence to reviewed
+code. The epoch only bounds the interval that evidence describes, and the
+documented claim says exactly that rather than asserting continuous observation
+of every instant.
+
+**5. The run key was created non-atomically.** `stat` → ENOENT → `writeFile` is a
+check followed by an unguarded write, and everything CORRECTION-05 established
+about never replacing an existing run key lived in the gap between them: two
+Stage A invocations both see ENOENT, both write, and the second destroys the key
+the first has already begun sealing artifacts with. Creation now uses
+`flag: "wx"`. Losing the race is BLOCKED — not "load the winner instead", since
+the winner's `runId` identifies a run this invocation did not begin and whose
+Stage A binding it has not verified — and the winner's file is neither
+overwritten nor `chmod`ed.
+
+Separately, the unused `sampleWhile` helper was REMOVED. It swallowed individual
+sampling failures and returned the richest successful sample whenever any had
+succeeded — the exact gap policy removed everywhere else. No live path called it;
+leaving it exported would only have let a future caller reintroduce the defect by
+reaching for the obvious name.
+
+CORRECTION-06's positive-finding precedence, exact `docker top` argv boundary,
+header validation, fail-closed row handling, feature continuity and the
+kill-switch value-not-gate rule are unchanged.
+
+#### CORRECTION-08 — two final artifact-integrity defects closed
+
+**1. The evidence schema identifier was stale.** It still read
+`10c4-correction-03`, which was no longer truthful: the acceptance contract has
+changed materially since, even where a record's JSON shape has not.
+
+A valid HMAC proves only that an artifact has not changed since somebody holding
+the run key produced it. It says nothing about WHICH revision of the harness's
+observation semantics produced the contents it authenticates, and only the
+schema version can.
+
+That gap mattered specifically for Stage A. Stage B case records are already
+refused structurally when a required field is absent, so an older case artifact
+cannot pass today's validator. Stage A's record shape has not changed since
+CORRECTION-03, so an artifact produced by a much weaker harness revision could
+carry the same runId, the same key, the same source SHA, the same image binding
+and a PASS verdict — and therefore satisfy `loadStageA()` and AUTHORIZE CURRENT
+STAGE B. What it actually attested was far less: narrow secret-safe environment
+observation, non-zero exits no longer accepted as measurements, fail-closed
+process parsing, state/feature/image/container-epoch continuity, strict run
+identity and atomic key creation all postdate it.
+
+The schema is now `10c4-correction-08`, one constant governing Stage A, case
+records and the aggregate so they cannot drift into describing different
+contracts. `schemaVersion` identifies the acceptance PRODUCER CONTRACT, not
+merely the set of JSON keys, and must be bumped whenever an observer or
+evaluator change could make an old artifact mean something WEAKER under the same
+shape. No live artifact compatibility is broken: Phase 10D has not run.
+
+**2. Restart endpoints were assembled rather than observed.** The watcher read
+the container instance and the PID separately and polled the PID for the
+transition. Both halves were wrong.
+
+Polling the PID produced FALSE NEGATIVES: PIDs are not unique across container
+objects, so a recreated Worker whose main process received the same pid was
+invisible — the watcher timed out and reported that no restart occurred while
+one plainly had. That matters because the unit is `docker run --rm` behind an
+`ExecStartPre=-docker rm -f`, so the container object is what a restart actually
+changes.
+
+Reading the instance around the PID rather than with it produced INCOHERENT
+ENDPOINTS: a transition recorded as A -> C could be assembled from an A instance
+read that preceded a PID from B and a later PID change that preceded a C
+instance read. None of those three observations was of the same runtime, and the
+record would claim "container A had PID X" for a pairing that never existed.
+
+The container instance is now the polling authority, and each endpoint is a
+coherent bracketed observation — instance, PID, instance again, all agreeing on
+the instance. An instance that moves inside the bracket makes the observation
+AMBIGUOUS, retried a bounded number of times, with exhaustion a measurement
+failure rather than a pairing accepted on the last attempt. The PID remains in
+evidence as auxiliary diagnostic data bound to the instance it was read from.
+
+The claim language is bounded accordingly: the watcher observed the transition
+from the recorded old container epoch to the recorded new one, and the case's
+outer bracketed snapshots add that the new epoch remained current through
+sealing. Polling is not claimed to prove that no transient intermediate
+container existed between two polls; an additional recreation that IS observed
+still BLOCKS.
+
+The CORRECTION-07 epoch architecture is unchanged: `containerEpoch`,
+`continuous` mode for ordinary cases, `one-restart` for `shutdown`, the pre/post
+bracketed deployment snapshots, image identity as code provenance, feature
+continuity, and container identity as runtime-epoch evidence only.
+
+#### CORRECTION-09 — a positively observed restart epoch is no longer erased
+
+CORRECTION-08 made the container instance the restart authority and required
+each endpoint to be a coherent observation. One case remained wrong.
+
+When the polling loop SUCCESSFULLY MEASURED a different instance and the
+coherent endpoint then settled on a THIRD instance, the watcher recorded the
+transition as old -> endpoint and discarded the instance it had just measured.
+That is not a gap in observation; it is the deletion of one. The harness did not
+merely fail to see an intermediate epoch — it saw one, and then reported a
+transition that skipped it.
+
+The two situations look alike and are not:
+
+  AN UNOBSERVED INTERVAL — the container was unavailable, nothing was measured
+  during the gap, and one coherent endpoint followed. Recording that transition
+  discards no observation, so it remains usable, with the same bounded claim
+  CORRECTION-08 established: polling cannot exclude epochs it never saw.
+
+  A POSITIVELY OBSERVED INTERMEDIATE — a probe successfully measured one
+  instance and the endpoint settled on another. Two distinct post-transition
+  epochs were measured, so no single transition can be attributed to the
+  restart.
+
+The poll's sighting is now retained as `detectedInstanceId`, and the coherent
+endpoint must equal it. If it does not, the case BLOCKS with "AN ADDITIONAL
+WORKER RECREATION WAS OBSERVED WHILE ESTABLISHING THE RESTART ENDPOINT" and no
+record is written. An endpoint-bracket retry does not change that: a later,
+cleaner observation never overwrites an earlier positive one. The finding names
+neither container id, because that two epochs were observed is the whole finding.
+
+One probe establishes that a different container object exists but cannot bind a
+PID to it, so the coherent bracket still runs — the accepted endpoint is the
+instance the poll saw, carrying the PID that observation established. A PID from
+one instance is never attached to another.
+
+This introduces no stronger claim about polling. It only preserves what polling
+actually observed. The schema identifier stays `10c4-correction-08`: the change
+makes the watcher STRICTER, so no artifact becomes acceptable more weakly, and
+the record semantics are unchanged.
+
+Everything CORRECTION-08 established is preserved: the producer-contract schema
+and its rejection of stale Stage-A and case artifacts, the container instance as
+restart authority, the PID as auxiliary evidence, the instance -> PID -> instance
+endpoint bracket with bounded retries, PID reuse being unable to hide a
+recreation, the outer bracketed deployment snapshots, and the absence of any
+continuous-observation claim.
+
+#### What Phase 10D is authorized to do
+
+Nothing yet. Only after this harness has been **independently reviewed and
+merged** may Phase 10D be authorized to touch the Lima VM, build and deploy the
+exact reviewed image, or set `YTDLP_ENABLED=true`.
+
 ---
 
 ## 5. Object storage (R2)

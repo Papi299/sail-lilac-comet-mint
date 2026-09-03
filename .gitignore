@@ -7,3 +7,9 @@ node_modules/
 
 # Generated Vercel local/build output. Never commit.
 .vercel/
+
+# Acceptance run key (PHASE-10C4 harness). Holds the per-run HMAC key that makes
+# Stage A / Stage B case artifacts tamper-evident. Written 0600, acceptance-only,
+# never an application credential, and deleted by the operator when acceptance
+# is complete. It must never be committed.
+.vf-acceptance-run.json

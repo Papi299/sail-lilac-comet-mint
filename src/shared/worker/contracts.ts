@@ -291,8 +291,15 @@ export const WorkerDiagnosticsSuccessSchema = z
      * APPLICATION feature state, distinct from runtime availability.
      *
      * `ytdlpEnabled` is the operator's explicit `YTDLP_ENABLED` intent. It is
-     * fail-closed, and installing the runtime never sets it. As of Phase 10C1
-     * it gates nothing, because no user-URL yt-dlp execution path exists.
+     * fail-closed, and installing the runtime never sets it.
+     *
+     * Since Phase 10C3 it gates a path that genuinely exists: it is one of the
+     * three independent conjuncts — implementation, runtime, operator intent —
+     * that `/api/sites.ytdlp` requires together. The Phase-10C1 note that it
+     * gated nothing was reconciled by
+     * PHASE-10C4-YTDLP-PRODUCTION-ACCEPTANCE-HARNESS-001; it described the
+     * Phase-10C1 source and would now read as a false statement about the
+     * current one.
      */
     features: z
       .object({
