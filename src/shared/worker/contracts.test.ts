@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert";
+import { z } from "zod";
 import {
   WorkerJobStatusSchema,
   WorkerJobViewSchema,
@@ -251,5 +252,103 @@ test("Worker Contracts - Media", async (t) => {
         extra: "field",
       }),
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE-10D-STAGE-A-OBSERVABILITY-BLOCKER-REMEDIATION-02
+//
+// The first authenticated Stage-A run saw `/api/diagnostics` and `/api/sites`
+// return HTTP 500 while the DIRECT product path worked end to end. This pins
+// the control-plane compatibility boundary that explains that split, so the
+// classification rests on an executable proof rather than on deployment dates.
+//
+// It is a statement about a HISTORICAL contract, deliberately kept in source:
+// the Vercel Production deployment was created before the Worker diagnostics
+// contract changed, and this is what that combination does.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("control-plane diagnostics contract skew (REMEDIATION-02)", async (t) => {
+  /**
+   * `WorkerDiagnosticsSuccessSchema` EXACTLY as it stood at
+   * 84321e40a0c1de7b5efd7b87d9b594c1578064d7 — the last commit before
+   * 506b1b62c4ce011895d4d62688177e6cd1f5d081 introduced the current shape, and
+   * the era the deployed Vercel Production build was cut from.
+   *
+   * Reproduced literally rather than imported, because the point is to show
+   * what a control plane compiled from THAT source does with a response from
+   * TODAY's Worker.
+   */
+  const ProductionEraDiagnosticsSchema = z
+    .object({
+      status: z.enum(["ok", "degraded"]),
+      queueDepth: z.number().int().nonnegative(),
+      runningJobs: z.number().int().nonnegative(),
+      maxConcurrent: z.number().int().nonnegative(),
+      binaries: z.object({ ffmpeg: z.boolean(), ytdlp: z.boolean() }).strict(),
+      safeEgress: z
+        .object({ attested: z.boolean(), policyVersion: z.string().nullable() })
+        .strict(),
+    })
+    .strict();
+
+  /** What the CURRENT Worker actually returns from `/v1/diagnostics`. */
+  const currentWorkerResponse = {
+    status: "ok" as const,
+    queueDepth: 0,
+    runningJobs: 0,
+    maxConcurrent: 1,
+    binaries: { ffmpeg: true, ytdlp: true },
+    runtime: { ytdlpVersion: "2026.08.19" },
+    features: { ytdlpEnabled: false },
+    safeEgress: { enforcement: "external" as const, policyVersion: null },
+  };
+
+  await t.test("today's Worker response satisfies today's schema", () => {
+    // The Worker parses its OWN response with this schema before sending it, so
+    // a control plane built from the SAME commit cannot fail to parse it. That
+    // is what makes a 500 evidence of skew rather than of a current-source bug.
+    assert.doesNotThrow(() => WorkerDiagnosticsSuccessSchema.parse(currentWorkerResponse));
+  });
+
+  await t.test("the Production-era schema REJECTS today's Worker response", () => {
+    const parsed = ProductionEraDiagnosticsSchema.safeParse(currentWorkerResponse);
+    assert.equal(parsed.success, false, "this rejection is the /api/diagnostics 500");
+  });
+
+  await t.test("and rejects it on four independent counts", () => {
+    const parsed = ProductionEraDiagnosticsSchema.safeParse(currentWorkerResponse);
+    assert.equal(parsed.success, false);
+    if (parsed.success) return;
+    const paths = parsed.error.issues.map((i) => i.path.join("."));
+
+    // Each of these is sufficient on its own; together they mean no amount of
+    // retrying or reconnecting could have made the old parser accept it.
+    assert.ok(
+      parsed.error.issues.some((i) => i.code === "unrecognized_keys"),
+      "`runtime` and `features` are unrecognized under a .strict() object",
+    );
+    assert.ok(
+      paths.some((p) => p.startsWith("safeEgress")),
+      "safeEgress changed shape: `attested` is required and absent; `enforcement` is unknown",
+    );
+  });
+
+  await t.test("the DIRECT path contracts did not change in the same way", () => {
+    // Why the direct regression could pass while diagnostics 500'd: the job
+    // contracts the direct path uses were untouched by the diagnostics change,
+    // so transport, HMAC and routing were all demonstrably healthy.
+    const job = {
+      status: "ok" as const,
+      queueDepth: 0,
+      runningJobs: 0,
+      maxConcurrent: 1,
+      binaries: { ffmpeg: true, ytdlp: true },
+      safeEgress: { attested: true, policyVersion: null },
+    };
+    assert.doesNotThrow(() => ProductionEraDiagnosticsSchema.parse(job));
+    // The same document is NOT acceptable to the current schema — the two
+    // contracts are mutually incompatible, in both directions.
+    assert.equal(WorkerDiagnosticsSuccessSchema.safeParse(job).success, false);
   });
 });

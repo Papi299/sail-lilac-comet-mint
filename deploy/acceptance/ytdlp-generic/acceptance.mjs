@@ -428,7 +428,7 @@ export async function collectStageAObservations(ctx) {
     runningImageId: await system.runningImageId(),
     imageShaTag: await system.imageShaTag(expectedSha),
     imageLatestAlias: await system.imageLatestAlias(expectedSha),
-    workerNetworkMode: await system.networkMode(),
+    workerNetworkPlacement: await system.networkPlacement(),
     workerEnvironmentNames: await system.environmentNames(),
     ytdlpEnabledRaw: await system.ytdlpEnabledRaw(),
     egressVerifier: await system.egressVerifier(),

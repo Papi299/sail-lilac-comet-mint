@@ -10,6 +10,7 @@
 // warn-and-continue path (§20).
 
 import { OUTCOMES, check, measuredCheck, summarize } from "./verdict.mjs";
+import { CONTAINER_ID_PATTERN, NET_NAMESPACE_PATTERN } from "./observers.mjs";
 
 /** The exact reviewed runtime contract (§13). Exact values, never ranges. */
 export const EXPECTED_RUNTIME = Object.freeze({
@@ -21,6 +22,48 @@ export const EXPECTED_RUNTIME = Object.freeze({
   nodeMajor: "22",
   nodeExpected: "v22.23.2",
 });
+
+/**
+ * Does this placement observation prove the Worker shares the media namespace?
+ *
+ * Every conjunct is required, and every one of them fails CLOSED:
+ *
+ *   - the Worker's network mode must be container-scoped at all, so `bridge`,
+ *     `host`, `none` and any name-shaped value are rejected outright;
+ *   - the targeted id and `videofetch-media-netns`'s own id must both be
+ *     canonical 64-hex ids and must be EQUAL — a wrong container is not a
+ *     shared namespace, however well-formed;
+ *   - both containers must be running, so a stopped namespace holder cannot
+ *     pass by leaving a PID unmeasured;
+ *   - both `/proc/<pid>/ns/net` identities must be readable AND equal, so a
+ *     pair of unreadable links can never coincidentally "agree".
+ *
+ * Docker's bookkeeping and the kernel's view are deliberately BOTH required.
+ * Either alone is weaker: the first trusts a record, the second cannot tell the
+ * intended namespace from any other one the Worker might have joined.
+ */
+export function sharesMediaNetworkNamespace(value) {
+  if (typeof value !== "object" || value === null) return false;
+  const {
+    targetContainerId,
+    mediaNetnsContainerId,
+    workerPid,
+    mediaNetnsPid,
+    workerNetNamespace,
+    mediaNetNamespace,
+  } = value;
+
+  if (!CONTAINER_ID_PATTERN.test(String(targetContainerId))) return false;
+  if (!CONTAINER_ID_PATTERN.test(String(mediaNetnsContainerId))) return false;
+  if (targetContainerId !== mediaNetnsContainerId) return false;
+
+  if (!Number.isInteger(workerPid) || workerPid <= 0) return false;
+  if (!Number.isInteger(mediaNetnsPid) || mediaNetnsPid <= 0) return false;
+
+  if (!NET_NAMESPACE_PATTERN.test(String(workerNetNamespace))) return false;
+  if (!NET_NAMESPACE_PATTERN.test(String(mediaNetNamespace))) return false;
+  return workerNetNamespace === mediaNetNamespace;
+}
 
 /** The security units that must be healthy before the Worker may run (§15). */
 export const REQUIRED_SERVICES = Object.freeze([
@@ -139,12 +182,21 @@ export function evaluateStageA(obs) {
   );
 
   // ── §32 network placement ──────────────────────────────────────────────
+  //
+  // REMEDIATION-02: this was a name-literal comparison against
+  // `container:videofetch-media-netns`, a string Docker does not emit for a
+  // running container — it stores the resolved 64-hex target id. The first
+  // authenticated Stage-A run failed a correctly placed Worker because of it.
+  //
+  // The replacement proves the PROPERTY rather than a rendering, from two
+  // independently measured identities that must agree: the target Docker
+  // records, and the namespace the kernel reports for both PIDs.
   add(
     measuredCheck(
       "worker.network-mode",
-      obs.workerNetworkMode,
-      (value) => value === "container:videofetch-media-netns",
-      "the Worker container runs in the media network namespace",
+      obs.workerNetworkPlacement,
+      (value) => sharesMediaNetworkNamespace(value),
+      "the Worker shares the media network namespace (Docker target id and /proc netns agree)",
       { stage },
     ),
   );

@@ -79,6 +79,32 @@ import { dirname } from "node:path";
  *                  as BLOCKED, for a reason describing the instrument rather
  *                  than the deployment.
  *
+ *   10D-REM-02     THREE Stage-A observers were measuring the instrument
+ *                  rather than the deployment, and the first authenticated
+ *                  Stage-A run (`5e6670a858543d93`) proved it by failing a
+ *                  healthy deployment:
+ *
+ *                    `worker.network-mode` compared against
+ *                    `container:videofetch-media-netns`, a string Docker never
+ *                    emits for a running container — it stores the resolved
+ *                    64-hex target id. It now proves the shared namespace from
+ *                    Docker's target identity AND both `/proc/<pid>/ns/net`
+ *                    identities, so a PASS means materially more than before.
+ *
+ *                    `runtime.bundled-ejs` imported `yt_dlp_ejs.__version__`,
+ *                    which pinned EJS 0.8.0 does not expose, so the probe's own
+ *                    ImportError was reported as the runtime being unavailable.
+ *
+ *                    Both `worker-env.*` checks ran a probe whose Python source
+ *                    was a `SyntaxError`, because a JavaScript `\n` had put a
+ *                    real newline inside a `"` literal. The environment names
+ *                    were never read at all.
+ *
+ *                  An artifact from before this could only ever have carried
+ *                  those four checks as FAIL or BLOCKED for reasons describing
+ *                  the harness. Under the corrected observers the same shape
+ *                  means something strictly stronger.
+ *
  * A Stage A `PASS` from before those is not the Stage A `PASS` this harness
  * means, and nothing in the record itself distinguishes them.
  *
@@ -89,10 +115,16 @@ import { dirname } from "node:path";
  * obvious case; a field whose measurement became stricter is the case that
  * matters, because nothing else catches it.
  *
- * No live artifact compatibility is being broken: Phase 10D has not run, so no
- * acceptance artifact exists anywhere that this invalidates.
+ * One live artifact IS invalidated by the 10D-REM-02 bump, deliberately: the
+ * sealed `10d-remediation-01` record from run `5e6670a858543d93`. It remains
+ * valid history — a cryptographically verifiable account of the first
+ * authenticated Stage-A attempt and of the harness defects it exposed — but it
+ * can no longer authorize anything under the corrected observers, and
+ * `verifyRecord` refuses it on the version boundary alone, independently of its
+ * FAIL verdict. It must not be overwritten or resealed; a corrected Stage A
+ * uses a FRESH acceptance run.
  */
-export const EVIDENCE_SCHEMA_VERSION = "10d-remediation-01";
+export const EVIDENCE_SCHEMA_VERSION = "10d-remediation-02";
 export const HARNESS_ID = "deploy/acceptance/ytdlp-generic/acceptance.mjs";
 export const AUTHENTICATOR_ALG = "HMAC-SHA256";
 

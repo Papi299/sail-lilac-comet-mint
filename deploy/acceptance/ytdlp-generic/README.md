@@ -33,7 +33,7 @@ These are not interchangeable, and the harness never labels one as the other.
 | **Proves** | pinned-runtime *semantics* | the behaviour of the *deployed system* |
 | **Needs** | the image, `--network none` | a real deployment, a real job, real bytes |
 | **Run by** | anyone, any time | Phase 10D, under a double opt-in |
-| **Status** | executed and green | **NOT EXECUTED** |
+| **Status** | executed and green | **ATTEMPTED ONCE — FAILED** (see below) |
 
 A green offline run is **not** Production acceptance. It says the artifact in
 the image behaves as reviewed; it says nothing about what a deployed Worker did
@@ -1957,3 +1957,114 @@ expose raw yt-dlp stderr; or if it cannot distinguish Stage A from Stage B
 fail-closed, cannot prevent accidental live execution, or reveals a genuine
 Production-code defect. A production-code correction is reported separately —
 never folded into acceptance tooling.
+
+
+---
+
+## The first authenticated Stage-A run — FAILED
+
+Run `5e6670a858543d93`, schema `10d-remediation-01`, against the reviewed Worker
+image `sha256:b7b7554c…62b5` deployed at
+`4a537e3cb7403801f39a706ce7bed896c0fe11f7`.
+
+```
+verdict   FAIL
+PASS      16
+FAIL       1   worker.network-mode
+BLOCKED    6   runtime.ytdlp-version, runtime.bundled-ejs,
+               capability.implemented, capability.generic-not-usable,
+               worker-env.forbidden-absent, worker-env.required-present
+```
+
+**Stage A has NOT passed. Generic execution remains disabled. Stage B remains
+unauthorized.** The sealed artifact is retained, unmodified, as history.
+
+### What actually worked
+
+The product path did. `direct.regression-ready` and `direct.byte-integrity` both
+passed: a real direct-media job reached `ready`, and the bytes delivered through
+the signed GET matched the controlled fixture exactly — 48497 bytes,
+`44827ff84f50036186a34e7d487ae13afab6934d0b6d17009f5dcf386cd81bdd`. All seven
+services, the safe-egress verifier, image identity, the `latest` alias, Python
+3.11, Node v22 and `YTDLP_ENABLED` disabled all passed too.
+
+That matters for reading the rest: transport, HMAC, Cloudflare routing and the
+Worker's job contracts were all demonstrably healthy.
+
+### Two harness defects — the instrument, not the deployment
+
+**`worker.network-mode` compared against a string Docker never emits.** The
+check required `NetworkMode === "container:videofetch-media-netns"`, but
+`--network container:<name>` is resolved at creation time and stored as the
+target's canonical 64-hex id. A correctly placed Worker therefore failed. It now
+proves the property from two independently measured identities that must agree —
+the Docker target id versus `videofetch-media-netns`'s own id, and
+`readlink /proc/<pid>/ns/net` for both containers — and fails closed on
+`bridge`/`host`/`none`, a wrong target, a stopped namespace holder, an
+unreadable link, or differing namespaces.
+
+**`runtime.bundled-ejs` asked for an attribute the package does not expose.**
+The probe imported `yt_dlp_ejs.__version__`; pinned EJS 0.8.0 exports only
+`version` (`__all__ = ["version"]`). The probe's own `ImportError` was reported
+as the runtime being unavailable. Measured against the reviewed image,
+`__version__` is absent and `version` is `0.8.0`.
+
+**A third defect the run also exposed:** both `worker-env.*` checks ran a probe
+whose Python source was a `SyntaxError`. A JavaScript `'\n'` is a real newline,
+so the interpreter received a `"` literal split across two physical lines. The
+environment names were never read at all. The separator is now escaped so Python
+receives its own newline escape.
+
+All three had passed review because the tests mocked them with idealized values.
+The regressions now EXECUTE: a real pair of namespace-sharing Docker containers,
+a real Python interpreter, and the real reviewed image.
+
+### `/api/diagnostics` and `/api/sites` 500 — control-plane deployment skew
+
+Five of the six BLOCKED checks trace to those two endpoints failing under an
+authenticated session. The classification is **CONTROL-PLANE DEPLOYMENT SKEW**,
+and it is not a repository defect:
+
+```
+new Worker /v1/diagnostics  →  {binaries, runtime, features,
+                                safeEgress{enforcement, policyVersion}}
+        ↓
+Production-era WorkerClient strict WorkerDiagnosticsSuccessSchema
+   (no `runtime`, no `features`, requires `safeEgress.attested`)
+        ↓  ZodError
+getWorkerClient().diagnostics() rejects
+        ↓
+/api/diagnostics → safe 500
+/api/sites       → loadSites() calls diagnostics() → safe 500
+```
+
+The Vercel Production deployment was created **2026-08-30 23:10**; the contract
+change (`506b1b62`) landed **2026-09-02 12:26**. Dates alone do not prove it, so
+`src/shared/worker/contracts.test.ts` proves it executably: today's Worker
+response satisfies today's schema — the Worker parses its own response with that
+same module before sending it, so a control plane built from the same commit
+*cannot* fail — while the Production-era schema rejects it on unrecognized keys
+and a changed `safeEgress` shape.
+
+The direct path passing is what rules out transport, auth and routing.
+
+**No backward-compatibility parsing was added.** Aligning Vercel Production is a
+separate, later, authorized task.
+
+### The schema moved to `10d-remediation-02`
+
+Because `worker.network-mode`, `runtime.bundled-ejs` and both `worker-env.*`
+checks now mean something materially stronger. The sealed
+`10d-remediation-01` record is refused by `verifyRecord` on the version boundary
+alone, independently of its FAIL verdict.
+
+### The corrected retry uses a FRESH acceptance run
+
+Never overwrite run `5e6670a858543d93`. Use new paths, for example:
+
+```
+~/vf-phase10d-acceptance/remediation-02/.vf-acceptance-run.json   (0600)
+~/vf-phase10d-acceptance/remediation-02/stage-a.json
+```
+
+with the containing directory at `0700`.
