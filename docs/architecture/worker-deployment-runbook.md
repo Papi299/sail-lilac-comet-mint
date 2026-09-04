@@ -4093,3 +4093,28 @@ target is refused (`lstat`, so a symlink counts as occupied) before any
 product-changing work, and the final create is exclusive so a racing writer
 loses instead of overwriting. The harness never deletes, truncates, renames or
 archives an artifact; choosing a new path is a deliberate operator action.
+
+### The missing-destination gap, closed before Stage B
+
+Review of that correction found the other half still open: `--evidence` was
+still **optional** for a live run, and the Stage B case producer only checked
+for it *after* it had run. Reproduced at CLI level against the unfixed source:
+
+- live Stage A with no `--evidence` ran to a full `PASS` (exit 0) — minting a
+  run key and creating a real direct-media job — and left no record behind;
+- a live Stage B case logged in and entered its producer, then returned a usage
+  error: real work, no artifact;
+- a live aggregate proceeded into `LIVE ACCEPTANCE — stage B (aggregate)` and
+  read the Stage-A and case artifacts before any destination was required.
+
+Every live acceptance command now requires `--evidence <path>`, checked together
+with the unoccupied-path gate at a single admission point ahead of the login,
+the run key and every producer. The path is parsed once there and carried to the
+final exclusive write, so the admitted, preflighted and created paths cannot
+disagree. Dry runs are unaffected: they never require and never write evidence.
+
+`EVIDENCE_SCHEMA_VERSION` remains `10d-remediation-02` — this changes CLI
+admission and durability preconditions, not observer semantics, evaluator
+semantics, record shape, HMAC material or the deployment binding. Run
+`a9ce1c400db8d817` remains the valid Stage-A authorization artifact, generic
+execution remains disabled, and Stage B has not started.

@@ -1472,6 +1472,7 @@ describe("real CLI orchestration", () => {
         "--stage", "B", "--aggregate", ...LIVE_ARGS,
         "--stage-a", "/tmp/stage-a.json",
         "--case-evidence", "/tmp/foreign.json",
+        "--evidence", "/tmp/aggregate-foreign.json",
       ],
       LIVE_ENV(),
       { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
@@ -1487,7 +1488,7 @@ describe("control-plane authentication", () => {
   it("5. a live run with the access secret invokes login exactly once", async () => {
     const world = makeFakeWorld();
     const run = await runCli(
-      ["--stage", "A", ...LIVE_ARGS],
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/login-once.json"],
       LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
       { runReadOnly: world.runReadOnly, fetch: world.fetch },
     );
@@ -1512,7 +1513,7 @@ describe("control-plane authentication", () => {
   it("5c. a failed login BLOCKS rather than continuing unauthenticated", async () => {
     const world = makeFakeWorld({ loginFails: true });
     const run = await runCli(
-      ["--stage", "A", ...LIVE_ARGS],
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/login-fails.json"],
       LIVE_ENV(),
       { runReadOnly: world.runReadOnly, fetch: world.fetch },
     );
@@ -2464,7 +2465,11 @@ describe("Stage A record binding", () => {
     ]) {
       const files = seedRun(new Map([["/tmp/sa.json", body]]));
       const run = await runCli(
-        ["--stage", "B", "--aggregate", ...LIVE_ARGS, "--stage-a", "/tmp/sa.json"],
+        [
+          "--stage", "B", "--aggregate", ...LIVE_ARGS,
+          "--stage-a", "/tmp/sa.json",
+          "--evidence", "/tmp/aggregate-unusable.json",
+        ],
         LIVE_ENV(),
         { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
       );
@@ -2879,10 +2884,11 @@ describe("Stage B outcome matrix", () => {
 describe("stage separation", () => {
   it("4. Stage A is refused against an enabled deployment", async () => {
     const world = makeFakeWorld({ ytdlpEnabled: "true" });
-    const run = await runCli(["--stage", "A", ...LIVE_ARGS], LIVE_ENV(), {
-      runReadOnly: world.runReadOnly,
-      fetch: world.fetch,
-    });
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/stage-mismatch.json"],
+      LIVE_ENV(),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+    );
     assert.equal(run.code, 2);
     assert.match(run.err, /STAGE MISMATCH/);
     assert.match(run.err, /Refusing to grade Stage A/);
@@ -7992,5 +7998,134 @@ describe("acceptance evidence immutability (CORRECTION-08)", () => {
     assert.equal(run.code, 2, `${run.out}\n${run.err}`);
     assert.match(run.err, /evidence path/i);
     assert.ok(!world.calls.fetches.includes("POST /api/download"));
+  });
+});
+
+// ── CORRECTION-08.1: a live command must NAME its destination ──────────────
+//
+// CORRECTION-08 made an artifact impossible to overwrite. It left the other
+// half open: `--evidence` was still OPTIONAL for a live run, and the Stage B
+// case producer only checked for it AFTER it had already run. An operator who
+// forgot the flag got a real generic job, a real cancellation or a real Worker
+// restart — and then a usage error instead of a record.
+//
+// A missing filename is not a free filename. For a production-changing case it
+// is the absence of authorization to execute the case at all.
+
+describe("live acceptance requires a durable destination (CORRECTION-08.1)", () => {
+  it("88. live Stage A without --evidence refuses before ANY live work", async () => {
+    const world = makeFakeWorld();
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+    );
+    assert.equal(run.code, 3, `usage failure expected:\n${run.out}\n${run.err}`);
+    assert.match(run.err, /--evidence <path> is required for a live acceptance command/);
+
+    assert.equal(world.calls.logins, 0, "no login");
+    assert.equal(world.calls.fetches.length, 0, "no product request, no direct job");
+    assert.equal(world.calls.commands.length, 0, "no system observation");
+    assert.equal(run.files.size, 0, "no run key, no filesystem mutation");
+    assert.doesNotMatch(run.out, /VERDICT/);
+  });
+
+  it("89. a live Stage B case without --evidence never enters the producer", async () => {
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const files = seedRun();
+    const run = await runCli(
+      ["--stage", "B", "--case", "success", ...LIVE_ARGS],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+        VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+        ...WORKER_ENV,
+      }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+    assert.equal(run.code, 3, `${run.out}\n${run.err}`);
+    assert.match(run.err, /--evidence <path> is required/);
+    assert.equal(world.calls.logins, 0, "no login");
+    assert.equal(world.calls.fetches.length, 0, "no generic job, no product request");
+    assert.equal(world.calls.commands.length, 0, "no pre-case deployment snapshot");
+    // Only the seeded run key remains; nothing was written.
+    assert.deepEqual([...run.files.keys()], [RUN_KEY_PATH]);
+  });
+
+  it("90. EVERY executable case producer is gated on --evidence", async () => {
+    // Table-driven over the real producer registry, so a case added later
+    // cannot quietly escape the gate.
+    for (const name of liveCaseNames()) {
+      const world = makeFakeWorld({
+        ytdlpEnabled: "true",
+        sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+      });
+      const run = await runCli(
+        ["--stage", "B", "--case", name, ...LIVE_ARGS],
+        LIVE_ENV({
+          VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+          VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+          ...WORKER_ENV,
+        }),
+        { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
+      );
+      assert.equal(run.code, 3, `${name} must refuse:\n${run.out}\n${run.err}`);
+      assert.match(run.err, /--evidence <path> is required/, name);
+      // No cancellation, no restart choreography, no fixture transfer, no
+      // deny-counter read — the producer was never entered.
+      assert.equal(world.calls.fetches.length, 0, `${name}: made a product request`);
+      assert.equal(world.calls.commands.length, 0, `${name}: ran a system command`);
+      assert.equal(world.calls.logins, 0, `${name}: logged in`);
+    }
+  });
+
+  it("91. a live aggregate without --evidence refuses before reading any artifact", async () => {
+    const world = makeFakeWorld();
+    const reads = [];
+    const files = seedRun(new Map([["/tmp/sa.json", "{}"], ["/tmp/case.json", "{}"]]));
+    const run = await runCli(
+      [
+        "--stage", "B", "--aggregate", ...LIVE_ARGS,
+        "--stage-a", "/tmp/sa.json",
+        "--case-evidence", "/tmp/case.json",
+      ],
+      LIVE_ENV(),
+      {
+        runReadOnly: world.runReadOnly,
+        fetch: world.fetch,
+        files,
+        readFile: async (path) => {
+          reads.push(path);
+          if (files.has(path)) return files.get(path);
+          throw new Error(`no such file ${path}`);
+        },
+      },
+    );
+    assert.equal(run.code, 3, `${run.out}\n${run.err}`);
+    assert.match(run.err, /--evidence <path> is required/);
+    // The Stage B verdict is the final durable acceptance result; it may never
+    // be announced without a sealed artifact.
+    assert.doesNotMatch(run.out, /VERDICT/);
+    assert.deepEqual(reads, [], "no Stage-A or case artifact may be read first");
+    assert.equal(world.calls.logins, 0);
+  });
+
+  it("92. dry runs still never require --evidence", async () => {
+    for (const argv of [
+      ["--stage", "A"],
+      ["--stage", "B", "--case", "success"],
+      ["--stage", "B", "--aggregate"],
+    ]) {
+      const world = makeFakeWorld();
+      const run = await runCli(argv, {}, { runReadOnly: world.runReadOnly, fetch: world.fetch });
+      assert.equal(run.code, 2, `${argv.join(" ")} must BLOCK as a dry run, not fail usage`);
+      assert.match(run.out, /LIVE EXECUTION REFUSED/);
+      assert.doesNotMatch(run.err, /--evidence <path> is required/);
+      assert.equal(run.files.size, 0, "a dry run writes nothing");
+      assert.equal(world.calls.fetches.length, 0);
+      assert.equal(world.calls.commands.length, 0);
+    }
   });
 });

@@ -214,17 +214,38 @@ export async function main(argv, env, deps = {}) {
   }
   registerSecret(accessSecret);
 
-  // ── §6 of CORRECTION-08: the evidence path must be free BEFORE any
-  //    product-changing acceptance work ──────────────────────────────────────
+  // ── §4/§6 of CORRECTION-08: a live command must NAME a free destination
+  //    BEFORE any product-changing acceptance work ───────────────────────────
   //
-  // Earlier than the login, earlier than the run key, and earlier than every
-  // producer. Discovering an occupied path after Stage A created a direct-media
-  // job — or after a Stage B case cancelled a download and restarted the Worker
-  // — would mean real production work whose record can never be written.
+  // Two conditions, one admission point, earlier than the login, earlier than
+  // the run key, and earlier than every producer.
+  //
+  // PRESENT. `--evidence` used to be optional for a live run, and the Stage B
+  // case producer only checked for it AFTER it had run — so an operator who
+  // forgot the flag got a real generic job, a real cancellation or a real
+  // Worker restart, and then a usage error instead of a record. A missing
+  // filename is not a free filename: for a production-changing case it is the
+  // absence of authorization to execute the case at all.
+  //
+  // UNOCCUPIED. Discovering a taken path after Stage A created its direct-media
+  // job would mean the same thing by a different route — real work whose record
+  // can never be written.
+  //
+  // Parsed ONCE, here, and carried on `ctx`: the path admitted is provably the
+  // path preflighted and the path exclusively created, because no producer
+  // re-reads argv at seal time.
   //
   // This does NOT close the race; it only makes the common case cost nothing.
   // The exclusive create at seal time remains mandatory.
-  const pathFree = await evidencePathAvailable(readOption(argv, "--evidence"), deps);
+  const evidencePath = readOption(argv, "--evidence");
+  if (!evidencePath) {
+    errorLog(
+      "usage error: --evidence <path> is required for a live acceptance command. " +
+        "Acceptance work whose result cannot be durably recorded is not authorized to run.",
+    );
+    return EXIT.USAGE;
+  }
+  const pathFree = await evidencePathAvailable(evidencePath, deps);
   if (!pathFree.ok) {
     errorLog(pathFree.reason);
     return EXIT.BLOCKED;
@@ -297,6 +318,8 @@ export async function main(argv, env, deps = {}) {
   const ctx = {
     run: acceptanceRun,
     argv,
+    // The single admitted, preflighted evidence destination (§6).
+    evidencePath,
     env,
     log,
     errorLog,
@@ -326,7 +349,7 @@ export async function main(argv, env, deps = {}) {
 // ── Stage A ────────────────────────────────────────────────────────────────
 
 async function runStageA(ctx) {
-  const { argv, log, errorLog, secrets, deps } = ctx;
+  const { log, errorLog, secrets, deps, evidencePath } = ctx;
 
   const obs = await collectStageAObservations(ctx);
 
@@ -386,8 +409,9 @@ async function runStageA(ctx) {
     summary: result.summary,
   });
 
-  const evidencePath = readOption(argv, "--evidence");
-  if (evidencePath) {
+  // The destination was admitted and preflighted at §4; sealing uses that exact
+  // path rather than re-reading argv, so the three can never disagree.
+  {
     const sealed = sealRecord(record, ctx.run.key);
     const rendered = renderEvidence(sealed, secrets);
     if (rendered.includes("<scrubbed>")) {
@@ -510,7 +534,7 @@ export async function runDirectRegression(ctx, directUrl, declaredDigest) {
 // ── Stage B: one case ──────────────────────────────────────────────────────
 
 async function runStageBCase(ctx, caseName) {
-  const { argv, log, errorLog, secrets, env, expectedSha, run: acceptanceRun, deps } = ctx;
+  const { argv, log, errorLog, secrets, env, expectedSha, run: acceptanceRun, deps, evidencePath } = ctx;
 
   // ── §12 of CORRECTION-07: ONE pre-case deployment snapshot ─────────────
   //
@@ -750,9 +774,13 @@ async function runStageBCase(ctx, caseName) {
     acceptanceRun.key,
   );
 
-  const evidencePath = readOption(argv, "--evidence");
+  // §7 of CORRECTION-08: this used to be the PRIMARY gate, and it sat HERE —
+  // after the producer had already run a generic job, cancelled a download or
+  // restarted the Worker. Live admission now establishes the invariant
+  // structurally, so what remains is a defensive assertion no public CLI path
+  // can reach, not a safety check anything relies on.
   if (!evidencePath) {
-    errorLog("usage error: --evidence <path> is required for a case run; the record is its output");
+    errorLog("internal error: a live case reached its producer without an admitted evidence path");
     return EXIT.USAGE;
   }
   const rendered = renderEvidence(record, secrets);
@@ -880,7 +908,7 @@ async function measureFeatureState(ctx, ytdlpEnabledRaw) {
 // ── Stage B: aggregation ───────────────────────────────────────────────────
 
 async function runStageBAggregate(ctx) {
-  const { argv, log, errorLog, read, secrets, system, session, expectedSha, deps } = ctx;
+  const { argv, log, errorLog, read, secrets, system, session, expectedSha, deps, evidencePath } = ctx;
 
   const stageAPath = readOption(argv, "--stage-a");
   const stageA = await loadStageA(stageAPath, read, {
@@ -1047,8 +1075,8 @@ async function runStageBAggregate(ctx) {
     summary: result.summary,
   });
 
-  const evidencePath = readOption(argv, "--evidence");
-  if (evidencePath) {
+  // The admitted, preflighted destination (§6) — never re-parsed from argv.
+  {
     const sealed = sealRecord(record, ctx.run.key);
     const rendered = renderEvidence(sealed, secrets);
     if (rendered.includes("<scrubbed>")) {

@@ -317,6 +317,31 @@ The run key has been fail-closed since CORRECTION-05. Until CORRECTION-08 the
 holding a run's only durable result was easier to destroy than the file holding
 its key.
 
+**Every LIVE acceptance command requires `--evidence <path>`.** Stage A, every
+Stage B case and the aggregation are admitted only after *both* conditions hold:
+
+```
+the evidence path is PRESENT      (a live run must name its destination)
+the evidence path is UNOCCUPIED   (naming a taken one is refused, not resolved)
+```
+
+Both are checked at one admission point — before the private-access login,
+before the run key is minted or loaded, and before any observer, product
+request, job, cancellation or restart. The path is parsed **once** there and
+carried on the context, so the path admitted is provably the path preflighted
+and the path exclusively created; no producer re-reads `argv` at seal time.
+
+A missing filename is not a free filename. The Stage B case producer used to
+check for `--evidence` *after* it had run — an operator who forgot the flag got
+a real generic job, a real cancellation or a real Worker restart, and then a
+usage error instead of a record. For a production-changing case, no evidence
+destination means no authorization to execute the case at all.
+
+**Dry runs never require and never write evidence.** The mandatory-path rule
+begins only after the live gate has positively admitted live execution; without
+both opt-ins every subcommand still prints `LIVE EXECUTION REFUSED`, exits 2 and
+touches nothing.
+
 - a **dry run writes nothing at all**, even when handed `--evidence`. It used to
   seal a `mode: "dry-run"` stub there — so the one invocation an operator
   reaches for *because* it changes nothing could replace a sealed PASS with a
@@ -336,6 +361,14 @@ its key.
 The bounded consequence of losing the race is stated plainly rather than hidden:
 the acceptance work may already have executed against Production, but no
 evidence claim is made for a run whose record could not be durably written.
+
+**What these two checks do and do not prove.** The early gate proves the target
+path was *unoccupied*; the exclusive creation proves it was *still* unoccupied at
+the final write. Neither proves the parent directory exists, is writable, or has
+safe permissions — an unwritable directory surfaces as a write failure at seal
+time, not as an early refusal. Pre-creating and verifying the private evidence
+workspace is a separate operator step, and the later Stage-B operational task
+does it before generic execution is enabled.
 
 `ENOENT` is the only condition that mints a run:
 
