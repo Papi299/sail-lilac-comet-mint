@@ -85,6 +85,27 @@ evidence found it.
 computed from its generated file after FFmpeg exits, and again by the fixture
 service at startup from the buffer it will actually serve.
 
+### The generic digest is an acceptance input, and its timing is the point
+
+The generic fixture's SHA-256 is carried into the live run as
+`VIDEOFETCH_ACCEPT_GENERIC_SHA256` (64 lowercase hex, required by the `success`
+case):
+
+```
+prepare-media.mjs  ->  genericSha256  ->  VIDEOFETCH_ACCEPT_GENERIC_SHA256  ->  Stage-B success
+```
+
+Set it **before** the Quick Tunnel is created and **before** any job exists. That
+ordering is what makes it evidence: a digest taken from the generated file cannot
+be a restatement of what VideoFetch returned, so `vercel.byte-integrity` compares
+the delivered bytes against something the product never touched.
+
+It is deliberately **not** committed as a constant. The fixture is regenerated
+from the exact Worker image immediately before acceptance, and a later reviewed
+image carrying a different but valid FFmpeg/x264 build produces different —
+equally correct — bytes. Read it from the generator's output, or from the
+manifest's `genericMediaSha256`, every time.
+
 ### Why the generic fixture is not the direct one
 
 `PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001`. Both routes used to serve
@@ -145,6 +166,7 @@ and build the harness environment from the single temporary origin:
 VIDEOFETCH_ACCEPT_DIRECT_URL=https://<random>.trycloudflare.com/direct.mp4
 VIDEOFETCH_ACCEPT_DIRECT_SHA256=<the manifest's directSha256>
 VIDEOFETCH_ACCEPT_GENERIC_URL=https://<random>.trycloudflare.com/generic
+VIDEOFETCH_ACCEPT_GENERIC_SHA256=<the manifest's genericMediaSha256>
 VIDEOFETCH_ACCEPT_BYTELIMIT_URL=https://<random>.trycloudflare.com/byte-limit
 VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL=https://<random>.trycloudflare.com/byte-evidence
 VIDEOFETCH_ACCEPT_EGRESS_REDIRECT_URL=https://<random>.trycloudflare.com/safe-egress

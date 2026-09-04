@@ -41,6 +41,10 @@
 //   VIDEOFETCH_ACCEPT_GENERIC_URL     operator-supplied public generic URL (§23)
 //   VIDEOFETCH_ACCEPT_DIRECT_URL      operator-supplied direct-media fixture URL
 //   VIDEOFETCH_ACCEPT_DIRECT_SHA256   that fixture's known digest (direct case)
+//   VIDEOFETCH_ACCEPT_GENERIC_SHA256  the GENERIC fixture's digest, computed
+//                                     from the generated file BEFORE it was
+//                                     exposed and before any job existed
+//                                     (required by the Stage-B success case)
 //   VF_CONTROL_KEY_ID / VF_CONTROL_SECRET / VF_WORKER_ORIGIN
 //                                     for the Worker's own cancel route
 
@@ -71,8 +75,10 @@ import {
 } from "./lib/download-window.mjs";
 import {
   CASE_PRODUCERS,
+  GENERIC_EXPECTED_DIGEST_ENV,
   buildCaseRecord,
   caseNames,
+  parseGenericExpectedDigest,
   describeFeatureState,
   evaluateCaseFeatureState,
   evaluateContainerEpoch,
@@ -599,10 +605,16 @@ async function runStageBCase(ctx, caseName) {
   const binding = { expectedSha, runningImageId: authorizedImageId };
 
   const producer = CASE_PRODUCERS[caseName];
+  // Parsed once, before the context is built and before any producer runs.
+  const genericDigest = parseGenericExpectedDigest(env[GENERIC_EXPECTED_DIGEST_ENV]);
   const caseCtx = {
     ...ctx,
     genericUrl: env.VIDEOFETCH_ACCEPT_GENERIC_URL ?? null,
     directUrl: env.VIDEOFETCH_ACCEPT_DIRECT_URL ?? null,
+    // CORRECTION-01 §5: admitted ONCE, here, and carried. The producer reads it
+    // from the context and never re-reads the environment, so the digest sealed
+    // into the record is provably the digest this command admitted.
+    genericExpectedDigest: genericDigest.ok ? genericDigest.digest : null,
     byteLimitUrl: env.VIDEOFETCH_ACCEPT_BYTELIMIT_URL ?? null,
     egressRedirectUrl: env.VIDEOFETCH_ACCEPT_EGRESS_REDIRECT_URL ?? null,
     cloudflaredUnit: readOption(argv, "--cloudflared-unit") ?? "vf-cloudflared",
@@ -633,6 +645,21 @@ async function runStageBCase(ctx, caseName) {
     shutdownWindowMs: ctx.deps.shutdownWindowMs,
     recoveryWindowMs: ctx.deps.recoveryWindowMs,
   };
+
+  // ── CORRECTION-01 §4: the expected generic digest, refused precisely ────
+  //
+  // Ahead of the generic `needs` sweep so a MALFORMED value is named as such
+  // rather than reported as absent, and ahead of `producer.run` so neither a
+  // missing nor a malformed value can reach a case that would then submit a
+  // real analysis and create a real job it could never seal a record for.
+  //
+  // Only cases that actually consume it are gated: the other Stage-B cases make
+  // no claim about the generic fixture's content identity, and demanding it from
+  // them would be a usage failure with no finding behind it.
+  if ((producer.needs ?? []).includes("genericExpectedDigest") && !genericDigest.ok) {
+    errorLog(`usage error: case '${caseName}' — ${genericDigest.reason}`);
+    return EXIT.USAGE;
+  }
 
   // Every input a case declares is required before anything is submitted.
   const missing = (producer.needs ?? []).filter((need) => {

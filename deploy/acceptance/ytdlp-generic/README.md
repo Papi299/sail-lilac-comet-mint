@@ -645,7 +645,7 @@ does not do this.**
 | R2 | `r2.delegated-write` | The object exists with non-zero length, written through the AF_UNIX broker. |
 | | `r2.worker-holds-no-credential` | The Worker still holds no persistent R2 credential. |
 | Vercel | `vercel.signed-get` | `303` to a presigned read-only GET. The Worker never performs the GET. |
-| | `vercel.byte-integrity` | **Three-way** length agreement — durable `fileSize`, R2 `contentLength`, delivered bytes — plus a real SHA-256. `HTTP 200` alone is not proof. |
+| | `vercel.byte-integrity` | The delivered bytes hash to the **generic fixture digest computed before the run**, *and* **three-way** length agreement — durable `fileSize`, R2 `contentLength`, delivered bytes. `HTTP 200` alone is not proof, and neither is length agreement alone. |
 | Privacy | `privacy.sentinel-not-leaked` | The ephemeral sentinel appears in none of the swept surfaces. |
 | Cancel | `cancel.durable-cancelled` | Cancel during `downloading` → durable `cancelled`, no late `ready`. |
 | | `cancel.processes-gone` | No yt-dlp or Node descendant survives. |
@@ -815,6 +815,51 @@ running yt-dlp directly and calling that proof would test a different system
 than the one being accepted.
 
 Its query string is redacted in every output surface.
+
+### The generic fixture digest is an input too, and so is its timing
+
+```
+VIDEOFETCH_ACCEPT_GENERIC_SHA256=<64 lowercase hex>
+```
+
+Required by the `success` case; the other Stage-B cases make no claim about the
+generic fixture's content identity and are not asked for it. A missing or
+malformed value is a **usage failure refused before the producer submits
+anything** — not a case that runs and then cannot be recorded.
+
+It is **not a constant in source, deliberately.** The generic fixture is
+regenerated from the exact Worker image immediately before acceptance, and a
+later reviewed image carrying a different but valid FFmpeg/x264 build produces
+different — equally correct — bytes. A committed digest would either need
+editing for every image, or would fail the run it existed to protect.
+
+What fixes its meaning is **when it is computed**, not where it is stored:
+
+```
+prepare-media.mjs generates the generic fixture
+        ↓  SHA-256 of the file on disk, from the generator's own output
+VIDEOFETCH_ACCEPT_GENERIC_SHA256          before the Quick Tunnel exists
+        ↓  validated once, at the CLI admission point
+case context `genericExpectedDigest`      before any product request
+        ↓  read once; the environment is never re-read mid-case
+runSuccessCase -> vercelDelivery.expectedDigest
+        ↓  inside the seal
+Stage-B `vercel.byte-integrity`
+```
+
+Because the digest is taken from the generated file before the fixture is
+exposed and before the job exists, it cannot be a restatement of what VideoFetch
+returned. It is never derived from the delivered bytes, R2 metadata, the durable
+file size, the Vercel response, or a second download.
+
+**Why the comparison is mandatory rather than optional.** It used to be
+`expectedDigest == null || expectedDigest === clientDigest`, on the reasoning
+that no independently known digest can exist for a generic source. That holds for
+an arbitrary public URL and not for this controlled fixture — and while it held,
+a **self-consistent wrong object** satisfied every remaining clause: delivered
+bytes, durable `fileSize` and R2 `contentLength` all agreeing with each other,
+carrying content that was never the fixture's. Three lengths agreeing prove the
+pipeline was internally coherent. They say nothing about which bytes it carried.
 
 ### Process observation — what is captured, and what never is
 
@@ -1721,7 +1766,7 @@ where they belong.
 | The delivered artifact matches the accepted preset | **Live** — `delivery.matches-advertised-preset` |
 | Delivered length == durable `fileSize` == provider `contentLength` | **Live** — `vercel.byte-integrity` |
 | The delivered bytes' SHA-256 | **Live**, recorded |
-| An *independent* digest of the Worker-produced object | **Only for the direct fixture**, whose digest the harness derives itself |
+| An *independent* digest of the delivered object | **Live**, for BOTH fixtures — the direct digest the harness derives itself, the generic digest supplied as `VIDEOFETCH_ACCEPT_GENERIC_SHA256` from the generated file before it was exposed |
 | Generic worked **while it was enabled** | **Live**, from the `success` record's sealed feature state |
 | The kill switch worked **while it was disabled** | **Live**, from the `kill-switch` record's sealed feature state |
 | This exact transfer crossed the byte threshold | **Live** — case-correlated fixture evidence vs. the deployed `MAX_FILE_SIZE` |
@@ -2205,6 +2250,16 @@ download budget was never approached; the job lived 39 s.
 own larger deterministic fixture instead, so the same 14 s transfer arrives as
 many completed reads. Verified 3/3 against the pinned image: one media GET, no
 retry GET, exit 0, byte-identical output, ~16.8 s per acquisition.
+
+> **Historical measurement, not a constant.** Under the reviewed acceptance image
+> `sha256:b7b7554c…` the generic recipe produced 10,872,896 bytes, SHA-256
+> `be6283681981745d19341a4798775500fef5be451f1ddda2dc93ffd4ab434167`, reproduced
+> identically across two independent generations. That value is recorded here so
+> a reviewer can reproduce this run — it is **not** committed anywhere as the
+> expected digest, because a later reviewed image with a different but valid
+> FFmpeg/x264 build would produce different, equally correct bytes. The expected
+> digest is always read from the generator at acceptance time and supplied as
+> `VIDEOFETCH_ACCEPT_GENERIC_SHA256`.
 
 ### The retry hypothesis was falsified
 

@@ -480,24 +480,33 @@ export function evaluateStageB(obs, stageAResult) {
       "vercel.byte-integrity",
       obs.vercelDelivery,
       // HTTP 200 alone is explicitly NOT proof (§37). Three-way length
-      // agreement — durable, provider and client — plus a real digest.
+      // agreement — durable, provider and client — AND content identity against
+      // a digest that did not come from this delivery.
+      //
+      // CORRECTION-01 §8. The digest comparison used to be optional
+      // (`expectedDigest == null || ...`), on the reasoning that no
+      // independently known digest can exist for a generic source. That is true
+      // of an ARBITRARY PUBLIC source and false of the controlled Stage-B
+      // fixture, which is generated locally, hashed from the file on disk, and
+      // only then exposed. Optional meant a self-consistent WRONG object — where
+      // the client bytes, the durable fileSize and the R2 Content-Length all
+      // agree with each other but the content is not the fixture — passed every
+      // clause. Three lengths agreeing prove the pipeline was internally
+      // coherent; they prove nothing about WHICH bytes it carried.
       (value) =>
         typeof value?.clientDigest === "string" &&
         /^[0-9a-f]{64}$/.test(value.clientDigest) &&
+        typeof value?.expectedDigest === "string" &&
+        /^[0-9a-f]{64}$/.test(value.expectedDigest) &&
+        value.expectedDigest === value.clientDigest &&
         value.clientBytes > 0 &&
         value.clientBytes === value.durableFileSize &&
-        value.clientBytes === value.r2ContentLength &&
-        // An independently known digest is compared when one exists (the direct
-        // fixture case); for a public generic source none can exist without
-        // re-acquiring the media, which the harness must not do.
-        (value.expectedDigest == null || value.expectedDigest === value.clientDigest),
-      // §33: state exactly which boundaries were measured. The client digest is
-      // a digest of the bytes the client received; it is NOT an independent
-      // measurement of the Worker-produced object, because deriving one would
-      // mean re-acquiring the media outside the application path. The direct
-      // fixture case is where a genuinely independent digest exists, and there
-      // `expectedDigest` is populated and compared.
-      "delivered byte length agrees with the durable fileSize and the provider contentLength, and the delivered bytes hash to a recorded SHA-256",
+        value.clientBytes === value.r2ContentLength,
+      // §33: state exactly which boundaries were measured. `expectedDigest` is
+      // the SHA-256 of the generated generic fixture, taken before the fixture
+      // was exposed and before the job existed, so this is content identity
+      // against an independent measurement — not a restatement of the delivery.
+      "delivered bytes hash to the generic fixture digest computed before the run, and the delivered byte length agrees with the durable fileSize and the provider contentLength",
       { stage },
     ),
   );

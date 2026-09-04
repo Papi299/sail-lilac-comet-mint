@@ -1724,7 +1724,13 @@ private selector's internal constraints. Those are proven **offline** by
 became `vercel.byte-integrity` and now states exactly which boundaries it
 measured — durable `fileSize`, provider `contentLength`, delivered bytes and
 their SHA-256 — without implying an independent digest of the Worker-produced
-object, which only the direct fixture case genuinely has.
+object, which at that time only the direct fixture case genuinely had.
+
+> Superseded for the generic case by
+> `PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001-CORRECTION-01`: the
+> controlled Stage-B fixture is generated locally and hashed before it is
+> exposed, so the generic case now has an independent digest too. See
+> [the generic fixture digest](#the-generic-fixture-digest-is-an-acceptance-input).
 
 #### CORRECTION-03 — six acceptance-integrity defects closed
 
@@ -4214,3 +4220,50 @@ only fixture bytes and diagnostic ordering changed, not observer semantics,
 evaluator semantics, record shape, HMAC material or the deployment binding. Run
 `a9ce1c400db8d817` stays admissible, generic execution remains **disabled**, and
 Stage B has not been rerun.
+
+---
+
+### The generic fixture digest is an acceptance input
+
+`PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001-CORRECTION-01`.
+
+Splitting the fixtures gave the generic route its own locally generated file —
+and with it, something the generic case never had before: a digest that is known
+before VideoFetch is involved at all. The success case now proves content
+identity, not just internal coherence.
+
+```
+prepare-media.mjs                       generates BOTH fixtures from the exact image
+        ↓  genericSha256, from the file on disk
+VIDEOFETCH_ACCEPT_GENERIC_SHA256        set BEFORE the Quick Tunnel is created
+        ↓                               and BEFORE any job exists
+--stage B --case success
+```
+
+Grammar: 64 lowercase hex. Required by the `success` case only — the other
+Stage-B cases make no claim about the generic fixture's content and are not asked
+for it. A missing or malformed value is refused as a **usage failure before the
+producer submits any product request**, so a run that could never produce a valid
+record never creates work.
+
+**It is not a source constant, deliberately.** The fixture is regenerated from
+the exact Worker image immediately before acceptance; a later reviewed image with
+a different but valid FFmpeg/x264 build produces different, equally correct bytes.
+Pinning the digest in source would mean editing it for every image — or failing
+the run it was supposed to protect. What fixes its meaning is *when* it is
+computed, not where it is stored.
+
+`vercel.byte-integrity` now requires `expectedDigest` to be a real digest AND to
+equal the delivered digest, on top of the existing three-way length agreement.
+The comparison used to be optional, and while it was, a **self-consistent wrong
+object** — delivered bytes, durable `fileSize` and R2 `contentLength` all
+agreeing with each other, carrying content that was never the fixture's —
+satisfied every other clause. Three agreeing lengths prove the pipeline was
+internally coherent; they say nothing about which bytes it carried.
+
+`EVIDENCE_SCHEMA_VERSION` and `CASE_SCHEMA_VERSION` remain `10d-remediation-02`:
+the record shape already carried `expectedDigest` and the evaluator already read
+it, so nothing about Stage-A semantics, the deployment binding or the HMAC
+material moved. Accepted Stage-A run `a9ce1c400db8d817` stays admissible. No
+successful Stage-B success artifact exists, so no historical success evidence is
+invalidated by requiring the field.
