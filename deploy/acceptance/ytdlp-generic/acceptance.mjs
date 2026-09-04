@@ -44,7 +44,7 @@
 //   VF_CONTROL_KEY_ID / VF_CONTROL_SECRET / VF_WORKER_ORIGIN
 //                                     for the Worker's own cancel route
 
-import { writeFile, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { evaluateLiveGate, readOption, readOptionList, readStage, LIVE_ENV_NAME, LIVE_ENV_VALUE } from "./lib/gate.mjs";
 import { OUTCOMES } from "./lib/verdict.mjs";
@@ -93,6 +93,8 @@ import {
   bindingAgreesWithRecord,
   validateDeploymentBinding,
   verifyRecord,
+  evidencePathAvailable,
+  writeEvidenceExclusive,
 } from "./lib/provenance.mjs";
 
 const EXIT = Object.freeze({ PASS: 0, FAIL: 1, BLOCKED: 2, USAGE: 3 });
@@ -120,7 +122,6 @@ export async function main(argv, env, deps = {}) {
   });
   const log = safe.log;
   const errorLog = safe.error;
-  const write = deps.writeFile ?? writeFile;
   const read = deps.readFile ?? readFile;
 
   const stageArg = readStage(argv);
@@ -171,21 +172,14 @@ export async function main(argv, env, deps = {}) {
   // Reached by EVERY subcommand. There is no case-specific shortcut past it.
   if (!gate.live) {
     printDryRun(log, stage, gate, caseName, aggregate);
-    const record = buildEvidence({
-      stage,
-      mode: "dry-run",
-      startedAt,
-      finishedAt: new Date().toISOString(),
-      checks: [],
-      summary: {
-        verdict: OUTCOMES.BLOCKED,
-        counts: { PASS: 0, FAIL: 0, BLOCKED: 0, NOT_EXERCISED: 0 },
-        blocking: ["dry-run"],
-        notExercised: [],
-      },
-    });
-    const evidencePath = readOption(argv, "--evidence");
-    if (evidencePath) await write(evidencePath, renderEvidence(record, secrets), "utf8");
+    // §3 of CORRECTION-08: a dry run is OBSERVATIONAL, including its output.
+    //
+    // It used to seal a `mode: "dry-run"` BLOCKED stub to `--evidence`, which
+    // made the single safest invocation in the harness — the one an operator
+    // reaches for precisely BECAUSE it changes nothing — capable of destroying
+    // a sealed acceptance artifact by replacing it with a record carrying no
+    // schema, no runId and no checks. The console output above is the entire
+    // explanation a refusal owes anyone; nothing reaches the filesystem.
     return EXIT.BLOCKED;
   }
 
@@ -219,6 +213,22 @@ export async function main(argv, env, deps = {}) {
     return EXIT.USAGE;
   }
   registerSecret(accessSecret);
+
+  // ── §6 of CORRECTION-08: the evidence path must be free BEFORE any
+  //    product-changing acceptance work ──────────────────────────────────────
+  //
+  // Earlier than the login, earlier than the run key, and earlier than every
+  // producer. Discovering an occupied path after Stage A created a direct-media
+  // job — or after a Stage B case cancelled a download and restarted the Worker
+  // — would mean real production work whose record can never be written.
+  //
+  // This does NOT close the race; it only makes the common case cost nothing.
+  // The exclusive create at seal time remains mandatory.
+  const pathFree = await evidencePathAvailable(readOption(argv, "--evidence"), deps);
+  if (!pathFree.ok) {
+    errorLog(pathFree.reason);
+    return EXIT.BLOCKED;
+  }
 
   log(`LIVE ACCEPTANCE — stage ${stage}${caseName ? ` case ${caseName}` : ""}${aggregate ? " (aggregate)" : ""}`);
   log(`control plane : ${redactUrl(baseUrl)}`);
@@ -290,7 +300,6 @@ export async function main(argv, env, deps = {}) {
     env,
     log,
     errorLog,
-    write,
     read,
     system,
     session,
@@ -317,7 +326,7 @@ export async function main(argv, env, deps = {}) {
 // ── Stage A ────────────────────────────────────────────────────────────────
 
 async function runStageA(ctx) {
-  const { argv, log, errorLog, write, secrets } = ctx;
+  const { argv, log, errorLog, secrets, deps } = ctx;
 
   const obs = await collectStageAObservations(ctx);
 
@@ -388,7 +397,11 @@ async function runStageA(ctx) {
       );
       return EXIT.BLOCKED;
     }
-    await write(evidencePath, rendered, "utf8");
+    const written = await writeEvidenceExclusive(evidencePath, rendered, deps);
+    if (!written.ok) {
+      errorLog(written.reason);
+      return EXIT.BLOCKED;
+    }
     log(`\nevidence written: ${evidencePath}`);
   }
   log(`\nVERDICT: ${result.summary.verdict}`);
@@ -497,7 +510,7 @@ export async function runDirectRegression(ctx, directUrl, declaredDigest) {
 // ── Stage B: one case ──────────────────────────────────────────────────────
 
 async function runStageBCase(ctx, caseName) {
-  const { argv, log, errorLog, write, secrets, env, expectedSha, run: acceptanceRun } = ctx;
+  const { argv, log, errorLog, secrets, env, expectedSha, run: acceptanceRun, deps } = ctx;
 
   // ── §12 of CORRECTION-07: ONE pre-case deployment snapshot ─────────────
   //
@@ -752,7 +765,11 @@ async function runStageBCase(ctx, caseName) {
     );
     return EXIT.BLOCKED;
   }
-  await write(evidencePath, rendered, "utf8");
+  const written = await writeEvidenceExclusive(evidencePath, rendered, deps);
+  if (!written.ok) {
+    errorLog(written.reason);
+    return EXIT.BLOCKED;
+  }
   log(`case evidence written: ${evidencePath}`);
   log("Run `--stage B --aggregate` with every case record to obtain the Stage B verdict.");
   return EXIT.PASS;
@@ -863,7 +880,7 @@ async function measureFeatureState(ctx, ytdlpEnabledRaw) {
 // ── Stage B: aggregation ───────────────────────────────────────────────────
 
 async function runStageBAggregate(ctx) {
-  const { argv, log, errorLog, write, read, secrets, system, session, expectedSha } = ctx;
+  const { argv, log, errorLog, read, secrets, system, session, expectedSha, deps } = ctx;
 
   const stageAPath = readOption(argv, "--stage-a");
   const stageA = await loadStageA(stageAPath, read, {
@@ -1041,7 +1058,11 @@ async function runStageBAggregate(ctx) {
       );
       return EXIT.BLOCKED;
     }
-    await write(evidencePath, rendered, "utf8");
+    const written = await writeEvidenceExclusive(evidencePath, rendered, deps);
+    if (!written.ok) {
+      errorLog(written.reason);
+      return EXIT.BLOCKED;
+    }
     log(`\nevidence written: ${evidencePath}`);
   }
   log(`\nVERDICT: ${result.summary.verdict}`);

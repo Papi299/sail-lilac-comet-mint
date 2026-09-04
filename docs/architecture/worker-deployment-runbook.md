@@ -4038,3 +4038,58 @@ scheduled after this remediation is reviewed and merged.
 `10d-remediation-01` → `10d-remediation-02`, because four checks now mean
 something materially stronger. The old sealed record can authorize nothing:
 `verifyRecord` refuses it on the version boundary alone.
+
+
+## Phase 10D — the corrected Stage-A run (PASSED)
+
+Run `a9ce1c400db8d817`, schema `10d-remediation-02`, `live`, against the same
+reviewed Worker image `sha256:b7b7554c…62b5` at source
+`4a537e3cb7403801f39a706ce7bed896c0fe11f7`, through the Vercel control plane
+after it was aligned to `a40bd7984d18009f349b35bd20c7ff16c26da7f7`.
+
+```
+verdict   PASS        PASS 23    FAIL 0    BLOCKED 0    NOT_EXERCISED 0
+```
+
+All 23 checks are `required`. `runtime.ytdlp-version` measured `2026.08.19`,
+`runtime.python-series` `3.11.2`, `runtime.node-family` `v22.23.2`,
+`runtime.bundled-ejs` `0.8.0`. `worker.network-mode` agreed on both the
+canonical Docker target id and the `/proc/<pid>/ns/net` identity. The direct
+regression reached `ready` with extractor `direct` and delivered the fixture
+byte-for-byte (48497 bytes, `44827ff8…1bdd`).
+
+This does **not** replace the first authenticated attempt. Run
+`5e6670a858543d93` / `10d-remediation-01` FAILED, and its sealed record and run
+key are retained unmodified. Both runs are historical evidence; neither is
+rewritten.
+
+**Generic execution remains DISABLED.** `YTDLP_ENABLED` is unset, `/api/sites`
+reports `ytdlp: false`, and no Stage B case has been run. A Stage A `PASS` is
+not enablement authorization — the artifact is reviewed first.
+
+### Evidence schema
+
+`10d-remediation-02` is **unchanged** by the immutability correction below.
+Observer semantics, evaluator semantics, record contents and the deployment
+binding are all untouched, so the accepted record stays admissible and the
+eventual Stage B joins this exact run rather than minting a new one.
+
+### The evidence-immutability defect, found after the PASS
+
+`PHASE-10D-ACCEPTANCE-EVIDENCE-IMMUTABILITY-001` recorded two behaviours in the
+harness that had survived every previous correction:
+
+- a **dry run** given `--evidence` wrote a `mode: "dry-run"` `BLOCKED` stub to
+  that path — observed live, replacing operator bytes at the target;
+- Stage A, every Stage B case and the aggregation each sealed with an ordinary
+  `writeFile`, which truncates an existing artifact.
+
+Together they meant the single durable output of a live acceptance run could be
+destroyed by a mistyped path, a repeated command, or a second operator — and the
+safest-looking invocation in the harness was one of the ways to do it.
+
+Corrected **before** Stage B: dry runs write nothing, an occupied `--evidence`
+target is refused (`lstat`, so a symlink counts as occupied) before any
+product-changing work, and the final create is exclusive so a racing writer
+loses instead of overwriting. The harness never deletes, truncates, renames or
+archives an artifact; choosing a new path is a deliberate operator action.

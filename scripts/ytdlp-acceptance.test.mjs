@@ -1123,6 +1123,10 @@ async function runCli(argv, env, deps = {}) {
   const lines = [];
   const errors = [];
   const files = deps.files ?? new Map();
+  // Filesystem entries that exist WITHOUT readable contents — a symlink is the
+  // real case. `lstat` must see them (so an evidence path they occupy is
+  // refused) while `readFile` still cannot produce bytes.
+  const links = deps.links ?? new Set();
   const modes = new Map();
   const writeOptions = new Map();
   const code = await main(argv, env, {
@@ -1160,6 +1164,17 @@ async function runCli(argv, env, deps = {}) {
       }
       return { mode: modes.get(path) ?? 0o600 };
     },
+    // §6 of CORRECTION-08: the evidence-path gate uses `lstat`, so a SYMLINK
+    // occupying the path is the entry itself rather than whatever it points at.
+    // Modelling it separately from `stat` is what lets a CLI-level test prove
+    // the gate does not follow the link.
+    lstat: async (path) => {
+      if (links.has(path)) return { isSymbolicLink: () => true };
+      if (files.has(path)) return { isSymbolicLink: () => false };
+      const error = new Error(`no such file ${path}`);
+      error.code = "ENOENT";
+      throw error;
+    },
     sleep: async () => {},
     // A monotonic counter clock. The real harness uses `performance.now()`;
     // the tests need strictly increasing values so a snapshot's interval can be
@@ -1170,7 +1185,7 @@ async function runCli(argv, env, deps = {}) {
     })(),
     ...deps,
   });
-  return { code, out: lines.join("\n"), err: errors.join("\n"), files, modes, writeOptions };
+  return { code, out: lines.join("\n"), err: errors.join("\n"), files, links, modes, writeOptions };
 }
 
 const LIVE_ENV = (extra = {}) => ({
@@ -7772,5 +7787,210 @@ describe("durable-state observer (10D-REM-01)", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+// ── CORRECTION-08: acceptance artifacts are append-only by path ─────────────
+//
+// Discovered immediately after the `10d-remediation-02` Stage A PASS
+// (`a9ce1c400db8d817`): a dry run handed `--evidence` wrote a BLOCKED stub to
+// that path, and every live producer sealed its record with an ordinary
+// `writeFile`, which truncates whatever is already there. Together those made
+// the single artifact the whole staged programme depends on silently
+// destroyable — by a mistyped path, a repeated command, or a second operator.
+//
+// The run key has been fail-closed since CORRECTION-05. These tests hold the
+// evidence artifacts to the same standard.
+
+describe("acceptance evidence immutability (CORRECTION-08)", () => {
+  const OCCUPIED = "/tmp/occupied-evidence.json";
+  const SENTINEL = '{"pre-existing":"operator bytes that must survive"}';
+
+  it("78. a dry run writes no evidence file even when --evidence is supplied", async () => {
+    const run = await runCli(["--stage", "A", "--evidence", "/tmp/dry-a.json"], {});
+    assert.equal(run.code, 2);
+    assert.match(run.out, /LIVE EXECUTION REFUSED/);
+    // The refusal is explained on the console; nothing reaches the filesystem.
+    assert.equal(run.files.has("/tmp/dry-a.json"), false, "a dry run must create no evidence file");
+    assert.equal(run.files.size, 0, "a dry run must not touch the filesystem at all");
+  });
+
+  it("78b. every dry-run subcommand is observational", async () => {
+    for (const argv of [
+      ["--stage", "A"],
+      ["--stage", "B", "--case", "success"],
+      ["--stage", "B", "--aggregate"],
+    ]) {
+      const run = await runCli([...argv, "--evidence", "/tmp/dry-sub.json"], {});
+      assert.equal(run.code, 2, `${argv.join(" ")} must dry-run`);
+      assert.equal(run.files.size, 0, `${argv.join(" ")} must write nothing`);
+    }
+  });
+
+  it("79. a dry run leaves pre-existing bytes at the evidence path exactly unchanged", async () => {
+    const files = new Map([[OCCUPIED, SENTINEL]]);
+    const run = await runCli(["--stage", "A", "--evidence", OCCUPIED], {}, { files });
+    assert.equal(run.code, 2);
+    assert.equal(run.files.get(OCCUPIED), SENTINEL, "the operator's bytes must be byte-identical");
+  });
+
+  it("80. live Stage A refuses an occupied evidence path BEFORE creating the direct job", async () => {
+    const world = makeFakeWorld();
+    const files = new Map([[OCCUPIED, SENTINEL]]);
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", OCCUPIED],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /EVIDENCE PATH ALREADY EXISTS/);
+    assert.equal(run.files.get(OCCUPIED), SENTINEL, "the existing artifact must be untouched");
+    // The gate is EARLY: no acceptance job may have been created.
+    assert.ok(
+      !world.calls.fetches.includes("POST /api/download"),
+      "no direct-media job may be created when the evidence path is occupied",
+    );
+    // And no acceptance run may be minted for a run that cannot record itself.
+    assert.equal(run.files.has(RUN_KEY_PATH), false, "no run key may be created");
+  });
+
+  it("81. a Stage B case refuses an occupied evidence path BEFORE the producer runs", async () => {
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const files = seedRun(new Map([[OCCUPIED, SENTINEL]]));
+    const run = await runCli(
+      ["--stage", "B", "--case", "success", ...LIVE_ARGS, "--evidence", OCCUPIED],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+        ...WORKER_ENV,
+      }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /EVIDENCE PATH ALREADY EXISTS/);
+    assert.equal(run.files.get(OCCUPIED), SENTINEL);
+    assert.ok(
+      !world.calls.fetches.includes("POST /api/download"),
+      "the case producer must not run when the evidence path is occupied",
+    );
+  });
+
+  it("82. Stage B aggregation refuses an occupied output artifact", async () => {
+    const world = makeFakeWorld();
+    const files = seedRun(new Map([[OCCUPIED, SENTINEL]]));
+    const run = await runCli(
+      ["--stage", "B", "--aggregate", ...LIVE_ARGS, "--evidence", OCCUPIED],
+      LIVE_ENV(),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /EVIDENCE PATH ALREADY EXISTS/);
+    assert.equal(run.files.get(OCCUPIED), SENTINEL, "the existing artifact must be untouched");
+  });
+
+  it("83. a file appearing AFTER the preflight loses the final exclusive create", async () => {
+    const world = makeFakeWorld();
+    // The winner's bytes are already present, but `lstat` reports ENOENT — the
+    // exact shape of a file created inside the gate-to-seal window.
+    const files = new Map([[OCCUPIED, SENTINEL]]);
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", OCCUPIED],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      {
+        runReadOnly: world.runReadOnly,
+        fetch: world.fetch,
+        files,
+        lstat: async (path) => {
+          if (path === OCCUPIED) {
+            const error = new Error(`no such file ${path}`);
+            error.code = "ENOENT";
+            throw error;
+          }
+          const error = new Error(`no such file ${path}`);
+          error.code = "ENOENT";
+          throw error;
+        },
+      },
+    );
+    assert.equal(run.code, 2, `expected BLOCKED, got:\n${run.out}\n${run.err}`);
+    assert.match(run.err, /EVIDENCE PATH ALREADY EXISTS/);
+    // Losing the race NEVER adopts, truncates, unlinks or retries.
+    assert.equal(run.files.get(OCCUPIED), SENTINEL, "the winner's artifact must be untouched");
+    assert.doesNotMatch(run.err, /retry/i);
+  });
+
+  it("84. an unused evidence path still seals and writes normally", async () => {
+    const world = makeFakeWorld();
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/fresh-stage-a.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const record = JSON.parse(run.files.get("/tmp/fresh-stage-a.json"));
+    assert.equal(record.verdict, "PASS");
+    assert.equal(record.schemaVersion, EVIDENCE_SCHEMA_VERSION);
+    assert.equal(record.harness, HARNESS_ID);
+    // The creation must have been exclusive, not an ordinary overwrite.
+    assert.equal(run.writeOptions.get("/tmp/fresh-stage-a.json")?.flag, "wx");
+  });
+
+  it("85. a sealed remediation-02 Stage A PASS is still admitted by loadStageA()", async () => {
+    const world = makeFakeWorld();
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/admissible-stage-a.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+
+    const sealed = run.files.get("/tmp/admissible-stage-a.json");
+    assert.equal(JSON.parse(sealed).schemaVersion, "10d-remediation-02");
+    const key = JSON.parse(run.files.get(RUN_KEY_PATH));
+
+    // Exactly what the eventual Stage B aggregation does with the artifact the
+    // accepted run left behind: this correction must not have changed what a
+    // sealed `10d-remediation-02` PASS means.
+    const loaded = await loadStageA("/tmp/admissible-stage-a.json", async () => sealed, {
+      run: { runId: key.runId, key: key.key },
+      expectedSha: SHA,
+    });
+    assert.equal(loaded.ok, true, loaded.reason);
+    assert.equal(loaded.summary.verdict, "PASS");
+    assert.equal(loaded.binding.expectedSha, SHA);
+  });
+
+  it("86. a SYMLINK occupying the evidence path is occupied, not followed", async () => {
+    const world = makeFakeWorld();
+    // Present to `lstat`, absent to `readFile` — a dangling symlink.
+    const links = new Set([OCCUPIED]);
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", OCCUPIED],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, links },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /EVIDENCE PATH ALREADY EXISTS/);
+    assert.equal(run.files.has(OCCUPIED), false, "the link target must not be written through");
+  });
+
+  it("87. an unmeasurable evidence path fails closed rather than proceeding", async () => {
+    const world = makeFakeWorld();
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", OCCUPIED],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      {
+        runReadOnly: world.runReadOnly,
+        fetch: world.fetch,
+        lstat: async () => {
+          throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+        },
+      },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /evidence path/i);
+    assert.ok(!world.calls.fetches.includes("POST /api/download"));
   });
 });

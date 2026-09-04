@@ -29,7 +29,7 @@
 // or carried over from a different image without anyone noticing.
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 /**
@@ -582,4 +582,101 @@ export function validateDeploymentBinding(binding, expectedSha) {
     };
   }
   return { ok: true };
+}
+
+// ── Acceptance artifacts are append-only by path (CORRECTION-08) ───────────
+//
+// The run key has been fail-closed since CORRECTION-05: a file that EXISTS is
+// never replaced, whatever is wrong with it. The evidence artifacts were not.
+// Stage A, every Stage B case and the aggregation each sealed their record with
+// an ordinary `writeFile`, which truncates, and a dry run handed `--evidence`
+// wrote a BLOCKED stub to the same path.
+//
+// The artifact is the entire durable output of a live acceptance run — the only
+// thing a later reviewer, or Stage B itself, can read. Silently replacing one
+// destroys evidence that cannot be regenerated without re-running production
+// acceptance. These two helpers give evidence the run key's model.
+
+/** The single operator-facing refusal, so all three producers say one thing. */
+export const EVIDENCE_PATH_OCCUPIED = "BLOCKED — EVIDENCE PATH ALREADY EXISTS";
+
+/**
+ * The EARLY gate (§6): is this evidence path unused?
+ *
+ * Called before a live command performs product-changing acceptance work, so an
+ * occupied path costs nothing rather than costing a real job, a cancellation or
+ * a Worker restart whose record can then never be written.
+ *
+ * `lstat`, never `stat`: a SYMLINK at the path is an entry occupying it, not a
+ * window onto whatever it points at. Following it would let a link decide where
+ * an acceptance artifact lands — and `writeFile` through a dangling link would
+ * create the target rather than refusing.
+ *
+ * Fails CLOSED. "We could not measure the path" is not "the path is free": an
+ * EACCES or EPERM here means the final exclusive create cannot be reasoned
+ * about either, and proceeding would risk exactly the destruction this exists
+ * to prevent.
+ *
+ * This check does NOT close the race — a file can still appear between here and
+ * the seal — which is why `writeEvidenceExclusive` remains mandatory.
+ */
+export async function evidencePathAvailable(path, deps = {}) {
+  const lstatFile = deps.lstat ?? lstat;
+  if (!path) return { ok: true };
+  try {
+    await lstatFile(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { ok: true };
+    return {
+      ok: false,
+      reason:
+        `BLOCKED: the evidence path ${path} could not be measured ` +
+        `(${error?.code ?? "unknown error"}); refusing to run acceptance work whose record ` +
+        "may not be durably writable",
+    };
+  }
+  return {
+    ok: false,
+    reason:
+      `${EVIDENCE_PATH_OCCUPIED}: ${path} already exists. An acceptance artifact is never ` +
+      "replaced, archived or renamed by this harness — choosing a new path is a deliberate " +
+      "operator action.",
+  };
+}
+
+/**
+ * The final, RACE-SAFE creation (§5).
+ *
+ * `flag: "wx"` makes the existence check and the write one decision, so a file
+ * that appeared after the early gate loses rather than being truncated. Losing
+ * is BLOCKED — never adopt the winner, never unlink and retry, never archive.
+ *
+ * The bounded consequence is stated plainly to the operator: the acceptance
+ * work may already have executed against production, but no evidence claim can
+ * be made when the record could not be durably recorded. Deciding what to do
+ * about that is the operator's call, not the harness's.
+ *
+ * The run key deliberately does NOT route through here: it carries secret
+ * material and keeps its own specialized 0600 implementation above.
+ */
+export async function writeEvidenceExclusive(path, contents, deps = {}) {
+  const write = deps.writeFile ?? writeFile;
+  try {
+    await write(path, contents, { encoding: "utf8", flag: "wx" });
+    return { ok: true };
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      return {
+        ok: false,
+        reason:
+          `${EVIDENCE_PATH_OCCUPIED}: ${path} was created after the pre-flight check and before ` +
+          "this record could be sealed to it. The existing file has NOT been modified. The " +
+          "acceptance work may already have run, but no evidence claim is made for it.",
+      };
+    }
+    return {
+      ok: false,
+      reason: `the evidence record could not be written to ${path} (${error?.code ?? "unknown error"})`,
+    };
+  }
 }
