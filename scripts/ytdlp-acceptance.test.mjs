@@ -197,6 +197,12 @@ const BYTE_JOB_ID = "bb63f3170c2342717c7dd8af11d09418";
 const FULL_LADDER = [...REQUIRED_TRANSITIONS];
 
 const digestOf = (text) => createHash("sha256").update(text).digest("hex");
+/** The namespace holder's PID in the fake world; distinct from the Worker's. */
+const MEDIA_NETNS_PID = 1391;
+
+/** A canonical 64-hex Docker container id, as `{{.Id}}` renders one. */
+const MEDIA_NETNS_ID = "6c81c4cd406a8660a0accba4f6c9c46417ecee96d8b508577d359c10affa3537";
+
 const FIXTURE_BODY = "acceptance-fixture-bytes";
 const FIXTURE_DIGEST = digestOf(FIXTURE_BODY);
 
@@ -211,7 +217,16 @@ function passingStageAObservations(overrides = {}) {
     imageShaTag: measured({ expectedSha: SHA, taggedImageId: IMAGE_ID, runningImageId: IMAGE_ID }),
     imageLatestAlias: measured({ latestImageId: IMAGE_ID, taggedImageId: IMAGE_ID }),
     egressVerifier: measured({ exitCode: 0 }),
-    workerNetworkMode: measured("container:videofetch-media-netns"),
+    workerNetworkPlacement: measured({
+      // The shape Docker ACTUALLY reports: `--network container:<name>` is
+      // resolved at creation time and stored as the target's canonical id.
+      targetContainerId: MEDIA_NETNS_ID,
+      mediaNetnsContainerId: MEDIA_NETNS_ID,
+      workerPid: 14312,
+      mediaNetnsPid: 1391,
+      workerNetNamespace: "net:[4026532355]",
+      mediaNetNamespace: "net:[4026532355]",
+    }),
     ytdlpVersion: measured("2026.08.19"),
     pythonVersion: measured("3.11.2"),
     nodeVersion: measured("v22.23.2"),
@@ -785,7 +800,11 @@ function makeFakeWorld(options = {}) {
           return { exitCode: 0, stdout: `${currentImage()}\n`, stderr: "" };
         }
         if (joined.includes("NetworkMode")) {
-          return { exitCode: 0, stdout: "container:videofetch-media-netns\n", stderr: "" };
+          // The shape Docker ACTUALLY stores: the RESOLVED target id, never the
+          // name. The fake emitted the name until REMEDIATION-02, which is why
+          // the retired evaluator looked correct in tests and failed a healthy
+          // Production Worker.
+          return { exitCode: 0, stdout: `container:${MEDIA_NETNS_ID}\n`, stderr: "" };
         }
         // Deliberately still answered with the COMPLETE NAME=value environment.
         // The allowlist now refuses this template, so the branch is unreachable
@@ -796,9 +815,16 @@ function makeFakeWorld(options = {}) {
           return { exitCode: 0, stdout: `${lines.join("\n")}\n`, stderr: "" };
         }
         if (joined.includes(".State.Pid")) {
+          // The namespace holder is a DIFFERENT container with its own PID.
+          if (argv[argv.length - 1] === "videofetch-media-netns") {
+            return { exitCode: 0, stdout: `${MEDIA_NETNS_PID}\n`, stderr: "" };
+          }
           return { exitCode: 0, stdout: `${currentContainerPid()}\n`, stderr: "" };
         }
         if (joined.includes("{{.Id}}")) {
+          if (argv[argv.length - 1] === "videofetch-media-netns") {
+            return { exitCode: 0, stdout: `${MEDIA_NETNS_ID}\n`, stderr: "" };
+          }
           if (env.containerIdUnreadable) {
             return { exitCode: 1, stdout: "", stderr: "no such container" };
           }
@@ -6326,7 +6352,7 @@ describe("measurement requires successful completion", () => {
       ["runningImageId", (o) => o.runningImageId(), (f, a) => f === "docker" && a[0] === "inspect" && a.join(" ").includes("{{.Image}}"), `${IMAGE_ID}\n`],
       ["containerPid", (o) => o.containerPid(), (f, a) => f === "docker" && a[0] === "inspect" && a.join(" ").includes("State.Pid"), "100\n"],
       ["containerInstanceId", (o) => o.containerInstanceId(), (f, a) => f === "docker" && a[0] === "inspect" && a.join(" ").includes("{{.Id}}"), `${CONTAINER_A}\n`],
-      ["networkMode", (o) => o.networkMode(), (f, a) => f === "docker" && a[0] === "inspect" && a.join(" ").includes("NetworkMode"), "container:videofetch-media-netns\n"],
+      ["networkPlacement", (o) => o.networkPlacement(), (f, a) => f === "docker" && a[0] === "inspect" && a.join(" ").includes("NetworkMode"), `container:${MEDIA_NETNS_ID}\n`],
       ["imageShaTag", (o) => o.imageShaTag(SHA), (f, a) => f === "docker" && a[0] === "inspect" && a.join(" ").includes("{{.Image}}"), `${IMAGE_ID}\n`],
       ["mediaNetnsPid", (o) => o.mediaNetnsPid(), (f, a) => f === "docker" && a[0] === "inspect" && a.includes("videofetch-media-netns"), "4242\n"],
       ["pythonVersion", (o) => o.pythonVersion(), (f, a) => f === "docker" && a[0] === "exec" && a.join(" ").endsWith("/usr/bin/python3 --version"), "Python 3.11.2\n"],
@@ -6886,7 +6912,12 @@ describe("evidence producer contract version", () => {
   const KEY = "a".repeat(64);
   const RUN = { runId: "0123456789abcdef", key: KEY };
   /** The identifier every artifact carried before this correction. */
-  const PREVIOUS_SCHEMA = "10c4-correction-03";
+  // REMEDIATION-02: the previous schema is now `10d-remediation-01` — the exact
+  // version the first authenticated Stage-A run (5e6670a858543d93) sealed. That
+  // record is real, authentic and retained, so this is not a hypothetical
+  // boundary: a cryptographically valid artifact from before the observer
+  // corrections must not authorize anything.
+  const PREVIOUS_SCHEMA = "10d-remediation-01";
 
   /**
    * A Stage-A record that is perfect in EVERY respect except its schema: valid
@@ -6921,15 +6952,20 @@ describe("evidence producer contract version", () => {
   const load = (record) =>
     loadStageA("/x", async () => JSON.stringify(record), { run: RUN, expectedSha: SHA });
 
-  it("71. the schema identifier is the final Phase-10C4 contract", () => {
-    assert.equal(EVIDENCE_SCHEMA_VERSION, "10d-remediation-01");
+  it("71. the schema identifier is the corrected Stage-A observer contract", () => {
+    assert.equal(EVIDENCE_SCHEMA_VERSION, "10d-remediation-02");
     assert.notEqual(EVIDENCE_SCHEMA_VERSION, PREVIOUS_SCHEMA);
     // ONE constant governs Stage A, case records and the aggregate, so they
     // cannot drift into describing different producer contracts.
     assert.equal(CASE_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION);
   });
 
-  it("72. a VALID Stage-A artifact on the previous schema is rejected", async () => {
+  it("72. the REAL sealed 10d-remediation-01 artifact can authorize nothing", async () => {
+    // Not a synthetic version string: `10d-remediation-01` is what run
+    // 5e6670a858543d93 actually sealed, under observers that compared against a
+    // NetworkMode string Docker never emits, asked EJS for an attribute it does
+    // not export, and ran a Python SyntaxError as the environment probe. The
+    // version boundary rejects it independently of its FAIL verdict.
     const stale = stageA(PREVIOUS_SCHEMA);
 
     // The seal is genuinely good — the rejection is not an authenticity
@@ -6998,7 +7034,7 @@ describe("evidence producer contract version", () => {
       { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
-    assert.equal(JSON.parse(run.files.get("/tmp/c.json")).schemaVersion, "10d-remediation-01");
+    assert.equal(JSON.parse(run.files.get("/tmp/c.json")).schemaVersion, "10d-remediation-02");
   });
 });
 

@@ -219,6 +219,32 @@ const READ_ONLY_COMMANDS = Object.freeze([
  */
 export const DOCKER_TOP_COLUMNS = "pid,ppid,pgid,comm";
 
+/**
+ * The container that OWNS the media network namespace.
+ *
+ * An application-owned literal, never derived from what Docker reported: the
+ * whole point of the placement proof is to compare the Worker's declared target
+ * against this container's independently resolved identity.
+ */
+export const MEDIA_NETNS_CONTAINER = "videofetch-media-netns";
+
+/** Docker's canonical container object id: 64 lowercase hex, no `sha256:`. */
+export const CONTAINER_ID_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * A container-scoped network mode, as Docker ACTUALLY renders it.
+ *
+ * `--network container:<name>` is resolved at creation time and stored as the
+ * target's canonical id, so `.HostConfig.NetworkMode` reads
+ * `container:<64-hex>` and NEVER `container:<name>` on a running container.
+ * Matching the name was the REMEDIATION-02 defect: it made a correctly placed
+ * Worker fail.
+ */
+export const CONTAINER_NETWORK_MODE_PATTERN = /^container:([0-9a-f]{64})$/;
+
+/** A Linux network-namespace identity as `readlink /proc/<pid>/ns/net` reports it. */
+export const NET_NAMESPACE_PATTERN = /^net:\[\d+\]$/;
+
 /** Docker's own container-name grammar, so the one dynamic token is still bounded. */
 const CONTAINER_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
 
@@ -304,12 +330,32 @@ function isWorkDirProbe(argv) {
  * zipimport artifact, which is where `yt_dlp_ejs` lives; a failure prints the
  * fixed token `UNAVAILABLE` rather than a Python error, so nothing about the
  * image's internals can arrive through this channel.
+ *
+ * ── The name is `version`, not `__version__` (REMEDIATION-02) ──────────────
+ *
+ * The first authenticated Stage-A run reported `runtime.bundled-ejs` as
+ * NOT MEASURABLE, and the cause was this probe rather than the image. The
+ * pinned EJS 0.8.0 package exposes exactly one public name:
+ *
+ *     from yt_dlp_ejs._version import version
+ *     __all__ = ["version"]
+ *
+ * so `from yt_dlp_ejs import __version__` raises `ImportError`, the probe's own
+ * `except` prints `UNAVAILABLE`, and the harness concluded the runtime could
+ * not answer. Measured against the reviewed image, `__version__` is absent and
+ * `version` is `0.8.0`.
+ *
+ * That is the failure mode this file must not repeat: a probe that asks a
+ * package for an API it does not expose reports the INSTRUMENT's error as the
+ * SUBJECT's. The regression for this probe therefore executes it against the
+ * real reviewed image rather than a mocked `"0.8.0"` on stdout — a mock is
+ * exactly what let the wrong import survive review.
  */
 export const EJS_PROBE_ARGV = Object.freeze([
   "/usr/bin/python3",
   "-c",
   "import sys;sys.path.insert(0,'/usr/local/lib/videofetch/yt-dlp')\n" +
-    "try:\n from yt_dlp_ejs import __version__ as v\n print(v)\n" +
+    "try:\n from yt_dlp_ejs import version as v\n print(v)\n" +
     "except Exception:\n print('UNAVAILABLE')",
 ]);
 
@@ -334,11 +380,32 @@ export const EJS_PROBE_ARGV = Object.freeze([
  * Names only. Environment variable names cannot contain `=` or a newline, so a
  * line-oriented reading is exact — and no `=` is ever printed, so no value can
  * ride along.
+ *
+ * ── The `\n` escaping is load-bearing (REMEDIATION-02) ─────────────────────
+ *
+ * The first authenticated Stage-A run reported both `worker-env` checks as NOT
+ * MEASURABLE. The cause was this constant: a JavaScript `'\n'` is a real
+ * newline, so the Python source that actually reached the interpreter was
+ *
+ *     import os;print("
+ *     ".join(sorted(os.environ)))
+ *
+ * whose `"` literal is unterminated. `python3 -c` exited non-zero with a
+ * `SyntaxError` and the observer correctly reported a failed measurement — of
+ * an instrument that had never been executed against a real container.
+ *
+ * The probe is now asserted BY EXECUTION against a disposable container, so a
+ * source string that is not valid Python cannot pass review again.
  */
 export const ENV_NAMES_PROBE_ARGV = Object.freeze([
   "/usr/bin/python3",
   "-c",
-  'import os;print("\n".join(sorted(os.environ)))',
+  // The separator is written `\\n` so PYTHON receives the two characters
+  // `\` `n` and parses them as its own newline escape. Writing `\n` here would
+  // make JAVASCRIPT substitute a real newline before the string ever reaches
+  // Python, splitting the `"` literal across two physical lines — which is a
+  // `SyntaxError: unterminated string literal`, not a probe (REMEDIATION-02).
+  'import os;print("\\n".join(sorted(os.environ)))',
 ]);
 
 /**
@@ -700,6 +767,28 @@ export function makeSystemObservers(deps = {}) {
   const imageRepo = deps.imageRepo ?? "videofetch-worker";
 
   /**
+   * The container expected to OWN the media network namespace.
+   *
+   * A NARROW TEST SEAM, and deliberately nothing more. Production never passes
+   * it: every call site takes the application-owned default, no CLI option
+   * reaches it, and it is not read from the environment — so an operator cannot
+   * redirect the placement proof at a container of their choosing.
+   *
+   * It exists because the namespace regression has to run against a DISPOSABLE
+   * pair of containers. Requiring the literal Production name there would mean
+   * either colliding with the real `videofetch-media-netns` on the acceptance
+   * VM, or falling back to hand-written observations — which is exactly the
+   * mocked-observer weakness this whole remediation removes.
+   *
+   * The value is bounded by Docker's own container-name grammar at the point of
+   * use (`inspectNamed`), so the seam widens no command shape.
+   */
+  const mediaNetnsContainer = deps.mediaNetnsContainer ?? MEDIA_NETNS_CONTAINER;
+  if (!CONTAINER_NAME_PATTERN.test(String(mediaNetnsContainer))) {
+    throw new Error("refusing a malformed media namespace container name");
+  }
+
+  /**
    * `docker inspect --format` on the container, returning a trimmed scalar.
    *
    * §6/§7 of CORRECTION-07: a non-zero exit means the command FAILED, and its
@@ -719,6 +808,49 @@ export function makeSystemObservers(deps = {}) {
       );
     }
     return String(result.stdout ?? "").trim();
+  }
+
+  /**
+   * `docker inspect --format <template> <named container>`.
+   *
+   * The name is checked against Docker's own grammar so the one dynamic token
+   * stays bounded, and every caller passes an application-owned literal.
+   */
+  async function inspectNamed(name, format) {
+    if (!CONTAINER_NAME_PATTERN.test(String(name))) {
+      throw new Error("refusing to inspect a malformed container name");
+    }
+    const result = await run("docker", ["inspect", "--format", format, name]);
+    if (result.exitCode !== 0) {
+      throw new Error(`docker inspect ${format} exited ${result.exitCode}; the value was not measured`);
+    }
+    return String(result.stdout ?? "").trim();
+  }
+
+  /**
+   * A container's main PID, or `null` when it is not running.
+   *
+   * A stopped container reports `0`, which is a MEASUREMENT ("not running")
+   * rather than a failure, so it is normalized to null and returned for the
+   * evaluator to fail closed on.
+   */
+  async function pidOf(name) {
+    const pid = Number(await inspectNamed(name, "{{.State.Pid}}"));
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  }
+
+  /**
+   * `readlink /proc/<pid>/ns/net`, or `null` when it cannot be read.
+   *
+   * Null is deliberate: the namespace identity is what the check compares, so
+   * an unreadable link must never coincidentally equal another unreadable one.
+   */
+  async function netNamespaceOf(pid) {
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    const result = await run("readlink", [`/proc/${pid}/ns/net`]);
+    if (result.exitCode !== 0) return null;
+    const link = String(result.stdout ?? "").trim();
+    return NET_NAMESPACE_PATTERN.test(link) ? link : null;
   }
 
   /** Resolves one image REFERENCE to its content id, or null when absent. */
@@ -793,10 +925,55 @@ export function makeSystemObservers(deps = {}) {
       });
     },
 
-    async networkMode() {
-      return observe("docker inspect network mode", async () =>
-        inspectContainer("{{.HostConfig.NetworkMode}}"),
-      );
+    /**
+     * PROOF OF NETWORK PLACEMENT, not a string comparison (REMEDIATION-02).
+     *
+     * The Stage-A requirement is that the Worker SHARES the intended media
+     * network namespace. The retired check asserted
+     * `NetworkMode === "container:videofetch-media-netns"`, which Docker never
+     * emits for a running container: `--network container:<name>` is resolved
+     * at creation and stored as the target's canonical 64-hex id. The first
+     * authenticated Stage-A run therefore FAILED a Worker that was correctly
+     * placed — the harness was wrong, not the deployment.
+     *
+     * Two independent identities are measured and must agree:
+     *
+     *   A. the id the Worker's NetworkMode targets  ==  the id
+     *      `videofetch-media-netns` actually resolves to;
+     *   B. `readlink /proc/<worker-pid>/ns/net`     ==
+     *      `readlink /proc/<media-netns-pid>/ns/net`.
+     *
+     * A alone would trust Docker's own bookkeeping; B alone would not prove the
+     * shared namespace is the INTENDED one — a Worker sharing some other
+     * container's namespace satisfies neither. Requiring both means a pass has
+     * to survive Docker's configuration record AND the kernel's own view.
+     *
+     * Command failures throw, so an unobservable Docker daemon or a missing
+     * container is reported as NOT MEASURED. Values that were read but are
+     * wrong — a zero PID, an unreadable link, a mismatched id — are RETURNED,
+     * so the evaluator fails them closed rather than hiding a real mismatch
+     * behind "unavailable".
+     */
+    async networkPlacement() {
+      return observe("worker network placement", async () => {
+        const rawMode = await inspectContainer("{{.HostConfig.NetworkMode}}");
+        const matched = CONTAINER_NETWORK_MODE_PATTERN.exec(rawMode);
+
+        const workerPid = await pidOf(container);
+        const mediaNetnsId = await inspectNamed(mediaNetnsContainer, "{{.Id}}");
+        const mediaPid = await pidOf(mediaNetnsContainer);
+
+        return {
+          // `null` when the mode is not container-scoped at all (`bridge`,
+          // `host`, `none`, a name-shaped value): measured, and not a target.
+          targetContainerId: matched ? matched[1] : null,
+          mediaNetnsContainerId: CONTAINER_ID_PATTERN.test(mediaNetnsId) ? mediaNetnsId : null,
+          workerPid,
+          mediaNetnsPid: mediaPid,
+          workerNetNamespace: await netNamespaceOf(workerPid),
+          mediaNetNamespace: await netNamespaceOf(mediaPid),
+        };
+      });
     },
 
     /**

@@ -3954,3 +3954,87 @@ workspace was removed, and the smoke case state went with the process. No
 listener remains on 18099, the only `cloudflared` process is the original
 production one (PID 705), and the temporary hostname returns **530**. The VM was
 returned to **Stopped**, its initial power state.
+
+
+## Phase 10D — the first authenticated Stage-A run (FAILED)
+
+Run `5e6670a858543d93`, schema `10d-remediation-01`, `live`, against the
+reviewed Worker image `sha256:b7b7554c…62b5` at source
+`4a537e3cb7403801f39a706ce7bed896c0fe11f7`.
+
+```
+verdict   FAIL        PASS 16    FAIL 1    BLOCKED 6
+```
+
+**Stage A has not passed. Generic execution remains DISABLED. Stage B remains
+unauthorized.** The sealed evidence and its run key are retained unmodified; a
+corrected retry must mint a FRESH acceptance run rather than reuse them.
+
+### The deployment transition that preceded it succeeded
+
+The retired `YTDLP_NETWORK_ISOLATED` entry was removed at a stopped-Worker
+boundary, the reviewed image was tagged `latest` as the same image object, and
+the Worker restarted cleanly — which is itself proof the migration was required,
+since the reviewed Worker refuses that variable's presence.
+
+### What the run established about the product
+
+`direct.regression-ready` and `direct.byte-integrity` both PASSED: a real
+direct-media job reached `ready` through the live control plane and the signed
+delivery matched the controlled fixture byte for byte (48497 bytes,
+`44827ff8…1bdd`). Image identity, the `latest` alias, all seven services, the
+safe-egress verifier, Python 3.11, Node v22 and `YTDLP_ENABLED` disabled passed
+as well.
+
+Transport, HMAC, Cloudflare routing and the Worker's job contracts are therefore
+demonstrably healthy — which is what makes the diagnostics failures diagnostic.
+
+### Three harness defects, corrected under REMEDIATION-02
+
+| check | why it failed | correction |
+| :--- | :--- | :--- |
+| `worker.network-mode` | required `container:videofetch-media-netns`, a string Docker never emits — it stores the resolved 64-hex target id | proves the shared namespace from the Docker target id **and** `readlink /proc/<pid>/ns/net` for both containers |
+| `runtime.bundled-ejs` | imported `yt_dlp_ejs.__version__`; pinned 0.8.0 exports only `version` | reads `version`; the reviewed image reports `0.8.0` |
+| `worker-env.forbidden-absent` / `worker-env.required-present` | the probe's Python source was a `SyntaxError` — a JavaScript `'\n'` put a real newline inside a `"` literal | the separator is escaped; the probe is now asserted by execution |
+
+All three survived review because the tests mocked them. The regressions now
+execute against real Docker containers, a real interpreter and the real image.
+
+### `/api/diagnostics` + `/api/sites` HTTP 500
+
+```
+CONTROL-PLANE SOURCE SKEW — STRONGLY SUPPORTED,
+DEPLOYED SOURCE IDENTITY NOT DIRECTLY ATTESTED
+```
+
+The leading diagnosis, not an attested root cause. No repository defect was
+found.
+
+**Established by test.** The historical `WorkerDiagnosticsSuccessSchema` is
+`.strict()`, has no `runtime` or `features`, and requires `safeEgress.attested`,
+so it rejects the current Worker's response; the current schema accepts it. The
+Worker validates its own response with the current schema before sending it, so
+a same-commit control plane cannot fail on it. `/api/sites` fails with
+`/api/diagnostics` because `loadSites()` calls `diagnostics()`.
+
+**Corroborating.** The deployment (created 2026-08-30 23:10, CLI-deployed)
+predates the contract change `506b1b62` (2026-09-02 12:26), and the direct path
+passed — ruling out transport, HMAC and routing.
+
+**Not established.** The deployed bundle's source revision: Vercel exposes no
+Git metadata for it, and the live rejection was not directly observed. A
+compatibility proof is not an incident proof.
+
+Before another live Stage-A retry, the Production control plane must be aligned
+with a reviewed source whose diagnostics contract is compatible with the
+deployed Worker — under separate deployment authorization.
+
+**No backward-compatibility parsing was added to accommodate the stale
+deployment.** Aligning Vercel Production is a separate authorized task, to be
+scheduled after this remediation is reviewed and merged.
+
+### Evidence schema
+
+`10d-remediation-01` → `10d-remediation-02`, because four checks now mean
+something materially stronger. The old sealed record can authorize nothing:
+`verifyRecord` refuses it on the version boundary alone.
