@@ -409,16 +409,28 @@ function sendText(res, status, text) {
 // ── The service ────────────────────────────────────────────────────────────
 
 /**
- * Builds the fixture service around one already-read media buffer.
+ * Builds the fixture service around TWO already-read media buffers.
  *
- * The media is read ONCE, by the caller, from a path the operator named on the
+ * Each body is read ONCE, by the caller, from a path the operator named on the
  * command line. No request can influence which bytes are served: there is no
  * path-to-file mapping anywhere in this module, so path traversal has nothing
  * to traverse and an arbitrary-file read has no reachable call site.
  *
+ * `media` and `genericMedia` are SEPARATE and both required
+ * (PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001). They used to be one
+ * buffer, which coupled the direct control fixture's identity — accepted
+ * Stage-A evidence, and required to stay bit-identical — to the size the
+ * throttled generic route needs in order to be acquirable at all. There is
+ * deliberately NO fallback from a missing `genericMedia` to `media`: silently
+ * reinstating the coupling is the one failure mode this split exists to
+ * prevent, and it would fail live rather than here.
+ *
  * @param {object} options
- * @param {Buffer} options.media           the direct/generic fixture MP4
- * @param {string} options.mediaPath       where it was read from (manifest only)
+ * @param {Buffer} options.media                    the DIRECT fixture MP4;
+ *                                                  also the byte-limit prefix
+ * @param {Buffer} options.genericMedia             the GENERIC fixture MP4
+ * @param {string} [options.directMediaPath]        where `media` was read from
+ * @param {string} [options.genericMediaSourcePath] where `genericMedia` was read from
  * @param {(event: object) => void} [options.log]
  * @param {number} [options.genericThrottleMs]
  * @param {number} [options.genericThrottleTickMs]
@@ -430,7 +442,9 @@ function sendText(res, status, text) {
 export function createFixtureService(options) {
   const {
     media,
-    mediaPath = null,
+    genericMedia,
+    directMediaPath = null,
+    genericMediaSourcePath = null,
     log = defaultLog,
     genericThrottleMs = GENERIC_THROTTLE_TARGET_MS,
     genericThrottleTickMs = GENERIC_THROTTLE_TICK_MS,
@@ -441,10 +455,14 @@ export function createFixtureService(options) {
   } = options;
 
   if (!Buffer.isBuffer(media) || media.byteLength === 0) {
-    throw new Error("the fixture media must be a non-empty Buffer");
+    throw new Error("the direct fixture media must be a non-empty Buffer");
+  }
+  if (!Buffer.isBuffer(genericMedia) || genericMedia.byteLength === 0) {
+    throw new Error("the generic fixture media must be a non-empty Buffer");
   }
 
-  const mediaDigest = createHash("sha256").update(media).digest("hex");
+  const directDigest = createHash("sha256").update(media).digest("hex");
+  const genericDigest = createHash("sha256").update(genericMedia).digest("hex");
   const registry = createCaseRegistry();
 
   /**
@@ -468,11 +486,18 @@ export function createFixtureService(options) {
     return candidate;
   }
 
-  /** Serves the fixed media buffer with an exact length. Also answers HEAD. */
-  function serveMediaHead(res, status = 200) {
+  /**
+   * Answers HEAD for one media route with THAT route's exact length.
+   *
+   * The body is a parameter rather than a closed-over constant: `/direct.mp4`
+   * and `/generic-media.mp4` describe different files now, and a HEAD that
+   * reported the other one's length would be a lie the Worker's direct analyzer
+   * reads directly.
+   */
+  function serveMediaHead(res, body, status = 200) {
     res.writeHead(status, {
       "content-type": MP4_CONTENT_TYPE,
-      "content-length": String(media.byteLength),
+      "content-length": String(body.byteLength),
       "accept-ranges": "none",
       "cache-control": "no-store",
     });
@@ -516,7 +541,7 @@ export function createFixtureService(options) {
       case "/direct.mp4": {
         if (method === "HEAD") {
           log({ route, status: 200, outcome: "head" });
-          serveMediaHead(res);
+          serveMediaHead(res, media);
           return;
         }
         if (method !== "GET") return methodNotAllowed(res, route, "GET, HEAD");
@@ -558,20 +583,25 @@ export function createFixtureService(options) {
       }
 
       // ── its throttled media ─────────────────────────────────────────────
+      //
+      // The GENERIC body, never the direct one. The throttle spreads whatever
+      // it is given across `genericThrottleMs`, so the body's SIZE is what
+      // decides whether the peer sees one long read or many short ones — which
+      // is the whole reason the two fixtures are no longer the same file.
       case "/generic-media.mp4": {
         if (method === "HEAD") {
           log({ route, status: 200, outcome: "head" });
-          serveMediaHead(res);
+          serveMediaHead(res, genericMedia);
           return;
         }
         if (method !== "GET") return methodNotAllowed(res, route, "GET, HEAD");
         res.writeHead(200, {
           "content-type": MP4_CONTENT_TYPE,
-          "content-length": String(media.byteLength),
+          "content-length": String(genericMedia.byteLength),
           "accept-ranges": "none",
           "cache-control": "no-store",
         });
-        const sent = await writeThrottled(createWriter(res), media, {
+        const sent = await writeThrottled(createWriter(res), genericMedia, {
           targetMs: genericThrottleMs,
           tickMs: genericThrottleTickMs,
           sleep,
@@ -581,7 +611,7 @@ export function createFixtureService(options) {
           route,
           status: 200,
           bytes: sent,
-          outcome: sent === media.byteLength ? "complete" : "peer-closed",
+          outcome: sent === genericMedia.byteLength ? "complete" : "peer-closed",
         });
         return;
       }
@@ -650,6 +680,10 @@ export function createFixtureService(options) {
           "cache-control": "no-store",
         });
         await streamUnknownLengthMedia(createWriter(res), {
+          // The DIRECT body, deliberately. This prefix only has to be a valid
+          // MP4 header the Worker will start acquiring; the case's assertion is
+          // about the bytes that follow it, so it must not inherit the generic
+          // fixture's size and turn a byte-limit proof into a size accident.
           prefix: media,
           totalBytes: byteLimitTotalBytes,
           blockBytes: byteLimitBlockBytes,
@@ -787,9 +821,17 @@ export function createFixtureService(options) {
     /**
      * The sanitized startup manifest (§23).
      *
-     * Route paths, byte counts, the media digest and the frozen egress
+     * Route paths, byte counts, BOTH media digests and the frozen egress
      * expectation. No credential, no environment, and no filesystem path other
-     * than the media file the operator explicitly supplied.
+     * than the two media files the operator explicitly supplied.
+     *
+     * `*Path` keys ending in a route (`/direct.mp4`, `/generic-media.mp4`) are
+     * HTTP paths; `directMediaPath` and `genericMediaSourcePath` are the
+     * filesystem files those routes were loaded from. The two bodies are
+     * reported separately and are never described by one shared digest — an
+     * operator reading this manifest must be able to tell, without inspecting
+     * the process, that `/direct.mp4` and `/generic-media.mp4` are different
+     * files.
      */
     manifest() {
       const address = server.address();
@@ -798,10 +840,13 @@ export function createFixtureService(options) {
         listenPort: address && typeof address === "object" ? address.port : null,
         directPath: "/direct.mp4",
         directBytes: media.byteLength,
-        directSha256: mediaDigest,
-        mediaPath,
+        directSha256: directDigest,
+        directMediaPath,
         genericPath: "/generic",
         genericMediaPath: "/generic-media.mp4",
+        genericMediaBytes: genericMedia.byteLength,
+        genericMediaSha256: genericDigest,
+        genericMediaSourcePath,
         genericMediaThrottleMs: genericThrottleMs,
         byteLimitPath: "/byte-limit",
         byteLimitMediaPath: "/byte-limit-media.mp4",
@@ -827,6 +872,7 @@ export function createFixtureService(options) {
 function parseArgv(argv) {
   const out = {
     media: null,
+    genericMedia: null,
     port: 0,
     genericThrottleMs: GENERIC_THROTTLE_TARGET_MS,
     byteLimitTotalBytes: BYTE_LIMIT_TOTAL_BYTES,
@@ -843,6 +889,9 @@ function parseArgv(argv) {
       case "--media":
         out.media = next();
         break;
+      case "--generic-media":
+        out.genericMedia = next();
+        break;
       case "--port":
         out.port = Number.parseInt(next(), 10);
         break;
@@ -856,7 +905,13 @@ function parseArgv(argv) {
         throw new Error(`unknown argument: ${arg}`);
     }
   }
-  if (!out.media) throw new Error("--media <path to the fixture mp4> is required");
+  if (!out.media) throw new Error("--media <path to the direct fixture mp4> is required");
+  // Fail-closed, and NEVER a fallback to `--media`. The one-buffer coupling this
+  // flag replaces is what made the throttled generic route unacquirable, so an
+  // operator who forgets it must be told here rather than during a live case.
+  if (!out.genericMedia) {
+    throw new Error("--generic-media <path to the generic fixture mp4> is required");
+  }
   if (!Number.isInteger(out.port) || out.port < 0 || out.port > 65535) {
     throw new Error("--port must be 0-65535");
   }
@@ -866,10 +921,15 @@ function parseArgv(argv) {
 /** The CLI entry point. Prints the manifest as one JSON line on stdout. */
 export async function main(argv) {
   const opts = parseArgv(argv);
-  const media = await readFile(opts.media);
+  const [media, genericMedia] = await Promise.all([
+    readFile(opts.media),
+    readFile(opts.genericMedia),
+  ]);
   const service = createFixtureService({
     media,
-    mediaPath: opts.media,
+    genericMedia,
+    directMediaPath: opts.media,
+    genericMediaSourcePath: opts.genericMedia,
     genericThrottleMs: opts.genericThrottleMs,
     byteLimitTotalBytes: opts.byteLimitTotalBytes,
   });

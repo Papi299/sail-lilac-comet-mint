@@ -645,7 +645,7 @@ does not do this.**
 | R2 | `r2.delegated-write` | The object exists with non-zero length, written through the AF_UNIX broker. |
 | | `r2.worker-holds-no-credential` | The Worker still holds no persistent R2 credential. |
 | Vercel | `vercel.signed-get` | `303` to a presigned read-only GET. The Worker never performs the GET. |
-| | `vercel.byte-integrity` | **Three-way** length agreement — durable `fileSize`, R2 `contentLength`, delivered bytes — plus a real SHA-256. `HTTP 200` alone is not proof. |
+| | `vercel.byte-integrity` | The delivered bytes hash to the **generic fixture digest computed before the run**, *and* **three-way** length agreement — durable `fileSize`, R2 `contentLength`, delivered bytes. `HTTP 200` alone is not proof, and neither is length agreement alone. |
 | Privacy | `privacy.sentinel-not-leaked` | The ephemeral sentinel appears in none of the swept surfaces. |
 | Cancel | `cancel.durable-cancelled` | Cancel during `downloading` → durable `cancelled`, no late `ready`. |
 | | `cancel.processes-gone` | No yt-dlp or Node descendant survives. |
@@ -815,6 +815,51 @@ running yt-dlp directly and calling that proof would test a different system
 than the one being accepted.
 
 Its query string is redacted in every output surface.
+
+### The generic fixture digest is an input too, and so is its timing
+
+```
+VIDEOFETCH_ACCEPT_GENERIC_SHA256=<64 lowercase hex>
+```
+
+Required by the `success` case; the other Stage-B cases make no claim about the
+generic fixture's content identity and are not asked for it. A missing or
+malformed value is a **usage failure refused before the producer submits
+anything** — not a case that runs and then cannot be recorded.
+
+It is **not a constant in source, deliberately.** The generic fixture is
+regenerated from the exact Worker image immediately before acceptance, and a
+later reviewed image carrying a different but valid FFmpeg/x264 build produces
+different — equally correct — bytes. A committed digest would either need
+editing for every image, or would fail the run it existed to protect.
+
+What fixes its meaning is **when it is computed**, not where it is stored:
+
+```
+prepare-media.mjs generates the generic fixture
+        ↓  SHA-256 of the file on disk, from the generator's own output
+VIDEOFETCH_ACCEPT_GENERIC_SHA256          before the Quick Tunnel exists
+        ↓  validated once, at the CLI admission point
+case context `genericExpectedDigest`      before any product request
+        ↓  read once; the environment is never re-read mid-case
+runSuccessCase -> vercelDelivery.expectedDigest
+        ↓  inside the seal
+Stage-B `vercel.byte-integrity`
+```
+
+Because the digest is taken from the generated file before the fixture is
+exposed and before the job exists, it cannot be a restatement of what VideoFetch
+returned. It is never derived from the delivered bytes, R2 metadata, the durable
+file size, the Vercel response, or a second download.
+
+**Why the comparison is mandatory rather than optional.** It used to be
+`expectedDigest == null || expectedDigest === clientDigest`, on the reasoning
+that no independently known digest can exist for a generic source. That holds for
+an arbitrary public URL and not for this controlled fixture — and while it held,
+a **self-consistent wrong object** satisfied every remaining clause: delivered
+bytes, durable `fileSize` and R2 `contentLength` all agreeing with each other,
+carrying content that was never the fixture's. Three lengths agreeing prove the
+pipeline was internally coherent. They say nothing about which bytes it carried.
 
 ### Process observation — what is captured, and what never is
 
@@ -1721,7 +1766,7 @@ where they belong.
 | The delivered artifact matches the accepted preset | **Live** — `delivery.matches-advertised-preset` |
 | Delivered length == durable `fileSize` == provider `contentLength` | **Live** — `vercel.byte-integrity` |
 | The delivered bytes' SHA-256 | **Live**, recorded |
-| An *independent* digest of the Worker-produced object | **Only for the direct fixture**, whose digest the harness derives itself |
+| An *independent* digest of the delivered object | **Live**, for BOTH fixtures — the direct digest the harness derives itself, the generic digest supplied as `VIDEOFETCH_ACCEPT_GENERIC_SHA256` from the generated file before it was exposed |
 | Generic worked **while it was enabled** | **Live**, from the `success` record's sealed feature state |
 | The kill switch worked **while it was disabled** | **Live**, from the `kill-switch` record's sealed feature state |
 | This exact transfer crossed the byte threshold | **Live** — case-correlated fixture evidence vs. the deployed `MAX_FILE_SIZE` |
@@ -2161,3 +2206,119 @@ Never overwrite run `5e6670a858543d93`. Use new paths, for example:
 ```
 
 with the containing directory at `0700`.
+
+---
+
+## The first Stage-B `success` attempt — BLOCKED
+
+Stage A passed. Run `a9ce1c400db8d817`, schema `10d-remediation-02`, verdict
+`PASS`, 23 / 0 / 0 / 0 — **still valid, still admissible, untouched.** Generic
+was then enabled for the authorized enabled-state window, the `success` case ran
+first, and the command exited `BLOCKED`. No case artifact was sealed; generic was
+rolled back to disabled and the remaining Stage-B cases were not run.
+
+### What the deployment actually did
+
+| | |
+| :--- | :--- |
+| durable status | `failed` |
+| `extractor` | `yt-dlp` |
+| `format_id` | `preset:best` |
+| `errorCode` | `TIMEOUT` |
+| reached | `queued` → `analyzing` → `downloading` → `failed` |
+| never reached | `processing`, `uploading`, R2 Put, R2 Head, ready commit |
+
+The public `GET /api/download/:id/status` DTO agreed with the durable row
+exactly. **R2 and the signing path were never implicated**, and could not have
+been: the job never became `ready`.
+
+### Root cause — the fixture, not the Worker timeout
+
+`/generic-media.mp4` served the same 48,497-byte body as `/direct.mp4`, throttled
+across 14 s so the cancellation and shutdown cases have a window to observe. A
+body that small is asked for by the pinned yt-dlp in essentially one socket read,
+and that read then spans the whole transfer — past the acquisition policy's
+`--socket-timeout=10`. yt-dlp retried twice (`--retries=2`), failed identically,
+and exited non-zero; `classifyDownloadFailure` mapped its output to `TIMEOUT`.
+
+Measured against the same 48 KB body: **5 s and 8 s throttles succeed; 11 s and
+14 s fail** — the boundary sits exactly at the socket timeout. The 600-second
+download budget was never approached; the job lived 39 s.
+
+`DOWNLOAD_SOCKET_TIMEOUT_SECONDS` is **not** widened.
+`PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001` gives the generic route its
+own larger deterministic fixture instead, so the same 14 s transfer arrives as
+many completed reads. Verified 3/3 against the pinned image: one media GET, no
+retry GET, exit 0, byte-identical output, ~16.8 s per acquisition.
+
+> **Historical measurement, not a constant.** Under the reviewed acceptance image
+> `sha256:b7b7554c…` the generic recipe produced 10,872,896 bytes, SHA-256
+> `be6283681981745d19341a4798775500fef5be451f1ddda2dc93ffd4ab434167`, reproduced
+> identically across two independent generations. That value is recorded here so
+> a reviewer can reproduce this run — it is **not** committed anywhere as the
+> expected digest, because a later reviewed image with a different but valid
+> FFmpeg/x264 build would produce different, equally correct bytes. The expected
+> digest is always read from the generator at acceptance time and supplied as
+> `VIDEOFETCH_ACCEPT_GENERIC_SHA256`.
+
+### The retry hypothesis was falsified
+
+The fixture log showed `/generic ×3` and `/generic-media.mp4 ×3`, which looks
+like three job executions. It is not one:
+
+- `claimNextQueuedJob` selects only `status = 'queued'`, and **nothing anywhere
+  in the Worker sets a job back to `queued`** — a failed job cannot be
+  re-claimed;
+- one *analysis* invocation performs **zero** media GETs (measured), so the three
+  page fetches are the product analysis, the durable execution's fresh analysis,
+  and the acquisition's own extraction;
+- one *successful* acquisition performs **exactly one** media GET (measured). The
+  extra media GETs were yt-dlp's own `--retries=2` attempts inside a single
+  acquisition.
+
+Request counts alone never establish execution counts. Both numbers here have a
+producer, and both were measured before either was believed.
+
+### Generic download progress does not come from yt-dlp
+
+The durable row's `progress`, `stage_label` and `downloaded_bytes` were all
+`NULL`, which is not evidence that nothing was downloading. Acquisition runs
+`--quiet --no-progress`, so the console emits nothing to parse: generic progress
+is produced by the **Worker's own file-size watcher** polling the `.part` file.
+The corrected fixture makes that observable — 89 non-zero `downloadedBytes`
+samples across a single acquisition.
+
+### The harness misreported it — corrected separately
+
+`runSuccessCase` polled to a terminal state and then called `signedDownload()`
+without branching on `finalJob.status`. `/api/download/:id/file` signs only
+`ready` jobs, so a genuinely failed job surfaced as
+`no object bytes were delivered through the signed GET` — a delivery accusation
+against the one subsystem that was never reached, with `polled.trace` lost
+because no record is sealed when a producer throws.
+
+The layers are now reported in causal order, and neither `signedDownload` nor
+`r2Evidence` runs for a job that did not become `ready`:
+
+```
+job did not reach terminal    -> poll-timeout diagnostic, no delivery attempt
+job terminal but not ready    -> job-failure diagnostic + canonical errorCode
+job ready, delivery failed    -> delivery diagnostic + the redirect status
+```
+
+The diagnostic carries only closed vocabulary — durable statuses, the canonical
+`WorkerErrorCode`, and the transition trace. No URL, sentinel, object key, signed
+URL, credential or raw extractor output.
+
+**The producer contract is unchanged**: a producer still throws, the case command
+still exits `BLOCKED`, and no case artifact is sealed. Whether an incomplete case
+observation deserves its own durable artifact is a separate question, deliberately
+not answered here.
+
+### What did not change
+
+`EVIDENCE_SCHEMA_VERSION` and `CASE_SCHEMA_VERSION` remain
+`10d-remediation-02`. No observer semantics, evaluator semantics, deployment
+binding, case-record shape, aggregate schema or HMAC format moved — only fixture
+bytes and diagnostic ordering — so the accepted Stage-A record stays admissible
+and Stage B rejoins run `a9ce1c400db8d817` unchanged.

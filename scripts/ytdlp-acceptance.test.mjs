@@ -138,7 +138,10 @@ import {
   CONTAINER_INSTANCE_PATTERN,
   CASE_PRODUCERS,
   CASE_SCHEMA_VERSION,
+  GENERIC_EXPECTED_DIGEST_ENV,
   HARNESS_ID,
+  parseGenericExpectedDigest,
+  runSuccessCase,
 } from "../deploy/acceptance/ytdlp-generic/lib/cases.mjs";
 import {
   readDenyCounter,
@@ -491,7 +494,9 @@ function passingStageBObservations(overrides = {}) {
       clientDigest: "b".repeat(64),
       durableFileSize: 83089,
       r2ContentLength: 83089,
-      expectedDigest: null,
+      // CORRECTION-01 §8: the independently known fixture digest, and it must
+      // equal what the client received.
+      expectedDigest: "b".repeat(64),
     }),
     sentinelSweep: measured({
       leaked: false,
@@ -1191,6 +1196,11 @@ async function runCli(argv, env, deps = {}) {
 const LIVE_ENV = (extra = {}) => ({
   [LIVE_ENV_NAME]: "1",
   VIDEOFETCH_ACCESS_SECRET: "an-actual-access-secret-value",
+  // CORRECTION-01: the generic fixture's pre-job digest. The fake control plane
+  // serves FIXTURE_BODY, so a run whose delivery is honest hashes to exactly
+  // this — which is what makes a DIVERGENT digest a discriminating failure
+  // rather than a fixture mismatch. Cases that must refuse it override it.
+  VIDEOFETCH_ACCEPT_GENERIC_SHA256: FIXTURE_DIGEST,
   ...extra,
 });
 
@@ -2781,6 +2791,8 @@ describe("Stage B outcome matrix", () => {
       { r2ContentLength: 1 },
       { durableFileSize: 7 },
       { expectedDigest: "f".repeat(64) },
+      { expectedDigest: null },
+      { expectedDigest: "B".repeat(64) },
     ]) {
       const result = evaluateStageB(
         passingStageBObservations({
@@ -2791,7 +2803,7 @@ describe("Stage B outcome matrix", () => {
             clientDigest: "b".repeat(64),
             durableFileSize: 83089,
             r2ContentLength: 83089,
-            expectedDigest: null,
+            expectedDigest: "b".repeat(64),
             ...patch,
           }),
         }),
@@ -8126,6 +8138,478 @@ describe("live acceptance requires a durable destination (CORRECTION-08.1)", () 
       assert.equal(run.files.size, 0, "a dry run writes nothing");
       assert.equal(world.calls.fetches.length, 0);
       assert.equal(world.calls.commands.length, 0);
+    }
+  });
+});
+
+// ── success-case terminal classification ───────────────────────────────────
+//
+// PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001 §14/§15.
+//
+// `runSuccessCase` used to poll to a terminal state and then call
+// `signedDownload()` unconditionally. `/api/download/:id/file` signs only
+// `ready` jobs, so a job that had genuinely FAILED produced "no object bytes
+// were delivered through the signed GET" — a delivery accusation against the
+// one subsystem that was never reached. The first live Stage-B `success`
+// attempt reported exactly that for a job whose durable row said
+// `failed` / `TIMEOUT`.
+//
+// These tests pin the causal order: job failure is reported as job failure,
+// and delivery is attempted (and blamed) only for a job that became ready.
+
+/** A generic analysis the case will accept, with one usable preset. */
+const SUCCESS_ANALYSIS = Object.freeze({
+  extractor: "yt-dlp",
+  presets: [{ id: "preset:best", formatId: "preset:best", container: "mp4" }],
+  formats: [],
+  thumbnail: null,
+});
+
+/**
+ * Drives `runSuccessCase` against a scripted job lifecycle.
+ *
+ * Everything the producer touches is a counter or a fixed value, so an assertion
+ * about "did delivery run" is a fact about the call, not an inference from a
+ * thrown message.
+ */
+function makeSuccessCaseCtx({
+  finalStatus,
+  errorCode = null,
+  timedOut = false,
+  trace = ["queued", "analyzing", "downloading", finalStatus],
+  location = "https://object.invalid/o",
+  redirectStatus = 303,
+  genericExpectedDigest = "c".repeat(64),
+  deliveredDigest = "c".repeat(64),
+}) {
+  const calls = { analyze: 0, createJob: 0, signedDownload: 0, fetchDigest: 0, r2Evidence: 0, sweepSurfaces: 0 };
+  const finalJob = finalStatus
+    ? { status: finalStatus, errorCode, container: "mp4", fileSize: 1024 }
+    : null;
+
+  const ctx = {
+    genericUrl: "https://fixture.invalid/generic",
+    directUrl: "https://fixture.invalid/direct.mp4",
+    genericExpectedDigest,
+    registerSecret: () => {},
+    sleep: async () => {},
+    monotonicNow: () => 0,
+    sampler: { sample: async () => ({ rows: [] }) },
+    session: {
+      analyze: async () => {
+        calls.analyze += 1;
+        return SUCCESS_ANALYSIS;
+      },
+      createJob: async () => {
+        calls.createJob += 1;
+        return { jobId: "a".repeat(32), status: "queued" };
+      },
+      pollTrace: async () => ({ trace, timeline: [], final: finalJob, timedOut }),
+      signedDownload: async () => {
+        calls.signedDownload += 1;
+        return { redirectStatus, location, presigned: true };
+      },
+      fetchDigest: async () => {
+        calls.fetchDigest += 1;
+        return { bytes: 1024, digest: deliveredDigest };
+      },
+    },
+    system: {
+      // Shaped exactly as the strict success validator requires, so a payload
+      // produced here is admissible and the digest field is the only variable.
+      durableJobRow: async () => ({
+        measured: true,
+        value: {
+          present: true,
+          jobId: "a".repeat(32),
+          status: finalStatus,
+          formatId: "preset:best",
+          extractor: "yt-dlp",
+          errorCode,
+        },
+      }),
+    },
+    r2Evidence: async () => {
+      calls.r2Evidence += 1;
+      return { objectExists: true, contentLength: 1024 };
+    },
+    sweepSurfaces: async () => {
+      calls.sweepSurfaces += 1;
+      return {
+        measured: true,
+        value: {
+          leaked: false,
+          leakedSurfaces: [],
+          surfacesChecked: ["journal", "docker-logs", "durable-row", "job-metadata", "api-error"],
+        },
+      };
+    },
+  };
+  return { ctx, calls };
+}
+
+describe("success-case terminal classification", () => {
+  it("reports a FAILED job as a job failure and never attempts delivery", async () => {
+    const { ctx, calls } = makeSuccessCaseCtx({ finalStatus: "failed", errorCode: "TIMEOUT" });
+
+    await assert.rejects(
+      () => runSuccessCase(ctx),
+      (error) => {
+        assert.match(error.message, /terminal status failed/);
+        assert.match(error.message, /errorCode TIMEOUT/);
+        assert.match(error.message, /queued>analyzing>downloading>failed/);
+        // The exact misdiagnosis this correction removes.
+        assert.ok(
+          !/no object bytes/i.test(error.message),
+          "a failed job must not be reported as a delivery failure",
+        );
+        assert.ok(!/signed GET/i.test(error.message));
+        return true;
+      },
+    );
+
+    assert.equal(calls.signedDownload, 0, "delivery must not be attempted for a failed job");
+    assert.equal(calls.fetchDigest, 0);
+    assert.equal(calls.r2Evidence, 0);
+    assert.equal(calls.sweepSurfaces, 0);
+  });
+
+  it("reports a CANCELLED job as a job failure and never attempts delivery", async () => {
+    const { ctx, calls } = makeSuccessCaseCtx({
+      finalStatus: "cancelled",
+      trace: ["queued", "analyzing", "downloading", "cancelled"],
+    });
+
+    await assert.rejects(() => runSuccessCase(ctx), /terminal status cancelled/);
+    assert.equal(calls.signedDownload, 0);
+    assert.equal(calls.r2Evidence, 0);
+  });
+
+  it("reports a POLL TIMEOUT as a poll timeout and never attempts delivery", async () => {
+    const { ctx, calls } = makeSuccessCaseCtx({
+      finalStatus: "downloading",
+      timedOut: true,
+      trace: ["queued", "analyzing", "downloading"],
+    });
+
+    await assert.rejects(
+      () => runSuccessCase(ctx),
+      (error) => {
+        assert.match(error.message, /did not reach a terminal status within the poll window/);
+        assert.match(error.message, /last observed downloading/);
+        assert.match(error.message, /queued>analyzing>downloading/);
+        return true;
+      },
+    );
+    assert.equal(calls.signedDownload, 0);
+    assert.equal(calls.r2Evidence, 0);
+  });
+
+  it("carries no URL, sentinel, object key or raw extractor output in the diagnostic", async () => {
+    const { ctx } = makeSuccessCaseCtx({ finalStatus: "failed", errorCode: "TIMEOUT" });
+    await assert.rejects(
+      () => runSuccessCase(ctx),
+      (error) => {
+        const message = error.message.toLowerCase();
+        for (const forbidden of ["http://", "https://", "vf_accept", "object.invalid"]) {
+          assert.ok(!message.includes(forbidden), `diagnostic must not carry '${forbidden}'`);
+        }
+        // Closed vocabulary only: durable statuses, the canonical error code and
+        // the transition trace. Raw extractor output is never persisted, so the
+        // whole message is asserted rather than probed for known fragments.
+        assert.match(
+          error.message,
+          /^the generic success job reached terminal status [a-z]+ \(errorCode [A-Z_]+\); trace [a-z>]+$/,
+        );
+        return true;
+      },
+    );
+  });
+
+  it("still runs the normal delivery path for a READY job", async () => {
+    const { ctx, calls } = makeSuccessCaseCtx({
+      finalStatus: "ready",
+      trace: ["queued", "analyzing", "downloading", "processing", "uploading", "ready"],
+    });
+
+    const payload = await runSuccessCase(ctx);
+    assert.equal(calls.signedDownload, 1);
+    assert.equal(calls.fetchDigest, 1);
+    assert.equal(calls.r2Evidence, 1);
+    assert.equal(calls.sweepSurfaces, 1);
+    assert.equal(payload.vercelDelivery.redirectStatus, 303);
+    assert.equal(payload.vercelDelivery.clientBytes, 1024);
+  });
+
+  it("keeps a READY job's undeliverable object a DELIVERY failure", async () => {
+    // The distinction the correction exists to preserve in both directions: a
+    // ready job that cannot be delivered is a delivery finding, and says so.
+    const { ctx, calls } = makeSuccessCaseCtx({
+      finalStatus: "ready",
+      location: null,
+      redirectStatus: 500,
+      trace: ["queued", "analyzing", "downloading", "processing", "uploading", "ready"],
+    });
+
+    await assert.rejects(
+      () => runSuccessCase(ctx),
+      (error) => {
+        assert.match(error.message, /ready generic job could not be delivered/);
+        assert.match(error.message, /HTTP 500/);
+        assert.match(error.message, /no usable Location/);
+        return true;
+      },
+    );
+    assert.equal(calls.signedDownload, 1, "delivery IS attempted for a ready job");
+    assert.equal(calls.r2Evidence, 0);
+  });
+});
+
+// ── the independent generic byte-integrity proof ───────────────────────────
+//
+// PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001-CORRECTION-01.
+//
+// The success record used to seal `expectedDigest: null`, and the evaluator used
+// to accept that (`expectedDigest == null || expectedDigest === clientDigest`).
+// The reasoning — "no independently known digest can exist for a generic
+// source" — is true of an ARBITRARY PUBLIC source and false of the controlled
+// Stage-B fixture, which is generated locally and hashed before it is exposed.
+//
+// With the comparison optional, a self-consistent WRONG object passed every
+// remaining clause: three lengths agreeing prove the pipeline was internally
+// coherent, and say nothing about WHICH bytes it carried.
+
+describe("generic delivery is proven against a pre-job fixture digest", () => {
+  const VALID = "c".repeat(64);
+
+  it("A. refuses a success run with no expected digest, before any product request", async () => {
+    // Exactly what the CLI puts on the context when the variable is absent.
+    const { ctx, calls } = makeSuccessCaseCtx({
+      finalStatus: "ready",
+      genericExpectedDigest: null,
+    });
+    await assert.rejects(() => runSuccessCase(ctx), new RegExp(GENERIC_EXPECTED_DIGEST_ENV));
+    assert.equal(calls.analyze, 0, "no analysis may be submitted");
+    assert.equal(calls.createJob, 0, "no job may be created");
+    assert.equal(calls.signedDownload, 0);
+  });
+
+  it("B. refuses a malformed expected digest, before any product request", async () => {
+    for (const malformed of ["", "not-a-digest", "C".repeat(64), "c".repeat(63), `${VALID} `, 42]) {
+      const { ctx, calls } = makeSuccessCaseCtx({
+        finalStatus: "ready",
+        genericExpectedDigest: malformed,
+      });
+      await assert.rejects(() => runSuccessCase(ctx), new RegExp(GENERIC_EXPECTED_DIGEST_ENV));
+      assert.equal(calls.analyze, 0, `no analysis for ${JSON.stringify(malformed)}`);
+      assert.equal(calls.createJob, 0, `no job for ${JSON.stringify(malformed)}`);
+    }
+  });
+
+  it("B2. the CLI refuses before the success producer runs at all", async () => {
+    // The same refusal at the command boundary, where the operator meets it.
+    for (const value of [undefined, "not-a-digest"]) {
+      const world = makeFakeWorld({
+        ytdlpEnabled: "true",
+        sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+      });
+      let jobRequests = 0;
+      const countingFetch = async (url, init) => {
+        const path = String(url);
+        if (path.includes("/api/analyze") || (path.includes("/api/download") && init?.method === "POST")) {
+          jobRequests += 1;
+        }
+        return world.fetch(url, init);
+      };
+      const run = await runCli(
+        ["--stage", "B", "--case", "success", ...LIVE_ARGS, "--evidence", "/tmp/c-digest.json"],
+        LIVE_ENV({
+          VIDEOFETCH_ACCEPT_GENERIC_URL: "https://media.invalid/generic/watch?v=abc",
+          VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4",
+          ...WORKER_ENV,
+          [GENERIC_EXPECTED_DIGEST_ENV]: value,
+        }),
+        { runReadOnly: world.runReadOnly, fetch: countingFetch, files: seedRun() },
+      );
+      assert.equal(run.code, 3, `usage exit expected: ${run.out}\n${run.err}`);
+      assert.match(run.err, new RegExp(GENERIC_EXPECTED_DIGEST_ENV));
+      assert.equal(jobRequests, 0, "no analyze and no job creation may reach the control plane");
+      assert.ok(!run.files.has("/tmp/c-digest.json"), "no record may be written");
+    }
+  });
+
+  it("B3. other Stage-B cases are not forced to supply a digest they do not consume", () => {
+    for (const name of ["cancellation", "byte-limit", "shutdown", "safe-egress", "direct-regression", "kill-switch"]) {
+      assert.ok(
+        !(CASE_PRODUCERS[name].needs ?? []).includes("genericExpectedDigest"),
+        `${name} makes no claim about the generic fixture's content identity`,
+      );
+    }
+    assert.ok(CASE_PRODUCERS.success.needs.includes("genericExpectedDigest"));
+  });
+
+  it("C. carries the admitted digest unchanged into the sealed payload", async () => {
+    const { ctx } = makeSuccessCaseCtx({
+      finalStatus: "ready",
+      trace: FULL_LADDER,
+      genericExpectedDigest: VALID,
+      deliveredDigest: VALID,
+    });
+    const payload = await runSuccessCase(ctx);
+    assert.equal(payload.vercelDelivery.expectedDigest, VALID);
+    // Provenance: it is the ADMITTED value, never a restatement of the delivery.
+    assert.notEqual(payload.vercelDelivery.expectedDigest, "d".repeat(64));
+  });
+
+  it("C2. the sealed digest is the admitted one, not the delivered one", async () => {
+    // If the producer ever sourced `expectedDigest` from what came back, this
+    // would pass silently and the whole comparison would be circular.
+    const { ctx } = makeSuccessCaseCtx({
+      finalStatus: "ready",
+      trace: FULL_LADDER,
+      genericExpectedDigest: VALID,
+      deliveredDigest: "e".repeat(64),
+    });
+    const payload = await runSuccessCase(ctx);
+    assert.equal(payload.vercelDelivery.expectedDigest, VALID);
+    assert.equal(payload.vercelDelivery.clientDigest, "e".repeat(64));
+    assert.notEqual(payload.vercelDelivery.expectedDigest, payload.vercelDelivery.clientDigest);
+  });
+
+  it("D. a matching delivered digest keeps vercel.byte-integrity PASS", () => {
+    const result = evaluateStageB(passingStageBObservations(), passingStageA());
+    const check = result.checks.find((c) => c.id === "vercel.byte-integrity");
+    assert.equal(check.outcome, "PASS");
+  });
+
+  it("E. a divergent delivered digest FAILS vercel.byte-integrity", () => {
+    const result = evaluateStageB(
+      passingStageBObservations({
+        vercelDelivery: measured({
+          redirectStatus: 303,
+          presigned: true,
+          clientBytes: 83089,
+          clientDigest: "b".repeat(64),
+          durableFileSize: 83089,
+          r2ContentLength: 83089,
+          expectedDigest: "a".repeat(64),
+        }),
+      }),
+      passingStageA(),
+    );
+    const check = result.checks.find((c) => c.id === "vercel.byte-integrity");
+    assert.equal(check.outcome, "FAIL");
+    assert.equal(result.summary.verdict, "FAIL");
+  });
+
+  it("F. a SELF-CONSISTENT WRONG OBJECT fails — the load-bearing regression", () => {
+    // Every length agrees with every other length. The pipeline is internally
+    // coherent end to end. The bytes are simply not the fixture's, and that is
+    // the only thing separating a real delivery from a plausible one.
+    //
+    // BOTH shapes must fail, and the second is the one that discriminates: with
+    // the comparison optional, an ABSENT expected digest let this exact object
+    // through every remaining clause.
+    for (const [label, expectedDigest] of [
+      ["a divergent expected digest", "c".repeat(64)],
+      ["NO expected digest at all", null],
+    ]) {
+      const wrongObject = measured({
+        redirectStatus: 303,
+        presigned: true,
+        clientBytes: 4242,
+        clientDigest: "9".repeat(64),
+        durableFileSize: 4242,
+        r2ContentLength: 4242,
+        expectedDigest,
+      });
+      const result = evaluateStageB(
+        passingStageBObservations({ vercelDelivery: wrongObject }),
+        passingStageA(),
+      );
+      const check = result.checks.find((c) => c.id === "vercel.byte-integrity");
+      assert.equal(
+        check.outcome,
+        "FAIL",
+        `three agreeing lengths must not substitute for identity (${label})`,
+      );
+      assert.equal(result.summary.verdict, "FAIL", label);
+
+      // And prove the trap is real: every OTHER clause of the check is satisfied.
+      assert.equal(wrongObject.value.clientBytes, wrongObject.value.durableFileSize);
+      assert.equal(wrongObject.value.clientBytes, wrongObject.value.r2ContentLength);
+      assert.ok(wrongObject.value.clientBytes > 0);
+      assert.match(wrongObject.value.clientDigest, /^[0-9a-f]{64}$/);
+    }
+  });
+
+  it("G. a success case record with a null expected digest is not admissible", async () => {
+    const binding = { expectedSha: SHA, runningImageId: IMAGE_ID };
+    // A genuine payload from the real producer, so the ONLY thing under test is
+    // the digest field — everything else in the record is as it would really be.
+    const { ctx } = makeSuccessCaseCtx({
+      finalStatus: "ready",
+      trace: FULL_LADDER,
+      genericExpectedDigest: VALID,
+      deliveredDigest: VALID,
+    });
+    const genuine = await runSuccessCase(ctx);
+    assert.equal(
+      validateCaseRecord(caseRecord({ caseName: "success", binding, payload: genuine }), binding).ok,
+      true,
+      "the unpatched payload must be admissible",
+    );
+
+    for (const bad of [null, "", "not-a-digest", "C".repeat(64), "c".repeat(63)]) {
+      const payload = {
+        ...genuine,
+        vercelDelivery: { ...genuine.vercelDelivery, expectedDigest: bad },
+      };
+      const verdict = validateCaseRecord(
+        caseRecord({ caseName: "success", binding, payload }),
+        binding,
+      );
+      assert.equal(verdict.ok, false, `expectedDigest ${JSON.stringify(bad)} must be refused`);
+      assert.match(verdict.reason, /vercelDelivery/);
+    }
+  });
+
+  it("H. the accepted Stage-A run a9ce1c400db8d817 remains admissible", async () => {
+    // CORRECTION-01 §10. This correction touches the success case's delivery
+    // evidence and nothing about Stage-A observer or evaluator semantics, so a
+    // record sealed by the accepted run must still authorize Stage B under this
+    // branch's own loader. Seeded with the EXACT accepted runId so the assertion
+    // names the artifact it is protecting rather than a stand-in.
+    const files = new Map();
+    files.set(RUN_KEY_PATH, JSON.stringify({ runId: "a9ce1c400db8d817", key: "d".repeat(64) }));
+
+    const world = makeFakeWorld();
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/accepted-stage-a.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+
+    const sealed = run.files.get("/tmp/accepted-stage-a.json");
+    const record = JSON.parse(sealed);
+    assert.equal(record.runId, "a9ce1c400db8d817");
+    assert.equal(record.schemaVersion, "10d-remediation-02");
+    assert.equal(CASE_SCHEMA_VERSION, "10d-remediation-02");
+
+    const loaded = await loadStageA("/tmp/accepted-stage-a.json", async () => sealed, {
+      run: { runId: "a9ce1c400db8d817", key: "d".repeat(64) },
+      expectedSha: SHA,
+    });
+    assert.equal(loaded.ok, true, loaded.reason);
+    assert.equal(loaded.summary.verdict, "PASS");
+    assert.equal(loaded.binding.expectedSha, SHA);
+  });
+
+  it("G2. the grammar itself refuses anything but 64 lowercase hex", () => {
+    assert.equal(parseGenericExpectedDigest("c".repeat(64)).ok, true);
+    for (const bad of [undefined, null, "", "C".repeat(64), "c".repeat(63), "c".repeat(65), "zz", 1]) {
+      assert.equal(parseGenericExpectedDigest(bad).ok, false, JSON.stringify(bad));
     }
   });
 });

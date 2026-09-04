@@ -59,6 +59,51 @@ const isInt = (v) => Number.isInteger(v);
 const isStr = (v) => typeof v === "string" && v.length > 0;
 const isArr = (v) => Array.isArray(v);
 const isDigest = (v) => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
+
+/**
+ * The grammar for the operator-supplied generic fixture digest.
+ *
+ * Lowercase hex, exactly 64 characters. Anything else is refused rather than
+ * normalized: an uppercase or whitespace-padded value would compare unequal to
+ * the client digest and turn a real byte-integrity proof into a false FAIL.
+ */
+export const GENERIC_EXPECTED_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+/** The environment variable carrying it into a live run. Never a secret. */
+export const GENERIC_EXPECTED_DIGEST_ENV = "VIDEOFETCH_ACCEPT_GENERIC_SHA256";
+
+/**
+ * Admits the generic fixture's pre-job digest (CORRECTION-01 §4/§5).
+ *
+ * This is NOT hard-coded in source, and deliberately so: the generic fixture is
+ * regenerated from the exact Worker image immediately before acceptance, and a
+ * later reviewed image carrying a different but valid FFmpeg/x264 build would
+ * produce different — equally correct — bytes. A source constant would either
+ * have to be edited for every image, or would silently fail the run it was
+ * supposed to protect.
+ *
+ * What the value must be is fixed instead by WHEN it is computed: from the
+ * generated file, before the fixture is exposed and before any job exists. It
+ * can therefore never be a restatement of what VideoFetch returned.
+ */
+export function parseGenericExpectedDigest(raw) {
+  if (raw === undefined || raw === null || raw === "") {
+    return {
+      ok: false,
+      reason:
+        `${GENERIC_EXPECTED_DIGEST_ENV} is required: the generic success case proves the ` +
+        "delivered bytes against the fixture digest computed BEFORE the fixture was exposed, " +
+        "and a run without it cannot make that comparison at all",
+    };
+  }
+  if (typeof raw !== "string" || !GENERIC_EXPECTED_DIGEST_PATTERN.test(raw)) {
+    return {
+      ok: false,
+      reason: `${GENERIC_EXPECTED_DIGEST_ENV} must be 64 lowercase hex characters`,
+    };
+  }
+  return { ok: true, digest: raw };
+}
 const isCaseId = (v) => typeof v === "string" && CASE_ID_PATTERN.test(v);
 /** A Docker container object id, as a STRING — never a coerced value (§27). */
 const isInstanceId = (v) => typeof v === "string" && CONTAINER_INSTANCE_PATTERN.test(v);
@@ -97,8 +142,17 @@ const CASE_PAYLOAD_VALIDATORS = Object.freeze({
       isArr(v?.samplerErrors) &&
       isArr(v?.ambiguousSamples),
     r2Evidence: (v) => isBool(v?.objectExists) && isInt(v?.contentLength),
+    // CORRECTION-01 §7: `expectedDigest` is REQUIRED and must be a real digest.
+    // It used to be permitted to be null, on the reasoning that no independently
+    // known digest can exist for an arbitrary public generic source. That is
+    // true of an arbitrary source and false of this one: the controlled fixture
+    // is generated locally and hashed before it is exposed, so a success record
+    // that omits the comparison is withholding evidence it had.
     vercelDelivery: (v) =>
-      isInt(v?.redirectStatus) && isBool(v?.presigned) && isDigest(v?.clientDigest),
+      isInt(v?.redirectStatus) &&
+      isBool(v?.presigned) &&
+      isDigest(v?.clientDigest) &&
+      isDigest(v?.expectedDigest),
     sentinelSweep: (v) => isBool(v?.leaked) && isArr(v?.surfacesChecked),
   },
   cancellation: {
@@ -778,6 +832,20 @@ async function driveJobWithWindow(ctx, jobId, initialStatus, opts = {}) {
 export async function runSuccessCase(ctx) {
   const { session, system, genericUrl, directUrl, now = () => new Date() } = ctx;
 
+  // ── CORRECTION-01 §4/§5: the expected digest is admitted FIRST ──────────
+  //
+  // Before the sentinel, before the direct control probe, before analysis and
+  // before any job exists. A run that cannot compare the delivered bytes to an
+  // independently known digest must not create work whose result it could not
+  // then judge — and refusing here, rather than at seal time, means no product
+  // request is made on a run that was never going to produce a valid record.
+  //
+  // Read ONCE from the context the CLI already validated. The environment is
+  // never re-read after the case begins, so the value sealed into the record is
+  // provably the value that was admitted.
+  const expectedDigest = parseGenericExpectedDigest(ctx.genericExpectedDigest);
+  if (!expectedDigest.ok) throw new Error(expectedDigest.reason);
+
   const sentinel = mintSentinel();
   ctx.registerSecret?.(sentinel);
   const submittedUrl = withSentinel(genericUrl, sentinel);
@@ -812,11 +880,50 @@ export async function runSuccessCase(ctx) {
     throw new Error(`durable job evidence unavailable: ${durable.reason}`);
   }
 
+  // ── Classify the TERMINAL RESULT before attempting delivery ─────────────
+  //
+  // PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001 §14. This used to fall
+  // straight through to `signedDownload()`, which signs only `ready` jobs — so
+  // a job that had genuinely failed produced "no object bytes were delivered
+  // through the signed GET", pointing at the one subsystem that was never
+  // involved. The first live Stage-B `success` attempt reported exactly that
+  // for a job whose durable row said `failed` / `TIMEOUT`.
+  //
+  // The layers are now reported in causal order: a job that did not become
+  // ready is a JOB failure, and delivery is not attempted or blamed. Neither
+  // `signedDownload` nor `r2Evidence` runs below this point unless the job is
+  // `ready`.
+  //
+  // Every value interpolated here is closed vocabulary — durable statuses and
+  // the canonical `WorkerErrorCode`. No URL, sentinel, object key, signed URL,
+  // credential or raw extractor output can reach this string.
+  const trace = Array.isArray(polled.trace) ? polled.trace.join(">") : "unavailable";
+  if (polled.timedOut === true) {
+    throw new Error(
+      `the generic success job did not reach a terminal status within the poll window ` +
+        `(last observed ${finalJob?.status ?? "unknown"}; trace ${trace})`,
+    );
+  }
+  if (finalJob?.status !== "ready") {
+    const errorCode = finalJob?.errorCode ?? null;
+    throw new Error(
+      `the generic success job reached terminal status ${finalJob?.status ?? "unknown"}` +
+        `${errorCode ? ` (errorCode ${errorCode})` : ""}; trace ${trace}`,
+    );
+  }
+
   // Delivery: 303 -> presigned -> bytes. The signed URL is used once and never
-  // recorded.
+  // recorded. Reached ONLY for a `ready` job, so a failure here really is a
+  // delivery failure — and says so, naming the redirect status and nothing
+  // else about the response.
   const signed = await session.signedDownload(jobId);
   const delivered = signed.location ? await session.fetchDigest(signed.location) : null;
-  if (!delivered) throw new Error("no object bytes were delivered through the signed GET");
+  if (!delivered) {
+    throw new Error(
+      `the ready generic job could not be delivered: the signed GET returned ` +
+        `HTTP ${signed.redirectStatus ?? "unknown"} with no usable Location`,
+    );
+  }
 
   // §16: R2 evidence is a MEASUREMENT. A failure to read the authenticated
   // Worker job view is not "the object exists because the job is ready".
@@ -874,12 +981,13 @@ export async function runSuccessCase(ctx) {
       clientDigest: delivered.digest,
       durableFileSize: finalJob?.fileSize ?? null,
       r2ContentLength: r2?.contentLength ?? null,
-      // No independently known digest exists for a public generic source: the
-      // only way to derive one would be to acquire the media a second time
-      // outside the application path, which is forbidden. Length agreement
-      // across durable, provider and client is the honest assertion here, and
-      // the direct fixture case is where a true expected digest exists.
-      expectedDigest: null,
+      // The digest of the generated generic fixture, computed from the file on
+      // disk before it was exposed and before this job existed (CORRECTION-01
+      // §6). It is NEVER derived from the delivered bytes, R2 metadata, the
+      // durable file size, the Vercel response, or a second download — any of
+      // those would make the comparison below a restatement of what VideoFetch
+      // returned rather than a check on it.
+      expectedDigest: expectedDigest.digest,
     },
     sentinelSweep: sweep.value,
   };
@@ -1510,7 +1618,7 @@ export const CASE_PRODUCERS = Object.freeze({
     // The Worker control credential is REQUIRED, not optional: R2 evidence and
     // the object-metadata sentinel surface both come from the authenticated
     // Worker job view, which is the only place `objectKey` exists.
-    needs: ["genericUrl", "directUrl", "workerControl"],
+    needs: ["genericUrl", "directUrl", "workerControl", "genericExpectedDigest"],
     operatorTransition: false,
     spansOneRestart: false,
     summary: "generic analysis, lifecycle, process window, R2, signed GET, sentinel sweep",
