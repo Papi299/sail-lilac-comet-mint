@@ -15,13 +15,14 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 
 import {
+  makeSystemObservers,
   EJS_PROBE_ARGV,
   ENV_NAMES_PROBE_ARGV,
   CONTAINER_ID_PATTERN,
@@ -170,6 +171,65 @@ describe("Stage-A bundled-EJS probe (REMEDIATION-02 defect B)", () => {
 
 describe("Stage-A network placement (REMEDIATION-02 defect A)", () => {
   const haveDocker = dockerAvailable();
+  const image = "alpine:latest";
+
+  /**
+   * Can this host observe a container's network namespace END TO END?
+   *
+   * `networkPlacement()` reads `/proc/<pid>/ns/net` for a PID that
+   * `docker inspect {{.State.Pid}}` reported. That is only meaningful where the
+   * Docker daemon shares the kernel running these tests — on Docker Desktop the
+   * PID belongs to a VM this process has no `/proc` for, so the link is
+   * unreadable and the observer correctly measures `null`.
+   *
+   * The end-to-end tests therefore run where Docker is native (the acceptance
+   * VM) and skip elsewhere, rather than being weakened into hand-written
+   * observations — which is precisely the defect this file exists to prevent.
+   */
+  function canObserveNamespacesEndToEnd() {
+    if (!haveDocker || process.platform !== "linux") return false;
+    try {
+      execFileSync("readlink", [`/proc/${process.pid}/ns/net`], { stdio: "pipe" });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const endToEnd = canObserveNamespacesEndToEnd() && imageAvailable(image);
+
+  /**
+   * Creates disposable containers and guarantees their removal.
+   *
+   * `async` + `await body()` is load-bearing: a synchronous wrapper's `finally`
+   * fires the moment an async body RETURNS ITS PROMISE, which tore the
+   * containers down before the observer ever ran. That produced a green
+   * "missing holder" result for entirely the wrong reason — caught only because
+   * these tests now execute the real observer.
+   */
+  async function withContainers(specs, body) {
+    const created = [];
+    try {
+      for (const [name, args] of specs) {
+        execFileSync("docker", ["run", "-d", "--name", name, ...args, image, "sleep", "120"], { stdio: "pipe" });
+        created.push(name);
+      }
+      return await body();
+    } finally {
+      for (const name of created.reverse()) {
+        try {
+          execFileSync("docker", ["rm", "-f", name], { stdio: "pipe" });
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+  }
+
+  const inspect = (name, format) =>
+    execFileSync("docker", ["inspect", "--format", format, name], { encoding: "utf8" }).trim();
+
+  const unique = () => randomUUID().slice(0, 8);
 
   it("rejects the string the retired check required", () => {
     // Docker never renders a running container's NetworkMode this way. The
@@ -179,61 +239,123 @@ describe("Stage-A network placement (REMEDIATION-02 defect A)", () => {
     assert.equal(CONTAINER_NETWORK_MODE_PATTERN.test(`container:${MEDIA_NETNS_CONTAINER}`), false);
   });
 
-  it("proves placement from real Docker containers sharing a namespace", { skip: !haveDocker }, async () => {
-    const holder = `vf-netns-holder-${randomUUID().slice(0, 8)}`;
-    const joiner = `vf-netns-joiner-${randomUUID().slice(0, 8)}`;
-    const image = "alpine:latest";
-
-    if (!imageAvailable(image)) return; // no network in tests; skip if uncached
-
-    const cleanup = () => {
-      for (const name of [joiner, holder]) {
-        try {
-          execFileSync("docker", ["rm", "-f", name], { stdio: "pipe" });
-        } catch {
-          /* already gone */
-        }
-      }
-    };
-
-    try {
-      execFileSync("docker", ["run", "-d", "--name", holder, image, "sleep", "120"], { stdio: "pipe" });
-      execFileSync("docker", ["run", "-d", "--name", joiner, "--network", `container:${holder}`, image, "sleep", "120"], { stdio: "pipe" });
-
-      const inspect = (name, format) =>
-        execFileSync("docker", ["inspect", "--format", format, name], { encoding: "utf8" }).trim();
-
+  it("Docker stores the RESOLVED id, never the name", { skip: !(haveDocker && imageAvailable(image)) }, async () => {
+    const holder = `vf-netns-holder-${unique()}`;
+    const joiner = `vf-netns-joiner-${unique()}`;
+    await withContainers([[holder, []], [joiner, ["--network", `container:${holder}`]]], () => {
       const rawMode = inspect(joiner, "{{.HostConfig.NetworkMode}}");
-      // The decisive fact this whole remediation rests on.
-      assert.match(rawMode, CONTAINER_NETWORK_MODE_PATTERN,
-        "Docker stores the RESOLVED container id, never the name");
-      assert.equal(rawMode.includes(holder), false, "the name is not preserved in NetworkMode");
+      assert.match(rawMode, CONTAINER_NETWORK_MODE_PATTERN, "the decisive fact this remediation rests on");
+      assert.equal(rawMode.includes(holder), false, "the NAME is not preserved");
+      assert.equal(CONTAINER_NETWORK_MODE_PATTERN.exec(rawMode)[1], inspect(holder, "{{.Id}}"));
+    });
+  });
 
-      const holderId = inspect(holder, "{{.Id}}");
-      assert.match(holderId, CONTAINER_ID_PATTERN);
+  // ── THE PRODUCER-SIDE PROOF ────────────────────────────────────────────────
+  //
+  //   real containers → makeSystemObservers → networkPlacement()
+  //     → real `docker inspect` → real `readlink /proc/<pid>/ns/net`
+  //       → measured observation → sharesMediaNetworkNamespace()
+  //
+  // Nothing in the happy path below is hand-written: every asserted value comes
+  // back from the observer and is then compared against the kernel and Docker
+  // independently. CORRECTION-01 added this because the first version of the
+  // test manufactured the two namespace strings and only exercised the
+  // evaluator — reproducing the very weakness under repair.
+  it("the REAL observer measures a real namespace-sharing pair", { skip: !endToEnd }, async () => {
+    const holder = `vf-netns-holder-${unique()}`;
+    const joiner = `vf-netns-joiner-${unique()}`;
+    await withContainers([[holder, []], [joiner, ["--network", `container:${holder}`]]], async () => {
+      const observers = makeSystemObservers({ container: joiner, mediaNetnsContainer: holder });
+      const observation = await observers.networkPlacement();
 
-      const targetId = CONTAINER_NETWORK_MODE_PATTERN.exec(rawMode)[1];
-      const joinerPid = Number(inspect(joiner, "{{.State.Pid}}"));
-      const holderPid = Number(inspect(holder, "{{.State.Pid}}"));
+      assert.equal(observation.measured, true, observation.reason ?? "");
+      const v = observation.value;
 
-      const placement = {
-        targetContainerId: targetId,
-        mediaNetnsContainerId: holderId,
-        workerPid: joinerPid,
-        mediaNetnsPid: holderPid,
-        workerNetNamespace: "net:[4026532355]",
-        mediaNetNamespace: "net:[4026532355]",
-      };
-      assert.equal(sharesMediaNetworkNamespace(placement), true,
-        "a genuinely namespace-sharing pair must PASS");
+      // Independently measured truth, read outside the observer.
+      const realHolderId = inspect(holder, "{{.Id}}");
+      const realJoinerPid = Number(inspect(joiner, "{{.State.Pid}}"));
+      const realHolderPid = Number(inspect(holder, "{{.State.Pid}}"));
+      const realJoinerNs = execFileSync("readlink", [`/proc/${realJoinerPid}/ns/net`], { encoding: "utf8" }).trim();
+      const realHolderNs = execFileSync("readlink", [`/proc/${realHolderPid}/ns/net`], { encoding: "utf8" }).trim();
 
-      // And the mismatches must all fail closed.
-      assert.equal(sharesMediaNetworkNamespace({ ...placement, targetContainerId: "b".repeat(64) }), false);
-      assert.equal(sharesMediaNetworkNamespace({ ...placement, mediaNetNamespace: "net:[4026539999]" }), false);
-      assert.equal(sharesMediaNetworkNamespace({ ...placement, mediaNetnsPid: null }), false);
-    } finally {
-      cleanup();
-    }
+      // The observer's values must BE those real values — this is the
+      // producer-side proof the evaluator alone could never give.
+      assert.equal(v.targetContainerId, realHolderId);
+      assert.equal(v.mediaNetnsContainerId, realHolderId);
+      assert.equal(v.workerPid, realJoinerPid);
+      assert.equal(v.mediaNetnsPid, realHolderPid);
+      assert.equal(v.workerNetNamespace, realJoinerNs);
+      assert.equal(v.mediaNetNamespace, realHolderNs);
+
+      // …and they must be genuine kernel identities that actually agree.
+      assert.match(v.workerNetNamespace, NET_NAMESPACE_PATTERN);
+      assert.match(v.mediaNetNamespace, NET_NAMESPACE_PATTERN);
+      assert.equal(v.workerNetNamespace, v.mediaNetNamespace);
+
+      assert.equal(sharesMediaNetworkNamespace(v), true, "a real shared namespace must PASS");
+    });
+  });
+
+  it("the REAL observer fails closed when the intended holder is a DIFFERENT container", { skip: !endToEnd }, async () => {
+    const holder = `vf-netns-holder-${unique()}`;
+    const other = `vf-netns-other-${unique()}`;
+    const joiner = `vf-netns-joiner-${unique()}`;
+    await withContainers(
+      [[holder, []], [other, []], [joiner, ["--network", `container:${holder}`]]],
+      async () => {
+        const observers = makeSystemObservers({ container: joiner, mediaNetnsContainer: other });
+        const observation = await observers.networkPlacement();
+        assert.equal(observation.measured, true, "the mismatch is MEASURED, not unobservable");
+        assert.notEqual(observation.value.targetContainerId, observation.value.mediaNetnsContainerId);
+        assert.equal(sharesMediaNetworkNamespace(observation.value), false,
+          "sharing SOME namespace is not sharing the INTENDED one");
+      },
+    );
+  });
+
+  it("the REAL observer fails closed on ordinary bridge networking", { skip: !endToEnd }, async () => {
+    const holder = `vf-netns-holder-${unique()}`;
+    const bridged = `vf-netns-bridged-${unique()}`;
+    await withContainers([[holder, []], [bridged, []]], async () => {
+      const observers = makeSystemObservers({ container: bridged, mediaNetnsContainer: holder });
+      const observation = await observers.networkPlacement();
+      assert.equal(observation.measured, true);
+      assert.equal(observation.value.targetContainerId, null, "bridge is not a container-scoped mode");
+      assert.equal(sharesMediaNetworkNamespace(observation.value), false);
+    });
+  });
+
+  it("the REAL observer refuses to measure a MISSING namespace holder", { skip: !endToEnd }, async () => {
+    const holder = `vf-netns-holder-${unique()}`;
+    const joiner = `vf-netns-joiner-${unique()}`;
+    await withContainers([[holder, []], [joiner, ["--network", `container:${holder}`]]], async () => {
+      const observers = makeSystemObservers({
+        container: joiner,
+        mediaNetnsContainer: `vf-netns-absent-${unique()}`,
+      });
+      const observation = await observers.networkPlacement();
+      // `docker inspect` on a container that does not exist EXITS NON-ZERO, so
+      // this is an inability to observe — BLOCKED — never a quiet false.
+      assert.equal(observation.measured, false, "a missing holder is unobservable, not 'not shared'");
+      assert.equal(sharesMediaNetworkNamespace(observation.value), false);
+    });
+  });
+
+  it("the REAL observer reports a STOPPED namespace holder as not-running", { skip: !endToEnd }, async () => {
+    const holder = `vf-netns-holder-${unique()}`;
+    const joiner = `vf-netns-joiner-${unique()}`;
+    await withContainers([[holder, []], [joiner, ["--network", `container:${holder}`]]], async () => {
+      execFileSync("docker", ["stop", "-t", "0", joiner], { stdio: "pipe" });
+      const observers = makeSystemObservers({ container: joiner, mediaNetnsContainer: holder });
+      const observation = await observers.networkPlacement();
+      if (observation.measured) {
+        // A stopped container reports PID 0, which normalizes to null.
+        assert.equal(observation.value.workerPid, null);
+        assert.equal(sharesMediaNetworkNamespace(observation.value), false);
+      } else {
+        assert.equal(sharesMediaNetworkNamespace(observation.value), false);
+      }
+    });
   });
 
   it("fails closed on every non-shared or unmeasured placement", () => {
@@ -276,6 +398,16 @@ describe("Stage-A network placement (REMEDIATION-02 defect A)", () => {
     assert.doesNotMatch("4026532355", NET_NAMESPACE_PATTERN);
     assert.match("6c81c4cd406a8660a0accba4f6c9c46417ecee96d8b508577d359c10affa3537", CONTAINER_ID_PATTERN);
     assert.doesNotMatch("6C81C4CD406A8660A0ACCBA4F6C9C46417ECEE96D8B508577D359C10AFFA3537", CONTAINER_ID_PATTERN);
+  });
+
+  it("the production default holder is application-owned and not operator-configurable", () => {
+    assert.equal(MEDIA_NETNS_CONTAINER, "videofetch-media-netns");
+    // The seam exists for disposable regressions only: no CLI option reaches it.
+    const cli = readFileSync(new URL("../deploy/acceptance/ytdlp-generic/acceptance.mjs", import.meta.url), "utf8");
+    assert.doesNotMatch(cli, /--media-netns|mediaNetnsContainer/,
+      "the namespace holder must never become operator input");
+    assert.throws(() => makeSystemObservers({ mediaNetnsContainer: "bad name;rm -rf /" }),
+      "a malformed holder name is refused by Docker's own grammar");
   });
 });
 

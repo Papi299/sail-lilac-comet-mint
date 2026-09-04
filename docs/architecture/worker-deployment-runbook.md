@@ -4000,19 +4000,34 @@ demonstrably healthy — which is what makes the diagnostics failures diagnostic
 All three survived review because the tests mocked them. The regressions now
 execute against real Docker containers, a real interpreter and the real image.
 
-### `/api/diagnostics` + `/api/sites` HTTP 500 — CONTROL-PLANE DEPLOYMENT SKEW
+### `/api/diagnostics` + `/api/sites` HTTP 500
 
-Not a repository defect. The Vercel Production deployment (created
-2026-08-30 23:10, CLI-deployed with no Git metadata) predates the Worker
-diagnostics contract change `506b1b62` (2026-09-02 12:26). Its
-`WorkerDiagnosticsSuccessSchema` is `.strict()`, has no `runtime` or `features`,
-and requires `safeEgress.attested` — so it rejects the current Worker's
-response, `getWorkerClient().diagnostics()` rejects, and both routes return a
-safe 500. `/api/sites` is affected because `loadSites()` calls `diagnostics()`.
+```
+CONTROL-PLANE SOURCE SKEW — STRONGLY SUPPORTED,
+DEPLOYED SOURCE IDENTITY NOT DIRECTLY ATTESTED
+```
 
-`src/shared/worker/contracts.test.ts` proves this executably rather than by
-date: the Worker validates its own response with the current schema before
-sending it, so a same-commit control plane cannot fail to parse it.
+The leading diagnosis, not an attested root cause. No repository defect was
+found.
+
+**Established by test.** The historical `WorkerDiagnosticsSuccessSchema` is
+`.strict()`, has no `runtime` or `features`, and requires `safeEgress.attested`,
+so it rejects the current Worker's response; the current schema accepts it. The
+Worker validates its own response with the current schema before sending it, so
+a same-commit control plane cannot fail on it. `/api/sites` fails with
+`/api/diagnostics` because `loadSites()` calls `diagnostics()`.
+
+**Corroborating.** The deployment (created 2026-08-30 23:10, CLI-deployed)
+predates the contract change `506b1b62` (2026-09-02 12:26), and the direct path
+passed — ruling out transport, HMAC and routing.
+
+**Not established.** The deployed bundle's source revision: Vercel exposes no
+Git metadata for it, and the live rejection was not directly observed. A
+compatibility proof is not an incident proof.
+
+Before another live Stage-A retry, the Production control plane must be aligned
+with a reviewed source whose diagnostics contract is compatible with the
+deployed Worker — under separate deployment authorization.
 
 **No backward-compatibility parsing was added to accommodate the stale
 deployment.** Aligning Vercel Production is a separate authorized task, to be

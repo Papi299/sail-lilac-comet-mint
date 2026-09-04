@@ -2019,11 +2019,19 @@ All three had passed review because the tests mocked them with idealized values.
 The regressions now EXECUTE: a real pair of namespace-sharing Docker containers,
 a real Python interpreter, and the real reviewed image.
 
-### `/api/diagnostics` and `/api/sites` 500 — control-plane deployment skew
+### `/api/diagnostics` and `/api/sites` 500
 
 Five of the six BLOCKED checks trace to those two endpoints failing under an
-authenticated session. The classification is **CONTROL-PLANE DEPLOYMENT SKEW**,
-and it is not a repository defect:
+authenticated session.
+
+> **CONTROL-PLANE SOURCE SKEW — STRONGLY SUPPORTED, DEPLOYED SOURCE IDENTITY
+> NOT DIRECTLY ATTESTED.** This is the leading root-cause diagnosis, not an
+> attested one. Vercel does not expose a source revision for this CLI-created
+> deployment, and no runtime evidence tying the observed 500 to a schema
+> rejection was obtained, so the failing bundle has not been shown to contain
+> the historical parser.
+
+The hypothesis, and what is actually established:
 
 ```
 new Worker /v1/diagnostics  →  {binaries, runtime, features,
@@ -2038,15 +2046,24 @@ getWorkerClient().diagnostics() rejects
 /api/sites       → loadSites() calls diagnostics() → safe 500
 ```
 
-The Vercel Production deployment was created **2026-08-30 23:10**; the contract
-change (`506b1b62`) landed **2026-09-02 12:26**. Dates alone do not prove it, so
-`src/shared/worker/contracts.test.ts` proves it executably: today's Worker
-response satisfies today's schema — the Worker parses its own response with that
-same module before sending it, so a control plane built from the same commit
-*cannot* fail — while the Production-era schema rejects it on unrecognized keys
-and a changed `safeEgress` shape.
+**Established.** `src/shared/worker/contracts.test.ts` proves executably that
+the two contracts are mutually incompatible: today's Worker response satisfies
+today's schema — the Worker parses its own response with that same module before
+sending it, so a same-commit control plane *cannot* fail on it — while the
+historical schema rejects it on unrecognized keys and a changed `safeEgress`
+shape. The direct path passing rules out transport, auth and routing.
 
-The direct path passing is what rules out transport, auth and routing.
+**Corroborating.** The deployment was created **2026-08-30 23:10**; the contract
+change (`506b1b62`) landed **2026-09-02 12:26**.
+
+**Not established.** Which source revision the failing deployment was actually
+built from. `vercel inspect` exposes no Git metadata for it, and the live
+rejection itself was not observed. A compatibility proof is not an incident
+proof.
+
+Closing that gap needs either sanitized Vercel runtime evidence naming the Zod
+rejection, or deployed-bundle metadata identifying the revision — neither of
+which is a precondition for the harness corrections in this PR.
 
 **No backward-compatibility parsing was added.** Aligning Vercel Production is a
 separate, later, authorized task.

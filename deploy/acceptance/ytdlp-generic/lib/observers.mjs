@@ -767,6 +767,28 @@ export function makeSystemObservers(deps = {}) {
   const imageRepo = deps.imageRepo ?? "videofetch-worker";
 
   /**
+   * The container expected to OWN the media network namespace.
+   *
+   * A NARROW TEST SEAM, and deliberately nothing more. Production never passes
+   * it: every call site takes the application-owned default, no CLI option
+   * reaches it, and it is not read from the environment — so an operator cannot
+   * redirect the placement proof at a container of their choosing.
+   *
+   * It exists because the namespace regression has to run against a DISPOSABLE
+   * pair of containers. Requiring the literal Production name there would mean
+   * either colliding with the real `videofetch-media-netns` on the acceptance
+   * VM, or falling back to hand-written observations — which is exactly the
+   * mocked-observer weakness this whole remediation removes.
+   *
+   * The value is bounded by Docker's own container-name grammar at the point of
+   * use (`inspectNamed`), so the seam widens no command shape.
+   */
+  const mediaNetnsContainer = deps.mediaNetnsContainer ?? MEDIA_NETNS_CONTAINER;
+  if (!CONTAINER_NAME_PATTERN.test(String(mediaNetnsContainer))) {
+    throw new Error("refusing a malformed media namespace container name");
+  }
+
+  /**
    * `docker inspect --format` on the container, returning a trimmed scalar.
    *
    * §6/§7 of CORRECTION-07: a non-zero exit means the command FAILED, and its
@@ -938,8 +960,8 @@ export function makeSystemObservers(deps = {}) {
         const matched = CONTAINER_NETWORK_MODE_PATTERN.exec(rawMode);
 
         const workerPid = await pidOf(container);
-        const mediaNetnsId = await inspectNamed(MEDIA_NETNS_CONTAINER, "{{.Id}}");
-        const mediaPid = await pidOf(MEDIA_NETNS_CONTAINER);
+        const mediaNetnsId = await inspectNamed(mediaNetnsContainer, "{{.Id}}");
+        const mediaPid = await pidOf(mediaNetnsContainer);
 
         return {
           // `null` when the mode is not container-scoped at all (`bridge`,
