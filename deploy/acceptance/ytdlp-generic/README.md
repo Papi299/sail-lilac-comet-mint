@@ -7,19 +7,34 @@ references any of it, and none of it is part of the Worker image's runtime path.
 >
 > ```
 > harness exists:            YES
-> live generic acceptance:   NO
-> Production deployment:     NO
-> Production enablement:     NO
+> Stage A (live):            PASSED — run a9ce1c400db8d817
+> Stage B:                   NOT STARTED
+> Production enablement:     NO — YTDLP_ENABLED remains unset
 > ```
 >
-> `PHASE-10C4-YTDLP-PRODUCTION-ACCEPTANCE-HARNESS-001` wrote this harness and
-> **did not execute it against Production**. It did not start the Lima VM,
-> build or install a Worker image, set `YTDLP_ENABLED`, contact a public media
-> site, or touch Cloudflare, R2 or Vercel.
+> **Stage A has passed.** Run `a9ce1c400db8d817`, schema `10d-remediation-02`,
+> `live`, bound to the reviewed Worker source
+> `4a537e3cb7403801f39a706ce7bed896c0fe11f7`:
 >
-> The live procedure below is a **specification for the later task**
-> `PHASE-10D-YTDLP-PRODUCTION-STAGED-DEPLOYMENT-AND-LIVE-ACCEPTANCE-001`.
-> Nothing in this file records a test that has passed.
+> ```
+> verdict   PASS        PASS 23    FAIL 0    BLOCKED 0    NOT_EXERCISED 0
+> ```
+>
+> It replaces nothing: the earlier `5e6670a858543d93` / `10d-remediation-01`
+> run **FAILED** (16 PASS / 1 FAIL / 6 BLOCKED) and its sealed record and run
+> key are retained unmodified as historical evidence. Both records stand.
+>
+> **A Stage A PASS is not enablement authorization.** Generic execution is still
+> disabled, no Stage B case has run, and `YTDLP_ENABLED` has not been set.
+>
+> Immediately after that PASS, `PHASE-10D-ACCEPTANCE-EVIDENCE-IMMUTABILITY-001`
+> found that a **dry run** handed `--evidence` wrote a `BLOCKED` stub to that
+> path, and that all three live producers sealed their records with an ordinary
+> overwriting write. The artifact the whole staged programme depends on was
+> therefore silently destroyable. That is corrected **before** Stage B — see
+> [Evidence artifacts are append-only by path](#evidence-artifacts-are-append-only-by-path).
+> The correction changes durability only; the accepted `10d-remediation-02`
+> record remains valid and admissible.
 
 ---
 
@@ -295,6 +310,66 @@ Stage A **begins** a run; Stage B cases and the aggregation **join** it.
   wrong with it;
 - **deleted by the operator when acceptance is complete.**
 
+##### Evidence artifacts are append-only by path
+
+The run key has been fail-closed since CORRECTION-05. Until CORRECTION-08 the
+**evidence records were not**, and the asymmetry was the whole defect: the file
+holding a run's only durable result was easier to destroy than the file holding
+its key.
+
+**Every LIVE acceptance command requires `--evidence <path>`.** Stage A, every
+Stage B case and the aggregation are admitted only after *both* conditions hold:
+
+```
+the evidence path is PRESENT      (a live run must name its destination)
+the evidence path is UNOCCUPIED   (naming a taken one is refused, not resolved)
+```
+
+Both are checked at one admission point — before the private-access login,
+before the run key is minted or loaded, and before any observer, product
+request, job, cancellation or restart. The path is parsed **once** there and
+carried on the context, so the path admitted is provably the path preflighted
+and the path exclusively created; no producer re-reads `argv` at seal time.
+
+A missing filename is not a free filename. The Stage B case producer used to
+check for `--evidence` *after* it had run — an operator who forgot the flag got
+a real generic job, a real cancellation or a real Worker restart, and then a
+usage error instead of a record. For a production-changing case, no evidence
+destination means no authorization to execute the case at all.
+
+**Dry runs never require and never write evidence.** The mandatory-path rule
+begins only after the live gate has positively admitted live execution; without
+both opt-ins every subcommand still prints `LIVE EXECUTION REFUSED`, exits 2 and
+touches nothing.
+
+- a **dry run writes nothing at all**, even when handed `--evidence`. It used to
+  seal a `mode: "dry-run"` stub there — so the one invocation an operator
+  reaches for *because* it changes nothing could replace a sealed PASS with a
+  record carrying no schema, no `runId` and no checks;
+- an existing `--evidence` target is **refused, never replaced** — as a file, a
+  directory, or a symlink. The gate uses `lstat`, so a link occupying the path
+  is the entry itself rather than a window onto its target;
+- the refusal is early: **before** Stage A creates its direct-media job and
+  **before** a Stage B case cancels or restarts anything, so an occupied path
+  never costs production work whose record cannot be written;
+- the final create is exclusive (`flag: "wx"`), so a file appearing inside the
+  gate-to-seal window **loses** rather than being truncated. Losing is
+  `BLOCKED`: never adopt the winner, never unlink and retry, never archive;
+- the harness never deletes, truncates, renames or archives an artifact.
+  **Choosing a new path is a deliberate operator action.**
+
+The bounded consequence of losing the race is stated plainly rather than hidden:
+the acceptance work may already have executed against Production, but no
+evidence claim is made for a run whose record could not be durably written.
+
+**What these two checks do and do not prove.** The early gate proves the target
+path was *unoccupied*; the exclusive creation proves it was *still* unoccupied at
+the final write. Neither proves the parent directory exists, is writable, or has
+safe permissions — an unwritable directory surfaces as a write failure at seal
+time, not as an early refusal. Pre-creating and verifying the private evidence
+workspace is a separate operator step, and the later Stage-B operational task
+does it before generic execution is enabled.
+
 `ENOENT` is the only condition that mints a run:
 
 | Existing file | Outcome |
@@ -364,6 +439,7 @@ and **authorize current Stage B**. What it actually attested would be far less:
 | CORRECTION-06 | positive findings outranking observation gaps; the exact `docker top` argv boundary; feature-state continuity |
 | CORRECTION-07 | raw evidence validated before normalization; successful exit required before stdout is a measurement; container-epoch continuity; type-strict run identity; atomic key creation |
 | 10D-REM-01 | the durable observer can address the deployment **at all** — see [Durable state is read inside the Worker](#durable-state-is-read-inside-the-worker). Before it, every `durable.*` check and the sentinel's `durable-row` surface could only ever have been `BLOCKED`, because the producer named a database file, a table and an executable that do not exist |
+| CORRECTION-08 | **nothing.** Deliberately *not* a bump: it changes only whether an artifact may be overwritten on disk. Observer semantics, evaluator semantics, record contents and the deployment binding are untouched, so a sealed `10d-remediation-02` `PASS` means exactly what it meant when run `a9ce1c400db8d817` produced one |
 
 **Bump it whenever an observer or evaluator change could make an old artifact
 mean something *weaker* under the same shape.** A field added or removed is the

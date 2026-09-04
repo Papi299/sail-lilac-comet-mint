@@ -44,7 +44,7 @@
 //   VF_CONTROL_KEY_ID / VF_CONTROL_SECRET / VF_WORKER_ORIGIN
 //                                     for the Worker's own cancel route
 
-import { writeFile, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { evaluateLiveGate, readOption, readOptionList, readStage, LIVE_ENV_NAME, LIVE_ENV_VALUE } from "./lib/gate.mjs";
 import { OUTCOMES } from "./lib/verdict.mjs";
@@ -93,6 +93,8 @@ import {
   bindingAgreesWithRecord,
   validateDeploymentBinding,
   verifyRecord,
+  evidencePathAvailable,
+  writeEvidenceExclusive,
 } from "./lib/provenance.mjs";
 
 const EXIT = Object.freeze({ PASS: 0, FAIL: 1, BLOCKED: 2, USAGE: 3 });
@@ -120,7 +122,6 @@ export async function main(argv, env, deps = {}) {
   });
   const log = safe.log;
   const errorLog = safe.error;
-  const write = deps.writeFile ?? writeFile;
   const read = deps.readFile ?? readFile;
 
   const stageArg = readStage(argv);
@@ -171,21 +172,14 @@ export async function main(argv, env, deps = {}) {
   // Reached by EVERY subcommand. There is no case-specific shortcut past it.
   if (!gate.live) {
     printDryRun(log, stage, gate, caseName, aggregate);
-    const record = buildEvidence({
-      stage,
-      mode: "dry-run",
-      startedAt,
-      finishedAt: new Date().toISOString(),
-      checks: [],
-      summary: {
-        verdict: OUTCOMES.BLOCKED,
-        counts: { PASS: 0, FAIL: 0, BLOCKED: 0, NOT_EXERCISED: 0 },
-        blocking: ["dry-run"],
-        notExercised: [],
-      },
-    });
-    const evidencePath = readOption(argv, "--evidence");
-    if (evidencePath) await write(evidencePath, renderEvidence(record, secrets), "utf8");
+    // §3 of CORRECTION-08: a dry run is OBSERVATIONAL, including its output.
+    //
+    // It used to seal a `mode: "dry-run"` BLOCKED stub to `--evidence`, which
+    // made the single safest invocation in the harness — the one an operator
+    // reaches for precisely BECAUSE it changes nothing — capable of destroying
+    // a sealed acceptance artifact by replacing it with a record carrying no
+    // schema, no runId and no checks. The console output above is the entire
+    // explanation a refusal owes anyone; nothing reaches the filesystem.
     return EXIT.BLOCKED;
   }
 
@@ -219,6 +213,43 @@ export async function main(argv, env, deps = {}) {
     return EXIT.USAGE;
   }
   registerSecret(accessSecret);
+
+  // ── §4/§6 of CORRECTION-08: a live command must NAME a free destination
+  //    BEFORE any product-changing acceptance work ───────────────────────────
+  //
+  // Two conditions, one admission point, earlier than the login, earlier than
+  // the run key, and earlier than every producer.
+  //
+  // PRESENT. `--evidence` used to be optional for a live run, and the Stage B
+  // case producer only checked for it AFTER it had run — so an operator who
+  // forgot the flag got a real generic job, a real cancellation or a real
+  // Worker restart, and then a usage error instead of a record. A missing
+  // filename is not a free filename: for a production-changing case it is the
+  // absence of authorization to execute the case at all.
+  //
+  // UNOCCUPIED. Discovering a taken path after Stage A created its direct-media
+  // job would mean the same thing by a different route — real work whose record
+  // can never be written.
+  //
+  // Parsed ONCE, here, and carried on `ctx`: the path admitted is provably the
+  // path preflighted and the path exclusively created, because no producer
+  // re-reads argv at seal time.
+  //
+  // This does NOT close the race; it only makes the common case cost nothing.
+  // The exclusive create at seal time remains mandatory.
+  const evidencePath = readOption(argv, "--evidence");
+  if (!evidencePath) {
+    errorLog(
+      "usage error: --evidence <path> is required for a live acceptance command. " +
+        "Acceptance work whose result cannot be durably recorded is not authorized to run.",
+    );
+    return EXIT.USAGE;
+  }
+  const pathFree = await evidencePathAvailable(evidencePath, deps);
+  if (!pathFree.ok) {
+    errorLog(pathFree.reason);
+    return EXIT.BLOCKED;
+  }
 
   log(`LIVE ACCEPTANCE — stage ${stage}${caseName ? ` case ${caseName}` : ""}${aggregate ? " (aggregate)" : ""}`);
   log(`control plane : ${redactUrl(baseUrl)}`);
@@ -287,10 +318,11 @@ export async function main(argv, env, deps = {}) {
   const ctx = {
     run: acceptanceRun,
     argv,
+    // The single admitted, preflighted evidence destination (§6).
+    evidencePath,
     env,
     log,
     errorLog,
-    write,
     read,
     system,
     session,
@@ -317,7 +349,7 @@ export async function main(argv, env, deps = {}) {
 // ── Stage A ────────────────────────────────────────────────────────────────
 
 async function runStageA(ctx) {
-  const { argv, log, errorLog, write, secrets } = ctx;
+  const { log, errorLog, secrets, deps, evidencePath } = ctx;
 
   const obs = await collectStageAObservations(ctx);
 
@@ -377,8 +409,9 @@ async function runStageA(ctx) {
     summary: result.summary,
   });
 
-  const evidencePath = readOption(argv, "--evidence");
-  if (evidencePath) {
+  // The destination was admitted and preflighted at §4; sealing uses that exact
+  // path rather than re-reading argv, so the three can never disagree.
+  {
     const sealed = sealRecord(record, ctx.run.key);
     const rendered = renderEvidence(sealed, secrets);
     if (rendered.includes("<scrubbed>")) {
@@ -388,7 +421,11 @@ async function runStageA(ctx) {
       );
       return EXIT.BLOCKED;
     }
-    await write(evidencePath, rendered, "utf8");
+    const written = await writeEvidenceExclusive(evidencePath, rendered, deps);
+    if (!written.ok) {
+      errorLog(written.reason);
+      return EXIT.BLOCKED;
+    }
     log(`\nevidence written: ${evidencePath}`);
   }
   log(`\nVERDICT: ${result.summary.verdict}`);
@@ -497,7 +534,7 @@ export async function runDirectRegression(ctx, directUrl, declaredDigest) {
 // ── Stage B: one case ──────────────────────────────────────────────────────
 
 async function runStageBCase(ctx, caseName) {
-  const { argv, log, errorLog, write, secrets, env, expectedSha, run: acceptanceRun } = ctx;
+  const { argv, log, errorLog, secrets, env, expectedSha, run: acceptanceRun, deps, evidencePath } = ctx;
 
   // ── §12 of CORRECTION-07: ONE pre-case deployment snapshot ─────────────
   //
@@ -737,9 +774,13 @@ async function runStageBCase(ctx, caseName) {
     acceptanceRun.key,
   );
 
-  const evidencePath = readOption(argv, "--evidence");
+  // §7 of CORRECTION-08: this used to be the PRIMARY gate, and it sat HERE —
+  // after the producer had already run a generic job, cancelled a download or
+  // restarted the Worker. Live admission now establishes the invariant
+  // structurally, so what remains is a defensive assertion no public CLI path
+  // can reach, not a safety check anything relies on.
   if (!evidencePath) {
-    errorLog("usage error: --evidence <path> is required for a case run; the record is its output");
+    errorLog("internal error: a live case reached its producer without an admitted evidence path");
     return EXIT.USAGE;
   }
   const rendered = renderEvidence(record, secrets);
@@ -752,7 +793,11 @@ async function runStageBCase(ctx, caseName) {
     );
     return EXIT.BLOCKED;
   }
-  await write(evidencePath, rendered, "utf8");
+  const written = await writeEvidenceExclusive(evidencePath, rendered, deps);
+  if (!written.ok) {
+    errorLog(written.reason);
+    return EXIT.BLOCKED;
+  }
   log(`case evidence written: ${evidencePath}`);
   log("Run `--stage B --aggregate` with every case record to obtain the Stage B verdict.");
   return EXIT.PASS;
@@ -863,7 +908,7 @@ async function measureFeatureState(ctx, ytdlpEnabledRaw) {
 // ── Stage B: aggregation ───────────────────────────────────────────────────
 
 async function runStageBAggregate(ctx) {
-  const { argv, log, errorLog, write, read, secrets, system, session, expectedSha } = ctx;
+  const { argv, log, errorLog, read, secrets, system, session, expectedSha, deps, evidencePath } = ctx;
 
   const stageAPath = readOption(argv, "--stage-a");
   const stageA = await loadStageA(stageAPath, read, {
@@ -1030,8 +1075,8 @@ async function runStageBAggregate(ctx) {
     summary: result.summary,
   });
 
-  const evidencePath = readOption(argv, "--evidence");
-  if (evidencePath) {
+  // The admitted, preflighted destination (§6) — never re-parsed from argv.
+  {
     const sealed = sealRecord(record, ctx.run.key);
     const rendered = renderEvidence(sealed, secrets);
     if (rendered.includes("<scrubbed>")) {
@@ -1041,7 +1086,11 @@ async function runStageBAggregate(ctx) {
       );
       return EXIT.BLOCKED;
     }
-    await write(evidencePath, rendered, "utf8");
+    const written = await writeEvidenceExclusive(evidencePath, rendered, deps);
+    if (!written.ok) {
+      errorLog(written.reason);
+      return EXIT.BLOCKED;
+    }
     log(`\nevidence written: ${evidencePath}`);
   }
   log(`\nVERDICT: ${result.summary.verdict}`);
