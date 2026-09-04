@@ -139,6 +139,7 @@ import {
   CASE_PRODUCERS,
   CASE_SCHEMA_VERSION,
   HARNESS_ID,
+  runSuccessCase,
 } from "../deploy/acceptance/ytdlp-generic/lib/cases.mjs";
 import {
   readDenyCounter,
@@ -8127,5 +8128,203 @@ describe("live acceptance requires a durable destination (CORRECTION-08.1)", () 
       assert.equal(world.calls.fetches.length, 0);
       assert.equal(world.calls.commands.length, 0);
     }
+  });
+});
+
+// ── success-case terminal classification ───────────────────────────────────
+//
+// PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001 §14/§15.
+//
+// `runSuccessCase` used to poll to a terminal state and then call
+// `signedDownload()` unconditionally. `/api/download/:id/file` signs only
+// `ready` jobs, so a job that had genuinely FAILED produced "no object bytes
+// were delivered through the signed GET" — a delivery accusation against the
+// one subsystem that was never reached. The first live Stage-B `success`
+// attempt reported exactly that for a job whose durable row said
+// `failed` / `TIMEOUT`.
+//
+// These tests pin the causal order: job failure is reported as job failure,
+// and delivery is attempted (and blamed) only for a job that became ready.
+
+/** A generic analysis the case will accept, with one usable preset. */
+const SUCCESS_ANALYSIS = Object.freeze({
+  extractor: "yt-dlp",
+  presets: [{ id: "preset:best", formatId: "preset:best", container: "mp4" }],
+  formats: [],
+  thumbnail: null,
+});
+
+/**
+ * Drives `runSuccessCase` against a scripted job lifecycle.
+ *
+ * Everything the producer touches is a counter or a fixed value, so an assertion
+ * about "did delivery run" is a fact about the call, not an inference from a
+ * thrown message.
+ */
+function makeSuccessCaseCtx({
+  finalStatus,
+  errorCode = null,
+  timedOut = false,
+  trace = ["queued", "analyzing", "downloading", finalStatus],
+  location = "https://object.invalid/o",
+  redirectStatus = 303,
+}) {
+  const calls = { signedDownload: 0, fetchDigest: 0, r2Evidence: 0, sweepSurfaces: 0 };
+  const finalJob = finalStatus
+    ? { status: finalStatus, errorCode, container: "mp4", fileSize: 1024 }
+    : null;
+
+  const ctx = {
+    genericUrl: "https://fixture.invalid/generic",
+    directUrl: "https://fixture.invalid/direct.mp4",
+    registerSecret: () => {},
+    sleep: async () => {},
+    monotonicNow: () => 0,
+    sampler: { sample: async () => ({ rows: [] }) },
+    session: {
+      analyze: async () => SUCCESS_ANALYSIS,
+      createJob: async () => ({ jobId: "a".repeat(32), status: "queued" }),
+      pollTrace: async () => ({ trace, timeline: [], final: finalJob, timedOut }),
+      signedDownload: async () => {
+        calls.signedDownload += 1;
+        return { redirectStatus, location, presigned: true };
+      },
+      fetchDigest: async () => {
+        calls.fetchDigest += 1;
+        return { bytes: 1024, digest: "d".repeat(64) };
+      },
+    },
+    system: {
+      durableJobRow: async () => ({
+        measured: true,
+        value: { status: finalStatus, errorCode, present: true },
+      }),
+    },
+    r2Evidence: async () => {
+      calls.r2Evidence += 1;
+      return { contentLength: 1024 };
+    },
+    sweepSurfaces: async () => {
+      calls.sweepSurfaces += 1;
+      return { measured: true, value: { clean: true } };
+    },
+  };
+  return { ctx, calls };
+}
+
+describe("success-case terminal classification", () => {
+  it("reports a FAILED job as a job failure and never attempts delivery", async () => {
+    const { ctx, calls } = makeSuccessCaseCtx({ finalStatus: "failed", errorCode: "TIMEOUT" });
+
+    await assert.rejects(
+      () => runSuccessCase(ctx),
+      (error) => {
+        assert.match(error.message, /terminal status failed/);
+        assert.match(error.message, /errorCode TIMEOUT/);
+        assert.match(error.message, /queued>analyzing>downloading>failed/);
+        // The exact misdiagnosis this correction removes.
+        assert.ok(
+          !/no object bytes/i.test(error.message),
+          "a failed job must not be reported as a delivery failure",
+        );
+        assert.ok(!/signed GET/i.test(error.message));
+        return true;
+      },
+    );
+
+    assert.equal(calls.signedDownload, 0, "delivery must not be attempted for a failed job");
+    assert.equal(calls.fetchDigest, 0);
+    assert.equal(calls.r2Evidence, 0);
+    assert.equal(calls.sweepSurfaces, 0);
+  });
+
+  it("reports a CANCELLED job as a job failure and never attempts delivery", async () => {
+    const { ctx, calls } = makeSuccessCaseCtx({
+      finalStatus: "cancelled",
+      trace: ["queued", "analyzing", "downloading", "cancelled"],
+    });
+
+    await assert.rejects(() => runSuccessCase(ctx), /terminal status cancelled/);
+    assert.equal(calls.signedDownload, 0);
+    assert.equal(calls.r2Evidence, 0);
+  });
+
+  it("reports a POLL TIMEOUT as a poll timeout and never attempts delivery", async () => {
+    const { ctx, calls } = makeSuccessCaseCtx({
+      finalStatus: "downloading",
+      timedOut: true,
+      trace: ["queued", "analyzing", "downloading"],
+    });
+
+    await assert.rejects(
+      () => runSuccessCase(ctx),
+      (error) => {
+        assert.match(error.message, /did not reach a terminal status within the poll window/);
+        assert.match(error.message, /last observed downloading/);
+        assert.match(error.message, /queued>analyzing>downloading/);
+        return true;
+      },
+    );
+    assert.equal(calls.signedDownload, 0);
+    assert.equal(calls.r2Evidence, 0);
+  });
+
+  it("carries no URL, sentinel, object key or raw extractor output in the diagnostic", async () => {
+    const { ctx } = makeSuccessCaseCtx({ finalStatus: "failed", errorCode: "TIMEOUT" });
+    await assert.rejects(
+      () => runSuccessCase(ctx),
+      (error) => {
+        const message = error.message.toLowerCase();
+        for (const forbidden of ["http://", "https://", "vf_accept", "object.invalid"]) {
+          assert.ok(!message.includes(forbidden), `diagnostic must not carry '${forbidden}'`);
+        }
+        // Closed vocabulary only: durable statuses, the canonical error code and
+        // the transition trace. Raw extractor output is never persisted, so the
+        // whole message is asserted rather than probed for known fragments.
+        assert.match(
+          error.message,
+          /^the generic success job reached terminal status [a-z]+ \(errorCode [A-Z_]+\); trace [a-z>]+$/,
+        );
+        return true;
+      },
+    );
+  });
+
+  it("still runs the normal delivery path for a READY job", async () => {
+    const { ctx, calls } = makeSuccessCaseCtx({
+      finalStatus: "ready",
+      trace: ["queued", "analyzing", "downloading", "processing", "uploading", "ready"],
+    });
+
+    const payload = await runSuccessCase(ctx);
+    assert.equal(calls.signedDownload, 1);
+    assert.equal(calls.fetchDigest, 1);
+    assert.equal(calls.r2Evidence, 1);
+    assert.equal(calls.sweepSurfaces, 1);
+    assert.equal(payload.vercelDelivery.redirectStatus, 303);
+    assert.equal(payload.vercelDelivery.clientBytes, 1024);
+  });
+
+  it("keeps a READY job's undeliverable object a DELIVERY failure", async () => {
+    // The distinction the correction exists to preserve in both directions: a
+    // ready job that cannot be delivered is a delivery finding, and says so.
+    const { ctx, calls } = makeSuccessCaseCtx({
+      finalStatus: "ready",
+      location: null,
+      redirectStatus: 500,
+      trace: ["queued", "analyzing", "downloading", "processing", "uploading", "ready"],
+    });
+
+    await assert.rejects(
+      () => runSuccessCase(ctx),
+      (error) => {
+        assert.match(error.message, /ready generic job could not be delivered/);
+        assert.match(error.message, /HTTP 500/);
+        assert.match(error.message, /no usable Location/);
+        return true;
+      },
+    );
+    assert.equal(calls.signedDownload, 1, "delivery IS attempted for a ready job");
+    assert.equal(calls.r2Evidence, 0);
   });
 });

@@ -21,7 +21,15 @@ import { after, before, describe, it } from "node:test";
 
 import { CASE_ID_PATTERN as HARNESS_CASE_ID_PATTERN } from "../deploy/acceptance/ytdlp-generic/lib/evidence.mjs";
 import { EGRESS_FIXTURE_CLASSES } from "../deploy/acceptance/ytdlp-generic/lib/egress-policy.mjs";
-import { ffmpegArgs } from "../deploy/acceptance/ytdlp-generic/fixtures/prepare-media.mjs";
+import {
+  FIXTURE_BASENAME,
+  GENERIC_FIXTURE_BASENAME,
+  GENERIC_FIXTURE_MAX_BYTES,
+  dockerArgs,
+  ffmpegArgs,
+  genericDockerArgs,
+  genericFfmpegArgs,
+} from "../deploy/acceptance/ytdlp-generic/fixtures/prepare-media.mjs";
 import {
   BYTE_LIMIT_TOTAL_BYTES,
   CASE_ID_PATTERN,
@@ -45,6 +53,20 @@ import {
 const MEDIA = Buffer.from("\x00\x00\x00\x18ftypmp42fixture-media-body-0123456789", "binary");
 const MEDIA_SHA256 = createHash("sha256").update(MEDIA).digest("hex");
 
+/**
+ * A stand-in for the SEPARATE generic fixture MP4.
+ *
+ * Deliberately different bytes and a different length from `MEDIA`. The whole
+ * point of the split is that `/direct.mp4` and `/generic-media.mp4` no longer
+ * describe the same body, and a test suite that fed both routes one buffer
+ * could not tell a correct implementation from the coupled one it replaced.
+ */
+const GENERIC_MEDIA = Buffer.from(
+  "\x00\x00\x00\x18ftypmp42generic-fixture-media-body-abcdefghijklmnopqrstuvwxyz-0123456789",
+  "binary",
+);
+const GENERIC_MEDIA_SHA256 = createHash("sha256").update(GENERIC_MEDIA).digest("hex");
+
 const CASE_A = "0123456789abcdef0123456789abcdef";
 const CASE_B = "fedcba9876543210fedcba9876543210";
 
@@ -60,7 +82,9 @@ const started = [];
 async function startFixture(overrides = {}) {
   const service = createFixtureService({
     media: MEDIA,
-    mediaPath: "/dev/null/fixture.mp4",
+    genericMedia: GENERIC_MEDIA,
+    directMediaPath: "/dev/null/fixture.mp4",
+    genericMediaSourcePath: "/dev/null/generic-fixture.mp4",
     log: () => {},
     genericThrottleMs: 400,
     genericThrottleTickMs: 100,
@@ -256,11 +280,22 @@ describe("acceptance fixture: generic progressive fixture", () => {
     const html = await (await fetch(`${fx.base}/generic`)).text();
     assert.match(html, /type='video\/mp4; codecs="avc1\.42E01E, mp4a\.40\.2"'/);
 
-    const recipe = ffmpegArgs("/out/x.mp4").join(" ");
-    assert.match(recipe, /-c:v libx264/);
-    assert.match(recipe, /-profile:v baseline/);
-    assert.match(recipe, /-level 3\.0/);
-    assert.match(recipe, /-c:a aac/);
+    // BOTH recipes must satisfy the one declaration: the page names the same
+    // codec pair for the generic media as for the direct fixture, so splitting
+    // the bodies must not split their codecs.
+    for (const [name, recipe] of [
+      ["direct", ffmpegArgs("/out/x.mp4").join(" ")],
+      ["generic", genericFfmpegArgs("/out/y.mp4").join(" ")],
+    ]) {
+      assert.match(recipe, /-c:v libx264/, name);
+      assert.match(recipe, /-profile:v baseline/, name);
+      assert.match(recipe, /-level 3\.0/, name);
+      assert.match(recipe, /-c:a aac/, name);
+      assert.match(recipe, /-ac 1/, name);
+      assert.match(recipe, /-pix_fmt yuv420p/, name);
+      assert.match(recipe, /-movflags \+faststart/, name);
+      assert.match(recipe, /-map_metadata -1/, name);
+    }
   });
 
   it("never reflects the submitted query into the media destination", async () => {
@@ -279,14 +314,15 @@ describe("acceptance fixture: generic progressive fixture", () => {
     assert.ok(html.includes('src="/generic-media.mp4"'));
   });
 
-  it("serves the media bytes exactly, unchanged by throttling", async () => {
+  it("serves the GENERIC media bytes exactly, unchanged by throttling", async () => {
     const res = await fetch(`${fx.base}/generic-media.mp4`);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("content-type"), "video/mp4");
-    assert.equal(res.headers.get("content-length"), String(MEDIA.byteLength));
+    assert.equal(res.headers.get("content-length"), String(GENERIC_MEDIA.byteLength));
     const body = Buffer.from(await res.arrayBuffer());
-    assert.ok(body.equals(MEDIA), "throttling must change timing only, never content");
-    assert.equal(createHash("sha256").update(body).digest("hex"), MEDIA_SHA256);
+    assert.ok(body.equals(GENERIC_MEDIA), "throttling must change timing only, never content");
+    assert.equal(createHash("sha256").update(body).digest("hex"), GENERIC_MEDIA_SHA256);
+    assert.ok(!body.equals(MEDIA), "the generic route must never serve the direct fixture");
   });
 
   it("actually delays completion, within a bounded tolerance", async () => {
@@ -298,7 +334,7 @@ describe("acceptance fixture: generic progressive fixture", () => {
     const body = Buffer.from(await (await fetch(`${slow.base}/generic-media.mp4`)).arrayBuffer());
     const elapsed = Date.now() - startedAt;
 
-    assert.ok(body.equals(MEDIA), "a throttled transfer still delivers every byte");
+    assert.ok(body.equals(GENERIC_MEDIA), "a throttled transfer still delivers every byte");
     // 9 ticks of 100 ms with 8 sleeps between them: comfortably over 500 ms and
     // nowhere near a stall. The upper bound keeps a regression that dropped the
     // throttle entirely, and one that made it unboundedly slow, both visible.
@@ -383,7 +419,7 @@ describe("acceptance fixture: byte-limit transfer semantics", () => {
   });
 
   it("can exceed the deployed 500 MiB limit by default, without allocating it", () => {
-    const fx = createFixtureService({ media: MEDIA, log: () => {} });
+    const fx = createFixtureService({ media: MEDIA, genericMedia: GENERIC_MEDIA, log: () => {} });
     assert.equal(BYTE_LIMIT_TOTAL_BYTES, 528 * 1024 * 1024);
     assert.ok(BYTE_LIMIT_TOTAL_BYTES > 500 * 1024 * 1024, "must be able to cross the deployed limit");
     assert.ok(BYTE_LIMIT_TOTAL_BYTES <= 540 * 1024 * 1024, "no larger than the case needs");
@@ -637,12 +673,168 @@ describe("acceptance fixture: startup manifest", () => {
     for (const forbidden of ["secret", "token", "password", "credential", "authorization", "cookie"]) {
       assert.ok(!serialized.includes(forbidden), `manifest must not mention '${forbidden}'`);
     }
-    // The only path it may name is the media file the operator supplied.
-    assert.equal(manifest.mediaPath, "/dev/null/fixture.mp4");
+    // The only paths it may name are the two media files the operator supplied.
+    assert.equal(manifest.directMediaPath, "/dev/null/fixture.mp4");
+    assert.equal(manifest.genericMediaSourcePath, "/dev/null/generic-fixture.mp4");
   });
 
-  it("refuses to start without media", () => {
-    assert.throws(() => createFixtureService({ media: Buffer.alloc(0) }), /non-empty Buffer/);
-    assert.throws(() => createFixtureService({ media: "not a buffer" }), /non-empty Buffer/);
+  it("reports the two bodies separately, never under one shared digest", async () => {
+    const fx = await startFixture();
+    const manifest = fx.service.manifest();
+    assert.equal(manifest.directBytes, MEDIA.byteLength);
+    assert.equal(manifest.directSha256, MEDIA_SHA256);
+    assert.equal(manifest.genericMediaBytes, GENERIC_MEDIA.byteLength);
+    assert.equal(manifest.genericMediaSha256, GENERIC_MEDIA_SHA256);
+    assert.notEqual(
+      manifest.directSha256,
+      manifest.genericMediaSha256,
+      "one digest describing two different bodies is the ambiguity this removes",
+    );
+    assert.ok(!("mediaDigest" in manifest), "no ambiguous shared digest key");
+    assert.ok(!("mediaPath" in manifest), "the ambiguous shared path key is gone");
+  });
+
+  it("refuses to start without BOTH media buffers", () => {
+    assert.throws(
+      () => createFixtureService({ media: Buffer.alloc(0), genericMedia: GENERIC_MEDIA }),
+      /direct fixture media must be a non-empty Buffer/,
+    );
+    assert.throws(
+      () => createFixtureService({ media: "not a buffer", genericMedia: GENERIC_MEDIA }),
+      /direct fixture media must be a non-empty Buffer/,
+    );
+    // No fallback to the direct body: a missing generic fixture is refused,
+    // because silently reinstating the coupling is the failure this prevents.
+    assert.throws(
+      () => createFixtureService({ media: MEDIA }),
+      /generic fixture media must be a non-empty Buffer/,
+    );
+    assert.throws(
+      () => createFixtureService({ media: MEDIA, genericMedia: Buffer.alloc(0) }),
+      /generic fixture media must be a non-empty Buffer/,
+    );
+  });
+});
+
+// ── fixture separation ─────────────────────────────────────────────────────
+//
+// PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001. One buffer used to answer
+// `/direct.mp4`, `/generic-media.mp4` and the byte-limit prefix. These are the
+// assertions that fail if any route is wired back to the wrong body.
+
+describe("acceptance fixture: direct and generic bodies are separate", () => {
+  let fx;
+  before(async () => {
+    fx = await startFixture();
+  });
+
+  it("routes each path to its own body", async () => {
+    const direct = Buffer.from(await (await fetch(`${fx.base}/direct.mp4`)).arrayBuffer());
+    const generic = Buffer.from(await (await fetch(`${fx.base}/generic-media.mp4`)).arrayBuffer());
+
+    assert.ok(direct.equals(MEDIA), "/direct.mp4 must serve the direct fixture");
+    assert.ok(generic.equals(GENERIC_MEDIA), "/generic-media.mp4 must serve the generic fixture");
+    assert.ok(!direct.equals(generic), "the two routes must not serve the same bytes");
+  });
+
+  it("answers HEAD on each route with THAT route's length", async () => {
+    // The Worker's direct analyzer reads `Content-Length` from a HEAD, so a
+    // HEAD that reported the other body's length would be a lie it acts on.
+    const direct = await fetch(`${fx.base}/direct.mp4`, { method: "HEAD" });
+    const generic = await fetch(`${fx.base}/generic-media.mp4`, { method: "HEAD" });
+
+    assert.equal(direct.headers.get("content-length"), String(MEDIA.byteLength));
+    assert.equal(generic.headers.get("content-length"), String(GENERIC_MEDIA.byteLength));
+    assert.notEqual(
+      direct.headers.get("content-length"),
+      generic.headers.get("content-length"),
+      "the stand-in bodies differ in length, so their HEADs must too",
+    );
+  });
+
+  it("keeps the byte-limit prefix on the DIRECT body", async () => {
+    // The byte-limit case asserts that bytes served past the deployed limit
+    // abort as TOO_LARGE. Its prefix only has to be a valid MP4 header; letting
+    // it inherit the larger generic body would change what the case measures.
+    const fixture = await startFixture({ byteLimitTotalBytes: MEDIA.byteLength + 1024 });
+    const body = Buffer.from(
+      await (await fetch(`${fixture.base}/byte-limit-media.mp4?vf_case=${CASE_A}`)).arrayBuffer(),
+    );
+    assert.ok(body.subarray(0, MEDIA.byteLength).equals(MEDIA));
+    assert.equal(body.byteLength, MEDIA.byteLength + 1024);
+    assert.ok(
+      !body.subarray(0, GENERIC_MEDIA.byteLength).equals(GENERIC_MEDIA),
+      "the byte-limit prefix must not be the generic fixture",
+    );
+  });
+});
+
+// ── the generation contract ────────────────────────────────────────────────
+
+describe("acceptance fixture: media generation contract", () => {
+  it("generates two distinctly named artifacts", () => {
+    assert.equal(FIXTURE_BASENAME, "acceptance-fixture.mp4");
+    assert.equal(GENERIC_FIXTURE_BASENAME, "acceptance-generic-fixture.mp4");
+    assert.notEqual(FIXTURE_BASENAME, GENERIC_FIXTURE_BASENAME);
+  });
+
+  it("leaves the accepted direct recipe untouched", () => {
+    // The direct fixture is part of the accepted Stage-A evidence and must
+    // stay bit-identical, so its recipe is pinned argument for argument.
+    assert.deepEqual(ffmpegArgs("/out/x.mp4"), [
+      "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+      "-fflags", "+bitexact",
+      "-f", "lavfi", "-i", "testsrc=size=320x240:rate=15:duration=3",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=3",
+      "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+      "-profile:v", "baseline", "-level", "3.0",
+      "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-shortest",
+      "-movflags", "+faststart",
+      "-flags:v", "+bitexact", "-flags:a", "+bitexact", "-fflags", "+bitexact",
+      "-map_metadata", "-1", "-t", "3",
+      "/out/x.mp4",
+    ]);
+  });
+
+  it("pins the generic recipe's determinism and size levers", () => {
+    const recipe = genericFfmpegArgs("/out/y.mp4").join(" ");
+    // Reproducible on a reviewer's machine, not just on the one that ran it:
+    // x264's output is a function of its thread count, which is derived from
+    // the host CPU count unless it is pinned.
+    assert.match(recipe, /-threads 1/);
+    assert.match(recipe, /-fflags \+bitexact/);
+    assert.match(recipe, /-flags:v \+bitexact/);
+    assert.match(recipe, /-flags:a \+bitexact/);
+    // 720x576 at 25 fps is exactly H.264 level 3.0's ceiling, so the stream
+    // stays inside the declared `avc1.42E01E` while carrying enough data that a
+    // 14-second throttled transfer is many completed reads instead of one.
+    assert.match(recipe, /testsrc2=size=720x576:rate=25:duration=14/);
+    assert.match(recipe, /-b:v 6M/);
+    // lavfi only. Nothing is fetched and no external media is involved.
+    assert.ok(!/https?:/.test(recipe), "the recipe must not reference a URL");
+  });
+
+  it("runs both recipes with no network", () => {
+    for (const argv of [
+      dockerArgs({ image: "videofetch-worker:test", outDir: "/out" }),
+      genericDockerArgs({ image: "videofetch-worker:test", outDir: "/out" }),
+    ]) {
+      const joined = argv.join(" ");
+      assert.match(joined, /--network none/);
+      assert.match(joined, /--entrypoint \/usr\/bin\/ffmpeg/);
+    }
+    assert.match(dockerArgs({ image: "i", outDir: "/out" }).join(" "), /acceptance-fixture\.mp4/);
+    assert.match(
+      genericDockerArgs({ image: "i", outDir: "/out" }).join(" "),
+      /acceptance-generic-fixture\.mp4/,
+    );
+  });
+
+  it("bounds the generic fixture well below a bandwidth test", () => {
+    assert.equal(GENERIC_FIXTURE_MAX_BYTES, 32 * 1024 * 1024);
+    // The pinned downloader never asks for more than 4 MiB in one read, so a
+    // fixture only needs to be large enough that a 14-second transfer delivers
+    // each read comfortably inside the Worker's 10-second socket timeout.
+    assert.ok(GENERIC_FIXTURE_MAX_BYTES >= 8 * 1024 * 1024);
   });
 });

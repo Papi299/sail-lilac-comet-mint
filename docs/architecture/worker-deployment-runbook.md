@@ -3776,6 +3776,27 @@ sources. The recipe is bit-exact, and regenerating it reproduced the same digest
 exactly — so the expected digest is checkable by a reviewer rather than merely
 asserted. It is never derived from anything that came back through VideoFetch.
 
+> The digest above is this section's original measurement, taken against the
+> retained `videofetch-worker:phase10c3-local` image. Under the authorized
+> acceptance image `sha256:b7b7554c…` the same recipe produces **48 497 bytes**,
+> SHA-256 `44827ff84f50036186a34e7d487ae13afab6934d0b6d17009f5dcf386cd81bdd` —
+> the identity carried by the accepted Stage-A record `a9ce1c400db8d817`, and the
+> one that must stay bit-identical.
+
+**There are now two media files, not one**
+(`PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001`):
+
+| | direct — `acceptance-fixture.mp4` | generic — `acceptance-generic-fixture.mp4` |
+| :--- | :--- | :--- |
+| serves | `/direct.mp4`, byte-limit prefix | `/generic-media.mp4` |
+| shape | 3 s, 320x240 @ 15 fps | 14 s, 720x576 @ 25 fps |
+| bytes | 48 497 (**unchanged**) | ~10.4 MiB, bounded at 32 MiB |
+| codecs | `avc1.42E01E` + `mp4a.40.2` | `avc1.42E01E` + `mp4a.40.2` |
+
+`server.mjs` requires **both** (`--media` and `--generic-media`) and has no
+fallback from one to the other. Why they had to be split is recorded under
+[the first Stage-B `success` attempt](#phase-10d--the-first-stage-b-success-attempt-blocked).
+
 ### Observed pinned-yt-dlp behaviour
 
 Measured against `/usr/bin/python3 /usr/local/lib/videofetch/yt-dlp`
@@ -4118,3 +4139,78 @@ admission and durability preconditions, not observer semantics, evaluator
 semantics, record shape, HMAC material or the deployment binding. Run
 `a9ce1c400db8d817` remains the valid Stage-A authorization artifact, generic
 execution remains disabled, and Stage B has not started.
+
+---
+
+## Phase 10D — the first Stage-B `success` attempt (BLOCKED)
+
+Stage A run `a9ce1c400db8d817` passed and remains the valid authorization
+artifact. Generic was enabled for the authorized enabled-state window; the
+`success` case ran first and exited `BLOCKED`; no case artifact was sealed; the
+exact original `worker.env` was restored and generic returned to disabled. The
+remaining Stage-B cases and the aggregate were not run.
+
+### The controlled enable/rollback transition itself worked
+
+`worker.env` went from 336 bytes to 355 (`+YTDLP_ENABLED=true`, exactly one
+binding added, every original byte preserved as a prefix, `root:root 0400`), the
+Worker image stayed `sha256:b7b7554c…` across the transition, all seven services
+stayed active, the safe-egress verifier stayed green, and `/api/sites.ytdlp`
+followed the deployment in both directions. Rollback restored the file
+byte-identically (SHA-256 `167a0477…`, proven by digest and `cmp`).
+
+### What the job did
+
+```
+durable status   failed          errorCode   TIMEOUT
+extractor        yt-dlp          format_id   preset:best
+reached          queued > analyzing > downloading > failed
+never reached    processing, uploading, R2 Put, R2 Head, ready commit
+```
+
+The public status DTO agreed with the durable row exactly. **R2 and the signing
+path were never implicated** — `GET /api/download/:id/file` signs only `ready`
+jobs, so its refusal was a consequence, not the cause.
+
+### Root cause
+
+`/generic-media.mp4` served the same 48 497-byte body as `/direct.mp4`, throttled
+across 14 s to give the cancellation and shutdown cases an observable
+`downloading` window. A body that small is asked for by the pinned yt-dlp in
+essentially one socket read, which then spans the whole 14 s — past the
+acquisition policy's `--socket-timeout=10`. Two retries later it exited non-zero
+and `classifyDownloadFailure` mapped its output to `TIMEOUT`. Measured boundary
+on that body: 5 s and 8 s throttles succeed, 11 s and 14 s fail.
+
+The Worker's timeout is **not** widened. The generic route gets its own larger
+deterministic fixture, so the same 14 s transfer arrives as many completed reads.
+Verified 3/3 against the authorized image: exit 0, exactly one media GET, no
+retry GET, byte-identical output, ~16.8 s per acquisition, 89 non-zero
+file-size-watcher samples.
+
+### Two readings that were wrong, and how they were closed
+
+**"Three media GETs means three job executions."** No: `claimNextQueuedJob`
+selects only `status = 'queued'` and nothing sets a job back to `queued`, so a
+failed job cannot be re-claimed. One analysis makes **zero** media GETs and one
+successful acquisition makes **exactly one** — both measured. The extras were
+yt-dlp's own `--retries=2` attempts inside a single acquisition.
+
+**"`downloaded_bytes` NULL means nothing downloaded."** No: acquisition runs
+`--quiet --no-progress`, so generic progress comes from the **Worker's own
+file-size watcher** on the `.part` file, never from yt-dlp's console.
+
+### The harness reported it in the wrong causal order
+
+`runSuccessCase` called `signedDownload()` without branching on
+`finalJob.status`, so a genuinely failed job surfaced as "no object bytes were
+delivered through the signed GET". Corrected: a job that did not become `ready`
+is reported as a job failure with its canonical `errorCode` and transition
+trace, and neither `signedDownload` nor `r2Evidence` runs. Delivery failures stay
+delivery failures, for ready jobs only.
+
+`EVIDENCE_SCHEMA_VERSION` and `CASE_SCHEMA_VERSION` remain `10d-remediation-02`:
+only fixture bytes and diagnostic ordering changed, not observer semantics,
+evaluator semantics, record shape, HMAC material or the deployment binding. Run
+`a9ce1c400db8d817` stays admissible, generic execution remains **disabled**, and
+Stage B has not been rerun.

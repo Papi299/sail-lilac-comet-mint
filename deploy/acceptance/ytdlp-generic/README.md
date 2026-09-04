@@ -2161,3 +2161,109 @@ Never overwrite run `5e6670a858543d93`. Use new paths, for example:
 ```
 
 with the containing directory at `0700`.
+
+---
+
+## The first Stage-B `success` attempt — BLOCKED
+
+Stage A passed. Run `a9ce1c400db8d817`, schema `10d-remediation-02`, verdict
+`PASS`, 23 / 0 / 0 / 0 — **still valid, still admissible, untouched.** Generic
+was then enabled for the authorized enabled-state window, the `success` case ran
+first, and the command exited `BLOCKED`. No case artifact was sealed; generic was
+rolled back to disabled and the remaining Stage-B cases were not run.
+
+### What the deployment actually did
+
+| | |
+| :--- | :--- |
+| durable status | `failed` |
+| `extractor` | `yt-dlp` |
+| `format_id` | `preset:best` |
+| `errorCode` | `TIMEOUT` |
+| reached | `queued` → `analyzing` → `downloading` → `failed` |
+| never reached | `processing`, `uploading`, R2 Put, R2 Head, ready commit |
+
+The public `GET /api/download/:id/status` DTO agreed with the durable row
+exactly. **R2 and the signing path were never implicated**, and could not have
+been: the job never became `ready`.
+
+### Root cause — the fixture, not the Worker timeout
+
+`/generic-media.mp4` served the same 48,497-byte body as `/direct.mp4`, throttled
+across 14 s so the cancellation and shutdown cases have a window to observe. A
+body that small is asked for by the pinned yt-dlp in essentially one socket read,
+and that read then spans the whole transfer — past the acquisition policy's
+`--socket-timeout=10`. yt-dlp retried twice (`--retries=2`), failed identically,
+and exited non-zero; `classifyDownloadFailure` mapped its output to `TIMEOUT`.
+
+Measured against the same 48 KB body: **5 s and 8 s throttles succeed; 11 s and
+14 s fail** — the boundary sits exactly at the socket timeout. The 600-second
+download budget was never approached; the job lived 39 s.
+
+`DOWNLOAD_SOCKET_TIMEOUT_SECONDS` is **not** widened.
+`PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001` gives the generic route its
+own larger deterministic fixture instead, so the same 14 s transfer arrives as
+many completed reads. Verified 3/3 against the pinned image: one media GET, no
+retry GET, exit 0, byte-identical output, ~16.8 s per acquisition.
+
+### The retry hypothesis was falsified
+
+The fixture log showed `/generic ×3` and `/generic-media.mp4 ×3`, which looks
+like three job executions. It is not one:
+
+- `claimNextQueuedJob` selects only `status = 'queued'`, and **nothing anywhere
+  in the Worker sets a job back to `queued`** — a failed job cannot be
+  re-claimed;
+- one *analysis* invocation performs **zero** media GETs (measured), so the three
+  page fetches are the product analysis, the durable execution's fresh analysis,
+  and the acquisition's own extraction;
+- one *successful* acquisition performs **exactly one** media GET (measured). The
+  extra media GETs were yt-dlp's own `--retries=2` attempts inside a single
+  acquisition.
+
+Request counts alone never establish execution counts. Both numbers here have a
+producer, and both were measured before either was believed.
+
+### Generic download progress does not come from yt-dlp
+
+The durable row's `progress`, `stage_label` and `downloaded_bytes` were all
+`NULL`, which is not evidence that nothing was downloading. Acquisition runs
+`--quiet --no-progress`, so the console emits nothing to parse: generic progress
+is produced by the **Worker's own file-size watcher** polling the `.part` file.
+The corrected fixture makes that observable — 89 non-zero `downloadedBytes`
+samples across a single acquisition.
+
+### The harness misreported it — corrected separately
+
+`runSuccessCase` polled to a terminal state and then called `signedDownload()`
+without branching on `finalJob.status`. `/api/download/:id/file` signs only
+`ready` jobs, so a genuinely failed job surfaced as
+`no object bytes were delivered through the signed GET` — a delivery accusation
+against the one subsystem that was never reached, with `polled.trace` lost
+because no record is sealed when a producer throws.
+
+The layers are now reported in causal order, and neither `signedDownload` nor
+`r2Evidence` runs for a job that did not become `ready`:
+
+```
+job did not reach terminal    -> poll-timeout diagnostic, no delivery attempt
+job terminal but not ready    -> job-failure diagnostic + canonical errorCode
+job ready, delivery failed    -> delivery diagnostic + the redirect status
+```
+
+The diagnostic carries only closed vocabulary — durable statuses, the canonical
+`WorkerErrorCode`, and the transition trace. No URL, sentinel, object key, signed
+URL, credential or raw extractor output.
+
+**The producer contract is unchanged**: a producer still throws, the case command
+still exits `BLOCKED`, and no case artifact is sealed. Whether an incomplete case
+observation deserves its own durable artifact is a separate question, deliberately
+not answered here.
+
+### What did not change
+
+`EVIDENCE_SCHEMA_VERSION` and `CASE_SCHEMA_VERSION` remain
+`10d-remediation-02`. No observer semantics, evaluator semantics, deployment
+binding, case-record shape, aggregate schema or HMAC format moved — only fixture
+bytes and diagnostic ordering — so the accepted Stage-A record stays admissible
+and Stage B rejoins run `a9ce1c400db8d817` unchanged.

@@ -812,11 +812,50 @@ export async function runSuccessCase(ctx) {
     throw new Error(`durable job evidence unavailable: ${durable.reason}`);
   }
 
+  // ── Classify the TERMINAL RESULT before attempting delivery ─────────────
+  //
+  // PHASE-10D-STAGE-B-SUCCESS-BLOCKER-REMEDIATION-001 §14. This used to fall
+  // straight through to `signedDownload()`, which signs only `ready` jobs — so
+  // a job that had genuinely failed produced "no object bytes were delivered
+  // through the signed GET", pointing at the one subsystem that was never
+  // involved. The first live Stage-B `success` attempt reported exactly that
+  // for a job whose durable row said `failed` / `TIMEOUT`.
+  //
+  // The layers are now reported in causal order: a job that did not become
+  // ready is a JOB failure, and delivery is not attempted or blamed. Neither
+  // `signedDownload` nor `r2Evidence` runs below this point unless the job is
+  // `ready`.
+  //
+  // Every value interpolated here is closed vocabulary — durable statuses and
+  // the canonical `WorkerErrorCode`. No URL, sentinel, object key, signed URL,
+  // credential or raw extractor output can reach this string.
+  const trace = Array.isArray(polled.trace) ? polled.trace.join(">") : "unavailable";
+  if (polled.timedOut === true) {
+    throw new Error(
+      `the generic success job did not reach a terminal status within the poll window ` +
+        `(last observed ${finalJob?.status ?? "unknown"}; trace ${trace})`,
+    );
+  }
+  if (finalJob?.status !== "ready") {
+    const errorCode = finalJob?.errorCode ?? null;
+    throw new Error(
+      `the generic success job reached terminal status ${finalJob?.status ?? "unknown"}` +
+        `${errorCode ? ` (errorCode ${errorCode})` : ""}; trace ${trace}`,
+    );
+  }
+
   // Delivery: 303 -> presigned -> bytes. The signed URL is used once and never
-  // recorded.
+  // recorded. Reached ONLY for a `ready` job, so a failure here really is a
+  // delivery failure — and says so, naming the redirect status and nothing
+  // else about the response.
   const signed = await session.signedDownload(jobId);
   const delivered = signed.location ? await session.fetchDigest(signed.location) : null;
-  if (!delivered) throw new Error("no object bytes were delivered through the signed GET");
+  if (!delivered) {
+    throw new Error(
+      `the ready generic job could not be delivered: the signed GET returned ` +
+        `HTTP ${signed.redirectStatus ?? "unknown"} with no usable Location`,
+    );
+  }
 
   // §16: R2 evidence is a MEASUREMENT. A failure to read the authenticated
   // Worker job view is not "the object exists because the job is ready".
