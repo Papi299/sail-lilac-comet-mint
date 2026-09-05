@@ -1875,6 +1875,34 @@ describe("success-path lifecycle: observed vs. causally proven `processing`", ()
     }
   });
 
+  it("no state OTHER than `processing` is inferable, even when it is the ONLY one missing", () => {
+    // The §12 shapes above each drop `processing` alongside another state, so a
+    // rule of the form "infer any single missing state" would never fire on
+    // them and they cannot discriminate it. These traces are complete EXCEPT for
+    // one non-`processing` state, which is precisely the case such a rule would
+    // wrongly wave through. `processing` is inferable because `uploading` can
+    // only commit from it; none of these has an analogous enforced witness, so
+    // each must stay an evidence gap.
+    const exactlyOneMissing = [
+      { missing: "queued", trace: ["analyzing", "downloading", "processing", "uploading", "ready"] },
+      { missing: "analyzing", trace: ["queued", "downloading", "processing", "uploading", "ready"] },
+      { missing: "downloading", trace: ["queued", "analyzing", "processing", "uploading", "ready"] },
+      { missing: "uploading", trace: ["queued", "analyzing", "downloading", "processing", "ready"] },
+      { missing: "ready", trace: ["queued", "analyzing", "downloading", "processing", "uploading"] },
+    ];
+    for (const { missing, trace } of exactlyOneMissing) {
+      const classified = classifySuccessTransitionTrace(trace);
+      assert.equal(
+        classified.outcome,
+        OUTCOMES.BLOCKED,
+        `only \`${missing}\` missing must be BLOCKED, not ${classified.outcome}`,
+      );
+      assert.deepEqual(classified.trace.missing, [missing]);
+      assert.equal(classified.processing, "unproven");
+      assert.equal(classified.proof, null);
+    }
+  });
+
   it("D. `processing` alone is NOT inferable without the observed `uploading` witness", () => {
     // The single most important negative: the witness IS the proof. Remove it
     // and the inference must not survive on the strength of `ready` alone.
