@@ -157,9 +157,32 @@ export function makeControlPlaneSession(deps = {}) {
      *
      * The interval is deliberately tight (200 ms by default). The runbook's own
      * direct-media record shows a whole job completing in ~1.2 s, so a lazy
-     * poller would miss most of the ladder — and under the corrected lifecycle
-     * contract a missed state is BLOCKED, not a pass. Improving the observation
-     * is the correct response to that, never weakening the evaluator.
+     * poller would miss most of the ladder. Tight polling stays the right answer
+     * for every phase that is directly observable, and weakening an evaluator to
+     * excuse lazy sampling is never the answer.
+     *
+     * But polling cannot promise what no cadence can deliver. A durable state
+     * whose lifetime is legitimately near zero may commit and clear between two
+     * samples at ANY interval. Live run `132658924d1c7a1b` hit exactly that: the
+     * Worker unconditionally commits `processing`
+     * (`beginProcessing() -> executePlan() -> beginUploading()`), but on a
+     * `keep-original` plan `executePlan` returns the already-acquired path
+     * almost immediately, so `processing` can live for less than one 200 ms
+     * poll. Shortening the interval narrows that race; it cannot close it.
+     *
+     * `processing` in the SUCCESS path is unique in being provable without being
+     * sampled: `SQLiteJobStore.beginUploading` is `processing -> uploading`, and
+     * no `downloading -> uploading` transition exists, so a directly observed
+     * `uploading` is causal proof that `processing` durably committed.
+     * `classifySuccessTransitionTrace` in `lifecycle.mjs` is the only place that
+     * reasoning lives, it applies to that ONE state, and it requires the proving
+     * `uploading` observation to actually be present.
+     *
+     * Nothing here fabricates a trace entry. This poller records only what it
+     * saw, `processing` included: if it was not sampled it does not appear, and
+     * the evaluator reports it as causally proven rather than observed. No other
+     * missed state may be inferred — for every other required state a missed
+     * poll remains an evidence gap and lands as BLOCKED.
      *
      * `onSample` fires after each poll so a caller can drive process sampling
      * for exactly the window in which the job is `downloading`.
@@ -181,6 +204,10 @@ export function makeControlPlaneSession(deps = {}) {
       // poll. Without this seed a fast job loses `queued` from the trace and
       // the corrected lifecycle contract reports BLOCKED, which would be an
       // artifact of when polling started rather than a property of the job.
+      //
+      // This is an OBSERVATION, not an inference: the create response is a real
+      // reading of the job's real durable state. It is how `queued` is captured,
+      // and it is why `queued` is not, and must not become, an inferable state.
       if (typeof opts.initialStatus === "string") {
         trace.push(opts.initialStatus);
         timeline.push({ status: opts.initialStatus, at: new Date().toISOString() });

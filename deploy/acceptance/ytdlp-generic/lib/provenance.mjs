@@ -108,23 +108,105 @@ import { dirname } from "node:path";
  * A Stage A `PASS` from before those is not the Stage A `PASS` this harness
  * means, and nothing in the record itself distinguishes them.
  *
+ *   10D-REM-03     The Stage-B success lifecycle previously required every
+ *                  durable state to be DIRECTLY SAMPLED. Live run
+ *                  `132658924d1c7a1b` disproved that as an observation model:
+ *                  a `keep-original` success committed `processing`
+ *                  unconditionally and legitimately cleared it between two
+ *                  200 ms polls, so a genuinely complete lifecycle recorded
+ *                  `queued → analyzing → downloading → uploading → ready`.
+ *
+ *                  The corrected evaluator allows ONLY `processing` to be
+ *                  CAUSALLY PROVEN, and only from a directly observed
+ *                  `uploading`, because the exact reviewed Worker store
+ *                  enforces `processing → uploading` and offers no
+ *                  `downloading → uploading` transition.
+ *
+ *                  This is the sharpest possible case for the boundary: the
+ *                  RAW ARTIFACT IS UNCHANGED, and the acceptance meaning of
+ *                  its `job.lifecycle-complete` moves BLOCKED → PASS. Nothing
+ *                  in the record's shape, its fields or its seal distinguishes
+ *                  the two readings. Only this constant can.
+ *
  * ── When to bump it again ──────────────────────────────────────────────────
  *
  * Whenever an observer or evaluator change could make an OLD artifact mean
- * something WEAKER under the same shape. A field added or removed is the
+ * something DIFFERENT under the same shape. A field added or removed is the
  * obvious case; a field whose measurement became stricter is the case that
- * matters, because nothing else catches it.
+ * matters, because nothing else catches it — and an evaluator that becomes
+ * more PERMISSIVE about the same raw bytes is the same case wearing the
+ * opposite sign, and is not exempt.
  *
- * One live artifact IS invalidated by the 10D-REM-02 bump, deliberately: the
- * sealed `10d-remediation-01` record from run `5e6670a858543d93`. It remains
- * valid history — a cryptographically verifiable account of the first
- * authenticated Stage-A attempt and of the harness defects it exposed — but it
- * can no longer authorize anything under the corrected observers, and
- * `verifyRecord` refuses it on the version boundary alone, independently of its
- * FAIL verdict. It must not be overwritten or resealed; a corrected Stage A
+ * That last direction is the one it is tempting to wave through, so state it
+ * plainly. A valid HMAC proves:
+ *
+ *     this artifact has not changed since it was produced
+ *
+ * It does NOT prove:
+ *
+ *     this artifact was produced and evaluated under today's lifecycle
+ *     semantics
+ *
+ * A `10d-remediation-02` success artifact must never silently become
+ * ACCEPTABLE under the `10d-remediation-03` evaluator merely because its JSON
+ * shape and its seal both remain valid. The seal answers integrity; this
+ * constant answers provenance of meaning, and identifying exactly this
+ * situation is the entire reason the boundary exists.
+ *
+ * Two live artifact families are invalidated by these bumps, deliberately.
+ *
+ *   10D-REM-02  the sealed `10d-remediation-01` record from run
+ *               `5e6670a858543d93` — the first authenticated Stage-A attempt,
+ *               and the harness defects it exposed.
+ *
+ *   10D-REM-03  the sealed `10d-remediation-02` records from run
+ *               `132658924d1c7a1b` — a Stage-A PASS (23/0/0/0) and a Stage-B
+ *               `success` case that genuinely reached `ready` with every byte,
+ *               R2 and delivery proof intact. Nothing is wrong with them; they
+ *               were simply graded by an evaluator whose lifecycle observation
+ *               model has since been corrected.
+ *
+ * Both remain valid history — cryptographically verifiable accounts of what
+ * the harness of their day measured — and `verifyRecord` refuses each on the
+ * version boundary alone, independently of its verdict. A corrected Stage A
  * uses a FRESH acceptance run.
+ *
+ * ── What each mechanism actually guarantees ────────────────────────────────
+ *
+ * Precision here matters more than reassurance, so state the boundary exactly.
+ *
+ *   INTEGRITY                   The HMAC proves the sealed bytes have not
+ *                               changed since somebody holding this run key
+ *                               sealed them. Nothing more.
+ *
+ *   CONTRACT VERSION            `schemaVersion` decides WHICH harness semantics
+ *                               may consume an artifact. It is the only field
+ *                               that can, because the seal is silent about it.
+ *
+ *   AUTOMATIC VERSION CROSSING  REFUSED, and test-detected. Admission must
+ *                               never normalize, relabel or reseal a retired
+ *                               record on the way in; every gate leaves an
+ *                               artifact it refused byte-identical. That is a
+ *                               harness behaviour, so it is ours to guarantee.
+ *
+ *   MANUAL OPERATOR FORGERY     OUTSIDE this threat model, as the top of this
+ *                               file has always said. The run key is LOCAL
+ *                               OPERATOR-HELD material: whoever holds it can
+ *                               mint a new record bearing any `schemaVersion`
+ *                               they like, and its HMAC will verify.
+ *
+ * So "never reseal historical evidence" is an OPERATING RULE, enforced by
+ * procedure and review, not a property the verifier can enforce. Re-sealing a
+ * retired record does not upgrade or launder it — it constructs a SEPARATE,
+ * NEW claim, leaving the original untouched and still refused — and no local
+ * check can establish which harness revision originally measured the facts
+ * that new claim asserts. `scripts/ytdlp-acceptance.test.mjs` records this
+ * explicitly as a threat-model demonstration rather than a claimed defence.
+ *
+ * The operational response to a retired artifact is therefore never to relabel
+ * it. It is a fresh Stage A, a fresh `success`, and a fresh complete Stage B.
  */
-export const EVIDENCE_SCHEMA_VERSION = "10d-remediation-02";
+export const EVIDENCE_SCHEMA_VERSION = "10d-remediation-03";
 export const HARNESS_ID = "deploy/acceptance/ytdlp-generic/acceptance.mjs";
 export const AUTHENTICATOR_ALG = "HMAC-SHA256";
 

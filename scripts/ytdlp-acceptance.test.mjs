@@ -71,6 +71,7 @@ import * as processSamplerModule from "../deploy/acceptance/ytdlp-generic/lib/pr
 import {
   evaluateTransitionTrace,
   classifyTransitionTrace,
+  classifySuccessTransitionTrace,
   classifyCancellationTrace,
   REQUIRED_TRANSITIONS,
 } from "../deploy/acceptance/ytdlp-generic/lib/lifecycle.mjs";
@@ -1782,6 +1783,324 @@ describe("durable lifecycle evidence", () => {
       classifyCancellationTrace(["queued", "analyzing", "downloading", "ready"]).outcome,
       OUTCOMES.FAIL,
     );
+  });
+});
+
+// ── PHASE-10D STAGE-B LIFECYCLE OBSERVABILITY REMEDIATION ───────────────────
+//
+// Live run `132658924d1c7a1b` produced a fully successful Stage-B `success`
+// case whose recorded trace omitted `processing`. The Worker did not skip that
+// state — `job-executor.server.ts` commits it unconditionally — but on a
+// `keep-original` plan its durable lifetime can be shorter than one 200 ms poll.
+// `classifySuccessTransitionTrace` closes that ONE gap by proof, never by
+// assumption, and only for `processing`.
+
+/** The exact trace the live success case recorded. */
+const LIVE_SUCCESS_TRACE = Object.freeze([
+  "queued", "analyzing", "downloading", "uploading", "ready",
+]);
+
+describe("success-path lifecycle: observed vs. causally proven `processing`", () => {
+  it("A. the full six-state trace PASSes with `processing` DIRECTLY OBSERVED", () => {
+    const classified = classifySuccessTransitionTrace(FULL_LADDER);
+    assert.equal(classified.outcome, OUTCOMES.PASS);
+    assert.equal(classified.processing, "observed");
+    assert.equal(classified.proof, null, "nothing needs proving when it was seen");
+    assert.match(classified.trace.reason, /directly observed/);
+    // The full trace is complete on its own terms.
+    assert.deepEqual(classified.trace.missing, []);
+  });
+
+  it("B. LIVE BLOCKER SHAPE — the five-state trace PASSes, `processing` CAUSALLY PROVEN", () => {
+    const classified = classifySuccessTransitionTrace(LIVE_SUCCESS_TRACE);
+    assert.equal(classified.outcome, OUTCOMES.PASS);
+    assert.equal(classified.processing, "causally-proven");
+    assert.notEqual(classified.processing, "observed", "it must NEVER be reported as observed");
+
+    // The proof is named, and it names the observation that carries it.
+    assert.equal(classified.proof.state, "processing");
+    assert.equal(classified.proof.observedWitness, "uploading");
+    assert.equal(classified.proof.enforcedPredecessorOfWitness, "processing");
+    assert.equal(classified.proof.directlyObserved, false);
+    assert.match(classified.proof.basis, /beginUploading/);
+    assert.match(classified.trace.reason, /CAUSALLY PROVEN/);
+
+    // The RAW RECORD IS NOT REWRITTEN. `processing` is not spliced into the
+    // trace, and it stays listed as never sampled. This is the line between
+    // proving a state and fabricating one.
+    assert.deepEqual(classified.trace.missing, ["processing"]);
+    assert.ok(!classified.trace.collapsed.includes("processing"));
+    assert.deepEqual(classified.trace.collapsed, [...LIVE_SUCCESS_TRACE]);
+  });
+
+  it("C. polling duplicates around downloading/uploading still PASS", () => {
+    const withDuplicates = [
+      "queued", "queued", "analyzing",
+      "downloading", "downloading", "downloading",
+      "uploading", "uploading", "ready",
+    ];
+    const classified = classifySuccessTransitionTrace(withDuplicates);
+    assert.equal(classified.outcome, OUTCOMES.PASS);
+    assert.equal(classified.processing, "causally-proven");
+
+    // …and duplicates around a fully observed ladder stay directly observed.
+    const fullWithDuplicates = [
+      "queued", "analyzing", "analyzing", "downloading", "downloading",
+      "processing", "processing", "uploading", "uploading", "ready", "ready",
+    ];
+    const full = classifySuccessTransitionTrace(fullWithDuplicates);
+    assert.equal(full.outcome, OUTCOMES.PASS);
+    assert.equal(full.processing, "observed");
+  });
+
+  // ── Only `processing` is inferable. Every other gap stays an evidence gap. ──
+  it("D-H. any OTHER missing required state is BLOCKED, never inferred", () => {
+    const cases = [
+      { id: "D", trace: ["queued", "analyzing", "downloading", "ready"], missing: ["processing", "uploading"] },
+      { id: "E", trace: ["queued", "downloading", "uploading", "ready"], missing: ["analyzing", "processing"] },
+      { id: "F", trace: ["queued", "analyzing", "uploading", "ready"], missing: ["downloading", "processing"] },
+      { id: "G", trace: ["analyzing", "downloading", "uploading", "ready"], missing: ["queued", "processing"] },
+      { id: "H", trace: ["queued", "analyzing", "downloading", "uploading"], missing: ["processing", "ready"] },
+    ];
+    for (const { id, trace, missing } of cases) {
+      const classified = classifySuccessTransitionTrace(trace);
+      assert.equal(
+        classified.outcome,
+        OUTCOMES.BLOCKED,
+        `${id}: ${JSON.stringify(trace)} must be BLOCKED, not ${classified.outcome}`,
+      );
+      assert.equal(classified.processing, "unproven", `${id}: nothing may be claimed proven`);
+      assert.equal(classified.proof, null, `${id}: no proof object may be minted`);
+      assert.deepEqual(classified.trace.missing, missing, `${id}: missing set`);
+    }
+  });
+
+  it("no state OTHER than `processing` is inferable, even when it is the ONLY one missing", () => {
+    // The §12 shapes above each drop `processing` alongside another state, so a
+    // rule of the form "infer any single missing state" would never fire on
+    // them and they cannot discriminate it. These traces are complete EXCEPT for
+    // one non-`processing` state, which is precisely the case such a rule would
+    // wrongly wave through. `processing` is inferable because `uploading` can
+    // only commit from it; none of these has an analogous enforced witness, so
+    // each must stay an evidence gap.
+    const exactlyOneMissing = [
+      { missing: "queued", trace: ["analyzing", "downloading", "processing", "uploading", "ready"] },
+      { missing: "analyzing", trace: ["queued", "downloading", "processing", "uploading", "ready"] },
+      { missing: "downloading", trace: ["queued", "analyzing", "processing", "uploading", "ready"] },
+      { missing: "uploading", trace: ["queued", "analyzing", "downloading", "processing", "ready"] },
+      { missing: "ready", trace: ["queued", "analyzing", "downloading", "processing", "uploading"] },
+    ];
+    for (const { missing, trace } of exactlyOneMissing) {
+      const classified = classifySuccessTransitionTrace(trace);
+      assert.equal(
+        classified.outcome,
+        OUTCOMES.BLOCKED,
+        `only \`${missing}\` missing must be BLOCKED, not ${classified.outcome}`,
+      );
+      assert.deepEqual(classified.trace.missing, [missing]);
+      assert.equal(classified.processing, "unproven");
+      assert.equal(classified.proof, null);
+    }
+  });
+
+  it("D. `processing` alone is NOT inferable without the observed `uploading` witness", () => {
+    // The single most important negative: the witness IS the proof. Remove it
+    // and the inference must not survive on the strength of `ready` alone.
+    const classified = classifySuccessTransitionTrace(["queued", "analyzing", "downloading", "ready"]);
+    assert.equal(classified.outcome, OUTCOMES.BLOCKED);
+    assert.ok(classified.trace.missing.includes("processing"));
+    assert.ok(classified.trace.missing.includes("uploading"));
+  });
+
+  it("I. an out-of-order trace FAILs, not BLOCKED", () => {
+    const classified = classifySuccessTransitionTrace([
+      "queued", "analyzing", "uploading", "downloading", "ready",
+    ]);
+    assert.equal(classified.outcome, OUTCOMES.FAIL);
+    assert.equal(classified.processing, "unproven");
+    assert.match(classified.trace.reason, /backwards/);
+  });
+
+  it("J. an unknown lifecycle value FAILs", () => {
+    const classified = classifySuccessTransitionTrace([
+      "queued", "analyzing", "downloading", "extracting", "uploading", "ready",
+    ]);
+    assert.equal(classified.outcome, OUTCOMES.FAIL);
+    assert.deepEqual(classified.trace.unknown, ["extracting"]);
+    assert.equal(classifySuccessTransitionTrace("ready").outcome, OUTCOMES.FAIL);
+    assert.equal(classifySuccessTransitionTrace(null).outcome, OUTCOMES.FAIL);
+  });
+
+  it("K. a trace containing `failed` FAILs — a success lifecycle has no failure in it", () => {
+    for (const trace of [
+      ["queued", "analyzing", "downloading", "processing", "uploading", "failed"],
+      ["queued", "analyzing", "downloading", "failed"],
+      ["queued", "analyzing", "downloading", "uploading", "failed", "ready"],
+    ]) {
+      const classified = classifySuccessTransitionTrace(trace);
+      assert.equal(classified.outcome, OUTCOMES.FAIL, JSON.stringify(trace));
+      assert.match(classified.trace.reason, /must not contain a terminal/);
+      assert.equal(classified.processing, "unproven");
+    }
+  });
+
+  it("L. a trace containing `cancelled` FAILs", () => {
+    for (const trace of [
+      ["queued", "analyzing", "downloading", "processing", "uploading", "cancelled"],
+      ["queued", "analyzing", "downloading", "uploading", "cancelled", "ready"],
+    ]) {
+      const classified = classifySuccessTransitionTrace(trace);
+      assert.equal(classified.outcome, OUTCOMES.FAIL, JSON.stringify(trace));
+      assert.match(classified.trace.reason, /must not contain a terminal/);
+    }
+  });
+
+  it("M. the GENERIC classifier is untouched and remains strict", () => {
+    // The live five-state shape is still BLOCKED for every other caller. The
+    // remediation narrowed one check; it did not relax the contract.
+    const generic = classifyTransitionTrace(LIVE_SUCCESS_TRACE);
+    assert.equal(generic.outcome, OUTCOMES.BLOCKED);
+    assert.deepEqual(generic.trace.missing, ["processing"]);
+    assert.equal(generic.processing, undefined, "the generic classifier mints no proof metadata");
+
+    assert.equal(classifyTransitionTrace(FULL_LADDER).outcome, OUTCOMES.PASS);
+    assert.equal(classifyTransitionTrace(["ready"]).outcome, OUTCOMES.BLOCKED);
+  });
+
+  it("N. cancellation semantics are unchanged", () => {
+    assert.equal(
+      classifyCancellationTrace(["queued", "analyzing", "downloading", "cancelled"]).outcome,
+      OUTCOMES.PASS,
+    );
+    assert.equal(classifyCancellationTrace(["queued", "cancelled"]).outcome, OUTCOMES.BLOCKED);
+    assert.equal(
+      classifyCancellationTrace(["queued", "analyzing", "downloading", "ready"]).outcome,
+      OUTCOMES.FAIL,
+    );
+    // A cancellation trace is NOT graded by the success classifier, and the
+    // success classifier does not soften cancellation in either direction.
+    assert.equal(
+      classifySuccessTransitionTrace(["queued", "analyzing", "downloading", "cancelled"]).outcome,
+      OUTCOMES.FAIL,
+    );
+  });
+
+  it("the six-state contract itself is unchanged", () => {
+    assert.deepEqual([...REQUIRED_TRANSITIONS], [
+      "queued", "analyzing", "downloading", "processing", "uploading", "ready",
+    ]);
+  });
+});
+
+// ── §13/§17: the load-bearing Stage-B evaluator regression ──────────────────
+
+describe("Stage B `job.lifecycle-complete` under the corrected classifier", () => {
+  /**
+   * A synthetic success observation carrying the exact RELEVANT raw facts of the
+   * live `stage-b/success.json` record from run `132658924d1c7a1b`: the trace it
+   * recorded, the preset it requested, and the terminal state it reached.
+   *
+   * Deliberately synthetic. No secret, sentinel, URL or bearer value from the
+   * real sealed artifact is reproduced here — the artifact itself remains
+   * untouched, unre-sealed and authoritative, and this fixture only replays the
+   * shape the evaluator must now grade correctly.
+   */
+  const liveSuccessObservations = (transitions) =>
+    passingStageBObservations({
+      genericJob: measured({
+        jobId: JOB_ID,
+        transitions: [...transitions],
+        requestedFormatId: "preset:best",
+      }),
+      // The durable row must agree with the requested preset, exactly as the
+      // live record does; otherwise `durable.application-format-id` would fail
+      // for an unrelated reason and mask what this regression is measuring.
+      durableJobRow: measured({
+        present: true,
+        jobId: JOB_ID,
+        status: "ready",
+        formatId: "preset:best",
+        extractor: "yt-dlp",
+      }),
+    });
+
+  const lifecycleCheck = (result) =>
+    result.checks.find((c) => c.id === "job.lifecycle-complete");
+
+  it("the exact live trace PASSes, and the reason states the causal proof", () => {
+    const result = evaluateStageB(liveSuccessObservations(LIVE_SUCCESS_TRACE), passingStageA());
+
+    const check = lifecycleCheck(result);
+    assert.equal(check.outcome, OUTCOMES.PASS, check.detail);
+    assert.ok(!result.summary.blocking.includes("job.lifecycle-complete"));
+
+    // §17: the whole otherwise-passing success record now verdicts PASS. This is
+    // the exact shape the sealed live artifact carries, and it was the ONLY
+    // thing standing between it and a clean success grade.
+    assert.equal(result.summary.verdict, OUTCOMES.PASS, JSON.stringify(result.summary.blocking));
+
+    // The reason must carry the PROOF, not merely a verdict: a later reader of
+    // the evidence has to be able to see why an unsampled state was accepted.
+    assert.match(check.detail, /CAUSALLY PROVEN/);
+    assert.match(check.detail, /uploading/);
+    assert.match(check.detail, /beginUploading/);
+    assert.match(check.detail, /not directly sampled/);
+  });
+
+  it("removing the proving `uploading` observation makes it BLOCKED again", () => {
+    // The load-bearing mutation. `uploading` is what proves `processing`; with
+    // it gone there is nothing left to reason from and the gap reopens.
+    const withoutUploading = LIVE_SUCCESS_TRACE.filter((s) => s !== "uploading");
+    const result = evaluateStageB(liveSuccessObservations(withoutUploading), passingStageA());
+
+    const check = lifecycleCheck(result);
+    assert.equal(check.outcome, OUTCOMES.BLOCKED, check.detail);
+    assert.equal(result.summary.verdict, OUTCOMES.BLOCKED);
+    assert.ok(result.summary.blocking.includes("job.lifecycle-complete"));
+  });
+
+  it("the fully observed ladder still PASSes through the evaluator", () => {
+    const result = evaluateStageB(liveSuccessObservations(FULL_LADDER), passingStageA());
+    const check = lifecycleCheck(result);
+    assert.equal(check.outcome, OUTCOMES.PASS);
+    assert.match(check.detail, /directly observed/);
+    assert.ok(!/CAUSALLY PROVEN/.test(check.detail));
+  });
+
+  it("an unobserved lifecycle is still BLOCKED, and a disordered one still FAILs", () => {
+    const unobserved = evaluateStageB(
+      passingStageBObservations({ genericJob: unmeasured("polling failed") }),
+      passingStageA(),
+    );
+    assert.equal(lifecycleCheck(unobserved).outcome, OUTCOMES.BLOCKED);
+
+    const disordered = evaluateStageB(
+      liveSuccessObservations(["queued", "analyzing", "uploading", "downloading", "ready"]),
+      passingStageA(),
+    );
+    assert.equal(lifecycleCheck(disordered).outcome, OUTCOMES.FAIL);
+  });
+
+  it("`shutdown.job-recovered` semantics are NOT weakened by this change", () => {
+    // Explicitly re-pinned here because it is the check most at risk of being
+    // collaterally softened by a lifecycle edit. It must still demand the exact
+    // recovered triple.
+    for (const override of [
+      { recoveredStatus: "ready" },
+      { recoveredErrorCode: "SOMETHING_ELSE" },
+      { recoveredSafeErrorMessage: "Worker restarted." },
+    ]) {
+      const result = evaluateStageB(
+        passingStageBObservations({ shutdownCase: measured(shutdownEvidence(override)) }),
+        passingStageA(),
+      );
+      const check = result.checks.find((c) => c.id === "shutdown.job-recovered");
+      assert.notEqual(
+        check.outcome,
+        OUTCOMES.PASS,
+        `shutdown.job-recovered must reject ${JSON.stringify(override)}`,
+      );
+    }
   });
 });
 
@@ -6951,6 +7270,14 @@ describe("evidence producer contract version", () => {
   // boundary: a cryptographically valid artifact from before the observer
   // corrections must not authorize anything.
   const PREVIOUS_SCHEMA = "10d-remediation-01";
+  /**
+   * The version retired by 10D-REM-03, and the one run `132658924d1c7a1b`
+   * sealed: a Stage-A PASS (23/0/0/0) and a Stage-B `success` case that
+   * genuinely reached `ready`. Nothing is wrong with those artifacts — they
+   * were graded by an evaluator whose lifecycle observation model has since
+   * been corrected, which is exactly what this boundary exists to identify.
+   */
+  const RETIRED_SCHEMA = "10d-remediation-02";
 
   /**
    * A Stage-A record that is perfect in EVERY respect except its schema: valid
@@ -6986,8 +7313,9 @@ describe("evidence producer contract version", () => {
     loadStageA("/x", async () => JSON.stringify(record), { run: RUN, expectedSha: SHA });
 
   it("71. the schema identifier is the corrected Stage-A observer contract", () => {
-    assert.equal(EVIDENCE_SCHEMA_VERSION, "10d-remediation-02");
+    assert.equal(EVIDENCE_SCHEMA_VERSION, "10d-remediation-03");
     assert.notEqual(EVIDENCE_SCHEMA_VERSION, PREVIOUS_SCHEMA);
+    assert.notEqual(EVIDENCE_SCHEMA_VERSION, RETIRED_SCHEMA);
     // ONE constant governs Stage A, case records and the aggregate, so they
     // cannot drift into describing different producer contracts.
     assert.equal(CASE_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION);
@@ -7021,7 +7349,11 @@ describe("evidence producer contract version", () => {
   it("72c. a valid old seal does not alter the result", async () => {
     // Sealed under the SAME key, so both records are equally authentic. Only
     // the producer contract differs, and only that decides.
-    for (const [schema, expected] of [[PREVIOUS_SCHEMA, false], [EVIDENCE_SCHEMA_VERSION, true]]) {
+    for (const [schema, expected] of [
+      [PREVIOUS_SCHEMA, false],
+      [RETIRED_SCHEMA, false],
+      [EVIDENCE_SCHEMA_VERSION, true],
+    ]) {
       const record = stageA(schema);
       assert.equal(verifySeal(record, KEY).ok, true, `${schema}: authentic`);
       assert.equal((await load(record)).ok, expected, `${schema}: admitted`);
@@ -7067,7 +7399,7 @@ describe("evidence producer contract version", () => {
       { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
-    assert.equal(JSON.parse(run.files.get("/tmp/c.json")).schemaVersion, "10d-remediation-02");
+    assert.equal(JSON.parse(run.files.get("/tmp/c.json")).schemaVersion, "10d-remediation-03");
   });
 });
 
@@ -7955,7 +8287,7 @@ describe("acceptance evidence immutability (CORRECTION-08)", () => {
     assert.equal(run.writeOptions.get("/tmp/fresh-stage-a.json")?.flag, "wx");
   });
 
-  it("85. a sealed remediation-02 Stage A PASS is still admitted by loadStageA()", async () => {
+  it("85. a sealed remediation-03 Stage A PASS is still admitted by loadStageA()", async () => {
     const world = makeFakeWorld();
     const run = await runCli(
       ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/admissible-stage-a.json"],
@@ -7965,12 +8297,13 @@ describe("acceptance evidence immutability (CORRECTION-08)", () => {
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
 
     const sealed = run.files.get("/tmp/admissible-stage-a.json");
-    assert.equal(JSON.parse(sealed).schemaVersion, "10d-remediation-02");
+    assert.equal(JSON.parse(sealed).schemaVersion, "10d-remediation-03");
     const key = JSON.parse(run.files.get(RUN_KEY_PATH));
 
     // Exactly what the eventual Stage B aggregation does with the artifact the
     // accepted run left behind: this correction must not have changed what a
-    // sealed `10d-remediation-02` PASS means.
+    // FRESHLY SEALED PASS means. The version boundary retires OLD artifacts; it
+    // must never make the harness unable to admit its own current output.
     const loaded = await loadStageA("/tmp/admissible-stage-a.json", async () => sealed, {
       run: { runId: key.runId, key: key.key },
       expectedSha: SHA,
@@ -8594,8 +8927,8 @@ describe("generic delivery is proven against a pre-job fixture digest", () => {
     const sealed = run.files.get("/tmp/accepted-stage-a.json");
     const record = JSON.parse(sealed);
     assert.equal(record.runId, "a9ce1c400db8d817");
-    assert.equal(record.schemaVersion, "10d-remediation-02");
-    assert.equal(CASE_SCHEMA_VERSION, "10d-remediation-02");
+    assert.equal(record.schemaVersion, "10d-remediation-03");
+    assert.equal(CASE_SCHEMA_VERSION, "10d-remediation-03");
 
     const loaded = await loadStageA("/tmp/accepted-stage-a.json", async () => sealed, {
       run: { runId: "a9ce1c400db8d817", key: "d".repeat(64) },
@@ -8611,5 +8944,324 @@ describe("generic delivery is proven against a pre-job fixture digest", () => {
     for (const bad of [undefined, null, "", "C".repeat(64), "c".repeat(63), "c".repeat(65), "zz", 1]) {
       assert.equal(parseGenericExpectedDigest(bad).ok, false, JSON.stringify(bad));
     }
+  });
+});
+
+// ── CORRECTION-01 §4-§7: the 10D-REM-03 evaluator-semantics boundary ───────
+//
+// This is the sharpest case the schema boundary has had to carry. Every earlier
+// bump retired artifacts whose OBSERVERS were weaker. This one retires
+// artifacts whose observers were fine and whose EVALUATOR has since become more
+// permissive about the very same raw bytes:
+//
+//     the same sealed five-state success trace
+//     graded BLOCKED under 10d-remediation-02
+//     graded PASS    under 10d-remediation-03
+//
+// A valid HMAC proves "this artifact has not changed since it was produced". It
+// does NOT prove "this artifact was produced and evaluated under today's
+// lifecycle semantics". Nothing in the record's shape, fields or seal separates
+// the two readings, so the version boundary is the only thing that can — and a
+// permissive change is not exempt from it just because it points the friendly
+// way.
+
+describe("10D-REM-03 — the lifecycle evaluator boundary retires remediation-02", () => {
+  const KEY = "a".repeat(64);
+  const RUN = { runId: "0123456789abcdef", key: KEY };
+  const RETIRED = "10d-remediation-02";
+  const BINDING = { expectedSha: SHA, runningImageId: IMAGE_ID };
+  const expectations = { runId: RUN.runId, expectedSha: SHA, runningImageId: IMAGE_ID };
+
+  /** A Stage-A PASS that is perfect in every respect except its schema. */
+  const stageAAt = (schemaVersion) =>
+    sealRecord(
+      {
+        harness: HARNESS_ID,
+        schemaVersion,
+        runId: RUN.runId,
+        task: "PHASE-10D",
+        stage: "A",
+        verdict: "PASS",
+        startedAt: "2026-09-04T00:00:00.000Z",
+        expectedSha: SHA,
+        runningImageId: IMAGE_ID,
+        taggedImageId: IMAGE_ID,
+        binding: { expectedSha: SHA, runningImageId: IMAGE_ID, taggedImageId: IMAGE_ID },
+        checks: [{ id: "image.identity", outcome: "PASS", required: true, detail: "" }],
+      },
+      KEY,
+    );
+
+  const loadA = (record) =>
+    loadStageA("/x", async () => JSON.stringify(record), { run: RUN, expectedSha: SHA });
+
+  /**
+   * A REALISTIC `success` case record carrying the exact live five-state trace,
+   * built by the real producer so nothing but the schema version is synthetic.
+   *
+   * Synthetic on purpose: no secret, sentinel, URL or bearer value from the
+   * real sealed `stage-b/success.json` is reproduced here. That artifact stays
+   * untouched on the acceptance host.
+   */
+  const liveSuccessCaseAt = async (schemaVersion) => {
+    const { ctx } = makeSuccessCaseCtx({
+      finalStatus: "ready",
+      trace: [...LIVE_SUCCESS_TRACE],
+      genericExpectedDigest: "c".repeat(64),
+      deliveredDigest: "c".repeat(64),
+    });
+    const payload = await runSuccessCase(ctx);
+    const record = caseRecord({ caseName: "success", binding: BINDING, payload, runId: RUN.runId });
+    return sealRecord({ ...record, schemaVersion }, KEY);
+  };
+
+  it("A. a correctly sealed remediation-02 Stage A is refused SOLELY on the version", async () => {
+    const stale = stageAAt(RETIRED);
+
+    // The seal is genuinely good, and every other admission condition holds —
+    // same run, same key, same source SHA, same image, PASS verdict, complete
+    // and self-consistent binding. The version is the only thing wrong.
+    assert.equal(verifySeal(stale, KEY).ok, true, "precondition: the artifact is authentic");
+
+    const loaded = await loadA(stale);
+    assert.equal(loaded.ok, false);
+    assert.match(loaded.reason, new RegExp(`${RETIRED}.*is not.*10d-remediation-03`));
+    assert.equal(loaded.binding, undefined, "and it authorizes nothing");
+
+    // The identical record at the current version IS admitted, which is what
+    // proves the refusal above is the version boundary and nothing else.
+    const fresh = await loadA(stageAAt(EVIDENCE_SCHEMA_VERSION));
+    assert.equal(fresh.ok, true, fresh.reason);
+  });
+
+  it("B. a sealed remediation-02 success is refused BEFORE the classifier can pass it", async () => {
+    const stale = await liveSuccessCaseAt(RETIRED);
+
+    // Precondition 1: the artifact is authentic.
+    assert.equal(verifySeal(stale, KEY).ok, true, "precondition: authentic");
+    // Precondition 2: it carries the exact trace the new classifier accepts, so
+    // the ONLY thing standing between it and a PASS is the version boundary.
+    assert.deepEqual(stale.payload.genericJob.transitions, [...LIVE_SUCCESS_TRACE]);
+    assert.equal(
+      classifySuccessTransitionTrace(stale.payload.genericJob.transitions).outcome,
+      OUTCOMES.PASS,
+      "precondition: the corrected classifier would pass this trace",
+    );
+
+    // …and it is refused at ADMISSION, by both gates the aggregate runs, before
+    // any payload field is believed and long before the classifier sees it.
+    const validated = validateCaseRecord(stale, BINDING);
+    assert.equal(validated.ok, false);
+    assert.match(validated.reason, new RegExp(`${RETIRED} is not 10d-remediation-03`));
+    assert.equal(validated.observations, undefined, "no observation may escape a refused record");
+
+    const verified = verifyRecord(stale, KEY, expectations);
+    assert.equal(verified.ok, false);
+    assert.match(verified.reason, new RegExp(`${RETIRED} is not 10d-remediation-03`));
+  });
+
+  it("C. the same success at remediation-03 IS admitted and PASSes by causal proof", async () => {
+    const fresh = await liveSuccessCaseAt(EVIDENCE_SCHEMA_VERSION);
+
+    const validated = validateCaseRecord(fresh, BINDING);
+    assert.equal(validated.ok, true, validated.reason);
+    assert.equal(verifyRecord(fresh, KEY, expectations).ok, true);
+
+    // Admitted, and its lifecycle check passes on causal proof — `processing`
+    // reported as proven, never as observed, and never spliced into the trace.
+    const result = evaluateStageB(
+      passingStageBObservations({
+        ...validated.observations,
+        durableJobRow: measured({
+          present: true,
+          jobId: fresh.payload.genericJob.jobId,
+          status: "ready",
+          formatId: fresh.payload.genericJob.requestedFormatId,
+          extractor: "yt-dlp",
+        }),
+      }),
+      passingStageA(),
+    );
+    const check = result.checks.find((c) => c.id === "job.lifecycle-complete");
+    assert.equal(check.outcome, OUTCOMES.PASS, check.detail);
+    assert.match(check.detail, /CAUSALLY PROVEN/);
+    assert.ok(!fresh.payload.genericJob.transitions.includes("processing"));
+  });
+
+  it("D. cross-version case aggregation is refused", async () => {
+    // Two case records for one run, differing ONLY in contract version. The
+    // aggregate must not build a verdict from a mixed-semantics corpus.
+    const fresh = await liveSuccessCaseAt(EVIDENCE_SCHEMA_VERSION);
+    const stale = await liveSuccessCaseAt(RETIRED);
+
+    assert.equal(validateCaseRecord(fresh, BINDING).ok, true);
+    assert.equal(validateCaseRecord(stale, BINDING).ok, false);
+
+    const admitted = [fresh, stale].filter((r) => validateCaseRecord(r, BINDING).ok);
+    assert.equal(admitted.length, 1, "a mixed-version corpus never aggregates whole");
+    assert.equal(admitted[0].schemaVersion, EVIDENCE_SCHEMA_VERSION);
+  });
+
+  it("E. a remediation-03 Stage A cannot be joined to a remediation-02 case", async () => {
+    const files = new Map();
+    files.set("/tmp/stage-a-03.json", JSON.stringify(stageAAt(EVIDENCE_SCHEMA_VERSION)));
+    files.set("/tmp/case-02.json", JSON.stringify(await liveSuccessCaseAt(RETIRED)));
+    files.set(RUN_KEY_PATH, JSON.stringify({ runId: RUN.runId, key: KEY }));
+
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const aggregate = await runCli(
+      [
+        "--stage", "B", "--aggregate", ...LIVE_ARGS,
+        "--stage-a", "/tmp/stage-a-03.json",
+        "--case-evidence", "/tmp/case-02.json",
+        "--evidence", "/tmp/aggregate-mixed-e.json",
+      ],
+      LIVE_ENV({ ...WORKER_ENV }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+
+    // The Stage A authorized, the stale case did not, and the lifecycle claim
+    // it would have carried lands BLOCKED rather than PASS.
+    assert.match(aggregate.err, /rejected case evidence/);
+    assert.match(aggregate.err, new RegExp(`${RETIRED} is not 10d-remediation-03`));
+    assert.match(aggregate.out, /accepted case evidence: none/);
+    assert.match(aggregate.out, /\[BLKD\] job\.lifecycle-complete/);
+    assert.notEqual(aggregate.code, 0);
+  });
+
+  it("F. a remediation-02 Stage A cannot authorize remediation-03 cases", async () => {
+    const files = new Map();
+    files.set("/tmp/stage-a-02.json", JSON.stringify(stageAAt(RETIRED)));
+    files.set("/tmp/case-03.json", JSON.stringify(await liveSuccessCaseAt(EVIDENCE_SCHEMA_VERSION)));
+    files.set(RUN_KEY_PATH, JSON.stringify({ runId: RUN.runId, key: KEY }));
+
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const aggregate = await runCli(
+      [
+        "--stage", "B", "--aggregate", ...LIVE_ARGS,
+        "--stage-a", "/tmp/stage-a-02.json",
+        "--case-evidence", "/tmp/case-03.json",
+        "--evidence", "/tmp/aggregate-mixed-f.json",
+      ],
+      LIVE_ENV({ ...WORKER_ENV }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+
+    // The stale Stage A cannot authorize ANYTHING, so the run stops at the
+    // authorization edge and the fresh case is never even considered.
+    assert.match(aggregate.err, /BLOCKED: the Stage A record is not usable/);
+    assert.match(aggregate.err, new RegExp(`${RETIRED}.*is not.*10d-remediation-03`));
+    assert.notEqual(aggregate.code, 0);
+  });
+
+  // MUTATION-7 SCOPE, stated precisely: the forbidden, testable behaviour is
+  // ADMISSION AUTOMATICALLY NORMALIZING / RELABELLING / RESEALING A RETIRED
+  // RECORD. That is a harness behaviour, entirely within our control, and it is
+  // what this regression detects.
+  //
+  // It is NOT the claim that a verifier can recognise a record an operator
+  // manually forged with the run key — see the threat-model demonstration below.
+  // Each gate is checked SEPARATELY so a mutation is attributed to the gate that
+  // performed it rather than to whichever one happened to run first.
+  it("admission never NORMALIZES a retired artifact — every gate leaves it byte-identical", async () => {
+    const staleCase = await liveSuccessCaseAt(RETIRED);
+    const staleA = stageAAt(RETIRED);
+
+    const unchanged = async (label, record, gate) => {
+      const before = JSON.stringify(record);
+      const result = await gate(record);
+      assert.equal(result.ok, false, `${label}: a retired record must be refused`);
+      assert.equal(JSON.stringify(record), before, `${label}: must not rewrite the record`);
+      assert.equal(record.schemaVersion, RETIRED, `${label}: its version must survive`);
+    };
+
+    await unchanged("validateCaseRecord", staleCase, (r) => validateCaseRecord(r, BINDING));
+    await unchanged("verifyRecord", staleCase, (r) => verifyRecord(r, KEY, expectations));
+    await unchanged("loadStageA", staleA, (r) => loadA(r));
+
+    // And the seals still verify afterwards, which is the sharpest form of "the
+    // bytes were not touched": any relabel-and-reseal would have replaced the
+    // authenticator, and any relabel WITHOUT a reseal would have broken it.
+    assert.equal(verifySeal(staleCase, KEY).ok, true);
+    assert.equal(verifySeal(staleA, KEY).ok, true);
+  });
+
+  // THREAT-MODEL DEMONSTRATION — not a claimed defence.
+  //
+  // The run key is LOCAL OPERATOR-HELD material, and the provenance contract has
+  // always said so: the seal "is not a defence against an operator who wants to
+  // forge their own acceptance — nothing local can be". This test exists to keep
+  // that boundary explicit and hard to misread, because the previous version of
+  // it was named as though relabelling were DETECTED. It is not.
+  //
+  // What is, and is not, established:
+  //
+  //   INTEGRITY                  the HMAC proves the sealed bytes have not
+  //                              changed since somebody holding the key sealed
+  //                              them.
+  //   CONTRACT VERSION           `schemaVersion` decides which harness semantics
+  //                              may consume an artifact.
+  //   AUTOMATIC VERSION CROSSING refused, and test-detected — see the boundary
+  //                              cases above and the admission-immutability one.
+  //   MANUAL OPERATOR FORGERY    OUTSIDE this threat model. An operator holding
+  //                              the run key can mint a new record bearing any
+  //                              version they like, and its HMAC will verify.
+  //
+  // Manual resealing therefore does not "upgrade" or "launder" the historical
+  // artifact — it CONSTRUCTS A SEPARATE, NEW CLAIM. The old object is untouched
+  // and still refused; the new object is a different artifact whose assertion
+  // about which harness revision measured the underlying facts nothing local can
+  // check. That is why "never reseal historical evidence" is an OPERATING RULE
+  // enforced by procedure and review, not a property enforced by the verifier.
+  it("manual reseal constructs a NEW claim; it does not modify the historical artifact", async () => {
+    const stale = await liveSuccessCaseAt(RETIRED);
+    const before = JSON.stringify(stale);
+
+    // The historical object: authentic, and refused on the version boundary.
+    assert.equal(verifySeal(stale, KEY).ok, true);
+    assert.equal(validateCaseRecord(stale, BINDING).ok, false);
+
+    const relabelled = sealRecord(
+      { ...stale, schemaVersion: EVIDENCE_SCHEMA_VERSION, authenticator: undefined },
+      KEY,
+    );
+    delete relabelled.authenticator.undefined;
+
+    // 1. The historical artifact is UNCHANGED by the attempt. Producing a
+    //    relabelled copy is not an edit of the original, and the original keeps
+    //    its own version and its own valid seal.
+    assert.equal(JSON.stringify(stale), before);
+    assert.equal(stale.schemaVersion, RETIRED);
+    assert.equal(verifySeal(stale, KEY).ok, true);
+    assert.equal(validateCaseRecord(stale, BINDING).ok, false, "and it stays refused");
+
+    // 2. The relabelled object is a DISTINCT artifact: different version,
+    //    different authenticator.
+    assert.equal(relabelled.schemaVersion, EVIDENCE_SCHEMA_VERSION);
+    assert.notEqual(relabelled.authenticator.mac, stale.authenticator.mac);
+
+    // 3. Its seal is cryptographically VALID, and — stated plainly rather than
+    //    wished away — the current verifier ADMITS it. This is the honest edge
+    //    of the local-HMAC threat model, recorded so nobody later mistakes the
+    //    version boundary for a defence against a key holder.
+    assert.equal(verifySeal(relabelled, KEY).ok, true);
+    assert.equal(
+      verifyRecord(relabelled, KEY, expectations).ok,
+      true,
+      "documenting the actual behaviour: a key holder can mint any version",
+    );
+
+    // This assertion documents CURRENT behaviour under the CURRENT threat model.
+    // It is deliberately not a normative requirement that forged records be
+    // accepted: if provenance is later hardened — a signature over the producing
+    // harness revision, a remote notary, an append-only witness — this test is
+    // expected to be updated alongside that mechanism, not treated as a contract
+    // preventing it.
   });
 });
