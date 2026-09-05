@@ -151,6 +151,26 @@ function sanitizeForDurableState(value: string, maxLength: number): string {
   return value.replace(/[\u0000-\u001F\u007F]/g, "").slice(0, maxLength);
 }
 
+/**
+ * §22/§23 + PHASE-10D-WORKER-RESTART-RECOVERY-DETERMINISM-001: the provenance
+ * of an operator-shutdown abort.
+ *
+ * Membership is decided by OBJECT IDENTITY of the very `AbortSignal` this
+ * process aborted for a shutdown. It is deliberately NOT derived from:
+ *
+ *   - the human-readable message of any error;
+ *   - the `PROCESSING_FAILED` code, which ordinary failures also carry;
+ *   - `signal.aborted` alone, which a user cancellation and a halted progress
+ *     reporter also set;
+ *   - anything thrown by yt-dlp, the direct downloader or FFmpeg.
+ *
+ * The set is module-private and holds no strong reference, so nothing outside
+ * this module — and no upstream payload — can add to it, read it, or forge it.
+ * It is per-signal (therefore per-execution) rather than one global flag, so a
+ * job that was never actually active and aborted can never be misclassified.
+ */
+const SHUTDOWN_ABORTED_SIGNALS = new WeakSet<AbortSignal>();
+
 export class JobExecutor {
   private readonly store: WorkerJobStore;
   private readonly writer: ObjectStoreWriter;
@@ -209,22 +229,35 @@ export class JobExecutor {
   /**
    * §22/§23: aborts every in-flight execution for an operator shutdown.
    *
-   * This deliberately does NOT call `store.cancelJob()`. A restart is not a
-   * user cancellation, so no `cancelled` state is written and first-terminal-
-   * wins is untouched: whatever the aborted execution commits (a `failed` row
-   * via the existing classification) or leaves behind (an interrupted active
-   * row, classified by `store.recover()` on the next boot) remains authoritative.
+   * INVARIANT (PHASE-10D-WORKER-RESTART-RECOVERY-DETERMINISM-001):
+   * operator shutdown aborts execution for PROCESS HYGIENE ONLY. It
+   * deliberately does not commit an ordinary terminal failure, and it
+   * deliberately does not call `store.cancelJob()` — a restart is neither an
+   * execution failure nor a user cancellation. An execution interrupted here
+   * unwinds, cleans up its work directory, and leaves its durable row in the
+   * ACTIVE state it had reached. That interrupted row is owned by the NEXT
+   * process: `store.recover()` runs before anything can listen or execute and
+   * classifies it deterministically as
+   * `failed` / `PROCESSING_FAILED` / "Worker restarted before the job
+   * completed." / stage `Worker restarted`.
+   *
+   * Letting the dying process classify the abort itself is what made the
+   * durable outcome nondeterministic: whichever of the two writers happened to
+   * win produced a different safe message for the same operator restart.
    *
    * Aborting is also what prevents descendant leakage: the hardened process
    * runner spawns media children detached into their own POSIX process group
    * and SIGKILLs the whole group on abort, so no FFmpeg descendant can outlive
-   * the shutting-down Worker.
+   * the shutting-down Worker. That behaviour is unchanged.
    *
    * @returns the number of executions signalled.
    */
   public abortActiveForShutdown(): number {
     const controllers = [...this.activeControllers.values()];
     for (const controller of controllers) {
+      // Provenance is recorded BEFORE the abort, so an abort listener that
+      // runs synchronously already sees a marked signal.
+      SHUTDOWN_ABORTED_SIGNALS.add(controller.signal);
       controller.abort(new AppError("PROCESSING_FAILED", "Worker shutting down"));
     }
     return controllers.length;
@@ -273,10 +306,21 @@ export class JobExecutor {
       await this.runWorkflow(job, workDir, signal);
     } catch (err: unknown) {
       if (signal.aborted) {
-        // Cancellation is not a failure: if cancel won the durable CAS, the
-        // terminal state it wrote must be preserved verbatim.
+        // 1. Cancellation is checked FIRST and wins outright: if cancel won the
+        //    durable CAS — even in the window between a shutdown abort and this
+        //    catch — the terminal state it wrote must be preserved verbatim.
         const view = this.store.getJob(jobId);
         if (view && view.status === "cancelled") {
+          return;
+        }
+
+        // 2. Operator shutdown is not an execution failure. THIS execution's
+        //    own signal was marked before it was aborted, so the decision does
+        //    not depend on the error object that yt-dlp, the direct downloader
+        //    or FFmpeg happened to reject with. Return without failJob(): the
+        //    durable row stays in its interrupted ACTIVE state and the next
+        //    process's `store.recover()` owns the restart transition.
+        if (SHUTDOWN_ABORTED_SIGNALS.has(signal)) {
           return;
         }
       }
@@ -286,6 +330,9 @@ export class JobExecutor {
       // §27: the raw error is deliberately never logged and never persisted.
       this.store.failJob(jobId, code, safeMsg);
     } finally {
+      // Cleanup is NEVER skipped, on any of the three outcomes above: the
+      // active controller is unregistered and the per-job working directory is
+      // removed even when the durable row is intentionally left active.
       this.activeControllers.delete(jobId);
       if (workDir) {
         await this.cleanup(workDir);

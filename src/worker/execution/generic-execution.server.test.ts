@@ -560,7 +560,7 @@ describe("generic job: cancellation and shutdown (§40/§41/§59)", () => {
     assert.equal(controllers.size, 0, "the controller is released");
   });
 
-  it("shutdown aborts generic acquisition without writing a cancelled state", async () => {
+  it("shutdown aborts generic acquisition without writing a cancelled OR failed state", async () => {
     const job = claimJob(h.store, "preset:1080");
     let sawAbort = false;
     let abortedCount = -1;
@@ -591,9 +591,19 @@ describe("generic job: cancellation and shutdown (§40/§41/§59)", () => {
     assert.equal(sawAbort, true);
     assert.equal(abortedCount, 1, "shutdown must signal exactly the one active execution");
     const final = h.store.getJob(job.jobId);
-    // A restart is not a user cancellation: the job fails deterministically.
-    assert.equal(final?.status, "failed");
+    // A restart is neither a user cancellation nor an execution failure: the
+    // interrupted row stays ACTIVE for the next process's `store.recover()`.
+    assert.equal(final?.status, "downloading");
+    assert.notEqual(final?.status, "cancelled");
+    assert.notEqual(final?.status, "failed");
     assert.equal(h.puts.length, 0);
+
+    h.store.recover();
+    const recovered = h.store.getJob(job.jobId);
+    assert.equal(recovered?.status, "failed");
+    assert.equal(recovered?.errorCode, "PROCESSING_FAILED");
+    assert.equal(recovered?.safeErrorMessage, "Worker restarted before the job completed.");
+    assert.equal(recovered?.stageLabel, "Worker restarted");
   });
 
   it("removes the job workDir after a generic failure", async () => {
@@ -791,6 +801,133 @@ describe("generic job: a late byte-monitor sample cannot break a succeeding job 
       progressAfterSettlement,
       0,
       "no progress may be emitted after acquisition settled",
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE-10D-WORKER-RESTART-RECOVERY-DETERMINISM-001: the generic regression
+// closest to the live Stage-B `shutdown` failure.
+//
+// The Production case restarted the container while a GENERIC (yt-dlp)
+// acquisition was in flight. The old process classified the shutdown abort as
+// an ordinary failure and committed
+// `PROCESSING_FAILED` / "We couldn't process this video. Try another format or
+// source.", so the interrupted row was already terminal by the time the new
+// process ran `store.recover()` and the restart message never appeared.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("generic job: operator shutdown during acquisition", () => {
+  it("leaves the row downloading, then recover() writes the restart result", async () => {
+    const job = claimJob(h.store, "preset:1080");
+    let acquisitionEntered = false;
+    let statusAtAcquisition = "";
+    let genericCalls = 0;
+
+    const deps: JobExecutorDeps = {
+      analyzeForExecution: async () =>
+        genericAnalysis(
+          [{ id: "preset:1080", container: "mp4", hasVideo: true }],
+          { "preset:1080": selection() },
+        ),
+      downloadOriginal: async () => {
+        throw new Error("the DIRECT downloader must never run for a generic job");
+      },
+      downloadGeneric: (async (
+        _url: string,
+        _workDir: string,
+        _plan: GenericExecutionPlan,
+        ctx: { signal?: AbortSignal },
+      ) => {
+        genericCalls += 1;
+        statusAtAcquisition = h.store.getJob(job.jobId)?.status ?? "missing";
+        acquisitionEntered = true;
+        // Blocks until the operator shutdown abort fires, then rejects exactly
+        // as a killed yt-dlp process group does.
+        await new Promise<void>((resolve) => {
+          ctx.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        throw new AppError("PROCESSING_FAILED", "yt-dlp process group terminated");
+      }) as NonNullable<JobExecutorDeps["downloadGeneric"]>,
+      processLocally: async () => {
+        throw new Error("shutdown must never reach Worker FFmpeg");
+      },
+    };
+
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps);
+    const execution = executor.execute(job);
+
+    // Analysis committed and acquisition is genuinely in flight.
+    const deadline = Date.now() + 5000;
+    while (!acquisitionEntered && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.equal(acquisitionEntered, true, "generic acquisition must be in flight");
+    assert.equal(statusAtAcquisition, "downloading", "acquisition runs while downloading");
+    assert.equal(executor.activeJobCount, 1);
+
+    assert.equal(executor.abortActiveForShutdown(), 1, "the generic execution was signalled");
+
+    // The executor drains cleanly inside the grace period.
+    await execution;
+    assert.equal(executor.activeJobCount, 0);
+
+    // ── BEFORE recover() ────────────────────────────────────────────────────
+    const interrupted = h.store.getJob(job.jobId);
+    assert.ok(interrupted);
+    assert.equal(interrupted.status, "downloading", "the interrupted row stays active");
+    assert.notEqual(interrupted.status, "failed", "no ordinary failure was committed");
+    assert.notEqual(interrupted.status, "cancelled", "a shutdown is not a user cancellation");
+    assert.notEqual(interrupted.status, "ready");
+    assert.equal(
+      interrupted.extractor,
+      "yt-dlp",
+      "the Worker's own generic strategy decision survives the interruption",
+    );
+    assert.equal(interrupted.errorCode, null);
+    assert.equal(h.puts.length, 0, "nothing was uploaded");
+    assert.equal(genericCalls, 1, "exactly one acquisition attempt");
+
+    // ── The next process owns the transition ────────────────────────────────
+    h.store.recover();
+
+    const recovered = h.store.getJob(job.jobId);
+    assert.ok(recovered);
+    assert.equal(recovered.status, "failed");
+    assert.equal(recovered.errorCode, "PROCESSING_FAILED");
+    assert.equal(recovered.safeErrorMessage, "Worker restarted before the job completed.");
+    assert.equal(recovered.stageLabel, "Worker restarted");
+    assert.equal(recovered.extractor, "yt-dlp", "recovery preserves the recorded strategy");
+  });
+
+  it("still ordinary-fails a generic acquisition that broke WITHOUT a shutdown", async () => {
+    const job = claimJob(h.store, "preset:1080");
+
+    const deps: JobExecutorDeps = {
+      analyzeForExecution: async () =>
+        genericAnalysis(
+          [{ id: "preset:1080", container: "mp4", hasVideo: true }],
+          { "preset:1080": selection() },
+        ),
+      downloadGeneric: (async () => {
+        throw new AppError("EXTRACTION_FAILED", SENTINEL);
+      }) as NonNullable<JobExecutorDeps["downloadGeneric"]>,
+    };
+
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps);
+    await executor.execute(job);
+
+    const final = h.store.getJob(job.jobId);
+    assert.equal(final?.status, "failed", "an ordinary generic failure is still terminal at once");
+    assert.equal(final?.errorCode, "EXTRACTION_FAILED");
+    assert.equal(
+      final?.safeErrorMessage,
+      "We couldn't extract the video streams from this page.",
+    );
+    assert.notEqual(
+      final?.safeErrorMessage,
+      "Worker restarted before the job completed.",
+      "an ordinary failure must never masquerade as a restart",
     );
   });
 });

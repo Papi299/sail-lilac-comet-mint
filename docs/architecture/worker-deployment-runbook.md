@@ -2952,6 +2952,37 @@ maintenance timer, stops claiming further queued work, aborts in-flight media
 (so no FFmpeg descendant survives the container), and closes SQLite last, all
 within a bounded grace period.
 
+**Who owns an interrupted active row.** Aborting in-flight media at shutdown is
+*process hygiene only*. The dying process deliberately writes **no** terminal
+state for the executions it aborted: it unwinds them, unregisters their abort
+controllers and removes their per-job work directories, and leaves each durable
+row in whichever active state (`analyzing` / `downloading` / `processing` /
+`uploading`) it had reached. The **next** process owns the transition —
+`store.recover()`, which runs inside `createWorkerRuntime()` before `listen()`
+and before any job can be claimed.
+
+That single-owner rule is what makes the operator-restart outcome deterministic:
+
+```
+failed / PROCESSING_FAILED
+"Worker restarted before the job completed."   stage: Worker restarted
+```
+
+The executor distinguishes a shutdown abort from an ordinary failure by the
+**identity of the AbortSignal it marked before aborting it**, held in a
+module-private `WeakSet`. It is never inferred from an error message, from the
+`PROCESSING_FAILED` code (ordinary failures carry it too), from `signal.aborted`
+alone (a user cancellation and a halted progress reporter both set it), or from
+anything thrown by yt-dlp, the direct downloader or FFmpeg. A user cancellation
+is still checked **first** and still wins outright, so a cancel that lands in the
+window between a shutdown abort and the executor's catch stays authoritative.
+
+Before `PHASE-10D-WORKER-RESTART-RECOVERY-DETERMINISM-001` the dying process
+classified its own shutdown abort and committed an ordinary terminal `failed`
+row. That row was already terminal by the time the next process ran
+`store.recover()`, which correctly refuses to overwrite a terminal state, so the
+restart message never appeared. See §11f.
+
 Configure the platform's termination grace period to at least the Worker's
 shutdown grace so a clean SIGTERM is not truncated by an immediate SIGKILL.
 
@@ -4267,3 +4298,118 @@ it, so nothing about Stage-A semantics, the deployment binding or the HMAC
 material moved. Accepted Stage-A run `a9ce1c400db8d817` stays admissible. No
 successful Stage-B success artifact exists, so no historical success evidence is
 invalidated by requiring the field.
+
+---
+
+## 11f. Phase 10D — the live Stage-B `shutdown` finding (FAILED), and its source remediation
+
+`PHASE-10D-WORKER-RESTART-RECOVERY-DETERMINISM-001`.
+
+The Stage-B remediation-02 run produced `success` PASS, `cancellation` PASS,
+`byte-limit` PASS and **`shutdown` FAIL**. The recorded `shutdown.json` FAIL is
+kept verbatim as historical evidence — it is the artifact that caught a real
+Worker runtime defect, and nothing in this section rewrites it.
+
+### What the live run established
+
+| Observation | Value |
+| :--- | :--- |
+| container restart | exactly one |
+| old/new container | different |
+| image | same authorized image |
+| feature continuity | enabled → enabled |
+| captured acquisition group survivors | none |
+| `restartObserved` | `true` |
+| `lateReady` | `false` |
+| durable recovered status | `failed` |
+| `errorCode` | `PROCESSING_FAILED` |
+| **expected** safe message | `Worker restarted before the job completed.` |
+| **actual** safe message | `We couldn't process this video. Try another format or source.` |
+
+The restart itself worked. Descendant termination worked — the captured
+acquisition process group had no survivors, so the hardened process-group
+containment is *not* implicated and is unchanged by this remediation. What was
+wrong was the **durable semantics** of the interrupted job.
+
+### Root cause
+
+```
+runtime.shutdown()
+  -> executor.abortActiveForShutdown()
+  -> AbortController aborts the active execution
+  -> media acquisition rejects
+  -> JobExecutor.execute() catch
+  -> signal.aborted, but the durable job is not `cancelled`
+  -> classifyErrorCode()
+  -> store.failJob(..., ERROR_MESSAGES.PROCESSING_FAILED)   <-- the defect
+  -> the job is terminal `failed`
+  -> queue pump drains, SQLite closes
+  -> the new Worker starts, store.recover() runs
+  -> the row is ALREADY TERMINAL, therefore untouched
+```
+
+Two writers could produce the durable outcome of one operator restart — the
+dying process's ordinary error classifier, or the next process's startup
+recovery — and which one won was a race. Whenever the aborted execution settled
+inside `WORKER_SHUTDOWN_GRACE_MS` (the normal graceful case, and the exact live
+case) the dying process won, and the operator-restart message was replaced by
+the generic processing message.
+
+### The remediation
+
+Operator shutdown now has a semantic outcome distinct from both an ordinary
+execution failure and a user cancellation:
+
+| Origin | Durable effect |
+| :--- | :--- |
+| user cancel | `store.cancelJob()` writes `cancelled`, then execution is aborted; the executor preserves `cancelled` |
+| ordinary failure | the operation throws, the executor classifies it, `failJob()` |
+| **operator shutdown** | execution is marked shutdown-aborted, media/descendants are killed, the work directory is cleaned, **no terminal state is written**, the active row survives for the next process's `store.recover()` |
+
+`SQLiteJobStore.recover()` is **unchanged**. Its policy was already correct:
+`analyzing` / `downloading` / `processing` / `uploading` become
+`failed` / `PROCESSING_FAILED` / `Worker restarted before the job completed.` /
+stage `Worker restarted`; `queued` stays queued; `ready`, `failed` and
+`cancelled` are never reopened. First-terminal-wins is untouched. The fix was to
+stop the dying process from racing it.
+
+Provenance is per-execution and structural, not textual: `abortActiveForShutdown()`
+adds each controller's `AbortSignal` to a module-private `WeakSet` immediately
+before aborting it, and the executor's catch consults that set by object
+identity. There is no global "we are shutting down" flag, so a job that was not
+actually active and aborted can never be misclassified, and nothing outside the
+module — least of all an upstream error payload — can forge the marker. The
+catch order is: cancelled first, then shutdown provenance, then ordinary
+classification.
+
+### Deployment consequence
+
+This is a Worker **runtime** change. Once it merges, the existing Stage-A
+authorization — `expectedSha 4a537e3cb7403801f39a706ce7bed896c0fe11f7`, image
+`sha256:b7b7554c…` — **must not** authorize the rebuilt Worker, and Stage B
+cannot simply resume at `shutdown`. The required sequence is:
+
+```
+new Worker image
+  -> FRESH Stage A, PASS bound to the new source SHA + image
+  -> FRESH COMPLETE Stage B
+       success, cancellation, byte-limit, shutdown,
+       safe-egress, direct-regression
+  -> disable
+  -> kill-switch
+  -> aggregate
+```
+
+Old Stage-B case artifacts, including the `shutdown` FAIL, remain historical
+only.
+
+### Schema
+
+No database migration, no durable schema change, no evidence schema change. The
+Worker state schema already expressed the required result — the row shape and
+the recovery classification were never the problem.
+`EVIDENCE_SCHEMA_VERSION` and `CASE_SCHEMA_VERSION` remain `10d-remediation-02`,
+and the `shutdown.job-recovered` assertion is unchanged: it still requires
+exactly `failed` / `PROCESSING_FAILED` /
+`Worker restarted before the job completed.` The acceptance harness found a real
+defect and was not weakened to accommodate it.

@@ -161,6 +161,13 @@ export async function createWorkerRuntime(
     // Conservative startup recovery, BEFORE anything can listen or execute:
     // queued stays queued, interrupted active work fails deterministically,
     // ready and terminal rows are left exactly as they are.
+    //
+    // This call is the ONLY writer of the worker-restart outcome. The previous
+    // process aborts its in-flight executions for hygiene but intentionally
+    // leaves their active rows alone (see `abortActiveForShutdown`), so an
+    // operator restart always lands here and always produces the same durable
+    // result — never an ordinary `PROCESSING_FAILED` row written by the dying
+    // process's error classifier.
     store.recover();
 
     const replayStore = new SQLiteWorkerReplayStore(
@@ -385,8 +392,18 @@ export async function createWorkerRuntime(
       server.closeIdleConnections?.();
 
       // Abort in-flight media so no FFmpeg descendant outlives the process.
-      // This never writes a `cancelled` state — a restart is not a user
-      // cancellation.
+      //
+      // This is process hygiene ONLY. It never writes a `cancelled` state — a
+      // restart is not a user cancellation — and it never commits an ordinary
+      // `failed` row either. An execution interrupted here unwinds and cleans
+      // up its work directory while deliberately LEAVING its durable row in
+      // the active state it had reached, inside the grace period below. The
+      // next process's `store.recover()` — which runs during
+      // `createWorkerRuntime()`, before `listen()` and before any job can be
+      // claimed — is the single owner of the restart transition, so the
+      // durable outcome of an operator restart is deterministic:
+      // `failed` / `PROCESSING_FAILED` /
+      // "Worker restarted before the job completed." / stage `Worker restarted`.
       executor.abortActiveForShutdown();
 
       // ── Phase 2: one bounded wait covering every drain ───────────────────

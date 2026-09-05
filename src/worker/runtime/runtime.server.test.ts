@@ -478,6 +478,143 @@ describe("Worker runtime composition", () => {
       }
     });
 
+    /**
+     * PHASE-10D-WORKER-RESTART-RECOVERY-DETERMINISM-001.
+     *
+     * The live Stage-B `shutdown` case restarted the container while a job was
+     * genuinely executing and expected
+     * "Worker restarted before the job completed." It got the ordinary
+     * "We couldn't process this video. Try another format or source." instead,
+     * because the DYING process's error classifier committed a terminal
+     * `failed` row before the new process could run `store.recover()`.
+     *
+     * This exercises the REAL ordering over ONE persistent SQLite file:
+     * runtime 1 executes → `runtime.shutdown()` → pump drains → DB closes →
+     * runtime 2 is built against the same state directory → `store.recover()`
+     * runs inside `createWorkerRuntime()`, BEFORE `listen()` and before any job
+     * can be claimed.
+     */
+    it("recovers a job interrupted by a real runtime shutdown, deterministically", async () => {
+      const dataDirectory = join(root, "state");
+      let jobId = "";
+      let databasePath = "";
+      let acquisitionEntered = false;
+
+      // ── runtime 1: a genuinely in-flight execution ────────────────────────
+      {
+        const runtimeA = await createWorkerRuntime(
+          makeConfig(dataDirectory, await reservePort()),
+          {
+            objectStoreWriter: new MemoryWriter(),
+            probeBinaries: async () => ({ ffmpeg: true, ytdlp: false, ytdlpVersion: null }),
+            shutdownGraceMs: 5000,
+            executorDeps: {
+              analyze: async () => metadata(),
+              // Parks until the operator shutdown abort fires, then rejects
+              // exactly as a killed acquisition process group does. No network,
+              // no subprocess, no R2.
+              downloadOriginal: async (
+                _url: string,
+                ctx: { workDir: string; signal?: AbortSignal },
+              ) => {
+                acquisitionEntered = true;
+                await new Promise<void>((resolve) => {
+                  ctx.signal?.addEventListener("abort", () => resolve(), { once: true });
+                });
+                throw new AppError("PROCESSING_FAILED", "acquisition group terminated");
+              },
+              processLocally: async () => {
+                throw new Error("shutdown must never reach local processing");
+              },
+            },
+          },
+        );
+        databasePath = runtimeA.databasePath;
+        await runtimeA.listen();
+
+        const created = runtimeA.store.createJob(
+          { url: MEDIA_URL, formatId: FORMAT_ID, principalId: "private-access-user" },
+          randomUUID(),
+        );
+        jobId = created.type === "created" ? created.job.jobId : "";
+        runtimeA.wakeQueue();
+
+        await waitFor(() => acquisitionEntered, "the real queue pump to start executing the job");
+        await waitFor(
+          () => runtimeA.store.getJob(jobId)?.status === "downloading",
+          "the durable row to reach downloading",
+        );
+        assert.equal(runtimeA.executor.activeJobCount, 1, "the execution is genuinely active");
+
+        // The REAL shutdown sequence: stop claiming, close the listener, abort
+        // in-flight media, wait for the pump to drain, then close SQLite.
+        await runtimeA.shutdown();
+      }
+
+      // ── runtime 1 must NOT have ordinary-failed the row ───────────────────
+      // Read the persistent file from a FRESH handle: runtime 1's database is
+      // already closed, so this is the durable evidence the next process sees.
+      const beforeRecovery = openWorkerDatabase({ path: databasePath });
+      try {
+        const row = beforeRecovery
+          .prepare(
+            "SELECT status, error_code, safe_error_message FROM worker_jobs WHERE job_id = ?",
+          )
+          .get(jobId) as {
+          status: string;
+          error_code: string | null;
+          safe_error_message: string | null;
+        };
+        assert.equal(
+          row.status,
+          "downloading",
+          "the drained process leaves the interrupted row ACTIVE for startup recovery",
+        );
+        assert.equal(row.error_code, null, "no ordinary error code was committed");
+        assert.equal(row.safe_error_message, null, "no ordinary safe message was committed");
+      } finally {
+        beforeRecovery.close();
+      }
+
+      // ── runtime 2: recovery runs during construction, before listen() ─────
+      const runtimeB = await createWorkerRuntime(
+        makeConfig(dataDirectory, await reservePort()),
+        { objectStoreWriter: new MemoryWriter(), executorDeps: mediaDeps() },
+      );
+
+      try {
+        assert.equal(runtimeB.databasePath, databasePath, "the same persistent database");
+
+        const recovered = runtimeB.store.getJob(jobId);
+        assert.ok(recovered);
+        assert.equal(recovered.status, "failed");
+        assert.equal(recovered.errorCode, "PROCESSING_FAILED");
+        assert.equal(
+          recovered.safeErrorMessage,
+          "Worker restarted before the job completed.",
+          "the operator restart produces exactly the deterministic restart message",
+        );
+        assert.notEqual(
+          recovered.safeErrorMessage,
+          "We couldn't process this video. Try another format or source.",
+          "the generic processing message is what the live Stage-B run wrongly saw",
+        );
+        assert.equal(recovered.stageLabel, "Worker restarted");
+
+        // Recovery had already happened before anything could listen or claim.
+        await runtimeB.listen();
+        runtimeB.wakeQueue();
+        await runtimeB.pump.whenDrained();
+        assert.equal(
+          runtimeB.store.getJob(jobId)?.status,
+          "failed",
+          "a recovered row is terminal and is never re-executed",
+        );
+      } finally {
+        await runtimeB.shutdown();
+      }
+    });
+
     it("preserves ready and terminal jobs across a restart", async () => {
       const dataDirectory = join(root, "state");
       const readyId = "0".repeat(32);
