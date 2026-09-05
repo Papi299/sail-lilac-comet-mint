@@ -628,7 +628,7 @@ does not do this.**
 | | `analysis.no-raw-formats` | `formats: []`. No raw `format_id` reaches the browser contract. |
 | | `analysis.presets-application-owned` | Every advertised option is a `preset:*` rung. |
 | | `analysis.no-generic-thumbnail` | No generic thumbnail URL under the v1 contract. |
-| Job | `job.lifecycle-complete` | **All six** durable states — `queued → analyzing → downloading → processing → uploading → ready` — observed, in order. See below. |
+| Job | `job.lifecycle-complete` | **All six** durable states — `queued → analyzing → downloading → processing → uploading → ready` — established, in order. Five are directly observed; `processing` may instead be *causally proven*. See below. |
 | | `job.requested-preset-owned` | Created with an application-owned preset. |
 | Durable | `durable.extractor-is-ytdlp` | `extractor: yt-dlp` persisted after analysis. |
 | | `durable.application-format-id` | The durable `format_id` **is** an application preset, and equals the one the job was created with. Positive evidence. |
@@ -689,6 +689,93 @@ Observation is what was strengthened to meet this, not the evaluator:
 
 If a complete trace still cannot be obtained, Phase 10D is `BLOCKED`. Do not add
 production instrumentation to close the gap.
+
+#### `processing`: directly observed, or causally proven
+
+Live run **`132658924d1c7a1b`** (Worker source `e4fa646b`, image
+`sha256:c3995e18…`) ran a fresh Stage A to **PASS — 23 / 0 / 0 / 0** and then a
+fresh Stage-B `success` case that reached `ready` with every product proof
+intact: sealed artifact, `exit 0`, extractor `yt-dlp`, requested
+`preset:best`, expected generic digest equal to the delivered digest, three-way
+byte agreement (client bytes == durable `fileSize` == R2 `contentLength` ==
+fixture bytes), the R2 object present, `303` to a presigned GET, no sentinel
+leak, feature state `enabled`, container epoch continuous.
+
+Its recorded trace was:
+
+```
+queued → analyzing → downloading → uploading → ready
+```
+
+`job.lifecycle-complete` reported **`BLOCKED`**, and per the stop rule no later
+Stage-B case was run.
+
+**The Worker does not skip `processing`.** `job-executor.server.ts`
+unconditionally runs `download → beginProcessing() → executePlan() →
+beginUploading()` on every strategy. For a `keep-original` plan `executePlan`
+returns the already-acquired path almost immediately, so the durable
+`processing` state's *lifetime* can be shorter than one 200 ms poll. It was
+durably real; it was not sampled.
+
+Tightening the poll cannot fix that. No cadence can guarantee sampling a legal
+near-zero-duration state. What closes it is the job store's own refusal set:
+
+| Store method | Transition |
+| :--- | :--- |
+| `SQLiteJobStore.beginProcessing` | `downloading → processing` |
+| `SQLiteJobStore.beginUploading` | `processing → uploading` |
+| — | **no `downloading → uploading` exists** |
+
+So a directly observed durable `uploading` is not "we probably missed it". It is
+**causal proof**: `uploading` can only commit from `processing`, therefore a
+durable `processing` committed. The store would have answered `state_conflict`
+and left the row unchanged otherwise. That premise is pinned executably in
+`src/worker/state/sqlite-job-store-execution.server.test.ts`, so it fails at the
+source if the state machine ever changes.
+
+`classifySuccessTransitionTrace` encodes exactly this, for the success path
+only:
+
+| Success trace | Outcome | `processing` |
+| :--- | :--- | :--- |
+| All six, in order | `PASS` | directly observed |
+| Only `processing` unsampled, with `downloading` **and** `uploading` observed in that order, ending `ready` | `PASS` | **causally proven** |
+| Any other required state missing — `processing` included, when `uploading` is absent | `BLOCKED` | unproven |
+| Moves backwards through the ladder | `FAIL` | unproven |
+| Contains a state outside the durable vocabulary | `FAIL` | unproven |
+| Contains `failed` or `cancelled` | `FAIL` | unproven |
+
+Constraints that make this a correction rather than a weakening:
+
+- the required ladder is **still six states**; the property proven is still the
+  complete durable lifecycle;
+- the **raw trace is never rewritten** — `processing` is not spliced into the
+  recorded transitions, it remains listed as never sampled, and the check's
+  reason says *causally proven*, never *observed*;
+- inference requires the **proving `uploading` observation to actually be
+  present**; `[queued, analyzing, downloading, ready]` is still `BLOCKED`;
+- **only `processing`** is inferable. `queued` is seeded from the create
+  response, `analyzing` proves the job entered Worker execution, `downloading`
+  anchors the process-observation window, `uploading` proves object delivery
+  began, and `ready` proves terminal success — each is directly observed for its
+  own reason, and none may be inferred;
+- the **generic `classifyTransitionTrace` is unchanged** and stays strict for
+  every other caller: the five-state shape is still `BLOCKED` there;
+- **cancellation, byte-limit, shutdown, safe-egress, direct-regression and
+  kill-switch semantics are untouched**. `shutdown.job-recovered` still requires
+  exactly `failed` / `PROCESSING_FAILED` / *Worker restarted before the job
+  completed.*
+
+The producer was **not** changed. It does not fabricate `processing`, insert a
+delay, emit a synthetic transition, or reach for a debug endpoint; the poll
+interval stays 200 ms and is not relied upon for a guarantee it cannot make. The
+schema stays **`10d-remediation-02`**: the producer payload, the raw
+observations, the seal format and the deployment binding are all unchanged —
+only how one existing raw observation proves one unavoidable predecessor state.
+
+The sealed `stage-b/success.json` from run `132658924d1c7a1b` is historical raw
+evidence and is **not** rewritten, resealed or rerun. It already contains the
+proof-bearing `uploading` observation.
 
 ### The downloading window
 

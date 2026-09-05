@@ -71,6 +71,7 @@ import * as processSamplerModule from "../deploy/acceptance/ytdlp-generic/lib/pr
 import {
   evaluateTransitionTrace,
   classifyTransitionTrace,
+  classifySuccessTransitionTrace,
   classifyCancellationTrace,
   REQUIRED_TRANSITIONS,
 } from "../deploy/acceptance/ytdlp-generic/lib/lifecycle.mjs";
@@ -1782,6 +1783,296 @@ describe("durable lifecycle evidence", () => {
       classifyCancellationTrace(["queued", "analyzing", "downloading", "ready"]).outcome,
       OUTCOMES.FAIL,
     );
+  });
+});
+
+// ── PHASE-10D STAGE-B LIFECYCLE OBSERVABILITY REMEDIATION ───────────────────
+//
+// Live run `132658924d1c7a1b` produced a fully successful Stage-B `success`
+// case whose recorded trace omitted `processing`. The Worker did not skip that
+// state — `job-executor.server.ts` commits it unconditionally — but on a
+// `keep-original` plan its durable lifetime can be shorter than one 200 ms poll.
+// `classifySuccessTransitionTrace` closes that ONE gap by proof, never by
+// assumption, and only for `processing`.
+
+/** The exact trace the live success case recorded. */
+const LIVE_SUCCESS_TRACE = Object.freeze([
+  "queued", "analyzing", "downloading", "uploading", "ready",
+]);
+
+describe("success-path lifecycle: observed vs. causally proven `processing`", () => {
+  it("A. the full six-state trace PASSes with `processing` DIRECTLY OBSERVED", () => {
+    const classified = classifySuccessTransitionTrace(FULL_LADDER);
+    assert.equal(classified.outcome, OUTCOMES.PASS);
+    assert.equal(classified.processing, "observed");
+    assert.equal(classified.proof, null, "nothing needs proving when it was seen");
+    assert.match(classified.trace.reason, /directly observed/);
+    // The full trace is complete on its own terms.
+    assert.deepEqual(classified.trace.missing, []);
+  });
+
+  it("B. LIVE BLOCKER SHAPE — the five-state trace PASSes, `processing` CAUSALLY PROVEN", () => {
+    const classified = classifySuccessTransitionTrace(LIVE_SUCCESS_TRACE);
+    assert.equal(classified.outcome, OUTCOMES.PASS);
+    assert.equal(classified.processing, "causally-proven");
+    assert.notEqual(classified.processing, "observed", "it must NEVER be reported as observed");
+
+    // The proof is named, and it names the observation that carries it.
+    assert.equal(classified.proof.state, "processing");
+    assert.equal(classified.proof.observedWitness, "uploading");
+    assert.equal(classified.proof.enforcedPredecessorOfWitness, "processing");
+    assert.equal(classified.proof.directlyObserved, false);
+    assert.match(classified.proof.basis, /beginUploading/);
+    assert.match(classified.trace.reason, /CAUSALLY PROVEN/);
+
+    // The RAW RECORD IS NOT REWRITTEN. `processing` is not spliced into the
+    // trace, and it stays listed as never sampled. This is the line between
+    // proving a state and fabricating one.
+    assert.deepEqual(classified.trace.missing, ["processing"]);
+    assert.ok(!classified.trace.collapsed.includes("processing"));
+    assert.deepEqual(classified.trace.collapsed, [...LIVE_SUCCESS_TRACE]);
+  });
+
+  it("C. polling duplicates around downloading/uploading still PASS", () => {
+    const withDuplicates = [
+      "queued", "queued", "analyzing",
+      "downloading", "downloading", "downloading",
+      "uploading", "uploading", "ready",
+    ];
+    const classified = classifySuccessTransitionTrace(withDuplicates);
+    assert.equal(classified.outcome, OUTCOMES.PASS);
+    assert.equal(classified.processing, "causally-proven");
+
+    // …and duplicates around a fully observed ladder stay directly observed.
+    const fullWithDuplicates = [
+      "queued", "analyzing", "analyzing", "downloading", "downloading",
+      "processing", "processing", "uploading", "uploading", "ready", "ready",
+    ];
+    const full = classifySuccessTransitionTrace(fullWithDuplicates);
+    assert.equal(full.outcome, OUTCOMES.PASS);
+    assert.equal(full.processing, "observed");
+  });
+
+  // ── Only `processing` is inferable. Every other gap stays an evidence gap. ──
+  it("D-H. any OTHER missing required state is BLOCKED, never inferred", () => {
+    const cases = [
+      { id: "D", trace: ["queued", "analyzing", "downloading", "ready"], missing: ["processing", "uploading"] },
+      { id: "E", trace: ["queued", "downloading", "uploading", "ready"], missing: ["analyzing", "processing"] },
+      { id: "F", trace: ["queued", "analyzing", "uploading", "ready"], missing: ["downloading", "processing"] },
+      { id: "G", trace: ["analyzing", "downloading", "uploading", "ready"], missing: ["queued", "processing"] },
+      { id: "H", trace: ["queued", "analyzing", "downloading", "uploading"], missing: ["processing", "ready"] },
+    ];
+    for (const { id, trace, missing } of cases) {
+      const classified = classifySuccessTransitionTrace(trace);
+      assert.equal(
+        classified.outcome,
+        OUTCOMES.BLOCKED,
+        `${id}: ${JSON.stringify(trace)} must be BLOCKED, not ${classified.outcome}`,
+      );
+      assert.equal(classified.processing, "unproven", `${id}: nothing may be claimed proven`);
+      assert.equal(classified.proof, null, `${id}: no proof object may be minted`);
+      assert.deepEqual(classified.trace.missing, missing, `${id}: missing set`);
+    }
+  });
+
+  it("D. `processing` alone is NOT inferable without the observed `uploading` witness", () => {
+    // The single most important negative: the witness IS the proof. Remove it
+    // and the inference must not survive on the strength of `ready` alone.
+    const classified = classifySuccessTransitionTrace(["queued", "analyzing", "downloading", "ready"]);
+    assert.equal(classified.outcome, OUTCOMES.BLOCKED);
+    assert.ok(classified.trace.missing.includes("processing"));
+    assert.ok(classified.trace.missing.includes("uploading"));
+  });
+
+  it("I. an out-of-order trace FAILs, not BLOCKED", () => {
+    const classified = classifySuccessTransitionTrace([
+      "queued", "analyzing", "uploading", "downloading", "ready",
+    ]);
+    assert.equal(classified.outcome, OUTCOMES.FAIL);
+    assert.equal(classified.processing, "unproven");
+    assert.match(classified.trace.reason, /backwards/);
+  });
+
+  it("J. an unknown lifecycle value FAILs", () => {
+    const classified = classifySuccessTransitionTrace([
+      "queued", "analyzing", "downloading", "extracting", "uploading", "ready",
+    ]);
+    assert.equal(classified.outcome, OUTCOMES.FAIL);
+    assert.deepEqual(classified.trace.unknown, ["extracting"]);
+    assert.equal(classifySuccessTransitionTrace("ready").outcome, OUTCOMES.FAIL);
+    assert.equal(classifySuccessTransitionTrace(null).outcome, OUTCOMES.FAIL);
+  });
+
+  it("K. a trace containing `failed` FAILs — a success lifecycle has no failure in it", () => {
+    for (const trace of [
+      ["queued", "analyzing", "downloading", "processing", "uploading", "failed"],
+      ["queued", "analyzing", "downloading", "failed"],
+      ["queued", "analyzing", "downloading", "uploading", "failed", "ready"],
+    ]) {
+      const classified = classifySuccessTransitionTrace(trace);
+      assert.equal(classified.outcome, OUTCOMES.FAIL, JSON.stringify(trace));
+      assert.match(classified.trace.reason, /must not contain a terminal/);
+      assert.equal(classified.processing, "unproven");
+    }
+  });
+
+  it("L. a trace containing `cancelled` FAILs", () => {
+    for (const trace of [
+      ["queued", "analyzing", "downloading", "processing", "uploading", "cancelled"],
+      ["queued", "analyzing", "downloading", "uploading", "cancelled", "ready"],
+    ]) {
+      const classified = classifySuccessTransitionTrace(trace);
+      assert.equal(classified.outcome, OUTCOMES.FAIL, JSON.stringify(trace));
+      assert.match(classified.trace.reason, /must not contain a terminal/);
+    }
+  });
+
+  it("M. the GENERIC classifier is untouched and remains strict", () => {
+    // The live five-state shape is still BLOCKED for every other caller. The
+    // remediation narrowed one check; it did not relax the contract.
+    const generic = classifyTransitionTrace(LIVE_SUCCESS_TRACE);
+    assert.equal(generic.outcome, OUTCOMES.BLOCKED);
+    assert.deepEqual(generic.trace.missing, ["processing"]);
+    assert.equal(generic.processing, undefined, "the generic classifier mints no proof metadata");
+
+    assert.equal(classifyTransitionTrace(FULL_LADDER).outcome, OUTCOMES.PASS);
+    assert.equal(classifyTransitionTrace(["ready"]).outcome, OUTCOMES.BLOCKED);
+  });
+
+  it("N. cancellation semantics are unchanged", () => {
+    assert.equal(
+      classifyCancellationTrace(["queued", "analyzing", "downloading", "cancelled"]).outcome,
+      OUTCOMES.PASS,
+    );
+    assert.equal(classifyCancellationTrace(["queued", "cancelled"]).outcome, OUTCOMES.BLOCKED);
+    assert.equal(
+      classifyCancellationTrace(["queued", "analyzing", "downloading", "ready"]).outcome,
+      OUTCOMES.FAIL,
+    );
+    // A cancellation trace is NOT graded by the success classifier, and the
+    // success classifier does not soften cancellation in either direction.
+    assert.equal(
+      classifySuccessTransitionTrace(["queued", "analyzing", "downloading", "cancelled"]).outcome,
+      OUTCOMES.FAIL,
+    );
+  });
+
+  it("the six-state contract itself is unchanged", () => {
+    assert.deepEqual([...REQUIRED_TRANSITIONS], [
+      "queued", "analyzing", "downloading", "processing", "uploading", "ready",
+    ]);
+  });
+});
+
+// ── §13/§17: the load-bearing Stage-B evaluator regression ──────────────────
+
+describe("Stage B `job.lifecycle-complete` under the corrected classifier", () => {
+  /**
+   * A synthetic success observation carrying the exact RELEVANT raw facts of the
+   * live `stage-b/success.json` record from run `132658924d1c7a1b`: the trace it
+   * recorded, the preset it requested, and the terminal state it reached.
+   *
+   * Deliberately synthetic. No secret, sentinel, URL or bearer value from the
+   * real sealed artifact is reproduced here — the artifact itself remains
+   * untouched, unre-sealed and authoritative, and this fixture only replays the
+   * shape the evaluator must now grade correctly.
+   */
+  const liveSuccessObservations = (transitions) =>
+    passingStageBObservations({
+      genericJob: measured({
+        jobId: JOB_ID,
+        transitions: [...transitions],
+        requestedFormatId: "preset:best",
+      }),
+      // The durable row must agree with the requested preset, exactly as the
+      // live record does; otherwise `durable.application-format-id` would fail
+      // for an unrelated reason and mask what this regression is measuring.
+      durableJobRow: measured({
+        present: true,
+        jobId: JOB_ID,
+        status: "ready",
+        formatId: "preset:best",
+        extractor: "yt-dlp",
+      }),
+    });
+
+  const lifecycleCheck = (result) =>
+    result.checks.find((c) => c.id === "job.lifecycle-complete");
+
+  it("the exact live trace PASSes, and the reason states the causal proof", () => {
+    const result = evaluateStageB(liveSuccessObservations(LIVE_SUCCESS_TRACE), passingStageA());
+
+    const check = lifecycleCheck(result);
+    assert.equal(check.outcome, OUTCOMES.PASS, check.detail);
+    assert.ok(!result.summary.blocking.includes("job.lifecycle-complete"));
+
+    // §17: the whole otherwise-passing success record now verdicts PASS. This is
+    // the exact shape the sealed live artifact carries, and it was the ONLY
+    // thing standing between it and a clean success grade.
+    assert.equal(result.summary.verdict, OUTCOMES.PASS, JSON.stringify(result.summary.blocking));
+
+    // The reason must carry the PROOF, not merely a verdict: a later reader of
+    // the evidence has to be able to see why an unsampled state was accepted.
+    assert.match(check.detail, /CAUSALLY PROVEN/);
+    assert.match(check.detail, /uploading/);
+    assert.match(check.detail, /beginUploading/);
+    assert.match(check.detail, /not directly sampled/);
+  });
+
+  it("removing the proving `uploading` observation makes it BLOCKED again", () => {
+    // The load-bearing mutation. `uploading` is what proves `processing`; with
+    // it gone there is nothing left to reason from and the gap reopens.
+    const withoutUploading = LIVE_SUCCESS_TRACE.filter((s) => s !== "uploading");
+    const result = evaluateStageB(liveSuccessObservations(withoutUploading), passingStageA());
+
+    const check = lifecycleCheck(result);
+    assert.equal(check.outcome, OUTCOMES.BLOCKED, check.detail);
+    assert.equal(result.summary.verdict, OUTCOMES.BLOCKED);
+    assert.ok(result.summary.blocking.includes("job.lifecycle-complete"));
+  });
+
+  it("the fully observed ladder still PASSes through the evaluator", () => {
+    const result = evaluateStageB(liveSuccessObservations(FULL_LADDER), passingStageA());
+    const check = lifecycleCheck(result);
+    assert.equal(check.outcome, OUTCOMES.PASS);
+    assert.match(check.detail, /directly observed/);
+    assert.ok(!/CAUSALLY PROVEN/.test(check.detail));
+  });
+
+  it("an unobserved lifecycle is still BLOCKED, and a disordered one still FAILs", () => {
+    const unobserved = evaluateStageB(
+      passingStageBObservations({ genericJob: unmeasured("polling failed") }),
+      passingStageA(),
+    );
+    assert.equal(lifecycleCheck(unobserved).outcome, OUTCOMES.BLOCKED);
+
+    const disordered = evaluateStageB(
+      liveSuccessObservations(["queued", "analyzing", "uploading", "downloading", "ready"]),
+      passingStageA(),
+    );
+    assert.equal(lifecycleCheck(disordered).outcome, OUTCOMES.FAIL);
+  });
+
+  it("`shutdown.job-recovered` semantics are NOT weakened by this change", () => {
+    // Explicitly re-pinned here because it is the check most at risk of being
+    // collaterally softened by a lifecycle edit. It must still demand the exact
+    // recovered triple.
+    for (const override of [
+      { recoveredStatus: "ready" },
+      { recoveredErrorCode: "SOMETHING_ELSE" },
+      { recoveredSafeErrorMessage: "Worker restarted." },
+    ]) {
+      const result = evaluateStageB(
+        passingStageBObservations({ shutdownCase: measured(shutdownEvidence(override)) }),
+        passingStageA(),
+      );
+      const check = result.checks.find((c) => c.id === "shutdown.job-recovered");
+      assert.notEqual(
+        check.outcome,
+        OUTCOMES.PASS,
+        `shutdown.job-recovered must reject ${JSON.stringify(override)}`,
+      );
+    }
   });
 });
 

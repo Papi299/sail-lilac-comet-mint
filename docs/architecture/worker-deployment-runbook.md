@@ -4413,3 +4413,185 @@ and the `shutdown.job-recovered` assertion is unchanged: it still requires
 exactly `failed` / `PROCESSING_FAILED` /
 `Worker restarted before the job completed.` The acceptance harness found a real
 defect and was not weakened to accommodate it.
+
+---
+
+## 11g. Phase 10D — the fresh Stage-B `success` case, and the lifecycle-observability correction
+
+`PHASE-10D-STAGE-B-LIFECYCLE-OBSERVABILITY-REMEDIATION-001`.
+
+**Source, test and documentation only.** No Worker runtime file changed, no
+image was rebuilt, no acceptance artifact was mutated, and no Stage A or Stage-B
+case was rerun to produce this section.
+
+### What the fresh run established
+
+Run **`132658924d1c7a1b`**, schema `10d-remediation-02`, against the repaired
+Worker built from source `e4fa646bf7492e16fc8d2733982f708a1e243afb`, image
+`sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa`.
+
+Fresh **Stage A: PASS — 23 / 0 / 0 / 0.**
+
+The fresh Stage-B `success` producer then exited `0` with a sealed, valid
+artifact:
+
+| Observation | Value |
+| :--- | :--- |
+| job | `ready` |
+| extractor | `yt-dlp` |
+| requested format | `preset:best` |
+| expected generic digest | matched the delivered digest |
+| client bytes | `==` durable `fileSize` `==` R2 `contentLength` `==` fixture bytes |
+| R2 object | exists |
+| delivery | `303` → presigned |
+| sentinel | not leaked |
+| feature state | enabled |
+| container epoch | continuous |
+| **recorded trace** | `queued → analyzing → downloading → uploading → ready` |
+
+`job.lifecycle-complete` reported **`BLOCKED`** because `processing` was not
+sampled. Per the stop rule, **no later Stage-B case ran.**
+
+### The correct root cause
+
+**Worker skips `processing`: NO.** The diagnosis "keep-original skips
+processing" is false and is deliberately not encoded anywhere in this
+remediation. `JobExecutor` unconditionally runs, on every strategy:
+
+```
+download
+  -> store.beginProcessing(jobId)
+  -> executePlan(...)
+  -> store.beginUploading(jobId)
+```
+
+**Worker durably enters `processing`: YES.** What is short is the state's
+*lifetime*, not its existence: for a `keep-original` plan `executePlan` returns
+the already-acquired path almost immediately, so durable `processing` can clear
+in less than one acceptance poll. The success poll interval is **200 ms**. The
+state was durably real and simply was not directly sampled.
+
+Tightening the interval is not the fix, and was not applied. No polling cadence
+can guarantee observing a legal near-zero-duration state.
+
+### The load-bearing state-machine invariant
+
+| Store method | Transition |
+| :--- | :--- |
+| `SQLiteJobStore.beginProcessing` | `downloading → processing` |
+| `SQLiteJobStore.beginUploading` | `processing → uploading` |
+| direct `downloading → uploading` | **REFUSED — no such transition exists** |
+
+Therefore an observed durable `uploading` on this exact reviewed Worker is
+*causal proof* that a durable `processing` previously committed — the store
+would have answered `state_conflict` and left the row unchanged otherwise. The
+argument is not "we probably missed it"; it is:
+
+```
+uploading was observed
+        +
+uploading can commit only from processing
+        =
+processing necessarily committed
+```
+
+That premise is now pinned executably in
+`src/worker/state/sqlite-job-store-execution.server.test.ts` (TEST ONLY — the
+store implementation is untouched), which asserts both that
+`downloading → beginUploading()` yields `state_conflict` with the row left in
+`downloading`, and that the only route to `uploading` is through
+`beginProcessing()`.
+
+### The correction
+
+`REQUIRED_TRANSITIONS` still holds **six** states. The lifecycle is *not*
+redefined as five, and the property Stage B proves is still the complete durable
+six-state lifecycle.
+
+A narrowly named `classifySuccessTransitionTrace()` was added to
+`deploy/acceptance/ytdlp-generic/lib/lifecycle.mjs` and is used by exactly one
+Stage-B check, `job.lifecycle-complete`. The generic
+`classifyTransitionTrace()` is **unchanged and still strict** — the five-state
+shape remains `BLOCKED` there — and `classifyCancellationTrace()` is unchanged.
+
+| Success trace | Outcome | `processing` |
+| :--- | :--- | :--- |
+| All six, in order | `PASS` | directly observed |
+| Only `processing` unsampled, with `downloading` and `uploading` observed in that order, ending `ready` | `PASS` | **causally proven** |
+| Any other required state missing, or `processing` missing without `uploading` | `BLOCKED` | unproven |
+| Backwards through the ladder | `FAIL` | unproven |
+| Unknown status value | `FAIL` | unproven |
+| Contains `failed` or `cancelled` | `FAIL` | unproven |
+
+Only `processing` gets this treatment, because only it has *both* an
+unconditional commit and an enforced immediate successor. Every other required
+state is directly observed for its own reason — `queued` is seeded from the
+create response, `analyzing` proves the job entered Worker execution,
+`downloading` anchors the process-observation window, `uploading` proves the
+object-delivery phase began, `ready` proves terminal success — and **no
+analogous exemption is authorized for any of them.**
+
+The raw trace is never rewritten. `processing` is not spliced into the recorded
+transitions, it stays listed as never sampled, and the check's reason says
+*causally proven*, never *observed*.
+
+The **producer is unchanged**: `runSuccessCase()` fabricates nothing, inserts no
+artificial delay, emits no synthetic transition, adds no debug endpoint, and the
+200 ms interval is untouched. The producer's observation remains truthful.
+
+Cancellation, byte-limit, shutdown, safe-egress, direct-regression and
+kill-switch semantics are untouched. `shutdown.job-recovered` still requires
+exactly `failed` / `PROCESSING_FAILED` /
+`Worker restarted before the job completed.`
+
+### Schema
+
+`EVIDENCE_SCHEMA_VERSION` and `CASE_SCHEMA_VERSION` remain
+**`10d-remediation-02`**, deliberately not bumped: the producer payload shape,
+the raw observations, the HMAC/seal format, Stage-A semantics and the deployment
+binding are all unchanged, and no successful Stage-B aggregate exists. The
+claimed property is still "the complete six-state lifecycle occurred". What
+changed is *how one existing raw observation proves one unavoidable predecessor
+state*.
+
+This is **not** permission to reinterpret an absence as success. The sealed
+success record already contains the proof-bearing `uploading` observation.
+
+### Existing evidence
+
+The Stage-A record for run `132658924d1c7a1b`, its run descriptor, and
+`stage-b/success.json` are **untouched** — not rewritten, resealed, renamed,
+replaced or deleted. `success.json` remains historical raw evidence from the
+actual live case. **Stage A was not rerun. `success` was not rerun.**
+
+### Operational consequence
+
+After this PR is independently reviewed and merged, **do not rerun Stage A and
+do not rerun `success`.** The next operational task is:
+
+1. physically authenticate the existing fresh Stage-A record;
+2. physically authenticate the existing `stage-b/success.json`;
+3. evaluate that success record under the corrected merged evaluator;
+4. require ALL success-derived required checks PASS;
+5. if and only if that succeeds, regenerate fixture infrastructure;
+6. re-enable generic under the same `c399…` image;
+7. resume at `cancellation`;
+8. then `byte-limit`, `shutdown`, `safe-egress`, `direct-regression`;
+9. restore the exact disabled `worker.env`;
+10. run `kill-switch`;
+11. aggregate using the EXISTING `success.json` plus the newly produced
+    remaining records.
+
+The current success job is **not** repeated merely because the old checker had
+an observation-model defect.
+
+### PR #41 status
+
+The restart-recovery defect of §11f is **not** closed live. It remains:
+
+- **SOURCE-REMEDIATED**
+- **UNIT/INTEGRATION-PROVEN**
+- **LIVE STAGE-B RE-PROOF NOT YET EXECUTED**
+
+The next live `shutdown` case remains the load-bearing test. Generic remains
+**disabled**.

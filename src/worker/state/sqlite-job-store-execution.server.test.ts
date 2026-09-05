@@ -80,4 +80,52 @@ describe("SQLiteJobStore Execution Transitions", () => {
     assert.strictEqual(uRes.type, "updated");
     if (uRes.type === "updated") assert.strictEqual(uRes.job.status, "uploading");
   });
+
+  // ── The `processing -> uploading` dependency, pinned executably ────────────
+  //
+  // The Stage-B acceptance harness treats a directly observed durable
+  // `uploading` as CAUSAL PROOF that a durable `processing` committed first
+  // (`classifySuccessTransitionTrace` in
+  // `deploy/acceptance/ytdlp-generic/lib/lifecycle.mjs`). That inference is only
+  // sound while this store refuses `downloading -> uploading`. These two tests
+  // are the executable form of that premise: if the store ever gains a direct
+  // path from `downloading` to `uploading`, they fail here, at the source of the
+  // assumption, rather than silently turning an acceptance PASS into a lie.
+
+  it("beginUploading REFUSES to skip processing: downloading -> uploading is a state_conflict", () => {
+    store.createJob({ url: "http://example.com/a.mp4", formatId: "direct-original", principalId: "private-access-user" }, "5f0f1d2c-9a44-4c1e-8b77-2a6c1f9e0d31");
+    const job = store.claimNextQueuedJob()!;
+    store.completeAnalysis(job.jobId, { title: "T", thumbnail: null, source: "example", extractor: "direct" });
+
+    // The job is durably `downloading`, and `processing` has NOT been committed.
+    const before = store.getJob(job.jobId)!;
+    assert.strictEqual(before.status, "downloading");
+
+    const skipped = store.beginUploading(job.jobId);
+    assert.strictEqual(skipped.type, "state_conflict", "downloading -> uploading must be refused");
+
+    // Refused means UNCHANGED, not merely un-acknowledged: the durable row must
+    // still read `downloading`. A refusal that still mutated the row would break
+    // the inference just as badly as an accepted transition.
+    const after = store.getJob(job.jobId)!;
+    assert.strictEqual(after.status, "downloading");
+  });
+
+  it("uploading is reachable ONLY through processing", () => {
+    store.createJob({ url: "http://example.com/a.mp4", formatId: "direct-original", principalId: "private-access-user" }, "c1b8a7e6-3d52-4f09-9a1b-7e4d2c8f6a05");
+    const job = store.claimNextQueuedJob()!;
+    store.completeAnalysis(job.jobId, { title: "T", thumbnail: null, source: "example", extractor: "direct" });
+    assert.strictEqual(store.getJob(job.jobId)!.status, "downloading");
+
+    // The direct hop is refused …
+    assert.strictEqual(store.beginUploading(job.jobId).type, "state_conflict");
+    assert.strictEqual(store.getJob(job.jobId)!.status, "downloading");
+
+    // … and the ONLY way through is the two-step ladder.
+    assert.strictEqual(store.beginProcessing(job.jobId).type, "updated");
+    assert.strictEqual(store.getJob(job.jobId)!.status, "processing");
+
+    assert.strictEqual(store.beginUploading(job.jobId).type, "updated");
+    assert.strictEqual(store.getJob(job.jobId)!.status, "uploading");
+  });
 });

@@ -7,7 +7,7 @@
 // this module directly.
 
 import { OUTCOMES, assertCheck, check, measuredCheck, summarize } from "./verdict.mjs";
-import { classifyTransitionTrace, classifyCancellationTrace } from "./lifecycle.mjs";
+import { classifySuccessTransitionTrace, classifyCancellationTrace } from "./lifecycle.mjs";
 import { basenameOf, evaluateGroupTermination, YTDLP_RUNTIME_BASENAMES } from "./process-tree.mjs";
 import {
   aggregateDownloadWindow,
@@ -292,6 +292,16 @@ export function evaluateStageB(obs, stageAResult) {
   // All six states, in order. An incomplete trace is an EVIDENCE GAP and lands
   // as BLOCKED; only a genuine ordering violation is FAIL. Missed polling is
   // never reinterpreted as proof.
+  //
+  // This ONE check uses `classifySuccessTransitionTrace` rather than the generic
+  // `classifyTransitionTrace`. The success path is the only place where a
+  // required state (`processing`) is both committed unconditionally by the
+  // Worker and reachable-from only by an enforced store transition, so it is the
+  // only place where a directly observed `uploading` can stand as causal proof
+  // of a `processing` that lived for less than one poll interval. Every other
+  // Stage-B semantic — cancellation, byte-limit, shutdown, safe-egress,
+  // direct-regression, kill-switch — is untouched and still strict, and the
+  // generic classifier itself is unchanged for every other caller.
   if (obs.genericJob?.measured !== true) {
     add(
       check(
@@ -302,7 +312,7 @@ export function evaluateStageB(obs, stageAResult) {
       ),
     );
   } else {
-    const classified = classifyTransitionTrace(obs.genericJob.value?.transitions);
+    const classified = classifySuccessTransitionTrace(obs.genericJob.value?.transitions);
     add(
       check("job.lifecycle-complete", classified.outcome, classified.trace.reason, { stage }),
     );
