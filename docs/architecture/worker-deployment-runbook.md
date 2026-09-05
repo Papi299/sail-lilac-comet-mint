@@ -4418,7 +4418,8 @@ defect and was not weakened to accommodate it.
 
 ## 11g. Phase 10D — the fresh Stage-B `success` case, and the lifecycle-observability correction
 
-`PHASE-10D-STAGE-B-LIFECYCLE-OBSERVABILITY-REMEDIATION-001`.
+`PHASE-10D-STAGE-B-LIFECYCLE-OBSERVABILITY-REMEDIATION-001`, as corrected by
+its `CORRECTION-01` (which moved the contract version — see **Schema** below).
 
 **Source, test and documentation only.** No Worker runtime file changed, no
 image was rebuilt, no acceptance artifact was mutated, and no Stage A or Stage-B
@@ -4544,46 +4545,88 @@ kill-switch semantics are untouched. `shutdown.job-recovered` still requires
 exactly `failed` / `PROCESSING_FAILED` /
 `Worker restarted before the job completed.`
 
-### Schema
+### Schema — `10d-remediation-02` → `10d-remediation-03`
 
-`EVIDENCE_SCHEMA_VERSION` and `CASE_SCHEMA_VERSION` remain
-**`10d-remediation-02`**, deliberately not bumped: the producer payload shape,
-the raw observations, the HMAC/seal format, Stage-A semantics and the deployment
-binding are all unchanged, and no successful Stage-B aggregate exists. The
-claimed property is still "the complete six-state lifecycle occurred". What
-changed is *how one existing raw observation proves one unavoidable predecessor
-state*.
+`EVIDENCE_SCHEMA_VERSION` moves to **`10d-remediation-03`**;
+`CASE_SCHEMA_VERSION` continues to alias it, so Stage A, case records and the
+aggregate cannot drift into describing different contracts. There are no
+separate Stage-A and Stage-B versions.
 
-This is **not** permission to reinterpret an absence as success. The sealed
-success record already contains the proof-bearing `uploading` observation.
+The producer payload shape, the raw observations, the HMAC/seal format and the
+deployment binding are all unchanged — and that is **not** sufficient to hold
+the version. `schemaVersion` names the producer / observer / evaluator
+contract, not the JSON shape, and this change alters what an existing sealed
+record *means*:
 
-### Existing evidence
+```
+the same sealed five-state success trace
+graded BLOCKED under 10d-remediation-02
+graded PASS    under 10d-remediation-03
+```
+
+The HMAC proves *this artifact has not changed since it was produced*. It does
+**not** prove *this artifact was produced and evaluated under today's lifecycle
+semantics*. Nothing in the record's shape, its fields or its seal distinguishes
+the two readings — identifying exactly that situation is the entire reason the
+version boundary exists. A `10d-remediation-02` success artifact must never
+silently become acceptable under the `10d-remediation-03` evaluator merely
+because its shape and its seal both still verify.
+
+Every earlier bump retired artifacts whose **observers** were weaker. This one
+retires artifacts whose observers were fine and whose **evaluator** became more
+permissive about the very same bytes. A permissive change is the same case
+wearing the opposite sign, and is not exempt.
+
+This remains **not** permission to reinterpret an absence as success: the
+inference requires the proof-bearing `uploading` observation to be present.
+
+### Existing evidence — historical only
 
 The Stage-A record for run `132658924d1c7a1b`, its run descriptor, and
 `stage-b/success.json` are **untouched** — not rewritten, resealed, renamed,
-replaced or deleted. `success.json` remains historical raw evidence from the
-actual live case. **Stage A was not rerun. `success` was not rerun.**
+replaced or deleted. **Stage A was not rerun. `success` was not rerun.**
+
+They remain valid history: a cryptographically verifiable account of a Stage-A
+PASS (23/0/0/0) and of a Stage-B `success` case that genuinely reached `ready`
+with every byte, R2 and delivery proof intact. Nothing is wrong with them.
+
+Under the corrected harness they are **historical only**. `verifyRecord`
+refuses each on the version boundary alone, so neither authorizes Stage B nor
+counts as current Stage-B case evidence.
+
+They must not be "upgraded". Re-sealing a retired record at the current version
+produces a cryptographically valid artifact, which is precisely why the seal
+cannot be the thing that decides this — a reseal would forge the provenance of
+meaning the boundary exists to establish. The required response to a retired
+artifact is a **fresh acceptance run**.
 
 ### Operational consequence
 
-After this PR is independently reviewed and merged, **do not rerun Stage A and
-do not rerun `success`.** The next operational task is:
+No Worker runtime change and no image change is created by this PR. The
+accepted Worker runtime remains source `e4fa646b…`, image `sha256:c3995e18…`,
+and **no rebuild or redeploy is required**.
 
-1. physically authenticate the existing fresh Stage-A record;
-2. physically authenticate the existing `stage-b/success.json`;
-3. evaluate that success record under the corrected merged evaluator;
-4. require ALL success-derived required checks PASS;
-5. if and only if that succeeds, regenerate fixture infrastructure;
-6. re-enable generic under the same `c399…` image;
-7. resume at `cancellation`;
-8. then `byte-limit`, `shutdown`, `safe-egress`, `direct-regression`;
-9. restore the exact disabled `worker.env`;
-10. run `kill-switch`;
-11. aggregate using the EXISTING `success.json` plus the newly produced
-    remaining records.
+After this PR is independently reviewed and merged:
 
-The current success job is **not** repeated merely because the old checker had
-an observation-model defect.
+1. start the existing VM if needed;
+2. verify the exact `c399…` image remains deployed with generic **disabled**;
+3. mint a **NEW** acceptance run / key;
+4. run a **fresh Stage A** under schema `10d-remediation-03`;
+5. require an exact Stage-A PASS;
+6. run a **fresh COMPLETE Stage B**, starting from `success`;
+7. the `shutdown` case must live-prove PR #41;
+8. restore the exact disabled configuration;
+9. run `kill-switch`;
+10. aggregate;
+11. finish with generic disabled.
+
+**Do NOT resume from `cancellation`. Do NOT reuse the old `success` record.**
+
+The earlier plan — authenticate and re-evaluate the existing `success.json`
+under the corrected evaluator, then resume at `cancellation` — is superseded by
+the version bump, and for the reason the bump exists: re-grading a
+`10d-remediation-02` artifact under `10d-remediation-03` semantics is the exact
+operation the boundary refuses.
 
 ### PR #41 status
 

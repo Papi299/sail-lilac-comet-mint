@@ -6,11 +6,24 @@ references any of it, and none of it is part of the Worker image's runtime path.
 > ### Status
 >
 > ```
+> contract version:          10d-remediation-03
 > harness exists:            YES
-> Stage A (live):            PASSED — run a9ce1c400db8d817
-> Stage B:                   NOT STARTED
+> Stage A (live):            NO CURRENT RECORD — every sealed Stage A is
+>                            historical; a FRESH one is required
+> Stage B:                   NOT STARTED under the current contract
 > Production enablement:     NO — YTDLP_ENABLED remains unset
 > ```
+>
+> **Read the run history below as history.** The contract version has moved
+> twice since, and `verifyRecord` admits only `10d-remediation-03`. Every run
+> named further down — `5e6670a858543d93` (`10d-remediation-01`),
+> `a9ce1c400db8d817` and `132658924d1c7a1b` (both `10d-remediation-02`) —
+> is retained, unmodified, valid history, and **none of them authorizes
+> anything today**. See
+> [`processing`: directly observed, or causally proven](#processing-directly-observed-or-causally-proven)
+> for why `10D-REM-03` moved the boundary, and
+> [`schemaVersion` identifies the producer contract](#schemaversion-identifies-the-producer-contract)
+> for what the boundary is for.
 >
 > **Stage A has passed.** Run `a9ce1c400db8d817`, schema `10d-remediation-02`,
 > `live`, bound to the reviewed Worker source
@@ -34,7 +47,9 @@ references any of it, and none of it is part of the Worker image's runtime path.
 > therefore silently destroyable. That is corrected **before** Stage B — see
 > [Evidence artifacts are append-only by path](#evidence-artifacts-are-append-only-by-path).
 > The correction changes durability only; the accepted `10d-remediation-02`
-> record remains valid and admissible.
+> record remained valid and admissible **at the time**. It is no longer
+> admissible: `10D-REM-03` retired that contract version — see the status note
+> above.
 
 ---
 
@@ -440,9 +455,13 @@ and **authorize current Stage B**. What it actually attested would be far less:
 | CORRECTION-07 | raw evidence validated before normalization; successful exit required before stdout is a measurement; container-epoch continuity; type-strict run identity; atomic key creation |
 | 10D-REM-01 | the durable observer can address the deployment **at all** — see [Durable state is read inside the Worker](#durable-state-is-read-inside-the-worker). Before it, every `durable.*` check and the sentinel's `durable-row` surface could only ever have been `BLOCKED`, because the producer named a database file, a table and an executable that do not exist |
 | CORRECTION-08 | **nothing.** Deliberately *not* a bump: it changes only whether an artifact may be overwritten on disk. Observer semantics, evaluator semantics, record contents and the deployment binding are untouched, so a sealed `10d-remediation-02` `PASS` means exactly what it meant when run `a9ce1c400db8d817` produced one |
+| 10D-REM-02 | three Stage-A observers were measuring the **instrument** rather than the deployment — see [The schema moved to `10d-remediation-02`](#the-schema-moved-to-10d-remediation-02) |
+| 10D-REM-03 | the Stage-B success lifecycle no longer requires every durable state to be **directly sampled**. `processing` may be *causally proven* from an observed `uploading`. This is the one bump so far where the raw artifact is unchanged and the acceptance meaning moves `BLOCKED → PASS` — see [`processing`: directly observed, or causally proven](#processing-directly-observed-or-causally-proven) |
 
 **Bump it whenever an observer or evaluator change could make an old artifact
-mean something *weaker* under the same shape.** A field added or removed is the
+mean something *different* under the same shape** — weaker is the obvious
+direction, and **more permissive is the same case wearing the opposite sign**. A
+field added or removed is the
 obvious case; a field whose *measurement* became stricter is the case that
 matters, because nothing else catches it.
 
@@ -768,14 +787,53 @@ Constraints that make this a correction rather than a weakening:
 
 The producer was **not** changed. It does not fabricate `processing`, insert a
 delay, emit a synthetic transition, or reach for a debug endpoint; the poll
-interval stays 200 ms and is not relied upon for a guarantee it cannot make. The
-schema stays **`10d-remediation-02`**: the producer payload, the raw
-observations, the seal format and the deployment binding are all unchanged —
-only how one existing raw observation proves one unavoidable predecessor state.
+interval stays 200 ms and is not relied upon for a guarantee it cannot make.
 
-The sealed `stage-b/success.json` from run `132658924d1c7a1b` is historical raw
-evidence and is **not** rewritten, resealed or rerun. It already contains the
-proof-bearing `uploading` observation.
+#### This moves the contract version to `10d-remediation-03`
+
+The producer payload, the raw observations, the seal format and the deployment
+binding are all unchanged. That is *not* sufficient to hold the version, because
+`schemaVersion` names the **producer / observer / evaluator contract**, not the
+JSON shape — and this change alters what an existing sealed record MEANS:
+
+```
+the same sealed five-state success trace
+graded BLOCKED under 10d-remediation-02
+graded PASS    under 10d-remediation-03
+```
+
+A valid HMAC proves *this artifact has not changed since it was produced*. It
+does **not** prove *this artifact was produced and evaluated under today's
+lifecycle semantics*. Nothing in the record's shape, fields or seal separates the
+two readings, so the version boundary is the only thing that can. A
+`10d-remediation-02` success artifact must never silently become acceptable under
+the `10d-remediation-03` evaluator merely because its shape and its seal both
+still verify.
+
+Every earlier bump retired artifacts whose **observers** were weaker. This one
+retires artifacts whose observers were fine and whose **evaluator** has since
+become more permissive about the very same bytes. A permissive change is not
+exempt from the boundary just because it points the friendly way.
+
+| | |
+| :--- | :--- |
+| run `132658924d1c7a1b` | **historical only** |
+| its Stage-A record | **historical only** — no longer authorizes Stage B |
+| its `stage-b/success.json` | **historical only** — no longer current case evidence |
+| Worker rebuild | **not required** |
+| Worker redeploy | **not required** |
+| fresh Stage A after merge | **REQUIRED**, under `10d-remediation-03` |
+| fresh `success` | **REQUIRED** |
+| fresh COMPLETE Stage B | **REQUIRED** |
+| resume at `cancellation` | **NO** |
+
+Those artifacts remain valid history — cryptographically verifiable accounts of
+what the harness of their day measured — and are **not** rewritten, resealed,
+renamed or deleted. Nor may they be "upgraded": re-sealing a retired record at
+the current version is cryptographically valid and therefore exactly the wrong
+instrument, since it forges the provenance of meaning the boundary exists to
+establish. `verifyRecord` refuses them on the version alone, independently of
+their verdicts, and the required response is a **fresh acceptance run**.
 
 ### The downloading window
 

@@ -7270,6 +7270,14 @@ describe("evidence producer contract version", () => {
   // boundary: a cryptographically valid artifact from before the observer
   // corrections must not authorize anything.
   const PREVIOUS_SCHEMA = "10d-remediation-01";
+  /**
+   * The version retired by 10D-REM-03, and the one run `132658924d1c7a1b`
+   * sealed: a Stage-A PASS (23/0/0/0) and a Stage-B `success` case that
+   * genuinely reached `ready`. Nothing is wrong with those artifacts — they
+   * were graded by an evaluator whose lifecycle observation model has since
+   * been corrected, which is exactly what this boundary exists to identify.
+   */
+  const RETIRED_SCHEMA = "10d-remediation-02";
 
   /**
    * A Stage-A record that is perfect in EVERY respect except its schema: valid
@@ -7305,8 +7313,9 @@ describe("evidence producer contract version", () => {
     loadStageA("/x", async () => JSON.stringify(record), { run: RUN, expectedSha: SHA });
 
   it("71. the schema identifier is the corrected Stage-A observer contract", () => {
-    assert.equal(EVIDENCE_SCHEMA_VERSION, "10d-remediation-02");
+    assert.equal(EVIDENCE_SCHEMA_VERSION, "10d-remediation-03");
     assert.notEqual(EVIDENCE_SCHEMA_VERSION, PREVIOUS_SCHEMA);
+    assert.notEqual(EVIDENCE_SCHEMA_VERSION, RETIRED_SCHEMA);
     // ONE constant governs Stage A, case records and the aggregate, so they
     // cannot drift into describing different producer contracts.
     assert.equal(CASE_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION);
@@ -7340,7 +7349,11 @@ describe("evidence producer contract version", () => {
   it("72c. a valid old seal does not alter the result", async () => {
     // Sealed under the SAME key, so both records are equally authentic. Only
     // the producer contract differs, and only that decides.
-    for (const [schema, expected] of [[PREVIOUS_SCHEMA, false], [EVIDENCE_SCHEMA_VERSION, true]]) {
+    for (const [schema, expected] of [
+      [PREVIOUS_SCHEMA, false],
+      [RETIRED_SCHEMA, false],
+      [EVIDENCE_SCHEMA_VERSION, true],
+    ]) {
       const record = stageA(schema);
       assert.equal(verifySeal(record, KEY).ok, true, `${schema}: authentic`);
       assert.equal((await load(record)).ok, expected, `${schema}: admitted`);
@@ -7386,7 +7399,7 @@ describe("evidence producer contract version", () => {
       { runReadOnly: world.runReadOnly, fetch: world.fetch, files: seedRun() },
     );
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
-    assert.equal(JSON.parse(run.files.get("/tmp/c.json")).schemaVersion, "10d-remediation-02");
+    assert.equal(JSON.parse(run.files.get("/tmp/c.json")).schemaVersion, "10d-remediation-03");
   });
 });
 
@@ -8274,7 +8287,7 @@ describe("acceptance evidence immutability (CORRECTION-08)", () => {
     assert.equal(run.writeOptions.get("/tmp/fresh-stage-a.json")?.flag, "wx");
   });
 
-  it("85. a sealed remediation-02 Stage A PASS is still admitted by loadStageA()", async () => {
+  it("85. a sealed remediation-03 Stage A PASS is still admitted by loadStageA()", async () => {
     const world = makeFakeWorld();
     const run = await runCli(
       ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/admissible-stage-a.json"],
@@ -8284,12 +8297,13 @@ describe("acceptance evidence immutability (CORRECTION-08)", () => {
     assert.equal(run.code, 0, `${run.out}\n${run.err}`);
 
     const sealed = run.files.get("/tmp/admissible-stage-a.json");
-    assert.equal(JSON.parse(sealed).schemaVersion, "10d-remediation-02");
+    assert.equal(JSON.parse(sealed).schemaVersion, "10d-remediation-03");
     const key = JSON.parse(run.files.get(RUN_KEY_PATH));
 
     // Exactly what the eventual Stage B aggregation does with the artifact the
     // accepted run left behind: this correction must not have changed what a
-    // sealed `10d-remediation-02` PASS means.
+    // FRESHLY SEALED PASS means. The version boundary retires OLD artifacts; it
+    // must never make the harness unable to admit its own current output.
     const loaded = await loadStageA("/tmp/admissible-stage-a.json", async () => sealed, {
       run: { runId: key.runId, key: key.key },
       expectedSha: SHA,
@@ -8913,8 +8927,8 @@ describe("generic delivery is proven against a pre-job fixture digest", () => {
     const sealed = run.files.get("/tmp/accepted-stage-a.json");
     const record = JSON.parse(sealed);
     assert.equal(record.runId, "a9ce1c400db8d817");
-    assert.equal(record.schemaVersion, "10d-remediation-02");
-    assert.equal(CASE_SCHEMA_VERSION, "10d-remediation-02");
+    assert.equal(record.schemaVersion, "10d-remediation-03");
+    assert.equal(CASE_SCHEMA_VERSION, "10d-remediation-03");
 
     const loaded = await loadStageA("/tmp/accepted-stage-a.json", async () => sealed, {
       run: { runId: "a9ce1c400db8d817", key: "d".repeat(64) },
@@ -8930,5 +8944,248 @@ describe("generic delivery is proven against a pre-job fixture digest", () => {
     for (const bad of [undefined, null, "", "C".repeat(64), "c".repeat(63), "c".repeat(65), "zz", 1]) {
       assert.equal(parseGenericExpectedDigest(bad).ok, false, JSON.stringify(bad));
     }
+  });
+});
+
+// ── CORRECTION-01 §4-§7: the 10D-REM-03 evaluator-semantics boundary ───────
+//
+// This is the sharpest case the schema boundary has had to carry. Every earlier
+// bump retired artifacts whose OBSERVERS were weaker. This one retires
+// artifacts whose observers were fine and whose EVALUATOR has since become more
+// permissive about the very same raw bytes:
+//
+//     the same sealed five-state success trace
+//     graded BLOCKED under 10d-remediation-02
+//     graded PASS    under 10d-remediation-03
+//
+// A valid HMAC proves "this artifact has not changed since it was produced". It
+// does NOT prove "this artifact was produced and evaluated under today's
+// lifecycle semantics". Nothing in the record's shape, fields or seal separates
+// the two readings, so the version boundary is the only thing that can — and a
+// permissive change is not exempt from it just because it points the friendly
+// way.
+
+describe("10D-REM-03 — the lifecycle evaluator boundary retires remediation-02", () => {
+  const KEY = "a".repeat(64);
+  const RUN = { runId: "0123456789abcdef", key: KEY };
+  const RETIRED = "10d-remediation-02";
+  const BINDING = { expectedSha: SHA, runningImageId: IMAGE_ID };
+  const expectations = { runId: RUN.runId, expectedSha: SHA, runningImageId: IMAGE_ID };
+
+  /** A Stage-A PASS that is perfect in every respect except its schema. */
+  const stageAAt = (schemaVersion) =>
+    sealRecord(
+      {
+        harness: HARNESS_ID,
+        schemaVersion,
+        runId: RUN.runId,
+        task: "PHASE-10D",
+        stage: "A",
+        verdict: "PASS",
+        startedAt: "2026-09-04T00:00:00.000Z",
+        expectedSha: SHA,
+        runningImageId: IMAGE_ID,
+        taggedImageId: IMAGE_ID,
+        binding: { expectedSha: SHA, runningImageId: IMAGE_ID, taggedImageId: IMAGE_ID },
+        checks: [{ id: "image.identity", outcome: "PASS", required: true, detail: "" }],
+      },
+      KEY,
+    );
+
+  const loadA = (record) =>
+    loadStageA("/x", async () => JSON.stringify(record), { run: RUN, expectedSha: SHA });
+
+  /**
+   * A REALISTIC `success` case record carrying the exact live five-state trace,
+   * built by the real producer so nothing but the schema version is synthetic.
+   *
+   * Synthetic on purpose: no secret, sentinel, URL or bearer value from the
+   * real sealed `stage-b/success.json` is reproduced here. That artifact stays
+   * untouched on the acceptance host.
+   */
+  const liveSuccessCaseAt = async (schemaVersion) => {
+    const { ctx } = makeSuccessCaseCtx({
+      finalStatus: "ready",
+      trace: [...LIVE_SUCCESS_TRACE],
+      genericExpectedDigest: "c".repeat(64),
+      deliveredDigest: "c".repeat(64),
+    });
+    const payload = await runSuccessCase(ctx);
+    const record = caseRecord({ caseName: "success", binding: BINDING, payload, runId: RUN.runId });
+    return sealRecord({ ...record, schemaVersion }, KEY);
+  };
+
+  it("A. a correctly sealed remediation-02 Stage A is refused SOLELY on the version", async () => {
+    const stale = stageAAt(RETIRED);
+
+    // The seal is genuinely good, and every other admission condition holds —
+    // same run, same key, same source SHA, same image, PASS verdict, complete
+    // and self-consistent binding. The version is the only thing wrong.
+    assert.equal(verifySeal(stale, KEY).ok, true, "precondition: the artifact is authentic");
+
+    const loaded = await loadA(stale);
+    assert.equal(loaded.ok, false);
+    assert.match(loaded.reason, new RegExp(`${RETIRED}.*is not.*10d-remediation-03`));
+    assert.equal(loaded.binding, undefined, "and it authorizes nothing");
+
+    // The identical record at the current version IS admitted, which is what
+    // proves the refusal above is the version boundary and nothing else.
+    const fresh = await loadA(stageAAt(EVIDENCE_SCHEMA_VERSION));
+    assert.equal(fresh.ok, true, fresh.reason);
+  });
+
+  it("B. a sealed remediation-02 success is refused BEFORE the classifier can pass it", async () => {
+    const stale = await liveSuccessCaseAt(RETIRED);
+
+    // Precondition 1: the artifact is authentic.
+    assert.equal(verifySeal(stale, KEY).ok, true, "precondition: authentic");
+    // Precondition 2: it carries the exact trace the new classifier accepts, so
+    // the ONLY thing standing between it and a PASS is the version boundary.
+    assert.deepEqual(stale.payload.genericJob.transitions, [...LIVE_SUCCESS_TRACE]);
+    assert.equal(
+      classifySuccessTransitionTrace(stale.payload.genericJob.transitions).outcome,
+      OUTCOMES.PASS,
+      "precondition: the corrected classifier would pass this trace",
+    );
+
+    // …and it is refused at ADMISSION, by both gates the aggregate runs, before
+    // any payload field is believed and long before the classifier sees it.
+    const validated = validateCaseRecord(stale, BINDING);
+    assert.equal(validated.ok, false);
+    assert.match(validated.reason, new RegExp(`${RETIRED} is not 10d-remediation-03`));
+    assert.equal(validated.observations, undefined, "no observation may escape a refused record");
+
+    const verified = verifyRecord(stale, KEY, expectations);
+    assert.equal(verified.ok, false);
+    assert.match(verified.reason, new RegExp(`${RETIRED} is not 10d-remediation-03`));
+  });
+
+  it("C. the same success at remediation-03 IS admitted and PASSes by causal proof", async () => {
+    const fresh = await liveSuccessCaseAt(EVIDENCE_SCHEMA_VERSION);
+
+    const validated = validateCaseRecord(fresh, BINDING);
+    assert.equal(validated.ok, true, validated.reason);
+    assert.equal(verifyRecord(fresh, KEY, expectations).ok, true);
+
+    // Admitted, and its lifecycle check passes on causal proof — `processing`
+    // reported as proven, never as observed, and never spliced into the trace.
+    const result = evaluateStageB(
+      passingStageBObservations({
+        ...validated.observations,
+        durableJobRow: measured({
+          present: true,
+          jobId: fresh.payload.genericJob.jobId,
+          status: "ready",
+          formatId: fresh.payload.genericJob.requestedFormatId,
+          extractor: "yt-dlp",
+        }),
+      }),
+      passingStageA(),
+    );
+    const check = result.checks.find((c) => c.id === "job.lifecycle-complete");
+    assert.equal(check.outcome, OUTCOMES.PASS, check.detail);
+    assert.match(check.detail, /CAUSALLY PROVEN/);
+    assert.ok(!fresh.payload.genericJob.transitions.includes("processing"));
+  });
+
+  it("D. cross-version case aggregation is refused", async () => {
+    // Two case records for one run, differing ONLY in contract version. The
+    // aggregate must not build a verdict from a mixed-semantics corpus.
+    const fresh = await liveSuccessCaseAt(EVIDENCE_SCHEMA_VERSION);
+    const stale = await liveSuccessCaseAt(RETIRED);
+
+    assert.equal(validateCaseRecord(fresh, BINDING).ok, true);
+    assert.equal(validateCaseRecord(stale, BINDING).ok, false);
+
+    const admitted = [fresh, stale].filter((r) => validateCaseRecord(r, BINDING).ok);
+    assert.equal(admitted.length, 1, "a mixed-version corpus never aggregates whole");
+    assert.equal(admitted[0].schemaVersion, EVIDENCE_SCHEMA_VERSION);
+  });
+
+  it("E. a remediation-03 Stage A cannot be joined to a remediation-02 case", async () => {
+    const files = new Map();
+    files.set("/tmp/stage-a-03.json", JSON.stringify(stageAAt(EVIDENCE_SCHEMA_VERSION)));
+    files.set("/tmp/case-02.json", JSON.stringify(await liveSuccessCaseAt(RETIRED)));
+    files.set(RUN_KEY_PATH, JSON.stringify({ runId: RUN.runId, key: KEY }));
+
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const aggregate = await runCli(
+      [
+        "--stage", "B", "--aggregate", ...LIVE_ARGS,
+        "--stage-a", "/tmp/stage-a-03.json",
+        "--case-evidence", "/tmp/case-02.json",
+        "--evidence", "/tmp/aggregate-mixed-e.json",
+      ],
+      LIVE_ENV({ ...WORKER_ENV }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+
+    // The Stage A authorized, the stale case did not, and the lifecycle claim
+    // it would have carried lands BLOCKED rather than PASS.
+    assert.match(aggregate.err, /rejected case evidence/);
+    assert.match(aggregate.err, new RegExp(`${RETIRED} is not 10d-remediation-03`));
+    assert.match(aggregate.out, /accepted case evidence: none/);
+    assert.match(aggregate.out, /\[BLKD\] job\.lifecycle-complete/);
+    assert.notEqual(aggregate.code, 0);
+  });
+
+  it("F. a remediation-02 Stage A cannot authorize remediation-03 cases", async () => {
+    const files = new Map();
+    files.set("/tmp/stage-a-02.json", JSON.stringify(stageAAt(RETIRED)));
+    files.set("/tmp/case-03.json", JSON.stringify(await liveSuccessCaseAt(EVIDENCE_SCHEMA_VERSION)));
+    files.set(RUN_KEY_PATH, JSON.stringify({ runId: RUN.runId, key: KEY }));
+
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const aggregate = await runCli(
+      [
+        "--stage", "B", "--aggregate", ...LIVE_ARGS,
+        "--stage-a", "/tmp/stage-a-02.json",
+        "--case-evidence", "/tmp/case-03.json",
+        "--evidence", "/tmp/aggregate-mixed-f.json",
+      ],
+      LIVE_ENV({ ...WORKER_ENV }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+
+    // The stale Stage A cannot authorize ANYTHING, so the run stops at the
+    // authorization edge and the fresh case is never even considered.
+    assert.match(aggregate.err, /BLOCKED: the Stage A record is not usable/);
+    assert.match(aggregate.err, new RegExp(`${RETIRED}.*is not.*10d-remediation-03`));
+    assert.notEqual(aggregate.code, 0);
+  });
+
+  it("re-sealing a retired artifact as remediation-03 does not launder it", async () => {
+    // The tempting shortcut, refused. Historical evidence is immutable, not
+    // upgradeable: a reseal would forge exactly the provenance of MEANING the
+    // boundary exists to establish, and the HMAC cannot attest to it.
+    const stale = await liveSuccessCaseAt(RETIRED);
+    assert.equal(validateCaseRecord(stale, BINDING).ok, false);
+
+    const laundered = sealRecord(
+      { ...stale, schemaVersion: EVIDENCE_SCHEMA_VERSION, authenticator: undefined },
+      KEY,
+    );
+    delete laundered.authenticator.undefined;
+
+    // The reseal is cryptographically valid — that is the whole problem, and
+    // why the seal alone can never be the thing that decides this.
+    assert.equal(verifySeal(laundered, KEY).ok, true);
+
+    // The ORIGINAL artifact is untouched by the attempt: it still carries its
+    // own version and its own seal.
+    assert.equal(stale.schemaVersion, RETIRED);
+    assert.equal(verifySeal(stale, KEY).ok, true);
+
+    // A relabelled record is a NEW claim about provenance, not the old
+    // artifact's, and it is not evidence that the retired run was evaluated
+    // under today's semantics. Producing one is the workflow this correction
+    // forbids; the required response to a retired artifact is a FRESH run.
+    assert.notEqual(laundered.authenticator.mac, stale.authenticator.mac);
   });
 });
