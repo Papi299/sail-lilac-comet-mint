@@ -9160,10 +9160,33 @@ describe("10D-REM-03 — the lifecycle evaluator boundary retires remediation-02
     assert.notEqual(aggregate.code, 0);
   });
 
+  it("admission never NORMALIZES a retired artifact — it refuses it", async () => {
+    // The tempting shortcut as a HARNESS BEHAVIOUR: quietly relabel a retired
+    // record to the current version on the way in, reseal it, and carry on.
+    // That is not admission, it is manufacturing the provenance of meaning the
+    // boundary exists to establish — so every gate must leave the artifact it
+    // rejected byte-for-byte as it found it.
+    const stale = await liveSuccessCaseAt(RETIRED);
+    const before = JSON.stringify(stale);
+
+    const staleA = stageAAt(RETIRED);
+    const beforeA = JSON.stringify(staleA);
+
+    assert.equal(validateCaseRecord(stale, BINDING).ok, false);
+    assert.equal(verifyRecord(stale, KEY, expectations).ok, false);
+    assert.equal((await loadA(staleA)).ok, false);
+
+    assert.equal(JSON.stringify(stale), before, "a refused case record must not be rewritten");
+    assert.equal(JSON.stringify(staleA), beforeA, "a refused Stage A must not be rewritten");
+    assert.equal(stale.schemaVersion, RETIRED, "its contract version must survive the refusal");
+    assert.equal(staleA.schemaVersion, RETIRED);
+  });
+
   it("re-sealing a retired artifact as remediation-03 does not launder it", async () => {
-    // The tempting shortcut, refused. Historical evidence is immutable, not
-    // upgradeable: a reseal would forge exactly the provenance of MEANING the
-    // boundary exists to establish, and the HMAC cannot attest to it.
+    // The same shortcut performed by hand, and equally refused. Historical
+    // evidence is immutable, not upgradeable: a reseal forges exactly the
+    // provenance of MEANING the boundary exists to establish, and the HMAC
+    // cannot attest to it.
     const stale = await liveSuccessCaseAt(RETIRED);
     assert.equal(validateCaseRecord(stale, BINDING).ok, false);
 
