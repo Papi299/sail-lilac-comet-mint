@@ -4594,11 +4594,30 @@ Under the corrected harness they are **historical only**. `verifyRecord`
 refuses each on the version boundary alone, so neither authorizes Stage B nor
 counts as current Stage-B case evidence.
 
-They must not be "upgraded". Re-sealing a retired record at the current version
-produces a cryptographically valid artifact, which is precisely why the seal
-cannot be the thing that decides this — a reseal would forge the provenance of
-meaning the boundary exists to establish. The required response to a retired
-artifact is a **fresh acceptance run**.
+The required response to a retired artifact is a **fresh acceptance run** — not
+a relabel.
+
+#### What each mechanism actually guarantees
+
+| Mechanism | Guarantee |
+| :--- | :--- |
+| **Integrity** — the HMAC | The sealed bytes have not changed since somebody holding this run key sealed them. Nothing more. |
+| **Contract version** — `schemaVersion` | Which harness semantics may consume an artifact. The only field that can say so, because the seal is silent about it. |
+| **Automatic version crossing** | **Refused, and test-detected.** Admission never normalizes, relabels or reseals a retired record on the way in — `validateCaseRecord`, `verifyRecord` and `loadStageA` each leave a refused artifact byte-identical. This is harness behaviour, so it is ours to guarantee. |
+| **Manual operator forgery** | **Outside this threat model.** The acceptance run key is local operator-held material, and the provenance contract has always said the seal "is not a defence against an operator who wants to forge their own acceptance — nothing local can be". Whoever holds the key can mint a new record bearing any `schemaVersion`, and its HMAC will verify. |
+
+So *never reseal historical evidence* is an **operating rule**, enforced by
+procedure and review — not a property the verifier can enforce. Re-sealing a
+retired record does not upgrade or launder it: it constructs a **separate, new
+claim**, leaving the original untouched and still refused, and no local check
+can establish which harness revision originally measured the facts that new
+claim asserts.
+
+This is stated plainly rather than glossed, because a version boundary that is
+mistaken for a defence against a key holder would be trusted for something it
+cannot do. What it *does* do — stop the harness from silently carrying an
+artifact across a semantic change — is the thing the `10D-REM-03` bump needed,
+and that part is enforced and tested.
 
 ### Operational consequence
 

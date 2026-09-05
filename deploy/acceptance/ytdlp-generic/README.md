@@ -829,11 +829,26 @@ exempt from the boundary just because it points the friendly way.
 
 Those artifacts remain valid history — cryptographically verifiable accounts of
 what the harness of their day measured — and are **not** rewritten, resealed,
-renamed or deleted. Nor may they be "upgraded": re-sealing a retired record at
-the current version is cryptographically valid and therefore exactly the wrong
-instrument, since it forges the provenance of meaning the boundary exists to
-establish. `verifyRecord` refuses them on the version alone, independently of
-their verdicts, and the required response is a **fresh acceptance run**.
+renamed or deleted. `verifyRecord` refuses them on the version alone,
+independently of their verdicts, and the required response is a **fresh
+acceptance run**.
+
+##### What each mechanism actually guarantees
+
+| Mechanism | Guarantee |
+| :--- | :--- |
+| **Integrity** — the HMAC | The sealed bytes have not changed since somebody holding this run key sealed them. Nothing more. |
+| **Contract version** — `schemaVersion` | Which harness semantics may consume an artifact. The only field that can say, because the seal is silent about it. |
+| **Automatic version crossing** | **Refused, and test-detected.** Admission never normalizes, relabels or reseals a retired record on the way in — `validateCaseRecord`, `verifyRecord` and `loadStageA` each leave a refused artifact byte-identical. This is harness behaviour, so it is ours to guarantee. |
+| **Manual operator forgery** | **Outside this threat model**, exactly as [The acceptance run key](#the-acceptance-run-key) already says. The key is local operator-held material: whoever holds it can mint a new record bearing any `schemaVersion`, and its HMAC will verify. |
+
+So *never reseal historical evidence* is an **operating rule**, enforced by
+procedure and review — not a property the verifier can enforce. Re-sealing a
+retired record does not upgrade or launder it: it constructs a **separate, new
+claim**, leaving the original untouched and still refused, and no local check
+can establish which harness revision originally measured the facts that new
+claim asserts. The test suite records this as a *threat-model demonstration*
+rather than a claimed defence.
 
 ### The downloading window
 

@@ -168,10 +168,43 @@ import { dirname } from "node:path";
  *
  * Both remain valid history — cryptographically verifiable accounts of what
  * the harness of their day measured — and `verifyRecord` refuses each on the
- * version boundary alone, independently of its verdict. Neither may be
- * overwritten, resealed, renamed or "upgraded" to the current version: a
- * reseal would forge exactly the provenance of meaning the boundary exists to
- * establish. A corrected Stage A uses a FRESH acceptance run.
+ * version boundary alone, independently of its verdict. A corrected Stage A
+ * uses a FRESH acceptance run.
+ *
+ * ── What each mechanism actually guarantees ────────────────────────────────
+ *
+ * Precision here matters more than reassurance, so state the boundary exactly.
+ *
+ *   INTEGRITY                   The HMAC proves the sealed bytes have not
+ *                               changed since somebody holding this run key
+ *                               sealed them. Nothing more.
+ *
+ *   CONTRACT VERSION            `schemaVersion` decides WHICH harness semantics
+ *                               may consume an artifact. It is the only field
+ *                               that can, because the seal is silent about it.
+ *
+ *   AUTOMATIC VERSION CROSSING  REFUSED, and test-detected. Admission must
+ *                               never normalize, relabel or reseal a retired
+ *                               record on the way in; every gate leaves an
+ *                               artifact it refused byte-identical. That is a
+ *                               harness behaviour, so it is ours to guarantee.
+ *
+ *   MANUAL OPERATOR FORGERY     OUTSIDE this threat model, as the top of this
+ *                               file has always said. The run key is LOCAL
+ *                               OPERATOR-HELD material: whoever holds it can
+ *                               mint a new record bearing any `schemaVersion`
+ *                               they like, and its HMAC will verify.
+ *
+ * So "never reseal historical evidence" is an OPERATING RULE, enforced by
+ * procedure and review, not a property the verifier can enforce. Re-sealing a
+ * retired record does not upgrade or launder it — it constructs a SEPARATE,
+ * NEW claim, leaving the original untouched and still refused — and no local
+ * check can establish which harness revision originally measured the facts
+ * that new claim asserts. `scripts/ytdlp-acceptance.test.mjs` records this
+ * explicitly as a threat-model demonstration rather than a claimed defence.
+ *
+ * The operational response to a retired artifact is therefore never to relabel
+ * it. It is a fresh Stage A, a fresh `success`, and a fresh complete Stage B.
  */
 export const EVIDENCE_SCHEMA_VERSION = "10d-remediation-03";
 export const HARNESS_ID = "deploy/acceptance/ytdlp-generic/acceptance.mjs";

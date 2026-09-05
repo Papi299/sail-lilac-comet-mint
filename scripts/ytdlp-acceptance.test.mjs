@@ -9160,55 +9160,108 @@ describe("10D-REM-03 — the lifecycle evaluator boundary retires remediation-02
     assert.notEqual(aggregate.code, 0);
   });
 
-  it("admission never NORMALIZES a retired artifact — it refuses it", async () => {
-    // The tempting shortcut as a HARNESS BEHAVIOUR: quietly relabel a retired
-    // record to the current version on the way in, reseal it, and carry on.
-    // That is not admission, it is manufacturing the provenance of meaning the
-    // boundary exists to establish — so every gate must leave the artifact it
-    // rejected byte-for-byte as it found it.
+  // MUTATION-7 SCOPE, stated precisely: the forbidden, testable behaviour is
+  // ADMISSION AUTOMATICALLY NORMALIZING / RELABELLING / RESEALING A RETIRED
+  // RECORD. That is a harness behaviour, entirely within our control, and it is
+  // what this regression detects.
+  //
+  // It is NOT the claim that a verifier can recognise a record an operator
+  // manually forged with the run key — see the threat-model demonstration below.
+  // Each gate is checked SEPARATELY so a mutation is attributed to the gate that
+  // performed it rather than to whichever one happened to run first.
+  it("admission never NORMALIZES a retired artifact — every gate leaves it byte-identical", async () => {
+    const staleCase = await liveSuccessCaseAt(RETIRED);
+    const staleA = stageAAt(RETIRED);
+
+    const unchanged = async (label, record, gate) => {
+      const before = JSON.stringify(record);
+      const result = await gate(record);
+      assert.equal(result.ok, false, `${label}: a retired record must be refused`);
+      assert.equal(JSON.stringify(record), before, `${label}: must not rewrite the record`);
+      assert.equal(record.schemaVersion, RETIRED, `${label}: its version must survive`);
+    };
+
+    await unchanged("validateCaseRecord", staleCase, (r) => validateCaseRecord(r, BINDING));
+    await unchanged("verifyRecord", staleCase, (r) => verifyRecord(r, KEY, expectations));
+    await unchanged("loadStageA", staleA, (r) => loadA(r));
+
+    // And the seals still verify afterwards, which is the sharpest form of "the
+    // bytes were not touched": any relabel-and-reseal would have replaced the
+    // authenticator, and any relabel WITHOUT a reseal would have broken it.
+    assert.equal(verifySeal(staleCase, KEY).ok, true);
+    assert.equal(verifySeal(staleA, KEY).ok, true);
+  });
+
+  // THREAT-MODEL DEMONSTRATION — not a claimed defence.
+  //
+  // The run key is LOCAL OPERATOR-HELD material, and the provenance contract has
+  // always said so: the seal "is not a defence against an operator who wants to
+  // forge their own acceptance — nothing local can be". This test exists to keep
+  // that boundary explicit and hard to misread, because the previous version of
+  // it was named as though relabelling were DETECTED. It is not.
+  //
+  // What is, and is not, established:
+  //
+  //   INTEGRITY                  the HMAC proves the sealed bytes have not
+  //                              changed since somebody holding the key sealed
+  //                              them.
+  //   CONTRACT VERSION           `schemaVersion` decides which harness semantics
+  //                              may consume an artifact.
+  //   AUTOMATIC VERSION CROSSING refused, and test-detected — see the boundary
+  //                              cases above and the admission-immutability one.
+  //   MANUAL OPERATOR FORGERY    OUTSIDE this threat model. An operator holding
+  //                              the run key can mint a new record bearing any
+  //                              version they like, and its HMAC will verify.
+  //
+  // Manual resealing therefore does not "upgrade" or "launder" the historical
+  // artifact — it CONSTRUCTS A SEPARATE, NEW CLAIM. The old object is untouched
+  // and still refused; the new object is a different artifact whose assertion
+  // about which harness revision measured the underlying facts nothing local can
+  // check. That is why "never reseal historical evidence" is an OPERATING RULE
+  // enforced by procedure and review, not a property enforced by the verifier.
+  it("manual reseal constructs a NEW claim; it does not modify the historical artifact", async () => {
     const stale = await liveSuccessCaseAt(RETIRED);
     const before = JSON.stringify(stale);
 
-    const staleA = stageAAt(RETIRED);
-    const beforeA = JSON.stringify(staleA);
-
-    assert.equal(validateCaseRecord(stale, BINDING).ok, false);
-    assert.equal(verifyRecord(stale, KEY, expectations).ok, false);
-    assert.equal((await loadA(staleA)).ok, false);
-
-    assert.equal(JSON.stringify(stale), before, "a refused case record must not be rewritten");
-    assert.equal(JSON.stringify(staleA), beforeA, "a refused Stage A must not be rewritten");
-    assert.equal(stale.schemaVersion, RETIRED, "its contract version must survive the refusal");
-    assert.equal(staleA.schemaVersion, RETIRED);
-  });
-
-  it("re-sealing a retired artifact as remediation-03 does not launder it", async () => {
-    // The same shortcut performed by hand, and equally refused. Historical
-    // evidence is immutable, not upgradeable: a reseal forges exactly the
-    // provenance of MEANING the boundary exists to establish, and the HMAC
-    // cannot attest to it.
-    const stale = await liveSuccessCaseAt(RETIRED);
+    // The historical object: authentic, and refused on the version boundary.
+    assert.equal(verifySeal(stale, KEY).ok, true);
     assert.equal(validateCaseRecord(stale, BINDING).ok, false);
 
-    const laundered = sealRecord(
+    const relabelled = sealRecord(
       { ...stale, schemaVersion: EVIDENCE_SCHEMA_VERSION, authenticator: undefined },
       KEY,
     );
-    delete laundered.authenticator.undefined;
+    delete relabelled.authenticator.undefined;
 
-    // The reseal is cryptographically valid — that is the whole problem, and
-    // why the seal alone can never be the thing that decides this.
-    assert.equal(verifySeal(laundered, KEY).ok, true);
-
-    // The ORIGINAL artifact is untouched by the attempt: it still carries its
-    // own version and its own seal.
+    // 1. The historical artifact is UNCHANGED by the attempt. Producing a
+    //    relabelled copy is not an edit of the original, and the original keeps
+    //    its own version and its own valid seal.
+    assert.equal(JSON.stringify(stale), before);
     assert.equal(stale.schemaVersion, RETIRED);
     assert.equal(verifySeal(stale, KEY).ok, true);
+    assert.equal(validateCaseRecord(stale, BINDING).ok, false, "and it stays refused");
 
-    // A relabelled record is a NEW claim about provenance, not the old
-    // artifact's, and it is not evidence that the retired run was evaluated
-    // under today's semantics. Producing one is the workflow this correction
-    // forbids; the required response to a retired artifact is a FRESH run.
-    assert.notEqual(laundered.authenticator.mac, stale.authenticator.mac);
+    // 2. The relabelled object is a DISTINCT artifact: different version,
+    //    different authenticator.
+    assert.equal(relabelled.schemaVersion, EVIDENCE_SCHEMA_VERSION);
+    assert.notEqual(relabelled.authenticator.mac, stale.authenticator.mac);
+
+    // 3. Its seal is cryptographically VALID, and — stated plainly rather than
+    //    wished away — the current verifier ADMITS it. This is the honest edge
+    //    of the local-HMAC threat model, recorded so nobody later mistakes the
+    //    version boundary for a defence against a key holder.
+    assert.equal(verifySeal(relabelled, KEY).ok, true);
+    assert.equal(
+      verifyRecord(relabelled, KEY, expectations).ok,
+      true,
+      "documenting the actual behaviour: a key holder can mint any version",
+    );
+
+    // This assertion documents CURRENT behaviour under the CURRENT threat model.
+    // It is deliberately not a normative requirement that forged records be
+    // accepted: if provenance is later hardened — a signature over the producing
+    // harness revision, a remote notary, an append-only witness — this test is
+    // expected to be updated alongside that mechanism, not treated as a contract
+    // preventing it.
   });
 });
