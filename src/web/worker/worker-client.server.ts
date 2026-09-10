@@ -1,6 +1,6 @@
 import { z } from "zod";
 import crypto from "node:crypto";
-import { AppError, type ErrorCode } from "../../lib/errors.ts";
+import { AppError, ERROR_MESSAGES, type ErrorCode } from "../../lib/errors.ts";
 import {
   WorkerKeyIdSchema,
   sha256WorkerBody,
@@ -33,6 +33,13 @@ import {
   WORKER_DIAGNOSTICS_PATH,
   WORKER_HEALTH_PATH,
 } from "../../shared/worker/constants.ts";
+
+/**
+ * Hard ceiling on any Worker response body this client will read into memory.
+ * Single-sourced so every read path — success, error envelope, health probe and
+ * the 503 disambiguation probe — is bounded identically.
+ */
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 /**
  * Rejects any byte that cannot legally appear in an HTTP header value, without
@@ -206,18 +213,63 @@ export class WorkerClient {
   /**
    * Statuses that mean the request never reached the Worker protocol.
    *
-   * 401/503 are pre-existing. 403 is added because it cannot originate from the
-   * current Worker protocol — it is absent from WORKER_ERROR_HTTP_STATUS and
-   * from every Worker code path — so a 403 on this endpoint is a non-Worker,
-   * upstream refusal. A refused Access service token is the expected cause, but
-   * other upstream controls (WAF, rate limiting, a bot rule) could produce one
-   * too; the classification deliberately does not depend on knowing which.
+   * Neither 401 nor 403 can originate from the current Worker protocol — both
+   * are absent from WORKER_ERROR_HTTP_STATUS and from every Worker code path —
+   * so either one on this endpoint is a non-Worker, upstream refusal. A refused
+   * Access service token is the expected cause, but other upstream controls
+   * (WAF, rate limiting, a bot rule) could produce one too; the classification
+   * deliberately does not depend on knowing which.
    *
    * It must be decided BEFORE any content-type or JSON validation, because such
-   * a response is an upstream page rather than a Worker error envelope.
+   * a response is an upstream page rather than a Worker error envelope. Its body
+   * is never read, parsed or surfaced.
+   *
+   * 503 is deliberately NOT in this set. It used to be, which was wrong: the
+   * Worker maps its own EXTRACTOR_UNAVAILABLE business error to 503
+   * (WORKER_ERROR_HTTP_STATUS), so a 503 here is ambiguous rather than
+   * necessarily upstream. It is resolved by `isCanonicalExtractorUnavailable`.
    */
-  private isUpstreamUnavailableStatus(status: number): boolean {
-    return status === 401 || status === 403 || status === 503;
+  private isUpstreamOnlyStatus(status: number): boolean {
+    return status === 401 || status === 403;
+  }
+
+  /**
+   * Decides whether an HTTP 503 is the Worker's own EXTRACTOR_UNAVAILABLE
+   * business error rather than an upstream/proxy/tunnel outage.
+   *
+   * 503 is the single status the Worker protocol shares with the
+   * infrastructure in front of it: the Worker answers 503 for
+   * EXTRACTOR_UNAVAILABLE, while a proxy, tunnel or load balancer answers 503
+   * for a genuine outage. They are told apart by demanding the FULL Worker
+   * response contract rather than the status alone — acceptable
+   * application/json content type, acceptable Content-Length semantics, a
+   * bounded body read, valid JSON, a strict WorkerErrorResponse envelope,
+   * exactly the EXTRACTOR_UNAVAILABLE code, and exactly the canonical safe
+   * message for it. The message must match because `toWorkerErrorEnvelope`
+   * always rewrites a Worker error message to `ERROR_MESSAGES[code]`, so a
+   * divergent message did not come from the Worker's error path.
+   *
+   * Every branch fails closed. Anything short of that exact envelope — an
+   * absent or HTML body, a wrong or missing content type, malformed, oversized
+   * or unreadable bytes, another Worker code, a doctored message — returns
+   * false, and the caller keeps the safer WORKER_UNAVAILABLE classification.
+   * The body is consumed here purely to classify it and is never surfaced in
+   * the resulting error.
+   */
+  private async isCanonicalExtractorUnavailable(response: Response): Promise<boolean> {
+    try {
+      this.validateContentType(response.headers.get("content-type"));
+      this.validateContentLength(response.headers.get("content-length"));
+      const responseBuffer = await this.readBoundedStream(response, MAX_RESPONSE_BYTES);
+      const parsed = WorkerErrorResponseSchema.safeParse(JSON.parse(responseBuffer.toString("utf8")));
+      return (
+        parsed.success &&
+        parsed.data.error.code === "EXTRACTOR_UNAVAILABLE" &&
+        parsed.data.error.message === ERROR_MESSAGES.EXTRACTOR_UNAVAILABLE
+      );
+    } catch {
+      return false;
+    }
   }
 
   private async makeRequest<T>(
@@ -285,14 +337,23 @@ export class WorkerClient {
 
     // Upstream refusal is classified BEFORE Worker response validation: the
     // body belongs to the proxy, not to the Worker protocol.
-    if (this.isUpstreamUnavailableStatus(response.status)) {
+    if (this.isUpstreamOnlyStatus(response.status)) {
+      throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
+    }
+
+    // 503 is ambiguous, so it is resolved here rather than assumed upstream.
+    // Only the Worker's exact canonical EXTRACTOR_UNAVAILABLE envelope survives
+    // as a business error; every other 503 keeps the safer classification.
+    if (response.status === 503) {
+      if (await this.isCanonicalExtractorUnavailable(response)) {
+        throw new AppError("EXTRACTOR_UNAVAILABLE");
+      }
       throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
     }
 
     this.validateContentType(response.headers.get("content-type"));
     this.validateContentLength(response.headers.get("content-length"));
 
-    const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
     const responseBuffer = await this.readBoundedStream(response, MAX_RESPONSE_BYTES);
     const responseText = responseBuffer.toString("utf8");
 
@@ -411,7 +472,10 @@ export class WorkerClient {
       clearTimeout(timeoutId);
     }
 
-    if (this.isUpstreamUnavailableStatus(response.status)) {
+    // The health route is a liveness probe: it answers 200 {"status":"ok"} and
+    // never emits a Worker business-error envelope, so 503 here is always an
+    // outage. The makeRequest disambiguation deliberately does not apply.
+    if (this.isUpstreamOnlyStatus(response.status) || response.status === 503) {
       throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
     }
 
@@ -422,7 +486,7 @@ export class WorkerClient {
     this.validateContentType(response.headers.get("content-type"));
     this.validateContentLength(response.headers.get("content-length"));
 
-    const responseBuffer = await this.readBoundedStream(response, 2 * 1024 * 1024);
+    const responseBuffer = await this.readBoundedStream(response, MAX_RESPONSE_BYTES);
     const responseText = responseBuffer.toString("utf8");
     let responseData: unknown;
     try {

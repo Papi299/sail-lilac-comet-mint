@@ -154,6 +154,21 @@ is an upstream page rather than a Worker error envelope. An Access login **redir
 responses (404, 409, 410, 413, 422, 429, 500, 502, 504 …) keep their existing
 error-envelope mapping and are never collapsed into unavailability.
 
+**HTTP 503 is ambiguous, not necessarily upstream.** Unlike 401/403, 503 *can*
+originate from the Worker protocol: `WORKER_ERROR_HTTP_STATUS` maps
+`EXTRACTOR_UNAVAILABLE` to 503, which is what a non-direct URL returns when
+generic extraction is unavailable. The control plane therefore does not classify
+503 before validation. It preserves `EXTRACTOR_UNAVAILABLE` only when the
+response satisfies the **entire** Worker response contract — `application/json`
+content type, valid `Content-Length`, bounded body read, valid JSON, strict
+`WorkerErrorResponseSchema`, the exact `EXTRACTOR_UNAVAILABLE` code, and the
+canonical safe message for it. Every other 503 — a proxy or tunnel outage page,
+HTML, a missing or wrong content type, malformed/oversized/unreadable bytes, a
+different Worker code, or a doctored message — fails closed to
+`WORKER_UNAVAILABLE`, and no upstream body text is ever surfaced. The
+unauthenticated `/health` route has no business-error envelope, so a 503 there
+is always `WORKER_UNAVAILABLE`.
+
 ### Filesystem roles
 
 ```

@@ -2,6 +2,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { WorkerClient } from "./worker-client.server.ts";
+import { ERROR_MESSAGES } from "../../lib/errors.ts";
 import { sha256WorkerBody } from "../../shared/worker/auth.ts";
 import { createWorkerSignatureHex } from "../../shared/worker/hmac.server.ts";
 import { workerJobPath, workerJobCancelPath } from "../../shared/worker/contracts.ts";
@@ -356,6 +357,223 @@ describe("WorkerClient", () => {
         runGetJob(makeClient(500, "Server Error", "text/plain")),
         (e: any) => e.code === "PROCESSING_FAILED"
       );
+    });
+  });
+
+  // ── HTTP 503 disambiguation (Phase 10F) ───────────────────────────────────
+  //
+  // 503 is the ONE status shared by the Worker protocol and the infrastructure
+  // in front of it: the Worker answers 503 for its own EXTRACTOR_UNAVAILABLE
+  // business error, while a proxy/tunnel answers 503 for a real outage.
+  // Previously every 503 was collapsed into WORKER_UNAVAILABLE before the body
+  // could be validated, so a legitimate "generic extraction is unavailable"
+  // reached the browser as a worker outage. Only the exact canonical Worker
+  // envelope may now survive as EXTRACTOR_UNAVAILABLE; everything else stays
+  // WORKER_UNAVAILABLE.
+  describe("503 disambiguation", () => {
+    const CANONICAL = ERROR_MESSAGES.EXTRACTOR_UNAVAILABLE;
+    const envelope = (code: string, message: string) =>
+      JSON.stringify({ success: false, error: { code, message } });
+    const CANONICAL_ENVELOPE = envelope("EXTRACTOR_UNAVAILABLE", CANONICAL);
+
+    /** Mirrors how the real Worker serializes: JSON + charset + Content-Length. */
+    const respondWith = (
+      status: number,
+      body: string | null,
+      contentType: string | null = "application/json; charset=utf-8",
+      contentLength?: string,
+    ) => {
+      const headers: Record<string, string> = {};
+      if (contentType !== null) headers["Content-Type"] = contentType;
+      if (body !== null) {
+        headers["Content-Length"] = contentLength ?? String(Buffer.byteLength(body, "utf8"));
+      }
+      return new WorkerClient({
+        baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+        fetchImplementation: (async () => new Response(body, { status, headers })) as unknown as typeof fetch,
+      });
+    };
+
+    const streaming = (status: number, start: (c: any) => void, contentLength: string) =>
+      new WorkerClient({
+        baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+        fetchImplementation: (async () => new Response(new ReadableStream({ start }), {
+          status,
+          headers: { "Content-Type": "application/json", "Content-Length": contentLength },
+        })) as unknown as typeof fetch,
+      });
+
+    const runGetJob = (c: WorkerClient) => c.getJob("00000000000000000000000000000000");
+    const isUnavailable = (e: any) => e.code === "WORKER_UNAVAILABLE";
+
+    // A ── the legitimate Worker 503 is preserved.
+    it("A: canonical Worker EXTRACTOR_UNAVAILABLE envelope -> EXTRACTOR_UNAVAILABLE", async () => {
+      await assert.rejects(
+        runGetJob(respondWith(503, CANONICAL_ENVELOPE)),
+        (e: any) =>
+          e.code === "EXTRACTOR_UNAVAILABLE" &&
+          e.message === CANONICAL &&
+          e.status === 503,
+      );
+    });
+
+    it("A: canonical envelope with a bare application/json type -> EXTRACTOR_UNAVAILABLE", async () => {
+      await assert.rejects(
+        runGetJob(respondWith(503, CANONICAL_ENVELOPE, "application/json")),
+        (e: any) => e.code === "EXTRACTOR_UNAVAILABLE",
+      );
+    });
+
+    it("A: the disambiguation applies to analyze(), the path that surfaces it to users", async () => {
+      const client = respondWith(503, CANONICAL_ENVELOPE);
+      await assert.rejects(
+        client.analyze({ url: "https://example.com/watch" } as any),
+        (e: any) => e.code === "EXTRACTOR_UNAVAILABLE",
+      );
+    });
+
+    // B ── an upstream proxy page is NOT a Worker envelope.
+    it("B: HTML proxy body -> WORKER_UNAVAILABLE", async () => {
+      await assert.rejects(
+        runGetJob(respondWith(503, "<html><body>503 Service Temporarily Unavailable</body></html>", "text/html; charset=utf-8")),
+        isUnavailable,
+      );
+    });
+
+    it("B: no body at all -> WORKER_UNAVAILABLE", async () => {
+      await assert.rejects(runGetJob(respondWith(503, null, null)), isUnavailable);
+    });
+
+    // C ── content-type is part of the Worker contract.
+    it("C: missing Content-Type -> WORKER_UNAVAILABLE", async () => {
+      await assert.rejects(runGetJob(respondWith(503, CANONICAL_ENVELOPE, null)), isUnavailable);
+    });
+
+    for (const contentType of ["text/plain", "application/jsonp", "text/html", "application/octet-stream"]) {
+      it(`C: Content-Type ${contentType} with an otherwise canonical body -> WORKER_UNAVAILABLE`, async () => {
+        await assert.rejects(runGetJob(respondWith(503, CANONICAL_ENVELOPE, contentType)), isUnavailable);
+      });
+    }
+
+    // D ── malformed JSON never reaches the schema.
+    it("D: malformed JSON -> WORKER_UNAVAILABLE", async () => {
+      await assert.rejects(runGetJob(respondWith(503, '{"success":false,"error":{')), isUnavailable);
+    });
+
+    // E ── schema-invalid JSON is refused by the strict envelope schema.
+    const schemaInvalid = [
+      '{"success":false}',
+      '{"success":true,"error":{"code":"EXTRACTOR_UNAVAILABLE","message":"' + CANONICAL + '"}}',
+      '{"success":false,"error":{"code":"EXTRACTOR_UNAVAILABLE"}}',
+      '{"success":false,"error":{"code":"EXTRACTOR_UNAVAILABLE","message":"' + CANONICAL + '","stack":"boom"}}',
+      '{"success":false,"error":{"code":"EXTRACTOR_UNAVAILABLE","message":123}}',
+      '"a bare string"',
+      "null",
+    ];
+    for (const [i, body] of schemaInvalid.entries()) {
+      it(`E: schema-invalid JSON #${i + 1} -> WORKER_UNAVAILABLE`, async () => {
+        await assert.rejects(runGetJob(respondWith(503, body)), isUnavailable);
+      });
+    }
+
+    // F ── a valid envelope carrying any OTHER code is inconsistent with 503:
+    // EXTRACTOR_UNAVAILABLE is the only Worker code mapped to that status.
+    for (const code of ["RATE_LIMITED", "PROCESSING_FAILED", "NOT_FOUND", "TIMEOUT", "INVALID_URL"]) {
+      it(`F: 503 carrying a valid ${code} envelope -> WORKER_UNAVAILABLE`, async () => {
+        await assert.rejects(
+          runGetJob(respondWith(503, envelope(code, ERROR_MESSAGES[code as keyof typeof ERROR_MESSAGES]))),
+          isUnavailable,
+        );
+      });
+    }
+
+    // G ── the Worker always rewrites the message to the canonical one, so a
+    // divergent message did not come from the Worker's error path.
+    const nonCanonical = [CANONICAL + " ", " " + CANONICAL, CANONICAL.toUpperCase(), "", "Service Unavailable", CANONICAL.slice(0, -1)];
+    for (const [i, message] of nonCanonical.entries()) {
+      it(`G: EXTRACTOR_UNAVAILABLE with non-canonical message #${i + 1} -> WORKER_UNAVAILABLE`, async () => {
+        await assert.rejects(
+          runGetJob(respondWith(503, envelope("EXTRACTOR_UNAVAILABLE", message))),
+          isUnavailable,
+        );
+      });
+    }
+
+    // H ── a failed read must not be optimistically trusted.
+    it("H: a body read that fails mid-stream -> WORKER_UNAVAILABLE", async () => {
+      const client = streaming(503, (c) => c.error(new Error("network disconnect")), "100");
+      await assert.rejects(runGetJob(client), isUnavailable);
+    });
+
+    // I ── the response bounds still gate the probe.
+    it("I: oversized streamed body -> WORKER_UNAVAILABLE", async () => {
+      const client = streaming(503, (c) => {
+        c.enqueue(new Uint8Array(2 * 1024 * 1024));
+        c.enqueue(new Uint8Array(1)); // one byte past the 2 MiB ceiling
+        c.close();
+      }, "2097152");
+      await assert.rejects(runGetJob(client), isUnavailable);
+    });
+
+    for (const len of ["-1", "1.5", "1e5", "100a", "9007199254740992", "3000000"]) {
+      it(`I: invalid Content-Length ${len} -> WORKER_UNAVAILABLE`, async () => {
+        await assert.rejects(
+          runGetJob(respondWith(503, CANONICAL_ENVELOPE, "application/json", len)),
+          isUnavailable,
+        );
+      });
+    }
+
+    // J ── 401/403 stay upstream even when dressed as a Worker envelope.
+    for (const status of [401, 403]) {
+      it(`J: ${status} carrying the canonical Worker envelope -> WORKER_UNAVAILABLE`, async () => {
+        await assert.rejects(runGetJob(respondWith(status, CANONICAL_ENVELOPE)), isUnavailable);
+      });
+    }
+
+    // No untrusted response text may reach the user-facing error.
+    it("an untrusted 503 body never leaks into the error message", async () => {
+      const SENTINEL = "UPSTREAM_INTERNAL_HOST_LEAK";
+      const bodies: Array<[string, string | null]> = [
+        [`<html><body>${SENTINEL}</body></html>`, "text/html"],
+        [envelope("EXTRACTOR_UNAVAILABLE", SENTINEL), "application/json"],
+        [envelope("RATE_LIMITED", SENTINEL), "application/json"],
+        [`{"success":false,"${SENTINEL}":true}`, "application/json"],
+      ];
+      for (const [body, contentType] of bodies) {
+        await assert.rejects(runGetJob(respondWith(503, body, contentType)), (e: any) => {
+          const rendered = `${String(e)}\n${e.message}\n${e.stack ?? ""}`;
+          return e.code === "WORKER_UNAVAILABLE" &&
+            e.message === ERROR_MESSAGES.WORKER_UNAVAILABLE &&
+            !rendered.includes(SENTINEL);
+        });
+      }
+    });
+
+    it("the preserved EXTRACTOR_UNAVAILABLE carries only the canonical safe message", async () => {
+      await assert.rejects(runGetJob(respondWith(503, CANONICAL_ENVELOPE)), (e: any) =>
+        e.message === CANONICAL && !e.message.includes("worker"),
+      );
+    });
+
+    // K/L ── neighbouring behaviour is untouched.
+    it("K: a non-503 Worker business envelope still propagates unchanged", async () => {
+      await assert.rejects(
+        runGetJob(respondWith(429, envelope("RATE_LIMITED", ERROR_MESSAGES.RATE_LIMITED))),
+        (e: any) => e.code === "RATE_LIMITED",
+      );
+    });
+
+    it("L: a 200 response is still validated against the success schema", async () => {
+      await assert.rejects(
+        runGetJob(respondWith(200, '{"success":true,"job":{"id":"1"}}')),
+        (e: any) => e.code === "PROCESSING_FAILED",
+      );
+    });
+
+    // The health route has no business-error envelope, so 503 stays an outage.
+    it("health() keeps 503 as WORKER_UNAVAILABLE even for a canonical envelope", async () => {
+      await assert.rejects(respondWith(503, CANONICAL_ENVELOPE).health(), isUnavailable);
     });
   });
 
