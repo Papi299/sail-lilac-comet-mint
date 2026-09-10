@@ -173,7 +173,12 @@ therefore does not classify 503 before validation. It preserves
 `EXTRACTOR_UNAVAILABLE` only when the response satisfies the **entire** Worker
 response contract — `application/json` content type, valid `Content-Length`,
 bounded body read, valid JSON, strict `WorkerErrorResponseSchema`, the exact
-`EXTRACTOR_UNAVAILABLE` code, and the canonical safe message for it. Every other
+`EXTRACTOR_UNAVAILABLE` code, and the canonical safe message for it. This is a
+**shape** test: it accepts a response as consistent with the Worker's canonical
+`EXTRACTOR_UNAVAILABLE` envelope, which is sufficient for this classification.
+It is not authenticated provenance and does not prove Worker origin — that
+would need response authentication, which this boundary does not have and this
+change does not add. Every other
 503 — a proxy or tunnel outage page, HTML, a missing or wrong content type,
 malformed/oversized/unreadable bytes, a different Worker code, or a doctored
 message — fails closed to `WORKER_UNAVAILABLE`, and no upstream body text is

@@ -561,11 +561,68 @@ describe("WorkerClient", () => {
       });
     });
 
-    it("C: a stalled 503 does not consume a second full timeout budget", { timeout: 15000 }, async () => {
-      // connect + headers + body classification share ONE requestTimeoutMs.
+    // C (single budget) ── connect + headers + 503 classification share ONE
+    // requestTimeoutMs.
+    //
+    // This only discriminates if a meaningful share of the budget is spent
+    // BEFORE the headers arrive. With instant headers, an implementation that
+    // wrongly started a fresh full budget for the body would finish at about
+    // the same time as a correct one and the test would prove nothing.
+    //
+    // So: 2000 ms total budget, headers delayed ~1200 ms, then a stalled body.
+    //   correct  -> ~800 ms of the ORIGINAL deadline remains  -> total ~2000 ms
+    //   fresh    -> a new ~2000 ms body budget starts         -> total ~3200 ms
+    // The body-phase duration is measured directly, so the assertion is about
+    // the remaining budget rather than only the wall-clock total.
+    const TOTAL_BUDGET_MS = 2000;
+    const HEADER_DELAY_MS = 1200;
+
+    it("C: the 503 body gets only the REMAINING request budget, not a fresh one", { timeout: 20000 }, async () => {
+      const marks: { headersAt?: number } = {};
+      const client = new WorkerClient({
+        baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+        requestTimeoutMs: TOTAL_BUDGET_MS,
+        fetchImplementation: (async () => {
+          // Burn a known share of the original budget before headers exist.
+          await new Promise((resolve) => setTimeout(resolve, HEADER_DELAY_MS));
+          marks.headersAt = Date.now();
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                // Plausible partial envelope, then silence: never closed, and
+                // deliberately NOT observing the abort signal, so only the
+                // client's own deadline can end this read.
+                controller.enqueue(new TextEncoder().encode(`{"partial":"${STALL_SENTINEL}"`));
+              },
+            }),
+            { status: 503, headers: { "Content-Type": "application/json; charset=utf-8" } },
+          );
+        }) as unknown as typeof fetch,
+      });
+
       const started = Date.now();
-      await assert.rejects(runGetJob(stalling(false)), isUnavailable);
-      assert.ok(Date.now() - started < 1900, "the deadline must be one total budget, not one per phase");
+      await assert.rejects(runGetJob(client), isUnavailable);
+      const finished = Date.now();
+
+      assert.ok(marks.headersAt !== undefined, "the 503 headers must have been delivered");
+      const headerPhase = marks.headersAt! - started;
+      const bodyPhase = finished - marks.headersAt!;
+      const total = finished - started;
+
+      // The headers really did arrive inside the original deadline.
+      assert.ok(
+        headerPhase >= HEADER_DELAY_MS - 200 && headerPhase < TOTAL_BUDGET_MS,
+        `headers must arrive before the original deadline, took ${headerPhase}ms`,
+      );
+      // The body really did stall rather than terminate on its own.
+      assert.ok(bodyPhase >= 300, `the body must have stalled, body phase was ${bodyPhase}ms`);
+      // The decisive assertion: the body phase used only what was LEFT of the
+      // budget (~800ms), not a fresh full one (~2000ms).
+      assert.ok(
+        bodyPhase <= 1500,
+        `the body must get only the remaining budget, body phase was ${bodyPhase}ms`,
+      );
+      assert.ok(total <= 2700, `one total budget expected, took ${total}ms`);
     });
 
     // I ── the response bounds still gate the probe.

@@ -257,9 +257,16 @@ export class WorkerClient {
    * application/json content type, acceptable Content-Length semantics, a
    * bounded body read, valid JSON, a strict WorkerErrorResponse envelope,
    * exactly the EXTRACTOR_UNAVAILABLE code, and exactly the canonical safe
-   * message for it. The message must match because `toWorkerErrorEnvelope`
-   * always rewrites a Worker error message to `ERROR_MESSAGES[code]`, so a
-   * divergent message did not come from the Worker's error path.
+   * message for it. The message is part of the shape because
+   * `toWorkerErrorEnvelope` always rewrites a Worker error message to
+   * `ERROR_MESSAGES[code]`, so a divergent message is not the contract the
+   * Worker's error path emits.
+   *
+   * This is a SHAPE test, not authenticated provenance. It establishes that a
+   * response is consistent with the Worker's canonical EXTRACTOR_UNAVAILABLE
+   * envelope — enough for this classification — and deliberately does not
+   * claim to prove Worker origin. Proving origin would require response
+   * authentication, which this client does not have and does not add.
    *
    * Every branch fails closed. Anything short of that exact envelope — an
    * absent or HTML body, a wrong or missing content type, malformed, oversized
