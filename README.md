@@ -66,7 +66,7 @@ See `.env.example`. Important knobs:
 | `MAX_CONCURRENT_PER_PRINCIPAL` | 2 | Active downloads per authenticated operator. Process-local. |
 | `RATE_LIMIT` | 20/min | Analyze requests per authenticated operator. Process-local. Forwarded-IP headers are not used as identity. |
 | `TEMP_DIRECTORY` | OS temp `/videofetch` | Isolated job folders |
-| `YTDLP_ENABLED` | unset (disabled) | Worker-only. Whether generic yt-dlp extraction is enabled. Exactly `true` or `false`; any other spelling is a startup failure. Absent means disabled. Installing the yt-dlp runtime does **not** enable it, and as of Phase 10C1 no user-URL yt-dlp execution path exists at all. |
+| `YTDLP_ENABLED` | unset (disabled) | Worker-only. Whether generic yt-dlp extraction is enabled. Exactly `true` or `false`; any other spelling is a startup failure. Absent means disabled. Installing the yt-dlp runtime does **not** enable it. The accepted Production Worker sets `YTDLP_ENABLED=true` persistently in `/etc/videofetch/worker.env` (Phase 10E), where it is the operational kill switch. It never controls or attests the network boundary — see `docs/architecture/safe-egress.md`. |
 | ~~`YTDLP_NETWORK_ISOLATED`~~ | — | **Retired.** It was an operator attestation, never the boundary. The Worker runtime refuses to start if it is present at any value, `false` included. |
 | ~~`YTDLP_PATH`~~ | — | **Retired** for the Worker: it chose the executable and prepended arbitrary leading arguments to every invocation. Also startup-fatal if present. |
 | `VIDEOFETCH_ACCESS_SECRET` | unset | Server-only private-access secret. Minimum 32 UTF-8 bytes. Required in production for downloader APIs; missing/short values fail closed (HTTP 503) instead of exposing the downloader. **`GET /api/diagnostics` requires a configured secret and a valid session in every environment**, including local development — the ordinary development bypass does not apply there. Rotating it invalidates active sessions. Generate with `openssl rand -base64 32`. Never expose via `VITE_*`. |
@@ -108,7 +108,7 @@ Production artifacts must be generated from the exact reviewed source commit. Do
 
 A future Vercel deployment must build from source. If a prebuilt deployment workflow is introduced later, that prebuilt output must be freshly generated from the exact approved commit in that workflow.
 
-Production deployment is not currently authorized.
+Production deployments are made only on explicit Product Owner authorization, from a clean worktree at the exact reviewed `main` commit. Vercel Git integration is not connected, so a merge never deploys and Vercel does not attest which commit a deployment was built from: deployment source identity is chain of custody. The current accepted Production deployment is recorded in `docs/architecture/worker-deployment-runbook.md` §11h.
 
 Docker already excludes `.vercel` (see `.dockerignore`) and runs `npm run build` from source inside the image. This repository does not copy generated Vercel output into the image.
 
@@ -120,14 +120,17 @@ Unit tests cover URL validation, SSRF helpers, pinned HTTP transport, the pinned
 
 ## Notes
 
-yt-dlp is intended to become the generic HTTP/HTTPS extractor, and the standalone Worker image ships a **pinned** yt-dlp runtime (exact release, digest-verified at build time, root-owned and read-only, no pip, no self-update). It is **not wired to anything**: as of `PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001` no user-supplied URL can reach yt-dlp, the Worker's only yt-dlp operation is a non-network version probe, and generic extraction is a later, separately authorized phase gated by `YTDLP_ENABLED`.
+yt-dlp is the generic HTTP/HTTPS extractor. The standalone Worker image ships a **pinned** yt-dlp runtime (exact release, digest-verified at build time, root-owned and read-only, no pip, no self-update), and user-supplied URLs reach it through the Worker's direct-first router: generic extraction was implemented in `PHASE-10C3-YTDLP-GENERIC-EXECUTION-INTEGRATION-001`, accepted live in Phase 10D, and is enabled in Production by `PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001`. Generic v1 is deliberately narrow — public, single-item, non-live sources acquired as one progressive HTTP(S) format, with no HLS, DASH or split video+audio merge — so sources outside that scope yield no generic download option. See `docs/architecture/worker-deployment-runbook.md` §4g–§4h.
 
 The reason the boundary matters: yt-dlp performs its own DNS lookups, follows redirects, and issues many subrequests, so application URL validation is **not** yt-dlp egress enforcement. Egress is enforced outside the container by the media network namespace and its host-owned nftables policy — which the Worker cannot read or alter, and therefore cannot attest to. See `docs/architecture/safe-egress.md`.
 
 Some websites (including YouTube and Vimeo) may require a signed-in session or block datacenter IP addresses. Direct media files and public archive sources are the most reliable. Only download media you have the right to save.
 
-## Architecture (APPROVED TARGET / NOT YET IMPLEMENTED)
+## Architecture documents
 
+The standalone-Worker architecture these documents describe is **implemented and deployed**: a Vercel control plane in front of an on-demand Worker reached through Cloudflare Access and a named Tunnel, with durable SQLite job state, externally enforced safe egress, and temporary R2 object storage written through a trusted credential broker. The current deployment state, operating model and phase records are in the Worker Deployment Runbook. The execution-boundary and migration documents also record the pre-migration design and the order the migration was carried out in; those parts are history. An implemented architecture is not a promise that any given site works — see the generic v1 scope under Notes.
+
+- [Worker Deployment Runbook](docs/architecture/worker-deployment-runbook.md) — current state and records
 - [Worker Execution Boundary](docs/architecture/worker-execution-boundary.md)
 - [Worker API Contract](docs/architecture/worker-api-contract.md)
 - [Safe Egress](docs/architecture/safe-egress.md)

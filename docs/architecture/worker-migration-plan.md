@@ -1,5 +1,30 @@
 # Worker Migration Plan
 
+> **Status: COMPLETED — this is a historical plan, not a live runbook.** Every
+> phase below has since been carried out. The current deployment state,
+> operating model and phase records are in
+> [`worker-deployment-runbook.md`](worker-deployment-runbook.md) (its header and
+> §11h). The steps are kept to show how the migration was sequenced, and are
+> **not** instructions to repeat.
+>
+> **Current yt-dlp configuration rules — these supersede the variable named in
+> the original plan text:**
+>
+> - `YTDLP_NETWORK_ISOLATED` must be **absent**. It is retired; its presence at
+>   any value, `false` included, is startup-fatal.
+> - `YTDLP_PATH` must be **absent**. It is retired and equally startup-fatal.
+> - `YTDLP_ENABLED` is the explicit feature switch: absent means disabled,
+>   exactly `true` enables generic execution, exactly `false` disables it, and
+>   any other spelling is a startup failure.
+> - Installing the pinned yt-dlp runtime does not itself authorize generic
+>   execution.
+> - Safe-egress enforcement is external — the media network namespace, its
+>   host-owned nftables policy, the policy verifier and the watchdog — and is
+>   never attested by an application environment variable.
+> - Production generic execution was enabled, after Phase-9 safe-egress
+>   acceptance and the Phase-10D live acceptance, by
+>   `PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001`.
+
 Moving media processing from the Vercel web runtime to a long-lived external worker is a significant architectural shift. To avoid a "flag day", the migration must be broken into incremental, independently testable phases.
 
 ## Phase Strategy
@@ -47,21 +72,21 @@ Moving media processing from the Vercel web runtime to a long-lived external wor
 ### 8. Deploy Worker with Safe Egress (yt-dlp disabled)
 - Deploy the new worker infrastructure (container, persistent volume).
 - Apply the externally owned egress policy (e.g., host-level `nftables`).
-- `YTDLP_NETWORK_ISOLATED` remains `false`.
+- Generic yt-dlp execution remains disabled. *(The original plan expressed this through the now-retired `YTDLP_NETWORK_ISOLATED` variable, held false; see the current rules above.)*
 
 ### 9. Safe-Egress Acceptance Suite
 - Run the full egress integration tests (direct-address, redirect, DNS, rebinding, descendant, firewall-mutation, public-success) *from inside* the deployed production worker container.
 
 ### 10. Enable yt-dlp Network Execution
-- ONLY AFTER Phase 9 passes, configure `YTDLP_NETWORK_ISOLATED=true` in the worker deployment.
+- ONLY AFTER Phase 9 passes — and after live acceptance of generic execution — enable it with `YTDLP_ENABLED=true` in the Worker's environment file. *(The original plan named the now-retired `YTDLP_NETWORK_ISOLATED` variable at this step; setting that variable is now startup-fatal.)* **Done:** Phase 10D accepted generic execution live and Phase 10E enabled it persistently.
 - `yt-dlp` is now permitted to execute against user-supplied URLs.
 
 ---
 
 ## Local Development Mode
 
-During transition, local development should remain seamless.
+During transition, local development should remain seamless. *(The first two bullets record transition-era intent; the yt-dlp rules after them are current.)*
 - A local start script (`npm run dev`) should spin up both the Vercel dev server and a local worker process concurrently.
 - The local worker uses a local SQLite file (e.g., `dev.sqlite`).
-- The local worker runs with `YTDLP_NETWORK_ISOLATED=false` (fail-closed).
-- Do NOT instruct developers to casually override `YTDLP_NETWORK_ISOLATED=true` on a normal home/workstation network. If local network testing is eventually needed, it must use a deliberately isolated local container boundary equivalent in intent to production.
+- A local Worker leaves `YTDLP_ENABLED` unset, so generic execution stays disabled (fail-closed), and never sets `YTDLP_NETWORK_ISOLATED` or `YTDLP_PATH` — the presence of either, at any value, is startup-fatal.
+- Do NOT instruct developers to casually set `YTDLP_ENABLED=true` on a normal home/workstation network: a local Worker has no external safe-egress boundary, and yt-dlp performs its own DNS lookups, redirects and subrequests. If local network testing is eventually needed, it must use a deliberately isolated local container boundary equivalent in intent to production.
