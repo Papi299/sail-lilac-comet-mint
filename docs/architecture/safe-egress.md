@@ -2,10 +2,11 @@
 
 ## Threat Model
 
-The worker is *intended* to execute `yt-dlp` against user-supplied URLs. It does
-not do so yet — no such execution path exists as of Phase 10C1 — but the
-boundary below is designed for the point at which it will. Attackers may supply
-URLs designed to cause:
+The Worker **does** execute `yt-dlp` against eligible user-supplied public URLs:
+generic extraction is implemented (Phase 10C3), was accepted live (Phase 10D)
+and is enabled in Production (Phase 10E). The boundary below is what contains
+it, and it is enforced **outside** the Worker. Attackers may supply URLs
+designed to cause:
 - DNS resolution to internal IP addresses.
 - HTTP redirects to internal services.
 - Extractor-specific subrequests (e.g., manifest parsing) pointing to private networks.
@@ -13,6 +14,8 @@ URLs designed to cause:
 - FFmpeg child network traffic to internal destinations.
 
 **Conclusion:** Application-level validation (e.g., parsing the initial URL) is insufficient because `yt-dlp` performs its own DNS lookups, follows redirects, and initiates numerous subrequests.
+
+Application URL validation therefore still does **not** enforce yt-dlp's secondary egress. The enforcement boundary is the external media network namespace, its host-owned nftables policy and the watchdog, which the Worker can neither read nor alter; enabling generic extraction changed none of that.
 
 ## The Safe-Egress Invariant
 
@@ -88,7 +91,7 @@ The object-storage endpoint MUST be a public HTTPS endpoint compatible with the 
 
 ## Acceptance Tests
 
-Before generic yt-dlp execution can be enabled (`YTDLP_ENABLED=true`; formerly the retired `YTDLP_NETWORK_ISOLATED=true`), deployment integration tests MUST pass *from inside the exact deployed worker network boundary*. A bare "connection refused" to an address with no listener is NOT strong proof. Use targets known to be listening or verify firewall-policy counters.
+Before generic yt-dlp execution can be enabled (`YTDLP_ENABLED=true`; formerly expressed by the retired `YTDLP_NETWORK_ISOLATED` flag), deployment integration tests MUST pass *from inside the exact deployed worker network boundary*. A bare "connection refused" to an address with no listener is NOT strong proof. Use targets known to be listening or verify firewall-policy counters.
 
 1. **Direct-address denial:** Prove loopback IPv4, RFC1918, metadata/link-local IPv4, CGNAT, `::1`, IPv6 ULA, and IPv6 link-local are unreachable.
 2. **Redirect test:** Request a controlled PUBLIC HTTP endpoint that responds with a redirect to a controlled forbidden target. Prove the worker cannot establish the forbidden connection.
@@ -97,6 +100,8 @@ Before generic yt-dlp execution can be enabled (`YTDLP_ENABLED=true`; formerly t
 5. **Descendant test:** Run FFmpeg (or another controlled child process) attempting to reach a forbidden destination. Prove it is blocked.
 6. **Firewall-mutation test:** Prove the worker process lacks privileges to alter the firewall/network policy.
 7. **Controlled public success:** Prove a controlled public HTTPS endpoint succeeds.
+
+In Production these tests passed in situ in Phase 9, against the exact final topology, before generic execution was enabled (runbook §11a).
 
 ## Enablement Gating (supersedes `YTDLP_NETWORK_ISOLATED`)
 
@@ -135,3 +140,5 @@ single environment variable is trusted to summarize.
 
 Docker alone is never sufficient. `assertSafeUrl()` alone is never sufficient.
 `YTDLP_ENABLED=true` alone is never sufficient either.
+
+In Production, those preconditions were established by Phase 9 (runbook §11a) and the Phase-10D live acceptance before `PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001` set `YTDLP_ENABLED=true` persistently. See runbook §11h.

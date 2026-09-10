@@ -9,59 +9,73 @@ made by the Product Owner, because it determines persistent-volume semantics,
 TLS termination, external egress enforcement, network-namespace ownership and
 R2 placement/jurisdiction.
 
-**Status: the Phase-8B final stack is LIVE and Phase 9 acceptance PASSED on
-2026-08-30.**
+**Status — current as of 2026-09-10, recorded by
+`POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`: Phase 9 and Phase 10 are
+complete and accepted, generic yt-dlp extraction is enabled in Production, and
+the execution plane runs on demand.**
 
-The reconciled deployment artefacts in `deploy/` are installed and running on
-the local Lima VM, and the Phase-9 safe-egress acceptance suite was executed
-against that exact live topology at `a68243868bafeb88125eccca9344ea6751a76cf5` — in the
-normal host-network state and again with the operator's NordVPN client actively
-connected. The full record, including what was measured directly and what rests
-on operator attestation, is in §11a.
+That reconciliation *recorded* previously accepted evidence and re-measured
+nothing. Each row below names its evidence class — *GitHub-verifiable*,
+*repository/source-verifiable*, *accepted operator-measured Production
+evidence*, *accepted provider observation* or *operator-attested* — and the full
+records are in §11 and §11a–§11h.
+
+| Layer | Current state | Evidence |
+| :--- | :--- | :--- |
+| Phase-8B final stack | installed and enabled on the `videofetch` Lima VM (Ubuntu 24.04 ARM64, Apple silicon) | operator-measured — §11a, §11b |
+| Phase 9 — safe egress | **COMPLETE / ACCEPTED** in situ, 2026-08-30 | operator-measured — §11a |
+| Production R2 + direct media | provisioned; end-to-end direct path **PROVEN** 2026-08-30 | operator-measured, provider observation — §11, §11c |
+| Phase 10D — live acceptance | **COMPLETE / ACCEPTED** under `10d-remediation-03` | operator-measured — §11h |
+| Phase 10E — persistent enablement | **COMPLETE / ACCEPTED** — `YTDLP_ENABLED=true` | operator-measured — §11h |
+| Phase 10F — 503 disambiguation | **CLOSED / PRODUCTION ACCEPTED** — PR #43 | GitHub-verifiable + operator-measured — §1b, §11h |
+| WorkerClient total-response deadline | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** — PR #44 | GitHub-verifiable + operator-measured — §1b, §11h |
+| Worker runtime source | `e4fa646bf7492e16fc8d2733982f708a1e243afb` (the PR #41 merge) | GitHub-verifiable |
+| Worker image | `sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa`, pinned yt-dlp `2026.08.19` | image operator-measured; pin source-verifiable |
+| Vercel Production | `dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC`, from `main` `45c625041389df7e1b37ef6d25a27b9e629ca134` | chain of custody — **not** Vercel Git-attested (§11h) |
+| Execution plane | **on demand**; the idle state is **Stopped** | §3c, §11h |
 
 Precisely:
 
-- The **final units — seven of them** — are installed, enabled and active on the
-  Lima VM (`videofetch`, Ubuntu 24.04 ARM64 on Apple silicon):
-  `videofetch-media-dns`, `videofetch-media-netns`, `videofetch-egress-policy`,
+- **The execution plane is on demand, not 24/7.** A **Stopped** VM means the
+  whole execution plane — Worker, broker, safe-egress boundary and ingress — is
+  intentionally offline, while the Vercel control plane stays up and fails
+  closed (§9). On a normal `limactl start`, guest systemd brings up the seven
+  installed and enabled units — `videofetch-media-dns`,
+  `videofetch-media-netns`, `videofetch-egress-policy`,
   `videofetch-egress-watchdog`, `videofetch-r2-broker`, `videofetch-worker` and
-  `vf-cloudflared`. `videofetch-media-dns` joined them with
-  `PRODUCTION-DNS-RESOLVER-001` (§11b); the Phase-9 record in §11a correctly
-  describes six, because six was the count during that measurement. The older
-  prototype units (`vf-anchor`, `vf-policy`, `vf-worker`, `vf-watchdog`) remain
-  present as unit files but are disabled and not running.
-- The safe-egress boundary was accepted **in situ**: every forbidden destination
-  class was denied, denials were attributed to named nftables rule counters, and
-  permitted public traffic succeeded. See §11a.
-- Phase 9 acceptance is a **local-deployment** result covering the safe-egress
-  boundary. It does not by itself assert anything about the ingress path, Vercel
-  environments or DNS operability, which are tracked by their own gates in §11.
-- **Production name resolution is deployed and verified.** The Phase-9 DNS cases
-  passed against an acceptance-owned resolver that its cleanup removed, leaving
-  the configured designated resolver with no listener — a functional readiness
-  gap, never a safe-egress bypass. `PRODUCTION-DNS-RESOLVER-001` is now
-  **CLOSED**: a durable `systemd-resolved` stub listener and a readiness gate
-  were deployed, and hostname resolution was verified in the live Worker after a
-  fresh boot. The designated address and the nftables policy are unchanged. See
-  §11b.
-- **The production direct-media end-to-end path is PROVEN.** On 2026-08-30 a
-  real job submitted through authenticated Vercel Production reached the Worker
-  over Cloudflare Access and the named Tunnel, executed the `direct` extractor,
-  uploaded to R2 through the trusted broker, and was served back by Vercel's
-  separate signed-GET identity byte-identically. It was blocked until that day
-  by `WORKER-TEMP-TMPFS-OWNERSHIP-001`, a runtime mount-ownership defect that is
-  now fixed and deployed. See §11c.
-- **Phase 10 has progressed in the repository only, and is NOT DEPLOYED.**
-  `PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001` added a pinned yt-dlp runtime to the
-  Worker **image definition** and retired the `YTDLP_NETWORK_ISOLATED` contract.
-  `PHASE-10C2-YTDLP-GENERIC-ANALYSIS-FOUNDATION-001` added a bounded generic
-  analyzer, unconnected. `PHASE-10C3-YTDLP-GENERIC-EXECUTION-INTEGRATION-001`
-  **connected it**: a user-supplied URL can now reach yt-dlp in the source, via
-  the direct-first router and durable generic acquisition.
-
-  Nothing was deployed. The live Worker still runs the previously built image,
-  and Production `YTDLP_ENABLED` remains **unset**, so generic extraction is not
-  reachable in Production. See §4 and §4h.
+  `vf-cloudflared` — and direct **and** generic operation become available with
+  no further step. The older prototype units (`vf-anchor`, `vf-policy`,
+  `vf-worker`, `vf-watchdog`) remain present as unit files but are disabled.
+  See §3c.
+- **Generic extraction is enabled persistently.** `/etc/videofetch/worker.env`
+  carries `YTDLP_ENABLED=true` exactly once; the retired
+  `YTDLP_NETWORK_ISOLATED` and `YTDLP_PATH` are absent, and the presence of
+  either at any value is startup-fatal. The state survives a full VM
+  stop/start. `YTDLP_ENABLED` is now the operational kill switch (§11h): it
+  switches a feature, and it is **not** the network boundary.
+- **Safe egress is enforced outside the Worker** — by the media network
+  namespace, its host-owned nftables policy, the policy verifier and the
+  watchdog (§3, §3a). Phase 9 accepted that boundary in situ against the exact
+  final topology at `a68243868bafeb88125eccca9344ea6751a76cf5`, in the normal
+  host-network state and again with the operator's NordVPN client connected.
+  See §11a.
+- **Production name resolution is deployed and verified.**
+  `PRODUCTION-DNS-RESOLVER-001` is **CLOSED**: a durable `systemd-resolved`
+  stub listener and a readiness gate serve the designated resolver, with the
+  designated address and the nftables policy unchanged. See §11b.
+- **The production direct-media path is PROVEN** end to end: authenticated
+  Vercel Production → Cloudflare Access → named Tunnel → Worker → R2 through the
+  trusted broker → Vercel's separate signed GET, byte-identical. See §11c.
+- **Phase 10 is complete.** The pinned runtime (10C1), the bounded analyzer
+  (10C2), connected generic execution (10C3) and the acceptance harness (10C4)
+  were followed by the Phase-10D live acceptance, the Phase-10E persistent
+  enablement and the Phase-10F control-plane correction. §4f–§4i record each
+  earlier phase *as it stood at the time* and carry supersession notes; the
+  closure record and the current operating state are §11h.
+- **Merging to `main` never deploys.** Vercel Git integration is not
+  connected, so a Production deployment happens only on explicit Product Owner
+  authorization, and its source identity is chain of custody from an exact
+  clean `main` worktree — not a Vercel Git attestation.
 
 ---
 
@@ -273,14 +287,16 @@ That result is **evidence about the enforcement model, not an acceptance**:
 
 - `YTDLP_NETWORK_ISOLATED` was **`false`** throughout Phases 8 and 9, and the
   runtime refused to start if it parsed truthy. That contract has since been
-  **retired** by Phase 10C1 — the variable is now refused at *any* value — but
-  the property it was standing in for is unchanged: generic yt-dlp execution
-  remains impossible. See §4.
+  **retired** by Phase 10C1 — the variable is now refused at *any* value.
+  Generic yt-dlp execution was impossible throughout Phases 8 and 9; it became
+  possible only after Phase 9 accepted this boundary, through the Phase-10D live
+  acceptance and the Phase-10E persistent enablement. See §4 and §11h.
 - Formal Phase 9 **was re-run against the exact final topology** on 2026-08-30
   and PASSED. See §11a. Its scope was the Worker **safe-egress** boundary; it did
   not remeasure the ingress path (§1a), which was left unchanged throughout.
-- Phase 10 remains the only phase authorized to enable yt-dlp, and it has not
-  begun.
+- Phase 10 was the only phase authorized to enable yt-dlp. It has since
+  completed: generic execution was accepted live in Phase 10D and enabled
+  persistently in Phase 10E. See §11h.
 
 The residual evidence items carried into Phase 9 are now CLOSED by that run:
 `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001`,
@@ -501,6 +517,16 @@ limactl start videofetch
   → cloudflared provides ingress
 ```
 
+**Current operating state.** Since Phase 10E the idle state is **Stopped**, and
+that is the intended state whenever the application is not in use. A stopped
+VM takes the entire execution plane offline — Worker, broker, safe-egress
+boundary and ingress together — while the Vercel control plane stays up and
+fails closed (§9). A normal `limactl start` brings up the seven installed and
+enabled units, and direct **and** generic operation become available with no
+further step, because `YTDLP_ENABLED=true` persists in
+`/etc/videofetch/worker.env` across a full VM stop/start (§11h). Nothing
+requires the VM to run 24/7.
+
 The user-facing start/stop wrapper is deliberately **not** part of this work; it
 follows once the deployment artefacts have been reviewed and installed.
 
@@ -508,8 +534,9 @@ follows once the deployment artefacts have been reviewed and installed.
 
 ## 4. yt-dlp
 
-**The Worker image ships a pinned yt-dlp runtime. Generic yt-dlp execution is
-implemented in the source as of Phase 10C3, and is NOT ENABLED in Production.**
+**The Worker image ships a pinned yt-dlp runtime (`2026.08.19`). Generic yt-dlp
+execution is implemented in the source as of Phase 10C3, was accepted live in
+Phase 10D, and is ENABLED in Production since Phase 10E.**
 
 Those statements are independent, and the whole design of this section is to
 keep them independent:
@@ -521,10 +548,14 @@ yt-dlp runtime installed
 ```
 
 *Since `PHASE-10C3-YTDLP-GENERIC-EXECUTION-INTEGRATION-001` a user-supplied URL
-CAN reach yt-dlp in the source, through the direct-first router. It cannot in
-Production, because `YTDLP_ENABLED` is unset there and the fail-closed default
-is disabled. §4h records the connected contract in full; §4a–§4f below describe
-the runtime, argument and environment policy, which Phase 10C3 did not change.*
+CAN reach yt-dlp in the source, through the direct-first router. Since
+`PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001` it can in Production
+too, whenever the on-demand VM is running: `/etc/videofetch/worker.env` sets
+`YTDLP_ENABLED=true`. The fail-closed default is unchanged — absent still means
+disabled — and removing that line, or setting exactly `false`, then restarting
+the Worker is the kill switch (§11h). §4h records the connected contract in
+full; §4a–§4f below describe the runtime, argument and environment policy,
+which Phase 10C3 did not change.*
 
 *Historical note: throughout Phases 8 and 9 the image contained neither Python
 nor yt-dlp, and `YTDLP_NETWORK_ISOLATED=false` was the operative lock. Both
@@ -691,6 +722,11 @@ unnecessarily loose operator execution surface, and the Production Worker has no
 need of it. The runtime identity is a reviewed constant in the image.
 
 ### 4f. What Phase 10C1 did NOT authorize *(historical — superseded by §4h)*
+
+> **Current disposition (post-Phase 10E).** The note below was itself written
+> in Phase 10C3 and is now superseded in one respect: Production **is**
+> enabled — by Phase 10E, through `/etc/videofetch/worker.env`. The image and
+> the committed systemd unit still carry no `YTDLP_ENABLED`. See §11h.
 
 > **This subsection describes the state as of Phase 10C1 and is retained as
 > history. Its central claim — that no user-URL execution path exists — stopped
@@ -1070,7 +1106,16 @@ application boolean.
 
 ---
 
-### 4h. Phase 10C3 — generic execution, CONNECTED but NOT DEPLOYED
+### 4h. Phase 10C3 — generic execution, CONNECTED but NOT DEPLOYED *(historical — deployed in Phase 10D, enabled in Phase 10E; see §11h)*
+
+> **Current disposition.** This subsection is the snapshot of the state after
+> Phase 10C3 and is preserved as written. Its deployment and enablement
+> statements — Production deployment and enablement "NOT performed",
+> `YTDLP_ENABLED` unset, generic extraction not reachable in Production — were
+> true then and are **superseded**: Phase 10D deployed and accepted generic
+> execution live, and Phase 10E enabled it persistently. Its code contract — the
+> browser trust boundary, raw format-id handling, the selector, the acquisition
+> scope, size enforcement and the durable lifecycle — remains current. See §11h.
 
 *The §4a–§4f runtime, argument and environment contracts are unchanged and
 remain authoritative. This subsection records what
@@ -1372,6 +1417,9 @@ Production deployment:    NOT performed
 Production enablement:    NOT performed
 ```
 
+> *Historical — the Phase-10C3 snapshot above and the paragraph below. Both are
+> superseded by Phase 10D and Phase 10E; see §11h.*
+
 Enabling generic extraction in Production remains a later, separately authorized
 task. It must include live public-site acceptance, a live safe-egress descendant
 proof, and a live R2 generic-media proof — none of which this phase performed.
@@ -1380,7 +1428,17 @@ because an existing execution path does not guarantee any given URL satisfies
 the public-source, progressive-HTTP(S), muxed-single-stream, safe-format-id and
 no-live policies.
 
-### 4i. Phase 10C4 — Production acceptance harness, NOT EXECUTED
+### 4i. Phase 10C4 — Production acceptance harness, NOT EXECUTED *(historical — executed in Phase 10D; see §11h)*
+
+> **Current disposition.** This subsection and its CORRECTION records are
+> preserved as written for the state after Phase 10C4. The harness has since
+> been **executed**: Phase 10D completed Stage A and the complete Stage B under
+> the final contract `10d-remediation-03`, and Phase 10E then enabled generic
+> execution persistently. The "NO" and "NOT performed" states below, the
+> statements that `YTDLP_ENABLED` is unset or absent, and the preference for a
+> disabled terminal state all describe that earlier time. The harness contract
+> itself — the stages, stop gates and evidence rules — remains current. See
+> §11h.
 
 *`PHASE-10C4-YTDLP-PRODUCTION-ACCEPTANCE-HARNESS-001` added acceptance tooling
 and reconciled stale deployment prose. It changed no Worker execution code, no
@@ -2421,6 +2479,9 @@ Nothing yet. Only after this harness has been **independently reviewed and
 merged** may Phase 10D be authorized to touch the Lima VM, build and deploy the
 exact reviewed image, or set `YTDLP_ENABLED=true`.
 
+> *Historical — superseded. Phase 10D was subsequently authorized, executed and
+> accepted; see §11h.*
+
 ---
 
 ## 5. Object storage (R2)
@@ -3091,21 +3152,65 @@ failed deterministically and may be retried by the user.
 
 ## 10. Phase-8B pre-flight checklist
 
-Except for the explicitly checked decision and acceptance-evidence items below,
-none of the production provisioning or deployment actions has been performed.
-Each unchecked provisioning/deployment item requires explicit Product Owner
+*Reconciled against accepted evidence on 2026-09-10 by
+`POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`, with the VM left Stopped and
+nothing re-measured.* An item is checked only where accepted evidence
+establishes it, and each check names its evidence class; an unchecked item
+lacks accepted evidence, which is not the same as being known to be missing.
+Where an original item no longer fitted the selected architecture it is
+restated, and its original wording is noted. The Phase-8B text of this section
+said that, apart from the checked items, no provisioning or deployment action
+had been performed; the deployment has since been performed (§11a–§11c, §11h).
+Any change to a provisioned item still requires explicit Product Owner
 authorization.
 
-- [ ] Host/provider and region selected.
-- [ ] Persistent volume provisioned and confirmed writable by UID 1000.
-- [ ] Exactly one replica configured; autoscaling disabled.
-- [ ] Read-only root filesystem, writable state mount, writable ephemeral `/tmp`.
-- [ ] All capabilities dropped; no privileged mode, host network or Docker socket.
+- [x] **Execution host selected — the Product Owner's local, on-demand Lima VM**
+      (`videofetch`, Ubuntu 24.04 ARM64, on the Product Owner's MacBook). The
+      original item read "Host/provider and region selected"; a cloud region
+      does not apply to a local host, so the item is restated to fit the
+      actual decision rather than checked as written. *Repository record of the
+      Product Owner's selection* — §1a, §3c.
+- [x] **Persistent state volume provisioned and writable by UID 1000.** The
+      committed unit bind-mounts `/var/lib/videofetch` read/write
+      (*repository-verifiable*). The non-root Worker has written durable job
+      rows there in Production, and they survived container replacement: the
+      live `shutdown` case recovered its interrupted row in a new container
+      (§11f, §11h — *accepted operator-measured*).
+- [x] **Exactly one replica — the supported deployment runs exactly one
+      Worker.** systemd manages exactly one `videofetch-worker` container, and
+      its start path force-removes the prior managed instance
+      (`ExecStartPre=-/usr/bin/docker rm -f videofetch-worker`) before starting
+      the replacement under the same fixed name. No autoscaling mechanism is
+      configured in the selected local-VM deployment (*repository-verifiable*:
+      `deploy/systemd/videofetch-worker.service`). The architecture supports
+      exactly one Worker and one SQLite writer (§1): running an additional
+      Worker against the same durable state is unsupported and violates the
+      deployment contract. The fixed name stops the managed service from
+      starting a second container under that name; it does not make an
+      independently launched, differently named container impossible.
+- [x] **Read-only root filesystem, writable state mount, writable ephemeral
+      scratch.** The unit passes `--read-only`, a read/write bind mount of
+      `/var/lib/videofetch`, and a `noexec,nosuid` tmpfs at `/tmp/videofetch`
+      owned by UID/GID 1000 (*repository-verifiable*). The live mount was
+      verified and then exercised by a real Production job (§11c — *accepted
+      operator-measured*).
+- [x] **All capabilities dropped; no privileged mode, host network or Docker
+      socket.** The unit passes `--cap-drop=ALL` and `no-new-privileges`,
+      carries no `--privileged` flag, joins only the media namespace
+      (`--network container:videofetch-media-netns`) and mounts no Docker
+      socket; `worker-unit-ytdlp-policy.test.ts` asserts the capability,
+      privilege, namespace and read-only controls (*repository-verifiable*).
+      Containment and mutation incapability were measured in situ by Phase 9
+      (§11a — *accepted operator-measured*).
 - [x] **External egress deny policy applied and owned outside the container.**
       *Installed and accepted.* The source artefacts in §3a are deployed on the
       Lima VM as the Phase-8B final stack, and Phase 9 accepted the boundary in
       situ (§11a). The prototype units remain only as inactive rollback assets.
-- [ ] TLS endpoint terminated in front of the Worker and reachable by Vercel.
+- [x] **TLS endpoint terminated in front of the Worker and reachable by
+      Vercel.** TLS terminates at Cloudflare in front of the named Tunnel, and
+      Vercel Production reached the Worker through Access and the Tunnel in the
+      end-to-end run and in every later Production acceptance (§11c, §11h —
+      *accepted operator-measured*).
 - [x] **`R2-CREDENTIAL-SCOPE-DECISION-001` closed by the Product Owner —
       Option B (renewable, action-scoped temporary credentials).** See §5f.
       Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001`. The decision
@@ -3162,23 +3267,55 @@ authorization.
       §5b. *Operator-attested: provisioned outside this repository and not
       independently re-verified here, since verifying it would require Vercel
       credentials this task deliberately does not hold.*
-- [ ] `WORKER_CONTROL_*` generated and configured on both runtimes.
-- [x] **`YTDLP_NETWORK_ISOLATED` confirmed false/unset.** Verified in the
-      running Worker container; yt-dlp is absent from the image and the VM.
-- [ ] Termination grace period >= Worker shutdown grace.
+- [x] **`WORKER_CONTROL_*` generated and configured on both runtimes.**
+      HMAC-authenticated Worker calls from Vercel Production succeed (§11c),
+      and the Phase-10D Stage-A gate `worker-env.required-present` measured
+      both names bound in the Worker, by name only (§11h — *accepted
+      operator-measured*). No value is recorded.
+- [x] **Retired yt-dlp variables absent; generic feature state explicit.**
+      `YTDLP_NETWORK_ISOLATED` and `YTDLP_PATH` are **absent** from
+      `/etc/videofetch/worker.env`: the presence of either at any value is
+      startup-fatal (*source-verifiable*), and the Phase-10D Stage-A gate
+      `worker-env.forbidden-absent` audits both names. `YTDLP_ENABLED=true` is
+      the persistent generic feature state (Phase 10E; accepted `worker.env`
+      SHA-256 `3583770c…`), and the accepted image `sha256:c3995e18…`
+      **contains** the pinned yt-dlp `2026.08.19` runtime (§11h — *accepted
+      operator-measured*). This replaces the Phase-8/9 item that confirmed the
+      retired variable false/unset and yt-dlp absent from the image and the VM,
+      which was true then and is no longer the contract.
+- [x] **Termination grace period >= Worker shutdown grace.** The unit sets
+      `TimeoutStopSec=30` and stops the container with `docker stop --time 15`;
+      both exceed `WORKER_SHUTDOWN_GRACE_MS` (10 000 ms,
+      `src/worker/runtime/runtime.server.ts`) (*repository-verifiable*).
 - [x] **Named tunnel created against a stable hostname; no router port
       forwarding; Worker not bound to any LAN or public interface.** Verified:
       the tunnel's ingress resolves a stable hostname to `http://127.0.0.1:8080`
       and the Worker publishes on VM loopback only.
-- [ ] Access application + **Service Auth** policy created; service token issued.
+- [x] **Access application + Service Auth policy created; service token
+      issued.** `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` was measured
+      against the real Service Auth configuration, and Vercel Production reaches
+      the Worker through Access (§11, §11c — *accepted provider observation /
+      operator-measured*). No token value or identifier is recorded.
 - [ ] `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET` set on
       **Vercel only** — both or neither — and never on the Worker.
+      *Left open by the 2026-09-10 reconciliation.* The Vercel half is
+      evidenced — Production authenticates to Access (§11c) — but no accepted
+      record measures their absence from the Worker: the Stage-A forbidden-name
+      audit does not cover these two names, and the §11 property that the
+      Worker never consumes them is a source property, not a deployment
+      measurement.
 - [x] **`CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` resolved and
       accepted.** Measured externally against the real Service Auth
       configuration. See §11.
 - [ ] External liveness probe wired in the deployment layer, from **outside**
       the restricted media namespace. The image ships no `HEALTHCHECK`.
+      *Left open by the 2026-09-10 reconciliation.* No automated external probe
+      is recorded as configured; successful manual health requests are not
+      one.
 - [ ] `GET /v1/healthz` returns 200 through the TLS endpoint.
+      *Left open by the 2026-09-10 reconciliation.* The TLS endpoint is proven
+      to reach the Worker's authenticated routes (§11c, §11h), but no accepted
+      record measures `/v1/healthz` itself through it.
 - [x] **Phase-9 safe-egress acceptance suite executed from inside the deployed
       boundary.** Executed 2026-08-30 and ACCEPTED. See §11a.
 
@@ -3190,7 +3327,7 @@ authorization.
 | :--- | :--- | :--- |
 | `R2-CREDENTIAL-SCOPE-DECISION-001` | **RESOLVED / CLOSED — Option B** | The Product Owner selected Option B: renewable, action-scoped temporary credentials. Implemented by `WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001` — the media Worker holds no persistent R2 credential, a trusted host broker outside the media namespace retains the single-bucket parent writer credential, and each operation receives a credential scoped to one bucket, one exact `WorkerObjectKey` and one S3 action with a bounded TTL, expressed as an action-only JWT claim set (corrected by `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001`; see §5b). The decision was **initially accepted using disposable live-provider material** — a throwaway bucket and parent token, torn down once that acceptance passed (§5f). **Production R2 and its credential plane were provisioned later, before Phase 9**, and the provider lifecycle backstop was added afterwards (§5h). The selected Option-B architecture is unchanged by either: minting stays renewable, action-scoped and per-operation. No account identifier, bucket name, token or secret value is recorded here. |
 | `R2-BROKER-PARENT-TOKEN-ROTATION-001` | **CLOSED** | Production R2 and its credential plane were provisioned **before** Phase 9, and the parent token was provisioned and verified with them. Custody is unchanged: the token remains a persistent broker-side credential held in the broker's `EnvironmentFile`, and rotation remains an `EnvironmentFile` update plus `systemctl restart videofetch-r2-broker`, which `BindsTo=` propagates as a brief Worker restart. No code change was required. Phase 9 did not exercise or modify R2 in any way; the broker ran untouched throughout with `NRestarts=0`. No account identifier, bucket name, token or secret value is recorded here. |
-| `R2-BROKER-LIVE-MINT-VERIFICATION-001` | **CLOSED — accepted** | **Initial failure → correction → definitive acceptance → teardown.** *First attempt, FAILED:* real R2 was reached and rejected the then-merged `scope + actions` credential at token **parsing** — `HTTP 400 InvalidArgument` on `X-Amz-Security-Token`, before any authorization decision — so the production path failed closed rather than over-granting; diagnostic action-only credentials were accepted and showed the intended enforcement, and expiration went unmeasured. *Correction:* `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001` (PR #21) changed **production** credentials to action-only claims (see §5b). *Definitive rerun, PASSED:* run against this repository's merged production implementation — the merged `mintTemporaryCredential` signer, the merged `CloudflareR2ObjectStoreWriter` for Put/Head/Delete, repository-generated `WorkerObjectKey` values, all three temporary-credential fields on every delegated request, **no parent-credential fallback** (a raw AWS SDK client was used only for `GetObject`/`ListObjectsV2`, which the production writer deliberately omits). The **full matrix passed**: under its own credential, exact-key `PutObject`, `HeadObject` and `DeleteObject` each **succeeded**, while every **cross-action** attempt, every **sibling-object** attempt and **`ListObjectsV2`** were **denied by R2** — provider-side authorization denials, not local or network failures. Denied sibling writes and deletes left the sibling untouched, the sibling genuinely existed during the head and delete sibling tests (no missing-object ambiguity), the delete negatives ran while the exact object still existed, and no post-delete 404 was used as denial evidence. **Natural expiration was enforced** on real wall-clock time (§5b) — a 1-second production credential replayed at `exp + 30s` was denied and created nothing, the observed expired-credential response in this acceptance being `403 SignatureDoesNotMatch` rather than a dedicated expiry code; because that response is not expiry-specific, the result was isolated by before/after acceptance of equivalent 1-second credentials for both `HeadObject` and `PutObject`. *Cleanup:* all task-owned objects were removed with fresh exact-key `DeleteObject` credentials and a read-only parent check reported 0 objects at the job prefix, 0 at the `videofetch` prefix and 0 bucket-wide. *Teardown (operator-attested, not independently re-verified):* disposable parent token revoked, disposable bucket confirmed empty and deleted, local acceptance credential file removed (§5f). **This gate therefore no longer blocks production R2 traffic.** Closure means only that the merged temporary-credential model passed live-provider acceptance — *at the time of closure* it did not mean production R2 was provisioned, that `R2-BROKER-PARENT-TOKEN-ROTATION-001` was resolved, or that Phase 9 or Phase 10 had progressed. **Those particular caveats have since been overtaken:** production R2 and its parent credential were provisioned before Phase 9, `R2-BROKER-PARENT-TOKEN-ROTATION-001` is CLOSED, and Phase 9 is COMPLETE / ACCEPTED. What this gate itself proved — that the merged mint path is action-scoped, exact-key and expiry-enforced against the live provider — is unaffected by any of that. It still does not mean Phase 10 progressed or that yt-dlp may be enabled; both remain closed off. |
+| `R2-BROKER-LIVE-MINT-VERIFICATION-001` | **CLOSED — accepted** | **Initial failure → correction → definitive acceptance → teardown.** *First attempt, FAILED:* real R2 was reached and rejected the then-merged `scope + actions` credential at token **parsing** — `HTTP 400 InvalidArgument` on `X-Amz-Security-Token`, before any authorization decision — so the production path failed closed rather than over-granting; diagnostic action-only credentials were accepted and showed the intended enforcement, and expiration went unmeasured. *Correction:* `R2-TEMP-CREDENTIAL-ACTIONS-ONLY-001` (PR #21) changed **production** credentials to action-only claims (see §5b). *Definitive rerun, PASSED:* run against this repository's merged production implementation — the merged `mintTemporaryCredential` signer, the merged `CloudflareR2ObjectStoreWriter` for Put/Head/Delete, repository-generated `WorkerObjectKey` values, all three temporary-credential fields on every delegated request, **no parent-credential fallback** (a raw AWS SDK client was used only for `GetObject`/`ListObjectsV2`, which the production writer deliberately omits). The **full matrix passed**: under its own credential, exact-key `PutObject`, `HeadObject` and `DeleteObject` each **succeeded**, while every **cross-action** attempt, every **sibling-object** attempt and **`ListObjectsV2`** were **denied by R2** — provider-side authorization denials, not local or network failures. Denied sibling writes and deletes left the sibling untouched, the sibling genuinely existed during the head and delete sibling tests (no missing-object ambiguity), the delete negatives ran while the exact object still existed, and no post-delete 404 was used as denial evidence. **Natural expiration was enforced** on real wall-clock time (§5b) — a 1-second production credential replayed at `exp + 30s` was denied and created nothing, the observed expired-credential response in this acceptance being `403 SignatureDoesNotMatch` rather than a dedicated expiry code; because that response is not expiry-specific, the result was isolated by before/after acceptance of equivalent 1-second credentials for both `HeadObject` and `PutObject`. *Cleanup:* all task-owned objects were removed with fresh exact-key `DeleteObject` credentials and a read-only parent check reported 0 objects at the job prefix, 0 at the `videofetch` prefix and 0 bucket-wide. *Teardown (operator-attested, not independently re-verified):* disposable parent token revoked, disposable bucket confirmed empty and deleted, local acceptance credential file removed (§5f). **This gate therefore no longer blocks production R2 traffic.** Closure means only that the merged temporary-credential model passed live-provider acceptance — *at the time of closure* it did not mean production R2 was provisioned, that `R2-BROKER-PARENT-TOKEN-ROTATION-001` was resolved, or that Phase 9 or Phase 10 had progressed. **Those particular caveats have since been overtaken:** production R2 and its parent credential were provisioned before Phase 9, `R2-BROKER-PARENT-TOKEN-ROTATION-001` is CLOSED, and Phase 9 is COMPLETE / ACCEPTED. What this gate itself proved — that the merged mint path is action-scoped, exact-key and expiry-enforced against the live provider — is unaffected by any of that. By itself it never meant that Phase 10 had progressed or that yt-dlp could be enabled — those were separate gates, and both have since been passed: see `PHASE-10D-YTDLP-PRODUCTION-STAGED-DEPLOYMENT-AND-LIVE-ACCEPTANCE-001` and `PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001` below. |
 | `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` | **CLOSED — accepted** | Empirically measured and accepted against the real Cloudflare Access Service Auth configuration; the gate is no longer blocking and is not reopened here. Scope note, unchanged: this is an acceptance of the measured INGRESS path, not a source-level property. This repository proves only that the Access service token is configured on Vercel alone and that the Worker application never consumes, verifies, persists or intentionally logs it — that part is still asserted by the control-plane boundary suite. Any change to the ingress topology invalidates the acceptance and requires a re-measurement. |
 | `PHASE-8B-SAFE-EGRESS-PROTOTYPE-RECOVERY-001` | **Source recovery complete; NOT a deployment or an acceptance** | The prototype's enforcement model was recovered from the Lima VM into reviewed source under `deploy/` and reconciled with the trusted-broker architecture (§3a). At the time of recovery the live VM was **not modified**, so prototype and reconciled source stayed comparable. No secret was copied: the only credential-shaped material encountered was clearly-labelled `FAKE_PROTOTYPE_*` placeholders in the stale prototype Worker unit, which is intentionally not recovered. **Superseded by deployment:** the reconciled artefacts have since been installed as the Phase-8B final stack, the prototype units are present but disabled and inactive, and Phase 9 acceptance PASSED against that live topology on 2026-08-30 — see §11a. |
 | `SAFE-EGRESS-NORDVPN-CONNECTED-RETEST-001` | **CLOSED — accepted 2026-08-30** | The COMPLETE acceptance suite was re-run against the live final topology with the operator's NordVPN client **actively connected** using their normal configuration (features left exactly as configured; none were enabled or disabled for the test). Connection was confirmed independently: the macOS default route moved to the NordLynx `utun` interface and the primary resolver changed with it. The VM's own routing was unaffected — Lima's `vz` NAT insulates the guest, so the media namespace's route fingerprint was byte-identical throughout and the watchdog recorded no breach. Under VPN the verifier passed **50/50** consecutive runs, and the whole matrix reproduced the disconnected-state result: every forbidden destination denied, counters attributed, designated DNS working, non-designated DNS dropped, rebinding and the controlled redirect contained, public HTTP/HTTPS succeeding, descendants confined, mutation refused, and the multicast measurement repeated. The operator's original (disconnected) state was restored and re-verified afterwards. See §11a. |
@@ -3201,6 +3338,10 @@ authorization.
 | `WORKER-TEMP-TMPFS-OWNERSHIP-001` | **CLOSED — merged, deployed and proven by a real job** | The Worker unit mounted its media temp filesystem as `--tmpfs /tmp/videofetch:rw,noexec,nosuid,size=2g`, with no ownership options. A tmpfs is a fresh filesystem mounted **over** the mountpoint, so it shadowed the directory `Dockerfile.worker` creates and `chown`s to `node:node`, and the kernel gave the new mount `root:root 0755` while the Worker runs as uid/gid **1000**. The first production direct-media job therefore failed `PROCESSING_FAILED` about 13 ms in, on `mkdir /tmp/videofetch/jobs` → `EACCES`, with `object_key = null` and nothing written to R2. Image-layer ownership cannot satisfy a path a tmpfs is mounted over; only the mount can. Fixed by appending `uid=1000,gid=1000` — **PR #29, merge commit `a5eba777d7b169f83836f045fcf43bab8578c6f6`**. `rw`, `noexec`, `nosuid`, `size=2g`, `--read-only`, `--cap-drop=ALL` and `no-new-privileges` are all retained, the Worker still runs non-root, the mount is not world-writable and is still a tmpfs rather than a host bind, and no application code changed. The suite's previous single order-sensitive regex had actively certified the broken declaration; it is replaced by an option-set parser plus guards against relaxing `noexec`/`nosuid` or substituting a bind mount. Verified live and then proven by a real production job. See §11c. |
 | `VERCEL-DIRECT-MEDIA-E2E-001` | **CLOSED — complete production chain accepted 2026-08-30** | The full path — private-access authentication on Vercel Production, Vercel → Cloudflare Access → named Tunnel → Worker HMAC, `direct` extraction of a controlled public MP4, real job execution on the Worker, `PutObject` + `HeadObject` through the trusted broker, `ready` commit with a durable `object_key`, and a byte-identical download through Vercel's **separate** R2 signer — was executed end to end and passed. yt-dlp was neither present nor invoked. See §11c. |
 | `NPM-LOCKFILE-RECONCILIATION-001` | **CLOSED** | `package-lock.json` carries a pre-existing devDependency resolution (`nitro` → `unstorage` requires `lru-cache@^11`, the lock pins `5.1.1`) that npm 10 rejects and npm 11 accepts. The Worker image works around it with an exact-pinned ephemeral npm 11 running `ci`; no `npm install` is used and the lockfile is unmodified. **Resolved and merged** in PR #24 (merge commit `7009550d5573dc5b7d3b7eda7efaf20120a1c22f`), with npm `11.19.1` pinned and the lockfile intentionally unchanged. |
+| `PHASE-10D-YTDLP-PRODUCTION-STAGED-DEPLOYMENT-AND-LIVE-ACCEPTANCE-001` | **COMPLETE / ACCEPTED** | Production staged deployment and live acceptance of generic yt-dlp execution under the final contract `10d-remediation-03`: a fresh Stage A and the complete Stage B — generic success, cancellation, byte limit, Worker restart recovery (the live proof of PR #41), safe egress, direct regression and the final rollback / kill-switch feature state — accepted against Worker runtime source `e4fa646b…` and image `sha256:c3995e18…`. Earlier-schema runs remain historical only. *Accepted operator-measured Production evidence;* run identifiers are not reproduced. See §11h. |
+| `PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001` | **COMPLETE / ACCEPTED** | `/etc/videofetch/worker.env` carries `YTDLP_ENABLED=true` exactly once, with the retired `YTDLP_NETWORK_ISOLATED` and `YTDLP_PATH` absent (accepted SHA-256 `3583770c…`), and the state survives a full VM stop/start. No image rebuild. `YTDLP_ENABLED` is now the operational kill switch — a feature switch, not the network boundary. The VM stays on demand. *Accepted operator-measured Production evidence.* See §11h. |
+| `PHASE-10F-CONTROL-PLANE-503-ERROR-DISAMBIGUATION-001` | **CLOSED / PRODUCTION ACCEPTED** | PR #43, merge `b4640ff6c92e92c0df2737d5a8c3bfc383837e70` (*GitHub-verifiable*). A canonical Worker `503` + `EXTRACTOR_UNAVAILABLE` is preserved by the control plane instead of collapsing to `WORKER_UNAVAILABLE` — a strict canonical shape/contract match, not authenticated provenance (§1b). Proven live through real Production (*accepted operator-measured*). See §11h. |
+| `WORKERCLIENT-TOTAL-RESPONSE-DEADLINE-HARDENING-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | PR #44, merge `45c625041389df7e1b37ef6d25a27b9e629ca134` (*GitHub-verifiable*). One `requestTimeoutMs` budget covers request start → headers → complete body consumption on every Worker response path (§1b). Deployed as Vercel `dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC` — chain of custody, not Vercel Git-attested. See §11h. |
 
 ---
 
@@ -3765,6 +3906,8 @@ Worker never held a signer key, and Vercel never held a writer or parent key.
 
 ### yt-dlp remains disabled
 
+*As recorded on 2026-08-30, before Phase 10 began. Superseded — generic execution has since been accepted and enabled; see §11h.*
+
 `YTDLP_NETWORK_ISOLATED=false` in the live container, no `yt-dlp`, `youtube-dl`
 or `python3` binary present in the image, Worker diagnostics reporting
 `ytdlp: false` through the real Vercel path, and the successful job using
@@ -3923,6 +4066,9 @@ metadata or weakening acceptance, so it was left to its own task and review.
 > existed. **Live Phase 10D has still not been executed:** Stage A, enabling
 > generic, and Stage B all remain outstanding, and nothing below is a claim
 > about Production.
+>
+> *Superseded: live Phase 10D has since been executed and accepted, and generic
+> execution is enabled in Production — see §11h.*
 
 **D1 — `hasAudio` is unreachable for any video-bearing format.**
 `selectCandidates` requires `audio_ext !== "none"`, but yt-dlp 2026.08.19's
@@ -4055,6 +4201,14 @@ returned to **Stopped**, its initial power state.
 
 
 ## Phase 10D — the first authenticated Stage-A run (FAILED)
+
+> **Historical run records.** This section and the Phase-10D sections after it,
+> through §11g, are dated records of individual runs and remediations,
+> preserved as written. Their present-tense statements — generic execution
+> "remains DISABLED", Stage B "has not started", PR #41 "not closed live" —
+> describe the moment each was recorded. None of their sealed artifacts was
+> modified, re-graded or resealed. Phase 10D's closure and the current
+> operating state are in §11h.
 
 Run `5e6670a858543d93`, schema `10d-remediation-01`, `live`, against the
 reviewed Worker image `sha256:b7b7554c…62b5` at source
@@ -4661,6 +4815,15 @@ and that part is enforced and tested.
 
 ### Operational consequence
 
+> **HISTORICAL / SUPERSEDED PLAN.** Everything under this heading and under
+> *PR #41 status* below is the forward plan as written when PR #42 merged,
+> preserved verbatim. It was carried out: a fresh Stage A and the complete
+> Stage B ran under `10d-remediation-03`, the `shutdown` case live-proved
+> PR #41, and Phase 10D closed. Its instruction to finish with generic
+> disabled governed Phase 10D only; the persistent enabled state was
+> established afterwards by Phase 10E. **None of it is a current
+> instruction.** The current record is §11h, below.
+
 No Worker runtime change and no image change is created by this PR. The
 accepted Worker runtime remains source `e4fa646b…`, image `sha256:c3995e18…`,
 and **no rebuild or redeploy is required**.
@@ -4689,6 +4852,10 @@ operation the boundary refuses.
 
 ### PR #41 status
 
+> *Historical — as of PR #42. The live Stage-B re-proof of PR #41 has since
+> been executed and accepted within Phase 10D, and generic execution has since
+> been enabled by Phase 10E. See §11h.*
+
 The restart-recovery defect of §11f is **not** closed live. It remains:
 
 - **SOURCE-REMEDIATED**
@@ -4697,3 +4864,152 @@ The restart-recovery defect of §11f is **not** closed live. It remains:
 
 The next live `shutdown` case remains the load-bearing test. Generic remains
 **disabled**.
+
+---
+
+## 11h. Phase-10 closure and current operating state
+
+**Recorded 2026-09-10 by `POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`.**
+This section *records* previously accepted evidence; it reproduces none of it.
+No VM was started, no `worker.env` was read, and no Worker, Vercel, Cloudflare
+or R2 state was re-measured to write it. Evidence classes are named inline —
+*GitHub-verifiable*, *repository/source-verifiable*, *accepted
+operator-measured Production evidence*, *accepted provider observation*,
+*operator-attested*. No secret, account identifier, bucket name, token, HMAC
+value, temporary hostname or signed URL appears here, and no closed gate in §11
+is reopened.
+
+### Phase 10D — COMPLETE / ACCEPTED
+
+`PHASE-10D-YTDLP-PRODUCTION-STAGED-DEPLOYMENT-AND-LIVE-ACCEPTANCE-001`
+
+| | |
+| :--- | :--- |
+| Final accepted contract | `10d-remediation-03` — `EVIDENCE_SCHEMA_VERSION`, aliased by `CASE_SCHEMA_VERSION` (*source-verifiable*) |
+| Stage A | completed successfully, fresh, under the final contract |
+| Stage B | the complete sequence completed successfully under the final contract |
+| Accepted requirements | generic success · cancellation · byte limit · Worker restart recovery (`shutdown`) · safe egress · direct regression · final rollback / kill-switch feature state |
+| Worker runtime source | `e4fa646bf7492e16fc8d2733982f708a1e243afb` — the PR #41 merge (*GitHub-verifiable*) |
+| Worker image | `sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa` |
+| Pinned yt-dlp | `2026.08.19` (*source-verifiable*: `src/worker/runtime/ytdlp-runtime.server.ts`) |
+
+*Accepted operator-measured Production evidence*, except where marked. The
+sealed final-contract Stage-A and Stage-B artifacts are not stored in this
+repository. Their run identifiers and per-check counts are deliberately **not
+reproduced** here: this reconciliation could not re-verify them from
+repository-accessible evidence, and it does not reconstruct identifiers from
+memory. No artifact was modified, re-graded or resealed.
+
+- **PR #41 is live-proven.** The restart-recovery defect of §11f —
+  source-remediated by PR #41 — was re-proven by the live `shutdown` case under
+  the final contract. The "LIVE STAGE-B RE-PROOF NOT YET EXECUTED" status at
+  the end of §11g is superseded.
+- **The earlier runs stay history.** Runs `5e6670a858543d93`
+  (`10d-remediation-01`, FAILED), `a9ce1c400db8d817` and `132658924d1c7a1b`
+  (both `10d-remediation-02`), and their case records — including the
+  `shutdown` FAIL that caught the §11f defect — are unchanged. They remain
+  inadmissible under `10d-remediation-03` by design (§11g): Phase 10D closed on
+  fresh runs, not on relabelled ones.
+
+### Phase 10E — COMPLETE / ACCEPTED
+
+`PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001` — *accepted
+operator-measured Production evidence.*
+
+| | |
+| :--- | :--- |
+| Persistent Worker configuration | `/etc/videofetch/worker.env` |
+| Accepted file SHA-256 | `3583770c69e0ef7535077ab3d0eda82b1af836c68849dbfde0aa380f8ca459a1` |
+| `YTDLP_ENABLED` | `true`, exactly once |
+| `YTDLP_NETWORK_ISOLATED` | **absent** — retired; startup-fatal at any value |
+| `YTDLP_PATH` | **absent** — retired; startup-fatal if present |
+| Persistence | survives a full VM stop/start |
+| Worker image | unchanged — the accepted `sha256:c3995e18…` image; no rebuild |
+
+The committed unit still sets no `Environment=YTDLP_ENABLED`; the value lives
+only in `worker.env` (§4i). *Enabled* is now the accepted baseline, so a
+missing or `false` value is drift from it.
+
+**`YTDLP_ENABLED` is the operational kill switch.** To disable generic
+extraction: remove the line from `/etc/videofetch/worker.env`, or set it to
+exactly `false`, and restart `videofetch-worker` only. Direct media keeps
+working. Restoring the accepted state means restoring the exact accepted file
+(SHA-256 above) and restarting the Worker again.
+
+**Enablement switches a feature; it is not the boundary.** `YTDLP_ENABLED`
+decides whether the application offers generic extraction and attests nothing
+about egress. Safe egress stays enforced **outside** the Worker — the media
+network namespace, its host-owned nftables policy, the policy verifier and the
+watchdog (§3, §3a) — which the Worker can neither read nor alter, and which
+Phase 9 accepted in situ (§11a).
+
+### Phase 10F — CLOSED / PRODUCTION ACCEPTED
+
+`PHASE-10F-CONTROL-PLANE-503-ERROR-DISAMBIGUATION-001` — PR #43, merge commit
+`b4640ff6c92e92c0df2737d5a8c3bfc383837e70` (*GitHub-verifiable*). The contract
+is in §1b.
+
+A canonical Worker `HTTP 503` carrying `EXTRACTOR_UNAVAILABLE` is preserved by
+the Vercel control plane as `EXTRACTOR_UNAVAILABLE`, and is **not** collapsed
+into `WORKER_UNAVAILABLE`. Live Production verification proved exactly that
+through the real control plane (*accepted operator-measured Production
+evidence*). Because `EXTRACTOR_UNAVAILABLE` is what a non-direct URL receives
+when generic extraction is unavailable, that proof ran with the kill switch
+temporarily in its disabled state; the accepted Phase-10E `worker.env` is the
+persistent state.
+
+The accepted classification is a **strict canonical shape / contract match** —
+content type, length, bounded body read, strict schema, exact code and the
+canonical message. It is **not** authenticated provenance: it does not prove
+that the envelope originated at the Worker, and this boundary has no response
+authentication (§1b).
+
+### WorkerClient total-response deadline — CLOSED / DEPLOYED / PRODUCTION ACCEPTED
+
+`WORKERCLIENT-TOTAL-RESPONSE-DEADLINE-HARDENING-001` — PR #44, merge commit
+`45c625041389df7e1b37ef6d25a27b9e629ca134` (*GitHub-verifiable*).
+
+One `requestTimeoutMs` budget covers **request start → headers → complete
+response-body consumption** — never a fresh budget per phase — for:
+
+- ordinary successful Worker responses;
+- non-503 Worker error responses;
+- health responses;
+- the Phase-10F `503` classifier.
+
+The contract is in §1b. Its primary proof is the deterministic source
+regression and mutation suite in `src/web/worker/worker-client.server.test.ts`
+(*repository-verifiable*); no synthetic stalled-body live test was required in
+Production. Deployed to Vercel Production as
+`dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC` and accepted there (*accepted
+operator-measured Production evidence*).
+
+### Vercel provenance — chain of custody, not Git attestation
+
+Vercel Git integration is **not connected**. Deployments carry no Git commit
+metadata, so Vercel does **not** attest which commit a deployment was built
+from. The source identity of `dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC` is **chain of
+custody**: it was deployed from a clean worktree of the exact `main` commit
+`45c625041389df7e1b37ef6d25a27b9e629ca134` (*operator-attested*).
+
+The same absence is also a safeguard: **a merge to `main` never deploys.** A
+Production deployment happens only on explicit Product Owner authorization,
+and merging any pull request is not that authorization.
+
+### Current operating state
+
+| Plane | State |
+| :--- | :--- |
+| Control plane | Vercel Production `dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC` — deployed and accepted |
+| Execution plane | the on-demand `videofetch` Lima VM — idle state **Stopped** |
+| Worker image | `sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa` |
+| Generic feature | enabled persistently — in effect whenever the VM runs |
+| Safe egress | enforced externally; Phase 9 accepted |
+| 24/7 requirement | **none** |
+
+```
+VM Stopped  →  the execution plane is intentionally offline; the control
+               plane stays up and fails closed (§9)
+VM started  →  the seven installed and enabled units come up, and direct AND
+               generic operation become available with no further step
+```

@@ -6,13 +6,29 @@ references any of it, and none of it is part of the Worker image's runtime path.
 > ### Status
 >
 > ```
-> contract version:          10d-remediation-03
+> contract version:          10d-remediation-03 (the final accepted contract)
 > harness exists:            YES
-> Stage A (live):            NO CURRENT RECORD — every sealed Stage A is
->                            historical; a FRESH one is required
-> Stage B:                   NOT STARTED under the current contract
-> Production enablement:     NO — YTDLP_ENABLED remains unset
+> Stage A (live):            COMPLETED — fresh, under 10d-remediation-03
+> Stage B (live):            COMPLETED — the complete sequence, under
+>                            10d-remediation-03
+> Phase 10D:                 COMPLETE / ACCEPTED
+> Production enablement:     YES — YTDLP_ENABLED=true persists in worker.env
+>                            (PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001)
 > ```
+>
+> *Current status, recorded 2026-09-10 by
+> `POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001` from accepted
+> operator-measured Production evidence; nothing was re-run to record it. The
+> sealed final-contract artifacts are not stored in this repository and their
+> run identifiers are not reproduced here. The closure record is §11h of
+> [`docs/architecture/worker-deployment-runbook.md`](../../../docs/architecture/worker-deployment-runbook.md).*
+>
+> *The rest of this Status block is the status history as recorded before
+> Phase 10D closed, preserved verbatim: its "still disabled", "no Stage B case
+> has run" and "has not been set" statements describe that time. Rationale
+> elsewhere in this README that cites Production `YTDLP_ENABLED` being unset —
+> such as why the aggregate accepts a disabled terminal state — was written for
+> Phase 10D; the harness contract it explains is unchanged.*
 >
 > **Read the run history below as history.** The contract version has moved
 > twice since, and `verifyRecord` admits only `10d-remediation-03`. Every run
@@ -63,7 +79,7 @@ These are not interchangeable, and the harness never labels one as the other.
 | **Proves** | pinned-runtime *semantics* | the behaviour of the *deployed system* |
 | **Needs** | the image, `--network none` | a real deployment, a real job, real bytes |
 | **Run by** | anyone, any time | Phase 10D, under a double opt-in |
-| **Status** | executed and green | **ATTEMPTED ONCE — FAILED** (see below) |
+| **Status** | executed and green | **COMPLETED** — Phase 10D accepted under `10d-remediation-03`; the earlier attempts below, including the first FAILED run, are history |
 
 A green offline run is **not** Production acceptance. It says the artifact in
 the image behaves as reviewed; it says nothing about what a deployed Worker did

@@ -1,6 +1,18 @@
 # Worker Execution Boundary and Architecture
 
-## Current Architecture Constraints
+> **Status.** This document originated as the migration boundary design for
+> moving media work out of the web runtime. That migration is **complete**:
+> the external-Worker architecture below is the implemented Production
+> architecture. The first architecture section is kept as the pre-migration
+> baseline, and forward-looking wording elsewhere ("target", "planned",
+> "future", "proposed") records the design as it was written. For the current
+> deployment state and operating model, read
+> [`worker-deployment-runbook.md`](worker-deployment-runbook.md).
+
+## Pre-migration architecture — HISTORICAL BASELINE *(originally "Current Architecture Constraints")*
+
+*Retained as history. "Currently" in the paragraph below means before the
+migration: VideoFetch no longer runs this way.*
 
 Currently, the VideoFetch architecture couples the web control plane and media extraction/processing into a single runtime (designed for Vercel, but currently running as a single Node.js process containing FFmpeg and yt-dlp).
 
@@ -16,7 +28,7 @@ flowchart TD
     Browser <--|Download| Vercel
 ```
 
-## Target Architecture
+## Current / implemented architecture *(originally "Target Architecture")*
 
 The target architecture moves all media analysis, downloading, and processing out of the web runtime into a long-lived external worker. The Vercel runtime acts strictly as the web/control plane.
 
@@ -32,6 +44,17 @@ flowchart TD
     Vercel -->|Signed URL| Browser
     Browser -->|Direct Download| ObjectStore
 ```
+
+**As implemented and deployed.** The design above is realized as: the Vercel
+control plane → Cloudflare Access (Service Auth) → a named Cloudflare Tunnel
+→ the Worker on an on-demand Lima VM, with Vercel's Worker calls
+HMAC-authenticated; durable SQLite job state; direct-first analysis with a
+generic yt-dlp fallback for eligible public URLs, enabled in Production since
+Phase 10E; media egress confined by the external safe-egress boundary; R2
+writes made with per-operation credentials minted by a trusted host broker; and
+delivery through a short-lived Vercel-signed GET. "Long-lived" means
+long-lived while the VM runs: the execution plane is on demand, not 24/7. See
+[`worker-deployment-runbook.md`](worker-deployment-runbook.md).
 
 ### Trust Boundary
 
@@ -100,6 +123,12 @@ Example conceptual form: `videofetch/jobs/<32-hex-job-id>/<random-128-bit-token>
 - **Worker (ObjectStoreWriter):** Has credentials to `put`, `head`, and `delete`. The worker DOES NOT sign download URLs.
 - **Vercel (ObjectStoreSigner):** Has credentials to `signGet`. Vercel DOES NOT have upload/delete credentials.
 
+*As implemented, the Worker holds **no persistent** R2 credential. Each `put`,
+`head` and `delete` uses a credential the trusted host broker mints for that
+single operation — one bucket, one exact object key, one action, a bounded TTL
+(`WORKER-R2-TEMP-CREDENTIAL-DELEGATION-001`) — and the Worker refuses to start
+if a persistent writer credential is present.*
+
 ### Object & Metadata Lifecycle
 
 There are two distinct lifetimes: durable job metadata (authoritative) and the completed object itself.
@@ -135,6 +164,14 @@ There are two distinct lifetimes: durable job metadata (authoritative) and the c
 | `src/services/processing/ffmpeg.server.ts` | FFmpeg remuxing/conversion | Worker | FFmpeg must run in the worker environment. |
 | `src/services/temp/files.server.ts` | Local temp file containment | Worker | Vercel will no longer handle local media files. |
 
+*Historical mapping, from before the migration. Execution now lives in the
+Worker runtime under `src/worker/`, which reuses some lower-level helpers from
+`src/services/` — the direct downloader, format normalization, the FFmpeg and
+process-runner utilities, and temp-file containment. The legacy download
+manager, processor, extractor registry, `ytdlp.server.ts` and FFmpeg module are
+barred from the browser-facing API by
+`src/web/boundary/control-plane-boundary.test.ts`.*
+
 ## Health and Diagnostics
 
 - **Web Health (`/api/health`):** Unauthenticated, minimal Vercel uptime check. Does not expose worker secrets.
@@ -148,6 +185,13 @@ There are two distinct lifetimes: durable job metadata (authoritative) and the c
 | `WORKER_CONTROL_SECRET` | YES | YES | NO | HMAC signing for Vercel-to-Worker API. |
 | Storage Writer Creds | NO | YES | NO | Worker uploads to Object Storage. |
 | Storage Signing Creds | YES | NO | NO | Vercel generates signed download URLs. |
+
+*As implemented: "Storage Writer Creds" are per-operation credentials minted by
+the host broker, never a persistent Worker secret (see the note under Temporary
+Storage Model). The broker's parent credential is supplied only to the broker
+on the VM host, outside the media namespace — never to the Worker or to Vercel.
+The Cloudflare Access service-token pair is configured on Vercel, and the Worker
+never reads it.*
 
 ## Repository Packaging Strategy
 
@@ -166,6 +210,11 @@ The current `Dockerfile` contains Node, FFmpeg, Python, and yt-dlp.
 **Future Direction:**
 - A new `Dockerfile.worker` will be created specifically for the worker runtime.
 - Vercel handles the web runtime without needing a custom Docker image.
+
+*Realized: `Dockerfile.worker` is the Worker image — its own FFmpeg, Python 3
+and a digest-pinned yt-dlp runtime — and Vercel builds the control plane without
+a custom image. The root `Dockerfile` remains as the legacy single-runtime
+image.*
 
 ## Rollback Model
 

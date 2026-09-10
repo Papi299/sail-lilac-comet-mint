@@ -64,9 +64,10 @@ export function resetPrivateAccessApiForTests(): void {
  *
  * It is one of THREE independent conjuncts in `ytdlp` below, and the weakest
  * kind of claim of the three: code existing is not a runtime being installed,
- * and neither is an operator having enabled the feature. Production still runs
- * with `YTDLP_ENABLED` unset as of this change, so `/api/sites.ytdlp` remains
- * false there.
+ * and neither is an operator having enabled the feature. `/api/sites.ytdlp` is
+ * true only while all three hold. Which deployment currently satisfies them is
+ * deployment state, recorded in docs/architecture/worker-deployment-runbook.md
+ * §11h rather than in source.
  */
 export { GENERIC_YTDLP_EXECUTION_IMPLEMENTED } from "@/shared/capabilities";
 

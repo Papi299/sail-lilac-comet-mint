@@ -2,7 +2,7 @@
 
 A polished video downloader. Paste a link, pick a quality, and download the file.
 
-VideoFetch analyzes public video pages and direct media URLs, normalizes available formats, then processes the download in a background job. Separate video and audio streams are merged automatically when FFmpeg is available.
+VideoFetch analyzes direct media URLs and eligible public video pages, offers application-owned quality presets, and runs each download as a durable background job on a standalone Worker; the finished file is kept briefly in private object storage and delivered through a short-lived signed link. Separate video and audio streams are **not** merged: generic pages are handled by a deliberately narrow yt-dlp path (see *Architecture* below).
 
 ## Features
 
@@ -16,37 +16,44 @@ VideoFetch analyzes public video pages and direct media URLs, normalizes availab
 ## Architecture
 
 ```text
-Frontend (TanStack Start)
-  → REST API
-    → Extractor registry (sample, direct media, yt-dlp)
-      → Job queue / workers
-        → FFmpeg processing
-          → Temporary storage
-            → Secure download URL
+Private browser
+  → Vercel control plane      private-access gate, request validation,
+                              HMAC-signed Worker calls, signed R2 GETs
+  → Cloudflare Access + named Tunnel
+  → standalone Worker         on-demand Lima VM
+      → SQLite durable job state
+      → direct-first analysis and acquisition
+      → generic yt-dlp fallback, when the URL is eligible
+      → Worker processing     its own FFmpeg, where a preset needs it
+      → temporary R2 object   per-operation credentials from a host broker
+  → Vercel signed download    short-lived GET; the object then expires
 ```
 
-Extractors implement a shared `MediaExtractor` interface (`canHandle`, `getMetadata`, `getFormats`, `download`) so additional websites can be added without changing the rest of the app.
+The control plane never runs media work: when the Worker is unreachable it fails closed with `WORKER_UNAVAILABLE`, and it never falls back to local processing. The Worker runs on demand — while its VM is stopped the downloader is offline by design. Media egress is confined by an external safe-egress boundary (a media network namespace, a host-owned nftables policy and a watchdog) that the Worker cannot read or alter. The current deployment state and operating model are in [`docs/architecture/worker-deployment-runbook.md`](docs/architecture/worker-deployment-runbook.md).
+
+**Generic v1 scope.** Generic extraction covers public, single-item, non-live sources that can be acquired as one progressive HTTP(S) format, and it offers only application-owned presets — never raw upstream format ids. There is no HLS or DASH acquisition and no split video+audio merge, so a source whose usable renditions would need a merge yields no generic video option.
+
+The `src/services/` extractor registry (`MediaExtractor`) and in-process download manager are the pre-migration design. They remain in the repository, and the Worker reuses some of their lower-level helpers, but they are not the Production execution path: `src/web/boundary/control-plane-boundary.test.ts` bars the browser-facing API from reaching them.
 
 ## Requirements
 
-- Node.js 22
-- FFmpeg
-- Python 3 with `yt-dlp` (`pip install yt-dlp`)
+- **Web control plane and tests:** Node.js 22 and npm. No local FFmpeg, Python or yt-dlp is needed to run the web control plane, and `npm test` does not require FFmpeg or yt-dlp.
+- **Worker:** built from `Dockerfile.worker`, which ships its own FFmpeg, Python 3 and a digest-pinned yt-dlp runtime — nothing is installed with `pip`. It runs on the Lima VM behind its R2 credential broker and safe-egress boundary; see `deploy/README.md` and the runbook.
 
 ## Development
 
 ```sh
 npm install
-pip install yt-dlp
-cp .env.example .env   # optional; defaults work for local development
 npm run dev
 ```
 
-The app listens on port 8080.
+`npm run dev` starts **only the web control plane** — the Vite dev server on port 8080. The UI loads, but every downloader request fails closed with `WORKER_UNAVAILABLE` until the control plane can reach a Worker: `WORKER_BASE_URL`, `WORKER_CONTROL_KEY_ID` and `WORKER_CONTROL_SECRET` must be present in its environment, plus `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET` when the Worker sits behind Cloudflare Access, and the `R2_*` location and signer variables for the final download. `.env.example` documents every variable.
+
+The repository does **not** provide a local end-to-end Worker workflow. No script starts a Worker; the Worker image is deployed together with its R2 credential broker and its external safe-egress boundary (`deploy/README.md`), and generic yt-dlp execution must never be enabled on a Worker that lacks that boundary. End-to-end behaviour is exercised against the deployed stack; locally, `npm test` exercises both runtimes without any external download.
 
 ## Scripts
 
-- `npm run dev` — development server
+- `npm run dev` — development server for the web control plane only (no Worker)
 - `npm run build` — production build
 - `npm run typecheck` — TypeScript
 - `npm test` — unit tests (no live downloads)
@@ -66,7 +73,7 @@ See `.env.example`. Important knobs:
 | `MAX_CONCURRENT_PER_PRINCIPAL` | 2 | Active downloads per authenticated operator. Process-local. |
 | `RATE_LIMIT` | 20/min | Analyze requests per authenticated operator. Process-local. Forwarded-IP headers are not used as identity. |
 | `TEMP_DIRECTORY` | OS temp `/videofetch` | Isolated job folders |
-| `YTDLP_ENABLED` | unset (disabled) | Worker-only. Whether generic yt-dlp extraction is enabled. Exactly `true` or `false`; any other spelling is a startup failure. Absent means disabled. Installing the yt-dlp runtime does **not** enable it, and as of Phase 10C1 no user-URL yt-dlp execution path exists at all. |
+| `YTDLP_ENABLED` | unset (disabled) | Worker-only. Whether generic yt-dlp extraction is enabled. Exactly `true` or `false`; any other spelling is a startup failure. Absent means disabled. Installing the yt-dlp runtime does **not** enable it. The accepted Production Worker sets `YTDLP_ENABLED=true` persistently in `/etc/videofetch/worker.env` (Phase 10E), where it is the operational kill switch. It never controls or attests the network boundary — see `docs/architecture/safe-egress.md`. |
 | ~~`YTDLP_NETWORK_ISOLATED`~~ | — | **Retired.** It was an operator attestation, never the boundary. The Worker runtime refuses to start if it is present at any value, `false` included. |
 | ~~`YTDLP_PATH`~~ | — | **Retired** for the Worker: it chose the executable and prepended arbitrary leading arguments to every invocation. Also startup-fatal if present. |
 | `VIDEOFETCH_ACCESS_SECRET` | unset | Server-only private-access secret. Minimum 32 UTF-8 bytes. Required in production for downloader APIs; missing/short values fail closed (HTTP 503) instead of exposing the downloader. **`GET /api/diagnostics` requires a configured secret and a valid session in every environment**, including local development — the ordinary development bypass does not apply there. Rotating it invalidates active sessions. Generate with `openssl rand -base64 32`. Never expose via `VITE_*`. |
@@ -92,13 +99,7 @@ Local development may omit `VIDEOFETCH_ACCESS_SECRET` for ordinary downloader op
 
 ## Docker
 
-The image installs FFmpeg and yt-dlp:
-
-```sh
-docker compose up --build
-```
-
-Temporary media is written to a tmpfs volume.
+`docker compose up --build` builds the root `Dockerfile`, which is the **legacy single-runtime image**. It serves the web app with `npm run preview` on port 8080; the FFmpeg and system yt-dlp it installs belong to the pre-migration in-process stack, which the browser-facing API no longer reaches. As configured it provides no `VIDEOFETCH_ACCESS_SECRET` and no Worker variables, so its downloader APIs fail closed. It is **not** the Worker image — that is `Dockerfile.worker`, deployed as described in `deploy/README.md`.
 
 ## Deployment provenance
 
@@ -108,7 +109,7 @@ Production artifacts must be generated from the exact reviewed source commit. Do
 
 A future Vercel deployment must build from source. If a prebuilt deployment workflow is introduced later, that prebuilt output must be freshly generated from the exact approved commit in that workflow.
 
-Production deployment is not currently authorized.
+Production deployments are made only on explicit Product Owner authorization, from a clean worktree at the exact reviewed `main` commit. Vercel Git integration is not connected, so a merge never deploys and Vercel does not attest which commit a deployment was built from: deployment source identity is chain of custody. The current accepted Production deployment is recorded in `docs/architecture/worker-deployment-runbook.md` §11h.
 
 Docker already excludes `.vercel` (see `.dockerignore`) and runs `npm run build` from source inside the image. This repository does not copy generated Vercel output into the image.
 
@@ -116,18 +117,21 @@ Docker already excludes `.vercel` (see `.dockerignore`) and runs `npm run build`
 
 ## Tests
 
-Unit tests cover URL validation, SSRF helpers, pinned HTTP transport, the pinned yt-dlp runtime policy (closed arguments, closed environment, exact version probe), temp-directory containment, private-access gating, filename sanitization, format normalization, progress parsing, job status, rate limiting, and error mapping. External downloads are not performed in CI.
+Unit tests cover URL validation, SSRF helpers, pinned HTTP transport, the pinned yt-dlp runtime policy (closed arguments, closed environment, exact version probe), temp-directory containment, private-access gating, filename sanitization, format normalization, progress parsing, job status, rate limiting, and error mapping. The tests never perform external downloads. The repository has no CI; run the suites locally.
 
 ## Notes
 
-yt-dlp is intended to become the generic HTTP/HTTPS extractor, and the standalone Worker image ships a **pinned** yt-dlp runtime (exact release, digest-verified at build time, root-owned and read-only, no pip, no self-update). It is **not wired to anything**: as of `PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001` no user-supplied URL can reach yt-dlp, the Worker's only yt-dlp operation is a non-network version probe, and generic extraction is a later, separately authorized phase gated by `YTDLP_ENABLED`.
+yt-dlp is the generic HTTP/HTTPS extractor. The standalone Worker image ships a **pinned** yt-dlp runtime (exact release, digest-verified at build time, root-owned and read-only, no pip, no self-update), and user-supplied URLs reach it through the Worker's direct-first router: generic extraction was implemented in `PHASE-10C3-YTDLP-GENERIC-EXECUTION-INTEGRATION-001`, accepted live in Phase 10D, and is enabled in Production by `PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001`. Generic v1 is deliberately narrow — public, single-item, non-live sources acquired as one progressive HTTP(S) format, with no HLS, DASH or split video+audio merge — so sources outside that scope yield no generic download option. See `docs/architecture/worker-deployment-runbook.md` §4g–§4h.
 
 The reason the boundary matters: yt-dlp performs its own DNS lookups, follows redirects, and issues many subrequests, so application URL validation is **not** yt-dlp egress enforcement. Egress is enforced outside the container by the media network namespace and its host-owned nftables policy — which the Worker cannot read or alter, and therefore cannot attest to. See `docs/architecture/safe-egress.md`.
 
 Some websites (including YouTube and Vimeo) may require a signed-in session or block datacenter IP addresses. Direct media files and public archive sources are the most reliable. Only download media you have the right to save.
 
-## Architecture (APPROVED TARGET / NOT YET IMPLEMENTED)
+## Architecture documents
 
+The standalone-Worker architecture these documents describe is **implemented and deployed**: a Vercel control plane in front of an on-demand Worker reached through Cloudflare Access and a named Tunnel, with durable SQLite job state, externally enforced safe egress, and temporary R2 object storage written through a trusted credential broker. The current deployment state, operating model and phase records are in the Worker Deployment Runbook. The execution-boundary and migration documents also record the pre-migration design and the order the migration was carried out in; those parts are history. An implemented architecture is not a promise that any given site works — see the generic v1 scope under Notes.
+
+- [Worker Deployment Runbook](docs/architecture/worker-deployment-runbook.md) — current state and records
 - [Worker Execution Boundary](docs/architecture/worker-execution-boundary.md)
 - [Worker API Contract](docs/architecture/worker-api-contract.md)
 - [Safe Egress](docs/architecture/safe-egress.md)
