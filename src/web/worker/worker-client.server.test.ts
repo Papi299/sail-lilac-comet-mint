@@ -700,6 +700,378 @@ describe("WorkerClient", () => {
     });
   });
 
+  // ── Total response deadline ───────────────────────────────────────────────
+  // WORKERCLIENT-TOTAL-RESPONSE-DEADLINE-HARDENING-001
+  //
+  // `requestTimeoutMs` must bound the COMPLETE response I/O operation —
+  // connect, upstream wait, response headers AND response-body read — as ONE
+  // total budget, on every path that consumes a body.
+  //
+  // Phase 10F established that property for the ambiguous 503 classification
+  // only. The ordinary success path, the non-503 Worker-error path and the
+  // health path each cleared the request timer BEFORE reading their body, so a
+  // response that delivered headers and then stalled was awaited forever: the
+  // byte ceiling cannot end such a read (it stays far below
+  // MAX_RESPONSE_BYTES), and unlike the overflow and stream-error shapes it
+  // never terminates on its own.
+  //
+  // Every stream below is deliberately NEVER closed, so only the client's own
+  // deadline can end it, and the explicit per-test `timeout` turns a
+  // regression into a failure rather than a hang.
+  describe("total response deadline", () => {
+    const SENTINEL = "STALLED_ORDINARY_BODY_SENTINEL_LEAK";
+    const JOB_ID = "00000000000000000000000000000000";
+
+    /**
+     * A response whose headers arrive after `headerDelayMs` and whose body
+     * then emits one plausible partial chunk and stalls forever.
+     *
+     * `observeAbort: false` (the default) models a stream that IGNORES its
+     * AbortSignal, proving the client bounds the read itself instead of
+     * trusting the stream to cooperate. `true` models real Fetch semantics,
+     * where the body errors once the signal aborts.
+     */
+    const stalling = (opts: {
+      status: number;
+      requestTimeoutMs: number;
+      headerDelayMs?: number;
+      observeAbort?: boolean;
+      marks?: { headersAt?: number };
+    }) => new WorkerClient({
+      baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+      requestTimeoutMs: opts.requestTimeoutMs,
+      fetchImplementation: (async (_url: any, fetchOpts: any) => {
+        if (opts.headerDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, opts.headerDelayMs));
+        }
+        if (opts.marks) opts.marks.headersAt = Date.now();
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(`{"partial":"${SENTINEL}"`));
+              if (opts.observeAbort) {
+                fetchOpts.signal?.addEventListener("abort", () => {
+                  try { controller.error(new Error("aborted by signal")); } catch { /* already closed */ }
+                }, { once: true });
+              }
+            },
+          }),
+          { status: opts.status, headers: { "Content-Type": "application/json; charset=utf-8" } },
+        );
+      }) as unknown as typeof fetch,
+    });
+
+    /**
+     * The canonical outcome of a stalled body: the transport error, its exact
+     * safe message, and NOTHING of the partial body, the internal deadline
+     * marker or the stream's own abort reason anywhere in the rendered error.
+     * This carries requirements I and J for every case that uses it.
+     */
+    const isCleanUnavailable = (e: any) => {
+      const rendered = `${String(e)}\n${e.message}\n${e.stack ?? ""}`;
+      assert.strictEqual(e.code, "WORKER_UNAVAILABLE");
+      assert.strictEqual(e.message, ERROR_MESSAGES.WORKER_UNAVAILABLE);
+      assert.ok(!rendered.includes(SENTINEL), "the partial response body must not leak");
+      assert.ok(!rendered.includes("request deadline exceeded"), "the deadline marker must not leak");
+      assert.ok(!rendered.includes("aborted by signal"), "the raw stream abort reason must not leak");
+      return true;
+    };
+
+    /** Bounded, and genuinely ended by the deadline rather than failing fast. */
+    const assertBoundedByDeadline = async (run: Promise<unknown>, budgetMs: number) => {
+      const started = Date.now();
+      await assert.rejects(run, isCleanUnavailable);
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed >= budgetMs / 2, `expected the deadline to be awaited, took ${elapsed}ms`);
+      assert.ok(elapsed < 10000, `expected a bounded wait, took ${elapsed}ms`);
+    };
+
+    // A stalled body behind INSTANT headers cannot tell a correct total budget
+    // apart from a fresh per-body one: both finish at about the same moment.
+    // The single-budget cases therefore burn a known share of the budget
+    // BEFORE the headers exist, and measure the body phase directly:
+    //   2000 ms total, ~1200 ms spent before headers
+    //     correct -> the body gets only the ~800 ms that REMAIN -> total ~2000 ms
+    //     fresh   -> the body starts a new ~2000 ms budget      -> total ~3200 ms
+    const TOTAL_BUDGET_MS = 2000;
+    const HEADER_DELAY_MS = 1200;
+
+    const assertOneTotalBudget = async (
+      status: number,
+      run: (c: WorkerClient) => Promise<unknown>,
+    ) => {
+      const marks: { headersAt?: number } = {};
+      const client = stalling({
+        status,
+        requestTimeoutMs: TOTAL_BUDGET_MS,
+        headerDelayMs: HEADER_DELAY_MS,
+        marks,
+      });
+
+      const started = Date.now();
+      await assert.rejects(run(client), isCleanUnavailable);
+      const finished = Date.now();
+
+      assert.ok(marks.headersAt !== undefined, "the response headers must have been delivered");
+      const headerPhase = marks.headersAt! - started;
+      const bodyPhase = finished - marks.headersAt!;
+      const total = finished - started;
+
+      // The headers really did arrive inside the original deadline.
+      assert.ok(
+        headerPhase >= HEADER_DELAY_MS - 200 && headerPhase < TOTAL_BUDGET_MS,
+        `headers must arrive before the original deadline, took ${headerPhase}ms`,
+      );
+      // The body really did stall rather than terminate on its own.
+      assert.ok(bodyPhase >= 300, `the body must have stalled, body phase was ${bodyPhase}ms`);
+      // The decisive assertion: the body phase used only what was LEFT of the
+      // budget (~800 ms), not a fresh full one (~2000 ms).
+      assert.ok(
+        bodyPhase <= 1500,
+        `the body must get only the remaining budget, body phase was ${bodyPhase}ms`,
+      );
+      assert.ok(total <= 2700, `one total budget expected, took ${total}ms`);
+    };
+
+    // A ── ordinary successful responses. Headers arrive, the body stalls.
+    // Also carries G (the stream ignores its AbortSignal), I and J.
+    it("A: a stalled 200 body is ended by the total request deadline -> WORKER_UNAVAILABLE", { timeout: 20000 }, async () => {
+      await assertBoundedByDeadline(
+        stalling({ status: 200, requestTimeoutMs: 1000 }).getJob(JOB_ID),
+        1000,
+      );
+    });
+
+    it("A: analyze(), the user-facing path, is bounded identically", { timeout: 20000 }, async () => {
+      await assertBoundedByDeadline(
+        stalling({ status: 200, requestTimeoutMs: 1000 }).analyze({ url: "https://example.com/watch" } as any),
+        1000,
+      );
+    });
+
+    // B ── the ordinary 200 body gets only the REMAINING budget. This is the
+    // case that discriminates a fresh per-body timeout from one total one.
+    it("B: a delayed-header 200 gives the body only the remaining budget, not a fresh one", { timeout: 20000 }, async () => {
+      await assertOneTotalBudget(200, (c) => c.getJob(JOB_ID));
+    });
+
+    // C ── a legitimate non-503 Worker-error status whose envelope never
+    // finishes arriving. An error that could not be completely read is a
+    // transport failure, not a successfully established business error.
+    it("C: a stalled 429 error body -> WORKER_UNAVAILABLE, not a business error", { timeout: 20000 }, async () => {
+      await assertBoundedByDeadline(
+        stalling({ status: 429, requestTimeoutMs: 1000 }).getJob(JOB_ID),
+        1000,
+      );
+    });
+
+    // D ── and that error path shares the one total budget too.
+    it("D: a delayed-header 429 gives its body only the remaining budget", { timeout: 20000 }, async () => {
+      await assertOneTotalBudget(429, (c) => c.getJob(JOB_ID));
+    });
+
+    // E ── the health probe. A liveness check whose body stalls is an outage.
+    it("E: a stalled health 200 body -> WORKER_UNAVAILABLE", { timeout: 20000 }, async () => {
+      await assertBoundedByDeadline(
+        stalling({ status: 200, requestTimeoutMs: 1000 }).health(),
+        1000,
+      );
+    });
+
+    // F ── health shares the one total budget.
+    it("F: a delayed-header health 200 gives its body only the remaining budget", { timeout: 20000 }, async () => {
+      await assertOneTotalBudget(200, (c) => c.health());
+    });
+
+    // H ── a realistic stream that ERRORS when Fetch aborts is bounded too, so
+    // the fix does not depend on which of the two mechanisms fires first.
+    it("H: a stalled body that errors on abort (real Fetch semantics) is still bounded", { timeout: 20000 }, async () => {
+      await assert.rejects(
+        stalling({ status: 200, requestTimeoutMs: 1000, observeAbort: true }).getJob(JOB_ID),
+        isCleanUnavailable,
+      );
+    });
+
+    // ── Non-regression: nothing that COMPLETES inside the deadline changes ──
+    //
+    // Arming the deadline across the body phase must not reclassify a response
+    // that finished in time. These are all fast: the deadline never fires.
+    const completing = (status: number, body: string, contentType = "application/json") => new WorkerClient({
+      baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+      requestTimeoutMs: 1000,
+      fetchImplementation: (async () => new Response(body, {
+        status,
+        headers: { "Content-Type": contentType, "Content-Length": String(Buffer.byteLength(body, "utf8")) },
+      })) as unknown as typeof fetch,
+    });
+
+    const VALID_JOB = JSON.stringify({
+      success: true,
+      job: {
+        jobId: JOB_ID, status: "queued", progress: null, stageLabel: null,
+        downloadedBytes: null, totalBytes: null, speed: null, eta: null,
+        errorCode: null, safeErrorMessage: null, filename: null, fileSize: null,
+        mime: null, quality: null, container: null, title: null, thumbnail: null,
+        source: null, extractor: null, createdAt: 0, updatedAt: 0, expiresAt: 0,
+        objectKey: null,
+      },
+    });
+
+    // K ── a valid success that completes within the deadline still succeeds.
+    it("K: a complete valid 200 within the deadline still resolves", async () => {
+      const job = await completing(200, VALID_JOB).getJob(JOB_ID);
+      assert.strictEqual(job.job.jobId, JOB_ID);
+      assert.strictEqual(job.job.status, "queued");
+    });
+
+    // L ── a valid non-503 business envelope still propagates its own code.
+    it("L: a complete valid 429 envelope within the deadline still propagates RATE_LIMITED", async () => {
+      await assert.rejects(
+        completing(429, JSON.stringify({ success: false, error: { code: "RATE_LIMITED", message: "x" } })).getJob(JOB_ID),
+        (e: any) => e.code === "RATE_LIMITED" && !e.message.includes("x"),
+      );
+    });
+
+    // M ── health still succeeds.
+    it("M: a complete valid health 200 within the deadline still resolves", async () => {
+      assert.deepStrictEqual(await completing(200, '{"status":"ok"}').health(), { status: "ok" });
+    });
+
+    // N/O ── the Phase-10F 503 semantics are untouched by this change.
+    it("N: the canonical 503 envelope still produces EXTRACTOR_UNAVAILABLE", async () => {
+      await assert.rejects(
+        completing(503, JSON.stringify({
+          success: false,
+          error: { code: "EXTRACTOR_UNAVAILABLE", message: ERROR_MESSAGES.EXTRACTOR_UNAVAILABLE },
+        })).getJob(JOB_ID),
+        (e: any) => e.code === "EXTRACTOR_UNAVAILABLE" && e.message === ERROR_MESSAGES.EXTRACTOR_UNAVAILABLE,
+      );
+    });
+
+    it("O: a non-canonical 503 still produces WORKER_UNAVAILABLE", async () => {
+      await assert.rejects(
+        completing(503, "<html><body>503</body></html>", "text/html").getJob(JOB_ID),
+        (e: any) => e.code === "WORKER_UNAVAILABLE",
+      );
+      await assert.rejects(
+        completing(503, '{"success":false,"error":{').getJob(JOB_ID),
+        (e: any) => e.code === "WORKER_UNAVAILABLE",
+      );
+    });
+
+    // P ── 401/403 still short-circuit before any body is read.
+    it("P: 401 and 403 remain WORKER_UNAVAILABLE and read no body", async () => {
+      for (const status of [401, 403]) {
+        await assert.rejects(
+          completing(status, VALID_JOB).getJob(JOB_ID),
+          (e: any) => e.code === "WORKER_UNAVAILABLE",
+        );
+      }
+    });
+
+    // Timer cleanup ── EVERY exit must clear the request timer, including the
+    // ones that return early and never read a body. A leaked timer would keep
+    // the event loop referenced for the rest of the budget, so a 60 s budget
+    // makes one unmistakable.
+    //
+    // The assertion is a DELTA across the call rather than an absolute count:
+    // it is then unaffected by any timer the runner or an unrelated suite
+    // happens to hold, and still fails if this request leaves one of its own.
+    const activeTimers = () =>
+      (process as any).getActiveResourcesInfo().filter((r: string) => r === "Timeout").length;
+
+    const respondingOnce = (status: number, body: string, contentType: string) => new WorkerClient({
+      baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+      requestTimeoutMs: 60000,
+      fetchImplementation: (async () => new Response(body, {
+        status,
+        headers: { "Content-Type": contentType, "Content-Length": String(Buffer.byteLength(body, "utf8")) },
+      })) as unknown as typeof fetch,
+    });
+
+    it("every settled request clears its timer, on every exit path", async () => {
+      const exits: Array<[string, () => Promise<unknown>]> = [
+        // early, body never read
+        ["401", () => respondingOnce(401, '{"error":"unauthorized"}', "application/json").getJob(JOB_ID)],
+        ["403", () => respondingOnce(403, "<html>denied</html>", "text/html").getJob(JOB_ID)],
+        // 503, both branches of the Phase-10F disambiguation
+        ["503 canonical", () => respondingOnce(503, JSON.stringify({
+          success: false,
+          error: { code: "EXTRACTOR_UNAVAILABLE", message: ERROR_MESSAGES.EXTRACTOR_UNAVAILABLE },
+        }), "application/json").getJob(JOB_ID)],
+        ["503 ambiguous", () => respondingOnce(503, "<html>503</html>", "text/html").getJob(JOB_ID)],
+        // validation failure after the body was read
+        ["malformed body", () => respondingOnce(200, "{badjson", "application/json").getJob(JOB_ID)],
+        ["bad content-type", () => respondingOnce(200, VALID_JOB, "text/html").getJob(JOB_ID)],
+        // a non-503 business error
+        ["429 envelope", () => respondingOnce(429, JSON.stringify({
+          success: false, error: { code: "RATE_LIMITED", message: "x" },
+        }), "application/json").getJob(JOB_ID)],
+        // transport failure before any response exists
+        ["fetch rejection", () => new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          requestTimeoutMs: 60000,
+          fetchImplementation: (async () => { throw new TypeError("unexpected redirect"); }) as unknown as typeof fetch,
+        }).getJob(JOB_ID)],
+        // health: early exit, and the success path
+        ["health 503", () => respondingOnce(503, '{"success":false}', "application/json").health()],
+        ["health 200", () => respondingOnce(200, '{"status":"ok"}', "application/json").health()],
+      ];
+
+      for (const [name, call] of exits) {
+        const before = activeTimers();
+        await call().catch(() => {});
+        assert.strictEqual(
+          activeTimers(),
+          before,
+          `the ${name} exit must not leave a request timer armed`,
+        );
+      }
+    });
+
+    // Q ── the byte and header bounds still decide their own outcomes; a body
+    // that COMPLETES (or overflows) is never reclassified as a timeout just
+    // because the deadline is now armed while it is read.
+    it("Q: an oversized streamed body under an armed deadline is still PROCESSING_FAILED", async () => {
+      const client = new WorkerClient({
+        baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+        requestTimeoutMs: 1000,
+        fetchImplementation: (async () => new Response(new ReadableStream({
+          start(c) {
+            c.enqueue(new Uint8Array(2 * 1024 * 1024));
+            c.enqueue(new Uint8Array(1)); // one byte past the 2 MiB ceiling
+            c.close();
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } })) as unknown as typeof fetch,
+      });
+      await assert.rejects(client.getJob(JOB_ID), (e: any) => e.code === "PROCESSING_FAILED");
+    });
+
+    it("Q: Content-Type and Content-Length rejections are unchanged under an armed deadline", async () => {
+      await assert.rejects(
+        completing(200, VALID_JOB, "text/html").getJob(JOB_ID),
+        (e: any) => e.code === "PROCESSING_FAILED",
+      );
+      for (const len of ["-1", "1.5", "1e5", "100a", "9007199254740992", "3000000"]) {
+        const client = new WorkerClient({
+          baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+          requestTimeoutMs: 1000,
+          fetchImplementation: (async () => new Response(VALID_JOB, {
+            status: 200, headers: { "Content-Type": "application/json", "Content-Length": len },
+          })) as unknown as typeof fetch,
+        });
+        await assert.rejects(client.getJob(JOB_ID), (e: any) => e.code === "PROCESSING_FAILED");
+      }
+    });
+
+    it("Q: malformed complete JSON is still PROCESSING_FAILED, never a timeout", async () => {
+      await assert.rejects(
+        completing(200, "{badjson").getJob(JOB_ID),
+        (e: any) => e.code === "PROCESSING_FAILED",
+      );
+    });
+  });
+
   describe("Health regressions", () => {
     it("health()", async () => {
       let capturedOptions: any;

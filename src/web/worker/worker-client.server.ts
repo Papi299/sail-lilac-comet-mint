@@ -346,26 +346,28 @@ export class WorkerClient {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
 
-    let response: Response;
+    // `requestTimeoutMs` is ONE total budget for the complete response I/O
+    // operation: connect, upstream wait, response headers AND every response
+    // body read below. The deadline therefore stays ARMED across the whole
+    // block and is cleared exactly once, in the outer `finally`, so no exit —
+    // success, business error, validation failure, 401/403, 503 or an expired
+    // deadline — can leave a timer alive or hand the body phase a second,
+    // fresh budget. A response that delivers headers late leaves the body only
+    // what REMAINS of the original budget, never a new one.
     try {
-      response = await this.fetchImpl(`${this.origin}${canonicalPath}`, {
-        method,
-        headers,
-        body: body !== null ? rawBodyBytes : undefined,
-        redirect: "error",
-        signal: controller.signal,
-      });
-    } catch {
-      clearTimeout(timeoutId);
-      throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
-    }
+      let response: Response;
+      try {
+        response = await this.fetchImpl(`${this.origin}${canonicalPath}`, {
+          method,
+          headers,
+          body: body !== null ? rawBodyBytes : undefined,
+          redirect: "error",
+          signal: controller.signal,
+        });
+      } catch {
+        throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
+      }
 
-    // The deadline stays ARMED across the block below, because classifying a
-    // 503 reads a response body: `requestTimeoutMs` is one total budget for
-    // connect + headers + that classification, never a fresh second budget. It
-    // is cleared on every exit, and before the ordinary response path further
-    // down, whose body-read budget this correction leaves unchanged.
-    try {
       // A status that cannot carry a Worker business envelope is classified
       // BEFORE any Worker response validation, and its body is never read.
       if (this.isUnavailablePathStatus(response.status)) {
@@ -382,63 +384,76 @@ export class WorkerClient {
         }
         throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
       }
+
+      this.validateContentType(response.headers.get("content-type"));
+      this.validateContentLength(response.headers.get("content-length"));
+
+      // The ordinary body read — successful responses and non-503 Worker error
+      // envelopes alike — runs under that SAME deadline. Headers followed by a
+      // body that never finishes is a transport failure, not an established
+      // success or an established business error, so it resolves to
+      // WORKER_UNAVAILABLE instead of being awaited indefinitely, and the
+      // partial bytes are discarded rather than surfaced.
+      const responseBuffer = await this.readBoundedStream(response, MAX_RESPONSE_BYTES, controller.signal);
+      const responseText = responseBuffer.toString("utf8");
+
+      let responseData: unknown;
+      try {
+        responseData = JSON.parse(responseText);
+      } catch {
+        throw new AppError("PROCESSING_FAILED");
+      }
+
+      if (!response.ok) {
+        const parsedError = WorkerErrorResponseSchema.safeParse(responseData);
+        if (!parsedError.success) {
+          throw new AppError("PROCESSING_FAILED");
+        }
+        const code = parsedError.data.error.code;
+        const isValidCode = WorkerErrorCodeSchema.safeParse(code).success;
+        if (isValidCode) {
+          throw new AppError(code as ErrorCode);
+        }
+        throw new AppError("PROCESSING_FAILED");
+      }
+
+      if (!statuses.includes(response.status)) {
+        throw new AppError("PROCESSING_FAILED");
+      }
+
+      const parsedSuccess = successSchema.safeParse(responseData);
+      if (!parsedSuccess.success) {
+        throw new AppError("PROCESSING_FAILED");
+      }
+
+      return parsedSuccess.data;
     } finally {
       clearTimeout(timeoutId);
     }
-
-    this.validateContentType(response.headers.get("content-type"));
-    this.validateContentLength(response.headers.get("content-length"));
-
-    const responseBuffer = await this.readBoundedStream(response, MAX_RESPONSE_BYTES);
-    const responseText = responseBuffer.toString("utf8");
-
-    let responseData: unknown;
-    try {
-      responseData = JSON.parse(responseText);
-    } catch {
-      throw new AppError("PROCESSING_FAILED");
-    }
-
-    if (!response.ok) {
-      const parsedError = WorkerErrorResponseSchema.safeParse(responseData);
-      if (!parsedError.success) {
-        throw new AppError("PROCESSING_FAILED");
-      }
-      const code = parsedError.data.error.code;
-      const isValidCode = WorkerErrorCodeSchema.safeParse(code).success;
-      if (isValidCode) {
-        throw new AppError(code as ErrorCode);
-      }
-      throw new AppError("PROCESSING_FAILED");
-    }
-
-    if (!statuses.includes(response.status)) {
-      throw new AppError("PROCESSING_FAILED");
-    }
-
-    const parsedSuccess = successSchema.safeParse(responseData);
-    if (!parsedSuccess.success) {
-      throw new AppError("PROCESSING_FAILED");
-    }
-
-    return parsedSuccess.data;
   }
 
   /**
-   * Reads a response body under a hard byte ceiling and, when a deadline
-   * signal is supplied, under the caller's remaining time budget too.
+   * Reads a response body under a hard byte ceiling AND under the caller's
+   * remaining time budget.
    *
    * A byte ceiling alone does not bound a read: a body that trickles or simply
-   * never completes stays under the ceiling forever. Callers that read a body
-   * while the request deadline is still armed pass `deadlineSignal` so a
-   * stalled stream is abandoned rather than awaited indefinitely. The abort
-   * reason is a bare marker and is never surfaced; the caller sees only the
-   * canonical unavailability error.
+   * never completes stays under the ceiling forever. `deadlineSignal` is the
+   * in-flight request's own timeout, so a stalled stream is abandoned rather
+   * than awaited indefinitely and no body read can outlive the budget its
+   * caller already started.
+   *
+   * The signal is REQUIRED, not optional. Every body-consuming path — an
+   * ordinary success, a non-503 Worker error envelope, the health probe and
+   * the 503 disambiguation probe — passes the same in-flight deadline, so a
+   * future caller cannot reintroduce an unbounded read simply by omitting it.
+   *
+   * The abort reason is a bare marker and is never surfaced; the caller sees
+   * only the canonical unavailability error, never partial body bytes.
    */
   private async readBoundedStream(
     response: Response,
     maxBytes: number,
-    deadlineSignal?: AbortSignal,
+    deadlineSignal: AbortSignal,
   ): Promise<Buffer> {
     if (!response.body) {
       return Buffer.alloc(0);
@@ -450,24 +465,21 @@ export class WorkerClient {
     // Built once rather than per iteration, so a slow stream cannot accumulate
     // abort listeners. Real fetch also errors the body stream on abort; racing
     // here means the deadline holds even for a stream that ignores its signal.
-    let expired: Promise<never> | null = null;
-    if (deadlineSignal) {
-      expired = new Promise<never>((_, reject) => {
-        const fail = () => reject(new Error("request deadline exceeded"));
-        if (deadlineSignal.aborted) fail();
-        else deadlineSignal.addEventListener("abort", fail, { once: true });
-      });
-      // Promise.race handles this while reading; this keeps an abort that
-      // arrives after the loop has finished from becoming an unhandled
-      // rejection.
-      expired.catch(() => {});
-    }
+    const expired = new Promise<never>((_, reject) => {
+      const fail = () => reject(new Error("request deadline exceeded"));
+      if (deadlineSignal.aborted) fail();
+      else deadlineSignal.addEventListener("abort", fail, { once: true });
+    });
+    // Promise.race handles this while reading; this keeps an abort that
+    // arrives after the loop has finished from becoming an unhandled
+    // rejection.
+    expired.catch(() => {});
 
     try {
       while (true) {
         let readResult;
         try {
-          readResult = expired === null ? await reader.read() : await Promise.race([reader.read(), expired]);
+          readResult = await Promise.race([reader.read(), expired]);
         } catch {
           throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
         }
@@ -531,48 +543,55 @@ export class WorkerClient {
     // the same proxy as every other request.
     const headers = new Headers();
     this.applyAccessHeaders(headers);
-    let response: Response;
+
+    // Exactly as in `makeRequest`: one armed deadline spans connect, headers
+    // and the health body read, cleared once on the way out. A liveness probe
+    // whose headers arrive but whose body never finishes is an outage, not a
+    // slow-but-live Worker, so it must not be able to outlive the budget.
     try {
-      response = await this.fetchImpl(`${this.origin}${WORKER_HEALTH_PATH}`, {
-        method: "GET",
-        headers,
-        redirect: "error",
-        signal: controller.signal,
-      });
-    } catch {
-      throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
+      let response: Response;
+      try {
+        response = await this.fetchImpl(`${this.origin}${WORKER_HEALTH_PATH}`, {
+          method: "GET",
+          headers,
+          redirect: "error",
+          signal: controller.signal,
+        });
+      } catch {
+        throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
+      }
+
+      // The health route is a liveness probe: it answers 200 {"status":"ok"} and
+      // never emits a Worker business-error envelope, so 503 here is always an
+      // outage. The makeRequest disambiguation deliberately does not apply.
+      if (this.isUnavailablePathStatus(response.status) || response.status === 503) {
+        throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
+      }
+
+      if (response.status !== 200) {
+        throw new AppError("PROCESSING_FAILED");
+      }
+
+      this.validateContentType(response.headers.get("content-type"));
+      this.validateContentLength(response.headers.get("content-length"));
+
+      const responseBuffer = await this.readBoundedStream(response, MAX_RESPONSE_BYTES, controller.signal);
+      const responseText = responseBuffer.toString("utf8");
+      let responseData: unknown;
+      try {
+        responseData = JSON.parse(responseText);
+      } catch {
+        throw new AppError("PROCESSING_FAILED");
+      }
+
+      const parsedSuccess = WorkerHealthSuccessSchema.safeParse(responseData);
+      if (!parsedSuccess.success) {
+        throw new AppError("PROCESSING_FAILED");
+      }
+
+      return parsedSuccess.data;
     } finally {
       clearTimeout(timeoutId);
     }
-
-    // The health route is a liveness probe: it answers 200 {"status":"ok"} and
-    // never emits a Worker business-error envelope, so 503 here is always an
-    // outage. The makeRequest disambiguation deliberately does not apply.
-    if (this.isUnavailablePathStatus(response.status) || response.status === 503) {
-      throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
-    }
-
-    if (response.status !== 200) {
-      throw new AppError("PROCESSING_FAILED");
-    }
-
-    this.validateContentType(response.headers.get("content-type"));
-    this.validateContentLength(response.headers.get("content-length"));
-
-    const responseBuffer = await this.readBoundedStream(response, MAX_RESPONSE_BYTES);
-    const responseText = responseBuffer.toString("utf8");
-    let responseData: unknown;
-    try {
-      responseData = JSON.parse(responseText);
-    } catch {
-      throw new AppError("PROCESSING_FAILED");
-    }
-
-    const parsedSuccess = WorkerHealthSuccessSchema.safeParse(responseData);
-    if (!parsedSuccess.success) {
-      throw new AppError("PROCESSING_FAILED");
-    }
-
-    return parsedSuccess.data;
   }
 }
