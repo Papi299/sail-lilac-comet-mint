@@ -175,7 +175,9 @@ export class WorkerClient {
     if (!Number.isSafeInteger(len)) {
       throw new AppError("PROCESSING_FAILED");
     }
-    if (len > 2 * 1024 * 1024) {
+    // The same ceiling the streamed read enforces, so a declared length can
+    // never be admitted at a size the body reader would later reject.
+    if (len > MAX_RESPONSE_BYTES) {
       throw new AppError("PROCESSING_FAILED");
     }
   }
@@ -211,25 +213,35 @@ export class WorkerClient {
   }
 
   /**
-   * Statuses that mean the request never reached the Worker protocol.
+   * Statuses that can never carry a Worker business-error envelope, and so
+   * always mean the control-plane→Worker path is unavailable to the user.
    *
-   * Neither 401 nor 403 can originate from the current Worker protocol — both
-   * are absent from WORKER_ERROR_HTTP_STATUS and from every Worker code path —
-   * so either one on this endpoint is a non-Worker, upstream refusal. A refused
-   * Access service token is the expected cause, but other upstream controls
-   * (WAF, rate limiting, a bot rule) could produce one too; the classification
-   * deliberately does not depend on knowing which.
+   * This is deliberately NOT a claim about where the response came from. 401
+   * in particular CAN be Worker-origin: the Worker's own HTTP server answers
+   * 401 (`sendUnauthorized`) for HMAC, timestamp and replay rejections, and an
+   * upstream access layer can answer 401 as well. Either way it is an
+   * authentication failure on the path to the Worker rather than a business
+   * outcome — the Worker's 401 body is `{"error":"unauthorized"}`, which is not
+   * a WorkerErrorResponse envelope — so it stays WORKER_UNAVAILABLE and its
+   * body is never trusted or surfaced. Reporting which side rejected the
+   * credential would also disclose auth detail to the browser.
    *
-   * It must be decided BEFORE any content-type or JSON validation, because such
-   * a response is an upstream page rather than a Worker error envelope. Its body
-   * is never read, parsed or surfaced.
+   * 403 is not emitted anywhere in the current Worker implementation — it is
+   * absent from WORKER_ERROR_HTTP_STATUS and from every Worker code path — so
+   * it is an upstream refusal. A refused Access service token is the expected
+   * cause, but other upstream controls (WAF, rate limiting, a bot rule) could
+   * produce one too; the classification does not depend on knowing which.
    *
-   * 503 is deliberately NOT in this set. It used to be, which was wrong: the
-   * Worker maps its own EXTRACTOR_UNAVAILABLE business error to 503
-   * (WORKER_ERROR_HTTP_STATUS), so a 503 here is ambiguous rather than
-   * necessarily upstream. It is resolved by `isCanonicalExtractorUnavailable`.
+   * Both are decided BEFORE any content-type or JSON validation, because
+   * neither body is a Worker error envelope.
+   *
+   * 503 is deliberately NOT in this set, and that is the distinction an earlier
+   * revision got wrong: 503 is an INTENTIONAL Worker business-error status
+   * (WORKER_ERROR_HTTP_STATUS maps EXTRACTOR_UNAVAILABLE to it), so it is
+   * ambiguous rather than necessarily upstream, and is resolved by
+   * `isCanonicalExtractorUnavailable`.
    */
-  private isUpstreamOnlyStatus(status: number): boolean {
+  private isUnavailablePathStatus(status: number): boolean {
     return status === 401 || status === 403;
   }
 
@@ -251,16 +263,23 @@ export class WorkerClient {
    *
    * Every branch fails closed. Anything short of that exact envelope — an
    * absent or HTML body, a wrong or missing content type, malformed, oversized
-   * or unreadable bytes, another Worker code, a doctored message — returns
-   * false, and the caller keeps the safer WORKER_UNAVAILABLE classification.
-   * The body is consumed here purely to classify it and is never surfaced in
-   * the resulting error.
+   * or unreadable bytes, a body that never finishes before the request
+   * deadline, another Worker code, a doctored message — returns false, and the
+   * caller keeps the safer WORKER_UNAVAILABLE classification. The body is
+   * consumed here purely to classify it and is never surfaced in the resulting
+   * error.
+   *
+   * `deadlineSignal` is the in-flight request's own timeout, so reading this
+   * body cannot outlive the request budget the caller already started.
    */
-  private async isCanonicalExtractorUnavailable(response: Response): Promise<boolean> {
+  private async isCanonicalExtractorUnavailable(
+    response: Response,
+    deadlineSignal: AbortSignal,
+  ): Promise<boolean> {
     try {
       this.validateContentType(response.headers.get("content-type"));
       this.validateContentLength(response.headers.get("content-length"));
-      const responseBuffer = await this.readBoundedStream(response, MAX_RESPONSE_BYTES);
+      const responseBuffer = await this.readBoundedStream(response, MAX_RESPONSE_BYTES, deadlineSignal);
       const parsed = WorkerErrorResponseSchema.safeParse(JSON.parse(responseBuffer.toString("utf8")));
       return (
         parsed.success &&
@@ -330,25 +349,34 @@ export class WorkerClient {
         signal: controller.signal,
       });
     } catch {
+      clearTimeout(timeoutId);
       throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
+    }
+
+    // The deadline stays ARMED across the block below, because classifying a
+    // 503 reads a response body: `requestTimeoutMs` is one total budget for
+    // connect + headers + that classification, never a fresh second budget. It
+    // is cleared on every exit, and before the ordinary response path further
+    // down, whose body-read budget this correction leaves unchanged.
+    try {
+      // A status that cannot carry a Worker business envelope is classified
+      // BEFORE any Worker response validation, and its body is never read.
+      if (this.isUnavailablePathStatus(response.status)) {
+        throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
+      }
+
+      // 503 is ambiguous, so it is resolved here rather than assumed upstream.
+      // Only the Worker's exact canonical EXTRACTOR_UNAVAILABLE envelope
+      // survives as a business error; every other 503 — including one whose
+      // body stalls past the deadline — keeps the safer classification.
+      if (response.status === 503) {
+        if (await this.isCanonicalExtractorUnavailable(response, controller.signal)) {
+          throw new AppError("EXTRACTOR_UNAVAILABLE");
+        }
+        throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
+      }
     } finally {
       clearTimeout(timeoutId);
-    }
-
-    // Upstream refusal is classified BEFORE Worker response validation: the
-    // body belongs to the proxy, not to the Worker protocol.
-    if (this.isUpstreamOnlyStatus(response.status)) {
-      throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
-    }
-
-    // 503 is ambiguous, so it is resolved here rather than assumed upstream.
-    // Only the Worker's exact canonical EXTRACTOR_UNAVAILABLE envelope survives
-    // as a business error; every other 503 keeps the safer classification.
-    if (response.status === 503) {
-      if (await this.isCanonicalExtractorUnavailable(response)) {
-        throw new AppError("EXTRACTOR_UNAVAILABLE");
-      }
-      throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
     }
 
     this.validateContentType(response.headers.get("content-type"));
@@ -389,7 +417,22 @@ export class WorkerClient {
     return parsedSuccess.data;
   }
 
-  private async readBoundedStream(response: Response, maxBytes: number): Promise<Buffer> {
+  /**
+   * Reads a response body under a hard byte ceiling and, when a deadline
+   * signal is supplied, under the caller's remaining time budget too.
+   *
+   * A byte ceiling alone does not bound a read: a body that trickles or simply
+   * never completes stays under the ceiling forever. Callers that read a body
+   * while the request deadline is still armed pass `deadlineSignal` so a
+   * stalled stream is abandoned rather than awaited indefinitely. The abort
+   * reason is a bare marker and is never surfaced; the caller sees only the
+   * canonical unavailability error.
+   */
+  private async readBoundedStream(
+    response: Response,
+    maxBytes: number,
+    deadlineSignal?: AbortSignal,
+  ): Promise<Buffer> {
     if (!response.body) {
       return Buffer.alloc(0);
     }
@@ -397,11 +440,27 @@ export class WorkerClient {
     let receivedBytes = 0;
     const chunks: Uint8Array[] = [];
 
+    // Built once rather than per iteration, so a slow stream cannot accumulate
+    // abort listeners. Real fetch also errors the body stream on abort; racing
+    // here means the deadline holds even for a stream that ignores its signal.
+    let expired: Promise<never> | null = null;
+    if (deadlineSignal) {
+      expired = new Promise<never>((_, reject) => {
+        const fail = () => reject(new Error("request deadline exceeded"));
+        if (deadlineSignal.aborted) fail();
+        else deadlineSignal.addEventListener("abort", fail, { once: true });
+      });
+      // Promise.race handles this while reading; this keeps an abort that
+      // arrives after the loop has finished from becoming an unhandled
+      // rejection.
+      expired.catch(() => {});
+    }
+
     try {
       while (true) {
         let readResult;
         try {
-          readResult = await reader.read();
+          readResult = expired === null ? await reader.read() : await Promise.race([reader.read(), expired]);
         } catch {
           throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
         }
@@ -418,7 +477,14 @@ export class WorkerClient {
         }
       }
     } finally {
-      reader.releaseLock();
+      // On the deadline path a read is still pending, so releasing the lock
+      // rejects it. Neither step may throw out of `finally`: that would
+      // replace the canonical error with a raw stream exception.
+      try {
+        reader.releaseLock();
+      } catch {
+        // Already released, or the reader is unusable — nothing left to free.
+      }
       response.body.cancel().catch(() => {});
     }
 
@@ -475,7 +541,7 @@ export class WorkerClient {
     // The health route is a liveness probe: it answers 200 {"status":"ok"} and
     // never emits a Worker business-error envelope, so 503 here is always an
     // outage. The makeRequest disambiguation deliberately does not apply.
-    if (this.isUpstreamOnlyStatus(response.status) || response.status === 503) {
+    if (this.isUnavailablePathStatus(response.status) || response.status === 503) {
       throw new AppError("WORKER_UNAVAILABLE", "The processing worker is temporarily unavailable. Please try again shortly.");
     }
 

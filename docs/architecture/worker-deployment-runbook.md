@@ -154,20 +154,40 @@ is an upstream page rather than a Worker error envelope. An Access login **redir
 responses (404, 409, 410, 413, 422, 429, 500, 502, 504 …) keep their existing
 error-envelope mapping and are never collapsed into unavailability.
 
-**HTTP 503 is ambiguous, not necessarily upstream.** Unlike 401/403, 503 *can*
-originate from the Worker protocol: `WORKER_ERROR_HTTP_STATUS` maps
-`EXTRACTOR_UNAVAILABLE` to 503, which is what a non-direct URL returns when
-generic extraction is unavailable. The control plane therefore does not classify
-503 before validation. It preserves `EXTRACTOR_UNAVAILABLE` only when the
-response satisfies the **entire** Worker response contract — `application/json`
-content type, valid `Content-Length`, bounded body read, valid JSON, strict
-`WorkerErrorResponseSchema`, the exact `EXTRACTOR_UNAVAILABLE` code, and the
-canonical safe message for it. Every other 503 — a proxy or tunnel outage page,
-HTML, a missing or wrong content type, malformed/oversized/unreadable bytes, a
-different Worker code, or a doctored message — fails closed to
-`WORKER_UNAVAILABLE`, and no upstream body text is ever surfaced. The
-unauthenticated `/health` route has no business-error envelope, so a 503 there
-is always `WORKER_UNAVAILABLE`.
+**HTTP 401 is not a provenance claim.** Unlike 403, a 401 *can* be
+Worker-origin: the Worker's own HTTP server answers 401 (`sendUnauthorized`) for
+HMAC, timestamp and replay rejections, and an upstream access layer can answer
+401 as well. It still maps to `WORKER_UNAVAILABLE`, but the reason is that 401
+is **not a Worker business-error status** — it is absent from
+`WORKER_ERROR_HTTP_STATUS`, and the Worker's 401 body is `{"error":"unauthorized"}`,
+not a `WorkerErrorResponse` envelope. Either way the control-plane→Worker path
+is unavailable to the user, and reporting which side rejected the credential
+would disclose auth detail to the browser. Its body is never trusted or
+surfaced.
+
+**HTTP 503 is ambiguous, and is the one status that needs disambiguation.**
+Unlike 401 and 403, 503 is an *intentional Worker business-error status*:
+`WORKER_ERROR_HTTP_STATUS` maps `EXTRACTOR_UNAVAILABLE` to 503, which is what a
+non-direct URL returns when generic extraction is unavailable. The control plane
+therefore does not classify 503 before validation. It preserves
+`EXTRACTOR_UNAVAILABLE` only when the response satisfies the **entire** Worker
+response contract — `application/json` content type, valid `Content-Length`,
+bounded body read, valid JSON, strict `WorkerErrorResponseSchema`, the exact
+`EXTRACTOR_UNAVAILABLE` code, and the canonical safe message for it. Every other
+503 — a proxy or tunnel outage page, HTML, a missing or wrong content type,
+malformed/oversized/unreadable bytes, a different Worker code, or a doctored
+message — fails closed to `WORKER_UNAVAILABLE`, and no upstream body text is
+ever surfaced. The unauthenticated `/health` route has no business-error
+envelope, so a 503 there is always `WORKER_UNAVAILABLE`.
+
+**The 503 classification is time-bounded.** Reading a body to classify it means
+`requestTimeoutMs` must cover connect + headers + that classification as **one
+total budget**, never a fresh second budget per phase. The deadline stays armed
+across the 503 branch, so a 503 that returns headers promptly and then stalls
+below the byte ceiling — which no size limit can bound — is abandoned and
+becomes `WORKER_UNAVAILABLE` rather than waiting for an external
+platform-level timeout. The reader is released and the body cancelled on that
+path, and neither the partial body nor the abort reason is surfaced.
 
 ### Filesystem roles
 

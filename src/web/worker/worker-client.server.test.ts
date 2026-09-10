@@ -505,6 +505,69 @@ describe("WorkerClient", () => {
       await assert.rejects(runGetJob(client), isUnavailable);
     });
 
+    // C (deadline) ── headers arrive promptly, body never finishes.
+    //
+    // A byte ceiling cannot bound this shape: the stream stays far below
+    // MAX_RESPONSE_BYTES indefinitely, and unlike the overflow and stream-error
+    // cases above it never terminates on its own. Only the request deadline
+    // ends it. Two variants, because a real Fetch body errors when its signal
+    // aborts while a hand-built ReadableStream need not:
+    //   1. a stream that IGNORES its abort signal, proving the client bounds
+    //      the read itself instead of trusting the stream to cooperate;
+    //   2. a stream that ERRORS on abort, modelling real Fetch semantics.
+    // The explicit per-test timeout makes a regression fail rather than hang.
+    const STALL_SENTINEL = "STALLED_BODY_SENTINEL_LEAK";
+    const stalling = (observeAbort: boolean) => new WorkerClient({
+      baseUrl: BASE_URL, currentKeyId: TEST_KEY_ID, currentSecret: TEST_SECRET,
+      requestTimeoutMs: 1000, // the minimum the config schema allows
+      fetchImplementation: (async (_url: any, opts: any) => new Response(
+        new ReadableStream({
+          start(controller) {
+            // A plausible partial envelope, then silence: never closed.
+            controller.enqueue(new TextEncoder().encode(`{"partial":"${STALL_SENTINEL}"`));
+            if (observeAbort) {
+              opts.signal?.addEventListener("abort", () => {
+                try { controller.error(new Error("aborted by signal")); } catch { /* already closed */ }
+              }, { once: true });
+            }
+          },
+        }),
+        { status: 503, headers: { "Content-Type": "application/json; charset=utf-8" } },
+      )) as unknown as typeof fetch,
+    });
+
+    it("C: a 503 body that never completes is ended by the request deadline -> WORKER_UNAVAILABLE", { timeout: 15000 }, async () => {
+      const started = Date.now();
+      await assert.rejects(runGetJob(stalling(false)), isUnavailable);
+      const elapsed = Date.now() - started;
+      // Lower bound: it genuinely waited for the deadline rather than failing
+      // fast for an unrelated reason. Upper bound: it did not wait forever.
+      assert.ok(elapsed >= 500, `expected the deadline to be awaited, took ${elapsed}ms`);
+      assert.ok(elapsed < 10000, `expected a bounded wait, took ${elapsed}ms`);
+    });
+
+    it("C: a stalled 503 body that errors on abort (real Fetch semantics) -> WORKER_UNAVAILABLE", { timeout: 15000 }, async () => {
+      await assert.rejects(runGetJob(stalling(true)), isUnavailable);
+    });
+
+    it("D: a deadline-terminated 503 leaks no body or stream text", { timeout: 15000 }, async () => {
+      await assert.rejects(runGetJob(stalling(false)), (e: any) => {
+        const rendered = `${String(e)}\n${e.message}\n${e.stack ?? ""}`;
+        return e.code === "WORKER_UNAVAILABLE" &&
+          e.message === ERROR_MESSAGES.WORKER_UNAVAILABLE &&
+          !rendered.includes(STALL_SENTINEL) &&
+          !rendered.includes("request deadline exceeded") &&
+          !rendered.includes("aborted by signal");
+      });
+    });
+
+    it("C: a stalled 503 does not consume a second full timeout budget", { timeout: 15000 }, async () => {
+      // connect + headers + body classification share ONE requestTimeoutMs.
+      const started = Date.now();
+      await assert.rejects(runGetJob(stalling(false)), isUnavailable);
+      assert.ok(Date.now() - started < 1900, "the deadline must be one total budget, not one per phase");
+    });
+
     // I ── the response bounds still gate the probe.
     it("I: oversized streamed body -> WORKER_UNAVAILABLE", async () => {
       const client = streaming(503, (c) => {
@@ -524,7 +587,10 @@ describe("WorkerClient", () => {
       });
     }
 
-    // J ── 401/403 stay upstream even when dressed as a Worker envelope.
+    // J ── neither 401 nor 403 becomes a business error, even when dressed as a
+    // Worker envelope. A 401 may genuinely be Worker-origin (its HTTP server
+    // answers 401 for HMAC/replay rejection), but 401 is not a Worker
+    // business-error status, so the path is unavailable either way.
     for (const status of [401, 403]) {
       it(`J: ${status} carrying the canonical Worker envelope -> WORKER_UNAVAILABLE`, async () => {
         await assert.rejects(runGetJob(respondWith(status, CANONICAL_ENVELOPE)), isUnavailable);
