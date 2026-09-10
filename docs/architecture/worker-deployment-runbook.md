@@ -3176,10 +3176,18 @@ authorization.
       rows there in Production, and they survived container replacement: the
       live `shutdown` case recovered its interrupted row in a new container
       (§11f, §11h — *accepted operator-measured*).
-- [x] **Exactly one replica.** The unit runs one container under the fixed
-      name `videofetch-worker` and force-removes any prior instance first, so
-      a second replica cannot coexist on the host; the selected local-VM
-      realization has no autoscaler to disable (*repository-verifiable*).
+- [x] **Exactly one replica — the supported deployment runs exactly one
+      Worker.** systemd manages exactly one `videofetch-worker` container, and
+      its start path force-removes the prior managed instance
+      (`ExecStartPre=-/usr/bin/docker rm -f videofetch-worker`) before starting
+      the replacement under the same fixed name. No autoscaling mechanism is
+      configured in the selected local-VM deployment (*repository-verifiable*:
+      `deploy/systemd/videofetch-worker.service`). The architecture supports
+      exactly one Worker and one SQLite writer (§1): running an additional
+      Worker against the same durable state is unsupported and violates the
+      deployment contract. The fixed name stops the managed service from
+      starting a second container under that name; it does not make an
+      independently launched, differently named container impossible.
 - [x] **Read-only root filesystem, writable state mount, writable ephemeral
       scratch.** The unit passes `--read-only`, a read/write bind mount of
       `/var/lib/videofetch`, and a `noexec,nosuid` tmpfs at `/tmp/videofetch`

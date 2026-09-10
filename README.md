@@ -2,7 +2,7 @@
 
 A polished video downloader. Paste a link, pick a quality, and download the file.
 
-VideoFetch analyzes public video pages and direct media URLs, normalizes available formats, then processes the download in a background job. Separate video and audio streams are merged automatically when FFmpeg is available.
+VideoFetch analyzes direct media URLs and eligible public video pages, offers application-owned quality presets, and runs each download as a durable background job on a standalone Worker; the finished file is kept briefly in private object storage and delivered through a short-lived signed link. Separate video and audio streams are **not** merged: generic pages are handled by a deliberately narrow yt-dlp path (see *Architecture* below).
 
 ## Features
 
@@ -16,37 +16,44 @@ VideoFetch analyzes public video pages and direct media URLs, normalizes availab
 ## Architecture
 
 ```text
-Frontend (TanStack Start)
-  → REST API
-    → Extractor registry (sample, direct media, yt-dlp)
-      → Job queue / workers
-        → FFmpeg processing
-          → Temporary storage
-            → Secure download URL
+Private browser
+  → Vercel control plane      private-access gate, request validation,
+                              HMAC-signed Worker calls, signed R2 GETs
+  → Cloudflare Access + named Tunnel
+  → standalone Worker         on-demand Lima VM
+      → SQLite durable job state
+      → direct-first analysis and acquisition
+      → generic yt-dlp fallback, when the URL is eligible
+      → Worker processing     its own FFmpeg, where a preset needs it
+      → temporary R2 object   per-operation credentials from a host broker
+  → Vercel signed download    short-lived GET; the object then expires
 ```
 
-Extractors implement a shared `MediaExtractor` interface (`canHandle`, `getMetadata`, `getFormats`, `download`) so additional websites can be added without changing the rest of the app.
+The control plane never runs media work: when the Worker is unreachable it fails closed with `WORKER_UNAVAILABLE`, and it never falls back to local processing. The Worker runs on demand — while its VM is stopped the downloader is offline by design. Media egress is confined by an external safe-egress boundary (a media network namespace, a host-owned nftables policy and a watchdog) that the Worker cannot read or alter. The current deployment state and operating model are in [`docs/architecture/worker-deployment-runbook.md`](docs/architecture/worker-deployment-runbook.md).
+
+**Generic v1 scope.** Generic extraction covers public, single-item, non-live sources that can be acquired as one progressive HTTP(S) format, and it offers only application-owned presets — never raw upstream format ids. There is no HLS or DASH acquisition and no split video+audio merge, so a source whose usable renditions would need a merge yields no generic video option.
+
+The `src/services/` extractor registry (`MediaExtractor`) and in-process download manager are the pre-migration design. They remain in the repository, and the Worker reuses some of their lower-level helpers, but they are not the Production execution path: `src/web/boundary/control-plane-boundary.test.ts` bars the browser-facing API from reaching them.
 
 ## Requirements
 
-- Node.js 22
-- FFmpeg
-- Python 3 with `yt-dlp` (`pip install yt-dlp`)
+- **Web control plane and tests:** Node.js 22 and npm. No local FFmpeg, Python or yt-dlp is needed to run the web control plane, and `npm test` does not require FFmpeg or yt-dlp.
+- **Worker:** built from `Dockerfile.worker`, which ships its own FFmpeg, Python 3 and a digest-pinned yt-dlp runtime — nothing is installed with `pip`. It runs on the Lima VM behind its R2 credential broker and safe-egress boundary; see `deploy/README.md` and the runbook.
 
 ## Development
 
 ```sh
 npm install
-pip install yt-dlp
-cp .env.example .env   # optional; defaults work for local development
 npm run dev
 ```
 
-The app listens on port 8080.
+`npm run dev` starts **only the web control plane** — the Vite dev server on port 8080. The UI loads, but every downloader request fails closed with `WORKER_UNAVAILABLE` until the control plane can reach a Worker: `WORKER_BASE_URL`, `WORKER_CONTROL_KEY_ID` and `WORKER_CONTROL_SECRET` must be present in its environment, plus `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET` when the Worker sits behind Cloudflare Access, and the `R2_*` location and signer variables for the final download. `.env.example` documents every variable.
+
+The repository does **not** provide a local end-to-end Worker workflow. No script starts a Worker; the Worker image is deployed together with its R2 credential broker and its external safe-egress boundary (`deploy/README.md`), and generic yt-dlp execution must never be enabled on a Worker that lacks that boundary. End-to-end behaviour is exercised against the deployed stack; locally, `npm test` exercises both runtimes without any external download.
 
 ## Scripts
 
-- `npm run dev` — development server
+- `npm run dev` — development server for the web control plane only (no Worker)
 - `npm run build` — production build
 - `npm run typecheck` — TypeScript
 - `npm test` — unit tests (no live downloads)
@@ -92,13 +99,7 @@ Local development may omit `VIDEOFETCH_ACCESS_SECRET` for ordinary downloader op
 
 ## Docker
 
-The image installs FFmpeg and yt-dlp:
-
-```sh
-docker compose up --build
-```
-
-Temporary media is written to a tmpfs volume.
+`docker compose up --build` builds the root `Dockerfile`, which is the **legacy single-runtime image**. It serves the web app with `npm run preview` on port 8080; the FFmpeg and system yt-dlp it installs belong to the pre-migration in-process stack, which the browser-facing API no longer reaches. As configured it provides no `VIDEOFETCH_ACCESS_SECRET` and no Worker variables, so its downloader APIs fail closed. It is **not** the Worker image — that is `Dockerfile.worker`, deployed as described in `deploy/README.md`.
 
 ## Deployment provenance
 
@@ -116,7 +117,7 @@ Docker already excludes `.vercel` (see `.dockerignore`) and runs `npm run build`
 
 ## Tests
 
-Unit tests cover URL validation, SSRF helpers, pinned HTTP transport, the pinned yt-dlp runtime policy (closed arguments, closed environment, exact version probe), temp-directory containment, private-access gating, filename sanitization, format normalization, progress parsing, job status, rate limiting, and error mapping. External downloads are not performed in CI.
+Unit tests cover URL validation, SSRF helpers, pinned HTTP transport, the pinned yt-dlp runtime policy (closed arguments, closed environment, exact version probe), temp-directory containment, private-access gating, filename sanitization, format normalization, progress parsing, job status, rate limiting, and error mapping. The tests never perform external downloads. The repository has no CI; run the suites locally.
 
 ## Notes
 

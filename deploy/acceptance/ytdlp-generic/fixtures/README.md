@@ -372,6 +372,12 @@ blocked the live generic, byte-limit and safe-egress cases — all three call
 > suite merged ahead of the live phase. **Live Phase 10D has still not been
 > executed** — Stage A, enabling generic, and Stage B all remain outstanding,
 > and nothing here claims Production acceptance.
+>
+> *Superseded — historical note added 2026-09-10. The sentence above was true
+> when D1/D2 were discovered. Phase 10D was subsequently executed and
+> accepted; the current disposition is in the Status block of
+> [`../README.md`](../README.md) and in §11h of
+> [`docs/architecture/worker-deployment-runbook.md`](../../../../docs/architecture/worker-deployment-runbook.md).*
 
 **D1 — `hasAudio` is unreachable for any video-bearing format.**
 `selectCandidates` requires `audio_ext !== "none"`, but `_fill_sorting_fields` in
