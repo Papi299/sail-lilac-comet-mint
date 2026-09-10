@@ -76,6 +76,10 @@ function selection(over: Partial<GenericSourceSelections[string]> = {}) {
   // selection outright (§12), so the default follows whatever the caller asked
   // for and can still be overridden explicitly.
   const hasVideo = over.hasVideo ?? true;
+  // Likewise `audioConstraint` must agree with `hasAudio`, which means PROVEN
+  // audio (exactly `codec-present`). A caller asking for `hasAudio: false` gets
+  // proven absence; the unknown state must be asked for explicitly.
+  const hasAudio = over.hasAudio ?? true;
   return {
     formatId: "22",
     protocol: "https" as const,
@@ -83,6 +87,7 @@ function selection(over: Partial<GenericSourceSelections[string]> = {}) {
     hasVideo: true,
     hasAudio: true,
     videoConstraint: (hasVideo ? "codec-present" : "absent") as GenericVideoConstraint,
+    audioConstraint: hasAudio ? ("codec-present" as const) : ("absent" as const),
     fileSize: null,
     ...over,
   };

@@ -263,6 +263,7 @@ describe("routing: YTDLP_ENABLED=true (§53)", () => {
             hasVideo: true,
             hasAudio: true,
             videoConstraint: "codec-present" as const,
+            audioConstraint: "codec-present" as const,
             fileSize: null,
           },
         },
@@ -273,6 +274,10 @@ describe("routing: YTDLP_ENABLED=true (§53)", () => {
     assert.equal(res.selections["preset:1080"]?.formatId, "22");
     // The PUBLIC half stays free of it.
     assert.equal(JSON.stringify(res.video).includes('"22"'), false);
+    // The private audio state travels with the selection, never with the
+    // browser-safe half (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
+    assert.equal(res.selections["preset:1080"]?.audioConstraint, "codec-present");
+    assert.equal(JSON.stringify(res.video).includes("audioConstraint"), false);
   });
 
   it("propagates the analyzer's own failure without a second attempt", async () => {

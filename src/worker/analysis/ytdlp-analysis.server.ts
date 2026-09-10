@@ -17,6 +17,7 @@ import {
   GenericSourceSelectionSchema,
   isSafeFormatId,
   toGenericSourceContainer,
+  type GenericAudioConstraint,
   type GenericSourceContainer,
   type GenericSourceProtocol,
   type GenericSourceSelection,
@@ -523,6 +524,11 @@ export function parseAnalysisInfo(stdout: string): AnalysisParseResult {
 
 type Candidate = {
   readonly hasVideo: boolean;
+  /**
+   * Audio presence is PROVEN: exactly `audioConstraint === "codec-present"`.
+   * Every generic preset is gated on this, so an unknown audio state can never
+   * be advertised as carrying audio.
+   */
   readonly hasAudio: boolean;
   readonly height: number | null;
   readonly fps: number | null;
@@ -545,6 +551,12 @@ type Candidate = {
    * can bind the same evidence rather than assuming a known codec (§11).
    */
   readonly videoConstraint: GenericVideoConstraint;
+  /**
+   * PRIVATE. WHAT analysis knew about audio — `classifyCodecState(acodec)`,
+   * one-for-one — so the acquisition selector can re-select the same state
+   * instead of rebuilding it from the narrower `hasAudio` boolean.
+   */
+  readonly audioConstraint: GenericAudioConstraint;
   /** Position in the upstream list. The final, fully deterministic tiebreak. */
   readonly index: number;
 };
@@ -558,6 +570,7 @@ function toSelection(c: Candidate): GenericSourceSelection {
     hasVideo: c.hasVideo,
     hasAudio: c.hasAudio,
     videoConstraint: c.videoConstraint,
+    audioConstraint: c.audioConstraint,
     fileSize: c.fileSize,
   });
 }
@@ -601,6 +614,25 @@ export function classifyCodecState(codec: string | null | undefined): CodecState
 
 function isPresentCodec(codec: string | null | undefined): boolean {
   return classifyCodecState(codec) === "present";
+}
+
+/**
+ * Maps a classified `acodec` onto the private audio constraint, one-for-one.
+ *
+ * Deliberately total and lossless: unknown stays unknown. Collapsing it to
+ * `absent` is what made the selector unable to re-select the very format it
+ * came from, and collapsing it to `codec-present` would claim audio that
+ * nothing proves (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
+ */
+function toAudioConstraint(state: CodecState): GenericAudioConstraint {
+  switch (state) {
+    case "present":
+      return "codec-present";
+    case "absent":
+      return "absent";
+    case "unknown":
+      return "unknown";
+  }
 }
 
 /** Folds a raw container/extension field for comparison, or null when absent. */
@@ -695,8 +727,14 @@ export function selectCandidates(
     // It is a sorting/container helper, not a muxed-audio-presence flag. Gating
     // on it made `hasVideo && hasAudio` structurally impossible for real output
     // from ANY site, so no generic video preset could ever be built (§D1).
-    const audioState = classifyCodecState(raw.acodec);
-    const hasAudio = audioState === "present";
+    //
+    // The three states survive as they are. `hasAudio` is the NARROWER
+    // statement — audio is PROVEN — so unknown is `false` there while staying
+    // `unknown` in the private constraint; it is never rewritten as absent to
+    // fit the boolean. Nothing correlational (container, `tbr`, `abr`, `asr`,
+    // `audio_channels`, `format_note`) substitutes for a present `acodec`.
+    const audioConstraint = toAudioConstraint(classifyCodecState(raw.acodec));
+    const hasAudio = audioConstraint === "codec-present";
 
     // ── Video presence ───────────────────────────────────────────────────
     //
@@ -781,6 +819,7 @@ export function selectCandidates(
       formatId,
       protocol: protocol as GenericSourceProtocol,
       videoConstraint,
+      audioConstraint,
       index,
     });
   });
@@ -868,6 +907,14 @@ export type GenericPresetBuild = {
  * can extract audio with its OWN FFmpeg after a future durable job has entered
  * `processing`. That never asks yt-dlp to extract anything: `-x`,
  * `--extract-audio` and `--audio-format` appear nowhere on this path.
+ *
+ * "Carries audio" means PROVEN audio: `hasAudio`, i.e. an `audioConstraint` of
+ * `codec-present`. A source whose `acodec` is unknown is a coherent private
+ * candidate but is never advertised — as video, as audio, or as MP3 — because
+ * nothing establishes that it has an audio stream at all, and extracting audio
+ * from one that has none fails in the Worker's FFmpeg after the user has
+ * already chosen it. `analyzeGenericMediaInternal` asserts this over every
+ * selection it emits (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
  */
 export function buildGenericPresets(
   candidates: readonly Candidate[],
@@ -881,7 +928,8 @@ export function buildGenericPresets(
   // upstream identity at all.
   const selections: Record<string, GenericSourceSelection> = {};
 
-  // Muxed single-source video candidates only.
+  // Muxed single-source video candidates only — video plus PROVEN audio. An
+  // unknown-audio candidate is not muxed as far as advertising is concerned.
   const muxedVideo = candidates.filter((c) => c.hasVideo && c.hasAudio);
 
   const videoPreset = (
@@ -1272,6 +1320,16 @@ export async function analyzeGenericMediaInternal(
   // ...and nothing may be selectable that was never advertised.
   for (const id of Object.keys(selections)) {
     if (!presets.some((p) => p.id === id)) throw new AppError("EXTRACTION_FAILED");
+  }
+  // Every preset generic v1 advertises is built on PROVEN audio, so every
+  // private selection behind one must record exactly that. Asserted here rather
+  // than left as a consequence of the candidate filters: an unknown or absent
+  // audio state reaching execution would mean analysis had quietly widened what
+  // generic v1 can acquire (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
+  for (const selection of Object.values(selections)) {
+    if (selection.audioConstraint !== "codec-present" || selection.hasAudio !== true) {
+      throw new AppError("EXTRACTION_FAILED");
+    }
   }
 
   const video = VideoMetadataSchema.parse({

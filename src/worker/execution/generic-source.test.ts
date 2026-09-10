@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
+  GENERIC_AUDIO_CONSTRAINTS,
   GENERIC_AUDIO_SOURCE_CONTAINERS,
   GENERIC_FORMAT_SELECTOR_ATOM,
   GENERIC_VIDEO_CONSTRAINTS,
@@ -13,6 +16,7 @@ import {
   toGenericSourceContainer,
   type GenericSourceSelection,
 } from "./generic-source.ts";
+import { buildGenericPresets, selectCandidates } from "../analysis/ytdlp-analysis.server.ts";
 
 /**
  * Phase 10C3 §51: the raw upstream `format_id` boundary.
@@ -30,6 +34,7 @@ const MUXED: GenericSourceSelection = {
   hasVideo: true,
   hasAudio: true,
   videoConstraint: "codec-present",
+  audioConstraint: "codec-present",
   fileSize: 1024,
 };
 
@@ -45,6 +50,7 @@ const UNKNOWN_VIDEO: GenericSourceSelection = {
   hasVideo: true,
   hasAudio: true,
   videoConstraint: "video-ext",
+  audioConstraint: "codec-present",
   fileSize: null,
 };
 
@@ -213,6 +219,7 @@ describe("generic source: format selector construction (§12/§13/§14)", () => 
         hasVideo: false,
         hasAudio: true,
         videoConstraint: "absent",
+        audioConstraint: "codec-present",
         fileSize: null,
       }),
       'b*[format_id="140"][protocol="https"][ext="m4a"][vcodec="none"][acodec!="none"]',
@@ -247,7 +254,9 @@ describe("generic source: format selector construction (§12/§13/§14)", () => 
       MUXED,
       UNKNOWN_VIDEO,
       { ...MUXED, hasVideo: false, container: "m4a" as const, videoConstraint: "absent" as const },
-      { ...MUXED, hasAudio: false },
+      { ...MUXED, hasAudio: false, audioConstraint: "absent" as const },
+      { ...MUXED, hasAudio: false, audioConstraint: "unknown" as const },
+      { ...UNKNOWN_VIDEO, hasAudio: false, audioConstraint: "unknown" as const },
     ]) {
       const selector = buildGenericFormatSelector(shape);
       assert.doesNotMatch(selector, /\//, "no `/` fallback: one source or none");
@@ -266,7 +275,11 @@ describe("generic source: format selector construction (§12/§13/§14)", () => 
   });
 
   it("inverts the stream-shape constraints to match the approved shape", () => {
-    const videoOnly = buildGenericFormatSelector({ ...MUXED, hasAudio: false });
+    const videoOnly = buildGenericFormatSelector({
+      ...MUXED,
+      hasAudio: false,
+      audioConstraint: "absent",
+    });
     assert.match(videoOnly, /\[vcodec!="none"\]/);
     assert.match(videoOnly, /\[acodec="none"\]/);
 
@@ -300,7 +313,12 @@ describe("generic source: format selector construction (§12/§13/§14)", () => 
     // Whole-expression assertion: whatever the inputs, the emitted string is
     // built only from the atom, bracket/quote delimiters, known keys, and
     // grammar-checked values.
-    for (const shape of [MUXED, UNKNOWN_VIDEO]) {
+    for (const shape of [
+      MUXED,
+      UNKNOWN_VIDEO,
+      { ...MUXED, hasAudio: false, audioConstraint: "absent" as const },
+      { ...UNKNOWN_VIDEO, hasAudio: false, audioConstraint: "unknown" as const },
+    ]) {
       const selector = buildGenericFormatSelector(shape);
       assert.match(selector, /^b\*(\[[a-z_]+(?:!=\?|!=|=)"[A-Za-z0-9._-]{1,128}"\])+$/);
     }
@@ -471,7 +489,8 @@ describe("known and absent video selection stay strict (§14/§15/§28)", () => 
   it("proven ABSENT video keeps requiring absence", () => {
     const selector = buildGenericFormatSelector({
       formatId: "140", protocol: "https", container: "m4a",
-      hasVideo: false, hasAudio: true, videoConstraint: "absent", fileSize: null,
+      hasVideo: false, hasAudio: true, videoConstraint: "absent",
+      audioConstraint: "codec-present", fileSize: null,
     });
     const base: PinnedFormat = {
       format_id: "140", protocol: "https", ext: "m4a",
@@ -492,10 +511,13 @@ describe("audio selection uses acodec, never audio_ext (§17)", () => {
     for (const shape of [
       MUXED,
       UNKNOWN_VIDEO,
-      { ...MUXED, hasAudio: false },
+      { ...MUXED, hasAudio: false, audioConstraint: "absent" as const },
+      { ...MUXED, hasAudio: false, audioConstraint: "unknown" as const },
+      { ...UNKNOWN_VIDEO, hasAudio: false, audioConstraint: "unknown" as const },
       {
         formatId: "140", protocol: "https" as const, container: "m4a" as const,
-        hasVideo: false, hasAudio: true, videoConstraint: "absent" as const, fileSize: null,
+        hasVideo: false, hasAudio: true, videoConstraint: "absent" as const,
+        audioConstraint: "codec-present" as const, fileSize: null,
       },
     ]) {
       assert.doesNotMatch(
@@ -553,12 +575,19 @@ describe("private selection consistency rules (§12)", () => {
   });
 
   it("rejects a selection that carries neither stream", () => {
-    assert.equal(
-      GenericSourceSelectionSchema.safeParse({
-        ...MUXED, container: "m4a", hasVideo: false, hasAudio: false, videoConstraint: "absent",
-      }).success,
-      false,
-    );
+    // Each case is internally coherent, so it is refused by THIS rule and not by
+    // an agreement check. `hasAudio` means PROVEN audio, so an absent-video
+    // shape whose audio is merely unknown proves no stream at all either.
+    for (const audioConstraint of ["absent", "unknown"] as const) {
+      assert.equal(
+        GenericSourceSelectionSchema.safeParse({
+          ...MUXED, container: "m4a", hasVideo: false, hasAudio: false,
+          videoConstraint: "absent", audioConstraint,
+        }).success,
+        false,
+        audioConstraint,
+      );
+    }
   });
 
   it("accepts the three coherent shapes", () => {
@@ -567,10 +596,336 @@ describe("private selection consistency rules (§12)", () => {
       UNKNOWN_VIDEO,
       {
         formatId: "140", protocol: "https" as const, container: "m4a" as const,
-        hasVideo: false, hasAudio: true, videoConstraint: "absent" as const, fileSize: null,
+        hasVideo: false, hasAudio: true, videoConstraint: "absent" as const,
+        audioConstraint: "codec-present" as const, fileSize: null,
       },
     ]) {
       assert.equal(GenericSourceSelectionSchema.safeParse(shape).success, true);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001
+//
+// Audio used to be reduced to a boolean before it reached this module, so an
+// UNKNOWN `acodec` arrived as `hasAudio: false` and the selector rebuilt that as
+// `[acodec="none"]` — which the pinned runtime can never match against the
+// `acodec: None` format it came from. The private selection now carries the
+// three states as they are, and the selector's audio half follows them.
+//
+// None of this changes what is ADVERTISED: every generic preset still requires
+// PROVEN audio. These tests pin the representation; the analysis tests pin the
+// advertising policy.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** One coherent private selection per audio state, on the same muxed source. */
+const AUDIO_PRESENT: GenericSourceSelection = MUXED;
+const AUDIO_ABSENT: GenericSourceSelection = { ...MUXED, hasAudio: false, audioConstraint: "absent" };
+const AUDIO_UNKNOWN: GenericSourceSelection = {
+  ...MUXED,
+  hasAudio: false,
+  audioConstraint: "unknown",
+};
+
+describe("private audio constraint: the three states", () => {
+  it("is exactly the closed tri-state vocabulary", () => {
+    assert.deepEqual([...GENERIC_AUDIO_CONSTRAINTS], ["codec-present", "absent", "unknown"]);
+  });
+
+  it("accepts codec-present with hasAudio=true", () => {
+    assert.equal(AUDIO_PRESENT.hasAudio, true);
+    assert.equal(GenericSourceSelectionSchema.safeParse(AUDIO_PRESENT).success, true);
+  });
+
+  it("accepts absent with hasAudio=false", () => {
+    assert.equal(GenericSourceSelectionSchema.safeParse(AUDIO_ABSENT).success, true);
+  });
+
+  it("accepts unknown with hasAudio=false — unknown is not proven audio", () => {
+    assert.equal(GenericSourceSelectionSchema.safeParse(AUDIO_UNKNOWN).success, true);
+    // The real affected shape: an unknown VIDEO codec (the HTML5 path) whose
+    // audio is unknown too, because the page declared no `codecs=` at all.
+    assert.equal(
+      GenericSourceSelectionSchema.safeParse({
+        ...UNKNOWN_VIDEO,
+        hasAudio: false,
+        audioConstraint: "unknown",
+      }).success,
+      true,
+    );
+  });
+
+  const MISMATCHES: Array<[string, boolean]> = [
+    ["codec-present", false],
+    ["absent", true],
+    ["unknown", true],
+  ];
+  for (const [audioConstraint, hasAudio] of MISMATCHES) {
+    it(`rejects audioConstraint=${audioConstraint} with hasAudio=${hasAudio}`, () => {
+      assert.equal(
+        GenericSourceSelectionSchema.safeParse({ ...MUXED, audioConstraint, hasAudio }).success,
+        false,
+        "hasAudio is true exactly when audio is PROVEN",
+      );
+    });
+  }
+
+  it("rejects any value outside the closed vocabulary, and a missing one", () => {
+    for (const audioConstraint of ["present", "none", "codec_present", "Unknown", "", null, undefined]) {
+      assert.equal(
+        GenericSourceSelectionSchema.safeParse({ ...MUXED, audioConstraint }).success,
+        false,
+        String(audioConstraint),
+      );
+    }
+    const withoutConstraint: Record<string, unknown> = { ...MUXED };
+    delete withoutConstraint.audioConstraint;
+    assert.equal(GenericSourceSelectionSchema.safeParse(withoutConstraint).success, false);
+  });
+});
+
+describe("private audio constraint: selector construction", () => {
+  it("codec-present keeps the strict form", () => {
+    assert.equal(
+      buildGenericFormatSelector(AUDIO_PRESENT),
+      'b*[format_id="22"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!="none"]',
+    );
+  });
+
+  it("absent binds explicit absence", () => {
+    assert.equal(
+      buildGenericFormatSelector(AUDIO_ABSENT),
+      'b*[format_id="22"][protocol="https"][ext="mp4"][vcodec!="none"][acodec="none"]',
+    );
+  });
+
+  it("unknown uses the none-inclusive form", () => {
+    assert.equal(
+      buildGenericFormatSelector(AUDIO_UNKNOWN),
+      'b*[format_id="22"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!=?"none"]',
+    );
+  });
+
+  it("builds the real affected shape: unknown video codec AND unknown audio", () => {
+    assert.equal(
+      buildGenericFormatSelector({ ...UNKNOWN_VIDEO, hasAudio: false, audioConstraint: "unknown" }),
+      'b*[format_id="0"][protocol="https"][ext="mp4"][vcodec!=?"none"][video_ext="mp4"][acodec!=?"none"]',
+    );
+  });
+
+  it("decides the audio half from audioConstraint, never from hasAudio", () => {
+    // absent and unknown share `hasAudio: false`. If the boolean still drove the
+    // selector they would collapse onto one filter — which is precisely the
+    // unknown->absent reduction this correction removes.
+    assert.equal(AUDIO_ABSENT.hasAudio, AUDIO_UNKNOWN.hasAudio);
+    assert.notEqual(
+      buildGenericFormatSelector(AUDIO_ABSENT),
+      buildGenericFormatSelector(AUDIO_UNKNOWN),
+    );
+  });
+
+  it("binds id, protocol, container, video shape and exactly one audio filter, last", () => {
+    for (const shape of [AUDIO_PRESENT, AUDIO_ABSENT, AUDIO_UNKNOWN]) {
+      const selector = buildGenericFormatSelector(shape);
+      const filters =
+        selector.slice(GENERIC_FORMAT_SELECTOR_ATOM.length).match(/\[[^\]]+\]/g) ?? [];
+      assert.deepEqual(filters.slice(0, 4), [
+        '[format_id="22"]',
+        '[protocol="https"]',
+        '[ext="mp4"]',
+        '[vcodec!="none"]',
+      ]);
+      assert.equal(filters.filter((f) => f.startsWith("[acodec")).length, 1, "one audio filter");
+      assert.match(filters[filters.length - 1]!, /^\[acodec/, "the audio filter stays last");
+      assert.doesNotMatch(selector, /\//, "no `/` fallback: one source or none");
+      assert.doesNotMatch(selector, /\+/, "no `+` merge: generic v1 never merges streams");
+      assert.doesNotMatch(selector, /audio_ext/, "audio_ext is never constrained");
+    }
+  });
+});
+
+describe("private audio constraint against pinned filter semantics", () => {
+  /**
+   * The same muxed source with its `acodec` in each state the pinned runtime
+   * can hand a filter. `missing` is the real HTML5 case: with no `codecs=` on
+   * the `<source type>`, `parse_codecs` returns `{}` and the key is never set
+   * (see `testdata/pinned-generic-html5-no-audio-codec.json`).
+   */
+  const base: PinnedFormat = {
+    format_id: "22",
+    protocol: "https",
+    ext: "mp4",
+    vcodec: "avc1.640028",
+  };
+  const ACODEC: Array<[string, string | null | undefined]> = [
+    ["missing", undefined],
+    ["null", null],
+    ["a real codec", "mp4a.40.2"],
+    ["the absence marker", "none"],
+  ];
+  const EXPECTED: Record<string, Record<string, boolean>> = {
+    // accepts only PRESENT
+    "codec-present": {
+      missing: false,
+      null: false,
+      "a real codec": true,
+      "the absence marker": false,
+    },
+    // accepts only "none"
+    absent: { missing: false, null: false, "a real codec": false, "the absence marker": true },
+    // accepts UNKNOWN and a later-known codec; rejects PROVEN absence
+    unknown: { missing: true, null: true, "a real codec": true, "the absence marker": false },
+  };
+  const SHAPES: Record<string, GenericSourceSelection> = {
+    "codec-present": AUDIO_PRESENT,
+    absent: AUDIO_ABSENT,
+    unknown: AUDIO_UNKNOWN,
+  };
+
+  for (const constraint of GENERIC_AUDIO_CONSTRAINTS) {
+    for (const [label, acodec] of ACODEC) {
+      const want = EXPECTED[constraint]![label]!;
+      it(`${constraint} ${want ? "selects" : "rejects"} acodec ${label}`, () => {
+        const format: PinnedFormat = { ...base };
+        if (acodec !== undefined) format.acodec = acodec;
+        assert.equal(selectsFormat(buildGenericFormatSelector(SHAPES[constraint]!), format), want);
+      });
+    }
+  }
+
+  it("re-selecting an unknown state proves nothing about audio", () => {
+    // The none-inclusive form matches an unknown AND a known codec: it states
+    // "not proven absent", which is all analysis knew. It is a coherence
+    // property of the selector, never a licence to advertise audio.
+    const selector = buildGenericFormatSelector(AUDIO_UNKNOWN);
+    assert.equal(selectsFormat(selector, { ...base }), true);
+    assert.equal(selectsFormat(selector, { ...base, acodec: "mp4a.40.2" }), true);
+    assert.equal(AUDIO_UNKNOWN.hasAudio, false, "and the selection still claims no audio");
+  });
+
+  it("THE LATENT DEFECT: rebuilding unknown as absent could never re-select it", () => {
+    // What the boolean produced before this correction, for the real affected
+    // shape. Pinned so the regression cannot come back unnoticed.
+    const real: PinnedFormat = {
+      format_id: "0",
+      protocol: "https",
+      ext: "mp4",
+      vcodec: null,
+      video_ext: "mp4",
+      audio_ext: "none",
+    };
+    const collapsed = buildGenericFormatSelector({
+      ...UNKNOWN_VIDEO,
+      hasAudio: false,
+      audioConstraint: "absent",
+    });
+    const honest = buildGenericFormatSelector({
+      ...UNKNOWN_VIDEO,
+      hasAudio: false,
+      audioConstraint: "unknown",
+    });
+    assert.equal(selectsFormat(collapsed, real), false, "unknown->absent selects nothing");
+    assert.equal(selectsFormat(honest, real), true, "the honest state re-selects its own source");
+  });
+});
+
+describe("analysis -> selector round trip", () => {
+  const LIMITS = { maxFileSizeBytes: 500 * 1024 * 1024 };
+
+  /** A captured pinned-runtime document's formats, read exactly as analysis tests do. */
+  function captured(name: string): Array<Record<string, unknown>> {
+    const doc = JSON.parse(
+      readFileSync(join(import.meta.dirname, "..", "analysis", "testdata", name), "utf8"),
+    ) as { formats: Array<Record<string, unknown>> };
+    return doc.formats;
+  }
+
+  /** Real-shaped raw formats covering every classification analysis makes. */
+  const RAW: Array<Record<string, unknown>> = [
+    {
+      format_id: "22", ext: "mp4", protocol: "https", height: 720,
+      vcodec: "avc1.64001F", acodec: "mp4a.40.2", video_ext: "mp4", audio_ext: "none",
+    },
+    {
+      format_id: "43", ext: "webm", protocol: "https", height: 360,
+      vcodec: "vp8", acodec: "vorbis", video_ext: "webm", audio_ext: "none",
+    },
+    {
+      format_id: "137", ext: "mp4", protocol: "https", height: 1080,
+      vcodec: "avc1.640028", acodec: "none", video_ext: "mp4", audio_ext: "none",
+    },
+    {
+      format_id: "140", ext: "m4a", protocol: "https",
+      vcodec: "none", acodec: "mp4a.40.2", video_ext: "none", audio_ext: "m4a",
+    },
+    {
+      format_id: "html5-unknown-audio", ext: "mp4", protocol: "https",
+      vcodec: null, video_ext: "mp4", audio_ext: "none",
+    },
+  ];
+
+  function inputs(): Array<[string, Array<Record<string, unknown>>]> {
+    return [
+      ["pinned-generic-html5.json", captured("pinned-generic-html5.json")],
+      [
+        "pinned-generic-html5-no-audio-codec.json",
+        captured("pinned-generic-html5-no-audio-codec.json"),
+      ],
+      ["a real-shaped mixed document", RAW],
+      ...RAW.map((f): [string, Array<Record<string, unknown>>] => [`only ${String(f.format_id)}`, [f]]),
+    ];
+  }
+
+  for (const ffmpegAvailable of [false, true]) {
+    it(`every EMITTED selection re-selects its originating format (ffmpeg=${ffmpegAvailable})`, () => {
+      let checked = 0;
+      for (const [label, formats] of inputs()) {
+        const { selections } = buildGenericPresets(selectCandidates(formats, LIMITS), {
+          ffmpegAvailable,
+        });
+        for (const [presetId, selection] of Object.entries(selections)) {
+          const origin = formats.find((f) => f.format_id === selection.formatId);
+          assert.ok(origin, `${label} ${presetId}: the selection must name a real upstream format`);
+          assert.equal(
+            selectsFormat(buildGenericFormatSelector(selection), origin as PinnedFormat),
+            true,
+            `${label} ${presetId}: analysis approved a format acquisition cannot re-select`,
+          );
+          checked += 1;
+        }
+      }
+      assert.ok(checked > 0, "the property must actually be exercised");
+    });
+  }
+
+  it("EVERY candidate — advertised or not — describes a selector that re-selects it", () => {
+    // Stronger than the emitted set: this includes the unknown-audio and
+    // video-only candidates analysis keeps privately but never advertises,
+    // which is exactly where the old boolean built an incoherent selector.
+    const states = new Set<string>();
+    for (const [label, formats] of inputs()) {
+      for (const c of selectCandidates(formats, LIMITS)) {
+        const selection = GenericSourceSelectionSchema.parse({
+          formatId: c.formatId,
+          protocol: c.protocol,
+          container: c.container,
+          hasVideo: c.hasVideo,
+          hasAudio: c.hasAudio,
+          videoConstraint: c.videoConstraint,
+          audioConstraint: c.audioConstraint,
+          fileSize: c.fileSize,
+        });
+        const origin = formats.find((f) => f.format_id === c.formatId);
+        assert.ok(origin);
+        assert.equal(
+          selectsFormat(buildGenericFormatSelector(selection), origin as PinnedFormat),
+          true,
+          `${label} ${c.formatId} (${c.audioConstraint})`,
+        );
+        states.add(c.audioConstraint);
+      }
+    }
+    assert.deepEqual([...states].sort(), ["absent", "codec-present", "unknown"]);
   });
 });

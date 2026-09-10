@@ -16,7 +16,11 @@ What it proves (§52):
   3. an UNQUOTED numeric `format_id` filter silently matches nothing — the
      precise trap the application-owned quoting exists to avoid;
   4. the `b*` atom performs no fallback even when `incomplete_formats` is set,
-     whereas the implicit `best` atom does.
+     whereas the implicit `best` atom does;
+  5. the audio half follows the private tri-state audio constraint
+     (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001): a PRESENT constraint matches
+     a present codec only, an ABSENT one matches `"none"` only, and an UNKNOWN
+     one matches an unknown or later-known codec but never `"none"`.
 
 Exit status is 0 only when every expectation holds.
 
@@ -39,10 +43,10 @@ def build_selector(
     format_id: str,
     protocol: str,
     ext: str,
-    has_audio: bool,
+    audio_constraint: str,
     video_constraint: str,
 ) -> str:
-    """Mirrors `buildGenericFormatSelector`, including the video-shape branch.
+    """Mirrors `buildGenericFormatSelector`, including both shape branches.
 
     `video_constraint` is the application-owned enum from
     src/worker/execution/generic-source.ts:
@@ -51,6 +55,13 @@ def build_selector(
         video-ext      analysis saw vcodec=None but a coherent
                        normalized shape (the Generic HTML5 case) -> none-inclusive
         absent         analysis saw vcodec="none"             -> strict absence
+
+    `audio_constraint` is the application-owned audio enum from the same module,
+    mirroring `classifyCodecState(acodec)` one-for-one:
+
+        codec-present  analysis saw a real audio codec        -> strict
+        absent         analysis saw acodec="none"             -> strict absence
+        unknown        acodec was None, empty or missing      -> none-inclusive
     """
     if video_constraint == "codec-present":
         video = [f'[vcodec!="none"]']
@@ -61,15 +72,25 @@ def build_selector(
     else:
         raise AssertionError(f"unknown video constraint {video_constraint!r}")
 
+    if audio_constraint == "codec-present":
+        audio = '[acodec!="none"]'
+    elif audio_constraint == "absent":
+        audio = '[acodec="none"]'
+    elif audio_constraint == "unknown":
+        audio = '[acodec!=?"none"]'
+    else:
+        raise AssertionError(f"unknown audio constraint {audio_constraint!r}")
+
     parts = [
         f'[format_id="{format_id}"]',
         f'[protocol="{protocol}"]',
         f'[ext="{ext}"]',
         *video,
-        # `acodec` is the only audio authority. `audio_ext` is deliberately
-        # never constrained: `_fill_sorting_fields` sets it to "none" on every
-        # format whose vcodec != "none", so binding it would match nothing.
-        f'[acodec{"!" if has_audio else ""}="none"]',
+        # `acodec` is the only audio authority, and the private audio
+        # constraint decides its form. `audio_ext` is deliberately never
+        # constrained: `_fill_sorting_fields` sets it to "none" on every format
+        # whose vcodec != "none", so binding it would match nothing.
+        audio,
     ]
     return ATOM + "".join(parts)
 
@@ -115,6 +136,23 @@ FORMATS = [
     {"format_id": "html5-audio", "ext": "mp4", "protocol": "https",
      "vcodec": "none", "acodec": "mp4a.40.2", "video_ext": "none", "audio_ext": "mp4",
      "height": None, "url": "https://example.invalid/11"},
+    # ── The same HTML5 shape with NO declared audio codec ──────────────────
+    # When the page's `<source type>` carries no `codecs=` parameter,
+    # `parse_codecs` returns `{}` and `acodec` is never set: the key is simply
+    # ABSENT from the format, not None. Captured from the pinned runtime in
+    # src/worker/analysis/testdata/pinned-generic-html5-no-audio-codec.json.
+    {"format_id": "html5-noacodec", "ext": "mp4", "protocol": "https",
+     "vcodec": None, "video_ext": "mp4", "audio_ext": "none",
+     "height": None, "url": "https://example.invalid/12"},
+    # The same, with the key present but explicitly None.
+    {"format_id": "html5-acodec-null", "ext": "mp4", "protocol": "https",
+     "vcodec": None, "acodec": None, "video_ext": "mp4", "audio_ext": "none",
+     "height": None, "url": "https://example.invalid/13"},
+    # The same shape with audio proven ABSENT (a `codecs=` naming video only
+    # makes `parse_codecs` fill in `acodec or 'none'`).
+    {"format_id": "html5-noaudio", "ext": "mp4", "protocol": "https",
+     "vcodec": None, "acodec": "none", "video_ext": "mp4", "audio_ext": "none",
+     "height": None, "url": "https://example.invalid/14"},
 ]
 
 
@@ -159,27 +197,27 @@ def main(artifact: str) -> int:
 
     print("\n1. the built selector picks exactly the approved format")
     expect("muxed mp4 https 22",
-           select(build_selector("22", "https", "mp4", True, "codec-present")), ["22"])
+           select(build_selector("22", "https", "mp4", "codec-present", "codec-present")), ["22"])
     expect("muxed mp4 https 18",
-           select(build_selector("18", "https", "mp4", True, "codec-present")), ["18"])
+           select(build_selector("18", "https", "mp4", "codec-present", "codec-present")), ["18"])
     expect("audio-only m4a 140",
-           select(build_selector("140", "https", "m4a", True, "absent")), ["140"])
+           select(build_selector("140", "https", "m4a", "codec-present", "absent")), ["140"])
     expect("audio-only webm 251",
-           select(build_selector("251", "https", "webm", True, "absent")), ["251"])
+           select(build_selector("251", "https", "webm", "codec-present", "absent")), ["251"])
     expect("muxed webm",
-           select(build_selector("muxed-webm", "https", "webm", True, "codec-present")), ["muxed-webm"])
+           select(build_selector("muxed-webm", "https", "webm", "codec-present", "codec-present")), ["muxed-webm"])
 
     print("\n2. no substitution when the source no longer matches")
     expect("video-only id under a muxed constraint",
-           select(build_selector("137", "https", "mp4", True, "codec-present")), [])
+           select(build_selector("137", "https", "mp4", "codec-present", "codec-present")), [])
     expect("manifest protocol under an https constraint",
-           select(build_selector("hls-720", "https", "mp4", True, "codec-present")), [])
+           select(build_selector("hls-720", "https", "mp4", "codec-present", "codec-present")), [])
     expect("wrong container",
-           select(build_selector("22", "https", "webm", True, "codec-present")), [])
+           select(build_selector("22", "https", "webm", "codec-present", "codec-present")), [])
     expect("unknown id",
-           select(build_selector("does-not-exist", "https", "mp4", True, "codec-present")), [])
+           select(build_selector("does-not-exist", "https", "mp4", "codec-present", "codec-present")), [])
     expect("audio constraint against a muxed id",
-           select(build_selector("22", "https", "mp4", True, "absent")), [])
+           select(build_selector("22", "https", "mp4", "codec-present", "absent")), [])
 
     print("\n3. the quoting is load-bearing for numeric ids")
     expect("UNQUOTED numeric filter matches nothing",
@@ -190,9 +228,9 @@ def main(artifact: str) -> int:
     print("\n4. b* never falls back; implicit best does")
     for incomplete in (False, True):
         expect(f"b* audio-only, incomplete_formats={incomplete}",
-               select(build_selector("140", "https", "m4a", True, "absent"), incomplete), ["140"])
+               select(build_selector("140", "https", "m4a", "codec-present", "absent"), incomplete), ["140"])
         expect(f"b* unknown id, incomplete_formats={incomplete}",
-               select(build_selector("nope", "https", "mp4", True, "codec-present"), incomplete), [])
+               select(build_selector("nope", "https", "mp4", "codec-present", "codec-present"), incomplete), [])
     # The implicit atom is extractor-flag dependent, which is exactly why the
     # application always states `b*` explicitly.
     implicit = '[format_id="140"][protocol="https"][ext="m4a"]'
@@ -213,7 +251,7 @@ def main(artifact: str) -> int:
     # mp4, and the none-inclusive form is required. This is the acquisition half
     # of PHASE-10D-GENERIC-REAL-OUTPUT-COMPATIBILITY-001: analysis approving a
     # format that acquisition then rejects is still a defect.
-    unknown = build_selector("html5", "https", "mp4", True, "video-ext")
+    unknown = build_selector("html5", "https", "mp4", "codec-present", "video-ext")
     expect("approved unknown-codec source is re-selected", select(unknown), ["html5"])
     expect("THE DEFECT: the strict form selects nothing",
            select('b*[format_id="html5"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!="none"]'),
@@ -225,9 +263,9 @@ def main(artifact: str) -> int:
 
     print("\n6. the unknown-video constraint stays closed")
     expect("a later KNOWN codec with the same shape still matches",
-           select(build_selector("html5-known", "https", "mp4", True, "video-ext")), ["html5-known"])
+           select(build_selector("html5-known", "https", "mp4", "codec-present", "video-ext")), ["html5-known"])
     expect("an explicitly ABSENT video stream is rejected",
-           select(build_selector("html5-audio", "https", "mp4", True, "video-ext")), [])
+           select(build_selector("html5-audio", "https", "mp4", "codec-present", "video-ext")), [])
     expect("video_ext must still name the approved container",
            select('b*[format_id="html5"][protocol="https"][ext="mp4"][vcodec!=?"none"][video_ext="webm"][acodec!="none"]'),
            [])
@@ -235,13 +273,69 @@ def main(artifact: str) -> int:
            select('b*[format_id="html5-audio"][protocol="https"][ext="mp4"][acodec!="none"]'),
            ["html5-audio"])
     expect("known video is NOT weakened by the new state",
-           select(build_selector("22", "https", "mp4", True, "codec-present")), ["22"])
+           select(build_selector("22", "https", "mp4", "codec-present", "codec-present")), ["22"])
     expect("a KNOWN-video approval no longer matches once the codec is gone",
-           select(build_selector("html5", "https", "mp4", True, "codec-present")), [])
+           select(build_selector("html5", "https", "mp4", "codec-present", "codec-present")), [])
 
     print("\n7. the none-inclusive marker's position is the only valid one")
-    for spec in ('b*[vcodec?!="none"]', 'b*[vcodec!?="none"]'):
+    for spec in ('b*[vcodec?!="none"]', 'b*[vcodec!?="none"]',
+                 'b*[acodec?!="none"]', 'b*[acodec!?="none"]'):
         expect(f"{spec} is a syntax error", select(spec), 'PARSE_ERROR:SyntaxError')
+
+    print("\n8. the audio half follows the private audio constraint")
+    # GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001. The same `None` branch governs
+    # `acodec`: a missing or None field matches only a none-inclusive filter.
+    #
+    #   codec-present  strict       matches PRESENT only
+    #   absent         equality     matches "none" only
+    #   unknown        none-incl.   matches UNKNOWN and PRESENT, never "none"
+    def html5(fid: str, audio_constraint: str) -> list[str] | str:
+        return select(build_selector(fid, "https", "mp4", audio_constraint, "video-ext"))
+
+    expect("PRESENT re-selects a present codec",
+           html5("html5", "codec-present"), ["html5"])
+    expect("PRESENT rejects a MISSING acodec",
+           html5("html5-noacodec", "codec-present"), [])
+    expect("PRESENT rejects acodec=None",
+           html5("html5-acodec-null", "codec-present"), [])
+    expect("PRESENT rejects acodec='none'",
+           html5("html5-noaudio", "codec-present"), [])
+
+    expect("ABSENT re-selects acodec='none'",
+           html5("html5-noaudio", "absent"), ["html5-noaudio"])
+    expect("ABSENT rejects a present codec",
+           html5("html5", "absent"), [])
+    expect("ABSENT rejects a MISSING acodec",
+           html5("html5-noacodec", "absent"), [])
+    expect("ABSENT rejects acodec=None",
+           html5("html5-acodec-null", "absent"), [])
+
+    expect("UNKNOWN re-selects a MISSING acodec",
+           html5("html5-noacodec", "unknown"), ["html5-noacodec"])
+    expect("UNKNOWN re-selects acodec=None",
+           html5("html5-acodec-null", "unknown"), ["html5-acodec-null"])
+    expect("UNKNOWN still matches a later-known codec",
+           html5("html5", "unknown"), ["html5"])
+    expect("UNKNOWN rejects PROVEN absence",
+           html5("html5-noaudio", "unknown"), [])
+
+    # The same three forms on a KNOWN-video source.
+    expect("ABSENT re-selects a proven video-only rendition",
+           select(build_selector("137", "https", "mp4", "absent", "codec-present")), ["137"])
+    expect("UNKNOWN on a known-video muxed source matches its known codec",
+           select(build_selector("22", "https", "mp4", "unknown", "codec-present")), ["22"])
+    expect("UNKNOWN never admits a video-only rendition",
+           select(build_selector("137", "https", "mp4", "unknown", "codec-present")), [])
+
+    print("\n9. the boolean it replaced could not describe unknown audio")
+    # Before the correction unknown audio was `has_audio=False`, rebuilt as
+    # `[acodec="none"]`. Flipping it to True would not have helped either.
+    expect("THE LATENT DEFECT: unknown collapsed to absent selects nothing",
+           select('b*[format_id="html5-noacodec"][protocol="https"][ext="mp4"]'
+                  '[vcodec!=?"none"][video_ext="mp4"][acodec="none"]'), [])
+    expect("...and unknown promoted to present selects nothing either",
+           select('b*[format_id="html5-noacodec"][protocol="https"][ext="mp4"]'
+                  '[vcodec!=?"none"][video_ext="mp4"][acodec!="none"]'), [])
 
     print()
     if failures:

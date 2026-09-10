@@ -357,6 +357,7 @@ describe("generic execution plan (§18)", () => {
     hasVideo: true,
     hasAudio: true,
     videoConstraint: "codec-present" as const,
+    audioConstraint: "codec-present" as const,
     fileSize: 1000,
   };
   const AUDIO_M4A = {
@@ -366,6 +367,7 @@ describe("generic execution plan (§18)", () => {
     hasVideo: false,
     hasAudio: true,
     videoConstraint: "absent" as const,
+    audioConstraint: "codec-present" as const,
     fileSize: 500,
   };
 
@@ -520,11 +522,36 @@ describe("generic execution plan (§18)", () => {
       () =>
         deriveGenericExecutionPlan(
           meta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
-          { "preset:1080": { ...MUXED_MP4, hasAudio: false } },
+          { "preset:1080": { ...MUXED_MP4, hasAudio: false, audioConstraint: "absent" as const } },
           "preset:1080",
         ),
       (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
     );
+  });
+
+  it("refuses every preset whose source audio is only UNKNOWN", () => {
+    // GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001: the private selection can now
+    // describe unknown audio honestly, but analysis never advertises it and the
+    // planner must not execute it either. Every current generic plan requires
+    // PROVEN audio, which `hasAudio` states exactly. Each case carries a
+    // positive control, so the refusal is attributable to the audio state.
+    const unknownAudio = { ...MUXED_MP4, hasAudio: false, audioConstraint: "unknown" as const };
+    for (const [id, container, hasVideo] of [
+      ["preset:1080", "mp4", true],
+      ["preset:audio", "m4a", false],
+      ["preset:mp3", "mp3", false],
+    ] as const) {
+      const presets = meta([{ id, container, hasVideo }]);
+      assert.doesNotThrow(
+        () => deriveGenericExecutionPlan(presets, { [id]: MUXED_MP4 }, id),
+        `${id}: the same preset IS executable from proven audio`,
+      );
+      assert.throws(
+        () => deriveGenericExecutionPlan(presets, { [id]: unknownAudio }, id),
+        (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
+        `${id}: unknown audio must not become executable`,
+      );
+    }
   });
 
   it("refuses a concrete (non-preset) id: generic advertises no formats", () => {

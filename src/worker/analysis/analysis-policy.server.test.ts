@@ -97,6 +97,7 @@ const SELECTIONS = {
     hasVideo: true,
     hasAudio: true,
     videoConstraint: "codec-present" as const,
+    audioConstraint: "codec-present" as const,
     fileSize: null,
   },
 };

@@ -4147,6 +4147,49 @@ the image, and `audio_ext` is never constrained by any generic selector.
 The enum is Worker-private: it never reaches the browser, Vercel, SQLite, an
 HTTP response, a log or an error, and it carries no upstream codec string.
 
+#### Later correction — the audio half (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001, 2026-09-11)
+
+*Added after Phase 10D; the record above is left as it was found.*
+
+The audio side of the same model was still reduced to a boolean. `hasAudio` was
+`true` only for a present `acodec`, so UNKNOWN audio was stored privately as
+`false` — and the selector rebuilt `false` as `[acodec="none"]`, a filter the
+pinned runtime can never match against the `acodec: None` format it came from.
+That was unreachable in v1, because no preset is ever built on a source without
+proven audio, but it was a representation that could not describe the source
+honestly.
+
+The private `GenericSourceSelection` now also carries an application-owned
+`audioConstraint` enum, mirroring `classifyCodecState(acodec)` one-for-one. It
+is the sole authority for the selector's audio half:
+
+```
+codec-present   [acodec!="none"]     (unchanged, strict)
+absent          [acodec="none"]      (unchanged, strict)
+unknown         [acodec!=?"none"]    unknown or a later-known codec; never "none"
+```
+
+`hasAudio` is retained with a narrower, explicit meaning — audio presence is
+**proven**, exactly `audioConstraint === "codec-present"` — and the schema
+enforces that agreement. `verify-selector.py` proves all three forms against the
+pinned binary.
+
+**Advertising did not change.** Unknown audio still never becomes a muxed claim:
+every generic video, audio and MP3 preset still requires proven audio, and
+analysis now *asserts* that every private selection it emits is
+`codec-present` rather than leaving that to its filters. The rule that keeps
+split streams unmerged therefore also leaves a **progressive** source whose
+`acodec` is unknown with no preset at all. That is the ordinary HTML5 page whose
+`<source type>` carries no `codecs=` parameter: the pinned runtime reports no
+`acodec` key for it (captured in
+`src/worker/analysis/testdata/pinned-generic-html5-no-audio-codec.json`).
+Re-selecting an unknown state proves nothing about the file, so this correction
+does **not** enable those sources. Offering them would need a separate,
+product-level decision about the public contract — `WorkerQualityPreset.hasAudio`
+is a boolean and cannot state "unknown".
+
+The enum is Worker-private in exactly the same way as `videoConstraint`.
+
 ### Temporary Quick-Tunnel verification
 
 Run from the Lima VM, which was **Stopped** before and after. The fixture bound

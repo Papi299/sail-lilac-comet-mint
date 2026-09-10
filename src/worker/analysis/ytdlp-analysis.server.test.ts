@@ -17,6 +17,7 @@ import {
   YTDLP_V1_NATIVE_PROTOCOLS,
   buildYtdlpAnalysisEnvironment,
   analyzeGenericMedia,
+  analyzeGenericMediaInternal,
   buildGenericPresets,
   buildYtdlpAnalysisArgv,
   classifyAnalysisFailure,
@@ -28,6 +29,8 @@ import {
   type GenericAnalysisLimits,
 } from "./ytdlp-analysis.server.ts";
 import { buildYtdlpEnvironment } from "../runtime/ytdlp-runtime.server.ts";
+import { buildGenericFormatSelector } from "../execution/generic-source.ts";
+import { WorkerAnalyzeSuccessSchema } from "../../shared/worker/contracts.ts";
 import {
   YTDLP_PROBE_TIMEOUT_MS,
   YTDLP_RUNTIME,
@@ -1944,6 +1947,7 @@ describe("the private execution descriptor stays private (§11/§34)", () => {
     assert.equal(serialized.includes("videoConstraint"), false);
     assert.equal(serialized.includes("video-ext"), false);
     assert.equal(serialized.includes("codec-present"), false);
+    assert.equal(serialized.includes("audioConstraint"), false);
     // Generic analysis still advertises no concrete formats at all.
     assert.deepEqual(meta.formats, []);
     for (const preset of meta.presets) {
@@ -1959,11 +1963,13 @@ describe("the private execution descriptor stays private (§11/§34)", () => {
     const selection = selections["preset:best"];
     assert.ok(selection);
     assert.equal(selection.videoConstraint, "video-ext");
+    assert.equal(selection.audioConstraint, "codec-present");
     assert.equal(selection.formatId, "0");
     // The enum is application-owned: it must never paraphrase or embed the
     // upstream codec field it was derived from.
     assert.equal(JSON.stringify(selection).includes("mp4a.40.2"), false);
     assert.deepEqual(Object.keys(selection).sort(), [
+      "audioConstraint",
       "container",
       "fileSize",
       "formatId",
@@ -1995,5 +2001,328 @@ describe("the private execution descriptor stays private (§11/§34)", () => {
 
     const { selections } = buildGenericPresets(candidates, { ffmpegAvailable: false });
     assert.equal(JSON.stringify(selections).includes("attacker.invalid"), false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001
+//
+// Audio is no longer reduced to a boolean before it reaches the private source
+// descriptor. `Candidate.audioConstraint` mirrors `classifyCodecState(acodec)`
+// one-for-one, and `hasAudio` is the narrower statement "audio is PROVEN".
+//
+// The advertising policy is deliberately UNCHANGED: every generic preset still
+// requires proven audio. These tests pin both halves — the honest private
+// representation, and the fact that it enables nothing new.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
+  /** Real-shaped raw formats, one per classification analysis makes. */
+  const MUXED_720 = {
+    format_id: "22", ext: "mp4", protocol: "https", height: 720,
+    vcodec: "avc1.64001F", acodec: "mp4a.40.2", video_ext: "mp4", audio_ext: "none",
+  };
+  const MUXED_360 = {
+    format_id: "18", ext: "mp4", protocol: "https", height: 360,
+    vcodec: "avc1.42001E", acodec: "mp4a.40.2", video_ext: "mp4", audio_ext: "none",
+  };
+  /** HTML5 with `codecs=` declared: video codec clobbered to null, audio survives. */
+  const HTML5_DECLARED = {
+    format_id: "h1", ext: "mp4", protocol: "https",
+    vcodec: null, acodec: "mp4a.40.2", video_ext: "mp4", audio_ext: "none",
+  };
+  /** HTML5 with NO `codecs=`: the pinned runtime sets no `acodec` key at all. */
+  const HTML5_UNDECLARED = {
+    format_id: "h2", ext: "mp4", protocol: "https",
+    vcodec: null, video_ext: "mp4", audio_ext: "none",
+  };
+  const VIDEO_ONLY = {
+    format_id: "137", ext: "mp4", protocol: "https", height: 1080,
+    vcodec: "avc1.640028", acodec: "none", video_ext: "mp4", audio_ext: "none",
+  };
+  const AUDIO_ONLY = {
+    format_id: "140", ext: "m4a", protocol: "https",
+    vcodec: "none", acodec: "mp4a.40.2", video_ext: "none", audio_ext: "m4a",
+  };
+
+  const DOCUMENTS: Array<[string, Array<Record<string, unknown>>]> = [
+    ["muxed ladder", [MUXED_720, MUXED_360]],
+    ["html5 with declared codecs", [HTML5_DECLARED]],
+    ["html5 without declared codecs", [HTML5_UNDECLARED]],
+    ["split streams", [VIDEO_ONLY, AUDIO_ONLY]],
+    ["unknown-audio video beside an audio-only source", [HTML5_UNDECLARED, AUDIO_ONLY]],
+    [
+      "everything at once",
+      [MUXED_720, MUXED_360, HTML5_DECLARED, HTML5_UNDECLARED, VIDEO_ONLY, AUDIO_ONLY],
+    ],
+  ];
+
+  /** The private-half analyzer, wired exactly like `analyze` above. */
+  function analyzeInternal(
+    url: string,
+    opts: { runner: (o: RunnerCall) => Promise<RunResult>; ffmpegAvailable?: boolean },
+  ) {
+    return analyzeGenericMediaInternal(url, {
+      limits: LIMITS,
+      runner: opts.runner,
+      probeRuntime: async () => OK_RUNTIME,
+      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+      ffmpegAvailable: opts.ffmpegAvailable ?? false,
+    });
+  }
+
+  describe("the private audio constraint mirrors acodec exactly", () => {
+    /** A proven-video mp4 whose only variable is its `acodec` field. */
+    function provenVideo(acodec?: unknown): Record<string, unknown> {
+      const f: Record<string, unknown> = {
+        format_id: "v", ext: "mp4", protocol: "https", height: 720,
+        vcodec: "avc1.64001F", video_ext: "mp4", audio_ext: "none",
+      };
+      if (acodec !== undefined) f.acodec = acodec;
+      return f;
+    }
+
+    function only(format: Record<string, unknown>) {
+      const candidates = selectCandidates([format], LIMITS);
+      assert.equal(candidates.length, 1, "the format is still describable");
+      return candidates[0]!;
+    }
+
+    it("a MISSING acodec key is UNKNOWN", () => {
+      const c = only(provenVideo());
+      assert.equal(c.audioConstraint, "unknown");
+      assert.equal(c.hasAudio, false, "unknown is not proven audio");
+      assert.equal(c.audioCodec, null);
+    });
+
+    it("an explicit null acodec is UNKNOWN", () => {
+      assert.equal(only(provenVideo(null)).audioConstraint, "unknown");
+    });
+
+    it("empty and 'null' forms follow the classifier contract: UNKNOWN", () => {
+      for (const acodec of ["", "   ", "null", "NULL"]) {
+        assert.equal(classifyCodecState(acodec), "unknown");
+        assert.equal(only(provenVideo(acodec)).audioConstraint, "unknown", JSON.stringify(acodec));
+      }
+    });
+
+    it("the exact absence marker is ABSENT", () => {
+      for (const acodec of ["none", "NONE", " none "]) {
+        const c = only(provenVideo(acodec));
+        assert.equal(c.audioConstraint, "absent", JSON.stringify(acodec));
+        assert.equal(c.hasAudio, false);
+      }
+    });
+
+    it("a real codec string is CODEC_PRESENT", () => {
+      for (const acodec of ["mp4a.40.2", "opus", "vorbis", "mp3"]) {
+        const c = only(provenVideo(acodec));
+        assert.equal(c.audioConstraint, "codec-present", acodec);
+        assert.equal(c.hasAudio, true);
+      }
+    });
+
+    it("hasAudio is true exactly for CODEC_PRESENT, across every state", () => {
+      const formats = [
+        provenVideo(),
+        provenVideo(null),
+        provenVideo(""),
+        provenVideo("none"),
+        provenVideo("mp4a.40.2"),
+        AUDIO_ONLY,
+        HTML5_DECLARED,
+        HTML5_UNDECLARED,
+      ].map((f, i) => ({ ...f, format_id: `f${i}` }));
+      const candidates = selectCandidates(formats, LIMITS);
+      assert.equal(candidates.length, formats.length);
+      const seen = new Set<string>();
+      for (const c of candidates) {
+        assert.equal(c.hasAudio, c.audioConstraint === "codec-present", c.formatId);
+        seen.add(c.audioConstraint);
+      }
+      assert.deepEqual([...seen].sort(), ["absent", "codec-present", "unknown"]);
+    });
+
+    it("audio_ext and correlational metadata never substitute for acodec", () => {
+      // Every field that merely correlates with audio, set as favourably as it
+      // can be. None of them is evidence of an audio stream.
+      const c = only({
+        ...provenVideo(),
+        audio_ext: "mp4",
+        abr: 128,
+        asr: 44100,
+        audio_channels: 2,
+        tbr: 2500,
+        format_note: "with audio",
+      });
+      assert.equal(c.audioConstraint, "unknown");
+      assert.equal(c.hasAudio, false);
+    });
+  });
+
+  describe("unknown audio stays unadvertised (fail-closed policy unchanged)", () => {
+    for (const ffmpegAvailable of [false, true]) {
+      it(`an UNKNOWN-audio progressive video is classifiable but creates NO preset (ffmpeg=${ffmpegAvailable})`, () => {
+        const candidates = selectCandidates([HTML5_UNDECLARED], LIMITS);
+        assert.equal(candidates.length, 1, "it remains an honest private candidate");
+        assert.equal(candidates[0]!.videoConstraint, "video-ext");
+        assert.equal(candidates[0]!.audioConstraint, "unknown");
+
+        const { presets, selections } = buildGenericPresets(candidates, { ffmpegAvailable });
+        assert.deepEqual(presets, [], "no video, audio or mp3 preset from unproven audio");
+        assert.deepEqual(selections, {});
+      });
+
+      it(`an ABSENT-audio video-bearing source creates no preset (ffmpeg=${ffmpegAvailable})`, () => {
+        const candidates = selectCandidates([VIDEO_ONLY], LIMITS);
+        assert.equal(candidates[0]?.audioConstraint, "absent");
+        const { presets, selections } = buildGenericPresets(candidates, { ffmpegAvailable });
+        assert.deepEqual(presets, []);
+        assert.deepEqual(selections, {});
+      });
+    }
+
+    it("the full analyzer still returns presets: [] for the affected shape", async () => {
+      const { runner } = fakeRunner(
+        ok(JSON.stringify(singleVideoInfo({ formats: [HTML5_UNDECLARED] }))),
+      );
+      const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
+      assert.deepEqual(meta.presets, []);
+      assert.deepEqual(meta.formats, []);
+      assert.equal(meta.capabilities.mp3, false);
+      assert.equal(meta.capabilities.merge, false);
+    });
+
+    it("the captured pinned no-codecs document still yields presets: []", async () => {
+      const doc = readFileSync(
+        join(import.meta.dirname, "testdata", "pinned-generic-html5-no-audio-codec.json"),
+        "utf8",
+      );
+      const f = (JSON.parse(doc).formats as Array<Record<string, unknown>>)[0]!;
+      // The decisive real-runtime fact: the key is ABSENT, not null.
+      assert.equal("acodec" in f, false, "the pinned runtime omits acodec entirely");
+      assert.equal(f.vcodec, null);
+      assert.equal(f.video_ext, "mp4");
+      assert.equal(f.audio_ext, "none");
+
+      const candidates = selectCandidates([f], LIMITS);
+      assert.equal(candidates.length, 1);
+      assert.equal(candidates[0]!.videoConstraint, "video-ext");
+      assert.equal(candidates[0]!.audioConstraint, "unknown");
+
+      const { runner } = fakeRunner(ok(doc));
+      const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
+      assert.deepEqual(meta.presets, [], "this correction must not enable the affected sources");
+    });
+  });
+
+  describe("every emitted selection carries PROVEN audio", () => {
+    for (const ffmpegAvailable of [false, true]) {
+      it(`buildGenericPresets emits only CODEC_PRESENT selections (ffmpeg=${ffmpegAvailable})`, () => {
+        let emitted = 0;
+        for (const [label, formats] of DOCUMENTS) {
+          const { selections } = buildGenericPresets(selectCandidates(formats, LIMITS), {
+            ffmpegAvailable,
+          });
+          for (const [id, selection] of Object.entries(selections)) {
+            assert.equal(selection.audioConstraint, "codec-present", `${label} ${id}`);
+            assert.equal(selection.hasAudio, true, `${label} ${id}`);
+            emitted += 1;
+          }
+        }
+        assert.ok(emitted > 0, "the invariant must actually be exercised");
+      });
+
+      it(`the internal analyzer emits only CODEC_PRESENT selections (ffmpeg=${ffmpegAvailable})`, async () => {
+        for (const [label, formats] of DOCUMENTS) {
+          const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats }))));
+          const { video, selections } = await analyzeInternal(SAFE_URL, { runner, ffmpegAvailable });
+          assert.deepEqual(
+            Object.keys(selections).sort(),
+            video.presets.map((p) => p.id).sort(),
+            `${label}: selections and presets stay in bijection`,
+          );
+          for (const [id, selection] of Object.entries(selections)) {
+            assert.equal(selection.audioConstraint, "codec-present", `${label} ${id}`);
+            assert.equal(selection.hasAudio, true, `${label} ${id}`);
+          }
+        }
+      });
+    }
+
+    it("every currently reachable selector is byte-identical to the pre-correction one", () => {
+      // The strings below are exactly what the boolean construction produced
+      // for these sources, which all carry proven audio. The correction must
+      // not move a single character of any selector acquisition actually runs.
+      const { selections } = buildGenericPresets(
+        selectCandidates([MUXED_720, MUXED_360, HTML5_DECLARED, VIDEO_ONLY, AUDIO_ONLY], LIMITS),
+        { ffmpegAvailable: true },
+      );
+      const built = Object.fromEntries(
+        Object.entries(selections).map(([id, s]) => [id, buildGenericFormatSelector(s)]),
+      );
+      const muxed22 = 'b*[format_id="22"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!="none"]';
+      const audio140 = 'b*[format_id="140"][protocol="https"][ext="m4a"][vcodec="none"][acodec!="none"]';
+      assert.deepEqual(built, {
+        "preset:best": muxed22,
+        "preset:720": muxed22,
+        "preset:360": 'b*[format_id="18"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!="none"]',
+        "preset:audio": audio140,
+        "preset:mp3": audio140,
+      });
+
+      const captured = readFileSync(
+        join(import.meta.dirname, "testdata", "pinned-generic-html5.json"),
+        "utf8",
+      );
+      const html5 = buildGenericPresets(
+        selectCandidates(JSON.parse(captured).formats, LIMITS),
+        { ffmpegAvailable: false },
+      ).selections["preset:best"];
+      assert.ok(html5);
+      assert.equal(
+        buildGenericFormatSelector(html5),
+        'b*[format_id="0"][protocol="http"][ext="mp4"][vcodec!=?"none"][video_ext="mp4"][acodec!="none"]',
+      );
+    });
+  });
+
+  describe("the public surface is unchanged and carries no private audio state", () => {
+    it("WorkerVideoMetadata and its presets keep exactly their public keys", async () => {
+      const { runner } = fakeRunner(
+        ok(JSON.stringify(singleVideoInfo({ formats: [MUXED_720, AUDIO_ONLY] }))),
+      );
+      const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
+      assert.deepEqual(Object.keys(meta).sort(), [
+        "capabilities", "duration", "extractor", "formats", "presets",
+        "source", "thumbnail", "title", "webpageUrl",
+      ]);
+      assert.ok(meta.presets.length > 0);
+      for (const preset of meta.presets) {
+        assert.deepEqual(Object.keys(preset).sort(), [
+          "audioCodec", "container", "fileSize", "formatId", "fps", "hasAudio",
+          "hasVideo", "id", "label", "resolution", "videoCodec",
+        ]);
+        assert.equal(preset.hasAudio, true, "every generic preset still states proven audio");
+      }
+    });
+
+    it("neither the metadata nor the HTTP body carries audioConstraint, raw ids or selectors", async () => {
+      for (const [label, formats] of DOCUMENTS) {
+        const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats }))));
+        const { video, selections } = await analyzeInternal(SAFE_URL, {
+          runner,
+          ffmpegAvailable: true,
+        });
+        const body = JSON.stringify(WorkerAnalyzeSuccessSchema.parse({ success: true, video }));
+        for (const forbidden of ["audioConstraint", "videoConstraint", "selections", "acodec", "b*["]) {
+          assert.equal(body.includes(forbidden), false, `${label}: ${forbidden}`);
+        }
+        for (const selection of Object.values(selections)) {
+          assert.equal(body.includes(`"${selection.formatId}"`), false, `${label}: raw id`);
+          assert.equal(body.includes(buildGenericFormatSelector(selection)), false, `${label}: selector`);
+        }
+      }
+    });
   });
 });
