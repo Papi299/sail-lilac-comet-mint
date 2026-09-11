@@ -1073,6 +1073,18 @@ describe("split pairs: cross-member invariants (SPLIT-01)", () => {
     );
   });
 
+  it("I1: a video member whose videoConstraint is `absent` is refused", () => {
+    // Stated separately from the case above because the member schema ties
+    // `hasVideo` to `videoConstraint`: the only way to express "no video" is
+    // through the constraint, and that is the field the pair invariant reads.
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse(
+        pair({ videoConstraint: "absent", hasVideo: false, container: "m4a" }),
+      ).success,
+      false,
+    );
+  });
+
   it("I1: the video member may be established by EITHER approved video constraint", () => {
     // `video-ext` is the unknown-codec-but-coherent-shape case, which is the
     // same evidence standard already accepted for muxed video presets.
@@ -1221,6 +1233,41 @@ describe("split pairs: the per-preset discriminated union (SPLIT-01)", () => {
     );
     assert.equal(GenericPresetSourceSchema.safeParse({ kind: "merge", source: MUXED }).success, false);
     assert.equal(GenericPresetSourceSchema.safeParse({ source: MUXED }).success, false);
+  });
+
+  it("refuses a malformed nested source", () => {
+    for (const bad of [
+      { ...MUXED, formatId: "22[ext=mp4]" },
+      { ...MUXED, protocol: "m3u8" },
+      { ...MUXED, container: "mkv" },
+      { ...MUXED, hasAudio: true, audioConstraint: "unknown" },
+      { ...MUXED, hasVideo: false },
+      {},
+      null,
+    ]) {
+      assert.equal(
+        GenericPresetSourceSchema.safeParse({ kind: "single", source: bad }).success,
+        false,
+        JSON.stringify(bad),
+      );
+    }
+  });
+
+  it("refuses a malformed nested pair", () => {
+    for (const bad of [
+      { video: SPLIT_VIDEO_MP4 },
+      { video: SPLIT_VIDEO_MP4, audio: SPLIT_AUDIO_WEBM },
+      { video: SPLIT_VIDEO_MP4, audio: { ...SPLIT_AUDIO_M4A, audioConstraint: "unknown", hasAudio: false } },
+      { video: { ...SPLIT_VIDEO_MP4, formatId: "bv+ba" }, audio: SPLIT_AUDIO_M4A },
+      {},
+      null,
+    ]) {
+      assert.equal(
+        GenericPresetSourceSchema.safeParse({ kind: "split", pair: bad }).success,
+        false,
+        JSON.stringify(bad),
+      );
+    }
   });
 
   it("is strict on both variants", () => {

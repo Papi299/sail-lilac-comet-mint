@@ -2351,3 +2351,172 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
     });
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPLIT-01 §18: PUBLIC behavioural equivalence
+//
+// SPLIT-01 wraps every emitted selection in a private envelope. The public half
+// must be untouched by that, so these cases pin the ENTIRE public preset array
+// for a candidate set that deliberately includes the video-only and audio-only
+// renditions a future split pair would be built from.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("SPLIT-01: the public preset surface is unchanged", () => {
+  /** Muxed, video-only and audio-only renditions in one document. */
+  const MIXED = [
+    { format_id: "22", ext: "mp4", protocol: "https", vcodec: "avc1.64001F", acodec: "mp4a.40.2", height: 720, fps: 30, filesize: 3_000_000 },
+    { format_id: "137", ext: "mp4", protocol: "https", vcodec: "avc1.640028", acodec: "none", height: 1080, fps: 30, filesize: 9_000_000 },
+    { format_id: "248", ext: "webm", protocol: "https", vcodec: "vp09.00.40.08", acodec: "none", height: 1080, fps: 30, filesize: 8_000_000 },
+    { format_id: "140", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2", filesize: 500_000 },
+    { format_id: "251", ext: "webm", protocol: "https", vcodec: "none", acodec: "opus", filesize: 450_000 },
+  ];
+
+  const build = (ffmpegAvailable: boolean) =>
+    buildGenericPresets(selectCandidates(MIXED, LIMITS), { ffmpegAvailable });
+
+  it("emits EXACTLY the pre-SPLIT preset array, field for field", () => {
+    // A golden assertion rather than a spot check: every field the browser can
+    // read is pinned, so a wrapper change that altered any of them fails here.
+    assert.deepEqual(build(true).presets, [
+      {
+        id: "preset:best",
+        label: "Best available",
+        resolution: "720p",
+        container: "mp4",
+        fileSize: 3_000_000,
+        hasVideo: true,
+        hasAudio: true,
+        formatId: "preset:best",
+        videoCodec: "h264",
+        audioCodec: "aac",
+        fps: 30,
+      },
+      {
+        id: "preset:720",
+        label: "720p",
+        resolution: "720p",
+        container: "mp4",
+        fileSize: 3_000_000,
+        hasVideo: true,
+        hasAudio: true,
+        formatId: "preset:720",
+        videoCodec: "h264",
+        audioCodec: "aac",
+        fps: 30,
+      },
+      {
+        id: "preset:audio",
+        label: "Audio only",
+        resolution: "audio",
+        container: "m4a",
+        fileSize: 500_000,
+        hasVideo: false,
+        hasAudio: true,
+        formatId: "preset:audio",
+        videoCodec: null,
+        audioCodec: "aac",
+        fps: null,
+      },
+      {
+        id: "preset:mp3",
+        label: "Audio only (MP3)",
+        resolution: "audio",
+        container: "mp3",
+        fileSize: null,
+        hasVideo: false,
+        hasAudio: true,
+        formatId: "preset:mp3",
+        videoCodec: null,
+        audioCodec: "mp3",
+        fps: null,
+      },
+    ]);
+  });
+
+  it("REGRESSION: video-only + audio-only candidates still yield NO video preset", () => {
+    // The whole point of SPLIT-01. Two 1080p video-only renditions and two
+    // audio-only renditions are present and individually eligible, and the
+    // product still offers only the 720p MUXED source. Advertising the pair is
+    // SPLIT-05's job and requires the acquisition and merge path first.
+    for (const ffmpegAvailable of [false, true]) {
+      const { presets } = build(ffmpegAvailable);
+      const video = presets.filter((p) => p.hasVideo);
+      assert.deepEqual(
+        video.map((p) => p.id),
+        ["preset:best", "preset:720"],
+        `ffmpeg=${ffmpegAvailable}`,
+      );
+      for (const p of video) {
+        assert.equal(p.resolution, "720p", "no 1080p preset may appear");
+        assert.equal(p.container, "mp4");
+      }
+      assert.equal(
+        presets.some((p) => p.resolution === "1080p"),
+        false,
+        "the 1080p split rendition must not be advertised",
+      );
+    }
+  });
+
+  it("preset ordering, count and the id === formatId contract are unchanged", () => {
+    for (const ffmpegAvailable of [false, true]) {
+      const { presets } = build(ffmpegAvailable);
+      assert.equal(presets.length, ffmpegAvailable ? 4 : 3);
+      assert.deepEqual(
+        presets.map((p) => p.id),
+        ffmpegAvailable
+          ? ["preset:best", "preset:720", "preset:audio", "preset:mp3"]
+          : ["preset:best", "preset:720", "preset:audio"],
+      );
+      for (const p of presets) {
+        assert.equal(p.formatId, p.id);
+        assert.match(p.id, GENERIC_PRESET_ID_PATTERN);
+      }
+    }
+  });
+
+  it("every emitted selection is still SINGLE, and names a muxed or audio-only source", () => {
+    for (const ffmpegAvailable of [false, true]) {
+      const { selections } = build(ffmpegAvailable);
+      for (const [id, value] of Object.entries(selections)) {
+        assert.equal(value.kind, "single", `${id}: no pair may be constructed in SPLIT-01`);
+        const source = singleSource(value);
+        // 137/248/251 are the split halves. Only the muxed 22 and the audio 140
+        // may back a preset today.
+        assert.ok(["22", "140"].includes(source.formatId), `${id}: unexpected source ${id}`);
+      }
+    }
+  });
+
+  it("§19: no private union marker and no raw id reaches the public response", async () => {
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: MIXED }))));
+    const { video, selections } = await analyzeGenericMediaInternal(SAFE_URL, {
+      limits: LIMITS,
+      runner,
+      probeRuntime: async () => OK_RUNTIME,
+      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+      ffmpegAvailable: true,
+    });
+    const body = JSON.stringify(WorkerAnalyzeSuccessSchema.parse({ success: true, video }));
+
+    // The private envelope's own vocabulary. `"video"`/`"audio"` are NOT listed:
+    // they are legitimate public words (the response's own `video` key, and the
+    // `resolution: "audio"` label), so asserting their absence would be a test
+    // that cannot pass rather than a boundary that holds.
+    for (const marker of ['"kind"', '"single"', '"split"', '"pair"', '"source":{']) {
+      assert.equal(body.includes(marker), false, marker);
+    }
+    // Every raw upstream id in the document, advertised or not — including the
+    // split halves a future pair would name.
+    for (const rawId of ["22", "137", "248", "140", "251"]) {
+      assert.equal(body.includes(`"${rawId}"`), false, `raw id ${rawId}`);
+    }
+    // ...and the private constraint vocabulary.
+    for (const marker of ["videoConstraint", "audioConstraint", "formatId\":\"2", "selections"]) {
+      assert.equal(body.includes(marker), false, marker);
+    }
+    // Positive control: the private half really did carry those ids.
+    assert.equal(singleSource(selections["preset:best"]).formatId, "22");
+    assert.equal(singleSource(selections["preset:audio"]).formatId, "140");
+  });
+});
