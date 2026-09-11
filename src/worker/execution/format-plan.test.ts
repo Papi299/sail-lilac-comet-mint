@@ -1,7 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { AppError } from "@/lib/errors";
-import { VideoMetadataSchema, type WorkerVideoMetadata } from "@/shared/worker/contracts";
+import {
+  VideoMetadataSchema,
+  WORKER_REQUESTED_FORMAT_IDS,
+  type WorkerVideoMetadata,
+} from "@/shared/worker/contracts";
 import {
   DIRECT_KEEP_CONTAINERS,
   deriveDirectExecutionPlan,
@@ -11,6 +15,7 @@ import {
   executionPlanRequiresProcessing,
   executionPlanTargetContainer,
   planRequiresProcessing,
+  GENERIC_SPLIT_VIDEO_PRESET_IDS,
   GenericExecutionPlanSchema,
   type GenericExecutionPlan,
 } from "./format-plan.ts";
@@ -890,19 +895,73 @@ describe("generic SPLIT execution plan (SPLIT-01)", () => {
     );
   });
 
-  it("the plan SCHEMA refuses a hand-built merge-split for an audio preset", () => {
-    for (const requestedFormatId of ["preset:audio", "preset:mp3"] as const) {
+  // ── CORRECTION-01: the plan schema's OWN requested-format vocabulary ──────
+  //
+  // The review found that `merge-split` used `WorkerRequestedFormatIdSchema`
+  // and subtracted only the two audio presets by refinement, leaving
+  // `direct-original` representable. These cases pin the vocabulary
+  // POSITIVELY and exhaustively, over the full public request vocabulary, so
+  // a future widening cannot reintroduce a non-video member unnoticed.
+
+  const splitPlan = (requestedFormatId: string) => ({
+    strategy: "yt-dlp",
+    operation: "merge-split",
+    requestedFormatId,
+    pair: { video: VIDEO_MP4, audio: AUDIO_M4A_ONLY },
+    targetContainer: "mp4",
+  });
+
+  it("the plan SCHEMA accepts EVERY intended video preset", () => {
+    for (const id of GENERIC_SPLIT_VIDEO_PRESET_IDS) {
       assert.equal(
-        GenericExecutionPlanSchema.safeParse({
-          strategy: "yt-dlp",
-          operation: "merge-split",
-          requestedFormatId,
-          pair: { video: VIDEO_MP4, audio: AUDIO_M4A_ONLY },
-          targetContainer: "mp4",
-        }).success,
-        false,
-        requestedFormatId,
+        GenericExecutionPlanSchema.safeParse(splitPlan(id)).success,
+        true,
+        `${id} must be a valid split-merge target`,
       );
+    }
+    // The vocabulary is the product's video ladder, in full.
+    assert.deepEqual([...GENERIC_SPLIT_VIDEO_PRESET_IDS], [
+      "preset:best",
+      "preset:2160",
+      "preset:1440",
+      "preset:1080",
+      "preset:720",
+      "preset:480",
+      "preset:360",
+      "preset:240",
+      "preset:144",
+    ]);
+  });
+
+  it("the plan SCHEMA refuses EVERY non-video member of the public request vocabulary", () => {
+    // Exhaustive over `WORKER_REQUESTED_FORMAT_IDS`, not a hand-listed few, so
+    // a new non-video member added to the public vocabulary is covered the day
+    // it appears. `direct-original` is the case the review caught.
+    const nonVideo = WORKER_REQUESTED_FORMAT_IDS.filter(
+      (id) => !(GENERIC_SPLIT_VIDEO_PRESET_IDS as readonly string[]).includes(id),
+    );
+    assert.deepEqual(nonVideo, ["direct-original", "preset:audio", "preset:mp3"]);
+
+    for (const id of nonVideo) {
+      assert.equal(
+        GenericExecutionPlanSchema.safeParse(splitPlan(id)).success,
+        false,
+        `${id} must never be fulfillable by a split merge`,
+      );
+    }
+  });
+
+  it("the ACCEPTED set equals the closed vocabulary exactly, with nothing else representable", () => {
+    // One assertion that fails in BOTH directions: a widening that admits a
+    // non-video id, and a narrowing that drops a real rung.
+    const accepted = WORKER_REQUESTED_FORMAT_IDS.filter(
+      (id) => GenericExecutionPlanSchema.safeParse(splitPlan(id)).success,
+    );
+    assert.deepEqual(accepted, [...GENERIC_SPLIT_VIDEO_PRESET_IDS]);
+
+    // ...and nothing outside the public vocabulary at all.
+    for (const junk of ["preset:9999", "", "bv+ba", "22", "best", "preset:"]) {
+      assert.equal(GenericExecutionPlanSchema.safeParse(splitPlan(junk)).success, false, junk);
     }
   });
 

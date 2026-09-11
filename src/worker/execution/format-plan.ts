@@ -293,6 +293,48 @@ function buildCandidate(
  * The plan is derived from a FRESH execution analysis, never from the browser's
  * earlier one, and never from durable state (§17/§42).
  */
+/**
+ * SPLIT-01 CORRECTION-01: the CLOSED set of requested ids a split merge may
+ * ever fulfil — the VIDEO presets, and nothing else.
+ *
+ * This exists because `WorkerRequestedFormatIdSchema` is the wrong vocabulary
+ * here. It is the browser REQUEST vocabulary, so it necessarily also contains
+ * `direct-original` and the two audio presets, none of which a merge can
+ * produce. Using it and subtracting the audio presets by refinement left
+ * `direct-original` representable: a hand-built `merge-split` plan naming it,
+ * with a valid pair and a correct target, passed the schema.
+ *
+ * Ordinary derivation refused that case anyway — `deriveGenericExecutionPlan`
+ * rejects a non-`preset:` id before the builder is reached — so nothing was
+ * reachable in Production. But SPLIT-01's whole premise is that the PLAN
+ * SCHEMA itself represents only valid operations, because every later task is
+ * going to trust it. Subtracting invalid members by refinement is exactly the
+ * shape of mistake that premise exists to prevent, so the vocabulary is stated
+ * positively instead.
+ *
+ * Deliberately a SEPARATE, private, application-owned enum:
+ *   - it is not exported to, derived from, or coupled with any public schema;
+ *   - `src/shared/worker/contracts.ts` is untouched and
+ *     `WorkerRequestedFormatIdSchema` keeps its full membership for the rest of
+ *     the product;
+ *   - a new video rung added to the product ladder must be added here too,
+ *     which is a deliberate, reviewed edit rather than an accident of subset.
+ */
+export const GENERIC_SPLIT_VIDEO_PRESET_IDS = [
+  "preset:best",
+  "preset:2160",
+  "preset:1440",
+  "preset:1080",
+  "preset:720",
+  "preset:480",
+  "preset:360",
+  "preset:240",
+  "preset:144",
+] as const satisfies readonly WorkerRequestedFormatId[];
+
+export const GenericSplitVideoPresetIdSchema = z.enum(GENERIC_SPLIT_VIDEO_PRESET_IDS);
+export type GenericSplitVideoPresetId = z.infer<typeof GenericSplitVideoPresetIdSchema>;
+
 export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
   z
     .object({
@@ -342,11 +384,10 @@ export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
     .object({
       strategy: z.literal("yt-dlp"),
       operation: z.literal("merge-split"),
-      // A VIDEO preset only. `preset:audio` and `preset:mp3` are single-source
-      // operations and are refused by `buildGenericSplitCandidate` before they
-      // could reach this schema; the literal union cannot express "any preset
-      // except two", so that refusal is the enforcement and this is the shape.
-      requestedFormatId: WorkerRequestedFormatIdSchema,
+      // The CLOSED video-preset vocabulary, stated POSITIVELY. `direct-original`
+      // and the two audio presets are not members, so no refinement is needed
+      // to exclude them and none can be forgotten (CORRECTION-01).
+      requestedFormatId: GenericSplitVideoPresetIdSchema,
       pair: GenericSplitSourceSelectionSchema,
       targetContainer: GenericSplitTargetContainerSchema,
     })
@@ -365,16 +406,16 @@ export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
           message: "targetContainer must equal the pair's table-derived target",
         });
       }
-      // `preset:audio` / `preset:mp3` are audio-only products and are never
-      // fulfilled by a merge. Stated here as well as in the builder so the
-      // schema alone refuses a hand-constructed plan.
-      if (plan.requestedFormatId === "preset:audio" || plan.requestedFormatId === "preset:mp3") {
-        ctx.addIssue({
-          code: "custom",
-          path: ["requestedFormatId"],
-          message: "an audio preset is never fulfilled by a split merge",
-        });
-      }
+      // The audio-preset refinement that used to live here is GONE, because the
+      // vocabulary above makes `preset:audio`, `preset:mp3` and
+      // `direct-original` unrepresentable rather than merely refuted. A
+      // refinement that can never fire is not defence in depth, it is dead code
+      // that implies a guard the enum already provides.
+      //
+      // Defence in depth is retained where it can still act: the derivation
+      // guard in `deriveGenericExecutionPlan` (non-`preset:` ids) and the
+      // explicit audio-preset refusal in `buildGenericSplitCandidate`, both
+      // unchanged.
     }),
 ]);
 
