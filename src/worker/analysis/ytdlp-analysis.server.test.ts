@@ -31,25 +31,46 @@ import {
 import { buildYtdlpEnvironment } from "../runtime/ytdlp-runtime.server.ts";
 import {
   buildGenericFormatSelector,
+  splitTargetContainer,
   type GenericPresetSource,
   type GenericSourceSelection,
+  type GenericSplitSourceSelection,
 } from "../execution/generic-source.ts";
 
 /**
- * Unwraps a preset source that generic v1 analysis must still emit as SINGLE.
+ * Unwraps a preset source that must be SINGLE at this call site.
  *
- * SPLIT-01 widened the private per-preset value to a discriminated union so a
- * future preset may be fulfilled by a video-only + audio-only pair. Analysis
- * builds NO pairs yet, so every value it emits must still be `kind: "single"`.
- * Asserting that here means these tests keep proving exactly what they always
- * proved AND additionally fail if a future edit starts emitting split presets
- * before the acquisition and merge path exists.
+ * SPLIT-01 widened the private per-preset value to a discriminated union, and
+ * SPLIT-05 made the split arm reachable. Every use of this helper is therefore a
+ * positive claim that THIS preset is fulfilled by exactly one upstream source —
+ * an audio preset, or a video preset backed by a muxed rendition — and it fails
+ * loudly if that stops being true.
  */
 function singleSource(value: GenericPresetSource | undefined): GenericSourceSelection {
   assert.ok(value, "every advertised preset must have a private selection");
-  assert.equal(value.kind, "single", "generic v1 analysis must emit only single sources");
+  assert.equal(value.kind, "single", "this preset must be fulfilled by one source");
   if (value.kind !== "single") throw new Error("unreachable");
   return value.source;
+}
+
+/** Unwraps a preset source that must be a SPLIT pair at this call site. */
+function splitPair(value: GenericPresetSource | undefined): GenericSplitSourceSelection {
+  assert.ok(value, "every advertised preset must have a private selection");
+  assert.equal(value.kind, "split", "this preset must be fulfilled by a pair");
+  if (value.kind !== "split") throw new Error("unreachable");
+  return value.pair;
+}
+
+/**
+ * Every upstream source one preset names: one for a muxed/audio selection, two
+ * for a pair.
+ *
+ * Shape-aware on purpose. A privacy or selector assertion that only looked at
+ * `kind: "single"` values would silently stop covering the split halves the day
+ * they became reachable, which is exactly when the coverage matters most.
+ */
+function selectionMembers(value: GenericPresetSource): GenericSourceSelection[] {
+  return value.kind === "single" ? [value.source] : [value.pair.video, value.pair.audio];
 }
 import { WorkerAnalyzeSuccessSchema } from "../../shared/worker/contracts.ts";
 import {
@@ -750,21 +771,29 @@ describe("generic analysis: preset policy", () => {
     assert.ok(ids.includes("preset:1080"));
   });
 
-  it("split-stream video-only formats produce NO video preset", async () => {
+  it("split-stream formats produce NO video preset WITHOUT Worker FFmpeg", async () => {
+    // `presetsFor` defaults to `ffmpegAvailable: false`. A pair can only be
+    // fulfilled by the Worker's own merge, so without it the pre-SPLIT-05
+    // behaviour is exactly preserved: no video preset, and no merge capability.
+    // The positive counterpart lives in the SPLIT-05 pairing suite below.
     const meta = await presetsFor([
       video({ acodec: "none", audio_ext: "none" }),
       { format_id: "audio-m4a", ext: "m4a", vcodec: "none", acodec: "mp4a.40.2", protocol: "https" },
     ]);
     const videoPresets = meta.presets.filter((p) => p.hasVideo);
-    assert.deepEqual(videoPresets, [], "merging separate streams is out of scope for v1");
+    assert.deepEqual(videoPresets, [], "no local merge is available, so there is no pair");
     // The audio-only source is still usable on its own.
     assert.ok(meta.presets.some((p) => p.id === "preset:audio"));
     assert.equal(meta.capabilities.merge, false);
   });
 
-  it("never advertises merge capability", async () => {
-    const meta = await presetsFor([video()]);
-    assert.equal(meta.capabilities.merge, false);
+  it("a muxed-only source never advertises merge capability", async () => {
+    // `merge` describes THIS source: nothing here needs a merge, with or
+    // without Worker FFmpeg, so the capability is false either way (§31).
+    for (const ffmpegAvailable of [false, true]) {
+      const meta = await presetsFor([video()], { ffmpegAvailable });
+      assert.equal(meta.capabilities.merge, false);
+    }
   });
 
   it("offers no preset at all when every format is ineligible", async () => {
@@ -1646,7 +1675,7 @@ describe("real pinned output: the captured /generic document (§20/§21)", () =>
   it("reaches a generic video preset with an honest unknown codec", () => {
     const { presets, selections } = buildGenericPresets(
       selectCandidates([capturedFormat()], LIMITS),
-      { ffmpegAvailable: false },
+      { ffmpegAvailable: false, maxFileSizeBytes: LIMITS.maxFileSizeBytes },
     );
     const best = presets.find((p) => p.id === "preset:best");
     assert.ok(best, "the pinned document must reach preset:best");
@@ -1668,7 +1697,7 @@ describe("real pinned output: the captured /generic document (§20/§21)", () =>
     if (!parsed.ok) return;
     const { presets } = buildGenericPresets(
       selectCandidates(parsed.info.formats ?? [], LIMITS),
-      { ffmpegAvailable: false },
+      { ffmpegAvailable: false, maxFileSizeBytes: LIMITS.maxFileSizeBytes },
     );
     assert.ok(presets.some((p) => p.id === "preset:best" && p.hasVideo && p.hasAudio));
   });
@@ -1901,9 +1930,11 @@ describe("real-shaped audio-only and split-stream regressions (§24/§25)", () =
     assert.ok(meta.presets.some((p) => p.id === "preset:audio"));
   });
 
-  it("split streams still produce NO merged video preset", async () => {
+  it("split streams produce NO merged video preset without Worker FFmpeg", async () => {
     // Both halves carry the real `*_ext` fields this time, so the refusal is
-    // proven against the pinned shape rather than against an omission.
+    // proven against the pinned shape rather than against an omission. `analyze`
+    // defaults to `ffmpegAvailable: false`; with the Worker's own FFmpeg this
+    // same pair IS advertised, which the SPLIT-05 pairing suite pins.
     const videoOnly = {
       format_id: "137",
       ext: "mp4",
@@ -1921,13 +1952,21 @@ describe("real-shaped audio-only and split-stream regressions (§24/§25)", () =
     assert.deepEqual(
       meta.presets.filter((p) => p.hasVideo),
       [],
-      "unknown-video support must not become a way to recombine split streams",
+      "no local merge is available, so the pair is not advertised",
     );
     assert.equal(meta.capabilities.merge, false);
     assert.ok(meta.presets.some((p) => p.id === "preset:audio"));
   });
 
-  it("an unknown-codec video source and a separate audio source do not merge", async () => {
+  it("an unknown-CODEC video half is still a valid pair half, gated only by FFmpeg", async () => {
+    // `vcodec: null` with a coherent `video_ext` is the `video-ext` constraint:
+    // the codec identity is unknown, but video PRESENCE is established, and the
+    // audio here is PROVEN absent (`acodec: "none"`). SPLIT-01's pair schema
+    // accepts `video-ext` explicitly (invariant I1) — it is the same evidence
+    // standard muxed video presets already rely on, and the container, not the
+    // codec, is what makes the stream copy legal.
+    //
+    // So the only thing that decides this case is the Worker's own FFmpeg.
     const unknownVideo = {
       format_id: "0",
       ext: "mp4",
@@ -1937,11 +1976,26 @@ describe("real-shaped audio-only and split-stream regressions (§24/§25)", () =
       video_ext: "mp4",
       audio_ext: "none",
     };
-    const { runner } = fakeRunner(
-      ok(JSON.stringify(singleVideoInfo({ formats: [unknownVideo, AUDIO_ONLY] }))),
-    );
-    const meta = await analyze(SAFE_URL, { runner });
-    assert.deepEqual(meta.presets.filter((p) => p.hasVideo), []);
+    const formats = [unknownVideo, AUDIO_ONLY];
+
+    const without = await analyze(SAFE_URL, {
+      runner: fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats })))).runner,
+      ffmpegAvailable: false,
+    });
+    assert.deepEqual(without.presets.filter((p) => p.hasVideo), []);
+    assert.equal(without.capabilities.merge, false);
+
+    const with_ = await analyze(SAFE_URL, {
+      runner: fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats })))).runner,
+      ffmpegAvailable: true,
+    });
+    const best = with_.presets.find((p) => p.id === "preset:best");
+    assert.ok(best, "the pair is advertisable once the Worker can merge it");
+    assert.equal(best.container, "mp4");
+    // No codec is ever invented for an unknown one.
+    assert.equal(best.videoCodec, null);
+    assert.equal(best.audioCodec, "aac");
+    assert.equal(with_.capabilities.merge, true);
   });
 });
 
@@ -1980,6 +2034,7 @@ describe("the private execution descriptor stays private (§11/§34)", () => {
   it("the private selection carries it, and carries no codec string", () => {
     const { selections } = buildGenericPresets(selectCandidates([HTML5], LIMITS), {
       ffmpegAvailable: false,
+      maxFileSizeBytes: LIMITS.maxFileSizeBytes,
     });
     const selection = singleSource(selections["preset:best"]);
     assert.equal(selection.videoConstraint, "video-ext");
@@ -2019,7 +2074,10 @@ describe("the private execution descriptor stays private (§11/§34)", () => {
     assert.equal(serialized.includes("url"), false);
     assert.equal(serialized.includes("http_headers"), false);
 
-    const { selections } = buildGenericPresets(candidates, { ffmpegAvailable: false });
+    const { selections } = buildGenericPresets(candidates, {
+      ffmpegAvailable: false,
+      maxFileSizeBytes: LIMITS.maxFileSizeBytes,
+    });
     assert.equal(JSON.stringify(selections).includes("attacker.invalid"), false);
   });
 });
@@ -2188,7 +2246,10 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
         assert.equal(candidates[0]!.videoConstraint, "video-ext");
         assert.equal(candidates[0]!.audioConstraint, "unknown");
 
-        const { presets, selections } = buildGenericPresets(candidates, { ffmpegAvailable });
+        const { presets, selections } = buildGenericPresets(candidates, {
+          ffmpegAvailable,
+          maxFileSizeBytes: LIMITS.maxFileSizeBytes,
+        });
         assert.deepEqual(presets, [], "no video, audio or mp3 preset from unproven audio");
         assert.deepEqual(selections, {});
       });
@@ -2196,7 +2257,10 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
       it(`an ABSENT-audio video-bearing source creates no preset (ffmpeg=${ffmpegAvailable})`, () => {
         const candidates = selectCandidates([VIDEO_ONLY], LIMITS);
         assert.equal(candidates[0]?.audioConstraint, "absent");
-        const { presets, selections } = buildGenericPresets(candidates, { ffmpegAvailable });
+        const { presets, selections } = buildGenericPresets(candidates, {
+          ffmpegAvailable,
+          maxFileSizeBytes: LIMITS.maxFileSizeBytes,
+        });
         assert.deepEqual(presets, []);
         assert.deepEqual(selections, {});
       });
@@ -2237,24 +2301,56 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
   });
 
   describe("every emitted selection carries PROVEN audio", () => {
+    /**
+     * The audio rule, in the form that applies to each SHAPE (SPLIT-05 §29).
+     *
+     * The rule itself is unchanged: an `unknown` audio state may never back an
+     * advertised preset. What SPLIT-05 changes is that "the selection" may now
+     * name two sources, so the rule is stated per shape rather than flattened:
+     *
+     *   single  audio PROVEN PRESENT on the one source, exactly as before.
+     *   split   audio PROVEN ABSENT on the video half — that is what makes it a
+     *           video half at all — and PROVEN PRESENT on the audio half.
+     *
+     * `unknown` appears on neither side of either shape, which is the property
+     * the original flat assertion was really protecting.
+     */
+    function assertProvenAudio(id: string, value: GenericPresetSource, label: string) {
+      if (value.kind === "single") {
+        assert.equal(value.source.audioConstraint, "codec-present", `${label} ${id}`);
+        assert.equal(value.source.hasAudio, true, `${label} ${id}`);
+        return;
+      }
+      const { video, audio } = value.pair;
+      assert.equal(video.audioConstraint, "absent", `${label} ${id}: video half`);
+      assert.equal(video.hasAudio, false, `${label} ${id}: video half`);
+      assert.equal(audio.audioConstraint, "codec-present", `${label} ${id}: audio half`);
+      assert.equal(audio.hasAudio, true, `${label} ${id}: audio half`);
+      // ...and video absence on the audio half is proven too, never unknown.
+      assert.equal(audio.videoConstraint, "absent", `${label} ${id}: audio half`);
+      for (const member of [video, audio]) {
+        assert.notEqual(member.audioConstraint, "unknown", `${label} ${id}: unknown audio`);
+        assert.notEqual(member.videoConstraint, "unknown", `${label} ${id}: unknown video`);
+      }
+    }
+
     for (const ffmpegAvailable of [false, true]) {
-      it(`buildGenericPresets emits only CODEC_PRESENT selections (ffmpeg=${ffmpegAvailable})`, () => {
+      it(`buildGenericPresets emits only PROVEN-audio selections (ffmpeg=${ffmpegAvailable})`, () => {
         let emitted = 0;
         for (const [label, formats] of DOCUMENTS) {
           const { selections } = buildGenericPresets(selectCandidates(formats, LIMITS), {
             ffmpegAvailable,
+            maxFileSizeBytes: LIMITS.maxFileSizeBytes,
           });
           for (const [id, presetSource] of Object.entries(selections)) {
-            const selection = singleSource(presetSource);
-            assert.equal(selection.audioConstraint, "codec-present", `${label} ${id}`);
-            assert.equal(selection.hasAudio, true, `${label} ${id}`);
+            assertProvenAudio(id, presetSource, label);
             emitted += 1;
           }
         }
         assert.ok(emitted > 0, "the invariant must actually be exercised");
       });
 
-      it(`the internal analyzer emits only CODEC_PRESENT selections (ffmpeg=${ffmpegAvailable})`, async () => {
+      it(`the internal analyzer emits only PROVEN-audio selections (ffmpeg=${ffmpegAvailable})`, async () => {
         for (const [label, formats] of DOCUMENTS) {
           const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats }))));
           const { video, selections } = await analyzeInternal(SAFE_URL, { runner, ffmpegAvailable });
@@ -2264,37 +2360,68 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
             `${label}: selections and presets stay in bijection`,
           );
           for (const [id, presetSource] of Object.entries(selections)) {
-            const selection = singleSource(presetSource);
-            assert.equal(selection.audioConstraint, "codec-present", `${label} ${id}`);
-            assert.equal(selection.hasAudio, true, `${label} ${id}`);
+            assertProvenAudio(id, presetSource, label);
           }
         }
       });
     }
 
-    it("every currently reachable selector is byte-identical to the pre-correction one", () => {
+    it("an UNKNOWN-audio video source is never promoted into a pair half", () => {
+      // The single most important pairing regression (§29/M1). An unknown-audio
+      // video source sitting next to a perfectly good audio-only partner is
+      // exactly the shape a "just treat unknown as absent" edit would pair up.
+      const { presets, selections } = buildGenericPresets(
+        selectCandidates([HTML5_UNDECLARED, AUDIO_ONLY], LIMITS),
+        { ffmpegAvailable: true, maxFileSizeBytes: LIMITS.maxFileSizeBytes },
+      );
+      assert.equal(
+        presets.some((p) => p.hasVideo),
+        false,
+        "unknown audio is not absence, so there is no video half and no pair",
+      );
+      for (const value of Object.values(selections)) {
+        assert.equal(value.kind, "single", "only the audio-only source may back a preset");
+      }
+      // The audio-only source is still independently usable.
+      assert.ok(presets.some((p) => p.id === "preset:audio"));
+    });
+
+    it("every reachable selector is byte-identical to the pre-correction one", () => {
       // The strings below are exactly what the boolean construction produced
       // for these sources, which all carry proven audio. The correction must
       // not move a single character of any selector acquisition actually runs.
+      //
+      // SPLIT-05 note: the 1080p rungs are now fulfilled by the 137 + 140 pair,
+      // so the map is keyed per MEMBER — each half is acquired by its own
+      // independent single-source invocation, never by a joined expression, so
+      // each half has its own complete selector and there is no `+` anywhere.
       const { selections } = buildGenericPresets(
         selectCandidates([MUXED_720, MUXED_360, HTML5_DECLARED, VIDEO_ONLY, AUDIO_ONLY], LIMITS),
-        { ffmpegAvailable: true },
+        { ffmpegAvailable: true, maxFileSizeBytes: LIMITS.maxFileSizeBytes },
       );
       const built = Object.fromEntries(
         Object.entries(selections).map(([id, s]) => [
           id,
-          buildGenericFormatSelector(singleSource(s)),
+          selectionMembers(s).map(buildGenericFormatSelector),
         ]),
       );
       const muxed22 = 'b*[format_id="22"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!="none"]';
       const audio140 = 'b*[format_id="140"][protocol="https"][ext="m4a"][vcodec="none"][acodec!="none"]';
+      // The video half binds PROVEN audio absence — `[acodec="none"]` — which is
+      // what makes acquiring it twice-over impossible if the site changes shape.
+      const video137 = 'b*[format_id="137"][protocol="https"][ext="mp4"][vcodec!="none"][acodec="none"]';
       assert.deepEqual(built, {
-        "preset:best": muxed22,
-        "preset:720": muxed22,
-        "preset:360": 'b*[format_id="18"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!="none"]',
-        "preset:audio": audio140,
-        "preset:mp3": audio140,
+        "preset:best": [video137, audio140],
+        "preset:1080": [video137, audio140],
+        "preset:720": [muxed22],
+        "preset:360": ['b*[format_id="18"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!="none"]'],
+        "preset:audio": [audio140],
+        "preset:mp3": [audio140],
       });
+      // §52: no selector on any path is a merge expression.
+      for (const selectors of Object.values(built)) {
+        for (const selector of selectors) assert.equal(selector.includes("+"), false, selector);
+      }
 
       const captured = readFileSync(
         join(import.meta.dirname, "testdata", "pinned-generic-html5.json"),
@@ -2302,7 +2429,7 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
       );
       const html5 = buildGenericPresets(
         selectCandidates(JSON.parse(captured).formats, LIMITS),
-        { ffmpegAvailable: false },
+        { ffmpegAvailable: false, maxFileSizeBytes: LIMITS.maxFileSizeBytes },
       ).selections["preset:best"];
       assert.equal(
         buildGenericFormatSelector(singleSource(html5)),
@@ -2342,10 +2469,16 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
         for (const forbidden of ["audioConstraint", "videoConstraint", "selections", "acodec", "b*["]) {
           assert.equal(body.includes(forbidden), false, `${label}: ${forbidden}`);
         }
+        // Shape-aware: for a pair this covers BOTH raw ids and BOTH selectors.
         for (const presetSource of Object.values(selections)) {
-          const selection = singleSource(presetSource);
-          assert.equal(body.includes(`"${selection.formatId}"`), false, `${label}: raw id`);
-          assert.equal(body.includes(buildGenericFormatSelector(selection)), false, `${label}: selector`);
+          for (const selection of selectionMembers(presetSource)) {
+            assert.equal(body.includes(`"${selection.formatId}"`), false, `${label}: raw id`);
+            assert.equal(
+              body.includes(buildGenericFormatSelector(selection)),
+              false,
+              `${label}: selector`,
+            );
+          }
         }
       }
     });
@@ -2353,15 +2486,21 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SPLIT-01 §18: PUBLIC behavioural equivalence
+// SPLIT-05 §86: the BEHAVIOURAL DELTA, stated as a pinned before/after
 //
-// SPLIT-01 wraps every emitted selection in a private envelope. The public half
-// must be untouched by that, so these cases pin the ENTIRE public preset array
-// for a candidate set that deliberately includes the video-only and audio-only
-// renditions a future split pair would be built from.
+// This suite replaces SPLIT-01's "the public preset surface is unchanged". That
+// premise was true while nothing could build a pair and is deliberately false
+// now, so the cases are inverted rather than deleted: the SAME candidate set is
+// pinned field-for-field in BOTH directions.
+//
+//   FFmpeg unavailable  the pre-SPLIT array, byte for byte. Nothing regressed.
+//   FFmpeg available    the 1080p pair becomes an ORDINARY video preset.
+//
+// The private envelope, the id === formatId contract and the raw-id boundary are
+// unchanged in both.
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("SPLIT-01: the public preset surface is unchanged", () => {
+describe("SPLIT-05: split renditions become advertisable", () => {
   /** Muxed, video-only and audio-only renditions in one document. */
   const MIXED = [
     { format_id: "22", ext: "mp4", protocol: "https", vcodec: "avc1.64001F", acodec: "mp4a.40.2", height: 720, fps: 30, filesize: 3_000_000 },
@@ -2372,12 +2511,17 @@ describe("SPLIT-01: the public preset surface is unchanged", () => {
   ];
 
   const build = (ffmpegAvailable: boolean) =>
-    buildGenericPresets(selectCandidates(MIXED, LIMITS), { ffmpegAvailable });
+    buildGenericPresets(selectCandidates(MIXED, LIMITS), {
+      ffmpegAvailable,
+      maxFileSizeBytes: LIMITS.maxFileSizeBytes,
+    });
 
-  it("emits EXACTLY the pre-SPLIT preset array, field for field", () => {
-    // A golden assertion rather than a spot check: every field the browser can
-    // read is pinned, so a wrapper change that altered any of them fails here.
-    assert.deepEqual(build(true).presets, [
+  it("BEFORE (no Worker FFmpeg): EXACTLY the pre-SPLIT preset array, field for field", () => {
+    // The pre-SPLIT golden array, unchanged from SPLIT-01 except that `mp3` is
+    // absent because MP3 always required FFmpeg. Two 1080p video-only
+    // renditions and two audio-only renditions are present and individually
+    // eligible, and the product still offers only the 720p MUXED source.
+    assert.deepEqual(build(false).presets, [
       {
         id: "preset:best",
         label: "Best available",
@@ -2392,6 +2536,71 @@ describe("SPLIT-01: the public preset surface is unchanged", () => {
         fps: 30,
       },
       {
+        id: "preset:720",
+        label: "720p",
+        resolution: "720p",
+        container: "mp4",
+        fileSize: 3_000_000,
+        hasVideo: true,
+        hasAudio: true,
+        formatId: "preset:720",
+        videoCodec: "h264",
+        audioCodec: "aac",
+        fps: 30,
+      },
+      {
+        id: "preset:audio",
+        label: "Audio only",
+        resolution: "audio",
+        container: "m4a",
+        fileSize: 500_000,
+        hasVideo: false,
+        hasAudio: true,
+        formatId: "preset:audio",
+        videoCodec: null,
+        audioCodec: "aac",
+        fps: null,
+      },
+    ]);
+  });
+
+  it("AFTER (Worker FFmpeg available): the 1080p pair is an ORDINARY video preset", () => {
+    // The delta, pinned field for field. `preset:1080` looks exactly like any
+    // other video preset: an application-owned id, one container, one codec
+    // pair, one size. Nothing states that two sources are involved.
+    assert.deepEqual(build(true).presets, [
+      {
+        id: "preset:best",
+        label: "Best available",
+        resolution: "1080p",
+        // Derived from the closed pair table: mp4 video + m4a audio -> mp4.
+        container: "mp4",
+        // The exact COMBINED known size, not either half alone (§15).
+        fileSize: 9_500_000,
+        hasVideo: true,
+        hasAudio: true,
+        formatId: "preset:best",
+        // Video metadata from the VIDEO half, audio metadata from the AUDIO half.
+        videoCodec: "h264",
+        audioCodec: "aac",
+        fps: 30,
+      },
+      {
+        id: "preset:1080",
+        label: "1080p",
+        resolution: "1080p",
+        container: "mp4",
+        fileSize: 9_500_000,
+        hasVideo: true,
+        hasAudio: true,
+        formatId: "preset:1080",
+        videoCodec: "h264",
+        audioCodec: "aac",
+        fps: 30,
+      },
+      {
+        // The muxed rung is untouched: a pair never displaces a single source
+        // at its own resolution, and never invents extra rungs.
         id: "preset:720",
         label: "720p",
         resolution: "720p",
@@ -2433,41 +2642,17 @@ describe("SPLIT-01: the public preset surface is unchanged", () => {
     ]);
   });
 
-  it("REGRESSION: video-only + audio-only candidates still yield NO video preset", () => {
-    // The whole point of SPLIT-01. Two 1080p video-only renditions and two
-    // audio-only renditions are present and individually eligible, and the
-    // product still offers only the 720p MUXED source. Advertising the pair is
-    // SPLIT-05's job and requires the acquisition and merge path first.
-    for (const ffmpegAvailable of [false, true]) {
-      const { presets } = build(ffmpegAvailable);
-      const video = presets.filter((p) => p.hasVideo);
-      assert.deepEqual(
-        video.map((p) => p.id),
-        ["preset:best", "preset:720"],
-        `ffmpeg=${ffmpegAvailable}`,
-      );
-      for (const p of video) {
-        assert.equal(p.resolution, "720p", "no 1080p preset may appear");
-        assert.equal(p.container, "mp4");
-      }
-      assert.equal(
-        presets.some((p) => p.resolution === "1080p"),
-        false,
-        "the 1080p split rendition must not be advertised",
-      );
-    }
-  });
-
   it("preset ordering, count and the id === formatId contract are unchanged", () => {
     for (const ffmpegAvailable of [false, true]) {
       const { presets } = build(ffmpegAvailable);
-      assert.equal(presets.length, ffmpegAvailable ? 4 : 3);
       assert.deepEqual(
         presets.map((p) => p.id),
         ffmpegAvailable
-          ? ["preset:best", "preset:720", "preset:audio", "preset:mp3"]
+          ? ["preset:best", "preset:1080", "preset:720", "preset:audio", "preset:mp3"]
           : ["preset:best", "preset:720", "preset:audio"],
       );
+      // Split fulfilment changes HOW a rung is served, never how many ids exist.
+      assert.ok(presets.length <= YTDLP_ANALYSIS_MAX_PRESETS);
       for (const p of presets) {
         assert.equal(p.formatId, p.id);
         assert.match(p.id, GENERIC_PRESET_ID_PATTERN);
@@ -2475,16 +2660,26 @@ describe("SPLIT-01: the public preset surface is unchanged", () => {
     }
   });
 
-  it("every emitted selection is still SINGLE, and names a muxed or audio-only source", () => {
-    for (const ffmpegAvailable of [false, true]) {
-      const { selections } = build(ffmpegAvailable);
-      for (const [id, value] of Object.entries(selections)) {
-        assert.equal(value.kind, "single", `${id}: no pair may be constructed in SPLIT-01`);
-        const source = singleSource(value);
-        // 137/248/251 are the split halves. Only the muxed 22 and the audio 140
-        // may back a preset today.
-        assert.ok(["22", "140"].includes(source.formatId), `${id}: unexpected source ${id}`);
-      }
+  it("the private selections name exactly the sources each preset was built on", () => {
+    const { selections } = build(true);
+    // The video rungs are pairs of the mp4 halves; the mp4 family partner is
+    // 140, chosen ONCE (251 is the webm family's partner and is not used here
+    // because the mp4 video half won the 1080p bucket).
+    for (const id of ["preset:best", "preset:1080"]) {
+      const pair = splitPair(selections[id]);
+      assert.equal(pair.video.formatId, "137");
+      assert.equal(pair.audio.formatId, "140");
+      assert.equal(splitTargetContainer(pair.video.container, pair.audio.container), "mp4");
+    }
+    // The muxed rung and both audio presets stay single-source (§28).
+    assert.equal(singleSource(selections["preset:720"]).formatId, "22");
+    assert.equal(singleSource(selections["preset:audio"]).formatId, "140");
+    assert.equal(singleSource(selections["preset:mp3"]).formatId, "140");
+
+    // With no FFmpeg, nothing is a pair and the split halves back nothing.
+    for (const [id, value] of Object.entries(build(false).selections)) {
+      const source = singleSource(value);
+      assert.ok(["22", "140"].includes(source.formatId), `${id}: unexpected source`);
     }
   });
 
@@ -2507,7 +2702,7 @@ describe("SPLIT-01: the public preset surface is unchanged", () => {
       assert.equal(body.includes(marker), false, marker);
     }
     // Every raw upstream id in the document, advertised or not — including the
-    // split halves a future pair would name.
+    // two halves that now really do back an advertised preset.
     for (const rawId of ["22", "137", "248", "140", "251"]) {
       assert.equal(body.includes(`"${rawId}"`), false, `raw id ${rawId}`);
     }
@@ -2515,8 +2710,789 @@ describe("SPLIT-01: the public preset surface is unchanged", () => {
     for (const marker of ["videoConstraint", "audioConstraint", "formatId\":\"2", "selections"]) {
       assert.equal(body.includes(marker), false, marker);
     }
+    // The capability is public, and it is now TRUE for this source — which is
+    // the one public value SPLIT-05 deliberately changes.
+    assert.equal(video.capabilities.merge, true);
+
     // Positive control: the private half really did carry those ids.
-    assert.equal(singleSource(selections["preset:best"]).formatId, "22");
+    assert.equal(splitPair(selections["preset:best"]).video.formatId, "137");
+    assert.equal(splitPair(selections["preset:best"]).audio.formatId, "140");
     assert.equal(singleSource(selections["preset:audio"]).formatId, "140");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPLIT-05: PAIRING, RANKING AND ADVERTISING
+//
+// The first source task that makes an approved video-only + audio-only pair
+// reachable as an ordinary application-owned preset. These cases pin the four
+// decisions that make that safe:
+//
+//   WHICH candidates may be halves       (§6: proven, never unknown)
+//   WHICH halves may be combined         (§5: the closed container table)
+//   WHICH partner each family uses       (§9/§10: one, fixed, no fallback)
+//   WHICH fulfilment wins a rung         (§23/§24: resolution, then muxed)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("SPLIT-05: pairing eligibility", () => {
+  const MAX = 500 * 1024 * 1024;
+  const LIM = { maxFileSizeBytes: MAX };
+
+  const build = (formats: Array<Record<string, unknown>>, ffmpegAvailable = true) =>
+    buildGenericPresets(selectCandidates(formats, LIM), {
+      ffmpegAvailable,
+      maxFileSizeBytes: MAX,
+    });
+
+  /** A video-only rendition: video present, audio PROVEN absent. */
+  const videoOnly = (o: Record<string, unknown> = {}) => ({
+    format_id: "v-mp4",
+    ext: "mp4",
+    protocol: "https",
+    height: 1080,
+    fps: 30,
+    vcodec: "avc1.640028",
+    acodec: "none",
+    video_ext: "mp4",
+    audio_ext: "none",
+    ...o,
+  });
+
+  /** An audio-only rendition: audio PROVEN present, video PROVEN absent. */
+  const audioOnly = (o: Record<string, unknown> = {}) => ({
+    format_id: "a-m4a",
+    ext: "m4a",
+    protocol: "https",
+    vcodec: "none",
+    acodec: "mp4a.40.2",
+    video_ext: "none",
+    audio_ext: "m4a",
+    ...o,
+  });
+
+  // ── §38: the approved families ─────────────────────────────────────────────
+
+  it("MP4 family: mp4 video-only + m4a audio-only -> an mp4 video preset", () => {
+    const { presets, selections } = build([videoOnly(), audioOnly()]);
+    const best = presets.find((p) => p.id === "preset:best");
+    assert.ok(best, "the pair must be advertised");
+    assert.equal(best.resolution, "1080p");
+    assert.equal(best.container, "mp4");
+    assert.equal(best.hasVideo, true);
+    assert.equal(best.hasAudio, true);
+
+    const pair = splitPair(selections["preset:best"]);
+    assert.equal(pair.video.formatId, "v-mp4");
+    assert.equal(pair.audio.formatId, "a-m4a");
+    assert.equal(splitTargetContainer(pair.video.container, pair.audio.container), "mp4");
+  });
+
+  it("WebM family: webm video-only + webm audio-only -> a webm video preset", () => {
+    const { presets, selections } = build([
+      videoOnly({ format_id: "v-webm", ext: "webm", vcodec: "vp09.00.40.08", video_ext: "webm" }),
+      audioOnly({ format_id: "a-webm", ext: "webm", acodec: "opus", audio_ext: "webm" }),
+    ]);
+    const best = presets.find((p) => p.id === "preset:best");
+    assert.ok(best, "MP4 assumptions must not be universal");
+    assert.equal(best.container, "webm", "the target comes from the closed table");
+    assert.equal(best.videoCodec, "vp9");
+    assert.equal(best.audioCodec, "opus");
+
+    const pair = splitPair(selections["preset:best"]);
+    assert.equal(splitTargetContainer(pair.video.container, pair.audio.container), "webm");
+  });
+
+  // ── §39: everything that is NOT a pair ─────────────────────────────────────
+
+  /**
+   * Every shape that must NOT become a pair.
+   *
+   * The third element says whether a VIDEO preset may still legitimately appear
+   * from a SINGLE source in that row — true only for the muxed row, where the
+   * "video half" is actually an ordinary muxed rendition. Everywhere else the
+   * absence of a video preset is itself part of the assertion, so a row cannot
+   * pass merely by producing nothing.
+   */
+  const NOT_PAIRS: Array<[string, Array<Record<string, unknown>>, boolean?]> = [
+    [
+      "cross-family: mp4 video + webm audio",
+      [videoOnly(), audioOnly({ format_id: "a-webm", ext: "webm", acodec: "opus", audio_ext: "webm" })],
+    ],
+    [
+      "cross-family: webm video + m4a audio",
+      [videoOnly({ format_id: "v-webm", ext: "webm", vcodec: "vp09.00.40.08", video_ext: "webm" }), audioOnly()],
+    ],
+    [
+      "mp4 video + mp3 audio (an allowed audio-only container, but not a pair)",
+      [videoOnly(), audioOnly({ format_id: "a-mp3", ext: "mp3", acodec: "mp3", audio_ext: "mp3" })],
+    ],
+    [
+      "the same raw id on both halves",
+      [videoOnly({ format_id: "same" }), audioOnly({ format_id: "same" })],
+    ],
+    [
+      "video half with UNKNOWN audio",
+      [videoOnly({ acodec: undefined, vcodec: null }), audioOnly()],
+    ],
+    [
+      "video half with PROVEN audio (it is muxed, not a half)",
+      [videoOnly({ acodec: "mp4a.40.2" }), audioOnly({ format_id: "a2" })],
+      true,
+    ],
+    [
+      "audio half with UNKNOWN video",
+      [videoOnly(), audioOnly({ vcodec: undefined, video_ext: undefined })],
+    ],
+    [
+      "audio half without PROVEN audio",
+      [videoOnly(), audioOnly({ acodec: "none" })],
+    ],
+    [
+      "a video half whose raw id is outside the safe grammar",
+      [videoOnly({ format_id: "bv+ba" }), audioOnly()],
+    ],
+    [
+      "an audio half whose raw id is outside the safe grammar",
+      [videoOnly(), audioOnly({ format_id: 'a"[x]' })],
+    ],
+    [
+      "a non-http(s) video half",
+      [videoOnly({ protocol: "m3u8_native" }), audioOnly()],
+    ],
+    [
+      "a non-http(s) audio half",
+      [videoOnly(), audioOnly({ protocol: "m3u8_native" })],
+    ],
+    [
+      "an unsupported source container on the video half",
+      [videoOnly({ ext: "mkv", video_ext: "mkv" }), audioOnly()],
+    ],
+  ];
+
+  for (const [label, formats, muxedVideoExpected = false] of NOT_PAIRS) {
+    it(`NOT a pair: ${label}`, () => {
+      const { presets, selections } = build(formats);
+      // Nothing may be fulfilled by a pair...
+      for (const [id, value] of Object.entries(selections)) {
+        assert.equal(value.kind, "single", `${label}: ${id} must not be a pair`);
+      }
+      // ...and, except for the genuinely muxed row, no video preset may exist
+      // at all. Without this half the row could pass by accident.
+      assert.equal(
+        presets.some((p) => p.hasVideo),
+        muxedVideoExpected,
+        `${label}: video-preset presence`,
+      );
+    });
+  }
+
+  it("the muxed case above really does still produce an ordinary single preset", () => {
+    // A pointed control for the "video half with PROVEN audio" row: refusing it
+    // as a PAIR must not also refuse it as the muxed source it actually is.
+    const { presets, selections } = build([videoOnly({ acodec: "mp4a.40.2" })]);
+    assert.ok(presets.some((p) => p.id === "preset:1080"));
+    assert.equal(singleSource(selections["preset:1080"]).formatId, "v-mp4");
+  });
+
+  it("an unpairable video half leaves the AUDIO side completely untouched", () => {
+    // Reduced capability, never a thrown error (§78).
+    const { presets } = build([
+      videoOnly({ format_id: "v-webm", ext: "webm", vcodec: "vp09.00.40.08", video_ext: "webm" }),
+      audioOnly(),
+    ]);
+    assert.deepEqual(presets.filter((p) => p.hasVideo), []);
+    assert.ok(presets.some((p) => p.id === "preset:audio"));
+    assert.ok(presets.some((p) => p.id === "preset:mp3"));
+  });
+
+  it("a video-only source with NO audio partner at all is simply not advertised", () => {
+    const { presets, selections } = build([videoOnly()]);
+    assert.deepEqual(presets, []);
+    assert.deepEqual(selections, {});
+  });
+});
+
+describe("SPLIT-05: one fixed audio partner per family (§9/§10)", () => {
+  const MAX = 500 * 1024 * 1024;
+  const build = (formats: Array<Record<string, unknown>>) =>
+    buildGenericPresets(selectCandidates(formats, { maxFileSizeBytes: MAX }), {
+      ffmpegAvailable: true,
+      maxFileSizeBytes: MAX,
+    });
+
+  /** Two mp4 video rungs, three m4a partners, two webm rungs, two webm partners. */
+  const LADDER = [
+    { format_id: "v1080", ext: "mp4", protocol: "https", height: 1080, vcodec: "avc1.640028", acodec: "none", filesize: 9_000_000 },
+    { format_id: "v720", ext: "mp4", protocol: "https", height: 720, vcodec: "avc1.64001F", acodec: "none", filesize: 4_000_000 },
+    { format_id: "a-aac-lo", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2", filesize: 300_000 },
+    { format_id: "a-aac-hi", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2", filesize: 900_000 },
+    { format_id: "a-aac-mid", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2", filesize: 600_000 },
+    { format_id: "w1080", ext: "webm", protocol: "https", height: 1080, vcodec: "vp09.00.40.08", acodec: "none", filesize: 8_000_000 },
+    { format_id: "w720", ext: "webm", protocol: "https", height: 720, vcodec: "vp09.00.40.08", acodec: "none", filesize: 3_500_000 },
+    { format_id: "a-opus-lo", ext: "webm", protocol: "https", vcodec: "none", acodec: "opus", filesize: 250_000 },
+    { format_id: "a-opus-hi", ext: "webm", protocol: "https", vcodec: "none", acodec: "opus", filesize: 700_000 },
+  ];
+
+  it("every MP4-family split uses the SAME single partner", () => {
+    const { selections } = build(LADDER);
+    // mp4 beats webm within a bucket, so both rungs are mp4-family splits.
+    const partners = new Set<string>();
+    for (const id of ["preset:best", "preset:1080", "preset:720"]) {
+      const pair = splitPair(selections[id]);
+      assert.equal(pair.audio.container, "m4a");
+      partners.add(pair.audio.formatId);
+    }
+    assert.equal(partners.size, 1, "one partner for the whole analysis, not one per rung");
+    // The existing deterministic ranking picks the larger known size among
+    // equal-codec audio-only candidates.
+    assert.deepEqual([...partners], ["a-aac-hi"]);
+  });
+
+  it("the WebM family has its OWN single partner, chosen the same way", () => {
+    // Drop the mp4 halves so the webm family is the one that wins the buckets.
+    const { selections } = build(LADDER.filter((f) => !String(f.format_id).startsWith("v") && !String(f.format_id).startsWith("a-aac")));
+    const partners = new Set<string>();
+    for (const id of ["preset:best", "preset:1080", "preset:720"]) {
+      const pair = splitPair(selections[id]);
+      assert.equal(pair.audio.container, "webm");
+      partners.add(pair.audio.formatId);
+    }
+    assert.deepEqual([...partners], ["a-opus-hi"]);
+  });
+
+  it("upstream ORDER introduces no second pairing policy", () => {
+    const forward = build(LADDER);
+    const reversed = build([...LADDER].reverse());
+    const shape = (b: ReturnType<typeof build>) =>
+      Object.fromEntries(
+        Object.entries(b.selections).map(([id, v]) => [
+          id,
+          v.kind === "single" ? v.source.formatId : `${v.pair.video.formatId}+${v.pair.audio.formatId}`,
+        ]),
+      );
+    assert.deepEqual(shape(forward), shape(reversed));
+    assert.deepEqual(forward.presets, reversed.presets);
+  });
+
+  it("NO alternate partner is tried when the fixed one does not fit (§10)", () => {
+    // The family partner is 900_000. The ceiling admits the 720p rung with it
+    // (4_000_000 + 900_000) but not the 1080p rung (9_000_000 + 900_000). A
+    // smaller partner exists and WOULD have made 1080p fit — and must not be
+    // reached for, because that would make the advertised audio depend on which
+    // video rung the user picked.
+    const { presets, selections } = buildGenericPresets(
+      selectCandidates(LADDER.filter((f) => !String(f.format_id).startsWith("w") && !String(f.format_id).startsWith("a-opus")), {
+        maxFileSizeBytes: 9_500_000,
+      }),
+      { ffmpegAvailable: true, maxFileSizeBytes: 9_500_000 },
+    );
+    assert.equal(
+      presets.some((p) => p.resolution === "1080p"),
+      false,
+      "the 1080p rung has no split fulfilment rather than a substituted partner",
+    );
+    const rung = splitPair(selections["preset:720"]);
+    assert.equal(rung.audio.formatId, "a-aac-hi", "still the family partner, not a smaller one");
+  });
+
+  it("preset:audio follows its OWN ranking and stays single-source (§28)", () => {
+    const { presets, selections } = build(LADDER);
+    const audio = singleSource(selections["preset:audio"]);
+    // It happens to be the same candidate the mp4 family paired with — the same
+    // ranking run twice, not a coupling. What matters is the SHAPE.
+    assert.equal(selections["preset:audio"]?.kind, "single");
+    assert.equal(selections["preset:mp3"]?.kind, "single");
+    assert.equal(audio.hasVideo, false);
+    assert.equal(audio.audioConstraint, "codec-present");
+    assert.equal(presets.find((p) => p.id === "preset:audio")?.container, "m4a");
+  });
+});
+
+describe("SPLIT-05: the combined known-size gate (§13/§14/§15/§41)", () => {
+  const pairFor = (videoSize: number | null, audioSize: number | null, max: number) => {
+    const v: Record<string, unknown> = {
+      format_id: "v", ext: "mp4", protocol: "https", height: 1080,
+      vcodec: "avc1.640028", acodec: "none",
+    };
+    const a: Record<string, unknown> = {
+      format_id: "a", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2",
+    };
+    if (videoSize !== null) v.filesize = videoSize;
+    if (audioSize !== null) a.filesize = audioSize;
+    return buildGenericPresets(selectCandidates([v, a], { maxFileSizeBytes: max }), {
+      ffmpegAvailable: true,
+      maxFileSizeBytes: max,
+    });
+  };
+
+  it("both sizes known and within the ceiling -> advertised with the EXACT sum", () => {
+    const { presets, selections } = pairFor(700, 200, 1000);
+    const best = presets.find((p) => p.id === "preset:best");
+    assert.ok(best);
+    assert.equal(best.fileSize, 900, "not the video size, not the audio size, not the ceiling");
+    assert.equal(selections["preset:best"]?.kind, "split");
+  });
+
+  it("both sizes known and OVER the ceiling -> NOT advertised", () => {
+    // Each half fits on its own; together they do not.
+    const { presets, selections } = pairFor(700, 400, 1000);
+    assert.equal(
+      presets.some((p) => p.hasVideo),
+      false,
+      "a pair analysis already knows cannot fit must not be advertised",
+    );
+    for (const value of Object.values(selections)) assert.equal(value.kind, "single");
+  });
+
+  it("an UNKNOWN video size still pairs, advertising fileSize: null", () => {
+    const { presets, selections } = pairFor(null, 200, 1000);
+    const best = presets.find((p) => p.id === "preset:best");
+    assert.ok(best, "unknown size is not a reason to refuse a valid pair");
+    assert.equal(best.fileSize, null, "no combined size is invented");
+    assert.equal(selections["preset:best"]?.kind, "split");
+  });
+
+  it("an UNKNOWN audio size still pairs, advertising fileSize: null", () => {
+    const { presets } = pairFor(700, null, 1000);
+    const best = presets.find((p) => p.id === "preset:best");
+    assert.ok(best);
+    assert.equal(best.fileSize, null);
+  });
+
+  it("an UNSAFE integer sum is refused rather than compared inexactly", () => {
+    // Both halves are individually within a ceiling this large, so the ONLY
+    // thing that can refuse the pair is the safe-integer rule.
+    const max = Number.MAX_SAFE_INTEGER;
+    const { presets, selections } = pairFor(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, max);
+    assert.equal(
+      presets.some((p) => p.hasVideo),
+      false,
+      "a budget decision made on an inexact number is not a decision",
+    );
+    for (const value of Object.values(selections)) assert.equal(value.kind, "single");
+  });
+
+  it("the individual-candidate gate is unchanged: an oversized half never becomes a candidate", () => {
+    const { presets } = pairFor(2000, 200, 1000);
+    assert.equal(presets.some((p) => p.hasVideo), false);
+  });
+});
+
+describe("SPLIT-05: ranking (§23/§24/§25/§42-§46)", () => {
+  const MAX = 500 * 1024 * 1024;
+  const build = (formats: Array<Record<string, unknown>>, ffmpegAvailable = true) =>
+    buildGenericPresets(selectCandidates(formats, { maxFileSizeBytes: MAX }), {
+      ffmpegAvailable,
+      maxFileSizeBytes: MAX,
+    });
+
+  const muxed = (height: number | null, o: Record<string, unknown> = {}) => ({
+    format_id: `m${height ?? "x"}`,
+    ext: "mp4", protocol: "https", vcodec: "avc1.640028", acodec: "mp4a.40.2",
+    ...(height === null ? {} : { height }),
+    ...o,
+  });
+  const splitVideo = (height: number | null, o: Record<string, unknown> = {}) => ({
+    format_id: `s${height ?? "x"}`,
+    ext: "mp4", protocol: "https", vcodec: "avc1.640028", acodec: "none",
+    ...(height === null ? {} : { height }),
+    ...o,
+  });
+  const partner = { format_id: "aud", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2" };
+
+  it("§42: at the SAME resolution, MUXED beats split — whatever else the split wins on", () => {
+    // The split rendition is deliberately given every non-resolution advantage
+    // the ranking knows about: nicer codec order is equal, but it has a larger
+    // known size and a higher fps, and it would win the container comparison if
+    // kind did not come first.
+    const { presets, selections } = build([
+      muxed(1080, { fps: 24, filesize: 1_000_000 }),
+      splitVideo(1080, { fps: 60, filesize: 50_000_000 }),
+      partner,
+    ]);
+    for (const id of ["preset:best", "preset:1080"]) {
+      assert.equal(selections[id]?.kind, "single", `${id} must use the muxed source`);
+      assert.equal(singleSource(selections[id]).formatId, "m1080");
+    }
+    assert.equal(presets.find((p) => p.id === "preset:1080")?.fps, 24);
+    // ...and the unused-but-valid pair creates no extra preset and no capability.
+    assert.deepEqual(
+      presets.map((p) => p.id),
+      ["preset:best", "preset:1080", "preset:audio", "preset:mp3"],
+    );
+  });
+
+  it("§43: a HIGHER split beats a LOWER muxed for preset:best", () => {
+    const { presets, selections } = build([muxed(720), splitVideo(1080), partner]);
+    assert.equal(presets.find((p) => p.id === "preset:best")?.resolution, "1080p");
+    assert.equal(selections["preset:best"]?.kind, "split");
+    assert.equal(selections["preset:1080"]?.kind, "split");
+    assert.equal(selections["preset:720"]?.kind, "single");
+    assert.equal(singleSource(selections["preset:720"]).formatId, "m720");
+  });
+
+  it("§44: a HIGHER muxed stays ordinary, and the lower split still fills its rung", () => {
+    const { presets, selections } = build([muxed(1080), splitVideo(720), partner]);
+    assert.equal(presets.find((p) => p.id === "preset:best")?.resolution, "1080p");
+    assert.equal(selections["preset:best"]?.kind, "single");
+    assert.equal(selections["preset:1080"]?.kind, "single");
+    assert.equal(selections["preset:720"]?.kind, "split");
+  });
+
+  it("§45: a split-only ladder fills every rung, with no duplicate or extra ids", () => {
+    const { presets, selections } = build([
+      splitVideo(2160), splitVideo(1080), splitVideo(720), partner,
+    ]);
+    assert.deepEqual(
+      presets.map((p) => p.id),
+      ["preset:best", "preset:2160", "preset:1080", "preset:720", "preset:audio", "preset:mp3"],
+    );
+    for (const id of ["preset:best", "preset:2160", "preset:1080", "preset:720"]) {
+      assert.equal(selections[id]?.kind, "split", id);
+    }
+    assert.equal(splitPair(selections["preset:best"]).video.formatId, "s2160");
+    assert.equal(splitPair(selections["preset:2160"]).video.formatId, "s2160");
+    assert.equal(splitPair(selections["preset:1080"]).video.formatId, "s1080");
+    assert.equal(splitPair(selections["preset:720"]).video.formatId, "s720");
+    // No split-specific vocabulary leaked into the ids.
+    assert.equal(new Set(presets.map((p) => p.id)).size, presets.length);
+    for (const p of presets) assert.match(p.id, GENERIC_PRESET_ID_PATTERN);
+  });
+
+  it("§46: unknown heights — muxed only", () => {
+    const { presets, selections } = build([muxed(null)]);
+    assert.equal(presets.find((p) => p.id === "preset:best")?.resolution, null);
+    assert.equal(selections["preset:best"]?.kind, "single");
+    assert.equal(presets.some((p) => p.id === "preset:1080"), false, "no named rung");
+  });
+
+  it("§46: unknown heights — split only", () => {
+    const { presets, selections } = build([splitVideo(null), partner]);
+    const best = presets.find((p) => p.id === "preset:best");
+    assert.ok(best, "video must not be dropped merely because height is unknown");
+    assert.equal(best.resolution, null);
+    assert.equal(selections["preset:best"]?.kind, "split");
+    assert.equal(
+      presets.some((p) => p.resolution !== null && p.resolution !== "audio"),
+      false,
+      "named rungs stay absent",
+    );
+  });
+
+  it("§46: unknown heights — MUXED wins over split at equivalent unknown height", () => {
+    const { presets, selections } = build([muxed(null), splitVideo(null), partner]);
+    assert.equal(presets.find((p) => p.id === "preset:best")?.resolution, null);
+    assert.equal(selections["preset:best"]?.kind, "single");
+    assert.equal(singleSource(selections["preset:best"]).formatId, "mx");
+  });
+
+  it("§26: a 1080p pair never also masquerades as the 720p rung", () => {
+    const { presets } = build([splitVideo(1080), partner]);
+    assert.equal(presets.some((p) => p.id === "preset:720"), false);
+    assert.ok(presets.some((p) => p.id === "preset:1080"));
+  });
+
+  it("split-vs-split in one bucket uses the EXISTING candidate ranking on the video half", () => {
+    // mp4 outranks webm, so the mp4 half wins even though the webm one appears
+    // first and is larger. The audio partner is fixed per family and takes no
+    // part in this decision.
+    const { selections } = build([
+      { format_id: "wv", ext: "webm", protocol: "https", height: 1080, vcodec: "vp09.00.40.08", acodec: "none", filesize: 90_000_000 },
+      { format_id: "wa", ext: "webm", protocol: "https", vcodec: "none", acodec: "opus" },
+      { format_id: "mv", ext: "mp4", protocol: "https", height: 1080, vcodec: "avc1.640028", acodec: "none", filesize: 1_000_000 },
+      partner,
+    ]);
+    const pair = splitPair(selections["preset:1080"]);
+    assert.equal(pair.video.formatId, "mv");
+    assert.equal(pair.audio.formatId, "aud");
+  });
+});
+
+describe("SPLIT-05: Worker FFmpeg availability gates every pair (§8/§47)", () => {
+  const MAX = 500 * 1024 * 1024;
+  const FORMATS = [
+    { format_id: "v", ext: "mp4", protocol: "https", height: 1080, vcodec: "avc1.640028", acodec: "none" },
+    { format_id: "a", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2" },
+    { format_id: "m", ext: "mp4", protocol: "https", height: 480, vcodec: "avc1.42001E", acodec: "mp4a.40.2" },
+  ];
+  const build = (ffmpegAvailable: boolean) =>
+    buildGenericPresets(selectCandidates(FORMATS, { maxFileSizeBytes: MAX }), {
+      ffmpegAvailable,
+      maxFileSizeBytes: MAX,
+    });
+
+  it("ffmpegAvailable=false: no split preset, and muxed behaviour is untouched", () => {
+    const { presets, selections } = build(false);
+    for (const [id, value] of Object.entries(selections)) {
+      assert.equal(value.kind, "single", `${id}: a pair needs the Worker's own merge`);
+    }
+    assert.deepEqual(
+      presets.map((p) => p.id),
+      ["preset:best", "preset:480", "preset:audio"],
+      "the muxed rung and the audio-only source are unaffected",
+    );
+    assert.equal(presets.find((p) => p.id === "preset:best")?.resolution, "480p");
+    // MP3 still requires FFmpeg, unchanged.
+    assert.equal(presets.some((p) => p.id === "preset:mp3"), false);
+  });
+
+  it("ffmpegAvailable=true: the same candidate set advertises the pair", () => {
+    const { presets, selections } = build(true);
+    assert.equal(presets.find((p) => p.id === "preset:best")?.resolution, "1080p");
+    assert.equal(selections["preset:best"]?.kind, "split");
+    assert.equal(selections["preset:480"]?.kind, "single");
+    assert.ok(presets.some((p) => p.id === "preset:mp3"));
+  });
+
+  it("the analyzer refuses to emit a split selection when FFmpeg is unavailable", async () => {
+    // The structural half of the same rule: even if preset construction were
+    // edited to build a pair without FFmpeg, the analyzer's own assertion fails
+    // closed rather than advertising a merge nothing can perform.
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: FORMATS }))));
+    const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: false });
+    assert.equal(meta.capabilities.merge, false);
+    assert.equal(meta.presets.some((p) => p.resolution === "1080p"), false);
+  });
+});
+
+describe("SPLIT-05: capabilities.merge semantics (§31/§74)", () => {
+  const MAX = 500 * 1024 * 1024;
+
+  async function analyzed(formats: Array<Record<string, unknown>>, ffmpegAvailable: boolean) {
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats }))));
+    return analyzeGenericMediaInternal(SAFE_URL, {
+      limits: { ...LIMITS, maxFileSizeBytes: MAX },
+      runner,
+      probeRuntime: async () => OK_RUNTIME,
+      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+      ffmpegAvailable,
+    });
+  }
+
+  const PAIRABLE = [
+    { format_id: "v", ext: "mp4", protocol: "https", height: 1080, vcodec: "avc1.640028", acodec: "none" },
+    { format_id: "a", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2" },
+  ];
+  const MUXED_ONLY = [
+    { format_id: "m", ext: "mp4", protocol: "https", height: 720, vcodec: "avc1.640028", acodec: "mp4a.40.2" },
+  ];
+  /** A valid pair that is never SELECTED, because a muxed rung outranks it. */
+  const PAIR_NOT_CHOSEN = [
+    { format_id: "m", ext: "mp4", protocol: "https", height: 1080, vcodec: "avc1.640028", acodec: "mp4a.40.2" },
+    { format_id: "v", ext: "mp4", protocol: "https", height: 1080, vcodec: "avc1.640028", acodec: "none" },
+    { format_id: "a", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2" },
+  ];
+
+  const TRUTH_TABLE: Array<[string, Array<Record<string, unknown>>, boolean, boolean]> = [
+    ["FFmpeg false + pairable streams", PAIRABLE, false, false],
+    ["FFmpeg true + no valid pair", MUXED_ONLY, true, false],
+    ["FFmpeg true + an advertised split-backed preset", PAIRABLE, true, true],
+    ["FFmpeg true + a POSSIBLE but unselected pair (§73)", PAIR_NOT_CHOSEN, true, false],
+  ];
+
+  for (const [label, formats, ffmpegAvailable, expected] of TRUTH_TABLE) {
+    it(`${label} -> merge ${expected}`, async () => {
+      const { video } = await analyzed(formats, ffmpegAvailable);
+      assert.equal(video.capabilities.merge, expected);
+    });
+  }
+
+  it("merge is true IFF at least one advertised preset is split-backed (both directions)", async () => {
+    for (const formats of [PAIRABLE, MUXED_ONLY, PAIR_NOT_CHOSEN]) {
+      for (const ffmpegAvailable of [false, true]) {
+        const { video, selections } = await analyzed(formats, ffmpegAvailable);
+        const anySplit = Object.values(selections).some((v) => v.kind === "split");
+        assert.equal(
+          video.capabilities.merge,
+          anySplit,
+          "the public capability must stay synchronized with what the user can choose",
+        );
+      }
+    }
+  });
+
+  it("§73: an unselected pair creates no duplicate preset and no capability", async () => {
+    const { video, selections } = await analyzed(PAIR_NOT_CHOSEN, true);
+    assert.equal(selections["preset:best"]?.kind, "single");
+    assert.equal(selections["preset:1080"]?.kind, "single");
+    assert.equal(video.capabilities.merge, false);
+    assert.deepEqual(
+      video.presets.map((p) => p.id),
+      ["preset:best", "preset:1080", "preset:audio", "preset:mp3"],
+    );
+  });
+
+  it("capabilities.mp3 stays decoupled from split support (§32)", async () => {
+    const { video } = await analyzed(PAIRABLE, true);
+    assert.equal(video.capabilities.merge, true);
+    assert.equal(video.capabilities.mp3, video.presets.some((p) => p.id === "preset:mp3"));
+  });
+});
+
+describe("SPLIT-05: raw pair ids stay private (§12/§48/§77)", () => {
+  const MAX = 500 * 1024 * 1024;
+  // Grammar-valid sentinels. Clearly synthetic, and clearly NOT Production values.
+  const PRIVATE_VIDEO = "PRIVATE_VIDEO_137";
+  const PRIVATE_AUDIO = "PRIVATE_AUDIO_140";
+  const FORMATS = [
+    { format_id: PRIVATE_VIDEO, ext: "mp4", protocol: "https", height: 1080, vcodec: "avc1.640028", acodec: "none", filesize: 9_000_000 },
+    { format_id: PRIVATE_AUDIO, ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2", filesize: 500_000 },
+  ];
+
+  it("neither sentinel appears anywhere in the browser-safe metadata", async () => {
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: FORMATS }))));
+    const { video, selections } = await analyzeGenericMediaInternal(SAFE_URL, {
+      limits: { ...LIMITS, maxFileSizeBytes: MAX },
+      runner,
+      probeRuntime: async () => OK_RUNTIME,
+      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+      ffmpegAvailable: true,
+    });
+
+    const serialized = JSON.stringify(video);
+    assert.equal(serialized.includes(PRIVATE_VIDEO), false, "the video half's id must stay private");
+    assert.equal(serialized.includes(PRIVATE_AUDIO), false, "the audio half's id must stay private");
+    assert.deepEqual(video.formats, [], "generic analysis exposes no raw formats");
+    for (const preset of video.presets) {
+      assert.equal(preset.id, preset.formatId);
+      assert.match(preset.id, GENERIC_PRESET_ID_PATTERN);
+    }
+
+    // ...and the INTERNAL half really does carry them, in the pair and nowhere
+    // else: exactly one place each id may exist.
+    const pair = splitPair(selections["preset:1080"]);
+    assert.equal(pair.video.formatId, PRIVATE_VIDEO);
+    assert.equal(pair.audio.formatId, PRIVATE_AUDIO);
+  });
+
+  it("no raw selector grammar can become a browser-selectable id", async () => {
+    // Safe-but-selector-LOOKING distinctions across candidate ids. The public
+    // vocabulary must stay closed regardless of what upstream called things.
+    const formats = [
+      { format_id: "best.2160-v", ext: "mp4", protocol: "https", height: 2160, vcodec: "avc1.640033", acodec: "none" },
+      { format_id: "bestaudio.m4a", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2" },
+    ];
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats }))));
+    const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
+
+    const serialized = JSON.stringify(meta);
+    for (const raw of ["best.2160-v", "bestaudio.m4a"]) {
+      assert.equal(serialized.includes(raw), false, raw);
+    }
+    for (const preset of meta.presets) {
+      assert.equal(preset.id, preset.formatId);
+      assert.match(preset.id, GENERIC_PRESET_ID_PATTERN);
+      for (const forbidden of ["+", "/", "[", "]", ",", "(", ")"]) {
+        assert.equal(preset.id.includes(forbidden), false, `${preset.id} contains ${forbidden}`);
+      }
+    }
+  });
+
+  it("the preset ceiling is unchanged at a maximal ladder (§76)", async () => {
+    // Every rung as a SPLIT, plus both audio presets: split changes HOW a rung
+    // is fulfilled, never how many preset ids exist.
+    const heights = [2160, 1440, 1080, 720, 480, 360, 240, 144];
+    const formats = [
+      ...heights.map((h) => ({
+        format_id: `v${h}`, ext: "mp4", protocol: "https", height: h,
+        vcodec: "avc1.640028", acodec: "none",
+      })),
+      { format_id: "a", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2" },
+    ];
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats }))));
+    const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
+
+    assert.deepEqual(meta.presets.map((p) => p.id), [
+      "preset:best", "preset:2160", "preset:1440", "preset:1080", "preset:720",
+      "preset:480", "preset:360", "preset:240", "preset:144",
+      "preset:audio", "preset:mp3",
+    ]);
+    assert.equal(meta.presets.length, YTDLP_ANALYSIS_MAX_PRESETS);
+    assert.equal(YTDLP_ANALYSIS_MAX_PRESETS, 11);
+    assert.equal(meta.capabilities.merge, true);
+  });
+});
+
+describe("SPLIT-05: the public/private boundary is unchanged (§35)", () => {
+  const MAX = 500 * 1024 * 1024;
+  const PAIRABLE = [
+    { format_id: "vv", ext: "mp4", protocol: "https", height: 1080, vcodec: "avc1.640028", acodec: "none" },
+    { format_id: "aa", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2" },
+  ];
+
+  it("analyzeGenericMedia returns ONLY the public metadata, pair or no pair", async () => {
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: PAIRABLE }))));
+    const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
+    // A positive split case really is being exercised.
+    assert.equal(meta.capabilities.merge, true);
+    assert.deepEqual(Object.keys(meta).sort(), [
+      "capabilities", "duration", "extractor", "formats", "presets",
+      "source", "thumbnail", "title", "webpageUrl",
+    ]);
+    assert.equal("selections" in meta, false, "no private half may be reachable here");
+    for (const preset of meta.presets) {
+      assert.deepEqual(Object.keys(preset).sort(), [
+        "audioCodec", "container", "fileSize", "formatId", "fps", "hasAudio",
+        "hasVideo", "id", "label", "resolution", "videoCodec",
+      ]);
+    }
+  });
+
+  it("the preset/selection bijection holds with pairs present (§34)", async () => {
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: PAIRABLE }))));
+    const { video, selections } = await analyzeGenericMediaInternal(SAFE_URL, {
+      limits: { ...LIMITS, maxFileSizeBytes: MAX },
+      runner,
+      probeRuntime: async () => OK_RUNTIME,
+      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+      ffmpegAvailable: true,
+    });
+    assert.deepEqual(
+      Object.keys(selections).sort(),
+      video.presets.map((p) => p.id).sort(),
+      "no orphan preset and no orphan selection",
+    );
+    assert.ok(Object.values(selections).some((v) => v.kind === "split"));
+  });
+
+  it("§75: public metadata agrees with the SHAPE that produced it", async () => {
+    const { runner } = fakeRunner(
+      ok(JSON.stringify(singleVideoInfo({
+        formats: [
+          ...PAIRABLE,
+          { format_id: "mx", ext: "mp4", protocol: "https", height: 480, vcodec: "avc1.42001E", acodec: "mp4a.40.2", fps: 25, filesize: 1234 },
+        ],
+      }))),
+    );
+    const { video, selections } = await analyzeGenericMediaInternal(SAFE_URL, {
+      limits: { ...LIMITS, maxFileSizeBytes: MAX },
+      runner,
+      probeRuntime: async () => OK_RUNTIME,
+      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+      ffmpegAvailable: true,
+    });
+
+    for (const preset of video.presets.filter((p) => p.hasVideo)) {
+      const value = selections[preset.id];
+      assert.ok(value);
+      if (value.kind === "single") {
+        assert.equal(preset.container, value.source.container, preset.id);
+        assert.equal(preset.fileSize, value.source.fileSize, preset.id);
+        continue;
+      }
+      // Target from the closed table; codecs from the correct halves.
+      assert.equal(
+        preset.container,
+        splitTargetContainer(value.pair.video.container, value.pair.audio.container),
+        preset.id,
+      );
+      const known =
+        value.pair.video.fileSize !== null && value.pair.audio.fileSize !== null
+          ? value.pair.video.fileSize + value.pair.audio.fileSize
+          : null;
+      assert.equal(preset.fileSize, known, preset.id);
+      assert.equal(value.pair.video.hasVideo, true, preset.id);
+      assert.equal(value.pair.audio.hasAudio, true, preset.id);
+    }
   });
 });

@@ -888,6 +888,7 @@ describe("analysis -> selector round trip", () => {
       for (const [label, formats] of inputs()) {
         const { selections } = buildGenericPresets(selectCandidates(formats, LIMITS), {
           ffmpegAvailable,
+          maxFileSizeBytes: LIMITS.maxFileSizeBytes,
         });
         for (const [presetId, presetSource] of Object.entries(selections)) {
           // SPLIT-01: a preset is fulfilled by one source or by a pair, and the
