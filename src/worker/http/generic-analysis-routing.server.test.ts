@@ -10,6 +10,12 @@ import {
   createMediaAnalysisPolicy,
   type GenericAnalysisLimits,
 } from "../analysis/media-analyzer.server.ts";
+import {
+  analyzeGenericMedia,
+  analyzeGenericMediaInternal,
+} from "../analysis/ytdlp-analysis.server.ts";
+import { YTDLP_RUNTIME } from "../runtime/ytdlp-runtime.server.ts";
+import { WorkerAnalyzeSuccessSchema } from "../../shared/worker/contracts.ts";
 
 /**
  * Phase 10C3 §44/§45/§53: what the ROUTER does, end to end, at the HTTP and
@@ -464,5 +470,130 @@ describe("routing: no fallback after a non-EXTRACTOR_UNAVAILABLE failure (§4)",
       (err: unknown) => err instanceof AppError && err.code === "INVALID_URL",
     );
     assert.equal(state.calls, 0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPLIT-05 §49: the REAL generic analyzer, driven through the router
+//
+// Every other case in this file uses a fake generic analyzer, because what they
+// prove is a ROUTING property. These two instead wire the real
+// `analyzeGenericMedia` / `analyzeGenericMediaInternal` into the same router,
+// with a deterministic fake SUBPROCESS runner underneath, so that what crosses
+// the service boundary is what the Worker would really produce for a pairable
+// source. No HTTP schema is changed to make them pass.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("routing: a pairable generic source reaches the boundary (SPLIT-05)", () => {
+  /** Grammar-valid, obviously synthetic sentinels. Never Production values. */
+  const PRIVATE_VIDEO = "PRIVATE_VIDEO_137";
+  const PRIVATE_AUDIO = "PRIVATE_AUDIO_140";
+
+  /** A `-J` document whose best rendition exists only as a video+audio pair. */
+  const INFO = JSON.stringify({
+    _type: "video",
+    title: "pairable clip",
+    duration: 120,
+    live_status: "not_live",
+    formats: [
+      {
+        format_id: PRIVATE_VIDEO,
+        ext: "mp4",
+        protocol: "https",
+        height: 1080,
+        fps: 30,
+        vcodec: "avc1.640028",
+        acodec: "none",
+        video_ext: "mp4",
+        audio_ext: "none",
+        filesize: 9_000_000,
+      },
+      {
+        format_id: PRIVATE_AUDIO,
+        ext: "m4a",
+        protocol: "https",
+        vcodec: "none",
+        acodec: "mp4a.40.2",
+        video_ext: "none",
+        audio_ext: "m4a",
+        filesize: 500_000,
+      },
+    ],
+  });
+
+  /** The real analyzer's dependencies, with only the subprocess faked out. */
+  const genericDeps = {
+    limits: LIMITS,
+    ffmpegAvailable: true,
+    runner: async () => ({ code: 0, stdout: INFO, stderr: "" }),
+    probeRuntime: async () => ({
+      available: true as const,
+      version: YTDLP_RUNTIME.expectedVersion,
+      reason: "ok" as const,
+    }),
+    validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+  };
+
+  it("the HTTP-visible response advertises the preset and reports merge, with nothing raw", async () => {
+    const meta = await analyzeMedia(GENERIC_URL, {
+      ytdlpEnabled: true,
+      limits: LIMITS,
+      analyzeDirect: async () => {
+        throw new AppError("EXTRACTOR_UNAVAILABLE");
+      },
+      analyzeGeneric: (url) => analyzeGenericMedia(url, genericDeps),
+    });
+
+    // The response is validated by the SAME strict success schema the Worker
+    // serializes with, so this is what the browser would actually receive.
+    const body = JSON.stringify(WorkerAnalyzeSuccessSchema.parse({ success: true, video: meta }));
+
+    // The new video preset is really there...
+    const rung = meta.presets.find((p) => p.id === "preset:1080");
+    assert.ok(rung, "the split-backed rendition must be advertised");
+    assert.equal(rung.container, "mp4");
+    assert.equal(rung.hasVideo, true);
+    assert.equal(rung.hasAudio, true);
+    assert.equal(rung.fileSize, 9_500_000, "the combined known size");
+
+    // ...and the capability says so.
+    assert.equal(meta.capabilities.merge, true);
+
+    // No private selections, no raw ids, no formats.
+    assert.equal("selections" in meta, false);
+    assert.equal(body.includes(PRIVATE_VIDEO), false, "the raw video id must not cross HTTP");
+    assert.equal(body.includes(PRIVATE_AUDIO), false, "the raw audio id must not cross HTTP");
+    assert.equal(body.includes('"pair"'), false);
+    assert.equal(body.includes('"split"'), false);
+    assert.deepEqual(meta.formats, [], "formats stays empty");
+    for (const p of meta.presets) {
+      assert.match(p.id, /^preset:/);
+      assert.equal(p.formatId, p.id);
+    }
+  });
+
+  it("the EXECUTION path carries the pair privately, and only there", async () => {
+    const res = await analyzeForExecution(GENERIC_URL, {
+      ytdlpEnabled: true,
+      limits: LIMITS,
+      analyzeDirect: async () => {
+        throw new AppError("EXTRACTOR_UNAVAILABLE");
+      },
+      analyzeGeneric: (url) => analyzeGenericMediaInternal(url, genericDeps),
+    });
+
+    assert.equal(res.strategy, "yt-dlp");
+    const routed = res.selections["preset:1080"];
+    assert.equal(routed?.kind, "split", "the router passes the pair through untouched");
+    if (routed?.kind !== "split") throw new Error("unreachable");
+    assert.equal(routed.pair.video.formatId, PRIVATE_VIDEO);
+    assert.equal(routed.pair.audio.formatId, PRIVATE_AUDIO);
+
+    // The public half stays free of both.
+    const publicBody = JSON.stringify(res.video);
+    assert.equal(publicBody.includes(PRIVATE_VIDEO), false);
+    assert.equal(publicBody.includes(PRIVATE_AUDIO), false);
+    assert.equal(publicBody.includes("audioConstraint"), false);
+    assert.equal(res.video.capabilities.merge, true);
   });
 });

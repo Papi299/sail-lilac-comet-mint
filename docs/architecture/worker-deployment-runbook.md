@@ -932,14 +932,86 @@ status describe finished, fixed-length media and are accepted. Live sources
 surface as `VIDEO_UNAVAILABLE`. `--wait-for-video` is never passed and no live
 polling exists.
 
-#### No split-stream video
+#### Split-stream video
 
-Video presets are built **only** from source formats that already contain video
-*and* audio in one format. A video-only rendition would need yt-dlp to merge it
-with a separate audio stream, which Phase-10B rules out of generic v1, so
-split-stream renditions produce **no video preset at all** — even when they are
-the only high-quality options a site offers. `capabilities.merge` is always
-`false`. This is an accepted, recorded reduction in capability, not a defect.
+> **Source capability, not deployed state.** The description below is of the
+> merged source after GENERIC-SPLIT-05. **The Worker image running in Production
+> does not contain it.** Enabling it in Production still requires an image build,
+> runtime acceptance, deployment and live verification — none of which this
+> record claims. Until then, Production behaves as the *Before SPLIT-05*
+> paragraph describes.
+
+**Before SPLIT-05.** Video presets were built **only** from source formats that
+already contained video *and* audio in one format, so split-stream renditions
+produced **no video preset at all** — even when they were the only high-quality
+options a site offers — and `capabilities.merge` was always `false`.
+
+**After SPLIT-05 (source).** A video-only rendition may be paired with an
+audio-only one and advertised as an **ordinary application-owned preset**. The
+browser cannot tell the difference: `preset:1080` is `preset:1080` whether it is
+served by one muxed source or by a pair, and the public preset vocabulary,
+`WorkerQualityPreset` shape and `formats: []` are all unchanged.
+
+The rules that make this safe are closed and deliberately narrow:
+
+- **Only two container combinations pair**, and each fixes its own target:
+  `mp4` video + `m4a` audio → `mp4`, and `webm` video + `webm` audio → `webm`.
+  Nothing else is a pair. The target is derived from that table and from nowhere
+  else, which is what makes the merge a provably legal **stream copy** with no
+  codec identity consulted anywhere.
+- **Unknown is never absence, and never presence.** A video half must have audio
+  *proven* absent (`acodec == "none"`), and an audio half must have video *proven*
+  absent and audio *proven* present. A source whose codec field is merely unknown
+  is never promoted into either half.
+- **One audio partner per family, chosen once** for the whole analysis, by the
+  existing deterministic candidate ranking. There is no alternate-partner
+  fallback: a video rendition that cannot pair with its family's partner simply
+  has no split fulfilment, so the advertised audio never depends on which video
+  rung the user picked.
+- **Ranking.** Resolution dominates across rungs, so a 1080p pair beats a 720p
+  muxed source for `preset:best`. Within one rung a **muxed source always wins**,
+  whatever the pair's container, codec, size or fps — equal quality is served
+  from one source rather than two.
+- **Sizes.** Each half is already gated individually against the configured
+  maximum; a pair is additionally refused when both sizes are known and their
+  (safe-integer) sum exceeds it. When either size is unknown the pair may still
+  be advertised with `fileSize: null` — actual bytes are enforced during
+  acquisition, which is where the real boundary is.
+- **Worker FFmpeg is required.** A pair is advertised only when the Worker's own
+  FFmpeg is available, because the merge is Worker-local work performed strictly
+  after `beginProcessing()` commits. Its absence is never answered by widening
+  yt-dlp's authority.
+- **Both raw upstream ids stay private.** Two ids instead of one changes the
+  count, not the boundary: neither crosses Worker HTTP, enters
+  `WorkerVideoMetadata` or SQLite, reaches Vercel or the browser, is logged, or
+  appears in an error.
+- **yt-dlp still performs NO merge.** There is no `+` in any selector, its
+  `--ffmpeg-location` still resolves nothing, and the two halves are acquired by
+  two independent single-source invocations.
+- **Nothing is persisted.** The pair is rebuilt by a fresh execution analysis at
+  job time; a site that changed in between yields `FORMAT_UNAVAILABLE` rather
+  than a stale pair.
+
+#### `capabilities.merge` (generic)
+
+For **generic** metadata, `capabilities.merge: true` means exactly:
+
+> at least one preset advertised for **this analyzed source** is fulfilled by the
+> approved Worker-local split merge.
+
+It does **not** mean yt-dlp is permitted to merge — yt-dlp merges nothing on this
+path — nor that the browser may submit raw split selectors, nor that every media
+item needs a merge. It is derived from the final selection map, so a pair that is
+merely *possible* but never selected (because a muxed rendition won its rung)
+leaves it `false`. The truth table is:
+
+| Worker FFmpeg | pairable streams | `capabilities.merge` |
+| --- | --- | --- |
+| unavailable | yes | `false` (and no split preset) |
+| available | none valid | `false` |
+| available | at least one advertised split-backed preset | `true` |
+
+Direct/legacy `capabilities.merge` semantics are unchanged.
 
 #### Acquisition eligibility: progressive HTTP(S) only
 
@@ -4121,8 +4193,12 @@ is not absent**. `vcodec = null` says the codec identity was not reported;
 - **Contradictions fail closed.** `vcodec = "none"` with a real `video_ext`, or
   a present `vcodec` with `video_ext = "none"`, make the format non-executable
   rather than being resolved in whichever direction would make it usable.
-- **Unknown audio never becomes a muxed claim**, so split streams still produce
-  no video preset and generic v1 still never merges.
+- **Unknown audio never becomes a muxed claim.** At the time this was written
+  that also meant split streams produced no video preset at all. GENERIC-SPLIT-05
+  later made an approved video-only + audio-only pair advertisable **in source**
+  (see *Split-stream video* above), but it did not weaken this rule by one inch:
+  an unknown-audio source is still neither a muxed claim nor a valid split half.
+  yt-dlp still never merges.
 
 Analysis and acquisition were corrected **together**, because a preset analysis
 advertises must remain selectable by the constrained acquisition subprocess. The
@@ -4177,9 +4253,8 @@ pinned binary.
 **Advertising did not change.** Unknown audio still never becomes a muxed claim:
 every generic video, audio and MP3 preset still requires proven audio, and
 analysis now *asserts* that every private selection it emits is
-`codec-present` rather than leaving that to its filters. The rule that keeps
-split streams unmerged therefore also leaves a **progressive** source whose
-`acodec` is unknown with no preset at all. That is the ordinary HTML5 page whose
+`codec-present` rather than leaving that to its filters. That rule leaves a
+**progressive** source whose `acodec` is unknown with no preset at all. That is the ordinary HTML5 page whose
 `<source type>` carries no `codecs=` parameter: the pinned runtime reports no
 `acodec` key for it (captured in
 `src/worker/analysis/testdata/pinned-generic-html5-no-audio-codec.json`).

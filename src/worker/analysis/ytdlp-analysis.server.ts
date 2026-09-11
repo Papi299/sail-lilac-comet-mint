@@ -15,7 +15,9 @@ import {
 import {
   GENERIC_VIDEO_SOURCE_CONTAINERS,
   GenericSourceSelectionSchema,
+  GenericSplitSourceSelectionSchema,
   isSafeFormatId,
+  splitTargetContainer,
   toGenericSourceContainer,
   type GenericAudioConstraint,
   type GenericPresetSource,
@@ -23,6 +25,7 @@ import {
   type GenericSourceProtocol,
   type GenericSourceSelection,
   type GenericSourceSelections,
+  type GenericSplitTargetContainer,
   type GenericVideoConstraint,
 } from "../execution/generic-source.ts";
 import {
@@ -579,14 +582,35 @@ function toSelection(c: Candidate): GenericSourceSelection {
 /**
  * Wraps one candidate as a SINGLE-source preset fulfilment.
  *
- * SPLIT-01 made the per-preset value a discriminated union so that a future
- * preset may instead be fulfilled by a video-only + audio-only pair. Generic v1
- * builds no pairs, so every selection this module emits goes through here and
- * is `kind: "single"` — which is exactly what the structural assertion at the
- * end of `analyzeGenericMediaInternal` re-proves over the finished map.
+ * SPLIT-01 made the per-preset value a discriminated union so that a preset may
+ * instead be fulfilled by a video-only + audio-only pair. This is the half that
+ * names exactly ONE upstream source; `toSplitSource` is the other half.
  */
 function toSingleSource(c: Candidate): GenericPresetSource {
   return { kind: "single", source: toSelection(c) };
+}
+
+/**
+ * Projects a video-only candidate and its audio-only partner into a validated
+ * SPLIT preset fulfilment, or `null` when they are not a pair (SPLIT-05 §11).
+ *
+ * `GenericSplitSourceSelectionSchema` is the FINAL authority on pair validity,
+ * and it is invoked here rather than re-stated: video present, video audio
+ * proven absent, audio video proven absent, audio proven present, two different
+ * upstream ids, and a container combination in the closed table. A rejection is
+ * answered by returning `null` — the pair simply does not exist — never by
+ * catching and weakening it.
+ *
+ * Both members are built by the SAME `toSelection` conversion single-source
+ * selections use, so a pair member can never be a differently-shaped descriptor
+ * that happens to satisfy the pair schema.
+ */
+function toSplitSource(video: Candidate, audio: Candidate): GenericPresetSource | null {
+  const pair = GenericSplitSourceSelectionSchema.safeParse({
+    video: toSelection(video),
+    audio: toSelection(audio),
+  });
+  return pair.success ? { kind: "split", pair: pair.data } : null;
 }
 
 /**
@@ -894,6 +918,224 @@ function bestOf(candidates: readonly Candidate[]): Candidate | null {
   return [...candidates].sort(compareCandidates)[0] ?? null;
 }
 
+// ── Split pairing (SPLIT-05) ─────────────────────────────────────────────────
+
+/**
+ * Is this candidate usable as the VIDEO half of a split pair? (§6)
+ *
+ * All four conditions are stated explicitly rather than being collapsed into
+ * `hasVideo && !hasAudio`, because the last one is the whole point:
+ * `audioConstraint === "absent"` means yt-dlp SAID there is no audio stream.
+ * An `unknown` audio state is `hasAudio: false` too, and it is NOT video-only —
+ * it is a source whose audio nothing established either way. Promoting it here
+ * because doing so would form a pair is exactly the collapse
+ * GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001 exists to prevent: the pair would
+ * acquire audio twice and then discard the source's own track via the stream
+ * map, a substitution the user never asked for (§29).
+ */
+function isSplitVideoCandidate(c: Candidate): boolean {
+  return (
+    c.hasVideo &&
+    c.videoConstraint !== "absent" &&
+    c.hasAudio === false &&
+    c.audioConstraint === "absent"
+  );
+}
+
+/**
+ * Is this candidate usable as the AUDIO half of a split pair? (§6/§30)
+ *
+ * Video must be PROVEN absent, not merely unknown: an unknown-video partner
+ * might actually carry video, in which case the "pair" is not a split pair at
+ * all. Audio must be PROVEN present, which is the same standard every existing
+ * generic audio preset already requires.
+ */
+function isSplitAudioCandidate(c: Candidate): boolean {
+  return (
+    c.hasVideo === false &&
+    c.videoConstraint === "absent" &&
+    c.hasAudio &&
+    c.audioConstraint === "codec-present"
+  );
+}
+
+/**
+ * The closed pairing families, expressed as VIDEO container -> AUDIO container.
+ *
+ * Deliberately the same two rows as `splitTargetContainer`'s table, stated here
+ * as the PARTNER-SELECTION vocabulary rather than re-derived from it. The table
+ * remains the authority on validity: every pair these families propose is still
+ * validated through `GenericSplitSourceSelectionSchema`, so widening this list
+ * alone can never widen what is actually mergeable.
+ */
+const SPLIT_FAMILIES = Object.freeze([
+  Object.freeze({ video: "mp4", audio: "m4a" }),
+  Object.freeze({ video: "webm", audio: "webm" }),
+] as const);
+
+/**
+ * The PAIR-level known-size gate, and the public size a split preset advertises.
+ *
+ * `selectCandidates` already refused either half individually over the ceiling;
+ * this is the additional check a pair needs, because two halves that each fit
+ * can still be too large together (§13).
+ *
+ *   both sizes known   -> the exact sum, gated against the ceiling. The sum must
+ *                         be a safe integer: beyond 2^53 an addition silently
+ *                         stops being exact, and a budget decision made on an
+ *                         inexact number is not a decision.
+ *   either unknown     -> advertisable, with a public `fileSize` of `null` (§14).
+ *                         No estimate is invented, and the pair is not refused:
+ *                         SPLIT-03 enforces ACTUAL bytes against a combined
+ *                         budget, which is the real security boundary. Metadata
+ *                         size never was one.
+ */
+function pairKnownSize(
+  video: Candidate,
+  audio: Candidate,
+  maxFileSizeBytes: number,
+): { readonly advertisable: boolean; readonly fileSize: number | null } {
+  if (video.fileSize === null || audio.fileSize === null) {
+    return { advertisable: true, fileSize: null };
+  }
+  const combined = video.fileSize + audio.fileSize;
+  if (!Number.isSafeInteger(combined)) return { advertisable: false, fileSize: null };
+  if (combined > maxFileSizeBytes) return { advertisable: false, fileSize: null };
+  return { advertisable: true, fileSize: combined };
+}
+
+/**
+ * ONE advertisable VIDEO rendition, however it is fulfilled (§17).
+ *
+ * The abstraction exists so that ranking, bucketing and preset construction see
+ * one kind of thing. A split pair is deliberately NOT squeezed into the shape of
+ * a single `Candidate`: doing so would need a synthetic candidate carrying one
+ * half's id and the other half's codec, which is precisely the drift the private
+ * source descriptor exists to prevent.
+ *
+ * `video` is the common ranking input for both kinds — the audio partner has no
+ * say in resolution (§22) and, being fixed per family, no say in ordering (§25).
+ * `targetContainer` and `fileSize` are the FINAL public values, derived once
+ * here so no later step has to re-decide them.
+ */
+type VideoFulfillment =
+  | {
+      readonly kind: "single";
+      readonly video: Candidate;
+      readonly source: GenericPresetSource;
+      readonly targetContainer: GenericSourceContainer;
+      readonly fileSize: number | null;
+    }
+  | {
+      readonly kind: "split";
+      readonly video: Candidate;
+      readonly audio: Candidate;
+      readonly source: GenericPresetSource;
+      readonly targetContainer: GenericSplitTargetContainer;
+      readonly fileSize: number | null;
+    };
+
+/**
+ * Ranks two fulfilments WITHIN one resolution bucket. Lower sorts first.
+ *
+ * Exactly like `compareCandidates`, resolution is never traded away here,
+ * because ranking only ever runs inside one bucket.
+ *
+ * KIND OUTRANKS EVERYTHING ELSE (§24). At equal resolution a muxed source wins
+ * over a pair whatever its container, codec, size or fps, because one-source
+ * delivery needs no merge at all: fewer acquisitions, no local FFmpeg work, and
+ * no second way for the job to fail. The preference is only ever paid for with
+ * things other than quality — a higher-resolution split still beats a lower
+ * muxed rendition, which is decided by bucketing before this function is
+ * reached (§23).
+ *
+ * Below kind, both cases defer to the EXISTING candidate ranking on the video
+ * half, so single-vs-single ordering is byte-for-byte what it was, and
+ * split-vs-split ordering introduces no second policy. It stays total: the only
+ * way two fulfilments could share a video candidate is one being muxed and the
+ * other video-only, which one candidate cannot be at once.
+ */
+function compareFulfillments(a: VideoFulfillment, b: VideoFulfillment): number {
+  const kindRank = (f: VideoFulfillment) => (f.kind === "single" ? 0 : 1);
+  return kindRank(a) - kindRank(b) || compareCandidates(a.video, b.video);
+}
+
+function bestFulfillment(fulfillments: readonly VideoFulfillment[]): VideoFulfillment | null {
+  if (fulfillments.length === 0) return null;
+  return [...fulfillments].sort(compareFulfillments)[0] ?? null;
+}
+
+/**
+ * Builds every advertisable VIDEO fulfilment for one candidate set.
+ *
+ * Muxed candidates become `single` fulfilments unconditionally, exactly as
+ * before. Split fulfilments are additionally built only when the WORKER's own
+ * FFmpeg is available (§8), because the merge is Worker-local work performed
+ * after `beginProcessing()` commits — yt-dlp is never asked to merge, and the
+ * absence of Worker FFmpeg is never answered by widening yt-dlp's authority.
+ *
+ * ONE audio partner is chosen per family, for the WHOLE result (§9), and there
+ * is no alternate-partner fallback (§10): a video candidate that cannot pair
+ * with its family's partner simply has no split fulfilment. Scanning lower-
+ * ranked audio tracks until one fit would make the advertised audio depend on
+ * which video rung the user picked, which is per-preset source substitution by
+ * another name.
+ */
+function buildVideoFulfillments(
+  candidates: readonly Candidate[],
+  opts: { readonly ffmpegAvailable: boolean; readonly maxFileSizeBytes: number },
+  muxedVideo: readonly Candidate[],
+): VideoFulfillment[] {
+  const fulfillments: VideoFulfillment[] = muxedVideo.map((c) => ({
+    kind: "single",
+    video: c,
+    source: toSingleSource(c),
+    targetContainer: c.container,
+    fileSize: c.fileSize,
+  }));
+
+  if (!opts.ffmpegAvailable) return fulfillments;
+
+  // The ONE partner per family, chosen once, by the existing deterministic
+  // candidate ranking. Keyed by the VIDEO container it serves.
+  const audioOnly = candidates.filter(isSplitAudioCandidate);
+  const partners = new Map<GenericSourceContainer, Candidate>();
+  for (const family of SPLIT_FAMILIES) {
+    const partner = bestOf(audioOnly.filter((c) => c.container === family.audio));
+    if (partner) partners.set(family.video, partner);
+  }
+
+  for (const video of candidates.filter(isSplitVideoCandidate)) {
+    const audio = partners.get(video.container);
+    if (!audio) continue;
+
+    // The target is derived from the closed table and from nowhere else, so a
+    // family row that drifted from the table produces no pair rather than a
+    // pair with an invented target (§19).
+    const targetContainer = splitTargetContainer(video.container, audio.container);
+    if (targetContainer === null) continue;
+
+    const size = pairKnownSize(video, audio, opts.maxFileSizeBytes);
+    if (!size.advertisable) continue;
+
+    // The schema is the last word. A rejection reduces capability; it is never
+    // caught and worked around (§11).
+    const source = toSplitSource(video, audio);
+    if (source === null) continue;
+
+    fulfillments.push({
+      kind: "split",
+      video,
+      audio,
+      source,
+      targetContainer,
+      fileSize: size.fileSize,
+    });
+  }
+
+  return fulfillments;
+}
+
 /**
  * The result of preset construction: the browser-safe presets, plus the PRIVATE
  * per-preset source selections execution needs.
@@ -908,31 +1150,46 @@ export type GenericPresetBuild = {
 };
 
 /**
- * Builds the generic v1 preset list.
+ * Builds the generic preset list.
  *
- * VIDEO presets come only from candidates that already carry video AND audio in
- * ONE source format. A video-only format would require yt-dlp to merge it with
- * a separate audio stream, which Phase-10B rules out of generic v1 outright, so
- * split-stream renditions produce no preset at all — even when they are the only
- * high-quality options a site offers. That is an accepted, recorded reduction in
- * capability, not a defect.
+ * VIDEO presets come from two kinds of fulfilment, ranked together (SPLIT-05):
  *
- * AUDIO presets may additionally come from a muxed candidate, because the Worker
- * can extract audio with its OWN FFmpeg after a future durable job has entered
- * `processing`. That never asks yt-dlp to extract anything: `-x`,
- * `--extract-audio` and `--audio-format` appear nowhere on this path.
+ *   - a MUXED candidate carrying video AND proven audio in ONE source, which is
+ *     the only kind that existed before SPLIT-05 and is unchanged here;
+ *   - an approved video-only + audio-only PAIR, merged LOCALLY by the Worker's
+ *     own FFmpeg after `beginProcessing()` commits.
  *
- * "Carries audio" means PROVEN audio: `hasAudio`, i.e. an `audioConstraint` of
- * `codec-present`. A source whose `acodec` is unknown is a coherent private
- * candidate but is never advertised — as video, as audio, or as MP3 — because
- * nothing establishes that it has an audio stream at all, and extracting audio
- * from one that has none fails in the Worker's FFmpeg after the user has
- * already chosen it. `analyzeGenericMediaInternal` asserts this over every
- * selection it emits (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
+ * The browser is told nothing about which. Both produce an ordinary
+ * application-owned preset — `preset:1080` is `preset:1080` — because how a
+ * rendition is fulfilled is a Worker implementation detail and the public
+ * vocabulary is closed (§12/§20/§21).
+ *
+ * yt-dlp still performs NO merge. `+` appears in no selector, its FFmpeg stays
+ * unresolvable, and each half of a pair is acquired by its own independent
+ * single-source invocation (§52).
+ *
+ * AUDIO presets are unchanged and remain SINGLE-source (§28): an audio-only
+ * source kept verbatim, or a muxed source the Worker extracts from with its own
+ * FFmpeg. A pair's chosen audio partner may well also be the best ordinary
+ * audio-only candidate — that is the same candidate winning two independent
+ * rankings, not a coupling.
+ *
+ * "Carries audio" still means PROVEN audio: `hasAudio`, i.e. an
+ * `audioConstraint` of `codec-present`. A source whose `acodec` is unknown is a
+ * coherent private candidate but is never advertised — as muxed video, as a
+ * split video half, as audio, or as MP3 — because nothing establishes that it
+ * has an audio stream at all. `analyzeGenericMediaInternal` asserts this over
+ * every selection it emits, in the form that applies to each shape
+ * (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001, §29).
+ *
+ * `maxFileSizeBytes` is needed for the PAIR-level combined-size gate (§13/§16).
+ * It is injected rather than imported so this module still cannot reach
+ * process-wide configuration and tests can vary it without mutating global
+ * state.
  */
 export function buildGenericPresets(
   candidates: readonly Candidate[],
-  opts: { readonly ffmpegAvailable: boolean },
+  opts: { readonly ffmpegAvailable: boolean; readonly maxFileSizeBytes: number },
 ): GenericPresetBuild {
   const presets: WorkerQualityPreset[] = [];
   // PRIVATE, and parallel to `presets` by construction: every preset pushed
@@ -946,33 +1203,46 @@ export function buildGenericPresets(
   // unknown-audio candidate is not muxed as far as advertising is concerned.
   const muxedVideo = candidates.filter((c) => c.hasVideo && c.hasAudio);
 
+  // Every advertisable video rendition, muxed and split alike, ranked together.
+  const videoFulfillments = buildVideoFulfillments(candidates, opts, muxedVideo);
+
   const videoPreset = (
     id: string,
     label: string,
     resolution: string | null,
-    c: Candidate,
-  ): WorkerQualityPreset => ((selections[id] = toSingleSource(c)), {
+    f: VideoFulfillment,
+  ): WorkerQualityPreset => ((selections[id] = f.source), {
     id,
     label,
     resolution,
-    container: c.container,
-    fileSize: c.fileSize,
+    // The FINAL container: the source's own for a muxed fulfilment, the closed
+    // table's derived target for a pair. Never a second, independently guessed
+    // value (§20/§75).
+    container: f.targetContainer,
+    // Combined known size for a pair, the source's own size for a muxed
+    // fulfilment, `null` when anything is unknown (§15).
+    fileSize: f.fileSize,
     hasVideo: true,
     hasAudio: true,
     // The product contract is `id === formatId`, and both are
-    // application-owned. No upstream identifier is involved in either.
+    // application-owned. No upstream identifier is involved in either — a pair
+    // holds two of them, and neither appears here (§12).
     formatId: id,
-    videoCodec: c.videoCodec,
-    audioCodec: c.audioCodec,
-    fps: c.fps,
+    videoCodec: f.video.videoCodec,
+    // The half that actually carries the stream: the muxed source itself, or
+    // the pair's AUDIO member.
+    audioCodec: f.kind === "single" ? f.video.audioCodec : f.audio.audioCodec,
+    fps: f.video.fps,
   });
 
   // "Best available" is the winner of the highest bucket that has one, so it
   // can never be a lower resolution than a named preset that is also offered.
+  // Resolution dominates ACROSS buckets, so a 1080p pair beats a 720p muxed
+  // source here; kind only decides ties WITHIN one bucket (§23/§24).
   const bucketed = RESOLUTION_STEPS.map((step) => ({
     step,
-    best: bestOf(
-      muxedVideo.filter((c) => c.height !== null && c.height >= step.minHeight),
+    best: bestFulfillment(
+      videoFulfillments.filter((f) => f.video.height !== null && f.video.height >= step.minHeight),
     ),
   }));
 
@@ -982,28 +1252,36 @@ export function buildGenericPresets(
       videoPreset("preset:best", "Best available", overallBest.step.resolution, overallBest.best),
     );
   } else {
-    // No height information anywhere, but a usable muxed source exists: offer
-    // it as "best" with an unknown resolution rather than dropping video whole.
-    const anyMuxed = bestOf(muxedVideo);
-    if (anyMuxed) presets.push(videoPreset("preset:best", "Best available", null, anyMuxed));
+    // No height information anywhere, but a usable fulfilment exists: offer it
+    // as "best" with an unknown resolution rather than dropping video whole.
+    // Single still outranks split at equivalent unknown height (§27).
+    const anyVideo = bestFulfillment(videoFulfillments);
+    if (anyVideo) presets.push(videoPreset("preset:best", "Best available", null, anyVideo));
   }
 
-  // Named ladder rungs. Each rung is the best candidate AT that height exactly,
-  // so a 1080p source does not also masquerade as the 720p option.
+  // Named ladder rungs. Each rung is the best fulfilment AT that height exactly,
+  // so a 1080p source does not also masquerade as the 720p option. A pair's
+  // bucket comes from its VIDEO half; the audio partner has no say (§22/§26).
   for (const step of RESOLUTION_STEPS) {
-    const inBucket = muxedVideo.filter((c) => {
-      const height = c.height;
+    const inBucket = videoFulfillments.filter((f) => {
+      const height = f.video.height;
       if (height === null) return false;
       if (height < step.minHeight) return false;
       // Exactly this rung: a taller source belongs to a higher rung only.
       return !RESOLUTION_STEPS.some((s) => s.minHeight > step.minHeight && height >= s.minHeight);
     });
-    const best = bestOf(inBucket);
+    const best = bestFulfillment(inBucket);
     if (best) presets.push(videoPreset(step.id, step.label, step.resolution, best));
   }
 
   // Audio. An audio-ONLY source needs no local processing; a muxed source needs
   // Worker FFmpeg, so it is offered only when FFmpeg is actually available.
+  //
+  // Deliberately UNTOUCHED by SPLIT-05 (§28). The audio presets keep their own
+  // ranking and stay `kind: "single"`: a merge is only ever how a VIDEO preset
+  // gets its audio. When a pair's family partner also wins here, that is the
+  // same candidate winning two independent rankings — not a coupling, and not a
+  // shared selection.
   const audioOnly = candidates.filter((c) => c.hasAudio && !c.hasVideo);
   const bestAudioOnly = bestOf(audioOnly);
   const audioSource = bestAudioOnly ?? (opts.ffmpegAvailable ? bestOf(muxedVideo) : null);
@@ -1315,8 +1593,12 @@ export async function analyzeGenericMediaInternal(
   }
 
   const candidates = selectCandidates(info.formats ?? [], deps.limits);
+  const ffmpegAvailable = deps.ffmpegAvailable ?? false;
   const { presets, selections } = buildGenericPresets(candidates, {
-    ffmpegAvailable: deps.ffmpegAvailable ?? false,
+    ffmpegAvailable,
+    // The PAIR-level combined-size budget (§13/§16). The same ceiling
+    // `selectCandidates` already applied to each half individually.
+    maxFileSizeBytes: deps.limits.maxFileSizeBytes,
   });
 
   // Structural assertions on this module's OWN output. These cannot be
@@ -1335,21 +1617,20 @@ export async function analyzeGenericMediaInternal(
   for (const id of Object.keys(selections)) {
     if (!presets.some((p) => p.id === id)) throw new AppError("EXTRACTION_FAILED");
   }
-  // Every preset generic v1 advertises is built on PROVEN audio, so every
+  // Every preset this analyzer advertises is built on PROVEN audio, so every
   // private selection behind one must record exactly that. Asserted here rather
   // than left as a consequence of the candidate filters: an unknown or absent
   // audio state reaching execution would mean analysis had quietly widened what
-  // generic v1 can acquire (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
+  // the Worker can acquire (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
   //
-  // SPLIT-01 makes this SHAPE-AWARE rather than relaxing it. The rule is
-  // unchanged for the single-source form, and the split form gets the rule that
-  // actually applies to it — a split pair's VIDEO member legitimately records
+  // The check is SHAPE-AWARE, not relaxed. Each form gets the rule that actually
+  // applies to it — a split pair's VIDEO member legitimately records
   // `audioConstraint: "absent"`, because its audio is proven absent and is
-  // supplied by the other member.
+  // supplied by the other member, while the PAIR as a whole still carries proven
+  // audio.
   //
-  // Writing this as one flat "every selection has proven audio" check would
-  // have been the easy way to keep it compiling, and it would have been wrong
-  // in both directions: it would reject every future split pair, and the
+  // Writing this as one flat "every selection has proven audio" check would be
+  // wrong in both directions: it would reject every valid split pair, and the
   // obvious "fix" for that — dropping the check — would let an unknown-audio
   // source reach execution unnoticed.
   for (const value of Object.values(selections)) {
@@ -1359,12 +1640,38 @@ export async function analyzeGenericMediaInternal(
       }
       continue;
     }
-    // Generic v1 analysis builds NO pairs. Reaching here would mean a future
-    // edit started advertising split presets without the acquisition and merge
-    // path that SPLIT-02..04 provide, so it fails closed rather than shipping a
-    // preset nothing can fulfil. SPLIT-05 replaces this with the real per-member
-    // assertion when the rest of the path exists.
-    throw new AppError("EXTRACTION_FAILED");
+
+    // ── SPLIT (SPLIT-05 §33) ────────────────────────────────────────────────
+    //
+    // SPLIT-01 fail-closed here unconditionally, because no acquisition or merge
+    // path existed. SPLIT-02..04 built that path, so the unconditional rejection
+    // is replaced by the assertions that actually apply to a pair — not removed.
+    //
+    // `GenericSplitSourceSelectionSchema` is invoked rather than re-implemented:
+    // it is the authority on all six pair invariants (video present, video audio
+    // proven absent, audio video proven absent, audio proven present, different
+    // upstream ids, closed container combination), and re-deriving them here
+    // would create a second, driftable copy of the rules.
+    if (!GenericSplitSourceSelectionSchema.safeParse(value.pair).success) {
+      throw new AppError("EXTRACTION_FAILED");
+    }
+
+    // Restated at THIS level, deliberately and narrowly: the two unknown-vs-absent
+    // facts are the ones a future relaxation would be most tempted to soften, and
+    // they are the ones that make a pair a pair rather than a silent substitution
+    // (§29/§30). The container table and the id-difference are left to the schema
+    // alone, which is the only place they are stated.
+    if (value.pair.video.audioConstraint !== "absent") throw new AppError("EXTRACTION_FAILED");
+    if (value.pair.audio.videoConstraint !== "absent") throw new AppError("EXTRACTION_FAILED");
+    if (value.pair.audio.audioConstraint !== "codec-present") {
+      throw new AppError("EXTRACTION_FAILED");
+    }
+
+    // A pair can only be fulfilled by the Worker's OWN FFmpeg. Advertising one
+    // without it would promise a merge nothing can perform (§8). Construction is
+    // already gated on this; asserting it makes the gate a property of the
+    // analyzer's output rather than of one filter inside preset building.
+    if (!ffmpegAvailable) throw new AppError("EXTRACTION_FAILED");
   }
 
   const video = VideoMetadataSchema.parse({
@@ -1392,8 +1699,24 @@ export async function analyzeGenericMediaInternal(
     presets,
     capabilities: {
       mp3: presets.some((p) => p.id === "preset:mp3"),
-      // Split-stream merging is deliberately unsupported in generic v1.
-      merge: false,
+      // SPLIT-05 §31: for GENERIC metadata, `merge` means exactly "at least one
+      // preset advertised for THIS source is fulfilled by the approved
+      // Worker-local split merge". It does NOT mean yt-dlp may merge — yt-dlp
+      // merges nothing, here or anywhere else on this path — nor that the
+      // browser may submit raw split selectors, nor that every item needs a
+      // merge.
+      //
+      // Derived from the FINAL selection map, so it can never claim a capability
+      // the user cannot actually choose, and can never stay false while a
+      // split-backed preset is on offer. A merely POSSIBLE but unselected pair
+      // sets nothing.
+      //
+      // The `ffmpegAvailable` conjunction is redundant at runtime — split
+      // construction is already gated on it, and the loop above re-asserts that
+      // — and is retained because this is a PUBLIC capability claim, and it
+      // should read as conditional on the thing that makes it true.
+      merge:
+        ffmpegAvailable && Object.values(selections).some((value) => value.kind === "split"),
     },
   });
 
