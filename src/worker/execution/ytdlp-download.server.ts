@@ -978,10 +978,10 @@ function splitKnownTotal(
  * Acquires BOTH sources of one approved split pair: the video-only member,
  * then the audio-only member, as two independent single-source yt-dlp runs.
  *
- * NOT REACHABLE YET. No analysis path builds a split preset source, so no
- * `merge-split` plan exists in Production, and the JobExecutor does not call
- * this function. It is the acquisition primitive executor integration will
- * wire in, reviewed first so its bounds are fixed before anything can reach it.
+ * NOT REACHABLE FROM PRODUCTION YET. Since SPLIT-04 the JobExecutor calls this
+ * for a `merge-split` plan, while the durable job says `downloading` — but no
+ * analysis path builds a split preset source, so no `merge-split` plan exists
+ * in Production. Executor support exists; product reachability does not.
  *
  * Order of operations is a security property:
  *

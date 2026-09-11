@@ -215,11 +215,11 @@ export async function generateSampleClip(workDir: string, timeoutMs: number): Pr
  *
  * ─── Reachability ───────────────────────────────────────────────────────────
  *
- * Nothing calls this yet, and that is deliberate. No analysis path builds a
- * split preset source, `downloadGenericOriginal()` still refuses a
- * `merge-split` plan outright, and JobExecutor is unchanged, so there is no
- * route from a real download job to this function. SPLIT-03 adds split
- * acquisition; a later task wires the two together, under `beginProcessing()`.
+ * Since SPLIT-04 the JobExecutor calls this for a `merge-split` plan, strictly
+ * after `beginProcessing()` commits, on the two halves SPLIT-03 acquired. But
+ * no analysis path builds a split preset source yet, so no `merge-split` plan
+ * exists in Production and no real download job reaches this function.
+ * Executor support exists; product reachability does not.
  *
  * ─── Lifecycle ──────────────────────────────────────────────────────────────
  *
@@ -304,7 +304,12 @@ export function buildSplitMergeArgs(opts: {
 }): string[] {
   const inputFormat = SPLIT_INPUT_FORMAT[opts.target];
   return [
-    "-y",
+    // SPLIT-04: NEVER overwrite. `mergeSplitMedia` refuses an existing output
+    // entry before spawning; `-n` makes FFmpeg refuse one that appeared between
+    // that check and FFmpeg's own existence check, instead of truncating it.
+    // `-y` is deliberately absent. This is the split merge only — the other
+    // FFmpeg commands in this module are unchanged.
+    "-n",
     "-nostdin",
     "-v",
     "error",
@@ -448,12 +453,20 @@ export async function mergeSplitMedia(opts: {
     throw new AppError("PROCESSING_FAILED");
   }
 
-  // ...and nothing may already exist at that name. `-y` would truncate
-  // whatever is there, and FFmpeg's file protocol FOLLOWS symlinks, so a
-  // pre-placed `merged.mp4 -> /elsewhere` would be written through rather than
-  // replaced. The work directory is job-owned, so an existing entry is stale
-  // or foreign state: refusing is fail-closed, deleting it would be a guess.
-  // The produced file is still re-validated after FFmpeg exits.
+  // ...and nothing may already exist at that name. FFmpeg's file protocol
+  // FOLLOWS symlinks, so a pre-placed `merged.mp4 -> /elsewhere` would be
+  // written through rather than replaced. The work directory is job-owned, so
+  // an existing entry is stale or foreign state: refusing is fail-closed,
+  // deleting it would be a guess.
+  //
+  // This check and FFmpeg's open are separate moments. The merge argv
+  // therefore carries `-n` (SPLIT-04), so an entry that exists by the time
+  // FFmpeg checks is refused by FFmpeg too, rather than truncated. `-n` is
+  // FFmpeg's `access(F_OK)`, which follows symlinks: it refuses an existing
+  // file and a live symlink, but not a DANGLING one. What makes the residual
+  // window harmless is ownership — the job directory has no writer but this
+  // job — and the produced file is still re-validated (a symlink is refused)
+  // after FFmpeg exits.
   if (await pathEntryExists(outputPath)) throw new AppError("PROCESSING_FAILED");
 
   // 3. Input stream shapes. Ambiguous media is refused, never disambiguated:

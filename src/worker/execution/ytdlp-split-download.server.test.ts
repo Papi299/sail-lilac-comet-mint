@@ -2040,9 +2040,14 @@ describe("split download: no media processing during acquisition (§3/§49/§50/
     }
   });
 
-  it("the JobExecutor does not reach the split primitive: it stays unreachable (§50)", () => {
+  it("the JobExecutor reaches the split primitive only through its seam, and builds no argv (§50)", () => {
+    // SPLIT-04 wires this primitive in as the production default of the
+    // executor's `downloadGenericSplit` seam, so the executor now names it — but
+    // it still assembles no yt-dlp command of its own. PRODUCT reachability is a
+    // separate fact, pinned by format-plan.test.ts ("HARD GATE: analysis builds
+    // NO pair"): no real analysis produces a merge-split plan yet.
     const executor = readFileSync(new URL("./job-executor.server.ts", import.meta.url), "utf8");
-    assert.equal(executor.includes("downloadGenericSplitSources"), false);
+    assert.equal(executor.includes("downloadGenericSplitSources"), true);
     assert.equal(executor.includes("buildYtdlpSplitDownloadArgv"), false);
   });
 });
