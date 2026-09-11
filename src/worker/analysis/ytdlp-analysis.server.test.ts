@@ -2905,6 +2905,47 @@ describe("SPLIT-05: pairing eligibility", () => {
     assert.ok(presets.some((p) => p.id === "preset:mp3"));
   });
 
+  it("a MUXED webm source is never mistaken for the webm-family audio partner", () => {
+    // The webm family is the one where this can actually happen: a muxed webm
+    // rendition shares its CONTAINER with a legitimate webm audio-only partner,
+    // so container alone does not distinguish them. Only proven video absence
+    // does. Using the muxed source as the "audio half" would acquire its video
+    // twice and then discard one copy via the stream map.
+    const muxedWebm = {
+      format_id: "muxed-webm", ext: "webm", protocol: "https", height: 480,
+      vcodec: "vp09.00.40.08", acodec: "opus", video_ext: "webm", audio_ext: "none",
+    };
+    const videoHalf = {
+      format_id: "webm-video", ext: "webm", protocol: "https", height: 1080,
+      vcodec: "vp09.00.40.08", acodec: "none", video_ext: "webm", audio_ext: "none",
+    };
+    const audioHalf = {
+      format_id: "webm-audio", ext: "webm", protocol: "https",
+      vcodec: "none", acodec: "opus", video_ext: "none", audio_ext: "webm",
+    };
+
+    // With a real partner present, the pair must name the AUDIO-ONLY source.
+    const withPartner = build([muxedWebm, videoHalf, audioHalf]);
+    const pair = splitPair(withPartner.selections["preset:1080"]);
+    assert.equal(pair.video.formatId, "webm-video");
+    assert.equal(pair.audio.formatId, "webm-audio");
+    // ...and the muxed rendition still fills its own rung as a single source.
+    assert.equal(singleSource(withPartner.selections["preset:480"]).formatId, "muxed-webm");
+
+    // With NO audio-only partner, the muxed source must NOT be pressed into
+    // service as one: the 1080p rendition simply has no split fulfilment.
+    const withoutPartner = build([muxedWebm, videoHalf]);
+    for (const [id, value] of Object.entries(withoutPartner.selections)) {
+      assert.equal(value.kind, "single", `${id}: a muxed source is not an audio half`);
+    }
+    assert.equal(
+      withoutPartner.presets.some((p) => p.resolution === "1080p"),
+      false,
+      "no partner means no pair, not a substituted one",
+    );
+    assert.equal(withoutPartner.presets.find((p) => p.id === "preset:best")?.resolution, "480p");
+  });
+
   it("a video-only source with NO audio partner at all is simply not advertised", () => {
     const { presets, selections } = build([videoOnly()]);
     assert.deepEqual(presets, []);
