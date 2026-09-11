@@ -1,6 +1,14 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, symlinkSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  symlinkSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AppError } from "../../lib/errors.ts";
@@ -20,7 +28,11 @@ import {
   outputTemplateFor,
 } from "./ytdlp-download.server.ts";
 import { YTDLP_RUNTIME, type YtdlpRuntimeStatus } from "../runtime/ytdlp-runtime.server.ts";
-import type { GenericExecutionPlan } from "./format-plan.ts";
+import { GenericExecutionPlanSchema } from "./format-plan.ts";
+import type {
+  GenericExecutionPlan,
+  GenericSingleSourceExecutionPlan,
+} from "./format-plan.ts";
 
 /**
  * The secret-bearing URL used throughout. It never reaches a real request:
@@ -41,7 +53,9 @@ const OK_RUNTIME: YtdlpRuntimeStatus = Object.freeze({
   reason: "ok" as const,
 });
 
-function videoPlan(overrides: Partial<GenericExecutionPlan["source"]> = {}): GenericExecutionPlan {
+function videoPlan(
+  overrides: Partial<GenericSingleSourceExecutionPlan["source"]> = {},
+): GenericSingleSourceExecutionPlan {
   return {
     strategy: "yt-dlp",
     operation: "keep-original",
@@ -58,7 +72,7 @@ function videoPlan(overrides: Partial<GenericExecutionPlan["source"]> = {}): Gen
       ...overrides,
     },
     targetContainer: "mp4",
-  } as GenericExecutionPlan;
+  } as GenericSingleSourceExecutionPlan;
 }
 
 const ok: RunResult = { code: 0, stdout: "", stderr: "" };
@@ -1312,5 +1326,68 @@ describe("generic download: no residual monitor work after settlement (§14)", (
 
     const after = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
     assert.ok(after <= before, `timer leak: ${before} -> ${after}`);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPLIT-01: this primitive acquires ONE source, and refuses a pair
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("generic download: a split plan is refused, never half-honoured (SPLIT-01)", () => {
+  const SPLIT_PLAN: GenericExecutionPlan = {
+    strategy: "yt-dlp",
+    operation: "merge-split",
+    requestedFormatId: "preset:1080",
+    pair: {
+      video: {
+        formatId: "137",
+        protocol: "https",
+        container: "mp4",
+        hasVideo: true,
+        hasAudio: false,
+        videoConstraint: "codec-present",
+        audioConstraint: "absent",
+        fileSize: null,
+      },
+      audio: {
+        formatId: "140",
+        protocol: "https",
+        container: "m4a",
+        hasVideo: false,
+        hasAudio: true,
+        videoConstraint: "absent",
+        audioConstraint: "codec-present",
+        fileSize: null,
+      },
+    },
+    targetContainer: "mp4",
+  };
+
+  it("the plan is well-formed, so the refusal is attributable to the OPERATION", () => {
+    // A positive control: this plan parses. Whatever the next case rejects, it
+    // is not rejecting a malformed object.
+    assert.equal(GenericExecutionPlanSchema.safeParse(SPLIT_PLAN).success, true);
+  });
+
+  it("FORMAT_UNAVAILABLE, and NOTHING is spawned", async () => {
+    // Acquiring only the video half would hand the executor a silently
+    // audio-less artifact — a substitution the user never asked for. The
+    // primitive refuses the whole plan instead.
+    const { runner, calls } = forbiddenRunner();
+    let probed = 0;
+    await assert.rejects(
+      () =>
+        downloadGenericOriginal(SAFE_URL, workDir, SPLIT_PLAN, {
+          ...baseDeps({ runner }),
+          probeRuntime: async () => {
+            probed += 1;
+            return OK_RUNTIME;
+          },
+        }),
+      (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
+    );
+    assert.equal(calls.length, 0, "no acquisition subprocess");
+    assert.equal(probed, 0, "not even the version probe may run");
+    assert.deepEqual(readdirSync(workDir), [], "no artifact and no side file");
   });
 });

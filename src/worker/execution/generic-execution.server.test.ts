@@ -18,7 +18,12 @@ import type { DurableWorkerJob } from "@/worker/state/job-store";
 import type { ObjectStoreWriter, ObjectStorePutInput } from "@/worker/storage/writer.ts";
 import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
 import type { ExecutionAnalysis } from "../analysis/media-analyzer.server.ts";
-import type { GenericSourceSelections, GenericVideoConstraint } from "./generic-source.ts";
+import type {
+  GenericPresetSource,
+  GenericSourceSelection,
+  GenericSourceSelections,
+  GenericVideoConstraint,
+} from "./generic-source.ts";
 import { downloadGenericOriginal, type GenericDownloadLimits } from "./ytdlp-download.server.ts";
 import type { GenericExecutionPlan } from "./format-plan.ts";
 
@@ -71,7 +76,14 @@ function genericMeta(presets: PresetSpec[]): WorkerVideoMetadata {
   });
 }
 
-function selection(over: Partial<GenericSourceSelections[string]> = {}) {
+/**
+ * Builds the per-preset private value for ONE approved source.
+ *
+ * SPLIT-01 made that value a discriminated union, so this returns the
+ * `kind: "single"` form. Every case in this file exercises single-source
+ * execution, which is the only kind anything can build today.
+ */
+function selection(over: Partial<GenericSourceSelection> = {}): GenericPresetSource {
   // `videoConstraint` must agree with `hasVideo` or the schema refuses the
   // selection outright (§12), so the default follows whatever the caller asked
   // for and can still be overridden explicitly.
@@ -81,15 +93,18 @@ function selection(over: Partial<GenericSourceSelections[string]> = {}) {
   // proven absence; the unknown state must be asked for explicitly.
   const hasAudio = over.hasAudio ?? true;
   return {
-    formatId: "22",
-    protocol: "https" as const,
-    container: "mp4" as const,
-    hasVideo: true,
-    hasAudio: true,
-    videoConstraint: (hasVideo ? "codec-present" : "absent") as GenericVideoConstraint,
-    audioConstraint: hasAudio ? ("codec-present" as const) : ("absent" as const),
-    fileSize: null,
-    ...over,
+    kind: "single",
+    source: {
+      formatId: "22",
+      protocol: "https" as const,
+      container: "mp4" as const,
+      hasVideo: true,
+      hasAudio: true,
+      videoConstraint: (hasVideo ? "codec-present" : "absent") as GenericVideoConstraint,
+      audioConstraint: hasAudio ? ("codec-present" as const) : ("absent" as const),
+      fileSize: null,
+      ...over,
+    },
   };
 }
 

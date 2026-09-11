@@ -91,14 +91,17 @@ function genericMeta(): WorkerVideoMetadata {
 
 const SELECTIONS = {
   "preset:1080": {
-    formatId: "22",
-    protocol: "https" as const,
-    container: "mp4" as const,
-    hasVideo: true,
-    hasAudio: true,
-    videoConstraint: "codec-present" as const,
-    audioConstraint: "codec-present" as const,
-    fileSize: null,
+    kind: "single" as const,
+    source: {
+      formatId: "22",
+      protocol: "https" as const,
+      container: "mp4" as const,
+      hasVideo: true,
+      hasAudio: true,
+      videoConstraint: "codec-present" as const,
+      audioConstraint: "codec-present" as const,
+      fileSize: null,
+    },
   },
 };
 

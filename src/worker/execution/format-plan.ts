@@ -6,10 +6,15 @@ import {
   type WorkerVideoMetadata,
 } from "@/shared/worker/contracts";
 import {
+  GenericPresetSourceSchema,
   GenericSourceContainerSchema,
   GenericSourceSelectionSchema,
+  GenericSplitSourceSelectionSchema,
+  GenericSplitTargetContainerSchema,
+  splitTargetContainer,
   type GenericSourceSelection,
   type GenericSourceSelections,
+  type GenericSplitSourceSelection,
 } from "./generic-source.ts";
 
 /**
@@ -318,9 +323,75 @@ export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
       targetContainer: z.literal("mp3"),
     })
     .strict(),
+  /**
+   * SPLIT-01: a video preset fulfilled by an approved video-only + audio-only
+   * PAIR, merged LOCALLY by the Worker's own FFmpeg after `beginProcessing()`
+   * commits.
+   *
+   * NOT REACHABLE YET. Nothing constructs a split preset source, so
+   * `deriveGenericExecutionPlan` can never produce this variant today. It
+   * exists so the representation, its invariants and its refusals can be
+   * reviewed before anything can build one — and so that every later task has
+   * exactly one shape to target.
+   *
+   * `pair` carries TWO raw upstream identifiers. They are private to exactly
+   * the same extent the single-source `source` is: never browser-facing, never
+   * durable, never logged, never in an error message.
+   */
+  z
+    .object({
+      strategy: z.literal("yt-dlp"),
+      operation: z.literal("merge-split"),
+      // A VIDEO preset only. `preset:audio` and `preset:mp3` are single-source
+      // operations and are refused by `buildGenericSplitCandidate` before they
+      // could reach this schema; the literal union cannot express "any preset
+      // except two", so that refusal is the enforcement and this is the shape.
+      requestedFormatId: WorkerRequestedFormatIdSchema,
+      pair: GenericSplitSourceSelectionSchema,
+      targetContainer: GenericSplitTargetContainerSchema,
+    })
+    .strict()
+    .superRefine((plan, ctx) => {
+      // The target is DERIVED from the pair, never asserted alongside it. A
+      // plan whose declared target disagrees with the closed container table is
+      // unrepresentable rather than merely wrong: the target becomes the output
+      // extension, the MIME decision and the advertised container at once, so a
+      // drifted value would make all three wrong together.
+      const derived = splitTargetContainer(plan.pair.video.container, plan.pair.audio.container);
+      if (plan.targetContainer !== derived) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["targetContainer"],
+          message: "targetContainer must equal the pair's table-derived target",
+        });
+      }
+      // `preset:audio` / `preset:mp3` are audio-only products and are never
+      // fulfilled by a merge. Stated here as well as in the builder so the
+      // schema alone refuses a hand-constructed plan.
+      if (plan.requestedFormatId === "preset:audio" || plan.requestedFormatId === "preset:mp3") {
+        ctx.addIssue({
+          code: "custom",
+          path: ["requestedFormatId"],
+          message: "an audio preset is never fulfilled by a split merge",
+        });
+      }
+    }),
 ]);
 
 export type GenericExecutionPlan = z.infer<typeof GenericExecutionPlanSchema>;
+
+/**
+ * The plan variants that name EXACTLY ONE upstream source.
+ *
+ * The single-source acquisition primitive takes this rather than the whole
+ * union, so "this function acquires one source" is a TYPE statement rather than
+ * a comment — a `merge-split` plan cannot be handed to it even by mistake, and
+ * a future edit cannot quietly teach it to acquire half a pair.
+ */
+export type GenericSingleSourceExecutionPlan = Exclude<
+  GenericExecutionPlan,
+  { operation: "merge-split" }
+>;
 
 /**
  * §18 + §37 + §38: derives the generic plan for one requested preset.
@@ -348,11 +419,18 @@ export function deriveGenericExecutionPlan(
   const rawSource = selections[id];
   if (!preset || !rawSource) throw new AppError("FORMAT_UNAVAILABLE");
 
-  const source = GenericSourceSelectionSchema.safeParse(rawSource);
-  if (!source.success) throw new AppError("FORMAT_UNAVAILABLE");
-  const src = source.data;
+  // The preset source is RE-PARSED rather than trusted: it crossed a module
+  // boundary, and it is what names the upstream source (or pair of sources)
+  // acquisition will act on. The discriminated union is the only shape accepted
+  // here, so a bare selection left behind by an older build is a refusal rather
+  // than something to be interpreted charitably.
+  const presetSource = GenericPresetSourceSchema.safeParse(rawSource);
+  if (!presetSource.success) throw new AppError("FORMAT_UNAVAILABLE");
 
-  const candidate = buildGenericCandidate(id, preset, src);
+  const candidate =
+    presetSource.data.kind === "single"
+      ? buildGenericCandidate(id, preset, presetSource.data.source)
+      : buildGenericSplitCandidate(id, preset, presetSource.data.pair);
 
   const parsed = GenericExecutionPlanSchema.safeParse(candidate);
   if (!parsed.success) throw new AppError("FORMAT_UNAVAILABLE");
@@ -423,6 +501,48 @@ function buildGenericCandidate(
     requestedFormatId: id,
     source,
     targetContainer: source.container,
+  };
+}
+
+/**
+ * SPLIT-01: builds the candidate plan for a preset fulfilled by a PAIR.
+ *
+ * NOT REACHABLE YET — no analysis path produces a split preset source, so
+ * nothing calls this today. It is written now so the refusals are reviewable
+ * before anything can construct a pair, and so the later analysis task has one
+ * fixed contract to satisfy rather than one to invent.
+ *
+ * Every refusal below is a `FORMAT_UNAVAILABLE`, deliberately: a preset whose
+ * pair cannot be honoured EXACTLY must fail, never be substituted with a
+ * different rendition, a single source, or a different container (§17).
+ */
+function buildGenericSplitCandidate(
+  id: WorkerRequestedFormatId,
+  preset: { hasVideo: boolean; hasAudio: boolean; container: string },
+  pair: GenericSplitSourceSelection,
+): Record<string, unknown> {
+  // Audio products are single-source operations. A merge is only ever how a
+  // VIDEO preset gets its audio, so these two can never arrive here.
+  if (id === "preset:audio" || id === "preset:mp3") {
+    throw new AppError("FORMAT_UNAVAILABLE");
+  }
+
+  // The advertised preset must itself claim both streams. A pair fulfilling a
+  // preset that claims no audio would deliver more than was advertised, which
+  // is a substitution in the other direction and equally refused.
+  if (!preset.hasVideo || !preset.hasAudio) throw new AppError("FORMAT_UNAVAILABLE");
+
+  // The target comes from the closed container table and from nowhere else. A
+  // combination outside it is not a pair, whatever the members claim.
+  const target = splitTargetContainer(pair.video.container, pair.audio.container);
+  if (target === null) throw new AppError("FORMAT_UNAVAILABLE");
+
+  return {
+    strategy: "yt-dlp",
+    operation: "merge-split",
+    requestedFormatId: id,
+    pair,
+    targetContainer: target,
   };
 }
 

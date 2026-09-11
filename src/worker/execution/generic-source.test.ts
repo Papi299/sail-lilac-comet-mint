@@ -9,10 +9,15 @@ import {
   GENERIC_VIDEO_CONSTRAINTS,
   GENERIC_SOURCE_PROTOCOLS,
   GENERIC_VIDEO_SOURCE_CONTAINERS,
+  GenericPresetSourceSchema,
   GenericSourceSelectionSchema,
+  GenericSplitSourceSelectionSchema,
   SAFE_FORMAT_ID_PATTERN,
+  asSingleSource,
+  asSplitPair,
   buildGenericFormatSelector,
   isSafeFormatId,
+  splitTargetContainer,
   toGenericSourceContainer,
   type GenericSourceSelection,
 } from "./generic-source.ts";
@@ -884,15 +889,32 @@ describe("analysis -> selector round trip", () => {
         const { selections } = buildGenericPresets(selectCandidates(formats, LIMITS), {
           ffmpegAvailable,
         });
-        for (const [presetId, selection] of Object.entries(selections)) {
-          const origin = formats.find((f) => f.format_id === selection.formatId);
-          assert.ok(origin, `${label} ${presetId}: the selection must name a real upstream format`);
-          assert.equal(
-            selectsFormat(buildGenericFormatSelector(selection), origin as PinnedFormat),
-            true,
-            `${label} ${presetId}: analysis approved a format acquisition cannot re-select`,
-          );
-          checked += 1;
+        for (const [presetId, presetSource] of Object.entries(selections)) {
+          // SPLIT-01: a preset is fulfilled by one source or by a pair, and the
+          // property holds for EVERY member either way — each half is acquired
+          // by its own independent selector, so each half must re-select the
+          // exact format it was approved from.
+          const members =
+            presetSource.kind === "single"
+              ? [["source", presetSource.source] as const]
+              : ([
+                  ["video", presetSource.pair.video],
+                  ["audio", presetSource.pair.audio],
+                ] as const);
+
+          for (const [half, selection] of members) {
+            const origin = formats.find((f) => f.format_id === selection.formatId);
+            assert.ok(
+              origin,
+              `${label} ${presetId} (${half}): the selection must name a real upstream format`,
+            );
+            assert.equal(
+              selectsFormat(buildGenericFormatSelector(selection), origin as PinnedFormat),
+              true,
+              `${label} ${presetId} (${half}): analysis approved a format acquisition cannot re-select`,
+            );
+            checked += 1;
+          }
         }
       }
       assert.ok(checked > 0, "the property must actually be exercised");
@@ -927,5 +949,335 @@ describe("analysis -> selector round trip", () => {
       }
     }
     assert.deepEqual([...states].sort(), ["absent", "codec-present", "unknown"]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPLIT-01: the private split video+audio pair
+//
+// This module is the one place a raw upstream id may exist, and a split pair
+// holds TWO of them. These cases pin the invariants that make an INVALID pair
+// unrepresentable rather than merely unbuilt — which is the whole reason the
+// representation lands before anything can construct one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A video-only mp4 half: carries video, PROVEN to carry no audio. */
+const SPLIT_VIDEO_MP4: GenericSourceSelection = {
+  formatId: "137",
+  protocol: "https",
+  container: "mp4",
+  hasVideo: true,
+  hasAudio: false,
+  videoConstraint: "codec-present",
+  audioConstraint: "absent",
+  fileSize: 9_000_000,
+};
+
+/** An audio-only m4a half: PROVEN audio, PROVEN to carry no video. */
+const SPLIT_AUDIO_M4A: GenericSourceSelection = {
+  formatId: "140",
+  protocol: "https",
+  container: "m4a",
+  hasVideo: false,
+  hasAudio: true,
+  videoConstraint: "absent",
+  audioConstraint: "codec-present",
+  fileSize: 500_000,
+};
+
+const SPLIT_VIDEO_WEBM: GenericSourceSelection = {
+  ...SPLIT_VIDEO_MP4,
+  formatId: "248",
+  container: "webm",
+};
+
+const SPLIT_AUDIO_WEBM: GenericSourceSelection = {
+  ...SPLIT_AUDIO_M4A,
+  formatId: "251",
+  container: "webm",
+};
+
+describe("split pairs: the closed container table (SPLIT-01)", () => {
+  it("maps exactly two combinations and refuses every other one", () => {
+    const containers = [
+      "mp4",
+      "webm",
+      "m4a",
+      "mp3",
+      "ogg",
+      "opus",
+      "aac",
+      "flac",
+      "wav",
+    ] as const;
+
+    const accepted: string[] = [];
+    for (const video of containers) {
+      for (const audio of containers) {
+        const target = splitTargetContainer(video, audio);
+        if (target !== null) accepted.push(`${video}+${audio}=${target}`);
+      }
+    }
+
+    // Exhaustive over the whole source-container vocabulary: the table is two
+    // rows, and widening it must break this test rather than pass silently.
+    assert.deepEqual(accepted.sort(), ["mp4+m4a=mp4", "webm+webm=webm"]);
+  });
+
+  it("refuses every CROSS-FAMILY combination", () => {
+    // These are the combinations that would need codec knowledge to be safe —
+    // Opus in mp4 works, Vorbis in mp4 does not, PCM in mp4 barely does. The
+    // table excludes them all, which is what lets the merge be a pure stream
+    // copy with no codec string consulted anywhere.
+    assert.equal(splitTargetContainer("mp4", "webm"), null);
+    assert.equal(splitTargetContainer("webm", "m4a"), null);
+    assert.equal(splitTargetContainer("mp4", "opus"), null);
+    assert.equal(splitTargetContainer("mp4", "wav"), null);
+    assert.equal(splitTargetContainer("webm", "mp3"), null);
+  });
+
+  it("refuses an AUDIO container as the video half, and vice versa", () => {
+    assert.equal(splitTargetContainer("m4a", "m4a"), null);
+    assert.equal(splitTargetContainer("mp3", "m4a"), null);
+    assert.equal(splitTargetContainer("mp4", "mp4"), null);
+  });
+});
+
+describe("split pairs: cross-member invariants (SPLIT-01)", () => {
+  const pair = (
+    video: Partial<GenericSourceSelection> = {},
+    audio: Partial<GenericSourceSelection> = {},
+  ) => ({
+    video: { ...SPLIT_VIDEO_MP4, ...video },
+    audio: { ...SPLIT_AUDIO_M4A, ...audio },
+  });
+
+  it("accepts the two legal pairs", () => {
+    assert.equal(GenericSplitSourceSelectionSchema.safeParse(pair()).success, true);
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse({
+        video: SPLIT_VIDEO_WEBM,
+        audio: SPLIT_AUDIO_WEBM,
+      }).success,
+      true,
+    );
+  });
+
+  it("I1: the video member must actually carry video", () => {
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse({
+        video: SPLIT_AUDIO_M4A,
+        audio: SPLIT_AUDIO_WEBM,
+      }).success,
+      false,
+    );
+  });
+
+  it("I1: the video member may be established by EITHER approved video constraint", () => {
+    // `video-ext` is the unknown-codec-but-coherent-shape case, which is the
+    // same evidence standard already accepted for muxed video presets.
+    for (const videoConstraint of ["codec-present", "video-ext"] as const) {
+      assert.equal(
+        GenericSplitSourceSelectionSchema.safeParse(pair({ videoConstraint })).success,
+        true,
+        videoConstraint,
+      );
+    }
+  });
+
+  it("I2: the video member's audio must be PROVEN ABSENT, never unknown and never present", () => {
+    // The heart of "UNKNOWN is never silently upgraded". An unknown-audio video
+    // half might really be muxed, in which case the job would fetch audio twice
+    // and then discard the source's own track via the stream map.
+    for (const audioConstraint of ["unknown", "codec-present"] as const) {
+      const hasAudio = audioConstraint === "codec-present";
+      assert.equal(
+        GenericSplitSourceSelectionSchema.safeParse(pair({ audioConstraint, hasAudio })).success,
+        false,
+        audioConstraint,
+      );
+    }
+  });
+
+  it("I3: the audio member's video must be PROVEN ABSENT, never unknown-shaped", () => {
+    for (const videoConstraint of ["codec-present", "video-ext"] as const) {
+      assert.equal(
+        GenericSplitSourceSelectionSchema.safeParse(
+          pair({}, { videoConstraint, hasVideo: true, container: "mp4" }),
+        ).success,
+        false,
+        videoConstraint,
+      );
+    }
+  });
+
+  it("I4: UNKNOWN audio can never masquerade as the PROVEN audio half", () => {
+    // An `unknown` audio state is a coherent private description of a source,
+    // but it establishes nothing. A pair built on it would merge a track that
+    // may not exist.
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse(
+        pair({}, { audioConstraint: "unknown", hasAudio: false }),
+      ).success,
+      false,
+    );
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse(
+        pair({}, { audioConstraint: "absent", hasAudio: false }),
+      ).success,
+      false,
+    );
+  });
+
+  it("I5: the two halves must be two DIFFERENT upstream sources", () => {
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse(pair({}, { formatId: SPLIT_VIDEO_MP4.formatId }))
+        .success,
+      false,
+    );
+  });
+
+  it("I6: the container combination must be in the closed table", () => {
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse({
+        video: SPLIT_VIDEO_MP4,
+        audio: SPLIT_AUDIO_WEBM,
+      }).success,
+      false,
+      "mp4 video + webm audio is not a pair",
+    );
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse({
+        video: SPLIT_VIDEO_WEBM,
+        audio: SPLIT_AUDIO_M4A,
+      }).success,
+      false,
+      "webm video + m4a audio is not a pair",
+    );
+  });
+
+  it("each member is still validated by the MEMBER schema", () => {
+    // An unsafe raw id, an unsafe protocol and a shape/container mismatch must
+    // all be caught on either half — the pair schema adds invariants, it does
+    // not replace the ones that already exist.
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse(pair({ formatId: "22[ext=mp4]" })).success,
+      false,
+    );
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse(pair({}, { formatId: "bv+ba" })).success,
+      false,
+    );
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse(pair({ protocol: "m3u8" as never })).success,
+      false,
+    );
+  });
+
+  it("is strict: a missing half or an extra key is refused", () => {
+    assert.equal(GenericSplitSourceSelectionSchema.safeParse({ video: SPLIT_VIDEO_MP4 }).success, false);
+    assert.equal(GenericSplitSourceSelectionSchema.safeParse({ audio: SPLIT_AUDIO_M4A }).success, false);
+    assert.equal(
+      GenericSplitSourceSelectionSchema.safeParse({ ...pair(), targetContainer: "mp4" }).success,
+      false,
+      "the target is DERIVED from the pair; it may not be asserted alongside it",
+    );
+  });
+});
+
+describe("split pairs: the per-preset discriminated union (SPLIT-01)", () => {
+  it("accepts both fulfilment shapes", () => {
+    assert.equal(
+      GenericPresetSourceSchema.safeParse({ kind: "single", source: MUXED }).success,
+      true,
+    );
+    assert.equal(
+      GenericPresetSourceSchema.safeParse({
+        kind: "split",
+        pair: { video: SPLIT_VIDEO_MP4, audio: SPLIT_AUDIO_M4A },
+      }).success,
+      true,
+    );
+  });
+
+  it("refuses a BARE selection — the shape an older build would have written", () => {
+    // The per-preset value used to be a bare `GenericSourceSelection`. A durable
+    // or in-flight value in that shape is refused rather than interpreted
+    // charitably, so an old producer cannot silently keep working.
+    assert.equal(GenericPresetSourceSchema.safeParse(MUXED).success, false);
+  });
+
+  it("refuses a mismatched or unknown discriminator", () => {
+    assert.equal(
+      GenericPresetSourceSchema.safeParse({
+        kind: "single",
+        pair: { video: SPLIT_VIDEO_MP4, audio: SPLIT_AUDIO_M4A },
+      }).success,
+      false,
+    );
+    assert.equal(
+      GenericPresetSourceSchema.safeParse({ kind: "split", source: MUXED }).success,
+      false,
+    );
+    assert.equal(GenericPresetSourceSchema.safeParse({ kind: "merge", source: MUXED }).success, false);
+    assert.equal(GenericPresetSourceSchema.safeParse({ source: MUXED }).success, false);
+  });
+
+  it("is strict on both variants", () => {
+    assert.equal(
+      GenericPresetSourceSchema.safeParse({ kind: "single", source: MUXED, extra: 1 }).success,
+      false,
+    );
+    assert.equal(
+      GenericPresetSourceSchema.safeParse({
+        kind: "split",
+        pair: { video: SPLIT_VIDEO_MP4, audio: SPLIT_AUDIO_M4A },
+        targetContainer: "mp4",
+      }).success,
+      false,
+    );
+  });
+
+  it("the narrowing helpers agree with the discriminator", () => {
+    const single = GenericPresetSourceSchema.parse({ kind: "single", source: MUXED });
+    const split = GenericPresetSourceSchema.parse({
+      kind: "split",
+      pair: { video: SPLIT_VIDEO_MP4, audio: SPLIT_AUDIO_M4A },
+    });
+    assert.deepEqual(asSingleSource(single), MUXED);
+    assert.equal(asSplitPair(single), null);
+    assert.equal(asSingleSource(split), null);
+    assert.equal(asSplitPair(split)?.video.formatId, "137");
+  });
+});
+
+describe("split pairs: each half gets its own complete selector (SPLIT-01)", () => {
+  it("binds every property the half was approved on, with no merge grammar", () => {
+    // Two independent expressions, never one joined `video+audio` expression.
+    assert.equal(
+      buildGenericFormatSelector(SPLIT_VIDEO_MP4),
+      'b*[format_id="137"][protocol="https"][ext="mp4"][vcodec!="none"][acodec="none"]',
+    );
+    assert.equal(
+      buildGenericFormatSelector(SPLIT_AUDIO_M4A),
+      'b*[format_id="140"][protocol="https"][ext="m4a"][vcodec="none"][acodec!="none"]',
+    );
+  });
+
+  it("neither half's selector can carry a merge or a fallback operator", () => {
+    for (const half of [SPLIT_VIDEO_MP4, SPLIT_AUDIO_M4A, SPLIT_VIDEO_WEBM, SPLIT_AUDIO_WEBM]) {
+      const selector = buildGenericFormatSelector(half);
+      assert.equal(selector.includes("+"), false, "no merge operator");
+      assert.equal(selector.includes("/"), false, "no fallback operator");
+      assert.equal(selector.startsWith(GENERIC_FORMAT_SELECTOR_ATOM), true);
+    }
+  });
+
+  it("the video half is bound to PROVEN audio absence, strictly", () => {
+    // `[acodec="none"]` matches the explicit marker and nothing else, so a
+    // source that GAINED an audio codec between analysis and acquisition fails
+    // selection instead of being acquired as materially different media.
+    assert.equal(buildGenericFormatSelector(SPLIT_VIDEO_MP4).includes('[acodec="none"]'), true);
+    assert.equal(buildGenericFormatSelector(SPLIT_AUDIO_M4A).includes('[vcodec="none"]'), true);
   });
 });
