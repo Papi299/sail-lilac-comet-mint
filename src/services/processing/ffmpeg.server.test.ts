@@ -276,7 +276,7 @@ describe("split merge argv policy (SPLIT-02)", () => {
 
   it("builds the exact MP4 command family", () => {
     assert.deepEqual(mp4(), [
-      "-y", "-nostdin", "-v", "error",
+      "-n", "-nostdin", "-v", "error",
       "-protocol_whitelist", "file", "-f", "mov", "-i", "/w/v.mp4",
       "-protocol_whitelist", "file", "-f", "mov", "-i", "/w/a.m4a",
       "-map", "0:v:0", "-map", "1:a:0",
@@ -289,7 +289,7 @@ describe("split merge argv policy (SPLIT-02)", () => {
 
   it("builds the exact WebM command family", () => {
     assert.deepEqual(webm(), [
-      "-y", "-nostdin", "-v", "error",
+      "-n", "-nostdin", "-v", "error",
       "-protocol_whitelist", "file", "-f", "matroska", "-i", "/w/v.webm",
       "-protocol_whitelist", "file", "-f", "matroska", "-i", "/w/a.webm",
       "-map", "0:v:0", "-map", "1:a:0",
@@ -358,6 +358,16 @@ describe("split merge argv policy (SPLIT-02)", () => {
     assert.ok(!webm().includes("-movflags"));
     assert.ok(!webm().includes("+faststart"));
   });
+
+  it("never overwrites: -n leads BOTH command families and -y appears nowhere (SPLIT-04)", () => {
+    // M9 guard. `-y` would let FFmpeg truncate an output entry that appeared
+    // after `mergeSplitMedia`'s own existence check.
+    for (const args of [mp4(), webm()]) {
+      assert.equal(args[0], "-n");
+      assert.equal(args.filter((arg) => arg === "-n").length, 1);
+      assert.ok(!args.includes("-y"), "no -y anywhere in the split merge");
+    }
+  });
 });
 
 describe("split merge execution (SPLIT-02)", () => {
@@ -368,7 +378,8 @@ describe("split merge execution (SPLIT-02)", () => {
     | { kind: "probe"; stdout: string; code?: number }
     | {
         kind: "ffmpeg";
-        write?: (outputPath: string) => Promise<void>;
+        /** May return an exit code, to emulate FFmpeg deciding from its argv. */
+        write?: (outputPath: string, args: readonly string[]) => Promise<void | number>;
         code?: number;
         stdout?: string;
         stderr?: string;
@@ -454,10 +465,12 @@ describe("split merge execution (SPLIT-02)", () => {
           } else if (step.kind === "ffmpeg") {
             const outputPath = args[args.length - 1];
             void (async () => {
-              await (step.write ?? defaultOutput)(outputPath);
+              const exit = step.write
+                ? await step.write(outputPath, args)
+                : await defaultOutput(outputPath);
               if (step.stdout) child.stdout.write(step.stdout);
               if (step.stderr) child.stderr.write(step.stderr);
-              closeLater(child, step.code ?? 0);
+              closeLater(child, typeof exit === "number" ? exit : (step.code ?? 0));
             })();
           } else if (step.stderr) {
             // "hang": emits some output, then never exits on its own.
@@ -890,6 +903,61 @@ describe("split merge execution (SPLIT-02)", () => {
       const { calls } = harness([]);
       await rejectsWith("PROCESSING_FAILED", () => merge({ target: "mp4", ...overrides }));
       assert.equal(calls.length, 0, `${JSON.stringify(overrides)} reached a subprocess`);
+    }
+  });
+
+  /**
+   * SPLIT-04: FFmpeg's overwrite policy, emulated at the spawn boundary from
+   * the REAL argv. With `-n`, FFmpeg checks the output with `access(F_OK)` —
+   * which follows symlinks, so `realpath` is the faithful stand-in — and exits
+   * 1 without opening it if it exists. Otherwise (`-y`) it opens the path for
+   * writing, through a symlink if there is one.
+   *
+   * `raceEntry` runs first: it is another writer creating the output entry
+   * AFTER `mergeSplitMedia`'s own pre-check, which has already passed by the
+   * time FFmpeg is spawned.
+   */
+  function ffmpegOverwritePolicy(raceEntry: (outputPath: string) => Promise<void>) {
+    return async (outputPath: string, args: readonly string[]): Promise<number> => {
+      await raceEntry(outputPath);
+      const exists = await realpath(outputPath).then(
+        () => true,
+        () => false,
+      );
+      if (args.includes("-n") && exists) return 1;
+      await writeFile(outputPath, Buffer.alloc(2048, 7));
+      return 0;
+    };
+  }
+
+  for (const target of ["mp4", "webm"] as const) {
+    it(`${target}: an output FILE appearing after the pre-check is refused by FFmpeg, never truncated (SPLIT-04)`, async () => {
+      const family = target === "mp4" ? ISO : WEBM;
+      const { calls } = harness([
+        { kind: "probe", stdout: doc(family, ["video"]) },
+        { kind: "probe", stdout: doc(family, ["audio"]) },
+        { kind: "ffmpeg", write: ffmpegOverwritePolicy((path) => writeFile(path, "foreign")) },
+      ]);
+      await rejectsWith("PROCESSING_FAILED", () => merge({ target }));
+      assert.equal(calls.length, 3, "a refused merge is never probed as an artifact");
+      assert.equal(await readFile(join(workDir, `merged.${target}`), "utf8"), "foreign", "never truncated");
+    });
+  }
+
+  it("a live output SYMLINK appearing after the pre-check is never written through (SPLIT-04)", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "vf-race-victim-"));
+    try {
+      const victim = join(outside, "victim.bin");
+      await writeFile(victim, "untouched");
+      const { calls } = harness([
+        ...goodMp4Halves(),
+        { kind: "ffmpeg", write: ffmpegOverwritePolicy((path) => symlink(victim, path)) },
+      ]);
+      await rejectsWith("PROCESSING_FAILED", () => merge({ target: "mp4" }));
+      assert.equal(calls.length, 3);
+      assert.equal(await readFile(victim, "utf8"), "untouched", "the file outside the workDir is intact");
+    } finally {
+      await rm(outside, { recursive: true, force: true });
     }
   });
 });

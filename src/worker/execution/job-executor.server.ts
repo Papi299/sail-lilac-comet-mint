@@ -1,4 +1,6 @@
 import { createReadStream } from "node:fs";
+import { statfs } from "node:fs/promises";
+import { z } from "zod";
 import { buildDownloadFilename } from "@/lib/filenames";
 import { config } from "@/lib/config";
 import { AppError, ERROR_MESSAGES } from "@/lib/errors";
@@ -6,20 +8,29 @@ import { createJobDir, removeJobDir } from "@/services/temp/files.server";
 import { analyzeDirectMedia } from "./direct-media.server.ts";
 import { downloadDirectOriginalWorker } from "@/services/extractors/direct.server";
 import { mimeForContainer } from "@/services/extractors/normalize";
-import { convertMedia } from "@/services/processing/ffmpeg.server";
+import {
+  SPLIT_MERGE_TARGETS,
+  convertMedia,
+  mergeSplitMedia,
+  type SplitMergeTarget,
+} from "@/services/processing/ffmpeg.server";
 import { validateLocalOutput } from "./local-output.server.ts";
 import {
   deriveExecutionPlan,
   executionPlanRequestedFormatId,
   executionPlanTargetContainer,
+  type DirectExecutionPlan,
   type ExecutionPlan,
+  type GenericSingleSourceExecutionPlan,
+  type GenericSplitExecutionPlan,
 } from "./format-plan.ts";
 import {
   downloadGenericOriginal,
+  downloadGenericSplitSources,
   type GenericDownloadLimits,
+  type GenericSplitSourcesDownload,
 } from "./ytdlp-download.server.ts";
 import type { ExecutionAnalysis } from "../analysis/media-analyzer.server.ts";
-import type { GenericExecutionPlan } from "./format-plan.ts";
 import type { CancelJobResult, DurableWorkerJob, WorkerJobStore } from "@/worker/state/job-store";
 import type { ObjectStoreWriter } from "@/worker/storage/writer";
 import type { WorkerVideoMetadata } from "@/shared/worker/contracts";
@@ -74,29 +85,50 @@ export type DownloadOriginalFn = (
   },
 ) => Promise<OriginalDownloadResult>;
 
+/** What either generic acquisition seam receives besides the URL, workDir and plan. */
+export type GenericAcquisitionContext = {
+  limits: GenericDownloadLimits;
+  signal?: AbortSignal;
+  onProgress?: (update: {
+    progress: number | null;
+    downloadedBytes?: number | null;
+    totalBytes?: number | null;
+    speed?: number | null;
+    eta?: number | null;
+    stage?: string;
+  }) => void;
+};
+
 /**
  * §20: acquires the ONE original described by a generic execution plan. Like
  * the direct downloader it must never convert — but unlike the direct one it
  * DOES receive a plan, because the plan names the single upstream source the
  * Worker approved. It receives no browser value of any kind.
+ *
+ * SPLIT-04: typed on the SINGLE-SOURCE plan variants only. A `merge-split` plan
+ * names two sources and has its own seam below, so handing one to this seam is
+ * a compile error rather than a runtime refusal someone could later remove.
  */
 export type DownloadGenericOriginalFn = (
   url: string,
   workDir: string,
-  plan: GenericExecutionPlan,
-  ctx: {
-    limits: GenericDownloadLimits;
-    signal?: AbortSignal;
-    onProgress?: (update: {
-      progress: number | null;
-      downloadedBytes?: number | null;
-      totalBytes?: number | null;
-      speed?: number | null;
-      eta?: number | null;
-      stage?: string;
-    }) => void;
-  },
+  plan: GenericSingleSourceExecutionPlan,
+  ctx: GenericAcquisitionContext,
 ) => Promise<OriginalDownloadResult>;
+
+/**
+ * SPLIT-04: acquires BOTH halves of one approved split pair — the exact
+ * complement of `DownloadGenericOriginalFn`. It takes only a `merge-split`
+ * plan, so neither seam can be asked to do the other's job. Like every
+ * acquisition seam it performs no local media work: the merge is a separate
+ * seam, reachable only after `beginProcessing()` commits.
+ */
+export type DownloadGenericSplitFn = (
+  url: string,
+  workDir: string,
+  plan: GenericSplitExecutionPlan,
+  ctx: GenericAcquisitionContext,
+) => Promise<GenericSplitSourcesDownload>;
 
 /**
  * §12: local processing is dependency-injected so acceptance tests can observe
@@ -109,6 +141,54 @@ export type LocalProcessingFn = (opts: {
   timeoutMs: number;
   signal?: AbortSignal;
 }) => Promise<string>;
+
+/**
+ * SPLIT-04: the TWO-input local merge, dependency-injected for the same reason
+ * as `LocalProcessingFn`. Deliberately a separate seam: a merge has no single
+ * "input", and fabricating one to reuse the one-input seam would hide which
+ * half is which.
+ */
+export type MergeSplitMediaFn = (opts: {
+  videoPath: string;
+  audioPath: string;
+  workDir: string;
+  target: SplitMergeTarget;
+  timeoutMs: number;
+  maxOutputBytes: number;
+  signal?: AbortSignal;
+}) => Promise<string>;
+
+/** SPLIT-04: bytes available on the filesystem holding a job's workDir. */
+export type AvailableWorkDirBytesFn = (workDir: string) => Promise<number>;
+
+/**
+ * SPLIT-04: the plans whose acquisition yields exactly ONE local original —
+ * every direct plan, and every generic plan except `merge-split`.
+ */
+type SingleSourceExecutionPlan =
+  | { readonly strategy: "direct"; readonly direct: DirectExecutionPlan }
+  | { readonly strategy: "yt-dlp"; readonly generic: GenericSingleSourceExecutionPlan };
+
+/**
+ * SPLIT-04: what the downloading phase hands to the processing phase.
+ *
+ * Each variant carries the plan it was acquired FOR, so processing dispatches
+ * on one discriminant and receives a plan and a result that belong together.
+ * "single plan + split result" and "split plan + single result" are not
+ * pairings any code path can form. A split acquisition is never flattened
+ * into a fake `OriginalDownloadResult`: a two-input merge has no one original.
+ */
+type AcquiredExecutionMedia =
+  | {
+      readonly kind: "single";
+      readonly plan: SingleSourceExecutionPlan;
+      readonly original: OriginalDownloadResult;
+    }
+  | {
+      readonly kind: "split";
+      readonly plan: GenericSplitExecutionPlan;
+      readonly sources: GenericSplitSourcesDownload;
+    };
 
 export type JobExecutorDeps = {
   /**
@@ -126,7 +206,13 @@ export type JobExecutorDeps = {
   analyze?: AnalyzeDirectMediaFn;
   downloadOriginal?: DownloadOriginalFn;
   downloadGeneric?: DownloadGenericOriginalFn;
+  /** SPLIT-04: dual-source acquisition. Production: SPLIT-03's primitive. */
+  downloadGenericSplit?: DownloadGenericSplitFn;
   processLocally?: LocalProcessingFn;
+  /** SPLIT-04: the two-input merge. Production: SPLIT-02's `mergeSplitMedia`. */
+  mergeSplit?: MergeSplitMediaFn;
+  /** SPLIT-04: split temp-capacity preflight. Production: `statfs` on the workDir. */
+  availableWorkDirBytes?: AvailableWorkDirBytesFn;
   /** Bounds handed to generic acquisition. Defaults to the process config. */
   genericLimits?: GenericDownloadLimits;
 };
@@ -179,7 +265,10 @@ export class JobExecutor {
   private readonly analyzeForExecution: AnalyzeForExecutionFn;
   private readonly downloadOriginal: DownloadOriginalFn;
   private readonly downloadGeneric: DownloadGenericOriginalFn;
+  private readonly downloadGenericSplit: DownloadGenericSplitFn;
   private readonly processLocally: LocalProcessingFn;
+  private readonly mergeSplit: MergeSplitMediaFn;
+  private readonly availableWorkDirBytes: AvailableWorkDirBytesFn;
   private readonly genericLimits: GenericDownloadLimits;
 
   constructor(
@@ -214,7 +303,17 @@ export class JobExecutor {
           mime: mimeForContainer(res.container),
           fileSize: res.fileSize,
         })));
+    this.downloadGenericSplit =
+      deps.downloadGenericSplit ??
+      ((url, workDir, plan, ctx) =>
+        downloadGenericSplitSources(url, workDir, plan, {
+          limits: ctx.limits,
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+          ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
+        }));
     this.processLocally = deps.processLocally ?? convertMedia;
+    this.mergeSplit = deps.mergeSplit ?? mergeSplitMedia;
+    this.availableWorkDirBytes = deps.availableWorkDirBytes ?? availableBytesOnWorkDirFilesystem;
     this.genericLimits = deps.genericLimits ?? {
       maxFileSizeBytes: config.maxFileSize,
       downloadTimeoutSeconds: Math.max(1, Math.floor(config.downloadTimeoutMs / 1000)),
@@ -384,21 +483,12 @@ export class JobExecutor {
 
     // ── downloading: ORIGINAL BYTES ONLY ─────────────────────────────────────
     // §4/§36: no FFmpeg work of any kind may start while the durable job says
-    // `downloading`. Neither branch can convert: the direct downloader takes no
-    // format at all, and the generic one acquires exactly the one progressive
-    // source its plan names, with yt-dlp's own FFmpeg made unavailable.
-    const original =
-      plan.strategy === "direct"
-        ? await this.downloadOriginal(job.url, {
-            workDir,
-            signal,
-            onProgress: this.makeProgressReporter(jobId),
-          })
-        : await this.downloadGeneric(job.url, workDir, plan.generic, {
-            limits: this.genericLimits,
-            signal,
-            onProgress: this.makeProgressReporter(jobId),
-          });
+    // `downloading`. No acquisition branch can convert: the direct downloader
+    // takes no format at all, the generic one acquires exactly the one
+    // progressive source its plan names, and the split one acquires exactly the
+    // two its pair names — in both generic cases with yt-dlp's own FFmpeg made
+    // unavailable. None of them probes, merges or otherwise touches media.
+    const acquired = await this.acquire(job.url, plan, workDir, signal, jobId);
 
     // ── processing ───────────────────────────────────────────────────────────
     const procRes = this.store.beginProcessing(jobId);
@@ -408,9 +498,12 @@ export class JobExecutor {
     this.checkCancelled(signal);
 
     // §11/§36: local processing happens strictly AFTER beginProcessing()
-    // committed. This is the ONLY place Worker FFmpeg can be reached, on either
-    // strategy.
-    const producedPath = await this.executePlan(plan, original, workDir, signal);
+    // committed. This is the ONLY place Worker FFmpeg — or, for a split pair,
+    // ffprobe and the merge — can be reached, on any strategy.
+    const producedPath =
+      acquired.kind === "split"
+        ? await this.executeSplitPlan(acquired.plan, acquired.sources, workDir, signal)
+        : await this.executePlan(acquired.plan, acquired.original, workDir, signal);
 
     const validOut = await validateLocalOutput(workDir, producedPath);
 
@@ -455,12 +548,174 @@ export class JobExecutor {
   }
 
   /**
+   * The downloading phase: routes the plan to exactly ONE acquisition seam and
+   * returns its result bound to the plan it was acquired for.
+   *
+   *   direct                      -> `downloadOriginal`
+   *   generic keep/extract-*      -> `downloadGeneric`       (one source)
+   *   generic `merge-split`       -> `downloadGenericSplit`  (two sources)
+   *
+   * The two generic seams are typed on complementary plan variants, so a pair
+   * cannot reach the single-source seam and a single source cannot reach the
+   * split one. Every seam runs while the durable status is `downloading`, and
+   * every result is checked here, at the module boundary, before processing
+   * may see it.
+   */
+  private async acquire(
+    url: string,
+    plan: ExecutionPlan,
+    workDir: string,
+    signal: AbortSignal,
+    jobId: string,
+  ): Promise<AcquiredExecutionMedia> {
+    if (plan.strategy === "direct") {
+      const original = await this.downloadOriginal(url, {
+        workDir,
+        signal,
+        onProgress: this.makeProgressReporter(jobId),
+      });
+      return { kind: "single", plan, original: assertSingleOriginal(original) };
+    }
+
+    const generic = plan.generic;
+    if (generic.operation !== "merge-split") {
+      const original = await this.downloadGeneric(url, workDir, generic, {
+        limits: this.genericLimits,
+        signal,
+        onProgress: this.makeProgressReporter(jobId),
+      });
+      return {
+        kind: "single",
+        plan: { strategy: "yt-dlp", generic },
+        original: assertSingleOriginal(original),
+      };
+    }
+
+    // ── SPLIT-04: one approved pair ─────────────────────────────────────────
+    //
+    // WorkDir ownership, which the split security argument rests on: `workDir`
+    // is the canonical per-job directory `createJobDir(jobId)` made for THIS
+    // execution. It is never derived from a browser value, exactly one executor
+    // runs this job, no other application writer ever targets it, and this
+    // executor's `finally` alone removes it. Within it, SPLIT-03 requires an
+    // exactly-empty directory before the video run and exactly `{video}` before
+    // the audio run, and SPLIT-02 refuses any pre-existing merge output entry.
+    // Neither primitive cleans up: partial artifacts stay until this executor
+    // unwinds.
+    await this.assertSplitWorkDirCapacity(workDir);
+    this.checkCancelled(signal);
+
+    // Acquisition progress is live only while acquisition is. SPLIT-03 already
+    // gates its own monitor; this gate is the executor's, so a late callback
+    // from ANY split implementation is inert once the call has settled — before
+    // `beginProcessing()` is even attempted — instead of reaching the reporter,
+    // losing the `downloading` CAS and aborting a job that had succeeded.
+    const report = this.makeProgressReporter(jobId);
+    let acquisitionLive = true;
+    let sources: unknown;
+    try {
+      sources = await this.downloadGenericSplit(url, workDir, generic, {
+        limits: this.genericLimits,
+        signal,
+        onProgress: (update) => {
+          if (acquisitionLive) report(update);
+        },
+      });
+    } finally {
+      acquisitionLive = false;
+    }
+    return {
+      kind: "split",
+      plan: generic,
+      sources: assertSplitSources(generic, sources, this.genericLimits.maxFileSizeBytes),
+    };
+  }
+
+  /**
+   * SPLIT-04 §13: the split temp-capacity PREFLIGHT.
+   *
+   * A split job's local media footprint is bounded by policy at
+   * 2 × maxFileSizeBytes: SPLIT-03 proves video + audio <= max, and SPLIT-02
+   * proves the merged artifact <= max, and the three coexist until the executor
+   * unwinds. Those two hard bounds ARE the proof, so no padding is added.
+   *
+   * A lower-bound check at one instant — not a reservation, and no claim that
+   * free space cannot change afterwards. Local disk is Worker capacity, not a
+   * property of the media, so every refusal is PROCESSING_FAILED, never
+   * TOO_LARGE. The measured value is never logged, persisted or put in an error.
+   */
+  private async assertSplitWorkDirCapacity(workDir: string): Promise<void> {
+    const max = this.genericLimits.maxFileSizeBytes;
+    const required = 2 * max;
+    if (!Number.isSafeInteger(max) || max <= 0 || !Number.isSafeInteger(required)) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+
+    let available: number;
+    try {
+      available = await this.availableWorkDirBytes(workDir);
+    } catch {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    if (!Number.isSafeInteger(available) || available < 0) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    if (available < required) throw new AppError("PROCESSING_FAILED");
+  }
+
+  /**
+   * SPLIT-04: executes a `merge-split` plan — SPLIT-02's two-input stream-copy
+   * merge of the two acquired halves. Reached only after `beginProcessing()`
+   * committed, exactly like the one-input path.
+   *
+   * Every argument is bound here and nowhere else: the video half to
+   * `videoPath`, the audio half to `audioPath`, the plan's table-derived target,
+   * the same application-owned processing timeout the one-input path uses (not
+   * what is left of the acquisition deadline), and ONE normal product ceiling
+   * for the delivered artifact. No pair member is re-selected, no fallback
+   * source exists, and nothing is inferred from codecs.
+   */
+  private async executeSplitPlan(
+    plan: GenericSplitExecutionPlan,
+    sources: GenericSplitSourcesDownload,
+    workDir: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    // Checked against SPLIT-02's own closed vocabulary rather than cast: the
+    // target chooses both demuxers, the muxer and the output name there.
+    const target: string = plan.targetContainer;
+    if (!isSplitMergeTarget(target)) throw new AppError("PROCESSING_FAILED");
+
+    const produced = await this.mergeSplit({
+      videoPath: sources.video.filePath,
+      audioPath: sources.audio.filePath,
+      workDir,
+      target,
+      timeoutMs: config.downloadTimeoutMs,
+      maxOutputBytes: this.genericLimits.maxFileSizeBytes,
+      signal,
+    });
+
+    // The delivered artifact must be the merge's own output: the planned
+    // extension, and never one of the two halves handed back as if merged.
+    if (!produced.endsWith(`.${target}`)) throw new AppError("PROCESSING_FAILED");
+    if (produced === sources.video.filePath || produced === sources.audio.filePath) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    return produced;
+  }
+
+  /**
    * §9 + §10: executes exactly the derived plan. `plan.targetContainer` is a
    * closed union, so no user-supplied string ever becomes an FFmpeg target,
    * an output extension, or a path segment.
+   *
+   * SPLIT-04: single-source plans only. A `merge-split` plan is not a member
+   * of `SingleSourceExecutionPlan`, so it can never be "processed" here as a
+   * one-input conversion of one half.
    */
   private async executePlan(
-    plan: ExecutionPlan,
+    plan: SingleSourceExecutionPlan,
     original: OriginalDownloadResult,
     workDir: string,
     signal: AbortSignal,
@@ -577,4 +832,101 @@ function finiteInt(value: number | null | undefined): number | null {
 
 function finiteNonNegative(value: number | null | undefined): number | null {
   return value != null && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/**
+ * SPLIT-04: the production capacity reader — the bytes an unprivileged process
+ * may still allocate (`bavail`, not `bfree`) on the filesystem holding
+ * `workDir`, via Node's `statfs`.
+ *
+ * Read as bigint so a very large filesystem cannot lose precision. A value
+ * beyond MAX_SAFE_INTEGER is clamped DOWN to it; that can never turn an
+ * insufficient filesystem into a sufficient one, because every requirement the
+ * gate compares it with is itself a safe integer.
+ */
+export async function availableBytesOnWorkDirFilesystem(workDir: string): Promise<number> {
+  const fs = await statfs(workDir, { bigint: true });
+  const bytes = fs.bavail * fs.bsize;
+  return bytes > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(bytes);
+}
+
+/** True when `value` is one of SPLIT-02's closed merge targets. */
+function isSplitMergeTarget(value: string): value is SplitMergeTarget {
+  return (SPLIT_MERGE_TARGETS as readonly string[]).includes(value);
+}
+
+/**
+ * SPLIT-04: a single-source acquisition must hand back ONE local file path.
+ *
+ * Every real single-source downloader already does; this only makes a result
+ * of another shape — a split pair's `{video, audio, totalFileSize}` included —
+ * fail closed at the boundary instead of reaching processing as `undefined`.
+ */
+function assertSingleOriginal(raw: OriginalDownloadResult): OriginalDownloadResult {
+  const filePath: unknown = (raw as { filePath?: unknown } | null)?.filePath;
+  if (typeof filePath !== "string" || filePath.length === 0) {
+    throw new AppError("PROCESSING_FAILED");
+  }
+  return raw;
+}
+
+const SplitSourceArtifactSchema = z
+  .object({
+    filePath: z.string().min(1),
+    container: z.string().min(1),
+    fileSize: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+
+const SplitSourcesDownloadSchema = z
+  .object({
+    video: SplitSourceArtifactSchema,
+    audio: SplitSourceArtifactSchema,
+    totalFileSize: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+
+/**
+ * SPLIT-04: the executor's own proof that a split acquisition returned what a
+ * pair acquisition must return.
+ *
+ * SPLIT-03's primitive already guarantees every property below. They are
+ * re-proven because this is a module boundary: the executor does not trust an
+ * injected or alternate implementation merely because the production one is
+ * correct, and malformed data is refused, never interpreted charitably.
+ *
+ *   - a structurally broken result (a missing half, an empty path, a
+ *     non-integer size, a total that is not the exact safe sum of the halves,
+ *     one file named twice) is PROCESSING_FAILED — SPLIT-03's own convention
+ *     for an acquired artifact that is not what it should be;
+ *   - a half whose container is not the one the pair approved is
+ *     FORMAT_UNAVAILABLE — the executor's existing convention at this exact
+ *     boundary (see `executePlan`'s keep-original check): the acquired media is
+ *     not the approved rendition, and substituting it is what §17 forbids;
+ *   - a total over the one combined byte budget is TOO_LARGE, as SPLIT-03
+ *     classifies the same condition.
+ *
+ * Nothing here is persisted, and no path appears in any error.
+ */
+function assertSplitSources(
+  plan: GenericSplitExecutionPlan,
+  raw: unknown,
+  maxFileSizeBytes: number,
+): GenericSplitSourcesDownload {
+  const parsed = SplitSourcesDownloadSchema.safeParse(raw);
+  if (!parsed.success) throw new AppError("PROCESSING_FAILED");
+  const { video, audio, totalFileSize } = parsed.data;
+
+  if (video.container !== plan.pair.video.container) throw new AppError("FORMAT_UNAVAILABLE");
+  if (audio.container !== plan.pair.audio.container) throw new AppError("FORMAT_UNAVAILABLE");
+
+  if (video.filePath === audio.filePath) throw new AppError("PROCESSING_FAILED");
+
+  const sum = video.fileSize + audio.fileSize;
+  if (!Number.isSafeInteger(sum) || totalFileSize !== sum) {
+    throw new AppError("PROCESSING_FAILED");
+  }
+  if (totalFileSize > maxFileSizeBytes) throw new AppError("TOO_LARGE");
+
+  return parsed.data;
 }
