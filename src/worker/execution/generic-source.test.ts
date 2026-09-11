@@ -1141,6 +1141,35 @@ describe("split pairs: cross-member invariants (SPLIT-01)", () => {
     );
   });
 
+  it("I4 is DEFENCE IN DEPTH: the MEMBER schema is what makes unproven audio unrepresentable", () => {
+    // Pins the operative layer, not just the composite outcome. I3 forces the
+    // audio half to `videoConstraint: "absent"` (hence `hasVideo: false`), and
+    // the member schema then requires a selection to carry video, audio or
+    // both — so an audio-only descriptor whose audio is `unknown` or `absent`
+    // is refused one layer BELOW the pair invariant.
+    //
+    // Without this case, relaxing the member schema would silently move the
+    // whole protection onto I4 with nothing noticing.
+    for (const audioConstraint of ["unknown", "absent"] as const) {
+      const audioOnlyWithoutProvenAudio = {
+        ...SPLIT_AUDIO_M4A,
+        hasAudio: false,
+        audioConstraint,
+      };
+      assert.equal(
+        GenericSourceSelectionSchema.safeParse(audioOnlyWithoutProvenAudio).success,
+        false,
+        `member schema must refuse an audio-only descriptor with ${audioConstraint} audio`,
+      );
+      // ...and the pair refuses it too, whichever layer speaks first.
+      assert.equal(
+        GenericSplitSourceSelectionSchema.safeParse(pair({}, audioOnlyWithoutProvenAudio)).success,
+        false,
+        `pair must refuse an audio half with ${audioConstraint} audio`,
+      );
+    }
+  });
+
   it("I5: the two halves must be two DIFFERENT upstream sources", () => {
     assert.equal(
       GenericSplitSourceSelectionSchema.safeParse(pair({}, { formatId: SPLIT_VIDEO_MP4.formatId }))

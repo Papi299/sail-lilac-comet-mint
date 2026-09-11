@@ -453,8 +453,20 @@ export const GenericSplitSourceSelectionSchema = z
       issue("audio", "the audio member must have proven-absent video");
     }
 
-    // I4: the audio member's audio is PROVEN PRESENT. `hasAudio` is the
-    // narrower boolean and must agree, exactly as the member schema requires.
+    // I4: the audio member's audio is PROVEN PRESENT.
+    //
+    // DEFENCE IN DEPTH, deliberately — not the operative gate, and it is worth
+    // being precise about that rather than implying a strength it does not add.
+    // I3 forces `videoConstraint: "absent"`, which the member schema ties to
+    // `hasVideo: false`; the member schema then requires a selection to carry
+    // video, audio or both, and ties `hasAudio === true` to
+    // `audioConstraint === "codec-present"`. An audio member with `unknown` or
+    // `absent` audio is therefore already unrepresentable one layer down.
+    //
+    // This restates it at the pair level so the pair stays self-describing and
+    // so a future relaxation of the member schema cannot silently make an
+    // unknown-audio half acceptable here. `member schema rejects an audio-only
+    // descriptor whose audio is not proven` is pinned by its own test.
     if (pair.audio.audioConstraint !== "codec-present" || !pair.audio.hasAudio) {
       issue("audio", "the audio member must have proven audio");
     }
