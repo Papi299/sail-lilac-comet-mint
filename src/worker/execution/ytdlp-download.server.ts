@@ -16,19 +16,31 @@ import {
   type YtdlpProbeOptions,
   type YtdlpRuntimeStatus,
 } from "../runtime/ytdlp-runtime.server.ts";
-import { buildGenericFormatSelector } from "./generic-source.ts";
+import { buildGenericFormatSelector, type GenericSourceSelection } from "./generic-source.ts";
 import {
   GenericExecutionPlanSchema,
   type GenericExecutionPlan,
   type GenericSingleSourceExecutionPlan,
+  type GenericSplitExecutionPlan,
 } from "./format-plan.ts";
 
 /**
- * Worker-owned GENERIC ORIGINAL ACQUISITION (Phase 10C3 §20).
+ * Worker-owned GENERIC ORIGINAL ACQUISITION (Phase 10C3 §20), and — since
+ * SPLIT-03 — the DUAL-SOURCE acquisition of one approved split pair.
  *
- * Takes one already-validated generic execution plan and produces exactly ONE
- * local original source artifact. It is the network half of generic execution
- * and nothing else.
+ * Two primitives, deliberately distinct in contract and in type:
+ *
+ *   `downloadGenericOriginal`      one single-source plan -> exactly ONE local
+ *                                  original source artifact;
+ *   `downloadGenericSplitSources`  one `merge-split` plan -> exactly TWO local
+ *                                  source artifacts, the pair's video-only and
+ *                                  audio-only members, acquired SEQUENTIALLY
+ *                                  as two independent single-source runs under
+ *                                  one deadline and one combined byte budget.
+ *
+ * Both are the network half of generic execution and nothing else. The split
+ * merge itself is SPLIT-02's `mergeSplitMedia`, which only the executor may
+ * reach, after `beginProcessing()` commits — never this module.
  *
  * ─── The lifecycle boundary this module protects ────────────────────────────
  *
@@ -41,7 +53,8 @@ import {
  *
  *   1. `--downloader=native`, inherited from the closed base policy, so
  *      acquisition uses `HttpFD`;
- *   2. a single progressive http/https source, so no fragment or manifest
+ *   2. a single progressive http/https source PER SUBPROCESS — a split pair is
+ *      two runs, never one `+`-joined selection — so no fragment or manifest
  *      downloader is reachable and no merge is possible;
  *   3. a PATH that resolves nothing, so `ffmpeg`/`ffprobe` cannot be found by
  *      bare name;
@@ -53,9 +66,10 @@ import {
  * ─── What this module must never do ─────────────────────────────────────────
  *
  * No FFmpeg work, no transcode, no remux, no stream merge, no audio extraction,
- * no format re-selection, and never more than one returned file. Audio
- * extraction and MP3 transcoding are the JobExecutor's, performed with the
- * Worker's own FFmpeg strictly after `beginProcessing()` commits.
+ * no format re-selection, and never more than one returned file per approved
+ * source. Audio extraction and MP3 transcoding — and, once integrated, the
+ * split merge — are the JobExecutor's, performed with the Worker's own FFmpeg
+ * strictly after `beginProcessing()` commits.
  */
 
 // ── Bounds ───────────────────────────────────────────────────────────────────
@@ -131,6 +145,23 @@ export const YTDLP_DOWNLOAD_FFMPEG_LOCATION = "/nonexistent/videofetch-yt-dlp-no
 
 /** The fixed, server-owned output template (§28). */
 export const YTDLP_DOWNLOAD_OUTPUT_BASENAME = "source";
+
+/**
+ * SPLIT-03: the fixed, server-owned output basenames of a split pair's halves.
+ *
+ * One per ROLE, never shared, and both distinct from the single-source
+ * `source`. A valid WebM pair has TWO `.webm` sources, so the extension alone
+ * cannot keep the halves apart — the basename must. Like `source`, neither is
+ * derived from anything upstream- or browser-controlled; the only
+ * interpolation in either template remains `%(ext)s`.
+ */
+export const YTDLP_SPLIT_OUTPUT_BASENAMES = Object.freeze({
+  video: "video-source",
+  audio: "audio-source",
+} as const);
+
+/** Which half of an approved split pair one acquisition run fetches. */
+export type GenericSplitRole = keyof typeof YTDLP_SPLIT_OUTPUT_BASENAMES;
 
 /**
  * The COMPLETE environment for an acquisition subprocess.
@@ -269,12 +300,67 @@ export function buildYtdlpDownloadArgv(opts: {
   readonly plan: GenericSingleSourceExecutionPlan;
   readonly maxFileSizeBytes: number;
 }): readonly string[] {
+  return buildAcquisitionArgv({
+    validatedUrl: opts.validatedUrl,
+    source: opts.plan.source,
+    outputTemplate: outputTemplateFor(opts.workDir),
+    maxFileSizeBytes: opts.maxFileSizeBytes,
+  });
+}
+
+/**
+ * SPLIT-03: the COMPLETE argv for ONE half of an approved split pair.
+ *
+ * `role` selects BOTH the pair member AND the output basename, so the video
+ * member's selector can only ever write `video-source.*` and the audio
+ * member's only `audio-source.*` — a binding made here, structurally, rather
+ * than by two independent arguments a caller could cross.
+ *
+ * Exactly ONE source per invocation. The selector is that member's own
+ * complete `buildGenericFormatSelector` expression; the two members are never
+ * joined into a `video+audio` yt-dlp selection, which would hand yt-dlp the
+ * choice of sources AND its own FFmpeg merge while the durable job still says
+ * `downloading`.
+ */
+export function buildYtdlpSplitDownloadArgv(opts: {
+  readonly validatedUrl: string;
+  readonly workDir: string;
+  /** A `merge-split` plan only; the single-source builder excludes it by type. */
+  readonly plan: GenericSplitExecutionPlan;
+  readonly role: GenericSplitRole;
+  /** This half's allowance: the combined budget minus bytes already acquired. */
+  readonly maxFileSizeBytes: number;
+}): readonly string[] {
+  return buildAcquisitionArgv({
+    validatedUrl: opts.validatedUrl,
+    source: opts.plan.pair[opts.role],
+    outputTemplate: splitOutputTemplateFor(opts.workDir, opts.role),
+    maxFileSizeBytes: opts.maxFileSizeBytes,
+  });
+}
+
+/**
+ * The one place an acquisition command is assembled: ONE approved source, the
+ * closed base policy, the closed acquisition policy, a fixed output template,
+ * and the URL last.
+ *
+ * Private, and shared by both public builders, so the single-source run and
+ * each half of a split pair cannot drift onto different policies. It takes a
+ * single source selection; there is no parameter through which a second
+ * source, a selector string or a raw yt-dlp argument could arrive.
+ */
+function buildAcquisitionArgv(opts: {
+  readonly validatedUrl: string;
+  readonly source: GenericSourceSelection;
+  readonly outputTemplate: string;
+  readonly maxFileSizeBytes: number;
+}): readonly string[] {
   return Object.freeze([
     YTDLP_RUNTIME.artifactPath,
     ...ytdlpPolicyArgs(),
     ...ytdlpDownloadPolicyArgs({
-      formatSelector: buildGenericFormatSelector(opts.plan.source),
-      outputTemplate: outputTemplateFor(opts.workDir),
+      formatSelector: buildGenericFormatSelector(opts.source),
+      outputTemplate: opts.outputTemplate,
       maxFileSizeBytes: opts.maxFileSizeBytes,
     }),
     "--",
@@ -302,6 +388,34 @@ export function expectedSourcePath(workDir: string, container: string): string {
 /** The `.part` path yt-dlp streams into before renaming. */
 export function expectedPartPath(workDir: string, container: string): string {
   return `${expectedSourcePath(workDir, container)}.part`;
+}
+
+/**
+ * SPLIT-03: the fixed output template for ONE half of a split pair.
+ *
+ * Same rule as `outputTemplateFor`: `%(ext)s` is the only interpolation, and
+ * the acquired extension must then equal that member's approved container.
+ */
+export function splitOutputTemplateFor(workDir: string, role: GenericSplitRole): string {
+  return join(workDir, `${YTDLP_SPLIT_OUTPUT_BASENAMES[role]}.%(ext)s`);
+}
+
+/** SPLIT-03: the exact final path one half of a pair must produce. */
+export function expectedSplitSourcePath(
+  workDir: string,
+  role: GenericSplitRole,
+  container: string,
+): string {
+  return join(workDir, `${YTDLP_SPLIT_OUTPUT_BASENAMES[role]}.${container}`);
+}
+
+/** SPLIT-03: the `.part` path that half streams into before renaming. */
+export function expectedSplitPartPath(
+  workDir: string,
+  role: GenericSplitRole,
+  container: string,
+): string {
+  return `${expectedSplitSourcePath(workDir, role, container)}.part`;
 }
 
 // ── Error classification (§34) ───────────────────────────────────────────────
@@ -368,7 +482,12 @@ export function classifyDownloadFailure(raw: string): AppError["code"] {
 type AbortCause = "caller" | "overflow" | null;
 
 export type GenericDownloadLimits = {
+  /**
+   * The acquisition byte ceiling. For a split pair it is ONE COMBINED budget —
+   * video bytes plus audio bytes together — never a separate allowance per half.
+   */
   readonly maxFileSizeBytes: number;
+  /** ONE subprocess budget for the whole call, the runtime probe included. */
   readonly downloadTimeoutSeconds: number;
 };
 
@@ -387,6 +506,29 @@ export type GenericOriginalDownload = {
   /** The approved source container; equals the file's real extension. */
   readonly container: string;
   readonly fileSize: number;
+};
+
+/**
+ * SPLIT-03: one validated LOCAL split-source artifact.
+ *
+ * Deliberately the same three fields as a single-source result. No upstream
+ * format id, selector, argv, source URL or codec string crosses the function
+ * boundary: those stay inside the private plan.
+ */
+export type GenericSplitSourceArtifact = {
+  /** Absolute path of the artifact, proven physically inside the workDir. */
+  readonly filePath: string;
+  /** That member's approved source container; equals the real extension. */
+  readonly container: string;
+  readonly fileSize: number;
+};
+
+/** SPLIT-03: the two acquired halves of one approved split pair. */
+export type GenericSplitSourcesDownload = {
+  readonly video: GenericSplitSourceArtifact;
+  readonly audio: GenericSplitSourceArtifact;
+  /** `video.fileSize + audio.fileSize`, proven within the combined budget. */
+  readonly totalFileSize: number;
 };
 
 export type GenericDownloadDeps = {
@@ -462,9 +604,9 @@ export async function downloadGenericOriginal(
   //
   // Unreachable today: no analysis path builds a split preset source, so
   // `deriveGenericExecutionPlan` cannot produce this operation. The refusal is
-  // the type narrowing AND the guarantee, so a future edit that starts building
-  // pairs before SPLIT-03 exists fails closed instead of downloading half a
-  // video.
+  // the type narrowing AND the guarantee: `downloadGenericSplitSources` is the
+  // ONLY acquisition API that consumes a pair, so a pair routed here by mistake
+  // fails closed instead of downloading half a video.
   if (checkedPlan.data.operation === "merge-split") {
     throw new AppError("FORMAT_UNAVAILABLE");
   }
@@ -489,11 +631,7 @@ export async function downloadGenericOriginal(
   //    acquisition SHARE it: giving the network run a fresh full budget after
   //    the probe already spent part of one would let the pair take up to twice
   //    what the configuration permits.
-  const budgetMs = Math.max(
-    YTDLP_DOWNLOAD_MIN_TIMEOUT_MS,
-    Math.floor(deps.limits.downloadTimeoutSeconds * 1000),
-  );
-  const deadline = clock() + budgetMs;
+  const deadline = clock() + acquisitionBudgetMs(deps.limits);
 
   const probeBudgetMs = Math.min(YTDLP_PROBE_TIMEOUT_MS, deadline - clock());
   if (probeBudgetMs <= 0) throw new AppError("TIMEOUT");
@@ -549,34 +687,11 @@ export async function downloadGenericOriginal(
       ? validPlan.source.fileSize
       : null;
 
-  // ── monitor liveness gate (CORRECTION-01 §7/§8) ──────────────────────────
-  //
-  // `clearInterval` alone proves nothing: a sample already suspended on a
-  // filesystem await resumes AFTER the timer is gone and would then emit
-  // progress or abort, crossing the acquisition -> processing boundary. Worse,
-  // by then the executor may have committed `beginProcessing()`, so a late
-  // `downloading` progress write would be a state conflict that aborts a job
-  // which had actually succeeded.
-  //
-  // So every side effect is gated on a liveness flag that `stopMonitor()` clears
-  // SYNCHRONOUSLY. Because the event loop is single-threaded, any continuation
-  // scheduled after that point observes `false` and becomes a pure no-op.
-  let monitorActive = true;
-
-  const sample = async () => {
-    if (!monitorActive) return;
-
-    // Either path may be absent: before yt-dlp creates the file, and after it
-    // renames `.part` away. Neither is an error.
-    const partSize = await statSize(partPath);
-    if (!monitorActive) return;
-
-    const finalSize = partSize === null ? await statSize(finalPath) : null;
-    if (!monitorActive) return;
-
-    const observed = partSize ?? finalSize;
-    if (observed === null) return;
-
+  // Every size the monitor observes for this run arrives here — and ONLY while
+  // the run's monitor is still live: `runMonitoredAcquisition` owns that
+  // liveness gate (CORRECTION-01 §7/§8). The byte policy and the progress
+  // arithmetic below are the single-source downloader's own, unchanged.
+  const onObserved = (observed: number) => {
     if (observed > maxBytes) {
       abortOnce("overflow", new AppError("TOO_LARGE"));
       return;
@@ -610,6 +725,131 @@ export async function downloadGenericOriginal(
     });
   };
 
+  try {
+    await runMonitoredAcquisition({
+      runner,
+      buildArgv: () =>
+        buildYtdlpDownloadArgv({
+          validatedUrl: safeUrl,
+          workDir,
+          plan: validPlan,
+          maxFileSizeBytes: maxBytes,
+        }),
+      workDir,
+      timeoutMs: networkTimeoutMs,
+      signal: controller.signal,
+      callerSignal: deps.signal,
+      abortCause: () => abortCause,
+      partPath,
+      finalPath,
+      statSize,
+      pollMs,
+      onObserved,
+    });
+  } finally {
+    deps.signal?.removeEventListener("abort", relayCallerAbort);
+  }
+
+  return validateAcquiredSource({
+    workDir,
+    container,
+    finalPath,
+    maxBytes,
+    readDir,
+  });
+}
+
+/**
+ * The ONE subprocess budget of an acquisition call, floored like analysis.
+ *
+ * Shared, so a split pair is bounded by exactly the configured limit a single
+ * source is — the same `downloadTimeoutSeconds`, the same floor — and never by
+ * a budget of its own.
+ */
+function acquisitionBudgetMs(limits: GenericDownloadLimits): number {
+  return Math.max(
+    YTDLP_DOWNLOAD_MIN_TIMEOUT_MS,
+    Math.floor(limits.downloadTimeoutSeconds * 1000),
+  );
+}
+
+// ── One monitored acquisition subprocess (shared) ────────────────────────────
+
+/**
+ * Runs ONE acquisition subprocess under the actual-byte monitor (§30), and
+ * resolves only once it has exited zero — with its monitor already dead.
+ *
+ * Shared by the single-source downloader and by EACH half of a split pair, so
+ * the load-bearing lifecycle rules below exist once rather than in two copies
+ * that could drift. It owns no byte policy and no progress arithmetic:
+ * `onObserved` receives the size observed for THIS run's `.part`/final path and
+ * decides both.
+ *
+ * Nor does it own an abort cause. The first-cause latch belongs to the calling
+ * OPERATION and is only read here, through `abortCause`, so the two runs of a
+ * split pair are interpreted by one latch rather than two that could disagree.
+ */
+async function runMonitoredAcquisition(opts: {
+  readonly runner: typeof runProcess;
+  /**
+   * Built lazily, inside the guarded region — where the single-source
+   * downloader has always built it — so an argv failure is classified by the
+   * same catch as every other failure of the run.
+   */
+  readonly buildArgv: () => readonly string[];
+  readonly workDir: string;
+  readonly timeoutMs: number;
+  /** The operation-owned controller's signal: one abort path to the group. */
+  readonly signal: AbortSignal;
+  /** The caller's own signal, consulted only to recognise a real cancellation. */
+  readonly callerSignal: AbortSignal | undefined;
+  /** Reads the operation's one-way first-cause latch. */
+  readonly abortCause: () => AbortCause;
+  readonly partPath: string;
+  readonly finalPath: string;
+  readonly statSize: (path: string) => Promise<number | null>;
+  readonly pollMs: number;
+  /** Called synchronously, and ONLY while this run's monitor is live. */
+  readonly onObserved: (observed: number) => void;
+}): Promise<void> {
+  const { statSize, partPath, finalPath } = opts;
+
+  // ── monitor liveness gate (CORRECTION-01 §7/§8) ──────────────────────────
+  //
+  // `clearInterval` alone proves nothing: a sample already suspended on a
+  // filesystem await resumes AFTER the timer is gone and would then emit
+  // progress or abort, crossing the acquisition -> processing boundary. Worse,
+  // by then the executor may have committed `beginProcessing()`, so a late
+  // `downloading` progress write would be a state conflict that aborts a job
+  // which had actually succeeded.
+  //
+  // So every side effect is gated on a liveness flag that `stopMonitor()` clears
+  // SYNCHRONOUSLY. Because the event loop is single-threaded, any continuation
+  // scheduled after that point observes `false` and becomes a pure no-op.
+  //
+  // SPLIT-03: the flag is per RUN. When a split pair's video run settles, its
+  // monitor is dead before the video artifact is validated, before the audio
+  // monitor exists and before the audio child is spawned — so a late video
+  // sample can neither report progress during audio nor abort the audio child.
+  let monitorActive = true;
+
+  const sample = async () => {
+    if (!monitorActive) return;
+
+    // Either path may be absent: before yt-dlp creates the file, and after it
+    // renames `.part` away. Neither is an error.
+    const partSize = await statSize(partPath);
+    if (!monitorActive) return;
+
+    const finalSize = partSize === null ? await statSize(finalPath) : null;
+    if (!monitorActive) return;
+
+    const observed = partSize ?? finalSize;
+    if (observed === null) return;
+
+    opts.onObserved(observed);
+  };
+
   let timer: ReturnType<typeof setInterval> | null = null;
   let sampling = false;
   const startMonitor = () => {
@@ -624,7 +864,7 @@ export async function downloadGenericOriginal(
         .finally(() => {
           sampling = false;
         });
-    }, pollMs);
+    }, opts.pollMs);
     // The timer must never keep the process alive on its own (§31).
     timer.unref?.();
   };
@@ -646,25 +886,19 @@ export async function downloadGenericOriginal(
   let result: RunResult;
   try {
     startMonitor();
-    result = await runner({
+    result = await opts.runner({
       command: YTDLP_RUNTIME.pythonPath,
-      args: [
-        ...buildYtdlpDownloadArgv({
-          validatedUrl: safeUrl,
-          workDir,
-          plan: validPlan,
-          maxFileSizeBytes: maxBytes,
-        }),
-      ],
-      timeoutMs: networkTimeoutMs,
-      env: buildYtdlpDownloadEnvironment({ workDir }),
-      signal: controller.signal,
+      args: [...opts.buildArgv()],
+      timeoutMs: opts.timeoutMs,
+      env: buildYtdlpDownloadEnvironment({ workDir: opts.workDir }),
+      signal: opts.signal,
       maxStdoutBytes: YTDLP_DOWNLOAD_MAX_STDOUT_BYTES,
       maxStderrBytes: YTDLP_DOWNLOAD_MAX_STDERR_BYTES,
     });
     // Disarm on the success path too, synchronously, so no in-flight sample can
-    // emit progress or abort while the artifact is being validated and the
-    // executor moves on to `beginProcessing()`.
+    // emit progress or abort while the artifact is being validated, while the
+    // next half of a split pair starts, or once the executor moves on to
+    // `beginProcessing()`.
     stopMonitor();
   } catch (err: unknown) {
     // Disarm FIRST, before anything is interpreted. Otherwise a sample whose
@@ -676,9 +910,9 @@ export async function downloadGenericOriginal(
     // the signal so it cannot be misreported as the user's own cancel (§30) —
     // and, because the cause latch is one-way, a caller abort that arrived
     // afterwards cannot overwrite it either.
-    if (abortCause === "overflow") throw new AppError("TOO_LARGE");
+    if (opts.abortCause() === "overflow") throw new AppError("TOO_LARGE");
     // Real cancellation propagates verbatim so the executor can tell it apart.
-    if (deps.signal?.aborted) throw err;
+    if (opts.callerSignal?.aborted) throw err;
     if (err instanceof ProcessOutputLimitError) {
       // Over-limit output is never surfaced. The process group is already
       // terminated by the runner.
@@ -688,7 +922,6 @@ export async function downloadGenericOriginal(
     throw new AppError("EXTRACTOR_UNAVAILABLE");
   } finally {
     stopMonitor();
-    deps.signal?.removeEventListener("abort", relayCallerAbort);
   }
 
   if (result.code !== 0) {
@@ -697,14 +930,311 @@ export async function downloadGenericOriginal(
     // attached to the thrown error, or returned.
     throw new AppError(classifyDownloadFailure(`${result.stderr}\n${result.stdout}`));
   }
+}
 
-  return validateAcquiredSource({
-    workDir,
+// ── The split-pair downloader (SPLIT-03) ─────────────────────────────────────
+
+/** One half's fixed, role-derived destination. */
+type SplitHalfPaths = {
+  readonly role: GenericSplitRole;
+  readonly container: string;
+  /** The exact directory entry a successful run of this half leaves behind. */
+  readonly name: string;
+  readonly finalPath: string;
+  readonly partPath: string;
+};
+
+function splitHalfPaths(workDir: string, role: GenericSplitRole, container: string): SplitHalfPaths {
+  return {
+    role,
     container,
-    finalPath,
-    maxBytes,
-    readDir,
-  });
+    name: `${YTDLP_SPLIT_OUTPUT_BASENAMES[role]}.${container}`,
+    finalPath: expectedSplitSourcePath(workDir, role, container),
+    partPath: expectedSplitPartPath(workDir, role, container),
+  };
+}
+
+/**
+ * The aggregate total for PROGRESS, or `null`.
+ *
+ * Known only when BOTH members reported a positive safe-integer size and their
+ * safe sum fits the combined budget. It is a progress hint and nothing else:
+ * no byte decision anywhere reads it, in either direction (§15).
+ */
+function splitKnownTotal(
+  pair: GenericSplitExecutionPlan["pair"],
+  maxBytes: number,
+): number | null {
+  const video = pair.video.fileSize;
+  const audio = pair.audio.fileSize;
+  if (video === null || audio === null) return null;
+  if (!Number.isSafeInteger(video) || !Number.isSafeInteger(audio)) return null;
+  if (video <= 0 || audio <= 0) return null;
+  const sum = video + audio;
+  return Number.isSafeInteger(sum) && sum <= maxBytes ? sum : null;
+}
+
+/**
+ * Acquires BOTH sources of one approved split pair: the video-only member,
+ * then the audio-only member, as two independent single-source yt-dlp runs.
+ *
+ * NOT REACHABLE YET. No analysis path builds a split preset source, so no
+ * `merge-split` plan exists in Production, and the JobExecutor does not call
+ * this function. It is the acquisition primitive executor integration will
+ * wire in, reviewed first so its bounds are fixed before anything can reach it.
+ *
+ * Order of operations is a security property:
+ *
+ *   1. re-validate the plan — a pair, and nothing else;
+ *   2. re-validate the submitted URL (§25) — ONE URL, used by both halves;
+ *   3. refuse an already-cancelled caller;
+ *   4. fix ONE deadline for the whole call;
+ *   5. verify the EXACT pinned runtime, ONCE;
+ *   6. VIDEO: exactly-empty workDir -> acquire -> validate;
+ *   7. AUDIO: exactly-{video} workDir -> acquire within the REMAINING time and
+ *      bytes -> validate;
+ *   8. assert the combined size one final time.
+ *
+ * Steps 1-3 complete before ANY process is spawned, exactly as for a single
+ * source. Everything after them shares:
+ *
+ *   - ONE deadline: probe + video + audio together get the configured budget
+ *     once, never a fresh budget per subprocess;
+ *   - ONE combined byte budget: `videoBytes + audioBytes <= maxFileSizeBytes`,
+ *     enforced on ACTUAL bytes — extractor-reported sizes are progress hints,
+ *     never authority;
+ *   - ONE operation-owned AbortController linked to the caller, reaching
+ *     whichever subprocess currently owns execution;
+ *   - ONE first-cause latch, so a cancellation stays a cancellation and an
+ *     overflow stays TOO_LARGE whichever half was running;
+ *   - ONE monotonic aggregate progress stream.
+ *
+ * Strictly sequential, video first. The halves never overlap, which is what
+ * keeps the byte budget, the deadline, cancellation and failure attribution
+ * simple enough to audit.
+ *
+ * It performs NO local media work — no FFmpeg, no ffprobe, no merge — and
+ * imports nothing that could. A failure of EITHER half fails the whole call:
+ * there is no partial result, no substitute source and no retry. The workDir is
+ * left to its lifecycle owner, the JobExecutor, to remove.
+ */
+export async function downloadGenericSplitSources(
+  url: string,
+  workDir: string,
+  plan: GenericSplitExecutionPlan,
+  deps: GenericDownloadDeps,
+): Promise<GenericSplitSourcesDownload> {
+  const runner = deps.runner ?? runProcess;
+  const probe = deps.probeRuntime ?? probeYtdlpRuntime;
+  const validate = deps.validateUrl ?? assertSafeUrl;
+  const clock = deps.clock ?? Date.now;
+  const statSize = deps.statSize ?? defaultStatSize;
+  const readDir = deps.readDir ?? ((p: string) => fsReaddir(p));
+  const pollMs = deps.sizePollMs ?? YTDLP_DOWNLOAD_SIZE_POLL_MS;
+
+  // 1. The plan is re-parsed rather than trusted. The whole-plan schema is the
+  //    authority for everything a pair must satisfy — `strategy: "yt-dlp"`,
+  //    the SPLIT-01 pair invariants, the closed video-preset vocabulary, and a
+  //    target equal to the closed pair table's — so none of that is restated
+  //    here as a check that could never fire. What this adds is the refusal of
+  //    every OTHER operation: the input type already excludes single-source
+  //    plans, and this makes it true at runtime as well.
+  const checkedPlan = GenericExecutionPlanSchema.safeParse(plan);
+  if (!checkedPlan.success) throw new AppError("FORMAT_UNAVAILABLE");
+  if (checkedPlan.data.operation !== "merge-split") throw new AppError("FORMAT_UNAVAILABLE");
+  const validPlan = checkedPlan.data;
+
+  if (!isAbsolute(workDir)) throw new AppError("PROCESSING_FAILED");
+  const maxBytes = deps.limits.maxFileSizeBytes;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new AppError("PROCESSING_FAILED");
+  }
+
+  // Each half's fixed final and `.part` paths, from ROLE + approved container.
+  // The role basenames differ, so these four paths cannot collide — and that is
+  // proven here, before anything runs, rather than assumed (§18).
+  const video = splitHalfPaths(workDir, "video", validPlan.pair.video.container);
+  const audio = splitHalfPaths(workDir, "audio", validPlan.pair.audio.container);
+  const paths = [video.finalPath, video.partPath, audio.finalPath, audio.partPath];
+  if (new Set(paths).size !== paths.length) throw new AppError("PROCESSING_FAILED");
+
+  // 2. The Worker's own URL/SSRF validation, ONCE, before anything is spawned.
+  //    Both halves use this same validated URL: the API has no way to accept
+  //    a second one.
+  const { url: safeUrl } = await validate(url);
+
+  // 3. An already-cancelled caller gets no subprocess at all.
+  if (deps.signal?.aborted) {
+    throw new AppError("PROCESSING_FAILED", "Download was cancelled.");
+  }
+
+  // 4. ONE deadline for the WHOLE call — probe, video and audio. Each
+  //    subprocess receives only what is left of it.
+  const deadline = clock() + acquisitionBudgetMs(deps.limits);
+
+  // ONE operation-owned controller and ONE first-cause latch for the whole
+  // call, linked to the caller before the probe starts, so user cancellation
+  // and operator shutdown reach whichever subprocess currently owns execution
+  // and both halves are interpreted by the same latch (CORRECTION-01 §11).
+  const controller = new AbortController();
+  let abortCause: AbortCause = null;
+  const abortOnce = (cause: NonNullable<AbortCause>, reason: unknown) => {
+    if (abortCause !== null) return;
+    abortCause = cause;
+    controller.abort(reason);
+  };
+  const relayCallerAbort = () => abortOnce("caller", deps.signal?.reason);
+  if (deps.signal) {
+    if (deps.signal.aborted) relayCallerAbort();
+    else deps.signal.addEventListener("abort", relayCallerAbort, { once: true });
+  }
+
+  // Nothing is running between the halves, so a pending abort there is a
+  // caller cancellation — or an overflow the video run latched in its final
+  // instant. The latch decides which, exactly as it does mid-run.
+  const throwIfAborted = () => {
+    if (!controller.signal.aborted) return;
+    if (abortCause === "overflow") throw new AppError("TOO_LARGE");
+    throw new AppError("PROCESSING_FAILED", "Download was cancelled.");
+  };
+
+  try {
+    // 5. The EXACT pinned runtime, probed ONCE for both halves, inside the
+    //    shared deadline and under the operation's controller.
+    const probeBudgetMs = Math.min(YTDLP_PROBE_TIMEOUT_MS, deadline - clock());
+    if (probeBudgetMs <= 0) throw new AppError("TIMEOUT");
+    const runtime = await probe({ signal: controller.signal, timeoutMs: probeBudgetMs });
+    if (!runtime.available) throw new AppError("EXTRACTOR_UNAVAILABLE");
+
+    // ── one monotonic aggregate progress stream (§31-§37) ──────────────────
+    //
+    // The durable job just says `downloading`, so the stream is ONE stream,
+    // never "video 0->100, then audio 0->100". `downloadedBytes` counts actual
+    // bytes: the observed video bytes, then the VALIDATED video bytes plus the
+    // observed audio bytes.
+    const knownTotal = splitKnownTotal(validPlan.pair, maxBytes);
+    const startedAt = clock();
+    let reportedBytes = 0;
+    const report = (aggregate: number) => {
+      // A monotonic floor: a restarted `.part` must never make the aggregate
+      // visibly move backwards.
+      reportedBytes = Math.max(reportedBytes, aggregate);
+      if (!deps.onProgress) return;
+      const downloaded = reportedBytes;
+      const now = clock();
+      // Averaged over the whole acquisition, and NOT reset at the audio
+      // boundary.
+      const speed =
+        now > startedAt ? Math.max(0, (downloaded * 1000) / (now - startedAt)) : null;
+      deps.onProgress({
+        // Without a coherent total there is no honest percentage — and never
+        // one made up from the configured maximum.
+        progress:
+          knownTotal !== null
+            ? Math.min(100, Math.max(0, (downloaded / knownTotal) * 100))
+            : null,
+        downloadedBytes: downloaded,
+        totalBytes: knownTotal,
+        speed,
+        eta:
+          knownTotal !== null && speed !== null && speed > 0
+            ? Math.max(0, (knownTotal - downloaded) / speed)
+            : null,
+        stage: "Downloading",
+      });
+    };
+
+    /**
+     * One half: exact prior directory state -> spawn within the REMAINING time
+     * and bytes -> exact posterior directory state -> independent artifact
+     * proof. No ffprobe: stream shape was approved by fresh analysis and bound
+     * by the selector; probing local media is processing, not downloading.
+     */
+    const acquireHalf = async (
+      half: SplitHalfPaths,
+      acquiredBytes: number,
+      entriesBefore: readonly string[],
+    ): Promise<GenericSplitSourceArtifact> => {
+      // Refuses ANY residue — including a pre-existing entry at this half's own
+      // final or `.part` path (§41). Nothing is deleted and continued past.
+      await assertExactEntries(workDir, entriesBefore, readDir);
+
+      // Synchronous from here to the spawn, so nothing can interleave between
+      // these checks and the child starting.
+      throwIfAborted();
+      const allowance = maxBytes - acquiredBytes;
+      if (allowance <= 0) throw new AppError("TOO_LARGE");
+      const timeoutMs = deadline - clock();
+      if (timeoutMs <= 0) throw new AppError("TIMEOUT");
+
+      await runMonitoredAcquisition({
+        runner,
+        buildArgv: () =>
+          buildYtdlpSplitDownloadArgv({
+            validatedUrl: safeUrl,
+            workDir,
+            plan: validPlan,
+            role: half.role,
+            maxFileSizeBytes: allowance,
+          }),
+        workDir,
+        timeoutMs,
+        signal: controller.signal,
+        callerSignal: deps.signal,
+        abortCause: () => abortCause,
+        partPath: half.partPath,
+        finalPath: half.finalPath,
+        statSize,
+        pollMs,
+        onObserved: (observed) => {
+          // The COMBINED live guard: bytes already validated for earlier halves
+          // plus this half's observed bytes, measured from actual files.
+          if (acquiredBytes + observed > maxBytes) {
+            abortOnce("overflow", new AppError("TOO_LARGE"));
+            return;
+          }
+          report(acquiredBytes + observed);
+        },
+      });
+
+      await assertExactEntries(workDir, [...entriesBefore, half.name], readDir);
+      return statAcquiredArtifact({
+        workDir,
+        container: half.container,
+        finalPath: half.finalPath,
+        maxBytes: allowance,
+      });
+    };
+
+    // 6. VIDEO first, from an EMPTY job directory, with the whole byte budget.
+    const videoArtifact = await acquireHalf(video, 0, []);
+
+    // 7. AUDIO second — only after the video artifact is proven — with only what
+    //    the video left of the deadline and of the byte budget.
+    const audioArtifact = await acquireHalf(audio, videoArtifact.fileSize, [video.name]);
+
+    // The audio run shared the job directory, so the video artifact returned
+    // must still be the one that was validated.
+    const videoNow = await statAcquiredArtifact({
+      workDir,
+      container: video.container,
+      finalPath: video.finalPath,
+      maxBytes,
+    });
+    if (videoNow.fileSize !== videoArtifact.fileSize) throw new AppError("PROCESSING_FAILED");
+
+    // 8. The acquisition layer's final combined-size assertion. The merged
+    //    output is bounded again, separately, by the merge primitive; neither
+    //    check replaces the other, and no merge headroom is assumed here.
+    const totalFileSize = videoArtifact.fileSize + audioArtifact.fileSize;
+    if (!Number.isSafeInteger(totalFileSize) || totalFileSize > maxBytes) {
+      throw new AppError("TOO_LARGE");
+    }
+
+    return { video: videoArtifact, audio: audioArtifact, totalFileSize };
+  } finally {
+    deps.signal?.removeEventListener("abort", relayCallerAbort);
+  }
 }
 
 // ── Final artifact validation (§29) ──────────────────────────────────────────
@@ -727,22 +1257,62 @@ async function validateAcquiredSource(opts: {
 }): Promise<GenericOriginalDownload> {
   const { workDir, container, finalPath, maxBytes, readDir } = opts;
 
-  let entries: string[];
-  try {
-    entries = await readDir(workDir);
-  } catch {
-    throw new AppError("PROCESSING_FAILED");
-  }
-
   const expectedName = `${YTDLP_DOWNLOAD_OUTPUT_BASENAME}.${container}`;
 
   // A successful run leaves EXACTLY the one expected file. This single check
   // subsumes: a surviving `.part`, retained fragments (`.part-FragN`), a second
   // media file from a merge that should not have happened, and any side file a
   // future option might write.
-  if (entries.length !== 1 || entries[0] !== expectedName) {
+  await assertExactEntries(workDir, [expectedName], readDir);
+
+  return statAcquiredArtifact({ workDir, container, finalPath, maxBytes });
+}
+
+/**
+ * Proves the job directory holds EXACTLY `expected` — no more, no fewer —
+ * whatever order the directory happens to enumerate in.
+ *
+ * Shared by both primitives. The single-source downloader expects one name; a
+ * split pair expects, in turn, nothing, then the video artifact, then both.
+ * An unexpected entry is refused rather than guessed about: picking "the
+ * probable file" out of an unexpected directory is exactly how a fragment or
+ * a leftover artifact becomes the delivered media.
+ */
+async function assertExactEntries(
+  workDir: string,
+  expected: readonly string[],
+  readDir: (path: string) => Promise<string[]>,
+): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await readDir(workDir);
+  } catch {
     throw new AppError("PROCESSING_FAILED");
   }
+  if (!sameEntries(entries, expected)) throw new AppError("PROCESSING_FAILED");
+}
+
+/** Order-independent exact equality, duplicates included. */
+function sameEntries(actual: readonly string[], expected: readonly string[]): boolean {
+  if (actual.length !== expected.length) return false;
+  const a = [...actual].sort();
+  const e = [...expected].sort();
+  return a.every((name, i) => name === e[i]);
+}
+
+/**
+ * Containment, symlink, regular-file and size proof for ONE acquired artifact.
+ *
+ * `maxBytes` is that artifact's allowance: the whole limit for a single source
+ * or a split pair's video half, and only the remainder for its audio half.
+ */
+async function statAcquiredArtifact(opts: {
+  workDir: string;
+  container: string;
+  finalPath: string;
+  maxBytes: number;
+}): Promise<GenericOriginalDownload> {
+  const { workDir, container, finalPath, maxBytes } = opts;
 
   // Containment, symlink and regular-file checks against the CANONICAL path.
   const resolvedWorkDir = resolve(workDir);

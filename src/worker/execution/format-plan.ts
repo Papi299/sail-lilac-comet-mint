@@ -435,6 +435,20 @@ export type GenericSingleSourceExecutionPlan = Exclude<
 >;
 
 /**
+ * SPLIT-03: the ONE plan variant that names an approved video-only + audio-only
+ * PAIR — the exact complement of `GenericSingleSourceExecutionPlan`.
+ *
+ * The dual-source acquisition primitive takes this rather than the whole union,
+ * so "this function acquires a pair" is a TYPE statement as well: a
+ * single-source plan cannot be handed to it even by mistake, and the two
+ * acquisition APIs cannot be asked to do each other's job.
+ */
+export type GenericSplitExecutionPlan = Extract<
+  GenericExecutionPlan,
+  { operation: "merge-split" }
+>;
+
+/**
  * §18 + §37 + §38: derives the generic plan for one requested preset.
  *
  * The requested preset must still be present in the FRESH analysis. If the site
