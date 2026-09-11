@@ -186,6 +186,51 @@ export const GENERIC_VIDEO_CONSTRAINTS = Object.freeze([
 export const GenericVideoConstraintSchema = z.enum(GENERIC_VIDEO_CONSTRAINTS);
 export type GenericVideoConstraint = z.infer<typeof GenericVideoConstraintSchema>;
 
+// ── What analysis knew about audio (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001) ──
+
+/**
+ * The closed set of AUDIO states generic analysis can record for a source — and
+ * therefore the closed set of acquisition constraints that can re-select it.
+ *
+ * It mirrors `classifyCodecState(acodec)` one-for-one, because the pinned
+ * runtime really does report three different things and a boolean can only
+ * hold two of them:
+ *
+ *   `codec-present`  the extractor named a real audio codec. Audio presence is
+ *                    PROVEN, and only this state may be bound with the strict
+ *                    `[acodec!="none"]` constraint.
+ *
+ *   `absent`         the extractor said `acodec == "none"` — audio is proven
+ *                    ABSENT, not merely unknown.
+ *
+ *   `unknown`        `acodec` was null, empty, `"null"` or missing. This is the
+ *                    ordinary Generic HTML5 case when the page's
+ *                    `<source type>` carries no `codecs=` parameter:
+ *                    `parse_codecs` returns `{}` and the key is never set at
+ *                    all. It is NOT a statement that audio is missing — and not
+ *                    a statement that it is there either.
+ *
+ * Before this enum existed, unknown was collapsed into `hasAudio: false`, and
+ * that boolean then rebuilt the selector as `[acodec="none"]` — a filter the
+ * pinned runtime can never match against the `acodec: None` format it came
+ * from. The incoherence was unreachable only because no generic preset is
+ * built on a source without proven audio; the enum makes it unrepresentable.
+ *
+ * Unlike `GenericVideoConstraint`, `unknown` IS a member. An unknown audio state
+ * can be re-selected honestly (`[acodec!=?"none"]`), so it is a coherent private
+ * description of a source. Whether such a source may be ADVERTISED is a
+ * separate question, answered by preset construction: under generic v1 it may
+ * not, because nothing proves it carries audio.
+ */
+export const GENERIC_AUDIO_CONSTRAINTS = Object.freeze([
+  "codec-present",
+  "absent",
+  "unknown",
+] as const);
+
+export const GenericAudioConstraintSchema = z.enum(GENERIC_AUDIO_CONSTRAINTS);
+export type GenericAudioConstraint = z.infer<typeof GenericAudioConstraintSchema>;
+
 // ── The private execution source descriptor ──────────────────────────────────
 
 /**
@@ -205,6 +250,14 @@ export const GenericSourceSelectionSchema = z
     protocol: GenericSourceProtocolSchema,
     container: GenericSourceContainerSchema,
     hasVideo: z.boolean(),
+    /**
+     * Audio presence is PROVEN — exactly `audioConstraint === "codec-present"`.
+     *
+     * Retained for the execution planner, which gates every current generic
+     * plan on proven audio. It does NOT mean "might have audio": an unknown
+     * audio state is `false` here and `unknown` in `audioConstraint`, and the
+     * selector reads only the latter.
+     */
     hasAudio: z.boolean(),
     /**
      * HOW video presence was established, so acquisition can rebuild the exact
@@ -216,6 +269,16 @@ export const GenericSourceSelectionSchema = z
      * same extent the rest of this structure is.
      */
     videoConstraint: GenericVideoConstraintSchema,
+    /**
+     * WHAT analysis knew about audio, so acquisition can rebuild the exact
+     * constraint analysis approved rather than squeezing an unknown state into
+     * a boolean (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
+     *
+     * The SOLE authority for the selector's audio half. Application-owned,
+     * closed, and private to exactly the same extent as `videoConstraint`: it
+     * never carries, encodes or paraphrases the upstream codec string.
+     */
+    audioConstraint: GenericAudioConstraintSchema,
     /** Known upstream size, when the extractor reported one. Never trusted alone. */
     fileSize: z.number().int().positive().nullable(),
   })
@@ -233,6 +296,20 @@ export const GenericSourceSelectionSchema = z
       });
     }
 
+    // The audio fields are likewise one fact stated twice, but the boolean is
+    // deliberately the NARROWER statement: `hasAudio` means audio is PROVEN.
+    // An unknown audio state is `hasAudio: false` — never true, because nothing
+    // establishes it, and never `absent`, because nothing establishes that
+    // either.
+    const provesAudio = selection.audioConstraint === "codec-present";
+    if (selection.hasAudio !== provesAudio) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["audioConstraint"],
+        message: "hasAudio must be true exactly when audioConstraint is codec-present",
+      });
+    }
+
     // A video-bearing source's container must be one this product can actually
     // deliver verbatim; an absent-video source's must be an audio container.
     // Both mirror `toGenericSourceContainer`, which is what produced the value.
@@ -247,7 +324,9 @@ export const GenericSourceSelectionSchema = z
       });
     }
 
-    // A descriptor carrying neither stream describes nothing acquirable.
+    // A descriptor PROVING neither stream describes nothing acquirable. Because
+    // `hasAudio` means proven audio, this also refuses an audio-only shape
+    // whose audio is merely unknown.
     if (!selection.hasVideo && !selection.hasAudio) {
       ctx.addIssue({
         code: "custom",
@@ -353,11 +432,12 @@ export function buildGenericFormatSelector(selection: GenericSourceSelection): s
     `[protocol=${quoteFilterValue(parsed.protocol)}]`,
     `[ext=${quoteFilterValue(parsed.container)}]`,
     ...videoShapeFilters(parsed),
-    // Audio shape. `acodec` is the ONLY audio-presence authority here.
-    // `audio_ext` is deliberately absent: `_fill_sorting_fields` sets it to
-    // "none" on every format whose `vcodec != "none"`, so `[audio_ext!="none"]`
-    // would match NOTHING for a real muxed source (§17, §D1).
-    parsed.hasAudio ? `[acodec!=${quoteFilterValue("none")}]` : `[acodec=${quoteFilterValue("none")}]`,
+    // Audio shape. `acodec` is the ONLY audio-presence authority here, and the
+    // private `audioConstraint` — never the boolean `hasAudio` — decides which
+    // form it takes. `audio_ext` is deliberately absent: `_fill_sorting_fields`
+    // sets it to "none" on every format whose `vcodec != "none"`, so
+    // `[audio_ext!="none"]` would match NOTHING for a real muxed source (§17, §D1).
+    audioShapeFilter(parsed),
   ];
 
   return `${GENERIC_FORMAT_SELECTOR_ATOM}${filters.join("")}`;
@@ -405,5 +485,43 @@ function videoShapeFilters(parsed: GenericSourceSelection): string[] {
       ];
     case "absent":
       return [`[vcodec=${quoteFilterValue("none")}]`];
+  }
+}
+
+/**
+ * The audio half of the selector, chosen by WHAT analysis knew about audio
+ * (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
+ *
+ * The same `_build_format_filter` predicate governs it (see
+ * `videoShapeFilters`): a Python `None` field never reaches the operator and
+ * matches only a none-inclusive filter. Verified against 2026.08.19 inside the
+ * accepted image, for a real HTML5 format whose `acodec` key is absent:
+ *
+ *     [acodec="none"]    missing -> NO MATCH   "mp4a.40.2" -> NO MATCH   "none" -> match
+ *     [acodec!="none"]   missing -> NO MATCH   "mp4a.40.2" -> match      "none" -> NO MATCH
+ *     [acodec!=?"none"]  missing -> match      "mp4a.40.2" -> match      "none" -> NO MATCH
+ *
+ * So each state gets the one form that re-selects exactly what it approved:
+ *
+ *   `codec-present`  strict. A proven codec is not weakened because an unknown
+ *                    state now exists, and a source that LOST its codec
+ *                    identity is no longer the approved shape.
+ *   `absent`         strict equality. Only the explicit marker was approved.
+ *   `unknown`        none-inclusive. The codec may become better described,
+ *                    but a transition to PROVEN absence must fail selection —
+ *                    the same rule the `video-ext` constraint follows.
+ *
+ * Re-selecting an unknown state proves nothing about the file. It is a property
+ * of selector coherence, and it never licenses advertising a source as carrying
+ * audio.
+ */
+function audioShapeFilter(parsed: GenericSourceSelection): string {
+  switch (parsed.audioConstraint) {
+    case "codec-present":
+      return `[acodec!=${quoteFilterValue("none")}]`;
+    case "absent":
+      return `[acodec=${quoteFilterValue("none")}]`;
+    case "unknown":
+      return `[acodec!=?${quoteFilterValue("none")}]`;
   }
 }
