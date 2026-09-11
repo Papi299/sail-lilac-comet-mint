@@ -14,6 +14,13 @@ binds 127.0.0.1 only  ─────────►  random *.trycloudflare.com
 > **This is test infrastructure.** It is never part of the Production Worker
 > service graph, never persistent, never autostarted, and never given a secret.
 
+> **SPLIT-06 adds a fifth, optional fixture set to the same service.** It is
+> configured independently (`split:`), serves a closed set of DASH manifests and
+> single-stream media halves, and is used by a completely different acceptance
+> stage: offline, `--network none`, loopback only, **never** exposed through a
+> tunnel. When it is not configured its routes do not exist, and everything
+> below is unchanged. See [`../SPLIT-06.md`](../SPLIT-06.md).
+
 ## Why the fixtures exist
 
 Phase 10D asserts properties of the Worker — the application byte watcher, the

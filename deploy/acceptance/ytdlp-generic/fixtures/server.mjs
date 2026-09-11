@@ -36,6 +36,22 @@
 //   GET  /byte-evidence                        this case's own observations
 //   GET  /safe-egress                          fixed private-v4 destination
 //
+// SPLIT-06 adds an OPTIONAL second fixture set, configured independently of
+// the Phase-10D one and serving a different acceptance stage — deterministic
+// local split-stream media inside a `--network none` container, never a public
+// tunnel. When `split` is not configured these routes do not exist at all:
+//
+//   GET  /split-mp4.mpd            (+HEAD)   pairable ISO-BMFF DASH manifest
+//   GET  /split-webm.mpd           (+HEAD)   pairable Matroska DASH manifest
+//   GET  /split-incompatible.mpd   (+HEAD)   an mp4+webm pair the table refuses
+//   GET  /split-video.mp4          (+HEAD)   the video-only ISO-BMFF half
+//   GET  /split-audio.m4a          (+HEAD)   the audio-only ISO-BMFF half
+//   GET  /split-video.webm         (+HEAD)   the video-only Matroska half
+//   GET  /split-audio.webm         (+HEAD)   the audio-only Matroska half
+//
+// Every one of them maps to ONE predeclared artifact this process already
+// holds in memory. There is no path-to-file mapping here either.
+//
 // Anything else is 404. An unsupported method on a known route is 405.
 
 import { createHash } from "node:crypto";
@@ -406,6 +422,112 @@ function sendText(res, status, text) {
   res.end(payload);
 }
 
+// ── The SPLIT-06 fixture set ───────────────────────────────────────────────
+
+/**
+ * The route paths SPLIT-06 declares, as a CLOSED table.
+ *
+ * The keys are the only split routes that can exist. Each maps to exactly one
+ * body supplied at construction time, so — as with every other route here —
+ * there is no request input from which a filesystem path could be built, and a
+ * traversal attempt has nothing to traverse.
+ */
+export const SPLIT_MANIFEST_ROUTES = Object.freeze([
+  "/split-mp4.mpd",
+  "/split-webm.mpd",
+  "/split-incompatible.mpd",
+]);
+
+export const SPLIT_MEDIA_ROUTES = Object.freeze([
+  "/split-video.mp4",
+  "/split-audio.m4a",
+  "/split-video.webm",
+  "/split-audio.webm",
+]);
+
+/** The exact `Content-Type` each split route answers with. Fixed in source. */
+export const SPLIT_ROUTE_CONTENT_TYPES = Object.freeze({
+  "/split-mp4.mpd": "application/dash+xml",
+  "/split-webm.mpd": "application/dash+xml",
+  "/split-incompatible.mpd": "application/dash+xml",
+  "/split-video.mp4": "video/mp4",
+  "/split-audio.m4a": "audio/mp4",
+  "/split-video.webm": "video/webm",
+  "/split-audio.webm": "audio/webm",
+});
+
+/** The Phase-10D route set, named positively so it can be gated as a whole. */
+export const PHASE_10D_ROUTES = Object.freeze([
+  "/direct.mp4",
+  "/generic",
+  "/generic-media.mp4",
+  "/byte-limit",
+  "/byte-limit-media.mp4",
+  "/byte-evidence",
+  "/safe-egress",
+]);
+
+/** True when `route` is one of the closed SPLIT-06 routes. */
+function isSplitRoute(route) {
+  return SPLIT_MANIFEST_ROUTES.includes(route) || SPLIT_MEDIA_ROUTES.includes(route);
+}
+
+/**
+ * Validates and freezes the caller's split fixture set.
+ *
+ * Fail-closed and EXACT: every declared route must be present, must be a
+ * non-empty Buffer, and no route outside the closed table may be supplied.
+ * A partially configured split set would make "which routes exist" depend on
+ * what the operator remembered, which is the property the closed table exists
+ * to remove.
+ */
+function buildSplitRouteTable(split) {
+  const manifests = split?.manifests;
+  const artifacts = split?.artifacts;
+  if (!manifests || typeof manifests !== "object") {
+    throw new Error("the split fixture set must supply a `manifests` map");
+  }
+  if (!artifacts || typeof artifacts !== "object") {
+    throw new Error("the split fixture set must supply an `artifacts` map");
+  }
+
+  const bodies = new Map();
+  const digests = new Map();
+  for (const [routes, supplied, label] of [
+    [SPLIT_MANIFEST_ROUTES, manifests, "manifest"],
+    [SPLIT_MEDIA_ROUTES, artifacts, "artifact"],
+  ]) {
+    for (const route of routes) {
+      const body = supplied[route];
+      if (!Buffer.isBuffer(body) || body.byteLength === 0) {
+        throw new Error(`the split ${label} for ${route} must be a non-empty Buffer`);
+      }
+      bodies.set(route, body);
+      digests.set(route, createHash("sha256").update(body).digest("hex"));
+    }
+    for (const route of Object.keys(supplied)) {
+      if (!routes.includes(route)) {
+        throw new Error(`${route} is not a declared split ${label} route`);
+      }
+    }
+  }
+
+  return {
+    bodies,
+    digests,
+    /**
+     * What this service OBSERVED on its split routes.
+     *
+     * Every field is a measurement this process made on its own request path:
+     * the route, the method and the bytes it actually wrote. No URL, no header,
+     * no client address, no user agent. A route with no record was never asked
+     * for, which is what makes "the audio acquisition read the audio route and
+     * nothing else" a positive statement rather than an absence of evidence.
+     */
+    requests: [],
+  };
+}
+
 // ── The service ────────────────────────────────────────────────────────────
 
 /**
@@ -443,6 +565,12 @@ export function createFixtureService(options) {
   const {
     media,
     genericMedia,
+    /**
+     * SPLIT-06's optional fixture set: `{ manifests, artifacts }`, both maps of
+     * route path -> predeclared body. Absent means the split routes do not
+     * exist, and the service behaves exactly as it did before SPLIT-06.
+     */
+    split,
     directMediaPath = null,
     genericMediaSourcePath = null,
     log = defaultLog,
@@ -454,15 +582,39 @@ export function createFixtureService(options) {
     now = () => new Date(),
   } = options;
 
-  if (!Buffer.isBuffer(media) || media.byteLength === 0) {
-    throw new Error("the direct fixture media must be a non-empty Buffer");
-  }
-  if (!Buffer.isBuffer(genericMedia) || genericMedia.byteLength === 0) {
-    throw new Error("the generic fixture media must be a non-empty Buffer");
+  // ── which fixture families this instance serves ─────────────────────────
+  //
+  // Stated POSITIVELY, per set, and never by subtraction. The Phase-10D family
+  // is requested by naming EITHER media buffer, which is what every existing
+  // caller does, so its fail-closed "both buffers or nothing" contract is
+  // unchanged: a caller that names one and forgets the other is still refused
+  // here rather than during a live case. SPLIT-06 names `split` and neither
+  // buffer — it has no use for an 8-16 MiB throttled body, and padding one in
+  // to satisfy a requirement it does not need would be exactly the kind of
+  // inert fixture state this service avoids.
+  //
+  // A service configured with neither is refused with the original message: an
+  // empty route table is never a usable fixture.
+  const wantsPhase10d = media !== undefined || genericMedia !== undefined;
+  const wantsSplit = split !== undefined;
+
+  if (wantsPhase10d || !wantsSplit) {
+    if (!Buffer.isBuffer(media) || media.byteLength === 0) {
+      throw new Error("the direct fixture media must be a non-empty Buffer");
+    }
+    if (!Buffer.isBuffer(genericMedia) || genericMedia.byteLength === 0) {
+      throw new Error("the generic fixture media must be a non-empty Buffer");
+    }
   }
 
-  const directDigest = createHash("sha256").update(media).digest("hex");
-  const genericDigest = createHash("sha256").update(genericMedia).digest("hex");
+  const splitSet = wantsSplit ? buildSplitRouteTable(split) : null;
+
+  const directDigest = wantsPhase10d
+    ? createHash("sha256").update(media).digest("hex")
+    : null;
+  const genericDigest = wantsPhase10d
+    ? createHash("sha256").update(genericMedia).digest("hex")
+    : null;
   const registry = createCaseRegistry();
 
   /**
@@ -518,6 +670,45 @@ export function createFixtureService(options) {
     }
     const route = url.pathname;
     const method = req.method ?? "GET";
+
+    // A route belongs to a fixture SET, and a set that was not configured has
+    // no routes. This is what keeps the table closed in both directions: a
+    // split-only instance answers 404 for `/direct.mp4` exactly as it does for
+    // `/favicon.ico`, rather than reaching a handler with no body to serve.
+    if (!wantsPhase10d && PHASE_10D_ROUTES.includes(route)) {
+      log({ route: "<unknown>", status: 404 });
+      sendText(res, 404, "not found");
+      return;
+    }
+    if (splitSet && isSplitRoute(route)) {
+      if (method !== "GET" && method !== "HEAD") return methodNotAllowed(res, route, "GET, HEAD");
+      const body = splitSet.bodies.get(route);
+      const contentType = SPLIT_ROUTE_CONTENT_TYPES[route];
+      res.writeHead(200, {
+        "content-type": contentType,
+        // Deterministic and honest: every split body is fully known before the
+        // response begins, so the length is the body's own.
+        "content-length": String(body.byteLength),
+        // The pinned native downloader does not need ranges for a progressive
+        // http source, and the acquired-artifact proof is byte identity of the
+        // whole file. Advertising range support would add a transfer mode the
+        // evidence does not describe.
+        "accept-ranges": "none",
+        "cache-control": "no-store",
+      });
+      if (method === "HEAD") {
+        splitSet.requests.push({ route, method, bytes: 0, at: now().toISOString() });
+        log({ route, status: 200, outcome: "head" });
+        res.end();
+        return;
+      }
+      res.end(body);
+      splitSet.requests.push({
+        route, method, bytes: body.byteLength, at: now().toISOString(),
+      });
+      log({ route, status: 200, bytes: body.byteLength });
+      return;
+    }
 
     switch (route) {
       // ── liveness ────────────────────────────────────────────────────────
@@ -835,16 +1026,30 @@ export function createFixtureService(options) {
      */
     manifest() {
       const address = server.address();
+      const splitManifest = splitSet
+        ? {
+            splitConfigured: true,
+            splitManifestPaths: [...SPLIT_MANIFEST_ROUTES],
+            splitMediaPaths: [...SPLIT_MEDIA_ROUTES],
+            splitContentTypes: { ...SPLIT_ROUTE_CONTENT_TYPES },
+            splitBytes: Object.fromEntries(
+              [...splitSet.bodies].map(([route, body]) => [route, body.byteLength]),
+            ),
+            splitSha256: Object.fromEntries(splitSet.digests),
+          }
+        : { splitConfigured: false };
+
       return {
+        ...splitManifest,
         listenAddress: LISTEN_ADDRESS,
         listenPort: address && typeof address === "object" ? address.port : null,
         directPath: "/direct.mp4",
-        directBytes: media.byteLength,
+        directBytes: wantsPhase10d ? media.byteLength : null,
         directSha256: directDigest,
         directMediaPath,
         genericPath: "/generic",
         genericMediaPath: "/generic-media.mp4",
-        genericMediaBytes: genericMedia.byteLength,
+        genericMediaBytes: wantsPhase10d ? genericMedia.byteLength : null,
         genericMediaSha256: genericDigest,
         genericMediaSourcePath,
         genericMediaThrottleMs: genericThrottleMs,
@@ -863,6 +1068,15 @@ export function createFixtureService(options) {
     /** Test-only visibility into the case registry. Never served over HTTP. */
     caseCount() {
       return registry.size();
+    },
+
+    /**
+     * The sanitized split-route request log. Never served over HTTP either:
+     * the SPLIT-06 orchestrator runs in the same container as this service and
+     * reads it in-process, so there is no evidence endpoint to secure.
+     */
+    splitRequests() {
+      return splitSet ? splitSet.requests.map((r) => ({ ...r })) : [];
     },
   };
 }
