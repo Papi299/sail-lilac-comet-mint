@@ -29,7 +29,28 @@ import {
   type GenericAnalysisLimits,
 } from "./ytdlp-analysis.server.ts";
 import { buildYtdlpEnvironment } from "../runtime/ytdlp-runtime.server.ts";
-import { buildGenericFormatSelector } from "../execution/generic-source.ts";
+import {
+  buildGenericFormatSelector,
+  type GenericPresetSource,
+  type GenericSourceSelection,
+} from "../execution/generic-source.ts";
+
+/**
+ * Unwraps a preset source that generic v1 analysis must still emit as SINGLE.
+ *
+ * SPLIT-01 widened the private per-preset value to a discriminated union so a
+ * future preset may be fulfilled by a video-only + audio-only pair. Analysis
+ * builds NO pairs yet, so every value it emits must still be `kind: "single"`.
+ * Asserting that here means these tests keep proving exactly what they always
+ * proved AND additionally fail if a future edit starts emitting split presets
+ * before the acquisition and merge path exists.
+ */
+function singleSource(value: GenericPresetSource | undefined): GenericSourceSelection {
+  assert.ok(value, "every advertised preset must have a private selection");
+  assert.equal(value.kind, "single", "generic v1 analysis must emit only single sources");
+  if (value.kind !== "single") throw new Error("unreachable");
+  return value.source;
+}
 import { WorkerAnalyzeSuccessSchema } from "../../shared/worker/contracts.ts";
 import {
   YTDLP_PROBE_TIMEOUT_MS,
@@ -1637,7 +1658,7 @@ describe("real pinned output: the captured /generic document (§20/§21)", () =>
     // The browser-facing id is application-owned; the raw upstream id "0" is
     // reachable only through the PRIVATE selection.
     assert.equal(best.formatId, "preset:best");
-    assert.equal(selections["preset:best"]?.formatId, "0");
+    assert.equal(singleSource(selections["preset:best"]).formatId, "0");
     assert.equal(JSON.stringify(presets).includes('"0"'), false);
   });
 
@@ -1960,8 +1981,7 @@ describe("the private execution descriptor stays private (§11/§34)", () => {
     const { selections } = buildGenericPresets(selectCandidates([HTML5], LIMITS), {
       ffmpegAvailable: false,
     });
-    const selection = selections["preset:best"];
-    assert.ok(selection);
+    const selection = singleSource(selections["preset:best"]);
     assert.equal(selection.videoConstraint, "video-ext");
     assert.equal(selection.audioConstraint, "codec-present");
     assert.equal(selection.formatId, "0");
@@ -2224,7 +2244,8 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
           const { selections } = buildGenericPresets(selectCandidates(formats, LIMITS), {
             ffmpegAvailable,
           });
-          for (const [id, selection] of Object.entries(selections)) {
+          for (const [id, presetSource] of Object.entries(selections)) {
+            const selection = singleSource(presetSource);
             assert.equal(selection.audioConstraint, "codec-present", `${label} ${id}`);
             assert.equal(selection.hasAudio, true, `${label} ${id}`);
             emitted += 1;
@@ -2242,7 +2263,8 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
             video.presets.map((p) => p.id).sort(),
             `${label}: selections and presets stay in bijection`,
           );
-          for (const [id, selection] of Object.entries(selections)) {
+          for (const [id, presetSource] of Object.entries(selections)) {
+            const selection = singleSource(presetSource);
             assert.equal(selection.audioConstraint, "codec-present", `${label} ${id}`);
             assert.equal(selection.hasAudio, true, `${label} ${id}`);
           }
@@ -2259,7 +2281,10 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
         { ffmpegAvailable: true },
       );
       const built = Object.fromEntries(
-        Object.entries(selections).map(([id, s]) => [id, buildGenericFormatSelector(s)]),
+        Object.entries(selections).map(([id, s]) => [
+          id,
+          buildGenericFormatSelector(singleSource(s)),
+        ]),
       );
       const muxed22 = 'b*[format_id="22"][protocol="https"][ext="mp4"][vcodec!="none"][acodec!="none"]';
       const audio140 = 'b*[format_id="140"][protocol="https"][ext="m4a"][vcodec="none"][acodec!="none"]';
@@ -2279,9 +2304,8 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
         selectCandidates(JSON.parse(captured).formats, LIMITS),
         { ffmpegAvailable: false },
       ).selections["preset:best"];
-      assert.ok(html5);
       assert.equal(
-        buildGenericFormatSelector(html5),
+        buildGenericFormatSelector(singleSource(html5)),
         'b*[format_id="0"][protocol="http"][ext="mp4"][vcodec!=?"none"][video_ext="mp4"][acodec!="none"]',
       );
     });
@@ -2318,11 +2342,181 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
         for (const forbidden of ["audioConstraint", "videoConstraint", "selections", "acodec", "b*["]) {
           assert.equal(body.includes(forbidden), false, `${label}: ${forbidden}`);
         }
-        for (const selection of Object.values(selections)) {
+        for (const presetSource of Object.values(selections)) {
+          const selection = singleSource(presetSource);
           assert.equal(body.includes(`"${selection.formatId}"`), false, `${label}: raw id`);
           assert.equal(body.includes(buildGenericFormatSelector(selection)), false, `${label}: selector`);
         }
       }
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPLIT-01 §18: PUBLIC behavioural equivalence
+//
+// SPLIT-01 wraps every emitted selection in a private envelope. The public half
+// must be untouched by that, so these cases pin the ENTIRE public preset array
+// for a candidate set that deliberately includes the video-only and audio-only
+// renditions a future split pair would be built from.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("SPLIT-01: the public preset surface is unchanged", () => {
+  /** Muxed, video-only and audio-only renditions in one document. */
+  const MIXED = [
+    { format_id: "22", ext: "mp4", protocol: "https", vcodec: "avc1.64001F", acodec: "mp4a.40.2", height: 720, fps: 30, filesize: 3_000_000 },
+    { format_id: "137", ext: "mp4", protocol: "https", vcodec: "avc1.640028", acodec: "none", height: 1080, fps: 30, filesize: 9_000_000 },
+    { format_id: "248", ext: "webm", protocol: "https", vcodec: "vp09.00.40.08", acodec: "none", height: 1080, fps: 30, filesize: 8_000_000 },
+    { format_id: "140", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2", filesize: 500_000 },
+    { format_id: "251", ext: "webm", protocol: "https", vcodec: "none", acodec: "opus", filesize: 450_000 },
+  ];
+
+  const build = (ffmpegAvailable: boolean) =>
+    buildGenericPresets(selectCandidates(MIXED, LIMITS), { ffmpegAvailable });
+
+  it("emits EXACTLY the pre-SPLIT preset array, field for field", () => {
+    // A golden assertion rather than a spot check: every field the browser can
+    // read is pinned, so a wrapper change that altered any of them fails here.
+    assert.deepEqual(build(true).presets, [
+      {
+        id: "preset:best",
+        label: "Best available",
+        resolution: "720p",
+        container: "mp4",
+        fileSize: 3_000_000,
+        hasVideo: true,
+        hasAudio: true,
+        formatId: "preset:best",
+        videoCodec: "h264",
+        audioCodec: "aac",
+        fps: 30,
+      },
+      {
+        id: "preset:720",
+        label: "720p",
+        resolution: "720p",
+        container: "mp4",
+        fileSize: 3_000_000,
+        hasVideo: true,
+        hasAudio: true,
+        formatId: "preset:720",
+        videoCodec: "h264",
+        audioCodec: "aac",
+        fps: 30,
+      },
+      {
+        id: "preset:audio",
+        label: "Audio only",
+        resolution: "audio",
+        container: "m4a",
+        fileSize: 500_000,
+        hasVideo: false,
+        hasAudio: true,
+        formatId: "preset:audio",
+        videoCodec: null,
+        audioCodec: "aac",
+        fps: null,
+      },
+      {
+        id: "preset:mp3",
+        label: "Audio only (MP3)",
+        resolution: "audio",
+        container: "mp3",
+        fileSize: null,
+        hasVideo: false,
+        hasAudio: true,
+        formatId: "preset:mp3",
+        videoCodec: null,
+        audioCodec: "mp3",
+        fps: null,
+      },
+    ]);
+  });
+
+  it("REGRESSION: video-only + audio-only candidates still yield NO video preset", () => {
+    // The whole point of SPLIT-01. Two 1080p video-only renditions and two
+    // audio-only renditions are present and individually eligible, and the
+    // product still offers only the 720p MUXED source. Advertising the pair is
+    // SPLIT-05's job and requires the acquisition and merge path first.
+    for (const ffmpegAvailable of [false, true]) {
+      const { presets } = build(ffmpegAvailable);
+      const video = presets.filter((p) => p.hasVideo);
+      assert.deepEqual(
+        video.map((p) => p.id),
+        ["preset:best", "preset:720"],
+        `ffmpeg=${ffmpegAvailable}`,
+      );
+      for (const p of video) {
+        assert.equal(p.resolution, "720p", "no 1080p preset may appear");
+        assert.equal(p.container, "mp4");
+      }
+      assert.equal(
+        presets.some((p) => p.resolution === "1080p"),
+        false,
+        "the 1080p split rendition must not be advertised",
+      );
+    }
+  });
+
+  it("preset ordering, count and the id === formatId contract are unchanged", () => {
+    for (const ffmpegAvailable of [false, true]) {
+      const { presets } = build(ffmpegAvailable);
+      assert.equal(presets.length, ffmpegAvailable ? 4 : 3);
+      assert.deepEqual(
+        presets.map((p) => p.id),
+        ffmpegAvailable
+          ? ["preset:best", "preset:720", "preset:audio", "preset:mp3"]
+          : ["preset:best", "preset:720", "preset:audio"],
+      );
+      for (const p of presets) {
+        assert.equal(p.formatId, p.id);
+        assert.match(p.id, GENERIC_PRESET_ID_PATTERN);
+      }
+    }
+  });
+
+  it("every emitted selection is still SINGLE, and names a muxed or audio-only source", () => {
+    for (const ffmpegAvailable of [false, true]) {
+      const { selections } = build(ffmpegAvailable);
+      for (const [id, value] of Object.entries(selections)) {
+        assert.equal(value.kind, "single", `${id}: no pair may be constructed in SPLIT-01`);
+        const source = singleSource(value);
+        // 137/248/251 are the split halves. Only the muxed 22 and the audio 140
+        // may back a preset today.
+        assert.ok(["22", "140"].includes(source.formatId), `${id}: unexpected source ${id}`);
+      }
+    }
+  });
+
+  it("§19: no private union marker and no raw id reaches the public response", async () => {
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: MIXED }))));
+    const { video, selections } = await analyzeGenericMediaInternal(SAFE_URL, {
+      limits: LIMITS,
+      runner,
+      probeRuntime: async () => OK_RUNTIME,
+      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+      ffmpegAvailable: true,
+    });
+    const body = JSON.stringify(WorkerAnalyzeSuccessSchema.parse({ success: true, video }));
+
+    // The private envelope's own vocabulary. `"video"`/`"audio"` are NOT listed:
+    // they are legitimate public words (the response's own `video` key, and the
+    // `resolution: "audio"` label), so asserting their absence would be a test
+    // that cannot pass rather than a boundary that holds.
+    for (const marker of ['"kind"', '"single"', '"split"', '"pair"', '"source":{']) {
+      assert.equal(body.includes(marker), false, marker);
+    }
+    // Every raw upstream id in the document, advertised or not — including the
+    // split halves a future pair would name.
+    for (const rawId of ["22", "137", "248", "140", "251"]) {
+      assert.equal(body.includes(`"${rawId}"`), false, `raw id ${rawId}`);
+    }
+    // ...and the private constraint vocabulary.
+    for (const marker of ["videoConstraint", "audioConstraint", "formatId\":\"2", "selections"]) {
+      assert.equal(body.includes(marker), false, marker);
+    }
+    // Positive control: the private half really did carry those ids.
+    assert.equal(singleSource(selections["preset:best"]).formatId, "22");
+    assert.equal(singleSource(selections["preset:audio"]).formatId, "140");
   });
 });

@@ -257,26 +257,34 @@ describe("routing: YTDLP_ENABLED=true (§53)", () => {
         video: genericMeta(),
         selections: {
           "preset:1080": {
-            formatId: "22",
-            protocol: "https" as const,
-            container: "mp4" as const,
-            hasVideo: true,
-            hasAudio: true,
-            videoConstraint: "codec-present" as const,
-            audioConstraint: "codec-present" as const,
-            fileSize: null,
+            kind: "single" as const,
+            source: {
+              formatId: "22",
+              protocol: "https" as const,
+              container: "mp4" as const,
+              hasVideo: true,
+              hasAudio: true,
+              videoConstraint: "codec-present" as const,
+              audioConstraint: "codec-present" as const,
+              fileSize: null,
+            },
           },
         },
       }),
     });
 
     assert.equal(res.strategy, "yt-dlp");
-    assert.equal(res.selections["preset:1080"]?.formatId, "22");
+    const routed = res.selections["preset:1080"];
+    assert.equal(routed?.kind, "single");
+    assert.equal(routed?.kind === "single" ? routed.source.formatId : null, "22");
     // The PUBLIC half stays free of it.
     assert.equal(JSON.stringify(res.video).includes('"22"'), false);
     // The private audio state travels with the selection, never with the
     // browser-safe half (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
-    assert.equal(res.selections["preset:1080"]?.audioConstraint, "codec-present");
+    assert.equal(
+      routed?.kind === "single" ? routed.source.audioConstraint : null,
+      "codec-present",
+    );
     assert.equal(JSON.stringify(res.video).includes("audioConstraint"), false);
   });
 

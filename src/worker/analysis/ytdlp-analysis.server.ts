@@ -18,6 +18,7 @@ import {
   isSafeFormatId,
   toGenericSourceContainer,
   type GenericAudioConstraint,
+  type GenericPresetSource,
   type GenericSourceContainer,
   type GenericSourceProtocol,
   type GenericSourceSelection,
@@ -576,6 +577,19 @@ function toSelection(c: Candidate): GenericSourceSelection {
 }
 
 /**
+ * Wraps one candidate as a SINGLE-source preset fulfilment.
+ *
+ * SPLIT-01 made the per-preset value a discriminated union so that a future
+ * preset may instead be fulfilled by a video-only + audio-only pair. Generic v1
+ * builds no pairs, so every selection this module emits goes through here and
+ * is `kind: "single"` — which is exactly what the structural assertion at the
+ * end of `analyzeGenericMediaInternal` re-proves over the finished map.
+ */
+function toSingleSource(c: Candidate): GenericPresetSource {
+  return { kind: "single", source: toSelection(c) };
+}
+
+/**
  * The three states a yt-dlp codec field can actually be in.
  *
  * Collapsing these to a boolean is the root of both Phase-10D generic defects,
@@ -926,7 +940,7 @@ export function buildGenericPresets(
   // Keeping the two together is what lets execution re-find the approved source
   // without re-deriving it from the browser-facing preset, which carries no
   // upstream identity at all.
-  const selections: Record<string, GenericSourceSelection> = {};
+  const selections: Record<string, GenericPresetSource> = {};
 
   // Muxed single-source video candidates only — video plus PROVEN audio. An
   // unknown-audio candidate is not muxed as far as advertising is concerned.
@@ -937,7 +951,7 @@ export function buildGenericPresets(
     label: string,
     resolution: string | null,
     c: Candidate,
-  ): WorkerQualityPreset => ((selections[id] = toSelection(c)), {
+  ): WorkerQualityPreset => ((selections[id] = toSingleSource(c)), {
     id,
     label,
     resolution,
@@ -998,7 +1012,7 @@ export function buildGenericPresets(
     // The SOURCE is `audioSource`; the ADVERTISED container may differ from it
     // (a muxed source advertised as m4a is extracted by the Worker's own FFmpeg
     // after `processing` begins, never by yt-dlp).
-    selections["preset:audio"] = toSelection(audioSource);
+    selections["preset:audio"] = toSingleSource(audioSource);
     presets.push({
       id: "preset:audio",
       label: "Audio only",
@@ -1016,7 +1030,7 @@ export function buildGenericPresets(
     // MP3 is always a Worker-side transcode, so it needs FFmpeg regardless of
     // which kind of source was chosen.
     if (opts.ffmpegAvailable) {
-      selections["preset:mp3"] = toSelection(audioSource);
+      selections["preset:mp3"] = toSingleSource(audioSource);
       presets.push({
         id: "preset:mp3",
         label: "Audio only (MP3)",
@@ -1326,10 +1340,31 @@ export async function analyzeGenericMediaInternal(
   // than left as a consequence of the candidate filters: an unknown or absent
   // audio state reaching execution would mean analysis had quietly widened what
   // generic v1 can acquire (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
-  for (const selection of Object.values(selections)) {
-    if (selection.audioConstraint !== "codec-present" || selection.hasAudio !== true) {
-      throw new AppError("EXTRACTION_FAILED");
+  //
+  // SPLIT-01 makes this SHAPE-AWARE rather than relaxing it. The rule is
+  // unchanged for the single-source form, and the split form gets the rule that
+  // actually applies to it — a split pair's VIDEO member legitimately records
+  // `audioConstraint: "absent"`, because its audio is proven absent and is
+  // supplied by the other member.
+  //
+  // Writing this as one flat "every selection has proven audio" check would
+  // have been the easy way to keep it compiling, and it would have been wrong
+  // in both directions: it would reject every future split pair, and the
+  // obvious "fix" for that — dropping the check — would let an unknown-audio
+  // source reach execution unnoticed.
+  for (const value of Object.values(selections)) {
+    if (value.kind === "single") {
+      if (value.source.audioConstraint !== "codec-present" || value.source.hasAudio !== true) {
+        throw new AppError("EXTRACTION_FAILED");
+      }
+      continue;
     }
+    // Generic v1 analysis builds NO pairs. Reaching here would mean a future
+    // edit started advertising split presets without the acquisition and merge
+    // path that SPLIT-02..04 provide, so it fails closed rather than shipping a
+    // preset nothing can fulfil. SPLIT-05 replaces this with the real per-member
+    // assertion when the rest of the path exists.
+    throw new AppError("EXTRACTION_FAILED");
   }
 
   const video = VideoMetadataSchema.parse({

@@ -17,7 +17,11 @@ import {
   type YtdlpRuntimeStatus,
 } from "../runtime/ytdlp-runtime.server.ts";
 import { buildGenericFormatSelector } from "./generic-source.ts";
-import { GenericExecutionPlanSchema, type GenericExecutionPlan } from "./format-plan.ts";
+import {
+  GenericExecutionPlanSchema,
+  type GenericExecutionPlan,
+  type GenericSingleSourceExecutionPlan,
+} from "./format-plan.ts";
 
 /**
  * Worker-owned GENERIC ORIGINAL ACQUISITION (Phase 10C3 §20).
@@ -257,7 +261,12 @@ function maxFileSizeArg(bytes: number): string {
 export function buildYtdlpDownloadArgv(opts: {
   readonly validatedUrl: string;
   readonly workDir: string;
-  readonly plan: GenericExecutionPlan;
+  /**
+   * SPLIT-01: a SINGLE-source plan only. `merge-split` names two upstream
+   * sources and has no single `source` to bind, so it is excluded by type
+   * rather than by a runtime check that a future edit could drop.
+   */
+  readonly plan: GenericSingleSourceExecutionPlan;
   readonly maxFileSizeBytes: number;
 }): readonly string[] {
   return Object.freeze([
@@ -445,6 +454,20 @@ export async function downloadGenericOriginal(
   //    and it is what builds the format selector.
   const checkedPlan = GenericExecutionPlanSchema.safeParse(plan);
   if (!checkedPlan.success) throw new AppError("FORMAT_UNAVAILABLE");
+
+  // SPLIT-01: this primitive acquires exactly ONE source, and says so. A
+  // `merge-split` plan names two, so it is REFUSED here rather than partially
+  // honoured — acquiring only the video half would hand the executor a silently
+  // audio-less artifact, which is precisely the substitution §17 forbids.
+  //
+  // Unreachable today: no analysis path builds a split preset source, so
+  // `deriveGenericExecutionPlan` cannot produce this operation. The refusal is
+  // the type narrowing AND the guarantee, so a future edit that starts building
+  // pairs before SPLIT-03 exists fails closed instead of downloading half a
+  // video.
+  if (checkedPlan.data.operation === "merge-split") {
+    throw new AppError("FORMAT_UNAVAILABLE");
+  }
   const validPlan = checkedPlan.data;
 
   if (!isAbsolute(workDir)) throw new AppError("PROCESSING_FAILED");

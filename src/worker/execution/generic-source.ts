@@ -338,13 +338,202 @@ export const GenericSourceSelectionSchema = z
 
 export type GenericSourceSelection = z.infer<typeof GenericSourceSelectionSchema>;
 
+// ── Split video+audio pairs (SPLIT-01 §E) ────────────────────────────────────
+
+/**
+ * The CLOSED table of source-container combinations generic v1 may merge, and
+ * the target container each one produces.
+ *
+ * Deliberately two rows, and deliberately SAME-FAMILY only. This table is the
+ * premise the merge-safety argument rests on, so it is worth stating the
+ * argument here rather than in a review comment:
+ *
+ *   The merge is a STREAM COPY. A copy is legal exactly when the copied stream
+ *   is representable in the target container. Because the target container is
+ *   always the same family as the VIDEO source's container, and the AUDIO
+ *   source's container is a member of that same family, both streams are
+ *   representable BY CONSTRUCTION:
+ *
+ *     - a video stream that was legally stored in ISO-BMFF (`mp4`) is legally
+ *       storable in ISO-BMFF, whatever its codec is — h264, hevc, av1, vp9, or
+ *       something this application never named;
+ *     - `m4a` IS ISO-BMFF, so its audio stream is likewise representable;
+ *     - identically for `webm` + `webm` on the Matroska side.
+ *
+ * This is why no codec identity is consulted anywhere on the merge path, and
+ * why no upstream codec string ever becomes an FFmpeg argument. The property
+ * comes from the CLOSED table, not from containers being generally informative.
+ *
+ * The cross-family combinations are exactly the ones that WOULD need codec
+ * knowledge — Opus in mp4 works, Vorbis in mp4 does not, PCM in mp4 is barely
+ * supported — so every one of them is absent, and `null` means "not a pair"
+ * rather than "guess".
+ *
+ * Note this is NARROWER than `GENERIC_AUDIO_SOURCE_CONTAINERS`. That list is
+ * correct for keeping an audio-only source VERBATIM, which is what it was
+ * written for; it is not correct for muxing into mp4 or webm.
+ */
+export function splitTargetContainer(
+  video: GenericSourceContainer,
+  audio: GenericSourceContainer,
+): GenericSplitTargetContainer | null {
+  if (video === "mp4" && audio === "m4a") return "mp4";
+  if (video === "webm" && audio === "webm") return "webm";
+  return null;
+}
+
+/**
+ * The only containers a split merge may PRODUCE. A closed union, so the target
+ * can become an output extension and a MIME decision without any widening.
+ */
+export const GenericSplitTargetContainerSchema = z.enum(["mp4", "webm"]);
+export type GenericSplitTargetContainer = z.infer<typeof GenericSplitTargetContainerSchema>;
+
+/**
+ * One validated, EXECUTABLE video-only + audio-only PAIR.
+ *
+ * Both members are ordinary `GenericSourceSelection` values — the member schema
+ * needed no change, because it already describes a video-only source
+ * (`hasVideo: true`, `audioConstraint: "absent"`) and an audio-only source
+ * (`videoConstraint: "absent"`, `audioConstraint: "codec-present"`) exactly.
+ * What this schema adds is the set of cross-member invariants that make an
+ * INVALID pair unrepresentable rather than merely unbuilt.
+ *
+ * Both raw upstream identifiers are equally private. Nothing here may cross
+ * Worker HTTP, enter `WorkerVideoMetadata`, enter SQLite, reach Vercel or the
+ * browser, be logged, or appear in an error message. Two ids instead of one
+ * changes the count, not the boundary.
+ *
+ * ─── Why the audio member must be PROVEN video-absent, and the video member
+ *     PROVEN audio-absent ──────────────────────────────────────────────────
+ *
+ * `unknown` is never upgraded to `present`, and never downgraded to `absent`.
+ * A pair built on an unknown state would be an implicit claim that the unknown
+ * resolved the convenient way. Concretely:
+ *
+ *   - an unknown-audio VIDEO member might actually be muxed, in which case the
+ *     job would acquire audio twice and then silently discard the source's own
+ *     track via the stream map — a substitution the user never asked for;
+ *   - an unknown-video AUDIO member might actually carry video, so the pair
+ *     would not be a split pair at all.
+ *
+ * Both states are also strictly re-selectable only in their proven form:
+ * `[acodec="none"]` and `[vcodec="none"]` match the explicit marker and nothing
+ * else, so a source that CHANGED shape between analysis and acquisition fails
+ * selection instead of being acquired as different media.
+ */
+export const GenericSplitSourceSelectionSchema = z
+  .object({
+    /** The video-only half. Carries video; proven to carry no audio. */
+    video: GenericSourceSelectionSchema,
+    /** The audio-only half. Carries PROVEN audio; proven to carry no video. */
+    audio: GenericSourceSelectionSchema,
+  })
+  .strict()
+  .superRefine((pair, ctx) => {
+    const issue = (path: "video" | "audio", message: string) =>
+      ctx.addIssue({ code: "custom", path: [path], message });
+
+    // I1: the video member really carries video. Either approved video
+    // constraint is accepted — `codec-present` and `video-ext` are the same
+    // evidence standard already accepted for muxed video presets, and the
+    // source container proves the stream is representable in the target
+    // container regardless of codec identity (see `splitTargetContainer`).
+    if (!pair.video.hasVideo || pair.video.videoConstraint === "absent") {
+      issue("video", "the video member must carry video");
+    }
+
+    // I2: the video member's audio is PROVEN ABSENT — never merely unknown.
+    if (pair.video.audioConstraint !== "absent") {
+      issue("video", "the video member must have proven-absent audio");
+    }
+
+    // I3: the audio member's video is PROVEN ABSENT — never merely unknown.
+    if (pair.audio.videoConstraint !== "absent" || pair.audio.hasVideo) {
+      issue("audio", "the audio member must have proven-absent video");
+    }
+
+    // I4: the audio member's audio is PROVEN PRESENT.
+    //
+    // DEFENCE IN DEPTH, deliberately — not the operative gate, and it is worth
+    // being precise about that rather than implying a strength it does not add.
+    // I3 forces `videoConstraint: "absent"`, which the member schema ties to
+    // `hasVideo: false`; the member schema then requires a selection to carry
+    // video, audio or both, and ties `hasAudio === true` to
+    // `audioConstraint === "codec-present"`. An audio member with `unknown` or
+    // `absent` audio is therefore already unrepresentable one layer down.
+    //
+    // This restates it at the pair level so the pair stays self-describing and
+    // so a future relaxation of the member schema cannot silently make an
+    // unknown-audio half acceptable here. `member schema rejects an audio-only
+    // descriptor whose audio is not proven` is pinned by its own test.
+    if (pair.audio.audioConstraint !== "codec-present" || !pair.audio.hasAudio) {
+      issue("audio", "the audio member must have proven audio");
+    }
+
+    // I5: two DIFFERENT upstream sources. A pair naming one id twice would
+    // acquire the same bytes twice and cannot be a real split rendition.
+    if (pair.video.formatId === pair.audio.formatId) {
+      issue("audio", "a split pair must name two different upstream sources");
+    }
+
+    // I6: the container combination is in the closed table. This is what makes
+    // the stream copy provably legal, so it is an invariant of the pair rather
+    // than a check performed later by whoever happens to build the command.
+    if (splitTargetContainer(pair.video.container, pair.audio.container) === null) {
+      issue("video", "the container combination is not a mergeable pair");
+    }
+  });
+
+export type GenericSplitSourceSelection = z.infer<typeof GenericSplitSourceSelectionSchema>;
+
+/**
+ * How ONE advertised preset is fulfilled: by a single approved source, or by an
+ * approved video-only + audio-only pair.
+ *
+ * A discriminated union rather than an optional second source, so "a single
+ * source that also has an audio partner" and "a pair with a missing half" are
+ * both unrepresentable rather than merely rejected somewhere downstream.
+ *
+ * The merge TARGET is deliberately NOT a member of this type. It is derived
+ * from the pair by `splitTargetContainer()` at plan-derivation time, so there
+ * is exactly one authority for it and a drifted pair cannot claim a target the
+ * closed table would refuse.
+ */
+export const GenericPresetSourceSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("single"),
+      source: GenericSourceSelectionSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("split"),
+      pair: GenericSplitSourceSelectionSchema,
+    })
+    .strict(),
+]);
+
+export type GenericPresetSource = z.infer<typeof GenericPresetSourceSchema>;
+
+/** Narrows a preset source to its single-source form, or `null`. */
+export function asSingleSource(value: GenericPresetSource): GenericSourceSelection | null {
+  return value.kind === "single" ? value.source : null;
+}
+
+/** Narrows a preset source to its split-pair form, or `null`. */
+export function asSplitPair(value: GenericPresetSource): GenericSplitSourceSelection | null {
+  return value.kind === "split" ? value.pair : null;
+}
+
 /**
  * The private per-preset selection map produced by execution analysis.
  *
  * Keyed by the APPLICATION preset id the browser may request. The values are
  * the private descriptors above.
  */
-export type GenericSourceSelections = Readonly<Record<string, GenericSourceSelection>>;
+export type GenericSourceSelections = Readonly<Record<string, GenericPresetSource>>;
 
 // ── Selector construction (§12/§13/§14) ──────────────────────────────────────
 
@@ -422,7 +611,16 @@ function quoteFilterValue(value: string): string {
  *     (`best`, `worst`, `all`, `mergeall`, extension names) an upstream id
  *     could collide with (§12);
  *   - no `/` fallback — one source or none;
- *   - no `+` merge — generic v1 never merges split streams.
+ *   - no `+` merge.
+ *
+ * The `+` exclusion survives split-stream support unchanged, and is the reason
+ * it can. A split pair is acquired as TWO independent invocations, each with
+ * its OWN complete expression built by this function, never as one joined
+ * `video+audio` expression. `+` is a yt-dlp selector OPERATOR: admitting it
+ * would reopen the grammar surface `SAFE_FORMAT_ID_PATTERN` and
+ * `quoteFilterValue` exist to close, and — worse — it would hand yt-dlp the
+ * CHOICE of sources plus its own FFmpeg merge, which would run local media work
+ * while the durable job still says `downloading`.
  */
 export function buildGenericFormatSelector(selection: GenericSourceSelection): string {
   const parsed = GenericSourceSelectionSchema.parse(selection);
