@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { UrlInput } from "@/components/video/url-input";
 import { VideoCard } from "@/components/video/video-card";
 import { FormatSelector } from "@/components/video/format-selector";
+import { NoCompatibleDownload } from "@/components/video/no-compatible-download";
 import { ProgressCard } from "@/components/video/progress-card";
 import { CompleteCard } from "@/components/video/complete-card";
 import { DownloadHistory } from "@/components/video/history";
@@ -19,6 +20,7 @@ import {
   startDownload,
   type HistoryItem,
 } from "@/lib/client-api";
+import { hasDownloadOptions, initialSelectionId } from "@/lib/download-options";
 import type { VideoMetadata } from "@/types/media";
 import type { JobProgress } from "@/types/job";
 
@@ -115,7 +117,7 @@ function Downloader() {
     try {
       const result = await analyzeVideo(nextUrl);
       setVideo(result);
-      setSelectedId(result.presets[0]?.id || result.formats[0]?.id || "");
+      setSelectedId(initialSelectionId(result));
       setPhase("ready");
     } catch (err) {
       setPhase("error");
@@ -153,6 +155,13 @@ function Downloader() {
     setJob(null);
     setError(null);
     setSelectedId("");
+  }
+
+  // Unlike `reset`, clears the URL: analyzing the same link again would yield
+  // the same result.
+  function tryAnotherUrl() {
+    setUrl("");
+    reset();
   }
 
   return (
@@ -214,15 +223,19 @@ function Downloader() {
             <CardContent className="space-y-6 p-5 sm:p-6">
               <VideoCard video={video} />
               {phase === "ready" ? (
-                <FormatSelector
-                  video={video}
-                  simpleMode={simpleMode}
-                  onSimpleMode={setSimpleMode}
-                  selectedId={selectedId}
-                  onSelect={setSelectedId}
-                  onDownload={() => void handleDownload()}
-                  downloading={starting}
-                />
+                hasDownloadOptions(video) ? (
+                  <FormatSelector
+                    video={video}
+                    simpleMode={simpleMode}
+                    onSimpleMode={setSimpleMode}
+                    selectedId={selectedId}
+                    onSelect={setSelectedId}
+                    onDownload={() => void handleDownload()}
+                    downloading={starting}
+                  />
+                ) : (
+                  <NoCompatibleDownload onTryAnother={tryAnotherUrl} />
+                )
               ) : null}
               {phase === "processing" && job ? <ProgressCard job={job} /> : null}
               {phase === "complete" && job ? <CompleteCard job={job} onReset={reset} /> : null}
