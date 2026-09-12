@@ -33,7 +33,7 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, writeFile, lstat, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
@@ -67,6 +67,8 @@ import {
 } from "../../../src/worker/execution/generic-source.ts";
 import {
   downloadGenericSplitSources,
+  expectedSplitPartPath,
+  expectedSplitSourcePath,
   isPinnedMaxFilesizeRefusal,
 } from "../../../src/worker/execution/ytdlp-download.server.ts";
 import { JobExecutor } from "../../../src/worker/execution/job-executor.server.ts";
@@ -94,8 +96,11 @@ import {
   readStatusTrace,
 } from "./lib/split-observers.mjs";
 import {
+  CHUNKED_REFUSAL_CHUNK_SIZE_SOURCE,
+  CHUNKED_REFUSAL_HARNESS_ARGUMENT,
   MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
   buildSplitEvidence,
+  evaluateChunkedMaxFilesizeRefusal,
   evaluateMaxFilesizeRefusal,
   renderSplitEvidence,
 } from "./lib/split-evidence.mjs";
@@ -375,7 +380,12 @@ async function proveFfmpegRefusesOverwrite(checks, ffmpegPath, scratchDir) {
 
 // ── 3. Fixtures and the fixture service ────────────────────────────────────
 
-async function startFixtureService(artifacts) {
+/**
+ * `ranges` builds the instance behind the chunked `--max-filesize` case only:
+ * the same closed routes and bytes, but its media routes also answer a single
+ * byte range. The full path's instance never does.
+ */
+async function startFixtureService(artifacts, { ranges = false } = {}) {
   const manifests = {
     "/split-mp4.mpd": Buffer.from(splitManifest("mp4"), "utf8"),
     "/split-webm.mpd": Buffer.from(splitManifest("webm"), "utf8"),
@@ -385,7 +395,7 @@ async function startFixtureService(artifacts) {
   for (const artifact of Object.values(artifacts)) {
     media[`/${artifact.basename}`] = artifact.bytes;
   }
-  const service = createFixtureService({ split: { manifests, artifacts: media } });
+  const service = createFixtureService({ split: { manifests, artifacts: media, ranges } });
   const address = await service.listen(0);
   return { service, port: address.port };
 }
@@ -1385,6 +1395,244 @@ async function acceptMaxFilesizeRefusal(ctx) {
   return observation;
 }
 
+// ── 8b. The CHUNKED `--max-filesize` refusal: REQUIRED since -04 ───────────
+
+/**
+ * How many whole chunks the refused audio half admits before a later one is
+ * refused. The chunk size is derived from the allowance so that exactly this
+ * many fit, whatever the family's fixture size.
+ */
+const CHUNKED_REFUSAL_EARLIER_CHUNKS = 3;
+
+/** The pinned `HttpFD`'s chunk randomization: `randint(int(size * 0.95), size)`. */
+const PINNED_CHUNK_SIZE_FLOOR = (size) => Math.floor(size * 0.95);
+
+const sha256Bytes = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
+/**
+ * The pinned `HttpFD`'s refusal of a LATER chunk — and what the PRODUCT makes
+ * of it.
+ *
+ * RUNTIME PROOF. The exact pinned runtime acquires a split pair whose formats
+ * carry an extractor-owned `downloader_options.http_chunk_size`, from a
+ * fixture instance that serves byte ranges. The video half must complete in
+ * contiguous chunks. The audio half, given only `combined − actual video
+ * bytes`, must admit whole earlier chunks into its `.part` and then be refused
+ * on a later one: exit 0, the refusal its final stdout line, and the `.part`
+ * holding exactly the fixture's leading bytes.
+ *
+ * PRODUCT PROOF. That same run goes through the REAL `downloadGenericSplitSources`
+ * and the REAL runner, so the Worker classifies the pinned runtime's own
+ * output and the job directory it really left: TOO_LARGE.
+ *
+ * WHY THIS IS FAITHFUL to an extractor-chunked source such as YouTube. The
+ * pinned `HttpFD.real_download` reads its chunk size once:
+ *
+ *     chunk_size = ... (self.params.get('http_chunk_size')
+ *                       or info_dict.get('downloader_options', {}).get('http_chunk_size')
+ *                       or 0)
+ *
+ * Production never passes `--http-chunk-size`, so for YouTube the value is the
+ * extractor's: `fmt['downloader_options'] = {'http_chunk_size': CHUNK_SIZE}`
+ * with `CHUNK_SIZE = 10 << 20`, on its https formats by default. A local
+ * fixture cannot run the pinned YouTube extractor, and the pinned GenericIE
+ * sets no `downloader_options`. So the harness takes the pinned GenericIE's OWN
+ * extraction of this fixture — the analysis's `--dump-single-json` document —
+ * adds exactly that one field to each http format, and hands the document to
+ * the product's own acquisition argv through `--load-info-json`, the ONLY
+ * argument added. `download_with_info_file` then enters the same
+ * `process_ie_result` → format selection (the product's own `--format`) →
+ * `process_info` → `dl` → `HttpFD.real_download` a freshly extracted URL
+ * enters, and `downloader_options` reaches `HttpFD` through the selected
+ * format exactly as YouTube's does, with `params.http_chunk_size` unset
+ * exactly as in Production. Only the chunk size is scaled to the fixture.
+ */
+async function acceptChunkedMaxFilesizeRefusal(ctx) {
+  const { checks, family, fixtures, limits, routes, workRoot } = ctx;
+
+  // A SEPARATE fixture instance on its own port: the same closed routes and
+  // bytes, whose media routes also answer byte ranges.
+  const ranged = await startFixtureService(fixtures, { ranges: true });
+  try {
+    const validateUrl = createExactFixtureUrlValidator({ port: ranged.port, routes });
+    const url = validateUrl.urlFor(MANIFEST_ROUTE[family]);
+    const ledger = createRunnerLedger(runProcess);
+    ledger.setPhase("max-filesize-chunked");
+
+    // 1. The pinned GenericIE's own extraction, through the product's own
+    //    analysis. Its stdout is held in memory for this step and never
+    //    recorded; the evidence carries counts and outcomes only.
+    let extracted = null;
+    const capturing = {
+      runner: async (opts) => {
+        const result = await ledger.runner(opts);
+        if ((opts.args ?? []).includes("--dump-single-json")) extracted = result.stdout;
+        return result;
+      },
+    };
+    const policy = createAnalysisPolicy({
+      validateUrl, ledger: capturing, limits, ffmpegAvailableFn: () => ffmpegAvailable(),
+    });
+    const analysis = await policy.analyzeForExecution(url);
+    const plan = deriveGenericExecutionPlan(analysis.video, analysis.selections, REQUESTED_PRESET);
+    if (typeof extracted !== "string") throw new Error("the analysis produced no info document");
+
+    // 2. The budget. The video half gets the whole of it; the audio half only
+    //    what the video leaves: half the audio fixture. The chunk size makes
+    //    exactly CHUNKED_REFUSAL_EARLIER_CHUNKS whole chunks fit that remainder
+    //    and the next never can, whatever the pinned randomization picks.
+    const videoFixture = fixtures[`${family}:video`];
+    const audioFixture = fixtures[`${family}:audio`];
+    const audioAllowance = Math.floor(audioFixture.byteLength / 2);
+    const combinedLimit = videoFixture.byteLength + audioAllowance;
+    const chunkSize = Math.floor(audioAllowance / CHUNKED_REFUSAL_EARLIER_CHUNKS);
+    checks.require(
+      "max-filesize-chunked/chunk-arithmetic-admits-exactly-the-earlier-chunks",
+      CHUNKED_REFUSAL_EARLIER_CHUNKS * chunkSize <= audioAllowance &&
+        (CHUNKED_REFUSAL_EARLIER_CHUNKS + 1) * PINNED_CHUNK_SIZE_FLOOR(chunkSize) > audioAllowance &&
+        audioFixture.byteLength > audioAllowance,
+      `chunk ${chunkSize}, allowance ${audioAllowance}`,
+    );
+
+    // 3. The info document plus the one field an extractor-chunked source has.
+    const info = JSON.parse(extracted);
+    let httpFormatCount = 0;
+    for (const format of Array.isArray(info.formats) ? info.formats : []) {
+      if (format?.protocol !== "http" && format?.protocol !== "https") continue;
+      format.downloader_options = { http_chunk_size: chunkSize };
+      httpFormatCount += 1;
+    }
+    const infoPath = join(workRoot, "chunked-refusal-info.json");
+    await writeFile(infoPath, JSON.stringify(info), { flag: "wx" });
+    const loaded = JSON.parse(await readFile(infoPath, "utf8"));
+    const chunkedFormatCount = (loaded.formats ?? []).filter(
+      (f) => f?.downloader_options?.http_chunk_size === chunkSize,
+    ).length;
+
+    // 4. The product's acquisition, with exactly one argument added.
+    const workDir = join(workRoot, "max-filesize-chunked-workdir");
+    await rm(workDir, { recursive: true, force: true });
+    await mkdir(workDir, { recursive: true });
+    const refusalLineWasFinal = [];
+    let paramsHttpChunkSizePassed = false;
+    const runner = async (opts) => {
+      const args = [...(opts.args ?? [])];
+      // Any spelling optparse would accept as `--http-chunk-size`.
+      if (args.some((a) => a.startsWith("--http"))) paramsHttpChunkSizePassed = true;
+      const separator = args.indexOf("--");
+      if (separator < 0) throw new Error("an acquisition argv without its `--` URL separator");
+      args.splice(separator, 0, `${CHUNKED_REFUSAL_HARNESS_ARGUMENT}=${infoPath}`);
+      const result = await ledger.runner({ ...opts, args });
+      const allowance = Number(
+        args.find((a) => a.startsWith("--max-filesize="))?.slice("--max-filesize=".length),
+      );
+      refusalLineWasFinal.push(isPinnedMaxFilesizeRefusal(result.stdout, allowance));
+      return result;
+    };
+    const requestsBefore = ranged.service.splitRequests().length;
+
+    let code = null;
+    let threw = false;
+    try {
+      await downloadGenericSplitSources(url, workDir, plan, {
+        limits: { maxFileSizeBytes: combinedLimit, downloadTimeoutSeconds: 60 },
+        validateUrl,
+        runner,
+      });
+    } catch (err) {
+      threw = true;
+      code = err instanceof AppError ? err.code : String(err?.name ?? "unknown");
+    }
+
+    // 5. What the run left — observed before anything is removed.
+    const videoName = basename(expectedSplitSourcePath(workDir, "video", plan.pair.video.container));
+    const audioFinalName = basename(expectedSplitSourcePath(workDir, "audio", plan.pair.audio.container));
+    const audioPartName = basename(expectedSplitPartPath(workDir, "audio", plan.pair.audio.container));
+    const entries = (await readdir(workDir).catch(() => [])).sort();
+    const partPath = join(workDir, audioPartName);
+    const partStat = await lstat(partPath).catch(() => null);
+    const partIsRegularFile = partStat !== null && partStat.isFile();
+    const partBytes = partIsRegularFile ? partStat.size : null;
+    const partMatchesFixturePrefix =
+      partBytes !== null &&
+      partBytes > 0 &&
+      sha256Bytes(await readFile(partPath)) === sha256Bytes(audioFixture.bytes.subarray(0, partBytes));
+    const videoPath = join(workDir, videoName);
+    const videoArtifactMatchesFixture =
+      (await pathExists(videoPath)) && (await sha256File(videoPath)) === videoFixture.sha256;
+    await rm(workDir, { recursive: true, force: true });
+
+    // 6. What the fixture served during the acquisition.
+    const served = ranged.service.splitRequests().slice(requestsBefore);
+    const gets = (route) => served.filter((r) => r.route === route && r.method === "GET");
+    const contiguousFromZero = (list) =>
+      list.length > 0 &&
+      list.every(
+        (r, i) =>
+          r.status === 206 &&
+          r.range !== null &&
+          r.range.start === (i === 0 ? 0 : list[i - 1].range.end + 1),
+      );
+    const videoGets = gets(MEDIA_ROUTE[family].video);
+    const audioGets = gets(MEDIA_ROUTE[family].audio);
+    const refused = audioGets.at(-1) ?? null;
+    const ytdlpRuns = ledger
+      .all()
+      .filter((s) => s.phase === "max-filesize-chunked" && s.args.some((a) => a.startsWith("--format=")));
+    const last = ytdlpRuns.at(-1);
+
+    const observation = {
+      refusedHalf: "audio",
+      chunkSizeSource: CHUNKED_REFUSAL_CHUNK_SIZE_SOURCE,
+      httpChunkSizeBytes: chunkSize,
+      httpFormatCount,
+      chunkedFormatCount,
+      paramsHttpChunkSizePassed,
+      harnessArgumentAdded: CHUNKED_REFUSAL_HARNESS_ARGUMENT,
+      manifestGetsDuringAcquisition: served.filter((r) => r.route === MANIFEST_ROUTE[family]).length,
+      threw,
+      acquisitionRuns: ytdlpRuns.length,
+      combinedLimitBytes: combinedLimit,
+      videoBytes: videoFixture.byteLength,
+      audioAllowanceBytes: audioAllowance,
+      maxFilesizeArguments: ytdlpRuns.map(
+        (s) => s.args.find((a) => a.startsWith("--max-filesize="))?.slice("--max-filesize=".length) ?? null,
+      ),
+      videoRangedGets: videoGets.length,
+      videoRangesContiguous:
+        contiguousFromZero(videoGets) && videoGets.at(-1).range.end === videoFixture.byteLength - 1,
+      videoArtifactMatchesFixture,
+      audioRangedGets: audioGets.length,
+      audioRangesContiguous: contiguousFromZero(audioGets),
+      expectedEarlierChunks: CHUNKED_REFUSAL_EARLIER_CHUNKS,
+      earlierChunksServed: Math.max(0, audioGets.length - 1),
+      refusedRangeStartBytes: refused?.range?.start ?? null,
+      refusedRangeContentLengthBytes: refused?.range ? refused.bytes : null,
+      // What yt-dlp compared: the bytes it held plus the refused response's
+      // declared length — measured here at the fixture, never read from stdout.
+      declaredBytes: refused?.range ? refused.range.start + refused.bytes : null,
+      ytdlpExitCode: last ? last.exitCode : null,
+      ytdlpRefusalLineWasFinal: refusalLineWasFinal.at(-1) ?? null,
+      ytdlpStdoutBytes: last?.stdoutBytes ?? null,
+      ytdlpStderrBytes: last?.stderrBytes ?? null,
+      finalFileExists: entries.includes(audioFinalName),
+      partIsRegularFile,
+      partBytes,
+      partMatchesFixturePrefix,
+      workDirEntries: entries,
+      expectedWorkDirEntries: [videoName, audioPartName].sort(),
+      canonicalErrorCode: code,
+      requiredCanonicalErrorCode: MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
+    };
+    for (const check of evaluateChunkedMaxFilesizeRefusal(observation)) {
+      checks.record(check.name, check.ok, check.detail);
+    }
+    return observation;
+  } finally {
+    await ranged.service.close();
+  }
+}
+
 // ── 9. CLI ─────────────────────────────────────────────────────────────────
 
 function parseArgv(argv) {
@@ -1463,6 +1711,7 @@ async function main(argv) {
   let incompatible = null;
   let noFfmpeg = null;
   let maxFilesize = null;
+  let maxFilesizeChunked = null;
   let overwrite = null;
   let toolchain = null;
   let fixtureSummary = null;
@@ -1550,6 +1799,7 @@ async function main(argv) {
     incompatible = await runIncompatibleCase(ctx);
     noFfmpeg = await runNoFfmpegCase(ctx);
     maxFilesize = await acceptMaxFilesizeRefusal(ctx);
+    maxFilesizeChunked = await acceptChunkedMaxFilesizeRefusal(ctx);
 
     verdict = checks.passed() ? "PASS" : "FAIL";
   } catch (err) {
@@ -1655,6 +1905,7 @@ async function main(argv) {
     cleanup: full?.cleanup ?? null,
     negativeCases: { incompatiblePair: incompatible, ffmpegUnavailableAtAnalysis: noFfmpeg },
     maxFilesizeRefusal: maxFilesize,
+    maxFilesizeChunkedRefusal: maxFilesizeChunked,
     ffmpegOverwriteRefusal: overwrite,
     checks: checks.all(),
   });

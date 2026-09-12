@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import type { ChildProcess } from "node:child_process";
+import { execFileSync, type ChildProcess } from "node:child_process";
 import {
   mkdtempSync,
   rmSync,
@@ -1059,9 +1059,10 @@ describe("generic download: the pinned --max-filesize refusal (YTDLP-MAX-FILESIZ
     }
   });
 
-  it("the witness never overrides the artifact rules: any residue stays PROCESSING_FAILED", async () => {
+  it("the witness never overrides the artifact rules: any OTHER residue stays PROCESSING_FAILED", async () => {
+    // This run's own partial `.part` is the one residue a genuine refusal can
+    // leave — a LATER chunk refused — and has its own describe below.
     const residues: Array<[string, () => void]> = [
-      ["a .part the run left behind", () => writeFileSync(expectedPartPath(workDir, "mp4"), "partial")],
       ["a side file", () => writeFileSync(join(workDir, "source.info.json"), "{}")],
       ["a wrong-extension artifact", () => writeFileSync(join(workDir, "source.webm"), "OTHER")],
     ];
@@ -1320,6 +1321,295 @@ describe("generic download: the pinned --max-filesize refusal (YTDLP-MAX-FILESIZ
         },
       );
     });
+
+    it("a LATER-chunk refusal on a real pipe, beside the run's own partial .part, is TOO_LARGE", async () => {
+      hookChild((child) => {
+        writeFileSync(expectedPartPath(workDir, "mp4"), "x".repeat(600));
+        child.stderr.end();
+        child.stdout.end(
+          statusLines() +
+            `[download] Destination: ${expectedSourcePath(workDir, "mp4")}\n` +
+            refusalLine(DECLARED, LIMIT),
+        );
+        setImmediate(() => child.emit("close", 0));
+      });
+      await assert.rejects(
+        () => downloadGenericOriginal(SAFE_URL, workDir, videoPlan(), baseDeps({ limits })),
+        (err: unknown) => err instanceof AppError && err.code === "TOO_LARGE",
+      );
+      assert.deepEqual(readdirSync(workDir), ["source.mp4.part"], "left for the executor");
+    });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001, correction: the same pinned
+// refusal on a LATER chunk leaves this run's partial `.part` — still
+// TOO_LARGE, and still nothing else
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * What the pinned runtime prints when a LATER response is refused: the
+ * destination it opened for the earlier chunks, then the refusal, whose
+ * declared length counts the bytes `NextFragment` carried over as `resume_len`.
+ */
+const chunkedRefusedRun = (declared: number, ceiling: number, url?: string): RunResult => ({
+  code: 0,
+  stdout:
+    statusLines(url) +
+    `[download] Destination: ${expectedSourcePath(workDir, "mp4")}\n` +
+    refusalLine(declared, ceiling),
+  stderr: "",
+});
+
+describe("generic download: a pinned --max-filesize refusal on a LATER chunk (YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001)", () => {
+  const LIMIT = 1000;
+  /** A declared length no stack frame or line number could ever contain. */
+  const DECLARED = 987_654_321;
+  const limits = { maxFileSizeBytes: LIMIT, downloadTimeoutSeconds: 60 };
+  const part = () => expectedPartPath(workDir, "mp4");
+  const run = (
+    overrides: Partial<Parameters<typeof downloadGenericOriginal>[3]> = {},
+    url = SAFE_URL,
+  ) => downloadGenericOriginal(url, workDir, videoPlan(), baseDeps({ limits, ...overrides }));
+
+  const emptyWorkDir = () => {
+    rmSync(workDir, { recursive: true, force: true });
+    mkdirSync(workDir);
+  };
+
+  /** A run that wrote `bytes` into its own `.part`, then reported `result`. */
+  const refusedAfter = (bytes: number, result: RunResult = chunkedRefusedRun(DECLARED, LIMIT)) =>
+    fakeRunner(async () => {
+      writeFileSync(part(), "x".repeat(bytes));
+      return result;
+    });
+
+  const code = (expected: string, label: string) => (err: unknown) => {
+    assert.ok(err instanceof AppError, label);
+    assert.equal(err.code, expected, label);
+    return true;
+  };
+
+  const cancelled = (err: unknown) =>
+    err instanceof AppError &&
+    err.code === "PROCESSING_FAILED" &&
+    err.message === "Download was cancelled.";
+
+  it("this run's partial .part and the witness: TOO_LARGE, the canonical message only, the .part left for the executor", async () => {
+    const { runner, calls } = fakeRunner(async () => {
+      writeFileSync(part(), "x".repeat(600));
+      return chunkedRefusedRun(DECLARED, LIMIT, SECRET_URL);
+    });
+    await assert.rejects(
+      () => run({ runner }, SECRET_URL),
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.equal(err.code, "TOO_LARGE");
+        assert.equal(err.message, ERROR_MESSAGES.TOO_LARGE);
+        const serialized = `${err.message} ${JSON.stringify(err)} ${String(err.stack)}`;
+        for (const leak of [SENTINEL, "max-filesize", "[download]", String(DECLARED), ".part", workDir]) {
+          assert.equal(serialized.includes(leak), false, `'${leak}' escaped into the error`);
+        }
+        return true;
+      },
+    );
+    assert.equal(calls.length, 1, "exactly one acquisition subprocess");
+    assert.ok(calls[0]!.args.includes(`--max-filesize=${LIMIT}`));
+    // Acquisition deletes nothing: the job directory's owner, the executor,
+    // removes the partial download along with everything else.
+    assert.deepEqual(readdirSync(workDir), ["source.mp4.part"]);
+    assert.equal(readFileSync(part()).byteLength, 600, "the .part is left exactly as the run wrote it");
+  });
+
+  it("a .part of one byte up to EXACTLY the run's allowance is the genuine chunked shape", async () => {
+    for (const bytes of [1, LIMIT - 1, LIMIT]) {
+      emptyWorkDir();
+      const { runner } = refusedAfter(bytes);
+      await assert.rejects(() => run({ runner }), code("TOO_LARGE", `${bytes} bytes`));
+    }
+  });
+
+  it("a .part PAST the allowance, with no watcher-first cause, is not this shape: PROCESSING_FAILED", async () => {
+    // The pinned check admits an earlier chunk only while `resume_len` plus its
+    // length stays within the allowance, so a genuine chunked refusal cannot
+    // leave more. More is the byte watcher's to report — here it never
+    // observes anything — and the shape proof never re-reads it as a refusal.
+    const { runner } = refusedAfter(LIMIT + 1);
+    await assert.rejects(
+      () => run({ runner, statSize: async () => null }),
+      code("PROCESSING_FAILED", "past the allowance"),
+    );
+  });
+
+  it("an EMPTY .part is not a partial download: PROCESSING_FAILED", async () => {
+    const { runner } = refusedAfter(0);
+    await assert.rejects(() => run({ runner }), code("PROCESSING_FAILED", "zero bytes"));
+  });
+
+  it("only THIS run's exact .part qualifies: any other or additional entry stays PROCESSING_FAILED", async () => {
+    const partial = () => writeFileSync(part(), "x".repeat(600));
+    const shapes: Array<[string, () => void]> = [
+      ["another basename's .part", () => writeFileSync(join(workDir, "video-source.mp4.part"), "x".repeat(600))],
+      ["another extension's .part", () => writeFileSync(join(workDir, "source.webm.part"), "x".repeat(600))],
+      ["a fragment, not a .part", () => writeFileSync(join(workDir, "source.mp4.part-Frag1"), "x".repeat(600))],
+      [
+        "the .part plus a side file",
+        () => {
+          partial();
+          writeFileSync(join(workDir, "source.info.json"), "{}");
+        },
+      ],
+      [
+        "the .part plus a second .part",
+        () => {
+          partial();
+          writeFileSync(join(workDir, "source.m4a.part"), "x".repeat(10));
+        },
+      ],
+      [
+        "the .part beside the final artifact: the ordinary validation decides",
+        () => {
+          partial();
+          writeSource("mp4", "0123456789");
+        },
+      ],
+    ];
+    for (const [label, shape] of shapes) {
+      emptyWorkDir();
+      const { runner } = fakeRunner(async () => {
+        shape();
+        return chunkedRefusedRun(DECLARED, LIMIT);
+      });
+      await assert.rejects(() => run({ runner }), code("PROCESSING_FAILED", label));
+    }
+  });
+
+  it("a symlink, a directory or a FIFO where the .part should be is not a partial download", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "ytdlp-dl-outside-"));
+    try {
+      const outsideFile = join(outside, "elsewhere.bin");
+      writeFileSync(outsideFile, "x".repeat(600));
+      const shapes: Array<[string, () => void]> = [
+        // Its canonical location is outside the job directory. Containment is
+        // proven against the real path, never the spelled one.
+        ["a symlink escaping the job directory", () => symlinkSync(outsideFile, part())],
+        ["a dangling symlink", () => symlinkSync(join(outside, "missing.bin"), part())],
+        ["a directory", () => mkdirSync(part())],
+        ["a FIFO", () => execFileSync("mkfifo", [part()])],
+      ];
+      for (const [label, shape] of shapes) {
+        emptyWorkDir();
+        const { runner } = fakeRunner(async () => {
+          shape();
+          return chunkedRefusedRun(DECLARED, LIMIT);
+        });
+        await assert.rejects(
+          () => run({ runner, statSize: async () => null }),
+          code("PROCESSING_FAILED", label),
+        );
+      }
+      assert.equal(readFileSync(outsideFile).byteLength, 600, "nothing outside the job directory was touched");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("a .part WITHOUT the witness for this run stays PROCESSING_FAILED", async () => {
+    const destination = `[download] Destination: ${expectedSourcePath(workDir, "mp4")}\n`;
+    const outputs: Array<[string, string]> = [
+      ["nothing printed", ""],
+      ["status lines and the destination only", statusLines() + destination],
+      ["a refusal naming another ceiling", statusLines() + destination + refusalLine(DECLARED, LIMIT * 2)],
+      ["a refusal that is not the final line", `${refusalLine(DECLARED, LIMIT)}[download] Download completed\n`],
+      ["a refusal after a playlist banner", `[download] Downloading playlist: x\n${refusalLine(DECLARED, LIMIT)}`],
+    ];
+    for (const [label, stdout] of outputs) {
+      emptyWorkDir();
+      const { runner } = refusedAfter(600, { code: 0, stdout, stderr: "" });
+      await assert.rejects(() => run({ runner }), code("PROCESSING_FAILED", label));
+    }
+  });
+
+  it("a NON-zero exit beside a .part: stderr alone classifies, the witness is never read", async () => {
+    const { runner } = refusedAfter(600, {
+      code: 1,
+      stdout: statusLines() + refusalLine(DECLARED, LIMIT),
+      stderr: "ERROR: Unable to download: Connection refused",
+    });
+    await assert.rejects(() => run({ runner }), code("NETWORK_ERROR", "non-zero exit"));
+  });
+
+  it("TIMEOUT and an output overflow beside a .part keep their own codes", async () => {
+    const throwsAfterPart = (err: unknown) =>
+      fakeRunner(async () => {
+        writeFileSync(part(), "x".repeat(600));
+        throw err;
+      }).runner;
+    await assert.rejects(
+      () => run({ runner: throwsAfterPart(new AppError("TIMEOUT")) }),
+      code("TIMEOUT", "timeout"),
+    );
+    emptyWorkDir();
+    await assert.rejects(
+      () => run({ runner: throwsAfterPart(new ProcessOutputLimitError("stdout")) }),
+      code("EXTRACTION_FAILED", "output overflow"),
+    );
+  });
+
+  it("the caller cancels FIRST, then the run exits 0 with the witness beside its .part: the cancellation stands", async () => {
+    const caller = new AbortController();
+    const { runner } = fakeRunner(async () => {
+      writeFileSync(part(), "x".repeat(600));
+      caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+      return chunkedRefusedRun(DECLARED, LIMIT);
+    });
+    await assert.rejects(
+      () =>
+        downloadGenericOriginal(SAFE_URL, workDir, videoPlan(), {
+          ...baseDeps({ runner, limits }),
+          signal: caller.signal,
+        }),
+      cancelled,
+    );
+  });
+
+  it("a cancellation landing while the .part shape is being proven still stands", async () => {
+    // It lands during the directory read; the `.part` proof that follows still
+    // runs to completion, and only the check AFTER it can see the cancellation.
+    const caller = new AbortController();
+    const { runner } = refusedAfter(600);
+    let reads = 0;
+    const readDir = async (path: string) => {
+      reads += 1;
+      caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+      return readdirSync(path);
+    };
+    await assert.rejects(
+      () =>
+        downloadGenericOriginal(SAFE_URL, workDir, videoPlan(), {
+          ...baseDeps({ runner, limits, readDir }),
+          signal: caller.signal,
+        }),
+      cancelled,
+    );
+    assert.equal(reads, 1, "the job directory really was read");
+  });
+
+  it("an overflow the watcher latched FIRST stays TOO_LARGE through a witnessed exit 0 beside its .part", async () => {
+    // Compare the same over-allowance `.part` with no watcher-first cause,
+    // above: PROCESSING_FAILED. Here the watcher saw it and latched the cause
+    // before the run reported, and the later step never re-decides it.
+    const { runner } = fakeRunner(async (call) => {
+      writeFileSync(part(), "x".repeat(LIMIT * 2));
+      const start = Date.now();
+      while (call.signal?.aborted !== true) {
+        if (Date.now() - start > 3_000) throw new Error("the watcher never latched an overflow");
+        await new Promise((r) => setTimeout(r, 1));
+      }
+      return chunkedRefusedRun(DECLARED, LIMIT);
+    });
+    await assert.rejects(() => run({ runner, sizePollMs: 1 }), code("TOO_LARGE", "watcher first"));
   });
 });
 

@@ -542,4 +542,83 @@ describe("YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001: a refused AUDIO half fa
     assert.ok(workDirSeen);
     assert.equal(fs.existsSync(workDirSeen), false, "the executor's finally removed the workDir, video half included");
   });
+
+  it("video acquired, audio refused on a LATER chunk: failed / TOO_LARGE, the partial audio .part removed by the executor", async () => {
+    const job = claimJob(h.store, "preset:1080");
+    const runs: Array<{ role: string; maxFilesize: string | undefined }> = [];
+    const transitions: string[] = [];
+    const realBeginProcessing = h.store.beginProcessing.bind(h.store);
+    h.store.beginProcessing = (...a: Parameters<SQLiteJobStore["beginProcessing"]>) => {
+      transitions.push("beginProcessing");
+      return realBeginProcessing(...a);
+    };
+    const { spawns } = hookSubprocesses(h, job.jobId, "mp4");
+
+    let workDirSeen = "";
+    let leftWhenAcquisitionThrew: string[] = [];
+    const remainder = LIMITS.maxFileSizeBytes - VIDEO_BYTES.length;
+    // The REAL SPLIT-03 primitive. The audio run is refused as the pinned
+    // HttpFD refuses a LATER chunk of a chunked source: the chunks it admitted
+    // are already in the half's own `.part`, then it prints the refusal of the
+    // run's own allowance and exits 0.
+    const download: DownloadGenericSplitFn = async (url, workDir, plan, ctx) => {
+      workDirSeen = workDir;
+      try {
+        return await downloadGenericSplitSources(url, workDir, plan, {
+          limits: ctx.limits,
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+          validateUrl: async (raw) => ({ url: raw, hostname: "example.invalid" }),
+          probeRuntime: async () => ({
+            available: true,
+            version: YTDLP_RUNTIME.expectedVersion,
+            reason: "ok" as const,
+          }),
+          runner: async (call) => {
+            const template = call.args.find((a) => a.startsWith("--output="))!.slice("--output=".length);
+            const role = path.basename(template).startsWith("video-source") ? "video" : "audio";
+            const maxFilesize = call.args
+              .find((a) => a.startsWith("--max-filesize="))
+              ?.slice("--max-filesize=".length);
+            runs.push({ role, maxFilesize });
+            if (role === "video") {
+              fs.writeFileSync(template.replace("%(ext)s", "mp4"), VIDEO_BYTES);
+              return { code: 0, stdout: "", stderr: "" };
+            }
+            fs.writeFileSync(`${template.replace("%(ext)s", "m4a")}.part`, "x".repeat(remainder - 1));
+            return {
+              code: 0,
+              stdout:
+                `[download] Destination: ${template.replace("%(ext)s", "m4a")}\n` +
+                `\r[download] File is larger than max-filesize (5000 bytes > ${maxFilesize} bytes). Aborting.\n`,
+              stderr: "",
+            };
+          },
+        });
+      } catch (err) {
+        leftWhenAcquisitionThrew = fs.readdirSync(workDir).sort();
+        throw err;
+      }
+    };
+
+    await executorFor(h, download, "mp4").execute(job);
+
+    const view = h.store.getJob(job.jobId)!;
+    assert.equal(view.status, "failed");
+    assert.equal(view.errorCode, "TOO_LARGE");
+    assert.equal(view.safeErrorMessage, ERROR_MESSAGES.TOO_LARGE);
+    assert.deepEqual(runs, [
+      { role: "video", maxFilesize: String(LIMITS.maxFileSizeBytes) },
+      { role: "audio", maxFilesize: String(remainder) },
+    ]);
+    assert.deepEqual(
+      leftWhenAcquisitionThrew,
+      ["audio-source.m4a.part", "video-source.mp4"],
+      "acquisition deleted nothing: the validated video and the partial audio were the executor's to remove",
+    );
+    assert.deepEqual(transitions, [], "processing never began");
+    assert.equal(spawns.length, 0, "no ffprobe and no FFmpeg merge");
+    assert.deepEqual(h.failCalls, ["TOO_LARGE"]);
+    assert.equal(h.puts.length, 0, "nothing uploaded");
+    assert.equal(fs.existsSync(workDirSeen), false, "the executor's finally removed the workDir, partial .part included");
+  });
 });

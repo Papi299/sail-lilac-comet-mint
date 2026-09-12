@@ -1418,15 +1418,31 @@ between the last poll and process exit.
 **Every gate reports the same canonical `TOO_LARGE`.** A `--max-filesize`
 refusal is not an error to the pinned yt-dlp: `HttpFD` prints one status line,
 `[download] File is larger than max-filesize (N bytes > M bytes). Aborting.`,
-opens no `.part` and no final file, and the process **exits 0**. Since
+writes no final file, and the process **exits 0**. Where it refuses decides
+what it leaves. On a download's first response nothing is written. On a LATER
+response it has already written the earlier responses' bytes to the run's
+`.part`. A later response is either the next chunk of a source fetched in HTTP
+chunks or a resumed retry. The pinned YouTube extractor requests chunking for
+its https formats (`downloader_options.http_chunk_size = 10 << 20`), so that is
+the usual YouTube case. Since
 `YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001` acquisition runs `--no-quiet`
 (under `--quiet` that line is swallowed) and maps a zero exit to `TOO_LARGE`
-only when all of these hold: that exact line is the final stdout line, it names
-exactly the run's own `--max-filesize` allowance, no playlist banner was
-printed, no earlier cause (overflow, cancellation, shutdown) was latched, and
-the run left the job directory exactly as it found it. Anything else keeps its
-previous classification; stderr alone classifies a non-zero exit, and neither
-stream is logged, persisted or returned. The byte watcher is unchanged and
+only when all of these hold:
+
+- that exact line is the final stdout line;
+- it names exactly the run's own `--max-filesize` allowance;
+- no playlist banner was printed;
+- no earlier cause (overflow, cancellation, shutdown) was latched;
+- the job directory holds exactly what that refusal can leave: either nothing
+  new, or only the run's own `.part`. That `.part` must be a regular file
+  inside the job directory, hold at least one byte, and hold no more than the
+  run's allowance;
+- any artifact validated before the run (a split pair's video half) is intact.
+
+Acquisition deletes nothing; the executor removes the partial `.part` along
+with the job directory. Anything else keeps its previous classification.
+stderr alone classifies a non-zero exit, and neither stream is logged,
+persisted or returned. The byte watcher is unchanged and
 still required — an unknown, missing or misreported length never reaches
 `--max-filesize` at all — and no size ceiling or network policy changed. This
 is **source, not deployment**: the Production image built from `e4fa646b…`

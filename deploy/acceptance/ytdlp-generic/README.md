@@ -153,7 +153,7 @@ prove.
 | `lib/split-fixture-url.mjs` | — | The test-only exact-fixture URL validator. |
 | `lib/local-object-writer.mjs` | — | The deterministic local `ObjectStoreWriter` (NOT R2). |
 | `lib/split-observers.mjs` | — | Spawn ledger, media-tool sampler, SQLite status-audit trigger. |
-| `lib/split-evidence.mjs` | — | The `split06-deterministic-full-path-03` record; `-01` and `-02` records are historical. |
+| `lib/split-evidence.mjs` | — | The `split06-deterministic-full-path-04` record; `-01`, `-02` and `-03` records are historical. |
 | `fixtures/split-media.mjs` | — | The four bit-exact split fixture recipes and the DASH manifests. |
 
 Tests: `scripts/ytdlp-acceptance.test.mjs` and `scripts/ytdlp-fixture.test.mjs`,

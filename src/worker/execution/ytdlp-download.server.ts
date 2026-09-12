@@ -1,5 +1,5 @@
 import { stat as fsStat, readdir as fsReaddir, lstat as fsLstat, realpath as fsRealpath } from "node:fs/promises";
-import { isAbsolute, join, resolve, dirname } from "node:path";
+import { isAbsolute, join, resolve, dirname, basename } from "node:path";
 import { AppError } from "../../lib/errors.ts";
 import { assertSafeUrl } from "../../lib/security/ssrf.server.ts";
 import {
@@ -262,9 +262,12 @@ export function ytdlpDownloadPolicyArgs(opts: {
     // `HttpFD.real_download` checks `max_filesize` inside `if data_len is not
     // None`. An unknown or decompressed length keeps streaming, which is
     // exactly why this is NOT sufficient and the actual-byte guard exists.
-    // When it DOES refuse, the pinned release exits 0 having written nothing,
-    // and the refusal keeps its TOO_LARGE meaning only through the witness
-    // `isPinnedMaxFilesizeRefusal` reads from stdout.
+    // When it DOES refuse, the pinned release exits 0, and the refusal keeps
+    // its TOO_LARGE meaning only through the witness
+    // `isPinnedMaxFilesizeRefusal` reads from stdout. It refuses before
+    // writing anything — or, when the refused response is a LATER one of the
+    // same download (the next chunk of an extractor-chunked source, or a
+    // resumed retry), after the earlier responses filled this run's `.part`.
     `--max-filesize=${maxFileSizeArg(opts.maxFileSizeBytes)}`,
 
     // ── fragment policy ──────────────────────────────────────────────────
@@ -492,21 +495,32 @@ export function classifyDownloadFailure(raw: string): AppError["code"] {
 
 /**
  * The ONE line yt-dlp 2026.08.19 prints when `--max-filesize` refuses a
- * download. Its `HttpFD.real_download` checks the declared length before it
- * opens any destination:
+ * download. Its `HttpFD.real_download` checks each response's declared length,
+ * plus the bytes this download already holds, before it reads that body:
  *
- *     if max_data_len is not None and data_len > max_data_len:
- *         self.to_screen(
- *             f'\r[download] File is larger than max-filesize ({data_len} bytes > {max_data_len} bytes). Aborting.')
- *         return False
+ *     if data_len is not None:
+ *         data_len = int(data_len) + ctx.resume_len
+ *         ...
+ *         if max_data_len is not None and data_len > max_data_len:
+ *             self.to_screen(
+ *                 f'\r[download] File is larger than max-filesize ({data_len} bytes > {max_data_len} bytes). Aborting.')
+ *             return False
  *
  * To the pinned release that is not an error. `FileDownloader.download`
  * returns `(False, True)`, `process_info` merely skips post-processing, nothing
- * reaches `report_error`, and the process exits 0 — with no `.part` and no
- * final file. This line is therefore the only thing that separates "refused as
- * too large" from any other run that exits 0 and leaves nothing behind, an
- * empty playlist among them. Both numbers are Python `int`s: plain decimal, no
- * sign, no leading zero, no unit.
+ * reaches `report_error`, and the process exits 0 — with no final file. This
+ * line is therefore the only thing that separates "refused as too large" from
+ * any other run that exits 0 without an artifact, an empty playlist among
+ * them. Both numbers are Python `int`s: plain decimal, no sign, no leading
+ * zero, no unit.
+ *
+ * WHERE it refuses decides what it leaves (see `isPinnedRefusalShape`). On a
+ * download's first response `resume_len` is 0 and no destination is open yet,
+ * so nothing is written. A source fetched in HTTP chunks — the extractor's
+ * `downloader_options.http_chunk_size`, which the pinned YouTube extractor sets
+ * to `10 << 20` on its https formats — makes every chunk a new response, raised
+ * through `NextFragment` with `resume_len` carried over; a later chunk is then
+ * refused with the earlier chunks already in this run's `.part`.
  */
 const MAX_FILESIZE_REFUSAL_LINE =
   /^\[download\] File is larger than max-filesize \(([1-9][0-9]*) bytes > ([1-9][0-9]*) bytes\)\. Aborting\.$/;
@@ -533,9 +547,10 @@ const PLAYLIST_BANNER_LINE = /^\[download\] Downloading (?:playlist|multi_video)
  *   - No playlist banner may appear anywhere.
  *
  * A witness, never a classification on its own: `runMonitoredAcquisition` also
- * requires a zero exit, no earlier cause, and a job directory the run left
- * exactly as it found it. The text is read here and dropped; none of it is
- * stored, logged, returned or attached to an error.
+ * requires a zero exit, no earlier cause, and a job directory holding exactly
+ * what such a refusal can leave (`isPinnedRefusalShape`). The text is read
+ * here and dropped; none of it is stored, logged, returned or attached to an
+ * error.
  */
 export function isPinnedMaxFilesizeRefusal(stdout: string, allowanceBytes: number): boolean {
   if (!Number.isSafeInteger(allowanceBytes) || allowanceBytes <= 0) return false;
@@ -819,8 +834,10 @@ export async function downloadGenericOriginal(
         }),
       workDir,
       // The executor's fresh per-job directory: a successful run leaves exactly
-      // `source.<ext>` in it, and a refused one leaves it empty.
+      // `source.<ext>` in it, and a refused one leaves it empty — or holding
+      // only `source.<ext>.part`, when a later response was the refused one.
       entriesBefore: [],
+      priorArtifacts: [],
       readDir,
       timeoutMs: networkTimeoutMs,
       signal: controller.signal,
@@ -893,9 +910,16 @@ async function runMonitoredAcquisition(opts: {
   readonly workDir: string;
   /**
    * The job directory's exact entries before this run. A size refusal must
-   * leave precisely these behind: nothing created and nothing removed.
+   * leave precisely these behind — plus, at most, this run's own `.part` (see
+   * `isPinnedRefusalShape`): nothing else created and nothing removed.
    */
   readonly entriesBefore: readonly string[];
+  /**
+   * The artifacts already validated in this job directory before this run:
+   * none, or a split pair's video half before its audio run. A size refusal
+   * must leave each of them exactly as it was validated.
+   */
+  readonly priorArtifacts: readonly GenericSplitSourceArtifact[];
   readonly readDir: (path: string) => Promise<string[]>;
   readonly timeoutMs: number;
   /** The operation-owned controller's signal: one abort path to the group. */
@@ -1041,16 +1065,73 @@ async function runMonitoredAcquisition(opts: {
   // file, and a size refusal is reported as a processing failure.
   //
   // TOO_LARGE needs ALL of: the witness for THIS run's allowance, no earlier
-  // cause, and a job directory the run left exactly as it found it — no final
-  // file, no `.part`, nothing. Anything short of that returns, and the ordinary
-  // validation refuses it exactly as before.
+  // cause, and a job directory holding exactly what that refusal can leave —
+  // nothing new, or only this run's own partial `.part` — with every artifact
+  // validated before this run intact. Anything short of that returns, and the
+  // ordinary validation refuses it exactly as before.
   if (!isPinnedMaxFilesizeRefusal(result.stdout, opts.maxFileSizeBytes)) return;
   throwIfEarlierCause(opts);
-  if (!(await hasExactEntries(opts.workDir, opts.entriesBefore, opts.readDir))) return;
-  // The directory read yielded to the event loop, so check again: a cause that
+  if (!(await isPinnedRefusalShape(opts))) return;
+  // The shape proof yielded to the event loop, so check again: a cause that
   // arrived meanwhile was still established before this classification.
   throwIfEarlierCause(opts);
   throw new AppError("TOO_LARGE");
+}
+
+/**
+ * True when the job directory holds EXACTLY what a pinned `--max-filesize`
+ * refusal of this run can leave behind. There are two such shapes, and only
+ * two (see `MAX_FILESIZE_REFUSAL_LINE`):
+ *
+ *   A. refused on the download's FIRST response: `entriesBefore`, untouched;
+ *   B. refused on a LATER response — the next chunk of a chunked source, or a
+ *      resumed retry: `entriesBefore` plus this run's own `.part`, holding
+ *      what the earlier responses delivered.
+ *
+ * In shape B the `.part` must pass the same containment, symlink and
+ * regular-file proof as a delivered artifact, and hold at least one byte and
+ * no more than this run's allowance: the pinned check admitted each earlier
+ * response only while `resume_len` plus its length stayed within it. A `.part`
+ * past the allowance is the actual-byte guard's to report, never this shape's.
+ *
+ * In both shapes, every artifact validated before this run must still pass its
+ * own proof at exactly its validated size.
+ *
+ * A question, never an assertion. Anything else — an unreadable directory, a
+ * final file, a side file, a fragment, another name or extension, a symlink,
+ * a directory or a FIFO where the `.part` should be — is "no", and the
+ * ordinary validation then refuses it exactly as before. Nothing is deleted:
+ * the `.part` is left for the job directory's lifecycle owner, the executor.
+ */
+async function isPinnedRefusalShape(opts: {
+  readonly workDir: string;
+  readonly entriesBefore: readonly string[];
+  readonly priorArtifacts: readonly GenericSplitSourceArtifact[];
+  readonly partPath: string;
+  readonly maxFileSizeBytes: number;
+  readonly readDir: (path: string) => Promise<string[]>;
+}): Promise<boolean> {
+  let entries: string[];
+  try {
+    entries = await opts.readDir(opts.workDir);
+  } catch {
+    return false;
+  }
+  if (!sameEntries(entries, opts.entriesBefore)) {
+    // Not shape A, so it is shape B or nothing.
+    if (!sameEntries(entries, [...opts.entriesBefore, basename(opts.partPath)])) return false;
+    const partBytes = await containedFileSizeOrNull(
+      opts.workDir,
+      opts.partPath,
+      opts.maxFileSizeBytes,
+    );
+    if (partBytes === null) return false;
+  }
+  for (const prior of opts.priorArtifacts) {
+    const size = await containedFileSizeOrNull(opts.workDir, prior.filePath, prior.fileSize);
+    if (size !== prior.fileSize) return false;
+  }
+  return true;
 }
 
 /**
@@ -1291,6 +1372,9 @@ export async function downloadGenericSplitSources(
       half: SplitHalfPaths,
       acquiredBytes: number,
       entriesBefore: readonly string[],
+      // The validated artifacts among `entriesBefore`, re-proven only if this
+      // half's run is a `--max-filesize` refusal (see `isPinnedRefusalShape`).
+      priorArtifacts: readonly GenericSplitSourceArtifact[],
     ): Promise<GenericSplitSourceArtifact> => {
       // Refuses ANY residue — including a pre-existing entry at this half's own
       // final or `.part` path (§41). Nothing is deleted and continued past.
@@ -1319,6 +1403,7 @@ export async function downloadGenericSplitSources(
         // Exactly what this half found: nothing before the video run, the
         // validated video artifact before the audio one.
         entriesBefore,
+        priorArtifacts,
         readDir,
         timeoutMs,
         signal: controller.signal,
@@ -1349,11 +1434,16 @@ export async function downloadGenericSplitSources(
     };
 
     // 6. VIDEO first, from an EMPTY job directory, with the whole byte budget.
-    const videoArtifact = await acquireHalf(video, 0, []);
+    const videoArtifact = await acquireHalf(video, 0, [], []);
 
     // 7. AUDIO second — only after the video artifact is proven — with only what
     //    the video left of the deadline and of the byte budget.
-    const audioArtifact = await acquireHalf(audio, videoArtifact.fileSize, [video.name]);
+    const audioArtifact = await acquireHalf(
+      audio,
+      videoArtifact.fileSize,
+      [video.name],
+      [videoArtifact],
+    );
 
     // The audio run shared the job directory, so the video artifact returned
     // must still be the one that was validated.
@@ -1425,28 +1515,13 @@ async function assertExactEntries(
   expected: readonly string[],
   readDir: (path: string) => Promise<string[]>,
 ): Promise<void> {
-  if (!(await hasExactEntries(workDir, expected, readDir))) {
-    throw new AppError("PROCESSING_FAILED");
-  }
-}
-
-/**
- * The same comparison as a QUESTION rather than an assertion, for the one
- * caller that must not throw: an unreadable directory is simply "not exactly
- * `expected`", and the ordinary validation then refuses it as it always did.
- */
-async function hasExactEntries(
-  workDir: string,
-  expected: readonly string[],
-  readDir: (path: string) => Promise<string[]>,
-): Promise<boolean> {
   let entries: string[];
   try {
     entries = await readDir(workDir);
   } catch {
-    return false;
+    throw new AppError("PROCESSING_FAILED");
   }
-  return sameEntries(entries, expected);
+  if (!sameEntries(entries, expected)) throw new AppError("PROCESSING_FAILED");
 }
 
 /** Order-independent exact equality, duplicates included. */
@@ -1470,10 +1545,19 @@ async function statAcquiredArtifact(opts: {
   maxBytes: number;
 }): Promise<GenericOriginalDownload> {
   const { workDir, container, finalPath, maxBytes } = opts;
+  const size = await proveContainedFile(workDir, finalPath, maxBytes);
+  return { filePath: resolve(finalPath), container, fileSize: size };
+}
 
+/**
+ * The proof itself, for ONE file directly inside the job directory: resolves to
+ * its size, or throws. Shared by every acquired artifact and by a refused run's
+ * `.part` (through `containedFileSizeOrNull`), so both meet one definition.
+ */
+async function proveContainedFile(workDir: string, path: string, maxBytes: number): Promise<number> {
   // Containment, symlink and regular-file checks against the CANONICAL path.
   const resolvedWorkDir = resolve(workDir);
-  const resolvedFile = resolve(finalPath);
+  const resolvedFile = resolve(path);
   if (!resolvedFile.startsWith(resolvedWorkDir + "/")) {
     throw new AppError("PROCESSING_FAILED");
   }
@@ -1504,5 +1588,22 @@ async function statAcquiredArtifact(opts: {
     throw new AppError("PROCESSING_FAILED");
   }
 
-  return { filePath: resolve(finalPath), container, fileSize: size };
+  return size;
+}
+
+/**
+ * `proveContainedFile` as a question, for `isPinnedRefusalShape`: the proven
+ * size, or `null` for anything the proof refuses — including a file past
+ * `maxBytes`, which is never re-read as a size refusal here.
+ */
+async function containedFileSizeOrNull(
+  workDir: string,
+  path: string,
+  maxBytes: number,
+): Promise<number | null> {
+  try {
+    return await proveContainedFile(workDir, path, maxBytes);
+  } catch {
+    return null;
+  }
 }
