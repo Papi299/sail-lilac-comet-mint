@@ -26,8 +26,8 @@
 import { createHash } from "node:crypto";
 
 import { FORBIDDEN_EVIDENCE_KEYS, stripForbiddenKeys } from "./evidence.mjs";
-import { isFullGitSha, RELEASE_INPUT_FILES } from "./release-provenance.mjs";
-import { FORBIDDEN_CANDIDATE_TAGS, RELEASE_DOCKERFILE } from "./release-container.mjs";
+import { HARNESS_DIRECTORY, HARNESS_DRIVER_PATH, isFullGitSha, RELEASE_INPUT_FILES } from "./release-provenance.mjs";
+import { FORBIDDEN_CANDIDATE_TAGS, IMAGE_ID_PATTERN, POLICY_VERIFIERS, RELEASE_DOCKERFILE } from "./release-container.mjs";
 
 /**
  * The schema identifier. Bump it when the record's MEANING changes.
@@ -40,15 +40,46 @@ import { FORBIDDEN_CANDIDATE_TAGS, RELEASE_DOCKERFILE } from "./release-containe
  *        `hardening` holds forbidden-tool, forbidden-environment and static
  *        policy-verifier outcomes; and `splitAcceptance` holds one validated,
  *        byte-hashed SPLIT-06 child record per family, mp4 AND webm, both
- *        required to PASS.
+ *        required to PASS. -01 records are HISTORICAL: never rewritten, never
+ *        re-read under -02 rules, and never sufficient to authorize SPLIT-07B.
+ *   -02  a PASS additionally means the EXECUTABLE ACCEPTANCE HARNESS itself was
+ *        provenance-bound and unchanged for the whole run, and that the image
+ *        executed was the image recorded:
+ *          - `harness` holds the harness checkout's OBSERVED commit and tree,
+ *            verified clean against explicit `--harness-source` /
+ *            `--harness-tree` expectations before any Docker command and again
+ *            at every checkpoint through the end of both SPLIT-06 children,
+ *            plus the proof that the executing driver is that checkout's own;
+ *          - every candidate container ran the immutable `sha256:` image ID
+ *            the driver inspected, never the mutable tag, and
+ *            `image.candidateRuns` records each run subject as parsed from the
+ *            argv Docker was given;
+ *          - the record is created exclusively (`wx`), so it can never
+ *            truncate or replace an artifact that already exists at its path.
+ *        -01 recorded the harness HEAD without verifying it and ran candidates
+ *        by tag, so a -01 PASS does not carry these claims.
  */
-export const SPLIT07_EVIDENCE_SCHEMA = "split07-release-image-candidate-01";
+export const SPLIT07_EVIDENCE_SCHEMA = "split07-release-image-candidate-02";
 
 /** The exact SPLIT-06 schema a SPLIT-07 PASS accepts as a child. */
 export const REQUIRED_CHILD_SCHEMA = "split06-deterministic-full-path-04";
 
 /** Both families are required. One is not a release-image acceptance. */
 export const REQUIRED_SPLIT_FAMILIES = Object.freeze(["mp4", "webm"]);
+
+/**
+ * Every candidate container a -02 PASS requires, by purpose. Each one must
+ * have executed the immutable image ID; a purpose missing from the record is a
+ * characterization that never ran.
+ */
+export const REQUIRED_CANDIDATE_RUN_PURPOSES = Object.freeze([
+  "probe:manifest",
+  "probe:tools",
+  "probe:env",
+  "probe:runtime",
+  ...POLICY_VERIFIERS.map((verifier) => `verifier:${verifier}`),
+  ...REQUIRED_SPLIT_FAMILIES.map((family) => `split06:${family}`),
+]);
 
 /**
  * The image configuration a release candidate must present.
@@ -165,8 +196,13 @@ export const EXPECTED_YTDLP_RUNTIME = Object.freeze({
 export const REQUIRED_PASS_CHECKS = Object.freeze([
   "source/context-verified-before-build",
   "source/context-unchanged-after-build",
+  "harness/verified-before-execution",
+  "harness/driver-is-inside-the-verified-harness",
+  "harness/unchanged-after-execution",
   "image/built-from-the-real-dockerfile",
   "image/candidate-tag-is-not-deployable",
+  "image/candidate-image-id-valid",
+  "image/every-candidate-container-ran-the-immutable-id",
   "image/os-is-linux",
   "image/architecture-recorded",
   "image/working-directory",
@@ -312,10 +348,19 @@ export function buildReleaseEvidence(input) {
     finishedAt: input.finishedAt,
 
     source: verifiedSource(input.source),
+    harness: verifiedHarness(input.harness),
 
     image: {
       candidateTag: input.image.candidateTag,
       imageId: input.image.imageId,
+      // What Docker was actually told to execute, per candidate container,
+      // parsed from the argv it was given. The tag above is a build/diagnostic
+      // label only.
+      runSubject: input.image.runSubject,
+      candidateRuns: (Array.isArray(input.image.candidateRuns) ? input.image.candidateRuns : []).map((entry) => ({
+        purpose: entry?.purpose ?? null,
+        subject: entry?.subject ?? null,
+      })),
       os: input.image.os,
       architecture: input.image.architecture,
       acceptedWorkerArchitecture: input.image.acceptedWorkerArchitecture,
@@ -475,6 +520,28 @@ function assertPassEarned(record) {
     );
   }
 
+  // -02: the image recorded is the image executed. The id must be a full
+  // immutable id, and every required candidate container must have run it.
+  const imageId = String(record.image?.imageId ?? "");
+  if (!IMAGE_ID_PATTERN.test(imageId)) {
+    throw new ReleaseEvidenceError(
+      `refusing to emit a PASS record without a valid immutable image ID: ${imageId}`,
+    );
+  }
+  const runs = Array.isArray(record.image?.candidateRuns) ? record.image.candidateRuns : [];
+  const purposes = runs.map((entry) => String(entry?.purpose)).sort();
+  const expectedPurposes = [...REQUIRED_CANDIDATE_RUN_PURPOSES].sort();
+  if (
+    record.image?.runSubject !== imageId ||
+    runs.some((entry) => entry?.subject !== imageId) ||
+    purposes.length !== expectedPurposes.length ||
+    purposes.some((purpose, i) => purpose !== expectedPurposes[i])
+  ) {
+    throw new ReleaseEvidenceError(
+      "refusing to emit a PASS record whose candidate containers did not all execute the immutable image ID",
+    );
+  }
+
   // The candidate tag is re-checked at emit time, so a record can never name a
   // deployable tag even if a future driver bypassed the container model.
   const tag = String(record.image?.candidateTag ?? "");
@@ -523,19 +590,63 @@ function verifiedSource(source) {
       object: input.object,
       sha256: input.sha256,
     })),
-    // The two provenance ROLES §7 keeps distinct. The release build context is
-    // a clean worktree fixed to a merged product commit; the harness that drove
-    // the run is a separate checkout, and during SPLIT-07A it is an UNMERGED
-    // branch. Conflating them would attribute the image to acceptance code that
-    // is deliberately not part of `Dockerfile.worker`.
-    harnessRole: {
-      harnessCommit: source.harnessCommit ?? null,
-      harnessRef: source.harnessRef ?? null,
-      harnessIsReleaseContext: false,
-      note: "the harness drove the run; it is not part of the release build context",
-    },
     verifiedBy:
       "run-release-image-acceptance.mjs: git against the release build context, before and after the build",
+  };
+}
+
+/**
+ * The `harness` block (since `-02`), admitted only when it is the driver's
+ * VERIFIED observation, before AND after the run. Every emitted record carries
+ * it: the driver refuses to assemble any record once a harness check fails, so
+ * a record whose harness was not verified throughout would be a false
+ * statement, and none is produced.
+ *
+ * The topology facts are OBSERVED, not assumed. SPLIT-07A drives a release
+ * context at a merged product commit from a separate, unmerged harness
+ * checkout; SPLIT-07B may legitimately use one merged commit, and even one
+ * checkout, for both roles. The record says which happened.
+ */
+function verifiedHarness(harness) {
+  const verified =
+    harness !== null &&
+    typeof harness === "object" &&
+    isFullGitSha(harness.commit) &&
+    isFullGitSha(harness.tree) &&
+    isFullGitSha(harness.directoryTree) &&
+    isFullGitSha(harness.driverObject) &&
+    harness.directory === HARNESS_DIRECTORY &&
+    harness.driverPath === HARNESS_DRIVER_PATH &&
+    harness.contextClean === true &&
+    harness.verifiedBeforeRun === true &&
+    harness.verifiedAfterRun === true &&
+    harness.driverInsideHarness === true &&
+    typeof harness.worktreeIsReleaseContext === "boolean" &&
+    typeof harness.commitIsReleaseSource === "boolean" &&
+    Array.isArray(harness.verificationPoints) &&
+    harness.verificationPoints[0] === "before-docker" &&
+    harness.verificationPoints[harness.verificationPoints.length - 1] === "after-children";
+  if (!verified) {
+    throw new ReleaseEvidenceError(
+      `refusing to emit a ${SPLIT07_EVIDENCE_SCHEMA} record without driver-verified harness provenance`,
+    );
+  }
+  return {
+    commit: harness.commit,
+    tree: harness.tree,
+    directory: harness.directory,
+    directoryTree: harness.directoryTree,
+    driverPath: harness.driverPath,
+    driverObject: harness.driverObject,
+    contextClean: true,
+    verifiedBeforeRun: true,
+    verifiedAfterRun: true,
+    verificationPoints: [...harness.verificationPoints],
+    driverInsideHarness: true,
+    worktreeIsReleaseContext: harness.worktreeIsReleaseContext,
+    commitIsReleaseSource: harness.commitIsReleaseSource,
+    verifiedBy:
+      "run-release-image-acceptance.mjs: git against --harness, before any Docker command and at every checkpoint to the end of both SPLIT-06 children",
   };
 }
 

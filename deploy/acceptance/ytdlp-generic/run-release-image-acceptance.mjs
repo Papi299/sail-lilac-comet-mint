@@ -24,7 +24,9 @@
 //               be ambiguously attributed.
 //
 // They may be the same directory only when the harness is already merged into
-// the product commit; the driver records them as distinct roles either way.
+// the product commit. Since `-02` BOTH are verified clean against explicit
+// expectations, the harness again at every checkpoint through the end of the
+// run, and the record states — as an observation — whether they coincided.
 //
 // ── What it changes about any deployment: nothing ──────────────────────────
 //
@@ -40,19 +42,25 @@
 //     --tree     <full 40-hex release product tree> \
 //     --context  /home/user/vf-build-<sha>      (clean worktree at --source) \
 //     --harness  /home/user/vf-split07a-harness (this checkout's repo root) \
+//     --harness-source <full 40-hex commit the harness checkout must be at> \
+//     --harness-tree   <full 40-hex tree of that commit> \
 //     --report   /var/tmp/split07 \
 //     [--docker docker] [--keep-image]
 
 import { spawn } from "node:child_process";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   assertCandidateReference,
+  assertImmutableImageId,
   assertNoForbiddenMounts,
   candidateImageTag,
   candidateRemoveArgs,
+  dockerRunSubject,
+  IMAGE_ID_PATTERN,
+  imageIdArgs,
   imageInspectArgs,
   POLICY_VERIFIERS,
   policyVerifierRunArgs,
@@ -63,8 +71,11 @@ import {
 import {
   buildExpectedSourceManifest,
   compareSourceManifests,
+  HARNESS_DRIVER_PATH,
   IMAGE_SOURCE_EXCLUDED_PREFIX,
   isFullGitSha,
+  ReleaseProvenanceError,
+  verifyHarnessProvenance,
   verifyReleaseContextProvenance,
 } from "./lib/release-provenance.mjs";
 import {
@@ -76,11 +87,15 @@ import {
   EXPECTED_IMAGE_ENVIRONMENT_NAMES,
   EXPECTED_YTDLP_RUNTIME,
   FORBIDDEN_IMAGE_ENVIRONMENT_NAMES,
+  REQUIRED_CANDIDATE_RUN_PURPOSES,
   REQUIRED_SPLIT_FAMILIES,
   renderReleaseEvidence,
   SPLIT07_EVIDENCE_SCHEMA,
   validateChildRecord,
 } from "./lib/release-evidence.mjs";
+// The repository's accepted exclusive-create writer (Phase-10D §5): `wx`, and a
+// lost race is a refusal — never "adopt the winner", never truncate.
+import { writeEvidenceExclusive } from "./lib/provenance.mjs";
 
 /** The accepted Production tag, read ONLY to prove it was not disturbed. */
 const PRODUCTION_TAG = "videofetch-worker:latest";
@@ -117,12 +132,14 @@ function spawnRunner(command, args, { capture = false, binary = false } = {}) {
 const FULL_SHA_ARGUMENTS = [
   ["--source", "source"],
   ["--tree", "tree"],
+  ["--harness-source", "harnessSource"],
+  ["--harness-tree", "harnessTree"],
 ];
 
 export function parseArgv(argv) {
   const out = {
-    source: null, tree: null, context: null, harness: null, report: null,
-    docker: "docker", keepImage: false,
+    source: null, tree: null, context: null, harness: null, harnessSource: null, harnessTree: null,
+    report: null, docker: "docker", keepImage: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -137,14 +154,19 @@ export function parseArgv(argv) {
       case "--tree": take("tree"); break;
       case "--context": take("context"); break;
       case "--harness": take("harness"); break;
+      case "--harness-source": take("harnessSource"); break;
+      case "--harness-tree": take("harnessTree"); break;
       case "--report": take("report"); break;
       case "--docker": take("docker"); break;
       case "--keep-image": out.keepImage = true; break;
       default: throw new Error(`unknown argument: ${arg}`);
     }
   }
-  for (const required of ["source", "tree", "context", "harness", "report"]) {
-    if (!out[required]) throw new Error(`--${required} is required`);
+  for (const [flag, key] of [
+    ["--source", "source"], ["--tree", "tree"], ["--context", "context"], ["--harness", "harness"],
+    ["--harness-source", "harnessSource"], ["--harness-tree", "harnessTree"], ["--report", "report"],
+  ]) {
+    if (!out[key]) throw new Error(`${flag} is required`);
   }
   for (const [flag, key] of FULL_SHA_ARGUMENTS) {
     if (!isFullGitSha(out[key])) throw new Error(`${flag} must be a full lowercase 40-hex SHA`);
@@ -200,8 +222,8 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
   const log = deps.log ?? ((line) => process.stdout.write(line));
   const now = deps.now ?? Date.now;
   const readFileBytes = deps.readFile ?? readFile;
-  const writeEvidence = deps.writeFile ?? writeFile;
   const makeDirectory = deps.mkdir ?? mkdir;
+  const resolvePath = deps.realpath ?? realpath;
   const startedAt = new Date(now()).toISOString();
 
   const checks = createChecks();
@@ -209,6 +231,16 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
   const harnessGit = directoryGit(run, opts.harness);
   const harnessDir = join(opts.harness, HARNESS_SUBDIRECTORY);
   const expectations = { git: contextGit, expectedSource: opts.source, expectedTree: opts.tree };
+  const harnessExpectations = { git: harnessGit, expectedCommit: opts.harnessSource, expectedTree: opts.harnessTree };
+
+  // Every candidate container goes through here, so the run SUBJECT recorded
+  // for it is parsed from the very argv Docker receives — not from what the
+  // driver meant to pass.
+  const candidateRuns = [];
+  const runCandidate = async (purpose, args, options = {}) => {
+    candidateRuns.push({ purpose, subject: dockerRunSubject(args) });
+    return run(opts.docker, args, options);
+  };
 
   // ── 0. Source provenance, BEFORE any Docker command ──────────────────────
   //
@@ -220,11 +252,56 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
   log(`[split07] release source verified: commit ${provenance.source} tree ${provenance.tree}, clean\n`);
   log(`[split07] ${provenance.dockerfilePath} blob ${provenance.dockerfileObject}\n`);
 
-  // The harness's own identity, recorded as a SEPARATE role. It is not part of
-  // the release build context and never reaches the image.
-  const harnessCommit = (await harnessGit(["rev-parse", "--verify", "--quiet", "HEAD"])).stdout.trim();
-  const harnessRef = (await harnessGit(["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
-  log(`[split07] harness role: ${harnessRef || "(detached)"} ${harnessCommit || "(unknown)"} — NOT the build context\n`);
+  // ── 0b. Harness provenance, ALSO before any Docker command (since -02) ────
+  //
+  // The harness is executable acceptance code — this driver, the SPLIT-06
+  // orchestrator, the Python verifiers, the image probe, the evidence evaluator
+  // — and it is mounted into the candidate. It is verified against the
+  // operator's explicit expectations exactly as strictly as the release context,
+  // then re-verified at every later checkpoint.
+  const harness = await verifyHarnessProvenance(harnessExpectations);
+  const harnessVerificationPoints = ["before-docker"];
+  checks.require("harness/verified-before-execution", harness.contextClean);
+  log(`[split07] harness verified: commit ${harness.commit} tree ${harness.tree}, clean\n`);
+
+  // The EXECUTING driver must be the verified harness's own. Otherwise a clean
+  // checkout could be named while different code actually ran the proof.
+  const runningDriver = await resolvePath(deps.driverPath ?? fileURLToPath(import.meta.url));
+  const verifiedDriver = await resolvePath(join(opts.harness, HARNESS_DRIVER_PATH));
+  const driverInsideHarness = runningDriver === verifiedDriver;
+  if (!driverInsideHarness) {
+    throw new ReleaseProvenanceError(
+      `the running driver ${runningDriver} is not the verified harness's own ${verifiedDriver}`,
+    );
+  }
+  checks.record("harness/driver-is-inside-the-verified-harness", driverInsideHarness, HARNESS_DRIVER_PATH);
+
+  // Topology, OBSERVED rather than assumed: SPLIT-07A drives a merged product
+  // commit from a separate unmerged harness; SPLIT-07B may use one merged
+  // commit, even one checkout, for both roles.
+  const worktreeIsReleaseContext = (await resolvePath(opts.harness)) === (await resolvePath(opts.context));
+  const commitIsReleaseSource = harness.commit === provenance.source;
+
+  /** Re-verifies the harness; any change is a refusal of the whole record. */
+  const verifyHarnessAt = async (point) => {
+    let observed;
+    try {
+      observed = await verifyHarnessProvenance(harnessExpectations);
+    } catch (error) {
+      throw new ReleaseProvenanceError(`the acceptance harness changed during the run (${point}): ${error.message}`);
+    }
+    if (observed.directoryTree !== harness.directoryTree || observed.driverObject !== harness.driverObject) {
+      throw new ReleaseProvenanceError(`the acceptance harness changed during the run (${point})`);
+    }
+    harnessVerificationPoints.push(point);
+    log(`[split07] harness re-verified clean at ${point}\n`);
+  };
+
+  // An occupied evidence path fails HERE, before a long run, as a courtesy to the
+  // operator. It is not the guarantee: the exclusive create at the end is.
+  await makeDirectory(opts.report, { recursive: true });
+  const evidencePath = join(opts.report, `split07-release-image-${now()}.json`);
+  await admitEvidencePath(evidencePath, deps);
 
   // The expected source manifest, read from the OBSERVED commit's Git objects.
   const expectedManifest = await buildExpectedSourceManifest({ git: contextGit, source: provenance.source });
@@ -249,9 +326,9 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
   const build = await run(opts.docker, buildArgs);
   if (build.code !== 0) throw new Error(`the release image build failed (${build.code})`);
 
-  let evidencePath = null;
   let verdict = "BLOCKED";
   let record = null;
+  let imageId = null;
 
   try {
     // 2b. The context must STILL be exactly what was verified, now that the
@@ -268,14 +345,22 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       after.source === provenance.source && after.tree === provenance.tree && after.contextClean === true,
     );
     log(`[split07] release source re-verified after the build\n`);
+    await verifyHarnessAt("after-build");
 
     // ── 3. Image identity and configuration ────────────────────────────────
     const inspected = await run(opts.docker, imageInspectArgs(image), { capture: true });
     if (inspected.code !== 0) throw new Error(`the candidate image ${image} could not be inspected`);
     const info = JSON.parse(inspected.stdout);
     const config = info.Config ?? {};
-    const imageId = String(info.Id ?? "");
-    log(`[split07] candidate ${image} ${imageId} (NOT DEPLOYABLE)\n`);
+    const inspectedId = String(info.Id ?? "");
+    log(`[split07] candidate ${image} ${inspectedId} (NOT DEPLOYABLE)\n`);
+    // From here on the candidate is its IMMUTABLE id. The config above and this
+    // id came from one inspect, so they describe one image; every container
+    // below executes exactly that image, whatever happens to the tag. The
+    // tested identity exists only once it is valid.
+    checks.require("image/candidate-image-id-valid", IMAGE_ID_PATTERN.test(inspectedId), inspectedId);
+    imageId = assertImmutableImageId(inspectedId);
+    const runSubject = imageId;
 
     const exposedPorts = Object.keys(config.ExposedPorts ?? {}).sort();
     const configuredVolumes = Object.keys(config.Volumes ?? {}).sort();
@@ -327,10 +412,10 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
     }
 
     // ── 4. In-image observations ───────────────────────────────────────────
-    const manifestProbe = await probeJson(run, opts, { image, harnessDir, mode: "manifest" });
-    const toolProbe = await probeJson(run, opts, { image, harnessDir, mode: "tools" });
-    const envProbe = await probeJson(run, opts, { image, harnessDir, mode: "env" });
-    const runtimeProbe = await probeJson(run, opts, { image, harnessDir, mode: "runtime" });
+    const manifestProbe = await probeJson(runCandidate, { imageId: runSubject, harnessDir, mode: "manifest" });
+    const toolProbe = await probeJson(runCandidate, { imageId: runSubject, harnessDir, mode: "tools" });
+    const envProbe = await probeJson(runCandidate, { imageId: runSubject, harnessDir, mode: "env" });
+    const runtimeProbe = await probeJson(runCandidate, { imageId: runSubject, harnessDir, mode: "runtime" });
 
     // 4a. Source-to-image identity. Path + byte content, both directions.
     const comparison = compareSourceManifests({
@@ -450,8 +535,8 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
     // ── 5. The committed offline policy verifiers, against THIS image ──────
     const policyVerifiers = [];
     for (const verifier of POLICY_VERIFIERS) {
-      const args = policyVerifierRunArgs({ image, harnessDir, verifier });
-      const result = await run(opts.docker, args, { capture: true });
+      const args = policyVerifierRunArgs({ imageId: runSubject, harnessDir, verifier });
+      const result = await runCandidate(`verifier:${verifier}`, args, { capture: true });
       policyVerifiers.push({ verifier, exitCode: result.code, ok: result.code === 0 });
       log(`[split07] ${verifier} exit ${result.code}\n`);
     }
@@ -474,15 +559,19 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
     // The `--accepted-base-source`/`--overlay-*` values SPLIT-06 requires are
     // satisfied truthfully in release mode: the image's runtime WAS built from
     // exactly this commit, so it is its own base source, and no overlay layer
-    // was applied, so the base and the run image are one image. Recording the
-    // same identity for both is what lets `split/children-ran-in-the-candidate-image`
-    // positively prove no overlay stood in for the release build.
+    // was applied, so the base and the run image are one image. The child
+    // records the human build TAG as its base label and the immutable ID Docker
+    // actually executed as its run image; `split/children-ran-in-the-candidate-image`
+    // then binds both to the run subject this driver itself handed to Docker.
     await makeDirectory(opts.report, { recursive: true });
     const familiesExecuted = [];
     const childObservations = [];
     for (const family of REQUIRED_SPLIT_FAMILIES) {
+      await verifyHarnessAt(`before-split06-${family}`);
       const evidenceName = `split06-${family}-${now()}.json`;
-      const args = releaseAcceptanceRunArgs({ image, family, harnessDir, reportDir: opts.report, evidenceName });
+      const args = releaseAcceptanceRunArgs({
+        imageId: runSubject, family, harnessDir, reportDir: opts.report, evidenceName,
+      });
       args.push(
         "--source-commit", provenance.source,
         "--source-tree", provenance.tree,
@@ -491,12 +580,12 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
         "--overlay-runtime-compatible",
         "--base-image", image,
         "--base-digest", imageId,
-        "--overlay-image", image,
+        "--overlay-image", runSubject,
         "--overlay-image-id", imageId,
       );
       assertNoForbiddenMounts(args);
       log(`[split07] SPLIT-06 ${family} against the release candidate\n`);
-      const result = await run(opts.docker, args);
+      const result = await runCandidate(`split06:${family}`, args);
       familiesExecuted.push(family);
       const childPath = join(opts.report, evidenceName);
 
@@ -533,6 +622,13 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       children.push(child);
     }
 
+    // The harness must STILL be exactly what was verified, now that both
+    // children have consumed it. A harness modified at any point in the run
+    // makes the run's own measurements untrustworthy, so the record is refused
+    // outright rather than emitted as a FAIL.
+    await verifyHarnessAt("after-children");
+    checks.record("harness/unchanged-after-execution", true, harnessVerificationPoints.join(","));
+
     for (const family of REQUIRED_SPLIT_FAMILIES) {
       const child = children.find((entry) => entry.family === family);
       checks.record(`split/${family}-child-passed`, child?.ok === true, child?.reason ?? null);
@@ -542,20 +638,36 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       sameList([...familiesExecuted].sort(), [...REQUIRED_SPLIT_FAMILIES].sort()),
       familiesExecuted.join(","),
     );
-    // No overlay stood in for the release image: every child ran in exactly the
-    // candidate, and SPLIT-06's base and run image are the same image id.
+    // Every candidate container executed the immutable id — measured from the
+    // argv Docker received, and complete: a required characterization that
+    // never ran is as disqualifying as one that ran the wrong image.
+    const runPurposes = candidateRuns.map((entry) => entry.purpose).sort();
+    checks.record(
+      "image/every-candidate-container-ran-the-immutable-id",
+      candidateRuns.length > 0 &&
+        candidateRuns.every((entry) => entry.subject === imageId) &&
+        sameList(runPurposes, [...REQUIRED_CANDIDATE_RUN_PURPOSES].sort()),
+      `${candidateRuns.length} runs; subjects ${[...new Set(candidateRuns.map((entry) => entry.subject))].join(",")}`,
+    );
+    // No overlay stood in for the release image, and the child names the image
+    // Docker actually ran: the driver's own run subject for that child is the
+    // immutable id, the child's run image is that id, and its base label is the
+    // build tag whose inspected id it is.
     checks.record(
       "split/children-ran-in-the-candidate-image",
       children.length > 0 &&
-        children.every(
-          (child) =>
-            child.ranImage === image &&
+        children.every((child) => {
+          const ran = candidateRuns.find((entry) => entry.purpose === `split06:${child.family}`);
+          return (
+            ran?.subject === imageId &&
+            child.ranImage === imageId &&
             child.ranImageId === imageId &&
             child.baseImage === image &&
             child.baseImageId === imageId &&
             child.sourceCommit === provenance.source &&
-            child.networkMode === "none",
-        ),
+            child.networkMode === "none"
+          );
+        }),
       imageId,
     );
 
@@ -576,8 +688,6 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
 
     // ── 8. The record ──────────────────────────────────────────────────────
     verdict = checks.failed.length === 0 ? "PASS" : "FAIL";
-    evidencePath = join(opts.report, `split07-release-image-${now()}.json`);
-    await admitEvidencePath(evidencePath, deps);
 
     record = buildReleaseEvidence({
       verdict,
@@ -592,12 +702,27 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
         dockerfileObject: provenance.dockerfileObject,
         dockerfileSha256: provenance.dockerfileSha256,
         releaseInputs: provenance.releaseInputs,
-        harnessCommit: isFullGitSha(harnessCommit) ? harnessCommit : null,
-        harnessRef: harnessRef.length > 0 ? harnessRef : null,
+      },
+      harness: {
+        commit: harness.commit,
+        tree: harness.tree,
+        directory: harness.directory,
+        directoryTree: harness.directoryTree,
+        driverPath: harness.driverPath,
+        driverObject: harness.driverObject,
+        contextClean: true,
+        verifiedBeforeRun: true,
+        verifiedAfterRun: harnessVerificationPoints[harnessVerificationPoints.length - 1] === "after-children",
+        verificationPoints: [...harnessVerificationPoints],
+        driverInsideHarness,
+        worktreeIsReleaseContext,
+        commitIsReleaseSource,
       },
       image: {
         candidateTag: image,
         imageId,
+        runSubject,
+        candidateRuns: candidateRuns.map((entry) => ({ purpose: entry.purpose, subject: entry.subject })),
         os: String(info.Os),
         architecture: String(info.Architecture),
         acceptedWorkerArchitecture: acceptedArchitecture,
@@ -689,7 +814,18 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       checks: checks.entries,
     });
 
-    await writeEvidence(evidencePath, renderReleaseEvidence(record));
+    // The correctness boundary is HERE, not the directory pre-flight above: an
+    // exclusive (`wx`) create either makes this file or fails, so a record that
+    // appeared after the pre-flight is refused rather than truncated, and a lost
+    // race is never "adopt the winner" — the other file is not this run's.
+    const written = await writeEvidenceExclusive(evidencePath, renderReleaseEvidence(record), {
+      writeFile: deps.writeFile,
+    });
+    if (!written.ok) {
+      record = null;
+      verdict = "BLOCKED";
+      throw new Error(`refusing to claim a ${SPLIT07_EVIDENCE_SCHEMA} verdict: ${written.reason}`);
+    }
     // Every failed check is named on the operator's console: a FAIL whose cause
     // is visible only inside the record is a FAIL that gets misdiagnosed.
     for (const name of checks.failed) log(`[split07]   FAIL ${name}\n`);
@@ -697,9 +833,20 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
   } finally {
     // The candidate exists only to execute SPLIT-07A — and is removed even
     // when the run above was refused, unless it is being held for diagnosis.
+    //
+    // The TAG is removed only while it still names the image this run built and
+    // tested: a tag retargeted in the meantime is not this run's to delete.
     if (!opts.keepImage) {
-      await run(opts.docker, candidateRemoveArgs(image), { capture: true });
-      log(`[split07] candidate ${image} removed\n`);
+      const current = await run(opts.docker, imageIdArgs(image), { capture: true });
+      const currentId = current.code === 0 ? String(current.stdout).trim() : null;
+      if (currentId === null || currentId.length === 0) {
+        log(`[split07] candidate ${image} is already gone\n`);
+      } else if (imageId !== null && currentId !== imageId) {
+        log(`[split07] candidate tag ${image} now names ${currentId}, not the tested ${imageId}; NOT removing it\n`);
+      } else {
+        await run(opts.docker, candidateRemoveArgs(image), { capture: true });
+        log(`[split07] candidate ${image} removed\n`);
+      }
     } else {
       log(`[split07] candidate ${image} RETAINED for diagnosis (still not deployable)\n`);
     }
@@ -709,9 +856,9 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
 }
 
 /** A probe run, parsed. Its stdout is one JSON document and nothing else. */
-async function probeJson(run, opts, { image, harnessDir, mode }) {
-  const args = probeRunArgs({ image, harnessDir, mode });
-  const result = await run(opts.docker, args, { capture: true });
+async function probeJson(runCandidate, { imageId, harnessDir, mode }) {
+  const args = probeRunArgs({ imageId, harnessDir, mode });
+  const result = await runCandidate(`probe:${mode}`, args, { capture: true });
   if (result.code !== 0) throw new Error(`the ${mode} image probe failed (${result.code})`);
   try {
     return JSON.parse(result.stdout);
@@ -745,7 +892,12 @@ async function observeProduction(run, docker) {
   };
 }
 
-/** Evidence is append-only BY PATH: an existing target is refused, never replaced. */
+/**
+ * An EARLY, human-friendly diagnostic only: it lets an occupied path fail before
+ * a long run instead of after it. It is NOT the correctness boundary — a path
+ * can appear between this check and the write — which is why the record itself
+ * is created with `writeEvidenceExclusive` (`wx`).
+ */
 async function admitEvidencePath(path, deps) {
   const list = deps.readdir ?? readdir;
   const directory = path.slice(0, path.lastIndexOf("/"));

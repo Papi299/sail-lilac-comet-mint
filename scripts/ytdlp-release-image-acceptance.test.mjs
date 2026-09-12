@@ -14,22 +14,36 @@
 // it. That is what makes these discrimination tests rather than smoke tests: a
 // check that cannot fail proves nothing, so each one is shown failing.
 
+// The fake world is deliberately FAITHFUL where the real run surprised us: the
+// image inherits the node base's ENTRYPOINT, a child SPLIT-06 record echoes the
+// image flags it was given (it cannot introspect Docker), a tag is a mutable
+// pointer that can be retargeted, and a `wx` write fails with EEXIST exactly as
+// `node:fs` does. Exactly one test touches the real filesystem, on purpose, to
+// prove the `wx` boundary against the kernel rather than against a fake.
+
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { mkdtemp, readFile as readFileFs, rm, writeFile as writeFileFs } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   assertCandidateReference,
+  assertImmutableImageId,
   assertNoForbiddenMounts,
   candidateImageTag,
   candidateRemoveArgs,
   CANDIDATE_IMAGE_REPOSITORY,
+  dockerRunSubject,
   FORBIDDEN_CANDIDATE_TAGS,
   FORBIDDEN_RELEASE_MOUNT_TARGETS,
   HARNESS_MOUNT_TARGET,
   HARNESS_SCRATCH_TARGET,
   HARNESS_SCRATCH_TMPFS,
+  IMAGE_ID_PATTERN,
+  imageIdArgs,
   imageInspectArgs,
   mountTargets,
   POLICY_VERIFIERS,
@@ -45,12 +59,15 @@ import {
 import {
   buildExpectedSourceManifest,
   compareSourceManifests,
+  HARNESS_DIRECTORY,
+  HARNESS_DRIVER_PATH,
   IMAGE_SOURCE_EXCLUDED_PREFIX,
   isFullGitSha,
   manifestDigest,
   RELEASE_INPUT_FILES,
   ReleaseProvenanceError,
   renderManifest,
+  verifyHarnessProvenance,
   verifyReleaseContextProvenance,
 } from "../deploy/acceptance/ytdlp-generic/lib/release-provenance.mjs";
 import {
@@ -62,6 +79,7 @@ import {
   EXPECTED_YTDLP_RUNTIME,
   FORBIDDEN_IMAGE_ENVIRONMENT_NAMES,
   ReleaseEvidenceError,
+  REQUIRED_CANDIDATE_RUN_PURPOSES,
   REQUIRED_CHILD_SCHEMA,
   REQUIRED_PASS_CHECKS,
   REQUIRED_SPLIT_FAMILIES,
@@ -82,6 +100,16 @@ const HARNESS = "/build/vf-harness";
 const REPORT = "/var/tmp/split07";
 const IMAGE_ID = "sha256:ea08b43366eede351dadf07b5f1bca69cd1da9911705e2cbd0040d737ea09173";
 const LATEST_ID = "sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa";
+/** A DIFFERENT image the candidate tag can be retargeted to mid-run. */
+const IMAGE_B = `sha256:${"b".repeat(64)}`;
+const HARNESS_TREE = "2222222222222222222222222222222222222222";
+const HARNESS_DIR_TREE = "3333333333333333333333333333333333333333";
+const DRIVER_OBJECT = "4444444444444444444444444444444444444444";
+const TAG = `${CANDIDATE_IMAGE_REPOSITORY}:split07-${SOURCE.slice(0, 12)}-local-test`;
+const PARENT = `${REPORT}/split07-release-image-1700000000000.json`;
+const STATUS_TRACKED = "status --porcelain=v1 --untracked-files=all --ignored=no --ignore-submodules=none";
+const STATUS_IGNORED = "status --porcelain=v1 --untracked-files=all --ignored=matching --ignore-submodules=none";
+const HARNESS_POINTS = ["before-docker", "after-build", "before-split06-mp4", "before-split06-webm", "after-children"];
 
 /** The application files the fake commit carries, plus the broker it removes. */
 const SOURCE_FILES = {
@@ -159,17 +187,26 @@ function pinnedArtifact(overrides = {}) {
   };
 }
 
-function passingChild(family, overrides = {}) {
+/**
+ * A PASS child, shaped as the REAL `split-full-path.mjs` shapes it: it records
+ * the image and source flags it was GIVEN. It cannot introspect Docker, which
+ * is exactly why the parent binds these to its own run subject.
+ */
+function passingChild(family, overrides = {}, flags = null) {
+  const f = flags ?? {
+    baseImage: TAG, baseDigest: IMAGE_ID, overlayImage: IMAGE_ID, overlayImageId: IMAGE_ID,
+    sourceCommit: SOURCE, sourceTree: TREE,
+  };
   return {
     schema: REQUIRED_CHILD_SCHEMA,
     verdict: "PASS",
     family,
-    source: { commit: SOURCE, tree: TREE, contextClean: true },
+    source: { commit: f.sourceCommit, tree: f.sourceTree, contextClean: true },
     image: {
-      acceptedBaseImage: `${CANDIDATE_IMAGE_REPOSITORY}:split07-${SOURCE.slice(0, 12)}-local-test`,
-      acceptedBaseDigest: IMAGE_ID,
-      overlayImage: `${CANDIDATE_IMAGE_REPOSITORY}:split07-${SOURCE.slice(0, 12)}-local-test`,
-      overlayImageId: IMAGE_ID,
+      acceptedBaseImage: f.baseImage,
+      acceptedBaseDigest: f.baseDigest,
+      overlayImage: f.overlayImage,
+      overlayImageId: f.overlayImageId,
       deployable: false,
     },
     network: { mode: "none" },
@@ -186,32 +223,104 @@ function passingChild(family, overrides = {}) {
  * thing about it.
  *
  * `spec` fields:
- *   git         overrides for individual git answers
- *   imageConfig overrides for `docker image inspect`
- *   probes      overrides per probe mode
- *   children    per-family child record overrides (or `null` to omit the file)
- *   verifiers   per-verifier exit code
- *   production  before/after Production observations
+ *   git / harnessGit        overrides for individual release-context / harness git answers
+ *   harnessChange           { after: "start"|"build"|"split06:mp4"|"split06:webm", kind }
+ *                           makes the harness stop verifying from that event on
+ *   imageConfig / configOverrides / probes   what image A (the inspected one) reports
+ *   imageBProbes            what image B reports, if it is ever executed
+ *   retargetTagAfterInspect the candidate tag points at B once it has been inspected
+ *   inspectId               the id the tag inspect reports, to test the id grammar
+ *   children                per-family child record overrides (or `null` to omit the file)
+ *   verifiers               per-verifier exit code
+ *   production / productionAfter             Production observations
+ *   files                   [path, bytes] entries already on the fake filesystem
+ *   competitorAtWrite       bytes another actor creates at the parent path at write time
  */
 function createWorld(spec = {}) {
   const calls = [];
   const dockerCalls = [];
-  const files = new Map();
-  const tag = `${CANDIDATE_IMAGE_REPOSITORY}:split07-${SOURCE.slice(0, 12)}-local-test`;
+  const files = new Map(spec.files ?? []);
+  const written = new Map();
+  const writeCalls = [];
+  const executed = [];
+  const events = new Set();
+  const tag = TAG;
+  let tagTarget = IMAGE_ID;
 
-  const gitAnswers = {
+  const contextAnswers = {
     "rev-parse --is-inside-work-tree": { code: 0, stdout: "true\n" },
     "rev-parse --show-toplevel": { code: 0, stdout: `${CONTEXT}\n` },
     "rev-parse --show-prefix": { code: 0, stdout: "\n" },
     "rev-parse --verify --quiet HEAD": { code: 0, stdout: `${SOURCE}\n` },
     [`rev-parse --verify --quiet ${SOURCE}^{tree}`]: { code: 0, stdout: `${TREE}\n` },
-    "status --porcelain=v1 --untracked-files=all --ignored=no --ignore-submodules=none": { code: 0, stdout: "" },
-    "status --porcelain=v1 --untracked-files=all --ignored=matching --ignore-submodules=none": { code: 0, stdout: "" },
+    [STATUS_TRACKED]: { code: 0, stdout: "" },
+    [STATUS_IGNORED]: { code: 0, stdout: "" },
     [`diff-index --cached --name-only ${SOURCE}`]: { code: 0, stdout: "" },
     "ls-files -v": { code: 0, stdout: appFiles().map((path) => `H ${path}`).join("\n") },
-    "rev-parse --abbrev-ref HEAD": { code: 0, stdout: "test/generic-split-07a\n" },
     ...(spec.git ?? {}),
   };
+
+  const harnessAnswers = {
+    "rev-parse --is-inside-work-tree": { code: 0, stdout: "true\n" },
+    "rev-parse --show-toplevel": { code: 0, stdout: `${HARNESS}\n` },
+    "rev-parse --show-prefix": { code: 0, stdout: "\n" },
+    "rev-parse --verify --quiet HEAD": { code: 0, stdout: `${HARNESS_COMMIT}\n` },
+    [`rev-parse --verify --quiet ${HARNESS_COMMIT}^{tree}`]: { code: 0, stdout: `${HARNESS_TREE}\n` },
+    [STATUS_TRACKED]: { code: 0, stdout: "" },
+    [STATUS_IGNORED]: { code: 0, stdout: "" },
+    [`diff-index --cached --name-only ${HARNESS_COMMIT}`]: { code: 0, stdout: "" },
+    "ls-files -v": { code: 0, stdout: `H ${HARNESS_DRIVER_PATH}\nH ${HARNESS_DIRECTORY}/split-full-path.mjs\n` },
+    [`rev-parse --verify --quiet ${HARNESS_COMMIT}:${HARNESS_DIRECTORY}`]: { code: 0, stdout: `${HARNESS_DIR_TREE}\n` },
+    [`rev-parse --verify --quiet ${HARNESS_COMMIT}:${HARNESS_DRIVER_PATH}`]: { code: 0, stdout: `${DRIVER_OBJECT}\n` },
+    ...(spec.harnessGit ?? {}),
+  };
+
+  /** How a harness stops verifying, one kind of change at a time. */
+  const harnessChanges = {
+    modified: { [STATUS_TRACKED]: { code: 0, stdout: ` M ${HARNESS_DIRECTORY}/split-full-path.mjs\n` } },
+    staged: {
+      [`diff-index --cached --name-only ${HARNESS_COMMIT}`]: { code: 0, stdout: `${HARNESS_DIRECTORY}/lib/release-evidence.mjs\n` },
+    },
+    untracked: { [STATUS_TRACKED]: { code: 0, stdout: `?? ${HARNESS_DIRECTORY}/lib/extra.mjs\n` } },
+    ignored: { [STATUS_IGNORED]: { code: 0, stdout: `!! ${HARNESS_DIRECTORY}/node_modules/\n` } },
+    hidden: { "ls-files -v": { code: 0, stdout: `S ${HARNESS_DIRECTORY}/split-full-path.mjs\n` } },
+    moved: { "rev-parse --verify --quiet HEAD": { code: 0, stdout: `${"5".repeat(40)}\n` } },
+  };
+
+  function harnessAnswer(key) {
+    const change = spec.harnessChange;
+    if (change && (change.after === "start" || events.has(change.after))) {
+      const overrides = harnessChanges[change.kind];
+      if (Object.prototype.hasOwnProperty.call(overrides, key)) return overrides[key];
+    }
+    return Object.prototype.hasOwnProperty.call(harnessAnswers, key) ? harnessAnswers[key] : { code: 1, stdout: "" };
+  }
+
+  const knownObjects = new Set([RELEASE_DOCKERFILE, HARNESS_DIRECTORY, HARNESS_DRIVER_PATH, ...Object.keys(SOURCE_FILES)]);
+  function contextAnswer(args) {
+    const key = args.join(" ");
+    if (Object.prototype.hasOwnProperty.call(contextAnswers, key)) return contextAnswers[key];
+    const objectMatch = /^rev-parse --verify --quiet [0-9a-f]{40}:(.+)$/.exec(key);
+    if (objectMatch) {
+      return knownObjects.has(objectMatch[1]) ? { code: 0, stdout: `${fakeObject(objectMatch[1])}\n` } : { code: 1, stdout: "" };
+    }
+    const blobMatch = /^cat-file blob [0-9a-f]{40}:(.+)$/.exec(key);
+    if (blobMatch) {
+      const path = blobMatch[1];
+      const body = path === RELEASE_DOCKERFILE ? DOCKERFILE_BODY : SOURCE_FILES[path];
+      return body === undefined
+        ? { code: 1, stdout: "", stdoutBuffer: Buffer.alloc(0) }
+        : { code: 0, stdout: "", stdoutBuffer: Buffer.from(body, "utf8") };
+    }
+    if (key.startsWith("ls-tree -r -z --full-tree ")) {
+      const records = Object.keys(SOURCE_FILES)
+        .sort()
+        .map((path) => `100644 blob ${fakeObject(path)}\t${path}\0`)
+        .join("");
+      return { code: 0, stdout: records };
+    }
+    return { code: 1, stdout: "" };
+  }
 
   const imageConfig = {
     Id: IMAGE_ID,
@@ -260,27 +369,26 @@ function createWorld(spec = {}) {
       uid: 1000,
       gid: 1000,
       cwd: "/app",
-      ytdlp: {
-        path: EXPECTED_YTDLP_RUNTIME.path,
-        sha256: EXPECTED_YTDLP_RUNTIME.sha256,
-        bytes: 3_000_000,
-        uid: 0,
-        gid: 0,
-        mode: "0555",
-        isRegularFile: true,
-        realpath: EXPECTED_YTDLP_RUNTIME.path,
-        writeAttempt: { attempted: true, succeeded: false, code: "EROFS" },
-        version: EXPECTED_YTDLP_RUNTIME.version,
-      },
+      ytdlp: pinnedArtifact(),
       python: { path: "/usr/bin/python3", version: "Python 3.11.2" },
       entrypointShim: shimObservation(),
       ffmpeg: { path: "/usr/bin/ffmpeg", present: true, executable: true, exitCode: 0, version: "ffmpeg version 5.1.8" },
       ffprobe: { path: "/usr/bin/ffprobe", present: true, executable: true, exitCode: 0, version: "ffprobe version 5.1.8" },
     },
   };
+  // Image B starts as an exact copy, so only the run SUBJECT could tell the two
+  // apart — unless a test gives B observations of its own.
+  const probesB = JSON.parse(JSON.stringify(probes));
   for (const [mode, override] of Object.entries(spec.probes ?? {})) {
     probes[mode] = { ...probes[mode], ...override };
   }
+  for (const [mode, override] of Object.entries(spec.imageBProbes ?? {})) {
+    probesB[mode] = { ...probesB[mode], ...override };
+  }
+  const images = {
+    [IMAGE_ID]: { config: imageConfig, probes },
+    [IMAGE_B]: { config: JSON.parse(JSON.stringify(imageConfig)), probes: probesB },
+  };
 
   const production = {
     latestImageId: LATEST_ID,
@@ -298,46 +406,13 @@ function createWorld(spec = {}) {
 
   const childSpec = spec.children ?? {};
 
-  function gitAnswer(args) {
-    const key = args.join(" ");
-    if (Object.prototype.hasOwnProperty.call(gitAnswers, key)) return gitAnswers[key];
-    // `rev-parse --verify --quiet <source>:<path>` — a release input's object.
-    const objectMatch = /^rev-parse --verify --quiet [0-9a-f]{40}:(.+)$/.exec(key);
-    if (objectMatch) {
-      const path = objectMatch[1];
-      const known = path === RELEASE_DOCKERFILE || Object.prototype.hasOwnProperty.call(SOURCE_FILES, path);
-      return known ? { code: 0, stdout: `${fakeObject(path)}\n` } : { code: 1, stdout: "" };
-    }
-    // `cat-file blob <source>:<path>` — the committed bytes.
-    const blobMatch = /^cat-file blob [0-9a-f]{40}:(.+)$/.exec(key);
-    if (blobMatch) {
-      const path = blobMatch[1];
-      const body = path === RELEASE_DOCKERFILE ? DOCKERFILE_BODY : SOURCE_FILES[path];
-      return body === undefined
-        ? { code: 1, stdout: "", stdoutBuffer: Buffer.alloc(0) }
-        : { code: 0, stdout: "", stdoutBuffer: Buffer.from(body, "utf8") };
-    }
-    // `ls-tree -r -z --full-tree <source> -- <roots...>`
-    if (key.startsWith("ls-tree -r -z --full-tree ")) {
-      const records = Object.keys(SOURCE_FILES)
-        .sort()
-        .map((path) => `100644 blob ${fakeObject(path)}\t${path}\0`)
-        .join("");
-      return { code: 0, stdout: records };
-    }
-    return { code: 1, stdout: "" };
-  }
-
-  async function run(command, args, options = {}) {
+  async function run(command, args) {
     calls.push({ command, args: [...args] });
     if (command === "git") {
       // `--no-optional-locks -C <dir> ...`
       const directory = args[2];
       const rest = args.slice(3);
-      if (directory === HARNESS && rest.join(" ") === "rev-parse --verify --quiet HEAD") {
-        return { code: 0, stdout: `${HARNESS_COMMIT}\n`, stdoutBuffer: Buffer.alloc(0), stderr: "" };
-      }
-      const answer = gitAnswer(rest);
+      const answer = directory === HARNESS ? harnessAnswer(rest.join(" ")) : contextAnswer(rest);
       return {
         code: answer.code,
         stdout: answer.stdout ?? "",
@@ -346,12 +421,17 @@ function createWorld(spec = {}) {
       };
     }
     dockerCalls.push({ command, args: [...args] });
-    return dockerAnswer(args, options);
+    return dockerAnswer(args);
+  }
+
+  function flagValue(args, name) {
+    const index = args.indexOf(name);
+    return index < 0 ? undefined : args[index + 1];
   }
 
   function dockerAnswer(args) {
     const key = args.join(" ");
-    if (key === `image inspect videofetch-worker:latest --format {{.Id}}`) {
+    if (key === "image inspect videofetch-worker:latest --format {{.Id}}") {
       productionObservations += 1;
       const value = productionPhase().latestImageId;
       return ok(value === null ? "" : `${value}\n`, value === null ? 1 : 0);
@@ -364,25 +444,56 @@ function createWorld(spec = {}) {
     if (key === "image inspect videofetch-worker:latest --format {{.Architecture}}") {
       return ok(`${spec.acceptedArchitecture ?? "arm64"}\n`);
     }
-    if (args[0] === "build") return ok("", spec.buildExit ?? 0);
-    if (key === `image inspect ${tag} --format {{json .}}`) {
-      return ok(`${JSON.stringify(imageConfig)}\n`, spec.inspectExit ?? 0);
+    if (args[0] === "build") {
+      events.add("build");
+      return ok("", spec.buildExit ?? 0);
     }
-    if (args[0] === "image" && args[1] === "rm") return ok("");
+    if (key === `image inspect ${tag} --format {{json .}}`) {
+      if (tagTarget === null) return ok("", 1);
+      const body = { ...images[tagTarget].config, Id: spec.inspectId ?? tagTarget };
+      // The tag is a mutable pointer: once inspected, it can be moved.
+      if (spec.retargetTagAfterInspect) tagTarget = IMAGE_B;
+      return ok(`${JSON.stringify(body)}\n`, spec.inspectExit ?? 0);
+    }
+    if (key === `image inspect ${tag} --format {{.Id}}`) {
+      return tagTarget === null ? ok("", 1) : ok(`${tagTarget}\n`);
+    }
+    if (args[0] === "image" && args[1] === "rm") {
+      if (args[2] === tag) tagTarget = null;
+      return ok("");
+    }
     if (args[0] === "run") {
+      // Docker resolves a tag to whatever it names NOW; an id names one image.
+      const subject = args.find((arg) => arg === tag || /^sha256:[0-9a-f]{64}$/.test(String(arg)));
+      const resolved = subject === tag ? tagTarget : subject;
+      if (!resolved || !images[resolved]) return ok("", 125);
+      executed.push(resolved);
       const probeMode = probeModeOf(args);
-      if (probeMode !== null) return ok(`${JSON.stringify({ mode: probeMode, ...probes[probeMode] })}\n`);
+      if (probeMode !== null) {
+        return ok(`${JSON.stringify({ mode: probeMode, ...images[resolved].probes[probeMode] })}\n`);
+      }
       const verifier = POLICY_VERIFIERS.find((name) => args.some((arg) => String(arg).endsWith(name)));
       if (verifier) return ok("", (spec.verifiers ?? {})[verifier] ?? 0);
-      const family = args[args.indexOf("--family") + 1];
-      const evidenceArg = String(args[args.indexOf("--evidence") + 1]);
+      const family = flagValue(args, "--family");
+      const evidenceArg = String(flagValue(args, "--evidence"));
       const name = evidenceArg.slice(evidenceArg.lastIndexOf("/") + 1);
+      const reportMount = args.find((arg) => String(arg).endsWith(":/report"));
+      const hostReport = reportMount ? String(reportMount).slice(0, -":/report".length) : REPORT;
       const override = Object.prototype.hasOwnProperty.call(childSpec, family) ? childSpec[family] : {};
       if (override !== null) {
-        files.set(`${REPORT}/${name}`, Buffer.from(
-          `${JSON.stringify(passingChild(family, override), null, 2)}\n`, "utf8",
+        const flags = {
+          baseImage: flagValue(args, "--base-image"),
+          baseDigest: flagValue(args, "--base-digest"),
+          overlayImage: flagValue(args, "--overlay-image"),
+          overlayImageId: flagValue(args, "--overlay-image-id"),
+          sourceCommit: flagValue(args, "--source-commit"),
+          sourceTree: flagValue(args, "--source-tree"),
+        };
+        files.set(`${hostReport}/${name}`, Buffer.from(
+          `${JSON.stringify(passingChild(family, override, flags), null, 2)}\n`, "utf8",
         ));
       }
+      events.add(`split06:${family}`);
       return ok("", (spec.splitExit ?? {})[family] ?? 0);
     }
     return ok("");
@@ -397,19 +508,34 @@ function createWorld(spec = {}) {
     return { code, stdout, stdoutBuffer: Buffer.from(stdout, "utf8"), stderr: "" };
   }
 
-  const written = new Map();
   return {
     tag,
     calls,
     dockerCalls,
     files,
     written,
+    writeCalls,
+    executed,
     deps: {
       run,
       log: () => {},
       now: () => 1_700_000_000_000,
+      // The fake world never touches the real filesystem unless a test opts in.
+      mkdir: async () => undefined,
+      // A faithful `node:fs` writeFile against the fake filesystem: `wx` fails
+      // with EEXIST and leaves the existing bytes alone; the options are kept.
+      writeFile: async (path, contents, options) => {
+        const key = String(path);
+        writeCalls.push({ path: key, options: options ?? null });
+        if (options?.flag === "wx" && files.has(key)) {
+          const error = new Error(`EEXIST: file already exists, open '${key}'`);
+          error.code = "EEXIST";
+          throw error;
+        }
+        files.set(key, Buffer.from(String(contents), "utf8"));
+        written.set(key, String(contents));
+      },
       readFile: async (path) => {
-        // Tests that mutate a child AFTER observation swap the bytes in `files`.
         if (!files.has(String(path))) {
           const error = new Error("ENOENT");
           error.code = "ENOENT";
@@ -418,26 +544,36 @@ function createWorld(spec = {}) {
         return files.get(String(path));
       },
       readdir: async () => [...files.keys()].map((path) => path.slice(path.lastIndexOf("/") + 1)),
+      driverPath: `${HARNESS}/${HARNESS_DRIVER_PATH}`,
+      realpath: async (path) => String(path),
     },
-    options: { source: SOURCE, tree: TREE, context: CONTEXT, harness: HARNESS, report: REPORT, docker: "docker", keepImage: false },
+    options: {
+      source: SOURCE, tree: TREE, context: CONTEXT, harness: HARNESS,
+      harnessSource: HARNESS_COMMIT, harnessTree: HARNESS_TREE,
+      report: REPORT, docker: "docker", keepImage: false,
+    },
   };
 }
 
 /**
  * Runs the driver against a fake world and returns its result or its error.
  *
- * Every side effect is injected, so these tests write nothing: `writeFile` and
- * `mkdir` are captured into the world rather than reaching a real report
- * directory, and the emitted document is asserted through `world.written`.
+ * Every side effect is injected, so these tests write nothing real. The
+ * world's `writeFile` honours `wx` exactly as `node:fs` does; `competitorAtWrite`
+ * lets another actor win the race between the pre-flight and the write.
  */
-async function drive(spec = {}, optionOverrides = {}) {
+async function drive(spec = {}, optionOverrides = {}, depOverrides = {}) {
   const world = createWorld(spec);
   const deps = {
     ...world.deps,
-    mkdir: async () => undefined,
-    writeFile: async (path, contents) => {
-      world.written.set(String(path), String(contents));
+    writeFile: async (path, contents, options) => {
+      const key = String(path);
+      if (typeof spec.competitorAtWrite === "string" && !world.files.has(key)) {
+        world.files.set(key, Buffer.from(spec.competitorAtWrite, "utf8"));
+      }
+      return world.deps.writeFile(path, contents, options);
     },
+    ...depOverrides,
   };
   try {
     const result = await runReleaseImageAcceptance({ ...world.options, ...optionOverrides }, deps);
@@ -454,7 +590,6 @@ const startedFinished = {
 
 /** A PASS-shaped evidence input, which individual tests then break. */
 function evidenceInput(overrides = {}) {
-  const tag = `${CANDIDATE_IMAGE_REPOSITORY}:split07-${SOURCE.slice(0, 12)}-local-test`;
   const base = {
     verdict: "PASS",
     ...startedFinished,
@@ -469,12 +604,27 @@ function evidenceInput(overrides = {}) {
       releaseInputs: RELEASE_INPUT_FILES.map((path) => ({
         path, object: fakeObject(path), sha256: sha256(path),
       })),
-      harnessCommit: HARNESS_COMMIT,
-      harnessRef: "test/generic-split-07a",
+    },
+    harness: {
+      commit: HARNESS_COMMIT,
+      tree: HARNESS_TREE,
+      directory: HARNESS_DIRECTORY,
+      directoryTree: HARNESS_DIR_TREE,
+      driverPath: HARNESS_DRIVER_PATH,
+      driverObject: DRIVER_OBJECT,
+      contextClean: true,
+      verifiedBeforeRun: true,
+      verifiedAfterRun: true,
+      verificationPoints: [...HARNESS_POINTS],
+      driverInsideHarness: true,
+      worktreeIsReleaseContext: false,
+      commitIsReleaseSource: false,
     },
     image: {
-      candidateTag: tag,
+      candidateTag: TAG,
       imageId: IMAGE_ID,
+      runSubject: IMAGE_ID,
+      candidateRuns: REQUIRED_CANDIDATE_RUN_PURPOSES.map((purpose) => ({ purpose, subject: IMAGE_ID })),
       os: "linux",
       architecture: "arm64",
       acceptedWorkerArchitecture: "arm64",
@@ -522,7 +672,7 @@ function evidenceInput(overrides = {}) {
         family, schema: REQUIRED_CHILD_SCHEMA, verdict: "PASS", ok: true,
         sha256: sha256(family), bytes: 100, checkCount: 2, failedCheckCount: 0,
         evidenceFile: `split06-${family}.json`, sourceCommit: SOURCE, sourceTree: TREE,
-        ranImage: tag, ranImageId: IMAGE_ID, networkMode: "none", reason: null,
+        ranImage: IMAGE_ID, ranImageId: IMAGE_ID, networkMode: "none", reason: null,
       })),
     },
     production: { latestTag: "videofetch-worker:latest", retaggedLatest: false },
@@ -611,14 +761,14 @@ describe("SPLIT-07 candidate image tags", () => {
 });
 
 describe("SPLIT-07 hardened container invocations", () => {
-  const image = candidateImageTag(SOURCE);
+  const imageId = IMAGE_ID;
 
   const invocations = () => [
-    ["probe", probeRunArgs({ image, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, mode: "manifest" })],
-    ["selector verifier", policyVerifierRunArgs({ image, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, verifier: "verify-selector.py" })],
-    ["download-policy verifier", policyVerifierRunArgs({ image, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, verifier: "verify-download-policy.py" })],
-    ["mp4 acceptance", releaseAcceptanceRunArgs({ image, family: "mp4", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, reportDir: REPORT, evidenceName: "a.json" })],
-    ["webm acceptance", releaseAcceptanceRunArgs({ image, family: "webm", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, reportDir: REPORT, evidenceName: "b.json" })],
+    ["probe", probeRunArgs({ imageId, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, mode: "manifest" })],
+    ["selector verifier", policyVerifierRunArgs({ imageId, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, verifier: "verify-selector.py" })],
+    ["download-policy verifier", policyVerifierRunArgs({ imageId, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, verifier: "verify-download-policy.py" })],
+    ["mp4 acceptance", releaseAcceptanceRunArgs({ imageId, family: "mp4", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, reportDir: REPORT, evidenceName: "a.json" })],
+    ["webm acceptance", releaseAcceptanceRunArgs({ imageId, family: "webm", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, reportDir: REPORT, evidenceName: "b.json" })],
   ];
 
   // §22 / §16 — `--network none` on every candidate container, SPLIT-06 included.
@@ -646,7 +796,7 @@ describe("SPLIT-07 hardened container invocations", () => {
   // scratch tmpfs, and exactly one writable bind: the report directory.
   it("gives the SPLIT-06 run two tmpfs mounts and exactly one writable bind", () => {
     const args = releaseAcceptanceRunArgs({
-      image, family: "mp4", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`,
+      imageId, family: "mp4", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`,
       reportDir: REPORT, evidenceName: "a.json",
     });
     assert.deepEqual(mountTargets(args), ["/tmp/videofetch", HARNESS_SCRATCH_TARGET, HARNESS_MOUNT_TARGET, "/report"]);
@@ -679,7 +829,7 @@ describe("SPLIT-07 hardened container invocations", () => {
       );
     }
     for (const family of ["mp4", "webm"]) {
-      const args = releaseAcceptanceRunArgs({ image, family, harnessDir: "/h", reportDir: REPORT, evidenceName: "a.json" });
+      const args = releaseAcceptanceRunArgs({ imageId, family, harnessDir: "/h", reportDir: REPORT, evidenceName: "a.json" });
       assert.ok(!mountTargets(args).includes("/tmp"), "a tmpfs on /tmp would hide /tmp/videofetch and loosen Production's posture");
       assert.match(HARNESS_SCRATCH_TMPFS, /(^|[:,])noexec(,|$)/);
     }
@@ -687,7 +837,7 @@ describe("SPLIT-07 hardened container invocations", () => {
 
   it("runs the harness from the image's own Node, entry point and /app workdir", () => {
     const args = releaseAcceptanceRunArgs({
-      image, family: "webm", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`,
+      imageId, family: "webm", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`,
       reportDir: REPORT, evidenceName: "b.json",
     });
     assert.ok(args.includes("/usr/local/bin/node"));
@@ -699,9 +849,9 @@ describe("SPLIT-07 hardened container invocations", () => {
 
   it("keeps the probes and the Python verifiers OUTSIDE /app", () => {
     for (const args of [
-      probeRunArgs({ image, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, mode: "tools" }),
+      probeRunArgs({ imageId, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, mode: "tools" }),
       ...POLICY_VERIFIERS.map((verifier) =>
-        policyVerifierRunArgs({ image, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, verifier })),
+        policyVerifierRunArgs({ imageId, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, verifier })),
     ]) {
       assert.deepEqual(mountTargets(args), [VERIFY_MOUNT_TARGET]);
       assert.ok(!args.join(" ").includes("/app/"), "a probe must not reach into the application tree");
@@ -710,7 +860,7 @@ describe("SPLIT-07 hardened container invocations", () => {
 
   it("supplies the verifiers no credential and no media URL", () => {
     for (const verifier of POLICY_VERIFIERS) {
-      const args = policyVerifierRunArgs({ image, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, verifier });
+      const args = policyVerifierRunArgs({ imageId, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, verifier });
       assert.ok(!args.includes("-e") && !args.includes("--env") && !args.includes("--env-file"));
       assert.ok(!args.join(" ").includes("http"));
       assert.deepEqual(args.slice(-3), ["/usr/bin/python3", `${VERIFY_MOUNT_TARGET}/${verifier}`, EXPECTED_YTDLP_RUNTIME.path]);
@@ -719,15 +869,15 @@ describe("SPLIT-07 hardened container invocations", () => {
 
   it("rejects an unknown verifier and a non-basename evidence file", () => {
     assert.throws(
-      () => policyVerifierRunArgs({ image, harnessDir: "/h", verifier: "verify-anything.py" }),
+      () => policyVerifierRunArgs({ imageId, harnessDir: "/h", verifier: "verify-anything.py" }),
       /unknown policy verifier/,
     );
     assert.throws(
-      () => releaseAcceptanceRunArgs({ image, family: "mp4", harnessDir: "/h", reportDir: REPORT, evidenceName: "../escape.json" }),
+      () => releaseAcceptanceRunArgs({ imageId, family: "mp4", harnessDir: "/h", reportDir: REPORT, evidenceName: "../escape.json" }),
       /plain basename/,
     );
     assert.throws(
-      () => releaseAcceptanceRunArgs({ image, family: "mkv", harnessDir: "/h", reportDir: REPORT, evidenceName: "a.json" }),
+      () => releaseAcceptanceRunArgs({ imageId, family: "mkv", harnessDir: "/h", reportDir: REPORT, evidenceName: "a.json" }),
       /mp4 or webm/,
     );
   });
@@ -1058,8 +1208,13 @@ describe("SPLIT-07 evidence builder", () => {
     assert.equal(record.image.deployable, false);
     assert.equal(record.image.retainedCandidate, false);
     assert.equal(record.image.builtFromDockerfile, RELEASE_DOCKERFILE);
-    assert.equal(record.source.harnessRole.harnessIsReleaseContext, false);
-    assert.equal(record.source.harnessRole.harnessCommit, HARNESS_COMMIT);
+    assert.equal(record.harness.commit, HARNESS_COMMIT);
+    assert.equal(record.harness.tree, HARNESS_TREE);
+    assert.equal(record.harness.verifiedBeforeRun, true);
+    assert.equal(record.harness.verifiedAfterRun, true);
+    assert.equal(record.harness.worktreeIsReleaseContext, false);
+    assert.equal(record.image.runSubject, IMAGE_ID);
+    assert.equal(record.source.harnessRole, undefined, "-01's unverified harnessRole is gone");
     assert.equal(record.splitAcceptance.requiredChildSchema, REQUIRED_CHILD_SCHEMA);
     assert.match(renderReleaseEvidence(record), /^\{\n {2}"schema"/);
   });
@@ -1196,7 +1351,7 @@ describe("SPLIT-07 evidence builder", () => {
   });
 
   it("names a NEW schema, and never reuses or bumps SPLIT-06's", () => {
-    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-01");
+    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-02");
     assert.equal(REQUIRED_CHILD_SCHEMA, "split06-deterministic-full-path-04");
     assert.notEqual(SPLIT07_EVIDENCE_SCHEMA, REQUIRED_CHILD_SCHEMA);
   });
@@ -1214,15 +1369,29 @@ describe("SPLIT-07 evidence builder", () => {
 // ── 4. The driver, end to end, against a fake world ────────────────────────
 
 describe("SPLIT-07 driver argument handling", () => {
-  it("requires both full SHAs and three absolute paths", () => {
-    const base = ["--source", SOURCE, "--tree", TREE, "--context", CONTEXT, "--harness", HARNESS, "--report", REPORT];
+  const base = [
+    "--source", SOURCE, "--tree", TREE, "--context", CONTEXT, "--harness", HARNESS,
+    "--harness-source", HARNESS_COMMIT, "--harness-tree", HARNESS_TREE, "--report", REPORT,
+  ];
+  const without = (flag) => {
+    const copy = [...base];
+    copy.splice(copy.indexOf(flag), 2);
+    return copy;
+  };
+
+  it("requires four full SHAs and three absolute paths", () => {
     assert.deepEqual(parseArgv(base), {
-      source: SOURCE, tree: TREE, context: CONTEXT, harness: HARNESS, report: REPORT,
+      source: SOURCE, tree: TREE, context: CONTEXT, harness: HARNESS,
+      harnessSource: HARNESS_COMMIT, harnessTree: HARNESS_TREE, report: REPORT,
       docker: "docker", keepImage: false,
     });
-    assert.throws(() => parseArgv(["--source", "7400a51b", "--tree", TREE, "--context", CONTEXT, "--harness", HARNESS, "--report", REPORT]), /--source must be a full/);
-    assert.throws(() => parseArgv(["--source", SOURCE, "--tree", TREE, "--context", "rel", "--harness", HARNESS, "--report", REPORT]), /--context must be an absolute path/);
-    assert.throws(() => parseArgv(["--source", SOURCE, "--tree", TREE, "--context", CONTEXT, "--report", REPORT]), /--harness is required/);
+    for (const flag of ["--source", "--tree", "--context", "--harness", "--harness-source", "--harness-tree", "--report"]) {
+      assert.throws(() => parseArgv(without(flag)), new RegExp(`${flag} is required`));
+    }
+    assert.throws(() => parseArgv([...without("--source"), "--source", "7400a51b"]), /--source must be a full/);
+    assert.throws(() => parseArgv([...without("--harness-source"), "--harness-source", "7f3cdd3f"]), /--harness-source must be a full/);
+    assert.throws(() => parseArgv([...without("--harness-tree"), "--harness-tree", "A".repeat(40)]), /--harness-tree must be a full/);
+    assert.throws(() => parseArgv([...without("--context"), "--context", "rel"]), /--context must be an absolute path/);
     assert.throws(() => parseArgv([...base, "--tag", "x"]), /unknown argument: --tag/);
   });
 });
@@ -1603,5 +1772,372 @@ describe("SPLIT-07 driver", () => {
   it("keeps the candidate only when explicitly asked, and never renames it", async () => {
     const { world } = await drive({}, { keepImage: true });
     assert.ok(!world.dockerCalls.some((call) => call.args[0] === "image" && call.args[1] === "rm"));
+  });
+});
+
+// ── 5. CORRECTION C — the immutable run subject ─────────────────────────────
+
+describe("SPLIT-07 immutable run subjects (container model)", () => {
+  const harnessDir = `${HARNESS}/deploy/acceptance/ytdlp-generic`;
+  const builders = [
+    ["probe", (imageId) => probeRunArgs({ imageId, harnessDir, mode: "runtime" })],
+    ["selector verifier", (imageId) => policyVerifierRunArgs({ imageId, harnessDir, verifier: "verify-selector.py" })],
+    ["download-policy verifier", (imageId) => policyVerifierRunArgs({ imageId, harnessDir, verifier: "verify-download-policy.py" })],
+    ["mp4 acceptance", (imageId) => releaseAcceptanceRunArgs({ imageId, family: "mp4", harnessDir, reportDir: REPORT, evidenceName: "a.json" })],
+    ["webm acceptance", (imageId) => releaseAcceptanceRunArgs({ imageId, family: "webm", harnessDir, reportDir: REPORT, evidenceName: "b.json" })],
+  ];
+  const notIds = [
+    TAG, "videofetch-worker:latest", "latest", "sha256:ea08b43366ee", IMAGE_ID.slice("sha256:".length),
+    `sha256:${"A".repeat(64)}`, `SHA256:${"a".repeat(64)}`, `sha256:${"a".repeat(63)}`, `sha256:${"a".repeat(65)}`, "",
+  ];
+
+  it("accepts exactly a full, lowercase sha256 image ID", () => {
+    assert.ok(IMAGE_ID_PATTERN.test(IMAGE_ID));
+    assert.equal(assertImmutableImageId(IMAGE_ID), IMAGE_ID);
+    for (const bad of [...notIds, null, undefined]) {
+      assert.throws(() => assertImmutableImageId(bad), /not an immutable image ID/, `${String(bad)} must be refused`);
+    }
+  });
+
+  it("makes the immutable ID the run subject of every candidate container", () => {
+    for (const [label, build] of builders) {
+      const args = build(IMAGE_ID);
+      assert.equal(dockerRunSubject(args), IMAGE_ID, `${label} must execute the id`);
+      assert.ok(!args.includes(TAG), `${label} must not name the tag anywhere`);
+    }
+  });
+
+  it("refuses a tag, latest or an abbreviated id as any candidate container's subject", () => {
+    for (const [label, build] of builders) {
+      for (const bad of notIds) {
+        assert.throws(() => build(bad), /not an immutable image ID/, `${label} must refuse ${bad}`);
+      }
+    }
+  });
+
+  it("keeps the TAG gates for build and cleanup, which never take an id", () => {
+    assert.throws(() => releaseBuildArgs({ image: IMAGE_ID, context: CONTEXT }), /refusing a candidate outside/);
+    assert.throws(() => candidateRemoveArgs(IMAGE_ID), /refusing a candidate outside/);
+    assert.throws(() => candidateRemoveArgs("videofetch-worker:latest"), /refusing a deployable candidate tag/);
+    assert.deepEqual(imageIdArgs(TAG), ["image", "inspect", TAG, "--format", "{{.Id}}"]);
+  });
+
+  it("parses the run subject with a closed grammar", () => {
+    assert.equal(dockerRunSubject(["run", "--rm", "--network", "none", "--cap-drop=ALL", IMAGE_ID, "--x"]), IMAGE_ID);
+    assert.throws(() => dockerRunSubject(["run", "--privileged", IMAGE_ID]), /unrecognized docker run option: --privileged/);
+    assert.throws(() => dockerRunSubject(["run", "--rm"]), /without an image/);
+    assert.throws(() => dockerRunSubject(["build", "."]), /not a docker run argv/);
+  });
+});
+
+describe("SPLIT-07 immutable run subjects (driver)", () => {
+  it("runs every candidate container by the inspected immutable ID, and records it from the argv", async () => {
+    const { result, error, world } = await drive();
+    assert.equal(error, null, error ? String(error.message) : undefined);
+    const runs = world.dockerCalls.filter((call) => call.args[0] === "run");
+    assert.equal(runs.length, REQUIRED_CANDIDATE_RUN_PURPOSES.length);
+    for (const call of runs) assert.equal(dockerRunSubject(call.args), IMAGE_ID);
+    assert.equal(world.executed.length, runs.length);
+    assert.ok(world.executed.every((id) => id === IMAGE_ID));
+    assert.equal(result.record.image.runSubject, IMAGE_ID);
+    assert.deepEqual(
+      result.record.image.candidateRuns.map((entry) => entry.purpose).sort(),
+      [...REQUIRED_CANDIDATE_RUN_PURPOSES].sort(),
+    );
+    assert.ok(result.record.image.candidateRuns.every((entry) => entry.subject === IMAGE_ID));
+    assert.equal(result.checks.find((c) => c.name === "image/every-candidate-container-ran-the-immutable-id").ok, true);
+    // Each child names the build tag only as its base LABEL, and the id as the image it ran.
+    for (const child of result.record.splitAcceptance.children) {
+      assert.equal(child.ranImage, IMAGE_ID);
+      assert.equal(child.ranImageId, IMAGE_ID);
+    }
+  });
+
+  it("still executes the inspected image A after the tag is retargeted to B, and never claims A while running B", async () => {
+    const { result, error, world } = await drive({
+      retargetTagAfterInspect: true,
+      // B would fail loudly if it ever executed.
+      imageBProbes: { runtime: { ytdlp: pinnedArtifact({ sha256: "0".repeat(64) }) }, manifest: { brokerPresent: true } },
+    });
+    assert.equal(error, null, error ? String(error.message) : undefined);
+    assert.equal(result.verdict, "PASS");
+    assert.equal(result.record.image.imageId, IMAGE_ID);
+    assert.ok(!world.executed.includes(IMAGE_B), "image B must never execute");
+    assert.equal(world.executed.length, REQUIRED_CANDIDATE_RUN_PURPOSES.length);
+    // The retargeted tag is not this run's to delete.
+    assert.ok(!world.dockerCalls.some((call) => call.args[0] === "image" && call.args[1] === "rm"));
+  });
+
+  it("refuses an inspected ID that is not full and immutable, before any candidate container", async () => {
+    for (const inspectId of ["sha256:ea08b43366ee", IMAGE_ID.slice("sha256:".length), "videofetch-worker:latest", `sha256:${"A".repeat(64)}`, ""]) {
+      const { result, error, world } = await drive({ inspectId });
+      assert.equal(result, null, `${inspectId} must be refused`);
+      assert.match(String(error?.message), /image\/candidate-image-id-valid/);
+      assert.equal(world.dockerCalls.filter((call) => call.args[0] === "run").length, 0);
+      assert.equal(world.writeCalls.length, 0);
+      assert.ok(world.dockerCalls.some((call) => call.args.join(" ") === `image rm ${world.tag}`), "the built tag is still cleaned up");
+    }
+  });
+});
+
+// ── 6. CORRECTION B — harness provenance ────────────────────────────────────
+
+describe("SPLIT-07 harness provenance (gate)", () => {
+  async function verifyHarness(spec = {}, expected = {}) {
+    const world = createWorld(spec);
+    const git = (args, options = {}) => world.deps.run("git", ["--no-optional-locks", "-C", HARNESS, ...args], options);
+    return verifyHarnessProvenance({
+      git,
+      expectedCommit: expected.commit ?? HARNESS_COMMIT,
+      expectedTree: expected.tree ?? HARNESS_TREE,
+    });
+  }
+
+  it("returns OBSERVATIONS for a clean harness at the expected commit and tree", async () => {
+    const observed = await verifyHarness();
+    assert.equal(observed.commit, HARNESS_COMMIT);
+    assert.equal(observed.tree, HARNESS_TREE);
+    assert.equal(observed.contextClean, true);
+    assert.equal(observed.directory, HARNESS_DIRECTORY);
+    assert.equal(observed.directoryTree, HARNESS_DIR_TREE);
+    assert.equal(observed.driverPath, HARNESS_DRIVER_PATH);
+    assert.equal(observed.driverObject, DRIVER_OBJECT);
+  });
+
+  for (const [label, spec, expected, pattern] of [
+    ["a wrong expected commit", {}, { commit: "6".repeat(40) }, /harness's HEAD is 1111.*not the expected 6666/],
+    ["a wrong expected tree", {}, { tree: "7".repeat(40) }, /has tree 2222.*not the expected 7777/],
+    ["a modified file", { harnessChange: { after: "start", kind: "modified" } }, {}, /the harness is not clean/],
+    ["a staged change", { harnessChange: { after: "start", kind: "staged" } }, {}, /the harness has staged changes/],
+    ["an untracked file", { harnessChange: { after: "start", kind: "untracked" } }, {}, /the harness is not clean/],
+    ["ignored content", { harnessChange: { after: "start", kind: "ignored" } }, {}, /the harness holds content Git does not track/],
+    ["a skip-worktree entry", { harnessChange: { after: "start", kind: "hidden" } }, {}, /in the harness are marked assume-unchanged or skip-worktree/],
+    ["a directory that is not a worktree", { harnessGit: { "rev-parse --is-inside-work-tree": { code: 128, stdout: "" } } }, {}, /the harness is not inside a Git worktree/],
+    ["a subdirectory of a worktree", { harnessGit: { "rev-parse --show-prefix": { code: 0, stdout: "deploy/\n" } } }, {}, /the harness is a subdirectory/],
+    ["a commit without the harness directory", { harnessGit: { [`rev-parse --verify --quiet ${HARNESS_COMMIT}:${HARNESS_DIRECTORY}`]: { code: 1, stdout: "" } } }, {}, /carries no deploy\/acceptance\/ytdlp-generic$/],
+    ["a commit without the driver", { harnessGit: { [`rev-parse --verify --quiet ${HARNESS_COMMIT}:${HARNESS_DRIVER_PATH}`]: { code: 1, stdout: "" } } }, {}, /carries no .*run-release-image-acceptance\.mjs/],
+  ]) {
+    it(`refuses ${label}`, async () => {
+      await assert.rejects(
+        verifyHarness(spec, expected),
+        (error) => error instanceof ReleaseProvenanceError && pattern.test(error.message),
+      );
+    });
+  }
+
+  it("refuses abbreviated harness expectations outright", async () => {
+    await assert.rejects(verifyHarness({}, { commit: "1111111" }), /--harness-source must be a full lowercase 40-hex SHA/);
+    await assert.rejects(verifyHarness({}, { tree: "A".repeat(40) }), /--harness-tree must be a full lowercase 40-hex SHA/);
+  });
+});
+
+describe("SPLIT-07 harness provenance (driver)", () => {
+  for (const [label, spec, optionOverrides] of [
+    ["a wrong expected harness commit", {}, { harnessSource: "6".repeat(40) }],
+    ["a wrong expected harness tree", {}, { harnessTree: "7".repeat(40) }],
+    ["a dirty harness", { harnessChange: { after: "start", kind: "modified" } }, {}],
+    ["a staged harness modification", { harnessChange: { after: "start", kind: "staged" } }, {}],
+    ["an untracked harness file", { harnessChange: { after: "start", kind: "untracked" } }, {}],
+    ["ignored content in the harness", { harnessChange: { after: "start", kind: "ignored" } }, {}],
+    ["a harness entry hidden by skip-worktree", { harnessChange: { after: "start", kind: "hidden" } }, {}],
+  ]) {
+    it(`starts NO docker command for ${label}`, async () => {
+      const { result, error, world } = await drive(spec, optionOverrides);
+      assert.equal(result, null);
+      assert.ok(error instanceof ReleaseProvenanceError, `expected a provenance refusal, got ${String(error)}`);
+      assert.deepEqual(world.dockerCalls, [], "no docker command may run before the harness is verified");
+      assert.equal(world.writeCalls.length, 0);
+    });
+  }
+
+  it("starts NO docker command when the executing driver is not the verified harness's own", async () => {
+    const { result, error, world } = await drive({}, {}, { driverPath: "/elsewhere/run-release-image-acceptance.mjs" });
+    assert.equal(result, null);
+    assert.ok(error instanceof ReleaseProvenanceError);
+    assert.match(error.message, /is not the verified harness's own/);
+    assert.deepEqual(world.dockerCalls, []);
+  });
+
+  it("accepts a clean, exact harness and records it, verified at every checkpoint", async () => {
+    const { result, error } = await drive();
+    assert.equal(error, null, error ? String(error.message) : undefined);
+    assert.equal(result.verdict, "PASS");
+    const harness = result.record.harness;
+    assert.equal(harness.commit, HARNESS_COMMIT);
+    assert.equal(harness.tree, HARNESS_TREE);
+    assert.equal(harness.directoryTree, HARNESS_DIR_TREE);
+    assert.equal(harness.driverObject, DRIVER_OBJECT);
+    assert.equal(harness.contextClean, true);
+    assert.equal(harness.verifiedBeforeRun, true);
+    assert.equal(harness.verifiedAfterRun, true);
+    assert.deepEqual(harness.verificationPoints, HARNESS_POINTS);
+    assert.equal(harness.driverInsideHarness, true);
+    assert.equal(harness.worktreeIsReleaseContext, false);
+    assert.equal(harness.commitIsReleaseSource, false);
+    for (const name of ["harness/verified-before-execution", "harness/driver-is-inside-the-verified-harness", "harness/unchanged-after-execution"]) {
+      assert.equal(result.checks.find((c) => c.name === name)?.ok, true, name);
+    }
+  });
+
+  it("refuses the record when the harness changes after the build, before any candidate container", async () => {
+    const { result, error, world } = await drive({ harnessChange: { after: "build", kind: "modified" } });
+    assert.equal(result, null);
+    assert.match(String(error?.message), /acceptance harness changed during the run \(after-build\)/);
+    assert.equal(world.dockerCalls.filter((c) => c.args[0] === "run").length, 0);
+    assert.equal(world.writeCalls.length, 0);
+    assert.ok(world.dockerCalls.some((c) => c.args.join(" ") === `image rm ${world.tag}`), "the candidate is still cleaned up");
+  });
+
+  it("refuses the record when the harness changes between the two children", async () => {
+    const { result, error, world } = await drive({ harnessChange: { after: "split06:mp4", kind: "untracked" } });
+    assert.equal(result, null);
+    assert.match(String(error?.message), /\(before-split06-webm\)/);
+    const families = world.dockerCalls.filter((c) => c.args.includes("--family")).map((c) => c.args[c.args.indexOf("--family") + 1]);
+    assert.deepEqual(families, ["mp4"], "the webm child must never run on a changed harness");
+    assert.equal(world.writeCalls.length, 0, "no parent evidence may be written");
+  });
+
+  it("refuses the record when the harness changes while the last child runs", async () => {
+    for (const kind of ["modified", "staged", "ignored", "hidden", "moved"]) {
+      const { result, error, world } = await drive({ harnessChange: { after: "split06:webm", kind } });
+      assert.equal(result, null, `${kind} must be refused`);
+      assert.match(String(error?.message), /\(after-children\)/);
+      assert.equal(world.writeCalls.length, 0, "no parent evidence may be written");
+    }
+  });
+
+  it("records the topology when one checkout at one commit serves both roles", async () => {
+    const { result, error } = await drive(
+      {},
+      { harness: CONTEXT, harnessSource: SOURCE, harnessTree: TREE },
+      { driverPath: `${CONTEXT}/${HARNESS_DRIVER_PATH}` },
+    );
+    assert.equal(error, null, error ? String(error.message) : undefined);
+    assert.equal(result.verdict, "PASS");
+    assert.equal(result.record.harness.worktreeIsReleaseContext, true);
+    assert.equal(result.record.harness.commitIsReleaseSource, true);
+  });
+});
+
+// ── 7. CORRECTION A — the parent record is created exclusively ─────────────
+
+describe("SPLIT-07 parent evidence is created exclusively", () => {
+  const PRIOR = Buffer.from('{"prior":"record"}\n', "utf8");
+
+  it("creates the parent with an exclusive (wx) utf8 write", async () => {
+    const { result, world } = await drive();
+    assert.equal(result.verdict, "PASS");
+    const writes = world.writeCalls.filter((call) => call.path === PARENT);
+    assert.equal(writes.length, 1);
+    assert.deepEqual(writes[0].options, { encoding: "utf8", flag: "wx" });
+    assert.equal(JSON.parse(world.files.get(PARENT).toString("utf8")).schema, SPLIT07_EVIDENCE_SCHEMA);
+  });
+
+  // A1 — the path already exists.
+  it("A1: refuses a path that already exists — early, before any Docker command — leaving it untouched", async () => {
+    const { result, error, world } = await drive({ files: [[PARENT, PRIOR]] });
+    assert.equal(result, null);
+    assert.match(String(error?.message), /refusing to replace an existing evidence artifact/);
+    assert.ok(world.files.get(PARENT).equals(PRIOR), "the existing bytes must be unchanged");
+    assert.equal(world.writeCalls.length, 0);
+    assert.deepEqual(world.dockerCalls, [], "an occupied path is diagnosed before the build");
+  });
+
+  it("A1: with the pre-flight blind, the exclusive create itself refuses and leaves the file untouched", async () => {
+    const { result, error, world } = await drive({ files: [[PARENT, PRIOR]] }, {}, { readdir: async () => [] });
+    assert.equal(result, null);
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-02 verdict/);
+    assert.ok(world.files.get(PARENT).equals(PRIOR), "the existing bytes must be unchanged");
+    assert.deepEqual(world.writeCalls.map((call) => call.options), [{ encoding: "utf8", flag: "wx" }]);
+  });
+
+  // A2 — another actor creates the path between the pre-flight and the write.
+  it("A2: loses a race after the pre-flight without truncating the winner or claiming a PASS", async () => {
+    const competitor = '{"competing":"invocation"}\n';
+    const lines = [];
+    const { result, error, world } = await drive({ competitorAtWrite: competitor }, {}, { log: (line) => lines.push(line) });
+    assert.equal(result, null, "a lost race returns no result, and so no PASS");
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-02 verdict/);
+    assert.match(String(error?.message), /has NOT been modified/);
+    assert.equal(world.files.get(PARENT).toString("utf8"), competitor, "the competing record must be byte-identical");
+    assert.deepEqual(
+      world.writeCalls.filter((call) => call.path === PARENT).map((call) => call.options),
+      [{ encoding: "utf8", flag: "wx" }],
+    );
+    assert.ok(!lines.some((line) => /PASS: /.test(line)), "no PASS may be announced");
+  });
+
+  it("A2 on the real filesystem: an exclusive create refuses a file that appeared after the pre-flight", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "split07-wx-"));
+    try {
+      const target = join(dir, "split07-release-image-1700000000000.json");
+      await writeFileFs(target, "competitor\n");
+      const world = createWorld();
+      // The pre-flight is blinded, so only the kernel's O_EXCL stands between
+      // this run and the existing file. `writeFile` is the REAL one.
+      const deps = { ...world.deps, readdir: async () => [], writeFile: undefined };
+      await assert.rejects(runReleaseImageAcceptance({ ...world.options, report: dir }, deps), /refusing to claim/);
+      assert.equal(await readFileFs(target, "utf8"), "competitor\n");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── 8. The -02 evidence gates ───────────────────────────────────────────────
+
+describe("SPLIT-07 -02 evidence gates", () => {
+  it("refuses a PASS whose candidate containers did not all execute the immutable ID", () => {
+    const tagged = evidenceInput();
+    tagged.image.candidateRuns = tagged.image.candidateRuns.map((entry, i) => (i === 3 ? { ...entry, subject: TAG } : entry));
+    assert.throws(() => buildReleaseEvidence(tagged), /did not all execute the immutable image ID/);
+
+    const missing = evidenceInput();
+    missing.image.candidateRuns = missing.image.candidateRuns.filter((entry) => entry.purpose !== "split06:webm");
+    assert.throws(() => buildReleaseEvidence(missing), /did not all execute the immutable image ID/);
+
+    const extra = evidenceInput();
+    extra.image.candidateRuns = [...extra.image.candidateRuns, { purpose: "probe:extra", subject: IMAGE_ID }];
+    assert.throws(() => buildReleaseEvidence(extra), /did not all execute the immutable image ID/);
+
+    assert.throws(() => buildReleaseEvidence(evidenceInput({ image: { runSubject: IMAGE_B } })), /did not all execute the immutable image ID/);
+    assert.throws(
+      () => buildReleaseEvidence(evidenceInput({ image: { imageId: "sha256:ea08b43366ee", runSubject: "sha256:ea08b43366ee" } })),
+      /without a valid immutable image ID/,
+    );
+  });
+
+  it("refuses ANY record — PASS or FAIL — without harness provenance verified before and after", () => {
+    for (const mutation of [
+      { verifiedBeforeRun: false }, { verifiedAfterRun: false }, { driverInsideHarness: false },
+      { contextClean: false }, { commit: "1111111" }, { tree: null }, { directoryTree: "x" }, { driverObject: null },
+      { directory: "deploy" }, { driverPath: "run.mjs" },
+      { worktreeIsReleaseContext: "no" }, { commitIsReleaseSource: undefined },
+      { verificationPoints: ["before-docker"] }, { verificationPoints: ["after-build", "after-children"] },
+    ]) {
+      for (const verdict of ["PASS", "FAIL"]) {
+        const input = evidenceInput({ verdict });
+        Object.assign(input.harness, mutation);
+        assert.throws(
+          () => buildReleaseEvidence(input),
+          /without driver-verified harness provenance/,
+          `${verdict} ${JSON.stringify(mutation)} must be refused`,
+        );
+      }
+    }
+    const absent = evidenceInput();
+    delete absent.harness;
+    assert.throws(() => buildReleaseEvidence(absent), /without driver-verified harness provenance/);
+  });
+
+  it("records the observed harness topology, whatever it is", () => {
+    const record = buildReleaseEvidence(evidenceInput({ harness: { worktreeIsReleaseContext: true, commitIsReleaseSource: true } }));
+    assert.equal(record.harness.worktreeIsReleaseContext, true);
+    assert.equal(record.harness.commitIsReleaseSource, true);
+  });
+
+  it("treats -01 as historical: the builder emits only -02", () => {
+    assert.equal(buildReleaseEvidence(evidenceInput()).schema, "split07-release-image-candidate-02");
+    assert.notEqual(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-01");
   });
 });

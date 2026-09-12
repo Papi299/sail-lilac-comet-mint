@@ -188,6 +188,29 @@ export function assertCandidateReference(reference) {
 }
 
 /**
+ * The exact grammar of an immutable local Docker image ID.
+ *
+ * Since `-02` every container that CHARACTERIZES the candidate executes this,
+ * never the tag. A tag is a mutable pointer: between the moment the driver
+ * inspects it and the moment a probe runs, it can be retargeted, and a record
+ * could then claim image A while Docker executed image B. The tag keeps its
+ * other jobs — `docker build -t`, human diagnostics, cleanup — and keeps every
+ * restriction `assertCandidateReference` places on it.
+ *
+ * Full and lowercase only. The daemon would happily run an abbreviated id, a
+ * repository reference or `latest`; this harness refuses all three.
+ */
+export const IMAGE_ID_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+/** The one gate every candidate RUN SUBJECT passes through. */
+export function assertImmutableImageId(value) {
+  if (typeof value !== "string" || !IMAGE_ID_PATTERN.test(value)) {
+    throw new Error(`refusing a candidate run subject that is not an immutable image ID: ${String(value)}`);
+  }
+  return value;
+}
+
+/**
  * `docker build` argv for the actual release image.
  *
  * The Dockerfile is ALWAYS the repository's real `Dockerfile.worker`, resolved
@@ -286,6 +309,48 @@ function mountOptionTarget(spec) {
   return null;
 }
 
+/**
+ * `docker image inspect <ref> --format {{.Id}}`: what a reference names NOW.
+ *
+ * Used before cleanup, so a tag that was retargeted after the run is never
+ * removed on the strength of an identity it no longer has.
+ */
+export function imageIdArgs(reference) {
+  if (typeof reference !== "string" || reference.length === 0) {
+    throw new Error("an image reference is required");
+  }
+  return ["image", "inspect", reference, "--format", "{{.Id}}"];
+}
+
+/**
+ * The image a `docker run` argv executes, parsed from the argv itself.
+ *
+ * A CLOSED grammar: exactly the options this module emits are understood, and
+ * any other option is a refusal rather than a guess. The driver records this
+ * value for every candidate container it launches, from the very argv it hands
+ * to Docker, so "every candidate container ran the immutable image" is measured
+ * from what was executed rather than asserted from what was intended.
+ */
+const RUN_OPTIONS_WITH_VALUE = new Set([
+  "--network", "--security-opt", "--tmpfs", "-e", "--env", "-v", "--volume", "--mount", "-w", "--entrypoint",
+]);
+const RUN_FLAGS = new Set(["--rm", "--read-only"]);
+
+export function dockerRunSubject(args) {
+  if (!Array.isArray(args) || args[0] !== "run") throw new Error("not a docker run argv");
+  for (let i = 1; i < args.length; i += 1) {
+    const arg = String(args[i]);
+    if (RUN_OPTIONS_WITH_VALUE.has(arg)) {
+      i += 1;
+      continue;
+    }
+    if (RUN_FLAGS.has(arg) || /^--[a-z][a-z-]*=/.test(arg)) continue;
+    if (arg.startsWith("-")) throw new Error(`unrecognized docker run option: ${arg}`);
+    return arg;
+  }
+  throw new Error("a docker run argv without an image");
+}
+
 /** `docker image inspect <ref> --format {{json .}}`: the whole config, once. */
 export function imageInspectArgs(reference) {
   if (typeof reference !== "string" || reference.length === 0) {
@@ -301,8 +366,8 @@ export function imageInspectArgs(reference) {
  * at `/verify` rather than inside the application tree. What they report are
  * OBSERVATIONS; every judgement about them is the driver's.
  */
-export function probeRunArgs({ image, harnessDir, mode, extra = [] }) {
-  assertCandidateReference(image);
+export function probeRunArgs({ imageId, harnessDir, mode, extra = [] }) {
+  assertImmutableImageId(imageId);
   requireAbsoluteHostPath("the harness directory", harnessDir);
   if (typeof mode !== "string" || !/^[a-z-]+$/.test(mode)) throw new Error("a probe mode is required");
   return assertNoForbiddenMounts([
@@ -314,7 +379,7 @@ export function probeRunArgs({ image, harnessDir, mode, extra = [] }) {
     `${harnessDir}:${VERIFY_MOUNT_TARGET}:ro`,
     "--entrypoint",
     "/usr/local/bin/node",
-    image,
+    imageId,
     `${VERIFY_MOUNT_TARGET}/lib/release-image-probe.mjs`,
     mode,
     ...extra,
@@ -329,8 +394,8 @@ export function probeRunArgs({ image, harnessDir, mode, extra = [] }) {
  * `--cap-drop=ALL` plus `no-new-privileges`. The verifier directory is the only
  * mount, read-only, outside `/app`, and no media URL or credential is supplied.
  */
-export function policyVerifierRunArgs({ image, harnessDir, verifier }) {
-  assertCandidateReference(image);
+export function policyVerifierRunArgs({ imageId, harnessDir, verifier }) {
+  assertImmutableImageId(imageId);
   requireAbsoluteHostPath("the harness directory", harnessDir);
   if (!POLICY_VERIFIERS.includes(verifier)) {
     throw new Error(`unknown policy verifier: ${String(verifier)}`);
@@ -342,7 +407,7 @@ export function policyVerifierRunArgs({ image, harnessDir, verifier }) {
     "--read-only",
     "-v",
     `${harnessDir}:${VERIFY_MOUNT_TARGET}:ro`,
-    image,
+    imageId,
     "/usr/bin/python3",
     `${VERIFY_MOUNT_TARGET}/${verifier}`,
     "/usr/local/lib/videofetch/yt-dlp",
@@ -367,18 +432,20 @@ export const POLICY_VERIFIERS = Object.freeze(["verify-selector.py", "verify-dow
  *     that reached for `/app/src` fails here instead of silently producing a
  *     run that proves nothing about the release image.
  *
- * Every `--source-*`/`--base-*`/`--overlay-*` value is supplied by the driver
- * from its own observations; this function owns only the container shape.
+ * The run subject is the candidate's immutable image ID (since `-02`), so the
+ * image that executes is exactly the image the driver inspected. Every
+ * `--source-*`/`--base-*`/`--overlay-*` value is supplied by the driver from its
+ * own observations; this function owns only the container shape.
  */
 export function releaseAcceptanceRunArgs({
-  image,
+  imageId,
   family,
   harnessDir,
   reportDir,
   evidenceName,
   containerReportDir = REPORT_MOUNT_TARGET,
 }) {
-  assertCandidateReference(image);
+  assertImmutableImageId(imageId);
   if (family !== "mp4" && family !== "webm") throw new Error("family must be mp4 or webm");
   requireAbsoluteHostPath("the harness directory", harnessDir);
   requireAbsoluteHostPath("the report directory", reportDir);
@@ -407,7 +474,7 @@ export function releaseAcceptanceRunArgs({
     "/app",
     "--entrypoint",
     "/usr/local/bin/node",
-    image,
+    imageId,
     "--import",
     "./scripts/register-ts-aliases.mjs",
     "--experimental-strip-types",

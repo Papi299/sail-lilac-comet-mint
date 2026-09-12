@@ -25,8 +25,15 @@
 //   H  the release recipe is present at the expected path, and its committed
 //      blob is recorded by object name and content digest.
 //
-// The CLI values are EXPECTATIONS. What `verifyReleaseContextProvenance`
-// returns are OBSERVATIONS, and only observations reach evidence.
+// The same clean-worktree gate (A–G) binds the HARNESS checkout too
+// (`verifyHarnessProvenance`, since `-02`): the driver, the SPLIT-06
+// orchestrator, the Python verifiers, the image probe and the evidence
+// evaluator are all executable acceptance code, and a locally modified harness
+// could change what is measured or what counts as PASS. Recording its HEAD is
+// not provenance; verifying it against explicit expectations is.
+//
+// The CLI values are EXPECTATIONS. What these functions return are
+// OBSERVATIONS, and only observations reach evidence.
 //
 // Git is reached through an injected runner, so every refusal is testable
 // without a repository and without Docker. Plain ESM whose only imports are
@@ -61,12 +68,100 @@ export const RELEASE_INPUT_FILES = Object.freeze([
   "src/worker/runtime/ytdlp-runtime.server.ts",
 ]);
 
+/** The harness directory the candidate containers mount, relative to its root. */
+export const HARNESS_DIRECTORY = "deploy/acceptance/ytdlp-generic";
+
+/** The driver file that must be the one actually executing the run. */
+export const HARNESS_DRIVER_PATH = `${HARNESS_DIRECTORY}/run-release-image-acceptance.mjs`;
+
 /** A refusal. Its message is for the operator; nothing here reaches evidence. */
 export class ReleaseProvenanceError extends Error {
   constructor(message) {
     super(message);
     this.name = "ReleaseProvenanceError";
   }
+}
+
+/**
+ * The shared clean-worktree gate, for one provenance ROLE.
+ *
+ * `role` names the checkout in every refusal ("release build context",
+ * "harness"), so an operator can tell which of the two failed.
+ *
+ * @param {object} opts
+ * @param {(args: string[], options?: object) => Promise<{code: number|null, stdout: string}>} opts.git
+ *        runs `git <args>` against the checkout: an argv, never a shell
+ * @param {string} opts.expectedCommit full 40-hex expected commit
+ * @param {string} opts.expectedTree   full 40-hex expected tree
+ * @param {string} opts.role           the checkout's role, for messages
+ */
+async function verifyCleanWorktree({ git, expectedCommit, expectedTree, role }) {
+  // A. A real worktree. `--is-inside-work-tree` is false for a bare repository
+  //    and fails outright outside one, so a plain directory of look-alike
+  //    files — the exact thing §8 refuses to accept as provenance — stops here
+  //    rather than being measured as if it were a commit.
+  const insideWorktree = await git(["rev-parse", "--is-inside-work-tree"]);
+  if (insideWorktree.code !== 0 || String(insideWorktree.stdout ?? "").trim() !== "true") {
+    throw new ReleaseProvenanceError(
+      `the ${role} is not inside a Git worktree, so it cannot be tied to a commit`,
+    );
+  }
+  // The checkout must BE the worktree root, not a subdirectory of one: a
+  // subtree's cleanliness says nothing about the commit Git reports.
+  const root = String((await git(["rev-parse", "--show-toplevel"])).stdout ?? "").trim();
+  const prefix = (await git(["rev-parse", "--show-prefix"])).stdout ?? "";
+  if (String(prefix).trim() !== "") {
+    throw new ReleaseProvenanceError(`the ${role} is a subdirectory of a worktree rooted at ${root}`);
+  }
+
+  // B. The exact commit.
+  const commit = await revParse(git, "HEAD", role);
+  if (commit !== expectedCommit) {
+    throw new ReleaseProvenanceError(`the ${role}'s HEAD is ${commit}, not the expected ${expectedCommit}`);
+  }
+
+  // C. The exact tree, of the commit just observed, so B and C describe one
+  //    object even if HEAD moved between the two reads.
+  const tree = await revParse(git, `${commit}^{tree}`, role);
+  if (tree !== expectedTree) {
+    throw new ReleaseProvenanceError(`commit ${commit} has tree ${tree}, not the expected ${expectedTree}`);
+  }
+
+  // D/F. Modified, deleted, staged AND untracked, in one listing. The explicit
+  //      flags override any local configuration that would hide an entry.
+  const dirty = await lines(git, [
+    "status", "--porcelain=v1", "--untracked-files=all", "--ignored=no", "--ignore-submodules=none",
+  ], role);
+  if (dirty.length > 0) {
+    throw new ReleaseProvenanceError(`the ${role} is not clean: ${summarize(dirty)}`);
+  }
+
+  // F. IGNORED content too. `git status` hides it, `.dockerignore` is not a
+  //    provenance boundary, `docker build` sends whatever is there, and a
+  //    mounted harness directory exposes whatever is there to the container.
+  const ignored = await lines(git, [
+    "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none",
+  ], role);
+  if (ignored.length > 0) {
+    throw new ReleaseProvenanceError(`the ${role} holds content Git does not track: ${summarize(ignored)}`);
+  }
+
+  // E. Nothing staged, stated as its own fact rather than inferred from the
+  //    status listing: the index must agree with HEAD exactly.
+  const staged = await lines(git, ["diff-index", "--cached", "--name-only", commit], role);
+  if (staged.length > 0) {
+    throw new ReleaseProvenanceError(`the ${role} has staged changes: ${summarize(staged)}`);
+  }
+
+  // G. No index entry may hide a modification from status.
+  const hidden = (await lines(git, ["ls-files", "-v"], role)).filter((line) => /^[a-zS] /.test(line));
+  if (hidden.length > 0) {
+    throw new ReleaseProvenanceError(
+      `index entries in the ${role} are marked assume-unchanged or skip-worktree: ${summarize(hidden)}`,
+    );
+  }
+
+  return { commit, tree, root };
 }
 
 /**
@@ -81,83 +176,9 @@ export class ReleaseProvenanceError extends Error {
 export async function verifyReleaseContextProvenance({ git, expectedSource, expectedTree }) {
   requireFullSha("--source", expectedSource);
   requireFullSha("--tree", expectedTree);
-
-  // A. A real worktree. `--is-inside-work-tree` is false for a bare repository
-  //    and fails outright outside one, so a plain directory of look-alike
-  //    files — the exact thing §8 refuses to accept as provenance — stops here
-  //    rather than being measured as if it were a commit.
-  const insideWorktree = await git(["rev-parse", "--is-inside-work-tree"]);
-  if (insideWorktree.code !== 0 || String(insideWorktree.stdout ?? "").trim() !== "true") {
-    throw new ReleaseProvenanceError(
-      "the release build context is not inside a Git worktree, so it cannot be tied to a commit",
-    );
-  }
-  // The context must BE the worktree root, not a subdirectory of one: `docker
-  // build` would otherwise send a subtree whose cleanliness says nothing about
-  // the commit Git reports.
-  const topLevel = (await git(["rev-parse", "--show-toplevel"])).stdout ?? "";
-  const prefix = (await git(["rev-parse", "--show-prefix"])).stdout ?? "";
-  if (String(prefix).trim() !== "") {
-    throw new ReleaseProvenanceError(
-      `the release build context is a subdirectory of a worktree rooted at ${String(topLevel).trim()}`,
-    );
-  }
-
-  // B. The exact commit.
-  const source = await revParse(git, "HEAD");
-  if (source !== expectedSource) {
-    throw new ReleaseProvenanceError(
-      `the release build context's HEAD is ${source}, not the expected ${expectedSource}`,
-    );
-  }
-
-  // C. The exact tree, of the commit just observed, so B and C describe one
-  //    object even if HEAD moved between the two reads.
-  const tree = await revParse(git, `${source}^{tree}`);
-  if (tree !== expectedTree) {
-    throw new ReleaseProvenanceError(
-      `commit ${source} has tree ${tree}, not the expected ${expectedTree}`,
-    );
-  }
-
-  // D/F. Modified, deleted, staged AND untracked, in one listing. The explicit
-  //      flags override any local configuration that would hide an entry.
-  const dirty = await lines(git, [
-    "status", "--porcelain=v1", "--untracked-files=all", "--ignored=no", "--ignore-submodules=none",
-  ]);
-  if (dirty.length > 0) {
-    throw new ReleaseProvenanceError(`the release build context is not clean: ${summarize(dirty)}`);
-  }
-
-  // F. IGNORED content too. `git status` hides it, `.dockerignore` is not a
-  //    provenance boundary, and `docker build` sends whatever is there — a
-  //    stray `node_modules` or `.env` in the context is exactly the kind of
-  //    thing that must not be able to reach a release image unnoticed.
-  const ignored = await lines(git, [
-    "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none",
-  ]);
-  if (ignored.length > 0) {
-    throw new ReleaseProvenanceError(
-      `the release build context holds content Git does not track: ${summarize(ignored)}`,
-    );
-  }
-
-  // E. Nothing staged, stated as its own fact rather than inferred from the
-  //    status listing: the index must agree with HEAD exactly.
-  const staged = await lines(git, ["diff-index", "--cached", "--name-only", source]);
-  if (staged.length > 0) {
-    throw new ReleaseProvenanceError(
-      `the release build context has staged changes: ${summarize(staged)}`,
-    );
-  }
-
-  // G. No index entry may hide a modification from status.
-  const hidden = (await lines(git, ["ls-files", "-v"])).filter((line) => /^[a-zS] /.test(line));
-  if (hidden.length > 0) {
-    throw new ReleaseProvenanceError(
-      `index entries are marked assume-unchanged or skip-worktree: ${summarize(hidden)}`,
-    );
-  }
+  const { commit: source, tree, root } = await verifyCleanWorktree({
+    git, expectedCommit: expectedSource, expectedTree, role: "release build context",
+  });
 
   // H. The release inputs, by committed object name and content digest. Read
   //    from the OBSERVED commit rather than from the worktree: a digest taken
@@ -176,11 +197,53 @@ export async function verifyReleaseContextProvenance({ git, expectedSource, expe
   return {
     source,
     tree,
+    root,
     contextClean: true,
     dockerfilePath: RELEASE_DOCKERFILE,
     dockerfileObject: dockerfile.object,
     dockerfileSha256: dockerfile.sha256,
     releaseInputs: inputs,
+  };
+}
+
+/**
+ * Verifies the HARNESS checkout and returns what was OBSERVED (since `-02`).
+ *
+ * The same gate as the release context — worktree root, exact commit, exact
+ * tree, nothing modified, staged, untracked, ignored or hidden — against the
+ * operator's explicit `--harness-source`/`--harness-tree`, never against values
+ * derived from the checkout being verified. It additionally records the Git
+ * tree object of the mounted harness directory and the driver's blob, so the
+ * record names exactly the acceptance code that ran.
+ *
+ * The driver calls this before any Docker command AND again at every later
+ * checkpoint, finishing after both SPLIT-06 children and before the parent
+ * record is assembled: the harness is mounted and consumed throughout the run,
+ * so a harness that was clean only at the start proves nothing about the end.
+ */
+export async function verifyHarnessProvenance({ git, expectedCommit, expectedTree }) {
+  requireFullSha("--harness-source", expectedCommit);
+  requireFullSha("--harness-tree", expectedTree);
+  const { commit, tree, root } = await verifyCleanWorktree({
+    git, expectedCommit, expectedTree, role: "harness",
+  });
+  const directoryTree = await objectAt(git, commit, HARNESS_DIRECTORY);
+  if (directoryTree === null) {
+    throw new ReleaseProvenanceError(`the harness commit ${commit} carries no ${HARNESS_DIRECTORY}`);
+  }
+  const driverObject = await objectAt(git, commit, HARNESS_DRIVER_PATH);
+  if (driverObject === null) {
+    throw new ReleaseProvenanceError(`the harness commit ${commit} carries no ${HARNESS_DRIVER_PATH}`);
+  }
+  return {
+    commit,
+    tree,
+    root,
+    contextClean: true,
+    directory: HARNESS_DIRECTORY,
+    directoryTree,
+    driverPath: HARNESS_DRIVER_PATH,
+    driverObject,
   };
 }
 
@@ -317,11 +380,11 @@ function requireFullSha(flag, value) {
   if (!isFullGitSha(value)) throw new ReleaseProvenanceError(`${flag} must be a full lowercase 40-hex SHA`);
 }
 
-async function revParse(git, rev) {
+async function revParse(git, rev, role = "release build context") {
   const result = await git(["rev-parse", "--verify", "--quiet", rev]);
   const value = String(result.stdout ?? "").trim();
   if (result.code !== 0 || !isFullGitSha(value)) {
-    throw new ReleaseProvenanceError(`git could not resolve ${rev} in the release build context`);
+    throw new ReleaseProvenanceError(`git could not resolve ${rev} in the ${role}`);
   }
   return value;
 }
@@ -351,12 +414,10 @@ async function blobSha256(git, commit, path) {
 }
 
 /** Non-empty output lines, leading status columns intact. */
-async function lines(git, args) {
+async function lines(git, args, role = "release build context") {
   const result = await git(args);
   if (result.code !== 0) {
-    throw new ReleaseProvenanceError(
-      `git ${args[0]} failed in the release build context (exit ${result.code})`,
-    );
+    throw new ReleaseProvenanceError(`git ${args[0]} failed in the ${role} (exit ${result.code})`);
   }
   return String(result.stdout ?? "")
     .split("\n")
