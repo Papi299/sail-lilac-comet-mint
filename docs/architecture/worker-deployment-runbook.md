@@ -940,6 +940,14 @@ polling exists.
 > runtime acceptance, deployment and live verification — none of which this
 > record claims. Until then, Production behaves as the *Before SPLIT-05*
 > paragraph describes.
+>
+> The image-build and runtime-acceptance steps now have a committed gate:
+> **SPLIT-07** (`deploy/acceptance/ytdlp-generic/SPLIT-07.md`) builds the image
+> with the real `Dockerfile.worker` from a verified clean commit and accepts it
+> offline — source-to-image identity, hardening, the pinned runtime, and the
+> SPLIT-06 full path for mp4 **and** webm. It is a **pre-deployment
+> candidate-image gate** only: it deploys nothing, never moves
+> `videofetch-worker:latest`, and a SPLIT-07 PASS is not Production acceptance.
 
 **Before SPLIT-05.** Video presets were built **only** from source formats that
 already contained video *and* audio in one format, so split-stream renditions
