@@ -67,6 +67,8 @@ import { openWorkerDatabase } from "../src/worker/state/database.server.ts";
 import { applyMigrations } from "../src/worker/state/migrations.server.ts";
 import {
   buildSplitEvidence,
+  evaluateMaxFilesizeRefusal,
+  MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
   renderSplitEvidence,
   SPLIT06_EVIDENCE_SCHEMA,
   SPLIT06_FORBIDDEN_EVIDENCE_SUBSTRINGS,
@@ -768,6 +770,26 @@ describe("split acceptance: container model", () => {
 
 // -- the evidence record ----------------------------------------------------
 
+/** A `--max-filesize` observation that satisfies every -03 condition. */
+const passingRefusal = (overrides = {}) => ({
+  ceilingBytes: 53408,
+  declaredContentLengthBytes: 106817,
+  refusedHalf: "video",
+  threw: true,
+  acquisitionRuns: 1,
+  maxFilesizeArgument: "53408",
+  ytdlpExitCode: 0,
+  ytdlpRefusalLineWasFinal: true,
+  ytdlpStdoutBytes: 312,
+  ytdlpStderrBytes: 0,
+  finalFileExists: false,
+  partFileExists: false,
+  workDirEntries: [],
+  canonicalErrorCode: MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
+  requiredCanonicalErrorCode: MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
+  ...overrides,
+});
+
 describe("split acceptance: evidence record", () => {
   const minimal = (overrides = {}) => ({
     verdict: "PASS",
@@ -810,7 +832,7 @@ describe("split acceptance: evidence record", () => {
     privacy: {},
     cleanup: {},
     negativeCases: {},
-    maxFilesizeCharacterization: {},
+    maxFilesizeRefusal: passingRefusal(),
     ffmpegOverwriteRefusal: {},
     checks: [],
     ...overrides,
@@ -819,7 +841,7 @@ describe("split acceptance: evidence record", () => {
   it("stamps its own schema and states the network mode", () => {
     const record = buildSplitEvidence(minimal());
     assert.equal(record.schema, SPLIT06_EVIDENCE_SCHEMA);
-    assert.equal(record.schema, "split06-deterministic-full-path-02");
+    assert.equal(record.schema, "split06-deterministic-full-path-03");
     assert.equal(record.network.mode, "none");
     assert.equal(record.network.publicHostsContacted, 0);
     assert.equal(record.network.dnsLookups, 0);
@@ -893,7 +915,7 @@ describe("split acceptance: evidence record", () => {
       "fixtures",
       "image",
       "lifecycle",
-      "maxFilesizeCharacterization",
+      "maxFilesizeRefusal",
       "negativeCases",
       "network",
       "plan",
@@ -915,6 +937,111 @@ describe("split acceptance: evidence record", () => {
     assert.equal(JSON.parse(text).schema, SPLIT06_EVIDENCE_SCHEMA);
     assert.ok(text.endsWith("\n"));
   });
+
+  it("refuses a PASS whose --max-filesize refusal was not classified TOO_LARGE", () => {
+    // Exactly the -02 observation: the pinned refusal reported PROCESSING_FAILED.
+    assert.throws(
+      () =>
+        buildSplitEvidence(
+          minimal({
+            maxFilesizeRefusal: passingRefusal({ canonicalErrorCode: "PROCESSING_FAILED" }),
+          }),
+        ),
+      /PASS .* max-filesize refusal failed: max-filesize\/classified-canonical-too-large/,
+    );
+    for (const overrides of [
+      { threw: false },
+      { finalFileExists: true },
+      { partFileExists: true },
+      { acquisitionRuns: 2 },
+    ]) {
+      assert.throws(
+        () => buildSplitEvidence(minimal({ maxFilesizeRefusal: passingRefusal(overrides) })),
+        /refusing to emit a PASS/,
+      );
+    }
+    assert.throws(
+      () => buildSplitEvidence(minimal({ maxFilesizeRefusal: undefined })),
+      /refusing to emit a PASS/,
+    );
+  });
+
+  it("a FAIL record still carries the refusal it observed", () => {
+    const record = buildSplitEvidence(
+      minimal({
+        verdict: "FAIL",
+        maxFilesizeRefusal: passingRefusal({ canonicalErrorCode: "PROCESSING_FAILED" }),
+      }),
+    );
+    assert.equal(record.verdict, "FAIL");
+    assert.equal(record.maxFilesizeRefusal.canonicalErrorCode, "PROCESSING_FAILED");
+  });
+});
+
+// -- the -03 `--max-filesize` acceptance condition ---------------------------
+
+describe("split acceptance: the -03 --max-filesize acceptance condition", () => {
+  const failing = (overrides) =>
+    evaluateMaxFilesizeRefusal(passingRefusal(overrides)).filter((c) => !c.ok);
+
+  it("a refusal classified TOO_LARGE with nothing acquired satisfies every condition", () => {
+    const checks = evaluateMaxFilesizeRefusal(passingRefusal());
+    assert.deepEqual(checks.filter((c) => !c.ok), []);
+    assert.deepEqual(
+      checks.map((c) => c.name),
+      [
+        "max-filesize/declared-length-exceeds-allowance",
+        "max-filesize/acquisition-was-refused",
+        "max-filesize/one-yt-dlp-run-carrying-the-run-allowance",
+        "max-filesize/left-no-final-file",
+        "max-filesize/left-no-part-file",
+        "max-filesize/classified-canonical-too-large",
+      ],
+    );
+    assert.equal(MAX_FILESIZE_REFUSAL_REQUIRED_CODE, "TOO_LARGE");
+  });
+
+  it("the OLD behaviour no longer passes: PROCESSING_FAILED fails the condition", () => {
+    const unmet = failing({ canonicalErrorCode: "PROCESSING_FAILED" });
+    assert.deepEqual(
+      unmet.map((c) => c.name),
+      ["max-filesize/classified-canonical-too-large"],
+    );
+    assert.match(unmet[0].detail, /PROCESSING_FAILED/);
+  });
+
+  it("the yt-dlp exit code is recorded, never required", () => {
+    for (const ytdlpExitCode of [0, 1, null]) {
+      assert.deepEqual(failing({ ytdlpExitCode }), [], `exit ${ytdlpExitCode}`);
+    }
+  });
+
+  it("every other requirement is enforced", () => {
+    const cases = [
+      [{ threw: false }, "max-filesize/acquisition-was-refused"],
+      [{ finalFileExists: true }, "max-filesize/left-no-final-file"],
+      [{ partFileExists: true }, "max-filesize/left-no-part-file"],
+      // The audio half must never have started, and the one run that did must
+      // carry this run's own allowance.
+      [{ acquisitionRuns: 2 }, "max-filesize/one-yt-dlp-run-carrying-the-run-allowance"],
+      [{ acquisitionRuns: 0 }, "max-filesize/one-yt-dlp-run-carrying-the-run-allowance"],
+      [{ maxFilesizeArgument: "106817" }, "max-filesize/one-yt-dlp-run-carrying-the-run-allowance"],
+      [{ maxFilesizeArgument: null }, "max-filesize/one-yt-dlp-run-carrying-the-run-allowance"],
+      [{ declaredContentLengthBytes: 1 }, "max-filesize/declared-length-exceeds-allowance"],
+      [{ ceilingBytes: 0 }, "max-filesize/declared-length-exceeds-allowance"],
+    ];
+    for (const [overrides, expected] of cases) {
+      const names = failing(overrides).map((c) => c.name);
+      assert.ok(names.includes(expected), `${JSON.stringify(overrides)} -> ${names.join(",")}`);
+    }
+  });
+
+  it("an absent block satisfies nothing", () => {
+    assert.equal(
+      evaluateMaxFilesizeRefusal(undefined).every((c) => !c.ok),
+      true,
+    );
+  });
 });
 
 // -- the observers ----------------------------------------------------------
@@ -924,7 +1051,7 @@ describe("split acceptance: observers", () => {
     const calls = [];
     const ledger = createRunnerLedger(async (opts) => {
       calls.push(opts);
-      return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "héllo", stderr: "" };
     });
     ledger.setPhase("acquisition");
     const opts = {

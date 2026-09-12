@@ -1,5 +1,8 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import type { ChildProcess } from "node:child_process";
 import {
   mkdtempSync,
   rmSync,
@@ -11,9 +14,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AppError } from "../../lib/errors.ts";
+import { AppError, ERROR_MESSAGES } from "../../lib/errors.ts";
 import type { RunResult } from "../../services/processing/process-runner.server.ts";
-import { ProcessOutputLimitError } from "../../services/processing/process-runner.server.ts";
+import {
+  ProcessOutputLimitError,
+  setProcessRunnerTestHooks,
+} from "../../services/processing/process-runner.server.ts";
 import {
   YTDLP_DOWNLOAD_FFMPEG_LOCATION,
   YTDLP_DOWNLOAD_MAX_STDERR_BYTES,
@@ -25,6 +31,7 @@ import {
   downloadGenericOriginal,
   expectedPartPath,
   expectedSourcePath,
+  isPinnedMaxFilesizeRefusal,
   outputTemplateFor,
 } from "./ytdlp-download.server.ts";
 import { YTDLP_RUNTIME, type YtdlpRuntimeStatus } from "../runtime/ytdlp-runtime.server.ts";
@@ -191,6 +198,19 @@ describe("generic download: argv policy (§23/§24/§56)", () => {
 
   it("passes the configured maximum as --max-filesize", () => {
     assert.ok(argv().includes(`--max-filesize=${MAX_BYTES}`));
+  });
+
+  it("runs with quiet mode OFF, so the pinned size refusal can be observed", () => {
+    const a = argv();
+    assert.equal(a.filter((x) => x === "--no-quiet").length, 1);
+    assert.equal(
+      a.some((x) => x === "--quiet" || x === "-q"),
+      false,
+      "--quiet swallows the one line that distinguishes a size refusal",
+    );
+    // Progress and warnings stay off: stdout carries status lines and nothing else.
+    assert.ok(a.includes("--no-progress"));
+    assert.ok(a.includes("--no-warnings"));
   });
 
   it("keeps fragment concurrency at one and retains no fragments", () => {
@@ -908,6 +928,398 @@ describe("generic download: privacy (§60)", () => {
     ]) {
       assert.equal(source.includes(token), false, `the downloader must not call ${token}`);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001: the pinned `--max-filesize`
+// refusal is TOO_LARGE — and nothing else is
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The exact line yt-dlp 2026.08.19's `HttpFD` prints, CR prefix and LF included. */
+const refusalLine = (declared: number | string, ceiling: number | string) =>
+  `\r[download] File is larger than max-filesize (${declared} bytes > ${ceiling} bytes). Aborting.\n`;
+
+/** The ordinary status lines the pinned release prints before it. */
+const statusLines = (url: string = SAFE_URL) =>
+  `[generic] Extracting URL: ${url}\n` +
+  "[generic] abc: Downloading webpage\n" +
+  "[info] abc: Downloading 1 format(s): 22\n";
+
+/** A refused run: exit 0, nothing written, stdout ending with the refusal. */
+const refusedRun = (declared: number, ceiling: number, url?: string): RunResult => ({
+  code: 0,
+  stdout: statusLines(url) + refusalLine(declared, ceiling),
+  stderr: "",
+});
+
+describe("generic download: the pinned --max-filesize refusal (YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001)", () => {
+  const LIMIT = 1000;
+  /** A declared length no stack frame or line number could ever contain. */
+  const DECLARED = 987_654_321;
+  const limits = { maxFileSizeBytes: LIMIT, downloadTimeoutSeconds: 60 };
+  const run = (
+    overrides: Partial<Parameters<typeof downloadGenericOriginal>[3]> = {},
+    url = SAFE_URL,
+  ) => downloadGenericOriginal(url, workDir, videoPlan(), baseDeps({ limits, ...overrides }));
+
+  const emptyWorkDir = () => {
+    rmSync(workDir, { recursive: true, force: true });
+    mkdirSync(workDir);
+  };
+
+  it("exit 0, nothing written, this run's ceiling refused: TOO_LARGE and the canonical message only", async () => {
+    const { runner, calls } = fakeRunner(refusedRun(DECLARED, LIMIT, SECRET_URL));
+    await assert.rejects(
+      () => run({ runner }, SECRET_URL),
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.equal(err.code, "TOO_LARGE");
+        assert.equal(err.message, ERROR_MESSAGES.TOO_LARGE);
+        const serialized = `${err.message} ${JSON.stringify(err)} ${String(err.stack)}`;
+        for (const leak of [SENTINEL, "max-filesize", "[download]", String(DECLARED)]) {
+          assert.equal(serialized.includes(leak), false, `'${leak}' escaped into the error`);
+        }
+        return true;
+      },
+    );
+    assert.equal(calls.length, 1, "exactly one acquisition subprocess");
+    assert.ok(calls[0]!.args.includes(`--max-filesize=${LIMIT}`));
+    assert.ok(calls[0]!.args.includes("--no-quiet"));
+    assert.deepEqual(readdirSync(workDir), [], "nothing was acquired");
+  });
+
+  it("the witness is exact, and reads only what the pinned downloader writes", () => {
+    assert.equal(isPinnedMaxFilesizeRefusal(statusLines() + refusalLine(1001, 1000), 1000), true);
+    // A declared length beyond 2^53 is compared exactly, never as a float.
+    assert.equal(isPinnedMaxFilesizeRefusal(refusalLine("98765432109876543210", 1000), 1000), true);
+    // CR and LF both end a line, in either combination.
+    assert.equal(isPinnedMaxFilesizeRefusal(refusalLine(1001, 1000).replace("\r", ""), 1000), true);
+    assert.equal(isPinnedMaxFilesizeRefusal(`${refusalLine(1001, 1000)}\r\n`, 1000), true);
+
+    const rejected: Array<[string, string, number]> = [
+      ["no output at all", "", 1000],
+      ["status lines, no refusal", statusLines(), 1000],
+      ["another run's ceiling", refusalLine(2001, 2000), 1000],
+      ["the whole budget, not this half's remainder", refusalLine(2001, 2000), 300],
+      ["a ceiling with a leading zero", refusalLine(1001, "01000"), 1000],
+      ["a declared length equal to the ceiling", refusalLine(1000, 1000), 1000],
+      ["a smaller declared length", refusalLine(999, 1000), 1000],
+      ["a zero declared length", refusalLine(0, 1000), 1000],
+      [
+        "a refusal that is not the final line",
+        `${refusalLine(1001, 1000)}[download] Download completed\n`,
+        1000,
+      ],
+      [
+        "a refusal after a playlist banner",
+        `[download] Downloading playlist: x\n${refusalLine(1001, 1000)}`,
+        1000,
+      ],
+      [
+        "a refusal after a multi_video banner",
+        `[download] Downloading multi_video: x\n${refusalLine(1001, 1000)}`,
+        1000,
+      ],
+      [
+        "min-filesize, which this policy never passes",
+        "\r[download] File is smaller than min-filesize (1 bytes < 1000 bytes). Aborting.\n",
+        1000,
+      ],
+      ["a line that merely contains the refusal", `WARNING: ${refusalLine(1001, 1000).slice(1)}`, 1000],
+      ["a non-positive allowance", refusalLine(1001, 1000), 0],
+      ["a non-integer allowance", refusalLine(1001, 1000), 1000.5],
+    ];
+    for (const [label, stdout, allowance] of rejected) {
+      assert.equal(isPinnedMaxFilesizeRefusal(stdout, allowance), false, label);
+    }
+  });
+
+  it("exit 0 with no artifact and NO witness stays PROCESSING_FAILED", async () => {
+    const withoutWitness: Array<[string, string]> = [
+      ["nothing printed", ""],
+      ["status lines only", statusLines()],
+      ["a refusal naming another ceiling", statusLines() + refusalLine(DECLARED, LIMIT * 2)],
+      [
+        "an empty playlist whose title forged the final line",
+        `[download] Downloading playlist: x\n${refusalLine(DECLARED, LIMIT)}`,
+      ],
+    ];
+    for (const [label, stdout] of withoutWitness) {
+      emptyWorkDir();
+      const { runner } = fakeRunner({ code: 0, stdout, stderr: "" });
+      await assert.rejects(
+        () => run({ runner }),
+        (err: unknown) => {
+          assert.ok(err instanceof AppError, label);
+          assert.equal(err.code, "PROCESSING_FAILED", label);
+          return true;
+        },
+      );
+    }
+  });
+
+  it("the witness never overrides the artifact rules: any residue stays PROCESSING_FAILED", async () => {
+    const residues: Array<[string, () => void]> = [
+      ["a .part the run left behind", () => writeFileSync(expectedPartPath(workDir, "mp4"), "partial")],
+      ["a side file", () => writeFileSync(join(workDir, "source.info.json"), "{}")],
+      ["a wrong-extension artifact", () => writeFileSync(join(workDir, "source.webm"), "OTHER")],
+    ];
+    for (const [label, residue] of residues) {
+      emptyWorkDir();
+      const { runner } = fakeRunner(async () => {
+        residue();
+        return refusedRun(DECLARED, LIMIT);
+      });
+      await assert.rejects(
+        () => run({ runner }),
+        (err: unknown) => {
+          assert.ok(err instanceof AppError, label);
+          assert.equal(err.code, "PROCESSING_FAILED", label);
+          return true;
+        },
+      );
+    }
+  });
+
+  it("a witness beside a REAL artifact changes nothing: the ordinary validation still decides", async () => {
+    // Not a state the pinned release can produce — it writes nothing when it
+    // refuses. Pinned so this classifier can only ever turn a would-be
+    // PROCESSING_FAILED into TOO_LARGE, never decide an artifact's fate.
+    const { runner } = fakeRunner(async () => {
+      writeSource("mp4", "0123456789");
+      return refusedRun(DECLARED, LIMIT);
+    });
+    const res = await run({ runner });
+    assert.equal(res.fileSize, 10);
+  });
+
+  it("a NON-zero exit is classified from stderr alone: a witness on stdout is never read", async () => {
+    const cases: Array<[string, RunResult, string]> = [
+      [
+        "a refusal line beside a network error",
+        {
+          code: 1,
+          stdout: statusLines() + refusalLine(DECLARED, LIMIT),
+          stderr: "ERROR: Unable to download: Connection refused",
+        },
+        "NETWORK_ERROR",
+      ],
+      [
+        "a refusal line beside an unrecognized error",
+        { code: 1, stdout: refusalLine(DECLARED, LIMIT), stderr: "ERROR: something entirely new" },
+        "EXTRACTION_FAILED",
+      ],
+      [
+        "yt-dlp's own retry line on stdout, which no longer steers the code",
+        {
+          code: 1,
+          stdout: `${statusLines()}[download] Got error: The read operation timed out. Retrying (1/2)...\n`,
+          stderr: "ERROR: something entirely new",
+        },
+        "EXTRACTION_FAILED",
+      ],
+      [
+        "positive control: stderr still classifies",
+        { code: 1, stdout: "", stderr: "ERROR: The read operation timed out" },
+        "TIMEOUT",
+      ],
+    ];
+    for (const [label, result, code] of cases) {
+      emptyWorkDir();
+      const { runner } = fakeRunner(result);
+      await assert.rejects(
+        () => run({ runner }),
+        (err: unknown) => {
+          assert.ok(err instanceof AppError, label);
+          assert.equal(err.code, code, label);
+          return true;
+        },
+      );
+    }
+  });
+
+  it("TIMEOUT and an output overflow keep their own codes", async () => {
+    await assert.rejects(
+      () =>
+        run({
+          runner: async () => {
+            throw new AppError("TIMEOUT");
+          },
+        }),
+      (err: unknown) => err instanceof AppError && err.code === "TIMEOUT",
+    );
+    emptyWorkDir();
+    await assert.rejects(
+      () =>
+        run({
+          runner: async () => {
+            throw new ProcessOutputLimitError("stdout");
+          },
+        }),
+      (err: unknown) => err instanceof AppError && err.code === "EXTRACTION_FAILED",
+    );
+  });
+
+  it("the caller cancels FIRST, then the run exits 0 with the witness: the cancellation stands", async () => {
+    const caller = new AbortController();
+    const { runner } = fakeRunner(async () => {
+      caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+      return refusedRun(DECLARED, LIMIT);
+    });
+    await assert.rejects(
+      () =>
+        downloadGenericOriginal(SAFE_URL, workDir, videoPlan(), {
+          ...baseDeps({ runner, limits }),
+          signal: caller.signal,
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.equal(err.code, "PROCESSING_FAILED", "a cancellation is never a size refusal");
+        assert.equal(err.message, "Download was cancelled.");
+        return true;
+      },
+    );
+  });
+
+  it("a cancellation landing while the refusal is being verified still stands", async () => {
+    const caller = new AbortController();
+    const { runner } = fakeRunner(refusedRun(DECLARED, LIMIT));
+    let reads = 0;
+    const readDir = async (path: string) => {
+      reads += 1;
+      caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+      return readdirSync(path);
+    };
+    await assert.rejects(
+      () =>
+        downloadGenericOriginal(SAFE_URL, workDir, videoPlan(), {
+          ...baseDeps({ runner, limits, readDir }),
+          signal: caller.signal,
+        }),
+      (err: unknown) =>
+        err instanceof AppError &&
+        err.code === "PROCESSING_FAILED" &&
+        err.message === "Download was cancelled.",
+    );
+    assert.equal(reads, 1, "the job directory really was read");
+  });
+
+  it("an overflow the watcher latched FIRST stays TOO_LARGE through a witnessed zero exit", async () => {
+    // Both mechanisms report TOO_LARGE; what is pinned here is that the
+    // watcher's established cause is not re-decided by the later step.
+    const { runner } = fakeRunner(async () => {
+      writeFileSync(expectedPartPath(workDir, "mp4"), "x".repeat(LIMIT * 2));
+      await new Promise((r) => setTimeout(r, 20));
+      rmSync(expectedPartPath(workDir, "mp4"), { force: true });
+      return refusedRun(DECLARED, LIMIT);
+    });
+    await assert.rejects(
+      () => run({ runner, sizePollMs: 1 }),
+      (err: unknown) => err instanceof AppError && err.code === "TOO_LARGE",
+    );
+  });
+
+  describe("through the REAL hardened runner (fake spawn, hooked processKill)", () => {
+    afterEach(() => setProcessRunnerTestHooks(null));
+
+    type Child = EventEmitter & {
+      pid?: number;
+      stdout: PassThrough;
+      stderr: PassThrough;
+      kill: () => boolean;
+    };
+
+    /**
+     * One scripted yt-dlp child. `processKill` is ALWAYS hooked, so the real
+     * runner's group termination is observed and no real process group is ever
+     * signalled.
+     */
+    function hookChild(script: (child: Child) => void, closeOnKill: number | null = null) {
+      const groupKills: number[] = [];
+      let child: Child | null = null;
+      setProcessRunnerTestHooks({
+        platform: "linux",
+        spawn: () => {
+          const spawned = new EventEmitter() as Child;
+          spawned.pid = 82_000;
+          spawned.stdout = new PassThrough();
+          spawned.stderr = new PassThrough();
+          spawned.kill = () => true;
+          child = spawned;
+          queueMicrotask(() => script(spawned));
+          return spawned as unknown as ChildProcess;
+        },
+        processKill: (pid) => {
+          groupKills.push(pid);
+          const owner = child;
+          if (owner) queueMicrotask(() => owner.emit("close", closeOnKill));
+          return true;
+        },
+      });
+      return { groupKills };
+    }
+
+    it("exit 0 with the witness on a real pipe is TOO_LARGE", async () => {
+      hookChild((child) => {
+        child.stderr.end();
+        child.stdout.end(statusLines() + refusalLine(DECLARED, LIMIT));
+        setImmediate(() => child.emit("close", 0));
+      });
+      await assert.rejects(
+        () => downloadGenericOriginal(SAFE_URL, workDir, videoPlan(), baseDeps({ limits })),
+        (err: unknown) => err instanceof AppError && err.code === "TOO_LARGE",
+      );
+    });
+
+    it("a TIMEOUT wins even when the child printed the witness and then exited 0", async () => {
+      const { groupKills } = hookChild((child) => {
+        child.stderr.end();
+        child.stdout.write(statusLines() + refusalLine(DECLARED, LIMIT));
+        // It never exits on its own: only the runner's deadline ends it.
+      }, 0);
+      // One clock, no sleeping on a real budget: a 1 s budget with 990 ms
+      // already spent leaves the acquisition 10 ms.
+      let now = 0;
+      const clock = () => {
+        const value = now;
+        now = 990;
+        return value;
+      };
+      await assert.rejects(
+        () =>
+          downloadGenericOriginal(
+            SAFE_URL,
+            workDir,
+            videoPlan(),
+            baseDeps({ limits: { maxFileSizeBytes: LIMIT, downloadTimeoutSeconds: 1 }, clock }),
+          ),
+        (err: unknown) => {
+          assert.ok(err instanceof AppError);
+          assert.equal(err.code, "TIMEOUT", "a timed-out run is never re-read as a size refusal");
+          return true;
+        },
+      );
+      assert.deepEqual(groupKills, [-82_000], "the owned group was killed by the deadline");
+    });
+
+    it("an output overflow wins: a witness at the end of an over-limit stdout is never read", async () => {
+      hookChild((child) => {
+        child.stderr.end();
+        child.stdout.write(
+          `${"x".repeat(YTDLP_DOWNLOAD_MAX_STDOUT_BYTES + 1)}\n${refusalLine(DECLARED, LIMIT)}`,
+        );
+      }, 0);
+      await assert.rejects(
+        () => downloadGenericOriginal(SAFE_URL, workDir, videoPlan(), baseDeps({ limits })),
+        (err: unknown) => {
+          assert.ok(err instanceof AppError);
+          assert.equal(err.code, "EXTRACTION_FAILED");
+          assert.equal(err.message.includes("stdout exceeded"), false);
+          return true;
+        },
+      );
+    });
   });
 });
 

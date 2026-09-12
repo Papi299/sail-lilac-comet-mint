@@ -77,10 +77,12 @@ import {
 /**
  * Hard ceiling on the acquisition subprocess's stdout.
  *
- * Far smaller than the analysis ceiling because the command is `--quiet` and
- * `--no-progress` and NO document is expected: a correct run prints essentially
- * nothing. 64 KiB is generous for the stray line a future release might emit
- * while still bounding a malfunctioning extractor tightly.
+ * Far smaller than the analysis ceiling because NO document is expected. The
+ * command runs with quiet mode OFF (see `ytdlpDownloadPolicyArgs`), but also
+ * with `--no-progress` and `--no-warnings`, so a correct run prints only
+ * yt-dlp's own handful of one-line status messages. 64 KiB bounds that with
+ * wide headroom while still bounding a malfunctioning extractor tightly;
+ * overflow is itself a failure.
  */
 export const YTDLP_DOWNLOAD_MAX_STDOUT_BYTES = 64 * 1024;
 
@@ -187,7 +189,7 @@ export function buildYtdlpDownloadEnvironment(opts: { workDir: string }): NodeJS
  * Every option is verified against yt-dlp 2026.08.19's own `options.py`:
  *
  *   --no-cache-dir         `'--no-cache-dir'`      -> cachedir=False
- *   --quiet                `'-q', '--quiet'`
+ *   --no-quiet             `'--no-quiet'`          -> quiet=False (the release default, stated)
  *   --no-progress          `'--no-progress'`
  *   --no-warnings          `'--no-warnings'`
  *   --socket-timeout       `'--socket-timeout'`, float
@@ -224,10 +226,20 @@ export function ytdlpDownloadPolicyArgs(opts: {
     // ── no filesystem residue ────────────────────────────────────────────
     "--no-cache-dir",
 
-    // ── quiet streams ────────────────────────────────────────────────────
-    // Nothing parses these; they exist only for failure classification, and a
-    // silent run keeps the bounded buffers empty.
-    "--quiet",
+    // ── console streams ──────────────────────────────────────────────────
+    // Quiet mode is deliberately OFF. In the pinned release `quiet` gates
+    // console output and nothing else: `YoutubeDL.to_screen`, which stream the
+    // screen is, and the `noprogress` default, which `--no-progress` sets
+    // explicitly below. Under `--quiet` the downloader's one `--max-filesize`
+    // refusal line is swallowed, and a refused download becomes
+    // indistinguishable from any other run that exits 0 and leaves nothing
+    // (see `isPinnedMaxFilesizeRefusal`).
+    //
+    // Progress and warnings stay off, so stdout carries only yt-dlp's own
+    // short status lines. They are held in bounded process memory and read
+    // for that one witness; stderr alone classifies a failed run. Neither
+    // stream is ever logged, persisted or returned.
+    "--no-quiet",
     "--no-progress",
     "--no-warnings",
 
@@ -250,6 +262,9 @@ export function ytdlpDownloadPolicyArgs(opts: {
     // `HttpFD.real_download` checks `max_filesize` inside `if data_len is not
     // None`. An unknown or decompressed length keeps streaming, which is
     // exactly why this is NOT sufficient and the actual-byte guard exists.
+    // When it DOES refuse, the pinned release exits 0 having written nothing,
+    // and the refusal keeps its TOO_LARGE meaning only through the witness
+    // `isPinnedMaxFilesizeRefusal` reads from stdout.
     `--max-filesize=${maxFileSizeArg(opts.maxFileSizeBytes)}`,
 
     // ── fragment policy ──────────────────────────────────────────────────
@@ -426,6 +441,10 @@ export function expectedSplitPartPath(
  * Same narrow contract as the analysis classifier: raw text goes IN, a
  * canonical code comes OUT, and the text is never stored, logged or attached to
  * the returned error. Anything unrecognized collapses to `EXTRACTION_FAILED`.
+ *
+ * It is fed a failed run's STDERR, where the pinned release reports every
+ * error — never its stdout, which carries yt-dlp's status lines and, through
+ * them, the URL and other upstream-controlled text.
  */
 export function classifyDownloadFailure(raw: string): AppError["code"] {
   const text = raw.toLowerCase();
@@ -467,6 +486,68 @@ export function classifyDownloadFailure(raw: string): AppError["code"] {
     return "NETWORK_ERROR";
   }
   return "EXTRACTION_FAILED";
+}
+
+// ── The pinned `--max-filesize` refusal ──────────────────────────────────────
+
+/**
+ * The ONE line yt-dlp 2026.08.19 prints when `--max-filesize` refuses a
+ * download. Its `HttpFD.real_download` checks the declared length before it
+ * opens any destination:
+ *
+ *     if max_data_len is not None and data_len > max_data_len:
+ *         self.to_screen(
+ *             f'\r[download] File is larger than max-filesize ({data_len} bytes > {max_data_len} bytes). Aborting.')
+ *         return False
+ *
+ * To the pinned release that is not an error. `FileDownloader.download`
+ * returns `(False, True)`, `process_info` merely skips post-processing, nothing
+ * reaches `report_error`, and the process exits 0 — with no `.part` and no
+ * final file. This line is therefore the only thing that separates "refused as
+ * too large" from any other run that exits 0 and leaves nothing behind, an
+ * empty playlist among them. Both numbers are Python `int`s: plain decimal, no
+ * sign, no leading zero, no unit.
+ */
+const MAX_FILESIZE_REFUSAL_LINE =
+  /^\[download\] File is larger than max-filesize \(([1-9][0-9]*) bytes > ([1-9][0-9]*) bytes\)\. Aborting\.$/;
+
+/**
+ * The banner the pinned `__process_playlist` prints for a playlist or
+ * multi-video result, before any entry is processed and even when there are
+ * none. Such a run can end its output with a line carrying an
+ * upstream-controlled title, so it is never read as a size refusal.
+ */
+const PLAYLIST_BANNER_LINE = /^\[download\] Downloading (?:playlist|multi_video): /;
+
+/**
+ * True when `stdout` ends with the pinned downloader's own `--max-filesize`
+ * refusal of THIS run's allowance.
+ *
+ *   - The refusal must be the FINAL non-empty line. After refusing a single
+ *     video the pinned release prints nothing more, so any later line means
+ *     something else ran afterwards.
+ *   - It must name exactly `allowanceBytes`: the value this module passed as
+ *     `--max-filesize` for this very run. For a split pair's audio half that is
+ *     the remainder, never the whole budget.
+ *   - Its declared length must really exceed that allowance.
+ *   - No playlist banner may appear anywhere.
+ *
+ * A witness, never a classification on its own: `runMonitoredAcquisition` also
+ * requires a zero exit, no earlier cause, and a job directory the run left
+ * exactly as it found it. The text is read here and dropped; none of it is
+ * stored, logged, returned or attached to an error.
+ */
+export function isPinnedMaxFilesizeRefusal(stdout: string, allowanceBytes: number): boolean {
+  if (!Number.isSafeInteger(allowanceBytes) || allowanceBytes <= 0) return false;
+  // The line is written as `\r[download] ...\n`: CR and LF both end a line.
+  const lines = stdout.split(/[\r\n]+/).filter((line) => line.length > 0);
+  if (lines.some((line) => PLAYLIST_BANNER_LINE.test(line))) return false;
+  const match = MAX_FILESIZE_REFUSAL_LINE.exec(lines.at(-1) ?? "");
+  if (match === null) return false;
+  const [, declared, ceiling] = match;
+  if (ceiling !== String(allowanceBytes)) return false;
+  // A declared length is upstream-controlled and may exceed 2^53.
+  return BigInt(declared) > BigInt(ceiling);
 }
 
 // ── Public shapes ────────────────────────────────────────────────────────────
@@ -728,14 +809,19 @@ export async function downloadGenericOriginal(
   try {
     await runMonitoredAcquisition({
       runner,
-      buildArgv: () =>
+      maxFileSizeBytes: maxBytes,
+      buildArgv: (allowance) =>
         buildYtdlpDownloadArgv({
           validatedUrl: safeUrl,
           workDir,
           plan: validPlan,
-          maxFileSizeBytes: maxBytes,
+          maxFileSizeBytes: allowance,
         }),
       workDir,
+      // The executor's fresh per-job directory: a successful run leaves exactly
+      // `source.<ext>` in it, and a refused one leaves it empty.
+      entriesBefore: [],
+      readDir,
       timeoutMs: networkTimeoutMs,
       signal: controller.signal,
       callerSignal: deps.signal,
@@ -792,12 +878,25 @@ function acquisitionBudgetMs(limits: GenericDownloadLimits): number {
 async function runMonitoredAcquisition(opts: {
   readonly runner: typeof runProcess;
   /**
+   * THIS run's byte allowance: what `--max-filesize` receives, and the only
+   * ceiling a refusal line may name. One value for both, so the command and
+   * the refusal classification cannot disagree about which run they describe.
+   */
+  readonly maxFileSizeBytes: number;
+  /**
    * Built lazily, inside the guarded region — where the single-source
    * downloader has always built it — so an argv failure is classified by the
-   * same catch as every other failure of the run.
+   * same catch as every other failure of the run. It is handed the allowance
+   * rather than closing over a copy of its own.
    */
-  readonly buildArgv: () => readonly string[];
+  readonly buildArgv: (maxFileSizeBytes: number) => readonly string[];
   readonly workDir: string;
+  /**
+   * The job directory's exact entries before this run. A size refusal must
+   * leave precisely these behind: nothing created and nothing removed.
+   */
+  readonly entriesBefore: readonly string[];
+  readonly readDir: (path: string) => Promise<string[]>;
   readonly timeoutMs: number;
   /** The operation-owned controller's signal: one abort path to the group. */
   readonly signal: AbortSignal;
@@ -888,7 +987,7 @@ async function runMonitoredAcquisition(opts: {
     startMonitor();
     result = await opts.runner({
       command: YTDLP_RUNTIME.pythonPath,
-      args: [...opts.buildArgv()],
+      args: [...opts.buildArgv(opts.maxFileSizeBytes)],
       timeoutMs: opts.timeoutMs,
       env: buildYtdlpDownloadEnvironment({ workDir: opts.workDir }),
       signal: opts.signal,
@@ -925,10 +1024,48 @@ async function runMonitoredAcquisition(opts: {
   }
 
   if (result.code !== 0) {
-    // Both streams are read HERE and nowhere else: classified into a canonical
-    // code and then dropped with the RunResult. Neither is logged, persisted,
-    // attached to the thrown error, or returned.
-    throw new AppError(classifyDownloadFailure(`${result.stderr}\n${result.stdout}`));
+    // stderr ALONE classifies a failed run: every error the pinned release
+    // reports goes there. stdout carries yt-dlp's status lines, which echo the
+    // URL and upstream-controlled strings, so it must never steer a failure
+    // code. Both streams are read only in this function — stdout through
+    // `isPinnedMaxFilesizeRefusal` — and then dropped with the RunResult:
+    // never logged, persisted, attached to the thrown error, or returned.
+    throw new AppError(classifyDownloadFailure(result.stderr));
+  }
+
+  // ── a zero exit that is the pinned downloader's size refusal ─────────────
+  //
+  // A zero exit is yt-dlp's opinion, and for a `--max-filesize` refusal that
+  // opinion is "nothing went wrong" (see `isPinnedMaxFilesizeRefusal`).
+  // Without this step the refusal reaches artifact validation as a missing
+  // file, and a size refusal is reported as a processing failure.
+  //
+  // TOO_LARGE needs ALL of: the witness for THIS run's allowance, no earlier
+  // cause, and a job directory the run left exactly as it found it — no final
+  // file, no `.part`, nothing. Anything short of that returns, and the ordinary
+  // validation refuses it exactly as before.
+  if (!isPinnedMaxFilesizeRefusal(result.stdout, opts.maxFileSizeBytes)) return;
+  throwIfEarlierCause(opts);
+  if (!(await hasExactEntries(opts.workDir, opts.entriesBefore, opts.readDir))) return;
+  // The directory read yielded to the event loop, so check again: a cause that
+  // arrived meanwhile was still established before this classification.
+  throwIfEarlierCause(opts);
+  throw new AppError("TOO_LARGE");
+}
+
+/**
+ * Throws for a cause that was established BEFORE a zero exit is interpreted,
+ * in the order the failure path uses: an internal overflow stays TOO_LARGE, and
+ * a caller abort — a user cancellation or an operator shutdown — stays a
+ * cancellation and is never reported as a size refusal.
+ */
+function throwIfEarlierCause(opts: {
+  readonly abortCause: () => AbortCause;
+  readonly callerSignal: AbortSignal | undefined;
+}): void {
+  if (opts.abortCause() === "overflow") throw new AppError("TOO_LARGE");
+  if (opts.callerSignal?.aborted) {
+    throw new AppError("PROCESSING_FAILED", "Download was cancelled.");
   }
 }
 
@@ -1169,15 +1306,20 @@ export async function downloadGenericSplitSources(
 
       await runMonitoredAcquisition({
         runner,
-        buildArgv: () =>
+        maxFileSizeBytes: allowance,
+        buildArgv: (runAllowance) =>
           buildYtdlpSplitDownloadArgv({
             validatedUrl: safeUrl,
             workDir,
             plan: validPlan,
             role: half.role,
-            maxFileSizeBytes: allowance,
+            maxFileSizeBytes: runAllowance,
           }),
         workDir,
+        // Exactly what this half found: nothing before the video run, the
+        // validated video artifact before the audio one.
+        entriesBefore,
+        readDir,
         timeoutMs,
         signal: controller.signal,
         callerSignal: deps.signal,
@@ -1283,13 +1425,28 @@ async function assertExactEntries(
   expected: readonly string[],
   readDir: (path: string) => Promise<string[]>,
 ): Promise<void> {
+  if (!(await hasExactEntries(workDir, expected, readDir))) {
+    throw new AppError("PROCESSING_FAILED");
+  }
+}
+
+/**
+ * The same comparison as a QUESTION rather than an assertion, for the one
+ * caller that must not throw: an unreadable directory is simply "not exactly
+ * `expected`", and the ordinary validation then refuses it as it always did.
+ */
+async function hasExactEntries(
+  workDir: string,
+  expected: readonly string[],
+  readDir: (path: string) => Promise<string[]>,
+): Promise<boolean> {
   let entries: string[];
   try {
     entries = await readDir(workDir);
   } catch {
-    throw new AppError("PROCESSING_FAILED");
+    return false;
   }
-  if (!sameEntries(entries, expected)) throw new AppError("PROCESSING_FAILED");
+  return sameEntries(entries, expected);
 }
 
 /** Order-independent exact equality, duplicates included. */

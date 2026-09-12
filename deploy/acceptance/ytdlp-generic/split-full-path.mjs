@@ -65,7 +65,10 @@ import {
   GenericSplitSourceSelectionSchema,
   splitTargetContainer,
 } from "../../../src/worker/execution/generic-source.ts";
-import { downloadGenericSplitSources } from "../../../src/worker/execution/ytdlp-download.server.ts";
+import {
+  downloadGenericSplitSources,
+  isPinnedMaxFilesizeRefusal,
+} from "../../../src/worker/execution/ytdlp-download.server.ts";
 import { JobExecutor } from "../../../src/worker/execution/job-executor.server.ts";
 import { openWorkerDatabase } from "../../../src/worker/state/database.server.ts";
 import { applyMigrations } from "../../../src/worker/state/migrations.server.ts";
@@ -90,7 +93,12 @@ import {
   installStatusAudit,
   readStatusTrace,
 } from "./lib/split-observers.mjs";
-import { buildSplitEvidence, renderSplitEvidence } from "./lib/split-evidence.mjs";
+import {
+  MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
+  buildSplitEvidence,
+  evaluateMaxFilesizeRefusal,
+  renderSplitEvidence,
+} from "./lib/split-evidence.mjs";
 import { isFullGitSha } from "./lib/split-provenance.mjs";
 
 // ── Bounds ─────────────────────────────────────────────────────────────────
@@ -1113,6 +1121,11 @@ async function runFullPath(ctx) {
       videoBytes: observed.acquiredVideoBytes,
       audioBytes: observed.acquiredAudioBytes,
       combinedBytes: observed.acquiredVideoBytes + observed.acquiredAudioBytes,
+      // Byte COUNTS of the two acquisition runs' console streams, never their
+      // text: acquisition runs `--no-quiet`, and these bound what that leaves
+      // in Worker memory for an ordinary successful run.
+      ytdlpStdoutBytes: acquisitionYtdlp.map((s) => s.stdoutBytes),
+      ytdlpStderrBytes: acquisitionYtdlp.map((s) => s.stderrBytes),
       mediaToolsDuringAcquisition: sampler.distinctToolsIn("acquisition"),
       mediaToolsDuringProcessing: sampler.distinctToolsIn("processing"),
       samplerTicks: sampler.tickCount(),
@@ -1276,22 +1289,26 @@ async function runNoFfmpegCase(ctx) {
   };
 }
 
-// ── 8. `--max-filesize` characterization (§53/§54) ─────────────────────────
+// ── 8. The `--max-filesize` refusal: REQUIRED since -03 ────────────────────
 
 /**
- * What does the exact pinned runtime DO when the declared `Content-Length`
- * already exceeds the supplied `--max-filesize`?
+ * What the exact pinned runtime does when the declared `Content-Length`
+ * already exceeds the supplied `--max-filesize` — and what the PRODUCT makes
+ * of it.
  *
- * This is a carried-forward SPLIT-03 question, and SPLIT-06 CHARACTERIZES it
- * rather than deciding it. The observation is recorded exactly as measured: if
- * the canonical code is not the one a future correction should arguably
- * produce, that is reported as an OBSERVED FOLLOW-UP, never normalized away and
- * never pinned as intended behaviour by a new unit assertion.
+ * The pinned `HttpFD` refuses before opening any destination, prints one
+ * status line and exits 0. -02 characterized that and recorded the resulting
+ * PROCESSING_FAILED as an observed follow-up. Since
+ * YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001 the Worker recognizes the
+ * refusal, and a -03 PASS REQUIRES the canonical code to be TOO_LARGE with
+ * nothing acquired. `evaluateMaxFilesizeRefusal` is the single definition.
  *
- * It runs through the REAL SPLIT-03 primitive with the real plan, so what is
- * measured is the product's own classification of the product's own subprocess.
+ * It runs through the REAL SPLIT-03 primitive, the real plan and the real
+ * pinned runtime, so what is measured is the product's own classification of
+ * the product's own subprocess. The yt-dlp exit code is recorded, never
+ * required.
  */
-async function characterizeMaxFilesize(ctx) {
+async function acceptMaxFilesizeRefusal(ctx) {
   const { checks, family, fixtures, port, limits, routes, workRoot } = ctx;
   const validateUrl = createExactFixtureUrlValidator({ port, routes });
   const url = validateUrl.urlFor(MANIFEST_ROUTE[family]);
@@ -1314,13 +1331,23 @@ async function characterizeMaxFilesize(ctx) {
   await rm(workDir, { recursive: true, force: true });
   await mkdir(workDir, { recursive: true });
 
+  // Each acquisition's stdout is read HERE for one derived fact — did it end
+  // with the pinned refusal of THIS ceiling — and then dropped. The ledger
+  // keeps byte counts only; no stream text reaches the record.
+  const refusalLineWasFinal = [];
+  const runner = async (opts) => {
+    const result = await ledger.runner(opts);
+    refusalLineWasFinal.push(isPinnedMaxFilesizeRefusal(result.stdout, ceiling));
+    return result;
+  };
+
   let code = null;
   let threw = false;
   try {
     await downloadGenericSplitSources(url, workDir, plan, {
       limits: { maxFileSizeBytes: ceiling, downloadTimeoutSeconds: 60 },
       validateUrl,
-      runner: ledger.runner,
+      runner,
     });
   } catch (err) {
     threw = true;
@@ -1328,31 +1355,34 @@ async function characterizeMaxFilesize(ctx) {
   }
 
   const ytdlpRuns = ledger.all().filter((s) => s.args.some((a) => a.startsWith("--format=")));
-  const exitCode = ytdlpRuns.length > 0 ? ytdlpRuns[ytdlpRuns.length - 1].exitCode : null;
+  const last = ytdlpRuns[ytdlpRuns.length - 1];
   const entries = (await readdir(workDir).catch(() => [])).sort();
-  const finalExists = entries.some((e) => !e.endsWith(".part"));
-  const partExists = entries.some((e) => e.endsWith(".part"));
   await rm(workDir, { recursive: true, force: true });
 
-  // The only assertion made here is that the refusal HAPPENED and produced no
-  // artifact. The CODE is recorded, never asserted: SPLIT-06 characterizes the
-  // classification, it does not redefine the error contract.
-  checks.require("max-filesize/acquisition-was-refused", threw === true);
-  checks.require("max-filesize/left-no-acquired-artifact", finalExists === false);
-
-  const correctionOutstanding = code !== "TOO_LARGE";
-  return {
+  const observation = {
     ceilingBytes: ceiling,
     declaredContentLengthBytes: videoFixture.byteLength,
-    ytdlpExitCode: exitCode,
-    finalFileExists: finalExists,
-    partFileExists: partExists,
+    refusedHalf: "video",
+    threw,
+    acquisitionRuns: ytdlpRuns.length,
+    // The one value this case needs from the command — never the command.
+    maxFilesizeArgument:
+      last?.args.find((a) => a.startsWith("--max-filesize="))?.slice("--max-filesize=".length) ?? null,
+    // Recorded, never required: the pinned release exits 0 on this refusal.
+    ytdlpExitCode: last ? last.exitCode : null,
+    ytdlpRefusalLineWasFinal: refusalLineWasFinal.at(-1) ?? null,
+    ytdlpStdoutBytes: last?.stdoutBytes ?? null,
+    ytdlpStderrBytes: last?.stderrBytes ?? null,
+    finalFileExists: entries.some((e) => !e.endsWith(".part")),
+    partFileExists: entries.some((e) => e.endsWith(".part")),
     workDirEntries: entries,
     canonicalErrorCode: code,
-    observedFollowUp: correctionOutstanding
-      ? "the pinned runtime's max-filesize refusal did NOT classify as TOO_LARGE; a correction remains a candidate and is NOT made here"
-      : null,
+    requiredCanonicalErrorCode: MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
   };
+  for (const check of evaluateMaxFilesizeRefusal(observation)) {
+    checks.record(check.name, check.ok, check.detail);
+  }
+  return observation;
 }
 
 // ── 9. CLI ─────────────────────────────────────────────────────────────────
@@ -1519,7 +1549,7 @@ async function main(argv) {
     full = await runFullPath(ctx);
     incompatible = await runIncompatibleCase(ctx);
     noFfmpeg = await runNoFfmpegCase(ctx);
-    maxFilesize = await characterizeMaxFilesize(ctx);
+    maxFilesize = await acceptMaxFilesizeRefusal(ctx);
 
     verdict = checks.passed() ? "PASS" : "FAIL";
   } catch (err) {
@@ -1624,7 +1654,7 @@ async function main(argv) {
     },
     cleanup: full?.cleanup ?? null,
     negativeCases: { incompatiblePair: incompatible, ffmpegUnavailableAtAnalysis: noFfmpeg },
-    maxFilesizeCharacterization: maxFilesize,
+    maxFilesizeRefusal: maxFilesize,
     ffmpegOverwriteRefusal: overwrite,
     checks: checks.all(),
   });

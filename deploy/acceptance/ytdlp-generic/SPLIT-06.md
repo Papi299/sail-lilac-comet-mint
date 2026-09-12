@@ -208,10 +208,41 @@ was relaxed to make the fixture work; the fixture conforms to the product.
 
 ---
 
+## The `--max-filesize` refusal — required since `-03`
+
+Each run also drives the real `downloadGenericSplitSources`, on the same
+fixture, with a byte allowance **below** the video half's honest
+`Content-Length`, so the pinned `HttpFD` refuses the video half before writing
+anything.
+
+The exact pinned runtime does not treat that refusal as an error: it prints one
+status line, opens no `.part` and no final file, and **exits 0**. Until
+`YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001` the Worker therefore reported
+it as `PROCESSING_FAILED`, and `-02` recorded that as an observed follow-up.
+The Worker now recognizes the refusal (the downloader's
+`isPinnedMaxFilesizeRefusal`), and a `-03` PASS **requires**
+(`evaluateMaxFilesizeRefusal` in `lib/split-evidence.mjs`):
+
+| Check | Requirement |
+| :--- | :--- |
+| `max-filesize/declared-length-exceeds-allowance` | the fixture's honest `Content-Length` is over the allowance the run is given |
+| `max-filesize/acquisition-was-refused` | the call threw |
+| `max-filesize/one-yt-dlp-run-carrying-the-run-allowance` | exactly one yt-dlp acquisition ran — the video half, with exactly that `--max-filesize`; the audio half never started |
+| `max-filesize/left-no-final-file` | no final media file |
+| `max-filesize/left-no-part-file` | no `.part` |
+| `max-filesize/classified-canonical-too-large` | the canonical code is `TOO_LARGE` |
+
+The yt-dlp exit code, whether the pinned refusal line was the final stdout line,
+and the two streams' byte counts are **recorded, not required**: SPLIT-06 pins
+the product's outcome, not yt-dlp's opinion of it. No stream text reaches the
+record.
+
+---
+
 ## Evidence
 
 Every run writes one machine-readable record, schema
-`split06-deterministic-full-path-02` (`lib/split-evidence.mjs`), to the
+`split06-deterministic-full-path-03` (`lib/split-evidence.mjs`), to the
 `--evidence` path. Following the harness's existing rule, that path must be
 **present and unoccupied**: an existing artifact is refused, never replaced.
 
@@ -221,6 +252,14 @@ observation** — `commit`, `tree`, `contextClean: true`,
 `acceptedBaseSourceCommit`, `overlayRuntimeCompatibilityVerified: true` and the
 files compared — and the builder refuses to emit one without it. `-01` records
 are historical artifacts of the pre-correction harness and are never rewritten.
+
+`-03` changed what a PASS means for the `--max-filesize` case (below). A `-02`
+record carried `maxFilesizeCharacterization`: the canonical code was recorded
+but never required, so a `-02` PASS coexisted with `PROCESSING_FAILED`. A `-03`
+record carries `maxFilesizeRefusal` instead, and the builder refuses to emit a
+PASS whose refusal does not satisfy `evaluateMaxFilesizeRefusal`. `-01` and
+`-02` records stay historical: they are never rewritten, and never re-read
+under `-03` rules.
 
 The record is assembled from an allowlist and refuses to be written if it would
 carry a forbidden field (`stderr`, `argv`, anything credential-shaped) or a raw
@@ -256,13 +295,13 @@ DNS or nftables, and no Production credential is read.
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
 | `run-split-acceptance.mjs` | where Docker is | Verifies the build context's provenance and the accepted base, builds the non-deployable overlay, runs the container. |
-| `split-full-path.mjs` | inside the acceptance container | The orchestrator. Preflight, fixtures, full path, negatives, characterizations, evidence. |
+| `split-full-path.mjs` | inside the acceptance container | The orchestrator. Preflight, fixtures, full path, negatives, the `--max-filesize` refusal, evidence. |
 | `lib/split-container.mjs` | — | The overlay Dockerfile and every `docker` argv. Pure; owns `--network none`. |
 | `lib/split-provenance.mjs` | — | The source-provenance gate: exact commit and tree, clean context, overlay runtime compatibility. |
 | `lib/split-fixture-url.mjs` | — | The exact-fixture URL validator. Test-only, and narrow by construction. |
 | `lib/local-object-writer.mjs` | — | The deterministic local `ObjectStoreWriter`. |
 | `lib/split-observers.mjs` | — | Spawn ledger, `/proc` media-tool sampler, SQLite status-audit trigger. |
-| `lib/split-evidence.mjs` | — | The `split06-…-02` record, its verified-provenance gate and its privacy refusals. |
+| `lib/split-evidence.mjs` | — | The `split06-…-03` record, its verified-provenance gate, its `--max-filesize` PASS gate and its privacy refusals. |
 | `fixtures/split-media.mjs` | — | The four bit-exact fixture recipes and the DASH manifests. |
 | `fixtures/server.mjs` | loopback only | Extended with the optional, closed SPLIT-06 route set. |
 | `scripts/ytdlp-split-acceptance.test.mjs` | `npm test` | Harness self-tests. No Docker, no FFmpeg, no network. |

@@ -20,8 +20,16 @@ import { OVERLAY_RUNTIME_COMPATIBILITY_FILES, isFullGitSha } from "./split-prove
  *        context, the accepted base source present, and every
  *        runtime-compatibility file the same Git object as in that accepted
  *        source. -01 records are historical and are never rewritten.
+ *   -03  the `--max-filesize` case is an ACCEPTANCE CONDITION, no longer a
+ *        characterization. A -02 record carried `maxFilesizeCharacterization`,
+ *        whose canonical code was recorded but never required, so a -02 PASS
+ *        coexisted with PROCESSING_FAILED. A -03 record carries
+ *        `maxFilesizeRefusal` instead, and a PASS requires it to satisfy
+ *        `evaluateMaxFilesizeRefusal` — TOO_LARGE, with nothing acquired.
+ *        -01 and -02 records are historical: never rewritten, and never
+ *        re-read under -03 rules.
  */
-export const SPLIT06_EVIDENCE_SCHEMA = "split06-deterministic-full-path-02";
+export const SPLIT06_EVIDENCE_SCHEMA = "split06-deterministic-full-path-03";
 
 /**
  * Values that must not appear ANYWHERE in a serialized record.
@@ -35,6 +43,53 @@ export const SPLIT06_FORBIDDEN_EVIDENCE_SUBSTRINGS = Object.freeze([
   "SPLIT06_VIDEO_01",
   "SPLIT06_AUDIO_01",
 ]);
+
+/** The canonical code a -03 PASS requires for the `--max-filesize` refusal. */
+export const MAX_FILESIZE_REFUSAL_REQUIRED_CODE = "TOO_LARGE";
+
+/**
+ * The -03 acceptance condition for the `--max-filesize` refusal case.
+ *
+ * Pure, and the single definition of it: the orchestrator records each result
+ * as a named check, and `buildSplitEvidence` re-evaluates the record's own
+ * block before it emits a PASS.
+ *
+ * The yt-dlp exit code is deliberately NOT a condition. The pinned release
+ * exits 0 on this refusal; SPLIT-06 pins the PRODUCT's canonical outcome, not
+ * yt-dlp's opinion of it. The exit code is recorded beside the result.
+ */
+export function evaluateMaxFilesizeRefusal(observation) {
+  const o = observation ?? {};
+  const positive = (n) => Number.isSafeInteger(n) && n > 0;
+  const tooLarge = o.canonicalErrorCode === MAX_FILESIZE_REFUSAL_REQUIRED_CODE;
+  return [
+    {
+      name: "max-filesize/declared-length-exceeds-allowance",
+      ok:
+        positive(o.ceilingBytes) &&
+        positive(o.declaredContentLengthBytes) &&
+        o.declaredContentLengthBytes > o.ceilingBytes,
+      detail: null,
+    },
+    { name: "max-filesize/acquisition-was-refused", ok: o.threw === true, detail: null },
+    {
+      // The video half, alone: a refused video half never starts the audio one.
+      name: "max-filesize/one-yt-dlp-run-carrying-the-run-allowance",
+      ok:
+        o.acquisitionRuns === 1 &&
+        positive(o.ceilingBytes) &&
+        o.maxFilesizeArgument === String(o.ceilingBytes),
+      detail: null,
+    },
+    { name: "max-filesize/left-no-final-file", ok: o.finalFileExists === false, detail: null },
+    { name: "max-filesize/left-no-part-file", ok: o.partFileExists === false, detail: null },
+    {
+      name: "max-filesize/classified-canonical-too-large",
+      ok: tooLarge,
+      detail: tooLarge ? null : `observed ${String(o.canonicalErrorCode)}`,
+    },
+  ];
+}
 
 /**
  * Assembles the record from an ALLOWLIST.
@@ -89,10 +144,23 @@ export function buildSplitEvidence(input) {
     privacy: input.privacy,
     cleanup: input.cleanup,
     negativeCases: input.negativeCases,
-    maxFilesizeCharacterization: input.maxFilesizeCharacterization,
+    maxFilesizeRefusal: input.maxFilesizeRefusal,
     ffmpegOverwriteRefusal: input.ffmpegOverwriteRefusal,
     checks: input.checks,
   };
+
+  // -03: a PASS is also a claim that the `--max-filesize` refusal was
+  // classified TOO_LARGE with nothing acquired, so no PASS record is emitted
+  // unless the record's own block satisfies that condition.
+  if (record.verdict === "PASS") {
+    const unmet = evaluateMaxFilesizeRefusal(record.maxFilesizeRefusal).filter((c) => !c.ok);
+    if (unmet.length > 0) {
+      throw new Error(
+        `refusing to emit a PASS ${SPLIT06_EVIDENCE_SCHEMA} record whose max-filesize refusal failed: ` +
+          unmet.map((c) => c.name).join(", "),
+      );
+    }
+  }
 
   // Order matters. The forbidden-key check runs on the RAW record, so a field
   // that should never have been assembled is a loud refusal rather than a

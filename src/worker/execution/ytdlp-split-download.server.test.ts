@@ -1078,6 +1078,143 @@ describe("split download: ONE combined byte budget (§13-§15/§24-§27/§59/§6
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001: the pinned --max-filesize
+// refusal of EITHER half is TOO_LARGE, bound to that half's own allowance
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The exact line the pinned `HttpFD` prints on a `--max-filesize` refusal. */
+const refusalLine = (declared: number, ceiling: number) =>
+  `\r[download] File is larger than max-filesize (${declared} bytes > ${ceiling} bytes). Aborting.\n`;
+
+/** A half the pinned runtime refuses: exits 0, writes nothing, ends stdout with the refusal. */
+function refusesAt(declared: number, ceiling: number): Half {
+  return async () => ({
+    code: 0,
+    stdout: `[info] abc: Downloading 1 format(s): x\n${refusalLine(declared, ceiling)}`,
+    stderr: "",
+  });
+}
+
+describe("split download: the pinned --max-filesize refusal (YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001)", () => {
+  const limits = { maxFileSizeBytes: 1000, downloadTimeoutSeconds: 60 };
+
+  it("VIDEO refused: one probe, the video run only, TOO_LARGE, no pair", async () => {
+    const plan = mp4Plan();
+    const probe = countingProbe();
+    const { runner, calls, roles } = splitRunner(plan, { video: refusesAt(4000, 1000) });
+    let returned: unknown = "never";
+    await rejectsWith("TOO_LARGE", async () => {
+      returned = await downloadGenericSplitSources(
+        SAFE_URL,
+        workDir,
+        plan,
+        baseDeps({ runner, limits, probeRuntime: probe.probeRuntime }),
+      );
+    });
+    assert.equal(returned, "never", "no pair crosses the boundary");
+    assert.equal(probe.seen.length, 1, "exactly one runtime probe");
+    assert.deepEqual(roles(), ["video"], "the audio half is never started");
+    assert.equal(argOf(calls[0]!, "--max-filesize="), "1000", "the video half carries the whole budget");
+    assert.deepEqual(readdirSync(workDir), [], "nothing was acquired");
+  });
+
+  it("AUDIO refused after video 700: the audio run carries exactly 300 and is TOO_LARGE", async () => {
+    const plan = mp4Plan();
+    const probe = countingProbe();
+    const { runner, calls, roles } = splitRunner(plan, {
+      video: writes(plan, "video", 700),
+      audio: refusesAt(450, 300),
+    });
+    let returned: unknown = "never";
+    await rejectsWith("TOO_LARGE", async () => {
+      returned = await downloadGenericSplitSources(
+        SAFE_URL,
+        workDir,
+        plan,
+        baseDeps({ runner, limits, probeRuntime: probe.probeRuntime }),
+      );
+    });
+    assert.equal(returned, "never", "no pair crosses the boundary");
+    assert.equal(probe.seen.length, 1, "ONE probe for the whole operation");
+    assert.deepEqual(roles(), ["video", "audio"], "video first, audio second, nothing after");
+    assert.equal(argOf(calls[0]!, "--max-filesize="), "1000");
+    assert.equal(argOf(calls[1]!, "--max-filesize="), "300", "the audio allowance is the remainder");
+    // Acquisition merges nothing and deletes nothing: the validated video half
+    // is left for the executor's own cleanup.
+    assert.deepEqual(readdirSync(workDir), ["video-source.mp4"]);
+  });
+
+  it("an AUDIO refusal naming the WHOLE budget is not this run's refusal: PROCESSING_FAILED", async () => {
+    const plan = mp4Plan();
+    const { runner } = splitRunner(plan, {
+      video: writes(plan, "video", 700),
+      audio: refusesAt(4000, 1000),
+    });
+    await rejectsWith("PROCESSING_FAILED", () =>
+      downloadGenericSplitSources(SAFE_URL, workDir, plan, baseDeps({ runner, limits })),
+    );
+  });
+
+  it("a zero exit that leaves nothing WITHOUT the witness stays PROCESSING_FAILED, either half", async () => {
+    for (const role of ["video", "audio"] as const) {
+      resetWorkDir();
+      const plan = mp4Plan();
+      const silent: Half = async () => ({ code: 0, stdout: "[info] abc: Downloading 1 format(s): x\n", stderr: "" });
+      const { runner } = splitRunner(
+        plan,
+        role === "video" ? { video: silent } : { video: writes(plan, "video", 700), audio: silent },
+      );
+      await rejectsWith("PROCESSING_FAILED", () =>
+        downloadGenericSplitSources(SAFE_URL, workDir, plan, baseDeps({ runner, limits })),
+      );
+    }
+  });
+
+  it("a refused AUDIO half that left a .part behind stays PROCESSING_FAILED", async () => {
+    // The shape a CHUNKED source could leave: the refusal fires on a later
+    // chunk, after earlier ones landed. Nothing short of an untouched job
+    // directory is read as the pinned refusal.
+    const plan = mp4Plan();
+    const { runner } = splitRunner(plan, {
+      video: writes(plan, "video", 700),
+      audio: async (call) => {
+        writeFileSync(partOf(plan, "audio"), "x".repeat(200));
+        return refusesAt(450, 300)(call);
+      },
+    });
+    await rejectsWith("PROCESSING_FAILED", () =>
+      downloadGenericSplitSources(SAFE_URL, workDir, plan, baseDeps({ runner, limits })),
+    );
+  });
+
+  it("audio: the caller cancels FIRST, then the run exits 0 with the witness — the cancellation stands", async () => {
+    const plan = mp4Plan();
+    const caller = new AbortController();
+    const { runner, roles } = splitRunner(plan, {
+      video: writes(plan, "video", 700),
+      audio: async (call) => {
+        caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+        return refusesAt(450, 300)(call);
+      },
+    });
+    await assert.rejects(
+      () =>
+        downloadGenericSplitSources(SAFE_URL, workDir, plan, {
+          ...baseDeps({ runner, limits }),
+          signal: caller.signal,
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.equal(err.code, "PROCESSING_FAILED", "never TOO_LARGE");
+        assert.equal(err.message, "Download was cancelled.");
+        return true;
+      },
+    );
+    assert.deepEqual(roles(), ["video", "audio"]);
+  });
+});
+
 /** Empties the job directory between sub-cases of one test. */
 function resetWorkDir() {
   rmSync(workDir, { recursive: true, force: true });
