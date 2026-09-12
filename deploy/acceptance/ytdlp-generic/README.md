@@ -130,9 +130,31 @@ No media URL, no hostname, no socket. Both exit non-zero on any deviation.
 | `lib/control-plane.mjs` | the VM host | The authenticated product-surface driver (login, analyze, job, signed GET). |
 | `lib/process-sampler.mjs` | the VM host | The real `docker top` sampler; establishes the owned yt-dlp PID. |
 | `lib/cases.mjs` | the VM host | Stage B case producers and the case-record contract. |
-| `fixtures/server.mjs` | the VM host, loopback only | The controlled acceptance fixture service — all four fixture families. |
+| `fixtures/server.mjs` | the VM host, loopback only | The controlled acceptance fixture service — all four Phase-10D fixture families, plus SPLIT-06's optional closed split route set. |
 | `fixtures/prepare-media.mjs` | the VM host, via `docker run --network none` | Regenerates the bit-exact fixture MP4 and reports its digest. |
 | `fixtures/README.md` | — | How to run, expose, verify and tear down the fixtures. |
+
+### SPLIT-06 — the deterministic split-stream full-path harness
+
+A **separate acceptance stage**, additive to everything above and changing none
+of it: offline, `--network none`, no tunnel, no control plane, no R2, no live
+source. It proves the split-stream chain (analysis → pairing → plan → two
+yt-dlp acquisitions → ffprobe/FFmpeg merge → upload → `ready`) executes against
+the exact accepted media runtime. See
+[`SPLIT-06.md`](SPLIT-06.md) — including what it deliberately does **not**
+prove.
+
+| File | Runs on | Purpose |
+| :--- | :--- | :--- |
+| `run-split-acceptance.mjs` | where Docker is | Verifies the build context's provenance and the accepted base, builds the non-deployable overlay, runs the container. |
+| `split-full-path.mjs` | inside the acceptance container | The deterministic full-path orchestrator. |
+| `lib/split-container.mjs` | — | The overlay Dockerfile and every `docker` argv. Owns `--network none`. |
+| `lib/split-provenance.mjs` | — | The source-provenance gate: exact commit and tree, clean context, overlay runtime compatibility. |
+| `lib/split-fixture-url.mjs` | — | The test-only exact-fixture URL validator. |
+| `lib/local-object-writer.mjs` | — | The deterministic local `ObjectStoreWriter` (NOT R2). |
+| `lib/split-observers.mjs` | — | Spawn ledger, media-tool sampler, SQLite status-audit trigger. |
+| `lib/split-evidence.mjs` | — | The `split06-deterministic-full-path-02` record. |
+| `fixtures/split-media.mjs` | — | The four bit-exact split fixture recipes and the DASH manifests. |
 
 Tests: `scripts/ytdlp-acceptance.test.mjs` and `scripts/ytdlp-fixture.test.mjs`,
 both run by `npm test`. They drive the real evaluators with fakes and the real
