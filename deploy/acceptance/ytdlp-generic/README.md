@@ -156,6 +156,34 @@ prove.
 | `lib/split-evidence.mjs` | — | The `split06-deterministic-full-path-04` record; `-01`, `-02` and `-03` records are historical. |
 | `fixtures/split-media.mjs` | — | The four bit-exact split fixture recipes and the DASH manifests. |
 
+### SPLIT-07 — the release-image candidate acceptance harness
+
+A **pre-deployment gate** for the image the real `Dockerfile.worker` builds —
+not an overlay. It does the following, and deploys nothing and never touches
+`latest`:
+- verifies a clean Git release source before and after the build;
+- verifies the harness checkout itself against explicit expectations, from
+  before any Docker command to the end of the run;
+- proves the built image's `/app` is byte-identical to that commit;
+- runs every candidate container by the image's immutable `sha256:` id;
+- checks the image's configuration, hardening and pinned runtime from inside it;
+- runs both offline policy verifiers against it;
+- runs the unchanged SPLIT-06 full path against it for **mp4 and webm**;
+- creates its record exclusively.
+
+See [`SPLIT-07.md`](SPLIT-07.md).
+
+| File | Runs on | Purpose |
+| :--- | :--- | :--- |
+| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, writes the `split07-release-image-candidate-02` record (`-01` records are historical). |
+| `lib/release-provenance.mjs` | — | The clean-worktree gate for the release context and the harness, and the `/app` source manifest from Git objects. |
+| `lib/release-container.mjs` | — | Every `docker` argv: non-deployable tags, immutable-id run subjects, hardening, Production's media tmpfs, the forbidden-mount guard. |
+| `lib/release-image-probe.mjs` | inside the candidate, at `/verify` | Import-free observer: manifest, forbidden tools, env names, runtime identity. |
+| `lib/release-evidence.mjs` | — | The parent record, SPLIT-06 child validation and re-hashing, and the PASS gate. |
+
+Self-tests: `scripts/ytdlp-release-image-acceptance.test.mjs` — no Docker, no
+network.
+
 Tests: `scripts/ytdlp-acceptance.test.mjs` and `scripts/ytdlp-fixture.test.mjs`,
 both run by `npm test`. They drive the real evaluators with fakes and the real
 fixture over loopback; **no test performs a live run, and none needs the
