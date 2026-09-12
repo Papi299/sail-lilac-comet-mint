@@ -1123,6 +1123,22 @@ describe("SPLIT-07 evidence builder", () => {
     }
   });
 
+  // Found by mutation testing: the test above also removes the other child, so
+  // the missing-child refusal fires first and the executed-family requirement
+  // itself was never isolated. Here BOTH children are present and passing.
+  it("refuses a PASS whose executed-family list is not exactly mp4 and webm, even with both children", () => {
+    for (const familiesExecuted of [["mp4"], ["webm"], ["mp4", "mp4"], ["mp4", "webm", "webm"], []]) {
+      const input = evidenceInput();
+      input.splitAcceptance.familiesExecuted = familiesExecuted;
+      assert.equal(input.splitAcceptance.children.length, 2);
+      assert.throws(
+        () => buildReleaseEvidence(input),
+        /did not execute exactly mp4 and webm/,
+        `${JSON.stringify(familiesExecuted)} must refuse a PASS`,
+      );
+    }
+  });
+
   it("refuses a PASS whose child is of the wrong schema or has no digest", () => {
     const wrongSchema = evidenceInput();
     wrongSchema.splitAcceptance.children[0].schema = "split06-deterministic-full-path-03";
