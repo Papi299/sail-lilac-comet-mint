@@ -103,24 +103,44 @@ export const RELEASE_HARDENING_ARGS = Object.freeze([
 ]);
 
 /**
- * The writable surfaces a hardened candidate run is granted, and nothing else.
+ * The writable surfaces a hardened SPLIT-06 run is granted, and nothing else.
  *
  * `--read-only` makes the image's own root immutable for the run, which is both
  * the deployment's posture and the control that makes "the pinned runtime
- * cannot be rewritten" observable rather than asserted. The chain still needs
- * somewhere to put deterministic temporary media and its temporary SQLite
- * database: `split-full-path.mjs` puts everything under one `mkdtemp` in
- * `tmpdir()`, so a tmpfs at `/tmp` is sufficient and nothing durable is needed.
+ * cannot be rewritten" observable rather than asserted.
  *
- * `exec` is NOT granted: nothing in the chain executes a file it wrote. The
- * pinned yt-dlp is the platform-independent zipimport artifact precisely so it
- * never unpacks itself into a temporary directory.
+ * PRODUCT media temp is EXACTLY the Production unit's mount
+ * (`deploy/systemd/videofetch-worker.service`), and a self-test reads the unit
+ * to keep it that way. A tmpfs mounted over `/tmp/videofetch` shadows the
+ * node-owned directory the image prepares, so its uid/gid options are
+ * load-bearing, not cosmetic (WORKER-TEMP-TMPFS-OWNERSHIP-001). The first real
+ * SPLIT-07A run put a tmpfs on `/tmp` instead, hid `/tmp/videofetch` from the
+ * product, and both families failed `PROCESSING_FAILED` before upload — the
+ * gate catching exactly the filesystem-layout drift it exists to catch.
+ *
+ * HARNESS scratch: SPLIT-06 keeps its fixtures, temporary database and object
+ * sink under `mkdtemp(tmpdir())`. That is a harness need, not a product one, so
+ * it gets its own tmpfs OUTSIDE every product path, and `TMPDIR` points there.
+ * `/tmp` itself stays read-only, as in Production, so a product write to `/tmp`
+ * outside `TEMP_DIRECTORY` still fails here exactly as it would there.
+ *
+ * The one ambient difference from Production is therefore `TMPDIR`. The product
+ * never reads it for its own placement (`config.tempDirectory` is the image's
+ * baked `TEMP_DIRECTORY`); yt-dlp receives a sealed environment whose `TMPDIR`
+ * is the job's own workDir; only FFmpeg/ffprobe inherit it, for stream-copy and
+ * probing, which write to explicit paths.
+ *
+ * Neither mount grants `exec`: nothing in the chain executes a file it wrote.
+ * The pinned yt-dlp is the platform-independent zipimport artifact precisely so
+ * it never unpacks itself into a temporary directory.
  */
-export const RELEASE_TMPFS_TARGET = "/tmp";
-export const RELEASE_TMPFS_OPTIONS = "rw,noexec,nosuid,nodev,size=512m";
+export const PRODUCT_MEDIA_TMPFS = "/tmp/videofetch:rw,noexec,nosuid,size=2g,uid=1000,gid=1000";
+export const HARNESS_SCRATCH_TARGET = "/acceptance-scratch";
+export const HARNESS_SCRATCH_TMPFS =
+  `${HARNESS_SCRATCH_TARGET}:rw,noexec,nosuid,nodev,size=512m,uid=1000,gid=1000`;
 
 /** The environment a candidate run may add. Deliberately tiny, and non-secret. */
-export const RELEASE_RUN_ENVIRONMENT = Object.freeze(["TMPDIR=/tmp"]);
+export const RELEASE_RUN_ENVIRONMENT = Object.freeze([`TMPDIR=${HARNESS_SCRATCH_TARGET}`]);
 
 /**
  * The candidate tag for one release source commit.
@@ -189,8 +209,9 @@ export function releaseBuildArgs({ image, context }) {
  *
  * Applied to every argv this module returns, so the prohibition is a property
  * of the module rather than a convention its callers are trusted to follow. It
- * reads `-v`/`--volume`/`--mount` operands and compares the TARGET path, which
- * is the half that decides what gets shadowed.
+ * reads `-v`/`--volume`/`--mount`/`--tmpfs` operands and compares the TARGET
+ * path, which is the half that decides what gets shadowed — an empty tmpfs
+ * over `/app/src` replaces product source just as surely as a bind would.
  */
 export function assertNoForbiddenMounts(args) {
   for (const target of mountTargets(args)) {
@@ -203,7 +224,7 @@ export function assertNoForbiddenMounts(args) {
   return args;
 }
 
-/** Every bind/mount TARGET path in a `docker run` argv. */
+/** Every bind, mount and tmpfs TARGET path in a `docker run` argv, in order. */
 export function mountTargets(args) {
   const targets = [];
   const list = Array.isArray(args) ? args : [];
@@ -217,6 +238,15 @@ export function mountTargets(args) {
     if (arg === "--mount") {
       targets.push(mountOptionTarget(list[i + 1]));
       i += 1;
+      continue;
+    }
+    if (arg === "--tmpfs") {
+      targets.push(tmpfsTarget(list[i + 1]));
+      i += 1;
+      continue;
+    }
+    if (typeof arg === "string" && arg.startsWith("--tmpfs=")) {
+      targets.push(tmpfsTarget(arg.slice("--tmpfs=".length)));
       continue;
     }
     if (typeof arg === "string" && (arg.startsWith("--volume=") || arg.startsWith("-v="))) {
@@ -235,6 +265,13 @@ function volumeTarget(spec) {
   if (typeof spec !== "string") return null;
   const parts = spec.split(":");
   return parts.length >= 2 ? parts[1] : null;
+}
+
+/** `target[:options]` — a tmpfs is named by its mount target alone. */
+function tmpfsTarget(spec) {
+  if (typeof spec !== "string") return null;
+  const colon = spec.indexOf(":");
+  return colon < 0 ? spec : spec.slice(0, colon);
 }
 
 /** `type=bind,source=...,target=...` — the `target`/`destination` operand. */
@@ -324,8 +361,8 @@ export const POLICY_VERIFIERS = Object.freeze(["verify-selector.py", "verify-dow
  *   - the harness is MOUNTED read-only, because a release image must not carry
  *     it, and mounted at its repository-relative path so `split-full-path.mjs`
  *     resolves `../../../src/...` to the IMAGE's `/app/src`;
- *   - `--read-only`, `--cap-drop=ALL` and `no-new-privileges` are added, with a
- *     tmpfs at `/tmp` for the run's temporary media and database;
+ *   - `--read-only`, `--cap-drop=ALL` and `no-new-privileges` are added, with
+ *     Production's exact media tmpfs and a separate harness scratch tmpfs;
  *   - `assertNoForbiddenMounts` runs over the finished argv, so a future edit
  *     that reached for `/app/src` fails here instead of silently producing a
  *     run that proves nothing about the release image.
@@ -353,8 +390,12 @@ export function releaseAcceptanceRunArgs({
     "--rm",
     ...RELEASE_HARDENING_ARGS,
     "--read-only",
+    // The product's writable media surface, exactly as Production mounts it.
     "--tmpfs",
-    `${RELEASE_TMPFS_TARGET}:${RELEASE_TMPFS_OPTIONS}`,
+    PRODUCT_MEDIA_TMPFS,
+    // The harness's own scratch, disjoint from every product path.
+    "--tmpfs",
+    HARNESS_SCRATCH_TMPFS,
     ...RELEASE_RUN_ENVIRONMENT.flatMap((entry) => ["-e", entry]),
     // The acceptance harness: test machinery the release image does not ship.
     "-v",

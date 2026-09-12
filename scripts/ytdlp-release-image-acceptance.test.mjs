@@ -17,6 +17,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 import {
   assertCandidateReference,
@@ -27,12 +28,16 @@ import {
   FORBIDDEN_CANDIDATE_TAGS,
   FORBIDDEN_RELEASE_MOUNT_TARGETS,
   HARNESS_MOUNT_TARGET,
+  HARNESS_SCRATCH_TARGET,
+  HARNESS_SCRATCH_TMPFS,
   imageInspectArgs,
   mountTargets,
   POLICY_VERIFIERS,
   policyVerifierRunArgs,
   probeRunArgs,
+  PRODUCT_MEDIA_TMPFS,
   RELEASE_DOCKERFILE,
+  RELEASE_RUN_ENVIRONMENT,
   releaseAcceptanceRunArgs,
   releaseBuildArgs,
   VERIFY_MOUNT_TARGET,
@@ -615,19 +620,47 @@ describe("SPLIT-07 hardened container invocations", () => {
     }
   });
 
-  // §22.9 / §16 — the SPLIT-06 run gets a writable tmpfs and exactly one
-  // writable report directory, and nothing else.
-  it("gives the SPLIT-06 run a tmpfs and exactly one writable bind", () => {
+  // §16 — the SPLIT-06 run gets Production's media tmpfs, a disjoint harness
+  // scratch tmpfs, and exactly one writable bind: the report directory.
+  it("gives the SPLIT-06 run two tmpfs mounts and exactly one writable bind", () => {
     const args = releaseAcceptanceRunArgs({
       image, family: "mp4", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`,
       reportDir: REPORT, evidenceName: "a.json",
     });
-    assert.match(args.join(" "), /--tmpfs \/tmp:rw,noexec,nosuid,nodev,size=512m/);
-    const binds = mountTargets(args);
-    assert.deepEqual(binds, [HARNESS_MOUNT_TARGET, "/report"]);
+    assert.deepEqual(mountTargets(args), ["/tmp/videofetch", HARNESS_SCRATCH_TARGET, HARNESS_MOUNT_TARGET, "/report"]);
+    const tmpfs = args.flatMap((arg, i) => (arg === "--tmpfs" ? [args[i + 1]] : []));
+    assert.deepEqual(tmpfs, [PRODUCT_MEDIA_TMPFS, HARNESS_SCRATCH_TMPFS]);
     // The harness mount is READ-ONLY; the report directory is the writable one.
     assert.ok(args.includes(`${HARNESS}/deploy/acceptance/ytdlp-generic:${HARNESS_MOUNT_TARGET}:ro`));
     assert.ok(args.includes(`${REPORT}:/report`));
+    assert.deepEqual(RELEASE_RUN_ENVIRONMENT, [`TMPDIR=${HARNESS_SCRATCH_TARGET}`]);
+  });
+
+  // WORKER-TEMP-TMPFS-OWNERSHIP-001 — the product's media tmpfs must be the one
+  // Production actually mounts, uid/gid included, or the run characterizes a
+  // filesystem layout nobody deploys.
+  it("mounts the product media tmpfs EXACTLY as the Production Worker unit does", () => {
+    const unit = readFileSync(new URL("../deploy/systemd/videofetch-worker.service", import.meta.url), "utf8");
+    const declared = [...unit.matchAll(/^\s*--tmpfs\s+(\S+)/gm)].map((match) => match[1]);
+    assert.deepEqual(declared, [PRODUCT_MEDIA_TMPFS], "the unit's one --tmpfs must equal SPLIT-07's");
+    assert.match(PRODUCT_MEDIA_TMPFS, /(^|[:,])uid=1000(,|$)/);
+    assert.match(PRODUCT_MEDIA_TMPFS, /(^|[:,])gid=1000(,|$)/);
+    assert.match(PRODUCT_MEDIA_TMPFS, /(^|[:,])noexec(,|$)/);
+  });
+
+  it("keeps harness scratch disjoint from every product path, and /tmp itself read-only", () => {
+    for (const productPath of ["/tmp/videofetch", "/var/lib/videofetch", "/app", "/usr/local/lib/videofetch"]) {
+      assert.ok(
+        !HARNESS_SCRATCH_TARGET.startsWith(`${productPath}/`) && !productPath.startsWith(`${HARNESS_SCRATCH_TARGET}/`) &&
+          HARNESS_SCRATCH_TARGET !== productPath,
+        `${HARNESS_SCRATCH_TARGET} must not overlap ${productPath}`,
+      );
+    }
+    for (const family of ["mp4", "webm"]) {
+      const args = releaseAcceptanceRunArgs({ image, family, harnessDir: "/h", reportDir: REPORT, evidenceName: "a.json" });
+      assert.ok(!mountTargets(args).includes("/tmp"), "a tmpfs on /tmp would hide /tmp/videofetch and loosen Production's posture");
+      assert.match(HARNESS_SCRATCH_TMPFS, /(^|[:,])noexec(,|$)/);
+    }
   });
 
   it("runs the harness from the image's own Node, entry point and /app workdir", () => {
@@ -692,6 +725,12 @@ describe("SPLIT-07 forbidden mounts", () => {
     }
   });
 
+  it("refuses a tmpfs over product source just as it refuses a bind", () => {
+    assert.throws(() => assertNoForbiddenMounts(["run", "--tmpfs", "/app/src:rw", "i"]), /\/app\/src/);
+    assert.throws(() => assertNoForbiddenMounts(["run", "--tmpfs=/app/node_modules", "i"]), /\/app\/node_modules/);
+    assert.doesNotThrow(() => assertNoForbiddenMounts(["run", "--tmpfs", PRODUCT_MEDIA_TMPFS, "i"]));
+  });
+
   it("refuses a mount UNDER a forbidden path, and the --mount long form", () => {
     assert.throws(() => assertNoForbiddenMounts(["run", "-v", "/host:/app/src/worker", "i"]), /\/app\/src/);
     assert.throws(
@@ -713,8 +752,10 @@ describe("SPLIT-07 forbidden mounts", () => {
         "--mount", "type=bind,source=/c,target=/three",
         "--mount=type=bind,src=/d,destination=/four",
         "--volume=/e:/five",
+        "--tmpfs", "/six:rw,size=1m",
+        "--tmpfs=/seven",
       ]),
-      ["/one", "/two", "/three", "/four", "/five"],
+      ["/one", "/two", "/three", "/four", "/five", "/six", "/seven"],
     );
   });
 });
