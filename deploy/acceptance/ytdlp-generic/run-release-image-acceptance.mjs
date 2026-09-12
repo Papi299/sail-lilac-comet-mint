@@ -68,8 +68,10 @@ import {
   verifyReleaseContextProvenance,
 } from "./lib/release-provenance.mjs";
 import {
+  ALLOWED_IMAGE_ENTRYPOINTS,
   assertChildUnchanged,
   buildReleaseEvidence,
+  ENTRYPOINT_SHIM_PATH,
   EXPECTED_IMAGE_CONFIG,
   EXPECTED_IMAGE_ENVIRONMENT_NAMES,
   EXPECTED_YTDLP_RUNTIME,
@@ -283,10 +285,15 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
     checks.record("image/architecture-recorded", typeof info.Architecture === "string" && info.Architecture.length > 0, String(info.Architecture));
     checks.record("image/working-directory", config.WorkingDir === EXPECTED_IMAGE_CONFIG.workingDir, String(config.WorkingDir));
     checks.record("image/runtime-user-is-non-root-node", config.User === EXPECTED_IMAGE_CONFIG.user, String(config.User));
+    // CMD must be exactly the Worker entry point, and ENTRYPOINT at most the
+    // base image's inherited exec shim. The shim's own posture is checked from
+    // inside the image below, once the runtime probe has observed it.
+    const entrypoint = asArray(config.Entrypoint);
     checks.record(
       "image/cmd-is-the-worker-entry-point",
-      sameList(asArray(config.Cmd), EXPECTED_IMAGE_CONFIG.cmd) && asArray(config.Entrypoint).length === 0,
-      asArray(config.Cmd).join(" "),
+      sameList(asArray(config.Cmd), EXPECTED_IMAGE_CONFIG.cmd) &&
+        ALLOWED_IMAGE_ENTRYPOINTS.some((allowed) => sameList(entrypoint, allowed)),
+      `entrypoint=${JSON.stringify(entrypoint)} cmd=${asArray(config.Cmd).join(" ")}`,
     );
     checks.record(
       "image/only-the-worker-port-is-exposed",
@@ -414,6 +421,25 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       "runtime/ffprobe-present-and-executable",
       runtimeProbe.ffprobe?.present === true && runtimeProbe.ffprobe?.executable === true,
       String(runtimeProbe.ffprobe?.version),
+    );
+    // The inherited shim runs BEFORE the Worker, so it is observed, not assumed:
+    // a regular root-owned file at its own real path, writable by nobody but
+    // root. With no ENTRYPOINT there is no shim in the start path at all.
+    const shim = runtimeProbe.entrypointShim ?? { present: false };
+    const shimModeBits = Number.parseInt(String(shim.mode ?? "7777"), 8);
+    checks.record(
+      "image/entrypoint-shim-root-owned-and-unwritable",
+      entrypoint.length === 0 ||
+        (shim.present === true &&
+          shim.isRegularFile === true &&
+          shim.path === ENTRYPOINT_SHIM_PATH &&
+          shim.realpath === ENTRYPOINT_SHIM_PATH &&
+          shim.uid === 0 &&
+          (shimModeBits & 0o022) === 0 &&
+          typeof shim.sha256 === "string" && /^[0-9a-f]{64}$/.test(shim.sha256)),
+      entrypoint.length === 0
+        ? "no entrypoint"
+        : `uid=${String(shim.uid)} mode=${String(shim.mode)} sha256=${String(shim.sha256)}`,
     );
     checks.record(
       "runtime/node-version-recorded",
@@ -579,6 +605,9 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
         workingDir: String(config.WorkingDir),
         cmd: asArray(config.Cmd),
         entrypoint: asArray(config.Entrypoint),
+        entrypointShim: shim.present === true
+          ? { path: String(shim.path), sha256: String(shim.sha256), uid: shim.uid ?? null, mode: String(shim.mode) }
+          : null,
         exposedPorts,
         healthcheckPresent: !(config.Healthcheck === undefined || config.Healthcheck === null),
         configuredVolumes,
@@ -661,6 +690,9 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
     });
 
     await writeEvidence(evidencePath, renderReleaseEvidence(record));
+    // Every failed check is named on the operator's console: a FAIL whose cause
+    // is visible only inside the record is a FAIL that gets misdiagnosed.
+    for (const name of checks.failed) log(`[split07]   FAIL ${name}\n`);
     log(`[split07] ${SPLIT07_EVIDENCE_SCHEMA} ${verdict}: ${evidencePath}\n`);
   } finally {
     // The candidate exists only to execute SPLIT-07A — and is removed even

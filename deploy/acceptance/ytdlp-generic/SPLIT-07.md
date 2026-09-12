@@ -59,7 +59,7 @@ actual built image rather than asserted from the Dockerfile text:
 | **Source** | The build context was a real Git worktree root at the exact expected commit and tree, with nothing modified, staged, untracked, ignored, or hidden by assume-unchanged/skip-worktree — **before** Docker ran and **again after** the build read it. |
 | **Recipe** | The image was built by `Dockerfile.worker` from that context, with no build arg, no secret and no host network. Its committed blob and SHA-256 are recorded. |
 | **Source → image** | Every regular file the recipe places in `/app` (`package.json`, `package-lock.json`, the alias loader and hooks, all of `src/**`) is present in the image with byte-identical content; no unexplained file is present; `src/broker/**` is absent and its removal is accounted for; the acceptance harness is not baked in. |
-| **Configuration** | Linux; architecture recorded and compared with the accepted Worker's; `WorkingDir=/app`; runtime user `node`; `CMD` is the standalone Worker entry point with no `ENTRYPOINT`; only `8080/tcp` exposed; no `HEALTHCHECK`; no image-declared volume; the expected non-secret defaults present. |
+| **Configuration** | Linux; architecture recorded and compared with the accepted Worker's; `WorkingDir=/app`; runtime user `node`; `CMD` is exactly the standalone Worker entry point, and `ENTRYPOINT` is at most the base image's inherited `docker-entrypoint.sh` exec shim — observed root-owned, unwritable, at its real path, digest recorded; only `8080/tcp` exposed; no `HEALTHCHECK`; no image-declared volume; the expected non-secret defaults present. |
 | **Environment** | No `YTDLP_ENABLED`, no retired `YTDLP_NETWORK_ISOLATED`/`YTDLP_PATH`, and no Worker HMAC, Cloudflare Access, R2 broker-parent, legacy R2 writer or Vercel signer name — checked in the image config **and** inside a running container. |
 | **Tooling** | No `docker`, `sudo`, `ssh`, `nft`, `iptables`, `curl` or `wget`, looked up on `PATH` **and** in every standard binary directory. A present tool is a failure that names where it was found; it is never normalized away. |
 | **Pinned runtime** | `/usr/local/lib/videofetch/yt-dlp` is version `2026.08.19` with SHA-256 `1fa6733c…d8d4d6`, root-owned, mode `0555`, a regular file at its own real path; `/usr/bin/python3` executes it; an **attempted write** by the runtime user is refused by the kernel. |
@@ -67,6 +67,21 @@ actual built image rather than asserted from the Dockerfile text:
 | **Offline policy** | `verify-selector.py` and `verify-download-policy.py` (which pins PR #54's `--no-quiet` contract) exit 0 against the image's own artifact. |
 | **Full path** | The unchanged SPLIT-06 harness PASSes for **mp4 and webm**, executing the candidate image's own `/app/src`, dependency graph, alias loader, Node, Python, yt-dlp, FFmpeg and ffprobe. |
 | **No disturbance** | `videofetch-worker:latest`'s image id, and the running Worker container's image id, start time and restart count, are identical before and after the run. |
+
+### The inherited ENTRYPOINT
+
+`node:22-bookworm-slim` declares `ENTRYPOINT ["docker-entrypoint.sh"]` and
+`Dockerfile.worker` does not override it, so every image this recipe produces —
+the accepted Production image included — starts through that shim. It is
+`exec "$@"`, prefixing `node` only when the first argument is a flag or not a
+command; with `CMD[0] = "node"` it execs the Worker entry point unchanged.
+
+SPLIT-07 accepts exactly `[]` or `["docker-entrypoint.sh"]` by name, and then
+checks the shim by **observation** from inside the image, because whatever runs
+before the Worker is part of what the image starts. The first real SPLIT-07A run
+required an empty `ENTRYPOINT`, and that check failed against the real image —
+another expectation the fake world had encoded wrongly (`Entrypoint: null`) and
+the real build corrected. The fake now mirrors the real base.
 
 ## What one PASS does NOT prove
 

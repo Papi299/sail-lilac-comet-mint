@@ -74,6 +74,26 @@ export const EXPECTED_IMAGE_CONFIG = Object.freeze({
 });
 
 /**
+ * The ENTRYPOINTs a release candidate may carry: none, or exactly the one the
+ * `node:22-bookworm-slim` base declares and `Dockerfile.worker` inherits.
+ *
+ * That shim is `exec "$@"`, prefixing `node` only when the first argument is a
+ * flag or not a command; with `CMD[0] = "node"` it execs the Worker entry point
+ * unchanged. It is accepted by NAME here and by OBSERVATION in the driver —
+ * root-owned, not writable, a regular file at its own real path, digest
+ * recorded — because anything that runs before the Worker is part of what the
+ * image starts, and a replaced or writable shim would make "CMD is the Worker
+ * entry point" a partial claim.
+ */
+export const ALLOWED_IMAGE_ENTRYPOINTS = Object.freeze([
+  Object.freeze([]),
+  Object.freeze(["docker-entrypoint.sh"]),
+]);
+
+/** Where the inherited shim resolves on the image's PATH. */
+export const ENTRYPOINT_SHIM_PATH = "/usr/local/bin/docker-entrypoint.sh";
+
+/**
  * Non-secret defaults the release image is expected to carry, by NAME.
  *
  * These are values `Dockerfile.worker` deliberately commits: bind address,
@@ -152,6 +172,7 @@ export const REQUIRED_PASS_CHECKS = Object.freeze([
   "image/working-directory",
   "image/runtime-user-is-non-root-node",
   "image/cmd-is-the-worker-entry-point",
+  "image/entrypoint-shim-root-owned-and-unwritable",
   "image/only-the-worker-port-is-exposed",
   "image/no-in-image-healthcheck",
   "image/no-host-mount-in-the-image-config",
@@ -302,6 +323,7 @@ export function buildReleaseEvidence(input) {
       workingDir: input.image.workingDir,
       cmd: input.image.cmd,
       entrypoint: input.image.entrypoint,
+      entrypointShim: input.image.entrypointShim ?? null,
       exposedPorts: input.image.exposedPorts,
       healthcheckPresent: input.image.healthcheckPresent,
       configuredVolumes: input.image.configuredVolumes,

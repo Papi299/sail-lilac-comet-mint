@@ -53,6 +53,9 @@ const TOOL_SEARCH_DIRECTORIES = [
   "/usr/local/games", "/usr/games", "/opt/bin", "/snap/bin",
 ];
 
+/** Where the base image's inherited ENTRYPOINT shim resolves. */
+const ENTRYPOINT_SHIM = "/usr/local/bin/docker-entrypoint.sh";
+
 /** The broker subtree the media image must not contain. */
 const BROKER_PATH = "/app/src/broker";
 
@@ -228,8 +231,35 @@ async function runtime() {
       version: firstLine(run(PYTHON, [YTDLP_ARTIFACT, "--version"])),
     },
     python: { path: PYTHON, version: firstLine(run(PYTHON, ["--version"])) },
+    entrypointShim: await describeFile(ENTRYPOINT_SHIM),
     ffmpeg: describeMediaTool("/usr/bin/ffmpeg"),
     ffprobe: describeMediaTool("/usr/bin/ffprobe"),
+  };
+}
+
+/**
+ * A file's identity and posture, or `{ present: false }`.
+ *
+ * Used for the inherited ENTRYPOINT shim: whatever runs before the Worker is
+ * part of what the image starts, so its owner, mode, real path and digest are
+ * observed rather than assumed from the image config's `Entrypoint` string.
+ */
+async function describeFile(path) {
+  let info;
+  try {
+    info = await lstat(path);
+  } catch {
+    return { path, present: false };
+  }
+  return {
+    path,
+    present: true,
+    isRegularFile: info.isFile(),
+    realpath: await realpath(path),
+    uid: info.uid,
+    gid: info.gid,
+    mode: (info.mode & 0o7777).toString(8).padStart(4, "0"),
+    sha256: info.isFile() ? await fileSha256(path) : null,
   };
 }
 

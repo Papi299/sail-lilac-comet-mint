@@ -54,8 +54,10 @@ import {
   verifyReleaseContextProvenance,
 } from "../deploy/acceptance/ytdlp-generic/lib/release-provenance.mjs";
 import {
+  ALLOWED_IMAGE_ENTRYPOINTS,
   assertChildUnchanged,
   buildReleaseEvidence,
+  ENTRYPOINT_SHIM_PATH,
   EXPECTED_IMAGE_CONFIG,
   EXPECTED_YTDLP_RUNTIME,
   FORBIDDEN_IMAGE_ENVIRONMENT_NAMES,
@@ -123,6 +125,21 @@ function faithfulImageManifest() {
     sha256: sha256(SOURCE_FILES[path]),
     bytes: SOURCE_FILES[path].length,
   }));
+}
+
+/** The inherited ENTRYPOINT shim as a faithful image reports it. */
+function shimObservation(overrides = {}) {
+  return {
+    path: ENTRYPOINT_SHIM_PATH,
+    present: true,
+    isRegularFile: true,
+    realpath: ENTRYPOINT_SHIM_PATH,
+    uid: 0,
+    gid: 0,
+    mode: "0755",
+    sha256: "a15ac9589c04baf9da95b08e0e79b5cf1d75ab8dc64e06a5e68e4ceb0ad7c8ea",
+    ...overrides,
+  };
 }
 
 /** The pinned artifact observation a faithful image reports, with one knob. */
@@ -204,7 +221,10 @@ function createWorld(spec = {}) {
       User: "node",
       WorkingDir: "/app",
       Cmd: [...EXPECTED_IMAGE_CONFIG.cmd],
-      Entrypoint: null,
+      // What the real node:22-bookworm-slim base declares and the recipe
+      // inherits. A fake that said `null` here once certified a check the real
+      // image then failed.
+      Entrypoint: ["docker-entrypoint.sh"],
       ExposedPorts: { "8080/tcp": {} },
       Env: [
         "PATH=/usr/local/bin:/usr/bin:/bin",
@@ -253,6 +273,7 @@ function createWorld(spec = {}) {
         version: EXPECTED_YTDLP_RUNTIME.version,
       },
       python: { path: "/usr/bin/python3", version: "Python 3.11.2" },
+      entrypointShim: shimObservation(),
       ffmpeg: { path: "/usr/bin/ffmpeg", present: true, executable: true, exitCode: 0, version: "ffmpeg version 5.1.8" },
       ffprobe: { path: "/usr/bin/ffprobe", present: true, executable: true, exitCode: 0, version: "ffprobe version 5.1.8" },
     },
@@ -460,7 +481,8 @@ function evidenceInput(overrides = {}) {
       user: "node",
       workingDir: "/app",
       cmd: [...EXPECTED_IMAGE_CONFIG.cmd],
-      entrypoint: [],
+      entrypoint: ["docker-entrypoint.sh"],
+      entrypointShim: { path: ENTRYPOINT_SHIM_PATH, sha256: "a".repeat(64), uid: 0, mode: "0755" },
       exposedPorts: ["8080/tcp"],
       healthcheckPresent: false,
       configuredVolumes: [],
@@ -1272,6 +1294,45 @@ describe("SPLIT-07 driver", () => {
       assert.equal(result.verdict, "FAIL", `${check} must fail`);
       assert.equal(result.checks.find((c) => c.name === check).ok, false, `${check} must be the failing check`);
     }
+  });
+
+  it("accepts no ENTRYPOINT, or exactly the inherited node exec shim, and nothing else", async () => {
+    assert.deepEqual(ALLOWED_IMAGE_ENTRYPOINTS.map((entry) => [...entry]), [[], ["docker-entrypoint.sh"]]);
+    for (const Entrypoint of [null, [], ["docker-entrypoint.sh"]]) {
+      const { result } = await drive({ configOverrides: { Entrypoint } });
+      assert.equal(result.verdict, "PASS", `Entrypoint=${JSON.stringify(Entrypoint)} must be accepted`);
+    }
+    for (const Entrypoint of [["/usr/bin/tini", "--"], ["sh", "-c", "node x"], ["docker-entrypoint.sh", "npm"], ["/usr/local/bin/docker-entrypoint.sh"]]) {
+      const { result } = await drive({ configOverrides: { Entrypoint } });
+      assert.equal(result.verdict, "FAIL", `Entrypoint=${JSON.stringify(Entrypoint)} must be refused`);
+      assert.equal(result.checks.find((c) => c.name === "image/cmd-is-the-worker-entry-point").ok, false);
+    }
+  });
+
+  it("FAILs an inherited shim that is missing, replaced, relinked or writable", async () => {
+    for (const mutation of [
+      { present: false },
+      { uid: 1000 },
+      { mode: "0777" },
+      { mode: "0775" },
+      { isRegularFile: false },
+      { realpath: "/tmp/elsewhere.sh" },
+      { sha256: null },
+    ]) {
+      const { result } = await drive({ probes: { runtime: { entrypointShim: shimObservation(mutation) } } });
+      assert.equal(result.verdict, "FAIL", `shim ${JSON.stringify(mutation)} must fail`);
+      assert.equal(result.checks.find((c) => c.name === "image/entrypoint-shim-root-owned-and-unwritable").ok, false);
+    }
+    // With no ENTRYPOINT there is no shim in the start path, so none is required.
+    const none = await drive({ configOverrides: { Entrypoint: [] }, probes: { runtime: { entrypointShim: { present: false } } } });
+    assert.equal(none.result.verdict, "PASS");
+  });
+
+  it("records the shim's observed digest in the evidence", async () => {
+    const { result } = await drive();
+    assert.deepEqual(result.record.image.entrypoint, ["docker-entrypoint.sh"]);
+    assert.equal(result.record.image.entrypointShim.path, ENTRYPOINT_SHIM_PATH);
+    assert.match(result.record.image.entrypointShim.sha256, /^[0-9a-f]{64}$/);
   });
 
   it("FAILs an image that is not Linux, and records the architecture", async () => {
