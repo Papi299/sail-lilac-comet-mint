@@ -338,6 +338,13 @@ yt-dlp at all. A partial-content path would therefore be unused complexity, so
 the fixture declares `Accept-Ranges: none` and answers the whole object whatever
 the client asks for — one response shape, deterministic.
 
+The SPLIT-06 split set follows the same rule by default. The one exception is
+an instance built with `ranges: true`, which SPLIT-06 uses only for its chunked
+`--max-filesize` characterization. On such an instance, the four split media
+routes also answer ONE byte range: 206 for a satisfiable range, 416 past the
+end. That is the transfer mode a chunked source is fetched in. The Phase-10D
+routes and the manifests never answer a range.
+
 The one-media-request property depends on submitting the **page**. Handing
 yt-dlp the media URL directly produces **two** GETs, because the Generic
 extractor fetches the URL itself to decide whether it is HTML before the

@@ -1078,6 +1078,336 @@ describe("split download: ONE combined byte budget (§13-§15/§24-§27/§59/§6
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001: the pinned --max-filesize
+// refusal of EITHER half is TOO_LARGE, bound to that half's own allowance
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The exact line the pinned `HttpFD` prints on a `--max-filesize` refusal. */
+const refusalLine = (declared: number, ceiling: number) =>
+  `\r[download] File is larger than max-filesize (${declared} bytes > ${ceiling} bytes). Aborting.\n`;
+
+/** A half the pinned runtime refuses: exits 0, writes nothing, ends stdout with the refusal. */
+function refusesAt(declared: number, ceiling: number): Half {
+  return async () => ({
+    code: 0,
+    stdout: `[info] abc: Downloading 1 format(s): x\n${refusalLine(declared, ceiling)}`,
+    stderr: "",
+  });
+}
+
+describe("split download: the pinned --max-filesize refusal (YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001)", () => {
+  const limits = { maxFileSizeBytes: 1000, downloadTimeoutSeconds: 60 };
+
+  it("VIDEO refused: one probe, the video run only, TOO_LARGE, no pair", async () => {
+    const plan = mp4Plan();
+    const probe = countingProbe();
+    const { runner, calls, roles } = splitRunner(plan, { video: refusesAt(4000, 1000) });
+    let returned: unknown = "never";
+    await rejectsWith("TOO_LARGE", async () => {
+      returned = await downloadGenericSplitSources(
+        SAFE_URL,
+        workDir,
+        plan,
+        baseDeps({ runner, limits, probeRuntime: probe.probeRuntime }),
+      );
+    });
+    assert.equal(returned, "never", "no pair crosses the boundary");
+    assert.equal(probe.seen.length, 1, "exactly one runtime probe");
+    assert.deepEqual(roles(), ["video"], "the audio half is never started");
+    assert.equal(argOf(calls[0]!, "--max-filesize="), "1000", "the video half carries the whole budget");
+    assert.deepEqual(readdirSync(workDir), [], "nothing was acquired");
+  });
+
+  it("AUDIO refused after video 700: the audio run carries exactly 300 and is TOO_LARGE", async () => {
+    const plan = mp4Plan();
+    const probe = countingProbe();
+    const { runner, calls, roles } = splitRunner(plan, {
+      video: writes(plan, "video", 700),
+      audio: refusesAt(450, 300),
+    });
+    let returned: unknown = "never";
+    await rejectsWith("TOO_LARGE", async () => {
+      returned = await downloadGenericSplitSources(
+        SAFE_URL,
+        workDir,
+        plan,
+        baseDeps({ runner, limits, probeRuntime: probe.probeRuntime }),
+      );
+    });
+    assert.equal(returned, "never", "no pair crosses the boundary");
+    assert.equal(probe.seen.length, 1, "ONE probe for the whole operation");
+    assert.deepEqual(roles(), ["video", "audio"], "video first, audio second, nothing after");
+    assert.equal(argOf(calls[0]!, "--max-filesize="), "1000");
+    assert.equal(argOf(calls[1]!, "--max-filesize="), "300", "the audio allowance is the remainder");
+    // Acquisition merges nothing and deletes nothing: the validated video half
+    // is left for the executor's own cleanup.
+    assert.deepEqual(readdirSync(workDir), ["video-source.mp4"]);
+  });
+
+  it("an AUDIO refusal naming the WHOLE budget is not this run's refusal: PROCESSING_FAILED", async () => {
+    const plan = mp4Plan();
+    const { runner } = splitRunner(plan, {
+      video: writes(plan, "video", 700),
+      audio: refusesAt(4000, 1000),
+    });
+    await rejectsWith("PROCESSING_FAILED", () =>
+      downloadGenericSplitSources(SAFE_URL, workDir, plan, baseDeps({ runner, limits })),
+    );
+  });
+
+  it("a zero exit that leaves nothing WITHOUT the witness stays PROCESSING_FAILED, either half", async () => {
+    for (const role of ["video", "audio"] as const) {
+      resetWorkDir();
+      const plan = mp4Plan();
+      const silent: Half = async () => ({ code: 0, stdout: "[info] abc: Downloading 1 format(s): x\n", stderr: "" });
+      const { runner } = splitRunner(
+        plan,
+        role === "video" ? { video: silent } : { video: writes(plan, "video", 700), audio: silent },
+      );
+      await rejectsWith("PROCESSING_FAILED", () =>
+        downloadGenericSplitSources(SAFE_URL, workDir, plan, baseDeps({ runner, limits })),
+      );
+    }
+  });
+
+  // ── a LATER-chunk refusal: the refused half's own partial `.part` ────────
+  //
+  // A chunked source (`downloader_options.http_chunk_size`) is fetched as a
+  // sequence of responses; the pinned check adds the bytes already held, so a
+  // later chunk is refused after the earlier ones filled the half's `.part`.
+
+  /** A half refused on a LATER chunk, with `bytes` already in its own `.part`. */
+  const refusesLaterAt =
+    (plan: GenericSplitExecutionPlan, role: GenericSplitRole, bytes: number, declared: number, ceiling: number): Half =>
+    async (call) => {
+      writeFileSync(partOf(plan, role), "x".repeat(bytes));
+      return refusesAt(declared, ceiling)(call);
+    };
+
+  it("VIDEO refused on a LATER chunk: TOO_LARGE, one probe, no audio run, no pair, its .part left for the executor", async () => {
+    const plan = mp4Plan();
+    const probe = countingProbe();
+    const { runner, calls, roles } = splitRunner(plan, {
+      video: refusesLaterAt(plan, "video", 600, 1600, 1000),
+    });
+    let returned: unknown = "never";
+    await rejectsWith("TOO_LARGE", async () => {
+      returned = await downloadGenericSplitSources(
+        SAFE_URL,
+        workDir,
+        plan,
+        baseDeps({ runner, limits, probeRuntime: probe.probeRuntime }),
+      );
+    });
+    assert.equal(returned, "never", "no pair crosses the boundary");
+    assert.equal(probe.seen.length, 1, "exactly one runtime probe");
+    assert.deepEqual(roles(), ["video"], "the audio half is never started");
+    assert.equal(argOf(calls[0]!, "--max-filesize="), "1000");
+    assert.deepEqual(readdirSync(workDir), ["video-source.mp4.part"], "nothing deleted, nothing else");
+  });
+
+  it("AUDIO refused on a LATER chunk after video 700: exactly 300, TOO_LARGE, the video and the audio .part left", async () => {
+    for (const plan of [mp4Plan(), webmPlan()]) {
+      resetWorkDir();
+      const probe = countingProbe();
+      const { runner, calls, roles } = splitRunner(plan, {
+        video: writes(plan, "video", 700),
+        audio: refusesLaterAt(plan, "audio", 200, 450, 300),
+      });
+      let returned: unknown = "never";
+      await rejectsWith("TOO_LARGE", async () => {
+        returned = await downloadGenericSplitSources(
+          SAFE_URL,
+          workDir,
+          plan,
+          baseDeps({ runner, limits, probeRuntime: probe.probeRuntime }),
+        );
+      });
+      const ext = plan.pair.audio.container;
+      assert.equal(returned, "never", `${ext}: no pair, so nothing to merge`);
+      assert.equal(probe.seen.length, 1);
+      assert.deepEqual(roles(), ["video", "audio"]);
+      assert.equal(argOf(calls[1]!, "--max-filesize="), "300", `${ext}: the audio allowance is the remainder`);
+      assert.deepEqual(
+        readdirSync(workDir).sort(),
+        [`audio-source.${ext}.part`, `video-source.${plan.pair.video.container}`].sort(),
+      );
+      assert.equal(readFileSync(finalOf(plan, "video")).byteLength, 700, "the validated video is untouched");
+    }
+  });
+
+  it("the audio .part is bounded by the REMAINDER, not the combined budget", async () => {
+    // With the watcher observing nothing, only the shape proof decides: up to
+    // 300 is the genuine shape; 301 or 999 — within the combined 1000, but not
+    // within what the video left — is not, and stays PROCESSING_FAILED.
+    for (const [bytes, expected] of [
+      [300, "TOO_LARGE"],
+      [301, "PROCESSING_FAILED"],
+      [999, "PROCESSING_FAILED"],
+    ] as const) {
+      resetWorkDir();
+      const plan = mp4Plan();
+      const { runner } = splitRunner(plan, {
+        video: writes(plan, "video", 700),
+        audio: refusesLaterAt(plan, "audio", bytes, 4000, 300),
+      });
+      await rejectsWith(expected, () =>
+        downloadGenericSplitSources(
+          SAFE_URL,
+          workDir,
+          plan,
+          baseDeps({ runner, limits, statSize: async () => null }),
+        ),
+      );
+    }
+  });
+
+  it("an AUDIO refusal naming the WHOLE budget beside its .part is not this run's refusal: PROCESSING_FAILED", async () => {
+    const plan = mp4Plan();
+    const { runner } = splitRunner(plan, {
+      video: writes(plan, "video", 700),
+      audio: refusesLaterAt(plan, "audio", 200, 4000, 1000),
+    });
+    await rejectsWith("PROCESSING_FAILED", () =>
+      downloadGenericSplitSources(SAFE_URL, workDir, plan, baseDeps({ runner, limits })),
+    );
+  });
+
+  it("only the AUDIO half's own .part qualifies beside the video", async () => {
+    const shapes: Array<[string, (plan: GenericSplitExecutionPlan) => void]> = [
+      ["the video's .part name", (plan) => writeFileSync(partOf(plan, "video"), "x".repeat(200))],
+      [
+        "the audio .part beside a final audio artifact",
+        (plan) => {
+          writeFileSync(partOf(plan, "audio"), "x".repeat(200));
+          writeFileSync(finalOf(plan, "audio"), "x".repeat(100));
+        },
+      ],
+      [
+        "the audio .part beside a side file",
+        (plan) => {
+          writeFileSync(partOf(plan, "audio"), "x".repeat(200));
+          writeFileSync(join(workDir, "audio-source.info.json"), "{}");
+        },
+      ],
+    ];
+    for (const [label, shape] of shapes) {
+      resetWorkDir();
+      const plan = mp4Plan();
+      const { runner } = splitRunner(plan, {
+        video: writes(plan, "video", 700),
+        audio: async (call) => {
+          shape(plan);
+          return refusesAt(450, 300)(call);
+        },
+      });
+      await assert.rejects(
+        () => downloadGenericSplitSources(SAFE_URL, workDir, plan, baseDeps({ runner, limits })),
+        (err: unknown) => err instanceof AppError && err.code === "PROCESSING_FAILED",
+        label,
+      );
+    }
+  });
+
+  it("either refusal shape needs the validated VIDEO intact: truncated, grown, symlinked or removed is PROCESSING_FAILED", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "ytdlp-split-outside-"));
+    try {
+      const sameSize = join(outside, "same-size.bin");
+      writeFileSync(sameSize, "x".repeat(700));
+      const tamperings: Array<[string, (plan: GenericSplitExecutionPlan) => void]> = [
+        ["truncated", (plan) => writeFileSync(finalOf(plan, "video"), "x".repeat(699))],
+        ["grown", (plan) => appendFileSync(finalOf(plan, "video"), "y")],
+        [
+          "replaced by a same-size symlink",
+          (plan) => {
+            rmSync(finalOf(plan, "video"));
+            symlinkSync(sameSize, finalOf(plan, "video"));
+          },
+        ],
+        ["removed", (plan) => rmSync(finalOf(plan, "video"))],
+      ];
+      for (const [label, tamper] of tamperings) {
+        for (const withPart of [false, true]) {
+          resetWorkDir();
+          const plan = mp4Plan();
+          const { runner } = splitRunner(plan, {
+            video: writes(plan, "video", 700),
+            audio: async (call) => {
+              tamper(plan);
+              if (withPart) writeFileSync(partOf(plan, "audio"), "x".repeat(200));
+              return refusesAt(450, 300)(call);
+            },
+          });
+          await assert.rejects(
+            () =>
+              downloadGenericSplitSources(
+                SAFE_URL,
+                workDir,
+                plan,
+                baseDeps({ runner, limits, statSize: async () => null }),
+              ),
+            (err: unknown) => err instanceof AppError && err.code === "PROCESSING_FAILED",
+            `${label}, ${withPart ? "with" : "without"} the audio .part`,
+          );
+        }
+      }
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("audio: the caller cancels FIRST beside the audio .part — the cancellation stands", async () => {
+    const plan = mp4Plan();
+    const caller = new AbortController();
+    const { runner } = splitRunner(plan, {
+      video: writes(plan, "video", 700),
+      audio: async (call) => {
+        writeFileSync(partOf(plan, "audio"), "x".repeat(200));
+        caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+        return refusesAt(450, 300)(call);
+      },
+    });
+    await assert.rejects(
+      () =>
+        downloadGenericSplitSources(SAFE_URL, workDir, plan, {
+          ...baseDeps({ runner, limits }),
+          signal: caller.signal,
+        }),
+      (err: unknown) =>
+        err instanceof AppError &&
+        err.code === "PROCESSING_FAILED" &&
+        err.message === "Download was cancelled.",
+    );
+  });
+
+  it("audio: the caller cancels FIRST, then the run exits 0 with the witness — the cancellation stands", async () => {
+    const plan = mp4Plan();
+    const caller = new AbortController();
+    const { runner, roles } = splitRunner(plan, {
+      video: writes(plan, "video", 700),
+      audio: async (call) => {
+        caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+        return refusesAt(450, 300)(call);
+      },
+    });
+    await assert.rejects(
+      () =>
+        downloadGenericSplitSources(SAFE_URL, workDir, plan, {
+          ...baseDeps({ runner, limits }),
+          signal: caller.signal,
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.equal(err.code, "PROCESSING_FAILED", "never TOO_LARGE");
+        assert.equal(err.message, "Download was cancelled.");
+        return true;
+      },
+    );
+    assert.deepEqual(roles(), ["video", "audio"]);
+  });
+});
+
 /** Empties the job directory between sub-cases of one test. */
 function resetWorkDir() {
   rmSync(workDir, { recursive: true, force: true });

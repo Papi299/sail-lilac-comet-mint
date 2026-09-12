@@ -5,7 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { AppError } from "@/lib/errors";
+import { AppError, ERROR_MESSAGES } from "@/lib/errors";
 import { applyMigrations } from "@/worker/state/migrations.server.ts";
 import { SQLiteJobStore } from "@/worker/state/sqlite-job-store.server.ts";
 import { setTempDirectoryForTests } from "@/services/temp/files.server";
@@ -949,5 +949,282 @@ describe("generic job: operator shutdown during acquisition", () => {
       "Worker restarted before the job completed.",
       "an ordinary failure must never masquerade as a restart",
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001: the pinned --max-filesize
+// refusal, through the REAL acquisition primitive inside the executor
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("generic job: a pinned --max-filesize refusal (YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001)", () => {
+  const LIMITS: GenericDownloadLimits = { maxFileSizeBytes: 1000, downloadTimeoutSeconds: 60 };
+
+  /** The stdout the pinned runtime produces when `--max-filesize` refuses `ceiling`. */
+  const refusalStdout = (ceiling: number) =>
+    "[info] abc: Downloading 1 format(s): 22\n" +
+    `\r[download] File is larger than max-filesize (4000 bytes > ${ceiling} bytes). Aborting.\n`;
+
+  type RefusalRecord = {
+    argvs: string[][];
+    workDir: string;
+    /** Set when the run was refused on a LATER chunk and left its `.part`. */
+    partPath?: string;
+    /** Whether that `.part` still existed when the primitive threw. */
+    partExistedWhenAcquisitionThrew?: boolean;
+  };
+
+  /**
+   * The REAL `downloadGenericOriginal` inside the executor, with only its
+   * yt-dlp boundary faked: the run exits 0 having written nothing, exactly as
+   * the pinned runtime does when `--max-filesize` refuses. `beforeResult` runs
+   * inside that fake subprocess, before it reports.
+   *
+   * With `partialBytes`, the refusal is of a LATER chunk: the fake subprocess
+   * first writes the chunks the pinned `HttpFD` admitted into the `.part` the
+   * REAL argv's `--output` names.
+   */
+  function refusedAcquisition(record: RefusalRecord, beforeResult?: () => void, partialBytes = 0) {
+    return (async (
+      url: string,
+      workDir: string,
+      plan: GenericExecutionPlan,
+      ctx: { limits: GenericDownloadLimits; signal?: AbortSignal },
+    ) => {
+      record.workDir = workDir;
+      try {
+        const res = await downloadGenericOriginal(url, workDir, plan, {
+          limits: ctx.limits,
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+          probeRuntime: async () => ({ available: true, version: "2026.08.19", reason: "ok" as const }),
+          validateUrl: async (raw: string) => ({ url: raw, hostname: "example.invalid" }),
+          runner: async (call) => {
+            record.argvs.push([...call.args]);
+            if (partialBytes > 0) {
+              const template = call.args
+                .find((a) => a.startsWith("--output="))!
+                .slice("--output=".length);
+              record.partPath = `${template.replace("%(ext)s", "mp4")}.part`;
+              fs.writeFileSync(record.partPath, "x".repeat(partialBytes));
+            }
+            beforeResult?.();
+            return { code: 0, stdout: refusalStdout(ctx.limits.maxFileSizeBytes), stderr: "" };
+          },
+        });
+        return { filePath: res.filePath, container: res.container, mime: "video/mp4", fileSize: res.fileSize };
+      } catch (err) {
+        if (record.partPath) record.partExistedWhenAcquisitionThrew = fs.existsSync(record.partPath);
+        throw err;
+      }
+    }) as NonNullable<JobExecutorDeps["downloadGeneric"]>;
+  }
+
+  /** Records the lifecycle transitions and failures the executor attempts. */
+  function traceStore() {
+    const transitions: string[] = [];
+    const failCodes: string[] = [];
+    const store = h.store;
+    const beginProcessing = store.beginProcessing.bind(store);
+    const beginUploading = store.beginUploading.bind(store);
+    const failJob = store.failJob.bind(store);
+    store.beginProcessing = (...a: Parameters<SQLiteJobStore["beginProcessing"]>) => {
+      transitions.push("beginProcessing");
+      return beginProcessing(...a);
+    };
+    store.beginUploading = (...a: Parameters<SQLiteJobStore["beginUploading"]>) => {
+      transitions.push("beginUploading");
+      return beginUploading(...a);
+    };
+    store.failJob = (...a: Parameters<SQLiteJobStore["failJob"]>) => {
+      failCodes.push(String(a[1]));
+      return failJob(...a);
+    };
+    return { transitions, failCodes };
+  }
+
+  const analysis = async () =>
+    genericAnalysis(
+      [{ id: "preset:1080", container: "mp4", hasVideo: true }],
+      { "preset:1080": selection() },
+    );
+
+  it("downloading -> failed / TOO_LARGE: no processing, no FFmpeg, no upload, no object key, workDir removed", async () => {
+    const job = claimJob(h.store, "preset:1080");
+    const trace = traceStore();
+    const record = { argvs: [] as string[][], workDir: "" };
+    let processed = 0;
+    let statusAtAcquisition = "";
+    const deps: JobExecutorDeps = {
+      analyzeForExecution: analysis,
+      genericLimits: LIMITS,
+      downloadGeneric: refusedAcquisition(record, () => {
+        statusAtAcquisition = h.store.getJob(job.jobId)?.status ?? "missing";
+      }),
+      processLocally: async () => {
+        processed += 1;
+        throw new Error("a refused acquisition must never reach Worker FFmpeg");
+      },
+    };
+
+    await new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps).execute(job);
+
+    const final = h.store.getJob(job.jobId);
+    assert.equal(statusAtAcquisition, "downloading");
+    assert.equal(final?.status, "failed");
+    assert.equal(final?.errorCode, "TOO_LARGE");
+    assert.equal(final?.safeErrorMessage, ERROR_MESSAGES.TOO_LARGE);
+    assert.deepEqual(trace.failCodes, ["TOO_LARGE"]);
+    assert.deepEqual(trace.transitions, [], "neither processing nor uploading was attempted");
+    assert.equal(processed, 0, "no Worker FFmpeg");
+    assert.equal(h.puts.length, 0, "nothing uploaded");
+    const row = h.db
+      .prepare("SELECT object_key FROM worker_jobs WHERE job_id = ?")
+      .get(job.jobId) as { object_key: string | null };
+    assert.equal(row.object_key, null, "no object key");
+    assert.equal(record.argvs.length, 1, "one acquisition subprocess");
+    assert.ok(
+      record.argvs[0]!.includes("--max-filesize=1000"),
+      "the executor's own limit is the run's allowance",
+    );
+    assert.ok(record.workDir);
+    assert.equal(fs.existsSync(record.workDir), false, "the executor's finally removed the workDir");
+  });
+
+  it("an operator shutdown established first stays a restart, never a TOO_LARGE failure", async () => {
+    const job = claimJob(h.store, "preset:1080");
+    const trace = traceStore();
+    const record = { argvs: [] as string[][], workDir: "" };
+    const active: { executor?: JobExecutor } = {};
+    active.executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+      analyzeForExecution: analysis,
+      genericLimits: LIMITS,
+      downloadGeneric: refusedAcquisition(record, () => {
+        assert.equal(active.executor!.abortActiveForShutdown(), 1);
+      }),
+    });
+    await active.executor.execute(job);
+
+    assert.equal(h.store.getJob(job.jobId)?.status, "downloading", "the row is left ACTIVE for recover()");
+    assert.deepEqual(trace.failCodes, [], "the dying process commits no failure at all");
+    assert.equal(fs.existsSync(record.workDir), false);
+    h.store.recover();
+    const recovered = h.store.getJob(job.jobId);
+    assert.equal(recovered?.errorCode, "PROCESSING_FAILED");
+    assert.equal(recovered?.safeErrorMessage, "Worker restarted before the job completed.");
+  });
+
+  it("a user cancellation established first stays cancelled, never a TOO_LARGE failure", async () => {
+    const job = claimJob(h.store, "preset:1080");
+    const trace = traceStore();
+    const record = { argvs: [] as string[][], workDir: "" };
+    const active: { executor?: JobExecutor } = {};
+    active.executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+      analyzeForExecution: analysis,
+      genericLimits: LIMITS,
+      downloadGeneric: refusedAcquisition(record, () => {
+        assert.equal(active.executor!.cancel(job.jobId).type, "cancelled");
+      }),
+    });
+    await active.executor.execute(job);
+
+    assert.equal(h.store.getJob(job.jobId)?.status, "cancelled");
+    assert.deepEqual(trace.failCodes, []);
+    assert.equal(fs.existsSync(record.workDir), false);
+  });
+
+  // ── the same refusal of a LATER chunk: the run's partial `.part` ─────────
+
+  it("LATER chunk: downloading -> failed / TOO_LARGE, no processing or upload, and the partial .part dies with the workDir", async () => {
+    const job = claimJob(h.store, "preset:1080");
+    const trace = traceStore();
+    const record: RefusalRecord = { argvs: [], workDir: "" };
+    let processed = 0;
+    let statusAtAcquisition = "";
+    const deps: JobExecutorDeps = {
+      analyzeForExecution: analysis,
+      genericLimits: LIMITS,
+      downloadGeneric: refusedAcquisition(
+        record,
+        () => {
+          statusAtAcquisition = h.store.getJob(job.jobId)?.status ?? "missing";
+        },
+        600,
+      ),
+      processLocally: async () => {
+        processed += 1;
+        throw new Error("a refused acquisition must never reach Worker FFmpeg");
+      },
+    };
+
+    await new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps).execute(job);
+
+    const final = h.store.getJob(job.jobId);
+    assert.equal(statusAtAcquisition, "downloading");
+    assert.equal(final?.status, "failed");
+    assert.equal(final?.errorCode, "TOO_LARGE");
+    assert.equal(final?.safeErrorMessage, ERROR_MESSAGES.TOO_LARGE);
+    assert.deepEqual(trace.failCodes, ["TOO_LARGE"]);
+    assert.deepEqual(trace.transitions, [], "neither processing nor uploading was attempted");
+    assert.equal(processed, 0, "no Worker FFmpeg");
+    assert.equal(h.puts.length, 0, "nothing uploaded");
+    const row = h.db
+      .prepare("SELECT object_key FROM worker_jobs WHERE job_id = ?")
+      .get(job.jobId) as { object_key: string | null };
+    assert.equal(row.object_key, null, "no object key");
+    assert.ok(record.argvs[0]!.includes("--max-filesize=1000"));
+    assert.ok(record.partPath?.startsWith(record.workDir), "the .part was the run's own, inside the workDir");
+    assert.equal(record.partExistedWhenAcquisitionThrew, true, "acquisition left the .part to its owner");
+    assert.equal(fs.existsSync(record.partPath!), false, "the executor's finally removed the .part");
+    assert.equal(fs.existsSync(record.workDir), false, "…with the workDir");
+  });
+
+  it("LATER chunk: an operator shutdown established first stays a restart, never a TOO_LARGE failure", async () => {
+    const job = claimJob(h.store, "preset:1080");
+    const trace = traceStore();
+    const record: RefusalRecord = { argvs: [], workDir: "" };
+    const active: { executor?: JobExecutor } = {};
+    active.executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+      analyzeForExecution: analysis,
+      genericLimits: LIMITS,
+      downloadGeneric: refusedAcquisition(
+        record,
+        () => {
+          assert.equal(active.executor!.abortActiveForShutdown(), 1);
+        },
+        600,
+      ),
+    });
+    await active.executor.execute(job);
+
+    assert.equal(h.store.getJob(job.jobId)?.status, "downloading", "the row is left ACTIVE for recover()");
+    assert.deepEqual(trace.failCodes, [], "the dying process commits no failure at all");
+    assert.equal(fs.existsSync(record.workDir), false, "the partial .part went with the workDir");
+    h.store.recover();
+    const recovered = h.store.getJob(job.jobId);
+    assert.equal(recovered?.errorCode, "PROCESSING_FAILED");
+    assert.equal(recovered?.safeErrorMessage, "Worker restarted before the job completed.");
+  });
+
+  it("LATER chunk: a user cancellation established first stays cancelled, never a TOO_LARGE failure", async () => {
+    const job = claimJob(h.store, "preset:1080");
+    const trace = traceStore();
+    const record: RefusalRecord = { argvs: [], workDir: "" };
+    const active: { executor?: JobExecutor } = {};
+    active.executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+      analyzeForExecution: analysis,
+      genericLimits: LIMITS,
+      downloadGeneric: refusedAcquisition(
+        record,
+        () => {
+          assert.equal(active.executor!.cancel(job.jobId).type, "cancelled");
+        },
+        600,
+      ),
+    });
+    await active.executor.execute(job);
+
+    assert.equal(h.store.getJob(job.jobId)?.status, "cancelled");
+    assert.deepEqual(trace.failCodes, []);
+    assert.equal(fs.existsSync(record.workDir), false, "the partial .part went with the workDir");
   });
 });

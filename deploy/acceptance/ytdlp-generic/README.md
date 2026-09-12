@@ -153,7 +153,7 @@ prove.
 | `lib/split-fixture-url.mjs` | — | The test-only exact-fixture URL validator. |
 | `lib/local-object-writer.mjs` | — | The deterministic local `ObjectStoreWriter` (NOT R2). |
 | `lib/split-observers.mjs` | — | Spawn ledger, media-tool sampler, SQLite status-audit trigger. |
-| `lib/split-evidence.mjs` | — | The `split06-deterministic-full-path-02` record. |
+| `lib/split-evidence.mjs` | — | The `split06-deterministic-full-path-04` record; `-01`, `-02` and `-03` records are historical. |
 | `fixtures/split-media.mjs` | — | The four bit-exact split fixture recipes and the DASH manifests. |
 
 Tests: `scripts/ytdlp-acceptance.test.mjs` and `scripts/ytdlp-fixture.test.mjs`,
@@ -2481,8 +2481,9 @@ producer, and both were measured before either was believed.
 
 The durable row's `progress`, `stage_label` and `downloaded_bytes` were all
 `NULL`, which is not evidence that nothing was downloading. Acquisition runs
-`--quiet --no-progress`, so the console emits nothing to parse: generic progress
-is produced by the **Worker's own file-size watcher** polling the `.part` file.
+`--no-progress` (at the time also `--quiet`), so the console carries no progress
+to parse: generic progress is produced by the **Worker's own file-size watcher**
+polling the `.part` file.
 The corrected fixture makes that observable — 89 non-zero `downloadedBytes`
 samples across a single acquisition.
 

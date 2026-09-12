@@ -78,7 +78,7 @@ def main(artifact: str) -> int:
         "--downloader=native",
         # Phase-10C3 acquisition policy
         "--no-cache-dir",
-        "--quiet",
+        "--no-quiet",
         "--no-progress",
         "--no-warnings",
         "--socket-timeout=10",
@@ -105,6 +105,12 @@ def main(artifact: str) -> int:
         return 1
 
     expect("fixup policy", opts.fixup, "never")
+    # Quiet mode is deliberately OFF: under --quiet the pinned HttpFD's one
+    # --max-filesize refusal line is swallowed, and the refusal would lose its
+    # TOO_LARGE meaning. Progress and warnings stay off.
+    expect("quiet mode (--no-quiet)", opts.quiet, False)
+    expect("progress (--no-progress)", opts.noprogress, True)
+    expect("warnings (--no-warnings)", opts.no_warnings, True)
     expect("format selector", opts.format, SELECTOR)
     expect("output template", opts.outtmpl, {"default": f"{WORKDIR}/source.%(ext)s"})
     # The parser stores these as RAW STRINGS; `yt_dlp/__init__.py` converts them

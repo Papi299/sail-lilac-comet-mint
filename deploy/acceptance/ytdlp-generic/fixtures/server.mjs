@@ -52,6 +52,12 @@
 // Every one of them maps to ONE predeclared artifact this process already
 // holds in memory. There is no path-to-file mapping here either.
 //
+// A split set is whole-object only (`Accept-Ranges: none`) unless it is built
+// with `ranges: true`. Then, and only then, its four MEDIA routes also answer
+// ONE `bytes=START-END` / `bytes=START-` range with 206 (416 past the end). The
+// SPLIT-06 orchestrator builds such an instance solely for its chunked
+// `--max-filesize` characterization; its full path never does.
+//
 // Anything else is 404. An unsupported method on a known route is 405.
 
 import { createHash } from "node:crypto";
@@ -473,6 +479,27 @@ function isSplitRoute(route) {
 }
 
 /**
+ * Reads ONE `bytes=START-END` or `bytes=START-` range against `total` bytes.
+ *
+ * `null` when there is nothing to honour — no header, a suffix or multi-range
+ * form, anything malformed, or an end before its start — and the whole object
+ * is then served, as RFC 9110 permits for any range a server does not support.
+ * `{ satisfiable: false }` when START is at or past the end. Otherwise the
+ * inclusive `[start, end]`, END clamped to the last byte. Fifteen digits keep
+ * every value a safe integer.
+ */
+export function readSingleByteRange(header, total) {
+  if (typeof header !== "string") return null;
+  const match = /^bytes=(\d{1,15})-(\d{0,15})$/.exec(header);
+  if (match === null) return null;
+  const start = Number(match[1]);
+  const end = match[2] === "" ? null : Number(match[2]);
+  if (end !== null && end < start) return null;
+  if (start >= total) return { satisfiable: false };
+  return { satisfiable: true, start, end: Math.min(end ?? total - 1, total - 1) };
+}
+
+/**
  * Validates and freezes the caller's split fixture set.
  *
  * Fail-closed and EXACT: every declared route must be present, must be a
@@ -489,6 +516,11 @@ function buildSplitRouteTable(split) {
   }
   if (!artifacts || typeof artifacts !== "object") {
     throw new Error("the split fixture set must supply an `artifacts` map");
+  }
+  // Absent means `false`: the whole-object behaviour every existing caller
+  // relies on. Anything but a real boolean is refused rather than coerced.
+  if (split.ranges !== undefined && typeof split.ranges !== "boolean") {
+    throw new Error("the split fixture set's `ranges` must be a boolean when supplied");
   }
 
   const bodies = new Map();
@@ -515,6 +547,18 @@ function buildSplitRouteTable(split) {
   return {
     bodies,
     digests,
+    /**
+     * Whether the split MEDIA routes answer a single byte range (206).
+     *
+     * Off by default, and then every split route is exactly what it always
+     * was: `accept-ranges: none`, the whole object whatever the client asks.
+     * SPLIT-06 turns it on only for the separate service instance behind its
+     * chunked `--max-filesize` characterization, because a source fetched in
+     * HTTP chunks is, by definition, a sequence of range requests — and the
+     * hosts that set `http_chunk_size` (googlevideo among them) serve them.
+     * Manifests never answer ranges.
+     */
+    ranges: split.ranges === true,
     /**
      * What this service OBSERVED on its split routes.
      *
@@ -684,6 +728,47 @@ export function createFixtureService(options) {
       if (method !== "GET" && method !== "HEAD") return methodNotAllowed(res, route, "GET, HEAD");
       const body = splitSet.bodies.get(route);
       const contentType = SPLIT_ROUTE_CONTENT_TYPES[route];
+      // Only a RANGED instance's media routes ever answer a range (see
+      // `buildSplitRouteTable`). Everything else is the unchanged
+      // whole-object behaviour.
+      const rangeable = splitSet.ranges && SPLIT_MEDIA_ROUTES.includes(route);
+      const range =
+        rangeable && method === "GET" ? readSingleByteRange(req.headers.range, body.byteLength) : null;
+      // A ranged instance also records each response's status and the range it
+      // served; the default instance's records are exactly what they were.
+      const record = (status, bytes, served) =>
+        splitSet.requests.push(
+          splitSet.ranges
+            ? { route, method, status, bytes, range: served, at: now().toISOString() }
+            : { route, method, bytes, at: now().toISOString() },
+        );
+
+      if (range !== null && !range.satisfiable) {
+        res.writeHead(416, {
+          "content-range": `bytes */${body.byteLength}`,
+          "content-length": "0",
+          "cache-control": "no-store",
+        });
+        res.end();
+        record(416, 0, null);
+        log({ route, status: 416, outcome: "range-not-satisfiable" });
+        return;
+      }
+      if (range !== null) {
+        const slice = body.subarray(range.start, range.end + 1);
+        res.writeHead(206, {
+          "content-type": contentType,
+          "content-length": String(slice.byteLength),
+          "content-range": `bytes ${range.start}-${range.end}/${body.byteLength}`,
+          "accept-ranges": "bytes",
+          "cache-control": "no-store",
+        });
+        res.end(slice);
+        record(206, slice.byteLength, { start: range.start, end: range.end, total: body.byteLength });
+        log({ route, status: 206, bytes: slice.byteLength });
+        return;
+      }
+
       res.writeHead(200, {
         "content-type": contentType,
         // Deterministic and honest: every split body is fully known before the
@@ -692,20 +777,19 @@ export function createFixtureService(options) {
         // The pinned native downloader does not need ranges for a progressive
         // http source, and the acquired-artifact proof is byte identity of the
         // whole file. Advertising range support would add a transfer mode the
-        // evidence does not describe.
-        "accept-ranges": "none",
+        // evidence does not describe — except on a ranged instance, whose one
+        // purpose is to serve the chunks such a source is fetched in.
+        "accept-ranges": rangeable ? "bytes" : "none",
         "cache-control": "no-store",
       });
       if (method === "HEAD") {
-        splitSet.requests.push({ route, method, bytes: 0, at: now().toISOString() });
+        record(200, 0, null);
         log({ route, status: 200, outcome: "head" });
         res.end();
         return;
       }
       res.end(body);
-      splitSet.requests.push({
-        route, method, bytes: body.byteLength, at: now().toISOString(),
-      });
+      record(200, body.byteLength, null);
       log({ route, status: 200, bytes: body.byteLength });
       return;
     }
@@ -1036,6 +1120,7 @@ export function createFixtureService(options) {
               [...splitSet.bodies].map(([route, body]) => [route, body.byteLength]),
             ),
             splitSha256: Object.fromEntries(splitSet.digests),
+            splitMediaRanges: splitSet.ranges ? "single byte range" : "none",
           }
         : { splitConfigured: false };
 

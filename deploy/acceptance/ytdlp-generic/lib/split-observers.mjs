@@ -39,12 +39,17 @@ export function createRunnerLedger(realRunner) {
       args: [...(opts.args ?? [])],
       startedAt: Date.now(),
       exitCode: null,
+      stdoutBytes: null,
+      stderrBytes: null,
       failed: false,
     };
     spawns.push(entry);
     try {
       const result = await realRunner(opts);
       entry.exitCode = result.code;
+      // Byte COUNTS only: the streams themselves are never retained here.
+      entry.stdoutBytes = Buffer.byteLength(result.stdout ?? "", "utf8");
+      entry.stderrBytes = Buffer.byteLength(result.stderr ?? "", "utf8");
       return result;
     } catch (err) {
       entry.failed = true;

@@ -202,16 +202,149 @@ video : ext mp4  protocol http  vcodec avc1.42E01E  acodec "none"
 audio : ext m4a  protocol http  vcodec "none"       acodec mp4a.40.2
 ```
 
-which is precisely the shape SPLIT-05 pairs. **No `--load-info-json` harness
-adapter is used, and none exists in this harness.** Nothing about the product
-was relaxed to make the fixture work; the fixture conforms to the product.
+which is precisely the shape SPLIT-05 pairs. **No `--load-info-json` adapter
+is used for source discovery or anywhere in the full path.** Nothing about the
+product was relaxed to make the fixture work; the fixture conforms to the
+product. The only place `--load-info-json` appears is the chunked
+`--max-filesize` case (below). There it re-loads this same pinned GenericIE
+extraction with one extractor-owned field added, because no local fixture can
+make an extractor emit `downloader_options`.
+
+---
+
+## The `--max-filesize` refusal — required since `-03`
+
+Each run also drives the real `downloadGenericSplitSources`, on the same
+fixture, with a byte allowance **below** the video half's honest
+`Content-Length`, so the pinned `HttpFD` refuses the video half before writing
+anything.
+
+The exact pinned runtime does not treat that refusal as an error: it prints one
+status line, opens no `.part` and no final file, and **exits 0**. Until
+`YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001` the Worker therefore reported
+it as `PROCESSING_FAILED`, and `-02` recorded that as an observed follow-up.
+The Worker now recognizes the refusal (the downloader's
+`isPinnedMaxFilesizeRefusal`), and a `-03` PASS **requires**
+(`evaluateMaxFilesizeRefusal` in `lib/split-evidence.mjs`):
+
+| Check | Requirement |
+| :--- | :--- |
+| `max-filesize/declared-length-exceeds-allowance` | the fixture's honest `Content-Length` is over the allowance the run is given |
+| `max-filesize/acquisition-was-refused` | the call threw |
+| `max-filesize/one-yt-dlp-run-carrying-the-run-allowance` | exactly one yt-dlp acquisition ran — the video half, with exactly that `--max-filesize`; the audio half never started |
+| `max-filesize/left-no-final-file` | no final media file |
+| `max-filesize/left-no-part-file` | no `.part` |
+| `max-filesize/classified-canonical-too-large` | the canonical code is `TOO_LARGE` |
+
+The yt-dlp exit code, whether the pinned refusal line was the final stdout line,
+and the two streams' byte counts are **recorded, not required**: SPLIT-06 pins
+the product's outcome, not yt-dlp's opinion of it. No stream text reaches the
+record.
+
+---
+
+## The chunked `--max-filesize` refusal — required since `-04`
+
+The `-03` case above is refused on the download's **first** response, so
+nothing is written. That is not the only shape the pinned refusal takes:
+`HttpFD.real_download` in yt-dlp 2026.08.19 checks **every** response, counting
+the bytes it already holds:
+
+```python
+chunk_size = ... (self.params.get('http_chunk_size')
+                  or info_dict.get('downloader_options', {}).get('http_chunk_size')
+                  or 0)
+...
+data_len = int(data_len) + ctx.resume_len      # plus the bytes already in the .part
+if max_data_len is not None and data_len > max_data_len:
+    ...                                        # the same refusal line; still exit 0
+    return False
+```
+
+A source fetched in HTTP chunks makes each chunk a new ranged response. After
+each one, `NextFragment` carries `resume_len` forward with the `.part` still
+open, so a **later** chunk is refused with the earlier ones already in the
+run's `.part`.
+
+The pinned YouTube extractor requests exactly that on its https formats:
+`fmt['downloader_options'] = {'http_chunk_size': CHUNK_SIZE}` with
+`CHUNK_SIZE = 10 << 20` (`extractor/youtube/_video.py:3229` and `:3613`). For a
+YouTube source larger than one chunk, this is the ordinary refusal shape, not an
+edge case.
+
+The Worker now classifies this shape `TOO_LARGE`, and only this shape. The job
+directory must hold exactly what the refusal can leave:
+
+- the refused run's own `.part`;
+- that `.part` is a regular file inside the job directory, 1…allowance bytes;
+- any artifact validated before the run is beside it, intact.
+
+### How it is exercised
+
+A **second** fixture instance on its own port serves the chunk requests. It has
+the same closed routes and bytes, but is built with `ranges: true`, so its media
+routes also answer a single byte range (206). The full path's instance never
+answers a range.
+
+The chunk size must reach `HttpFD` the way YouTube's does: through the
+extractor-owned `downloader_options` operand, with `params.http_chunk_size`
+unset as in Production (the Worker never passes `--http-chunk-size`). Two
+limits apply: a local fixture cannot run the pinned YouTube extractor, and the
+pinned GenericIE sets no `downloader_options`. So the harness:
+
+1. runs the product's own analysis against the ranged instance, keeping the
+   pinned GenericIE's own `--dump-single-json` document in memory;
+2. adds exactly one field to each http format of that document,
+   `downloader_options: {http_chunk_size: N}`, mirroring `_video.py:3613`;
+3. runs the REAL `downloadGenericSplitSources` with the REAL runner, adding
+   exactly one argument to the product's own acquisition argv:
+   `--load-info-json=<that document>`.
+
+`download_with_info_file` then follows the same path a freshly extracted URL
+follows:
+
+`process_ie_result` → format selection (the product's own `--format`) →
+`process_info` → `dl` → `HttpFD.real_download`
+
+So `downloader_options` reaches `HttpFD` through the selected format exactly as
+YouTube's does. The manifest is not fetched again during acquisition, and that
+is itself a check.
+
+Only the chunk size is scaled. With `N = floor(remainder / 3)`, exactly three
+whole chunks fit the audio remainder and a fourth never can, whatever the
+pinned `randint(int(0.95 N), N)` picks. The video half gets the whole budget
+(`video + floor(audio / 2)`) and must complete in contiguous chunks. The audio
+half gets only `combined − actual video bytes`.
+
+### What a `-04` PASS requires
+
+These checks come from `evaluateChunkedMaxFilesizeRefusal` in `lib/split-evidence.mjs`:
+
+| Check | Requirement |
+| :--- | :--- |
+| `max-filesize-chunked/chunk-size-was-extractor-owned` | every http format carried `downloader_options.http_chunk_size`, no argv carried an `--http…` option, and the only argument added was `--load-info-json` |
+| `max-filesize-chunked/acquisition-used-the-loaded-info-document` | no manifest request during acquisition |
+| `max-filesize-chunked/audio-run-carried-the-remainder` | two runs; `--max-filesize` was the combined budget, then exactly `combined − video` |
+| `max-filesize-chunked/video-half-was-acquired-in-chunks` | ≥ 2 contiguous 206 responses covering the whole video, and the artifact equals the fixture |
+| `max-filesize-chunked/earlier-chunks-landed-before-a-later-one-was-refused` | exactly the predicted number of whole audio chunks, contiguous from byte 0; the refused request started at exactly the `.part`'s size |
+| `max-filesize-chunked/declared-length-exceeds-allowance` | the refused response's start plus its declared length exceeds the remainder |
+| `max-filesize-chunked/pinned-exit-0-with-the-refusal-as-final-line` | exit 0, and stdout ended with the refusal of that run's own allowance |
+| `max-filesize-chunked/left-exactly-the-video-artifact-and-the-audio-part` | the job directory held the video artifact and the audio `.part`, nothing else |
+| `max-filesize-chunked/part-is-a-regular-file-within-the-allowance` | a regular file of 1…remainder bytes |
+| `max-filesize-chunked/part-holds-exactly-the-earlier-chunks` | its bytes equal the fixture's leading bytes |
+| `max-filesize-chunked/classified-canonical-too-large` | the canonical code is `TOO_LARGE` |
+
+Unlike the `-03` case, the yt-dlp exit code **is** required here. This block
+characterizes the pinned runtime itself, and only a zero exit reaches the
+refusal witness. As before, no stream text reaches the record, only counts,
+sizes and outcomes.
 
 ---
 
 ## Evidence
 
 Every run writes one machine-readable record, schema
-`split06-deterministic-full-path-02` (`lib/split-evidence.mjs`), to the
+`split06-deterministic-full-path-04` (`lib/split-evidence.mjs`), to the
 `--evidence` path. Following the harness's existing rule, that path must be
 **present and unoccupied**: an existing artifact is refused, never replaced.
 
@@ -221,6 +354,23 @@ observation** — `commit`, `tree`, `contextClean: true`,
 `acceptedBaseSourceCommit`, `overlayRuntimeCompatibilityVerified: true` and the
 files compared — and the builder refuses to emit one without it. `-01` records
 are historical artifacts of the pre-correction harness and are never rewritten.
+
+`-03` changed what a PASS means for the `--max-filesize` case (below). A `-02`
+record carried `maxFilesizeCharacterization`: the canonical code was recorded
+but never required, so a `-02` PASS coexisted with `PROCESSING_FAILED`. A `-03`
+record carries `maxFilesizeRefusal` instead, and the builder refuses to emit a
+PASS whose refusal does not satisfy `evaluateMaxFilesizeRefusal`. `-01` and
+`-02` records stay historical: they are never rewritten, and never re-read
+under `-03` rules.
+
+`-04` strengthened what a PASS means again. A `-03` PASS proved only the
+refusal of a download's FIRST response, where nothing is written. It said
+nothing about the chunked shape, which leaves a partial `.part` and which the
+Worker now also classifies `TOO_LARGE`, so re-reading a `-03` record under the
+new rule would misstate it. A `-04` record adds `maxFilesizeChunkedRefusal`.
+The builder refuses to emit a PASS unless both `evaluateMaxFilesizeRefusal`
+(unchanged) and `evaluateChunkedMaxFilesizeRefusal` are satisfied. `-01`,
+`-02` and `-03` records stay historical.
 
 The record is assembled from an allowlist and refuses to be written if it would
 carry a forbidden field (`stderr`, `argv`, anything credential-shaped) or a raw
@@ -256,13 +406,13 @@ DNS or nftables, and no Production credential is read.
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
 | `run-split-acceptance.mjs` | where Docker is | Verifies the build context's provenance and the accepted base, builds the non-deployable overlay, runs the container. |
-| `split-full-path.mjs` | inside the acceptance container | The orchestrator. Preflight, fixtures, full path, negatives, characterizations, evidence. |
+| `split-full-path.mjs` | inside the acceptance container | The orchestrator. Preflight, fixtures, full path, negatives, the `--max-filesize` refusal and its chunked twin, evidence. |
 | `lib/split-container.mjs` | — | The overlay Dockerfile and every `docker` argv. Pure; owns `--network none`. |
 | `lib/split-provenance.mjs` | — | The source-provenance gate: exact commit and tree, clean context, overlay runtime compatibility. |
 | `lib/split-fixture-url.mjs` | — | The exact-fixture URL validator. Test-only, and narrow by construction. |
 | `lib/local-object-writer.mjs` | — | The deterministic local `ObjectStoreWriter`. |
 | `lib/split-observers.mjs` | — | Spawn ledger, `/proc` media-tool sampler, SQLite status-audit trigger. |
-| `lib/split-evidence.mjs` | — | The `split06-…-02` record, its verified-provenance gate and its privacy refusals. |
+| `lib/split-evidence.mjs` | — | The `split06-…-04` record, its verified-provenance gate, its two `--max-filesize` PASS gates and its privacy refusals. |
 | `fixtures/split-media.mjs` | — | The four bit-exact fixture recipes and the DASH manifests. |
-| `fixtures/server.mjs` | loopback only | Extended with the optional, closed SPLIT-06 route set. |
+| `fixtures/server.mjs` | loopback only | Extended with the optional, closed SPLIT-06 route set; an instance built with `ranges: true` also answers single byte ranges on its media routes. |
 | `scripts/ytdlp-split-acceptance.test.mjs` | `npm test` | Harness self-tests. No Docker, no FFmpeg, no network. |

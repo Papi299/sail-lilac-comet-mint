@@ -1359,7 +1359,7 @@ execution that value becomes a real file suffix, a MIME decision and an
 ```
 /usr/bin/python3 /usr/local/lib/videofetch/yt-dlp
   <Phase-10C1 closed base policy>
-  --no-cache-dir --quiet --no-progress --no-warnings
+  --no-cache-dir --no-quiet --no-progress --no-warnings
   --socket-timeout=10 --retries=2 --fragment-retries=1 --extractor-retries=1
   --ffmpeg-location=/nonexistent/videofetch-yt-dlp-no-ffmpeg
   --fixup=never
@@ -1414,6 +1414,40 @@ The watcher polls the known `.part`/final paths every 150 ms, and on overflow
 aborts the owned process group and classifies the result as `TOO_LARGE` — not as
 a user cancellation. A final `stat` after a clean exit catches a file that grew
 between the last poll and process exit.
+
+**Every gate reports the same canonical `TOO_LARGE`.** A `--max-filesize`
+refusal is not an error to the pinned yt-dlp: `HttpFD` prints one status line,
+`[download] File is larger than max-filesize (N bytes > M bytes). Aborting.`,
+writes no final file, and the process **exits 0**. Where it refuses decides
+what it leaves. On a download's first response nothing is written. On a LATER
+response it has already written the earlier responses' bytes to the run's
+`.part`. A later response is either the next chunk of a source fetched in HTTP
+chunks or a resumed retry. The pinned YouTube extractor requests chunking for
+its https formats (`downloader_options.http_chunk_size = 10 << 20`), so that is
+the usual YouTube case. Since
+`YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001` acquisition runs `--no-quiet`
+(under `--quiet` that line is swallowed) and maps a zero exit to `TOO_LARGE`
+only when all of these hold:
+
+- that exact line is the final stdout line;
+- it names exactly the run's own `--max-filesize` allowance;
+- no playlist banner was printed;
+- no earlier cause (overflow, cancellation, shutdown) was latched;
+- the job directory holds exactly what that refusal can leave: either nothing
+  new, or only the run's own `.part`. That `.part` must be a regular file
+  inside the job directory, hold at least one byte, and hold no more than the
+  run's allowance;
+- any artifact validated before the run (a split pair's video half) is intact.
+
+Acquisition deletes nothing; the executor removes the partial `.part` along
+with the job directory. Anything else keeps its previous classification.
+stderr alone classifies a non-zero exit, and neither stream is logged,
+persisted or returned. The byte watcher is unchanged and
+still required — an unknown, missing or misreported length never reaches
+`--max-filesize` at all — and no size ceiling or network policy changed. This
+is **source, not deployment**: the Production image built from `e4fa646b…`
+still passes `--quiet` and reports this refusal as `PROCESSING_FAILED` until a
+new Worker image is built, accepted and deployed.
 
 #### Durable lifecycle
 
@@ -4546,8 +4580,9 @@ successful acquisition makes **exactly one** — both measured. The extras were
 yt-dlp's own `--retries=2` attempts inside a single acquisition.
 
 **"`downloaded_bytes` NULL means nothing downloaded."** No: acquisition runs
-`--quiet --no-progress`, so generic progress comes from the **Worker's own
-file-size watcher** on the `.part` file, never from yt-dlp's console.
+`--no-progress` (at the time also `--quiet`), so generic progress comes from the
+**Worker's own file-size watcher** on the `.part` file, never from yt-dlp's
+console.
 
 ### The harness reported it in the wrong causal order
 

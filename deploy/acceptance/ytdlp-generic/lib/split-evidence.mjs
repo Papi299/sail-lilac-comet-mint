@@ -20,8 +20,27 @@ import { OVERLAY_RUNTIME_COMPATIBILITY_FILES, isFullGitSha } from "./split-prove
  *        context, the accepted base source present, and every
  *        runtime-compatibility file the same Git object as in that accepted
  *        source. -01 records are historical and are never rewritten.
+ *   -03  the `--max-filesize` case is an ACCEPTANCE CONDITION, no longer a
+ *        characterization. A -02 record carried `maxFilesizeCharacterization`,
+ *        whose canonical code was recorded but never required, so a -02 PASS
+ *        coexisted with PROCESSING_FAILED. A -03 record carries
+ *        `maxFilesizeRefusal` instead, and a PASS requires it to satisfy
+ *        `evaluateMaxFilesizeRefusal` — TOO_LARGE, with nothing acquired.
+ *        -01 and -02 records are historical: never rewritten, and never
+ *        re-read under -03 rules.
+ *   -04  the CHUNKED `--max-filesize` refusal is an acceptance condition too.
+ *        A pinned `HttpFD` fetching a source in HTTP chunks — an extractor's
+ *        `downloader_options.http_chunk_size`, as the pinned YouTube extractor
+ *        sets on every https format — refuses a LATER chunk after the earlier
+ *        ones filled the run's `.part`, and the Worker now classifies that
+ *        shape TOO_LARGE as well. A -03 PASS proved only the refusal of a
+ *        download's first response, with nothing written, so a -04 record
+ *        adds `maxFilesizeChunkedRefusal`, and a PASS requires it to satisfy
+ *        `evaluateChunkedMaxFilesizeRefusal` besides the unchanged -03
+ *        condition. -01, -02 and -03 records are historical: never
+ *        rewritten, and never re-read under -04 rules.
  */
-export const SPLIT06_EVIDENCE_SCHEMA = "split06-deterministic-full-path-02";
+export const SPLIT06_EVIDENCE_SCHEMA = "split06-deterministic-full-path-04";
 
 /**
  * Values that must not appear ANYWHERE in a serialized record.
@@ -35,6 +54,183 @@ export const SPLIT06_FORBIDDEN_EVIDENCE_SUBSTRINGS = Object.freeze([
   "SPLIT06_VIDEO_01",
   "SPLIT06_AUDIO_01",
 ]);
+
+/** The canonical code a -03 PASS requires for the `--max-filesize` refusal. */
+export const MAX_FILESIZE_REFUSAL_REQUIRED_CODE = "TOO_LARGE";
+
+/**
+ * The -03 acceptance condition for the `--max-filesize` refusal case.
+ *
+ * Pure, and the single definition of it: the orchestrator records each result
+ * as a named check, and `buildSplitEvidence` re-evaluates the record's own
+ * block before it emits a PASS.
+ *
+ * The yt-dlp exit code is deliberately NOT a condition. The pinned release
+ * exits 0 on this refusal; SPLIT-06 pins the PRODUCT's canonical outcome, not
+ * yt-dlp's opinion of it. The exit code is recorded beside the result.
+ */
+export function evaluateMaxFilesizeRefusal(observation) {
+  const o = observation ?? {};
+  const positive = (n) => Number.isSafeInteger(n) && n > 0;
+  const tooLarge = o.canonicalErrorCode === MAX_FILESIZE_REFUSAL_REQUIRED_CODE;
+  return [
+    {
+      name: "max-filesize/declared-length-exceeds-allowance",
+      ok:
+        positive(o.ceilingBytes) &&
+        positive(o.declaredContentLengthBytes) &&
+        o.declaredContentLengthBytes > o.ceilingBytes,
+      detail: null,
+    },
+    { name: "max-filesize/acquisition-was-refused", ok: o.threw === true, detail: null },
+    {
+      // The video half, alone: a refused video half never starts the audio one.
+      name: "max-filesize/one-yt-dlp-run-carrying-the-run-allowance",
+      ok:
+        o.acquisitionRuns === 1 &&
+        positive(o.ceilingBytes) &&
+        o.maxFilesizeArgument === String(o.ceilingBytes),
+      detail: null,
+    },
+    { name: "max-filesize/left-no-final-file", ok: o.finalFileExists === false, detail: null },
+    { name: "max-filesize/left-no-part-file", ok: o.partFileExists === false, detail: null },
+    {
+      name: "max-filesize/classified-canonical-too-large",
+      ok: tooLarge,
+      detail: tooLarge ? null : `observed ${String(o.canonicalErrorCode)}`,
+    },
+  ];
+}
+
+/**
+ * Where the chunked case's chunk size must come from: the operand of the pinned
+ * `HttpFD.real_download` an extractor feeds, never the CLI's
+ * `--http-chunk-size`, which Production never passes.
+ */
+export const CHUNKED_REFUSAL_CHUNK_SIZE_SOURCE = "info_dict.downloader_options.http_chunk_size";
+
+/** The one argument the chunked case adds to the product's own acquisition argv. */
+export const CHUNKED_REFUSAL_HARNESS_ARGUMENT = "--load-info-json";
+
+/**
+ * The -04 acceptance condition for the CHUNKED `--max-filesize` refusal.
+ *
+ * Two halves, both required:
+ *
+ *   RUNTIME — what the exact pinned `HttpFD` does with a source carrying an
+ *   extractor-owned `downloader_options.http_chunk_size`: it admits whole
+ *   earlier chunks into the run's `.part`, then refuses a LATER one, exits 0
+ *   with the refusal as its final stdout line, and leaves that `.part` behind;
+ *
+ *   PRODUCT — what the Worker makes of it: the refused audio half, run with
+ *   exactly `combined − actual video bytes`, is TOO_LARGE.
+ *
+ * Pure, and the single definition: the orchestrator records each result as a
+ * named check, and `buildSplitEvidence` re-evaluates the record's own block
+ * before it emits a PASS. Unlike the -03 case, the yt-dlp exit code IS a
+ * condition here — this block characterizes the pinned runtime itself, and
+ * only a zero exit reaches the refusal witness at all.
+ */
+export function evaluateChunkedMaxFilesizeRefusal(observation) {
+  const o = observation ?? {};
+  const positive = (n) => Number.isSafeInteger(n) && n > 0;
+  const sameList = (a, b) =>
+    Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]);
+  const tooLarge = o.canonicalErrorCode === MAX_FILESIZE_REFUSAL_REQUIRED_CODE;
+  return [
+    {
+      name: "max-filesize-chunked/chunk-size-was-extractor-owned",
+      ok:
+        o.chunkSizeSource === CHUNKED_REFUSAL_CHUNK_SIZE_SOURCE &&
+        positive(o.httpChunkSizeBytes) &&
+        Number.isSafeInteger(o.httpFormatCount) &&
+        o.httpFormatCount >= 2 &&
+        o.chunkedFormatCount === o.httpFormatCount &&
+        o.paramsHttpChunkSizePassed === false &&
+        o.harnessArgumentAdded === CHUNKED_REFUSAL_HARNESS_ARGUMENT,
+      detail: null,
+    },
+    {
+      // Nothing was re-extracted: both halves were driven by the loaded
+      // document, so its `downloader_options` is what `HttpFD` received.
+      name: "max-filesize-chunked/acquisition-used-the-loaded-info-document",
+      ok: o.manifestGetsDuringAcquisition === 0,
+      detail: null,
+    },
+    {
+      name: "max-filesize-chunked/audio-run-carried-the-remainder",
+      ok:
+        o.acquisitionRuns === 2 &&
+        positive(o.combinedLimitBytes) &&
+        positive(o.videoBytes) &&
+        positive(o.audioAllowanceBytes) &&
+        o.audioAllowanceBytes === o.combinedLimitBytes - o.videoBytes &&
+        sameList(o.maxFilesizeArguments, [String(o.combinedLimitBytes), String(o.audioAllowanceBytes)]),
+      detail: null,
+    },
+    {
+      name: "max-filesize-chunked/video-half-was-acquired-in-chunks",
+      ok:
+        Number.isSafeInteger(o.videoRangedGets) &&
+        o.videoRangedGets >= 2 &&
+        o.videoRangesContiguous === true &&
+        o.videoArtifactMatchesFixture === true,
+      detail: null,
+    },
+    {
+      name: "max-filesize-chunked/earlier-chunks-landed-before-a-later-one-was-refused",
+      ok:
+        Number.isSafeInteger(o.earlierChunksServed) &&
+        o.earlierChunksServed >= 1 &&
+        o.earlierChunksServed === o.expectedEarlierChunks &&
+        o.audioRangesContiguous === true &&
+        positive(o.partBytes) &&
+        o.refusedRangeStartBytes === o.partBytes,
+      detail: null,
+    },
+    {
+      name: "max-filesize-chunked/declared-length-exceeds-allowance",
+      ok:
+        positive(o.declaredBytes) &&
+        positive(o.audioAllowanceBytes) &&
+        o.declaredBytes > o.audioAllowanceBytes,
+      detail: null,
+    },
+    {
+      name: "max-filesize-chunked/pinned-exit-0-with-the-refusal-as-final-line",
+      ok: o.ytdlpExitCode === 0 && o.ytdlpRefusalLineWasFinal === true,
+      detail: null,
+    },
+    {
+      name: "max-filesize-chunked/left-exactly-the-video-artifact-and-the-audio-part",
+      ok:
+        o.finalFileExists === false &&
+        Array.isArray(o.expectedWorkDirEntries) &&
+        o.expectedWorkDirEntries.length === 2 &&
+        sameList(o.workDirEntries, o.expectedWorkDirEntries),
+      detail: null,
+    },
+    {
+      name: "max-filesize-chunked/part-is-a-regular-file-within-the-allowance",
+      ok:
+        o.partIsRegularFile === true &&
+        positive(o.partBytes) &&
+        positive(o.audioAllowanceBytes) &&
+        o.partBytes <= o.audioAllowanceBytes,
+      detail: null,
+    },
+    {
+      name: "max-filesize-chunked/part-holds-exactly-the-earlier-chunks",
+      ok: o.partMatchesFixturePrefix === true,
+      detail: null,
+    },
+    {
+      name: "max-filesize-chunked/classified-canonical-too-large",
+      ok: tooLarge,
+      detail: tooLarge ? null : `observed ${String(o.canonicalErrorCode)}`,
+    },
+  ];
+}
 
 /**
  * Assembles the record from an ALLOWLIST.
@@ -89,10 +285,30 @@ export function buildSplitEvidence(input) {
     privacy: input.privacy,
     cleanup: input.cleanup,
     negativeCases: input.negativeCases,
-    maxFilesizeCharacterization: input.maxFilesizeCharacterization,
+    maxFilesizeRefusal: input.maxFilesizeRefusal,
+    maxFilesizeChunkedRefusal: input.maxFilesizeChunkedRefusal,
     ffmpegOverwriteRefusal: input.ffmpegOverwriteRefusal,
     checks: input.checks,
   };
+
+  // -03: a PASS is also a claim that the `--max-filesize` refusal was
+  // classified TOO_LARGE with nothing acquired; -04 adds the chunked refusal,
+  // classified TOO_LARGE with only the refused half's partial `.part` left. No
+  // PASS record is emitted unless the record's own blocks satisfy both.
+  if (record.verdict === "PASS") {
+    for (const [label, evaluate, block] of [
+      ["max-filesize refusal", evaluateMaxFilesizeRefusal, record.maxFilesizeRefusal],
+      ["chunked max-filesize refusal", evaluateChunkedMaxFilesizeRefusal, record.maxFilesizeChunkedRefusal],
+    ]) {
+      const unmet = evaluate(block).filter((c) => !c.ok);
+      if (unmet.length > 0) {
+        throw new Error(
+          `refusing to emit a PASS ${SPLIT06_EVIDENCE_SCHEMA} record whose ${label} failed: ` +
+            unmet.map((c) => c.name).join(", "),
+        );
+      }
+    }
+  }
 
   // Order matters. The forbidden-key check runs on the RAW record, so a field
   // that should never have been assembled is a loud refusal rather than a

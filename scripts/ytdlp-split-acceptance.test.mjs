@@ -25,6 +25,7 @@ import {
   createFixtureService,
   LISTEN_ADDRESS,
   PHASE_10D_ROUTES,
+  readSingleByteRange,
   SPLIT_MANIFEST_ROUTES,
   SPLIT_MEDIA_ROUTES,
   SPLIT_ROUTE_CONTENT_TYPES,
@@ -67,6 +68,11 @@ import { openWorkerDatabase } from "../src/worker/state/database.server.ts";
 import { applyMigrations } from "../src/worker/state/migrations.server.ts";
 import {
   buildSplitEvidence,
+  CHUNKED_REFUSAL_CHUNK_SIZE_SOURCE,
+  CHUNKED_REFUSAL_HARNESS_ARGUMENT,
+  evaluateChunkedMaxFilesizeRefusal,
+  evaluateMaxFilesizeRefusal,
+  MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
   renderSplitEvidence,
   SPLIT06_EVIDENCE_SCHEMA,
   SPLIT06_FORBIDDEN_EVIDENCE_SUBSTRINGS,
@@ -406,6 +412,88 @@ describe("split fixture service: exposure surface", () => {
     );
     // ...and a service configured with nothing at all is still refused.
     assert.throws(() => createFixtureService({}), /direct fixture media must be a non-empty Buffer/);
+  });
+});
+
+// -- the opt-in RANGED split instance (the chunked --max-filesize case only) --
+
+describe("split fixture service: the opt-in ranged instance", () => {
+  it("reads exactly one byte range, and nothing it cannot honour", () => {
+    assert.deepEqual(readSingleByteRange("bytes=0-99", 1000), { satisfiable: true, start: 0, end: 99 });
+    assert.deepEqual(readSingleByteRange("bytes=900-", 1000), { satisfiable: true, start: 900, end: 999 });
+    assert.deepEqual(readSingleByteRange("bytes=900-5000", 1000), { satisfiable: true, start: 900, end: 999 });
+    assert.deepEqual(readSingleByteRange("bytes=1000-", 1000), { satisfiable: false });
+    assert.deepEqual(readSingleByteRange("bytes=1000-2000", 1000), { satisfiable: false });
+    for (const ignored of [
+      undefined,
+      "",
+      "bytes=-100",
+      "bytes=0-1,5-9",
+      "bytes=9-3",
+      "items=0-1",
+      "bytes=0x1-2",
+      "bytes= 0-1",
+      `bytes=${"9".repeat(16)}-`,
+    ]) {
+      assert.equal(readSingleByteRange(ignored, 1000), null, String(ignored));
+    }
+  });
+
+  it("is OFF by default: every split route stays whole-object, Range header or not", async () => {
+    const fx = await startSplitFixture();
+    const res = await fetch(`${fx.base}/split-video.mp4`, { headers: { range: "bytes=0-3" } });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("accept-ranges"), "none");
+    assert.equal(Buffer.from(await res.arrayBuffer()).byteLength, bodyFor("/split-video.mp4").byteLength);
+    // The default instance's log is exactly what it always was.
+    assert.deepEqual(Object.keys(fx.service.splitRequests()[0]).sort(), ["at", "bytes", "method", "route"]);
+    assert.equal(fx.service.manifest().splitMediaRanges, "none");
+  });
+
+  it("serves one range per media request, 416 past the end, and never a range of a manifest", async () => {
+    const set = splitSet();
+    const fx = await startSplitFixture({ split: { ...set, ranges: true } });
+    const body = bodyFor("/split-audio.m4a");
+
+    const part = await fetch(`${fx.base}/split-audio.m4a`, { headers: { range: "bytes=2-9" } });
+    assert.equal(part.status, 206);
+    assert.equal(part.headers.get("content-range"), `bytes 2-9/${body.byteLength}`);
+    assert.equal(part.headers.get("content-length"), "8");
+    assert.equal(part.headers.get("accept-ranges"), "bytes");
+    assert.deepEqual(Buffer.from(await part.arrayBuffer()), body.subarray(2, 10));
+
+    const past = await fetch(`${fx.base}/split-audio.m4a`, { headers: { range: `bytes=${body.byteLength}-` } });
+    assert.equal(past.status, 416);
+    assert.equal(past.headers.get("content-range"), `bytes */${body.byteLength}`);
+    await past.arrayBuffer();
+
+    const whole = await fetch(`${fx.base}/split-audio.m4a`);
+    assert.equal(whole.status, 200);
+    assert.equal(whole.headers.get("accept-ranges"), "bytes");
+    await whole.arrayBuffer();
+
+    const manifest = await fetch(`${fx.base}/split-mp4.mpd`, { headers: { range: "bytes=0-3" } });
+    assert.equal(manifest.status, 200, "a manifest never answers a range");
+    assert.equal(manifest.headers.get("accept-ranges"), "none");
+    await manifest.arrayBuffer();
+
+    assert.deepEqual(
+      fx.service.splitRequests().map((r) => [r.route, r.status, r.bytes, r.range]),
+      [
+        ["/split-audio.m4a", 206, 8, { start: 2, end: 9, total: body.byteLength }],
+        ["/split-audio.m4a", 416, 0, null],
+        ["/split-audio.m4a", 200, body.byteLength, null],
+        ["/split-mp4.mpd", 200, set.manifests["/split-mp4.mpd"].byteLength, null],
+      ],
+    );
+    assert.equal(fx.service.manifest().splitMediaRanges, "single byte range");
+  });
+
+  it("refuses a `ranges` that is not a boolean", () => {
+    assert.throws(
+      () => createFixtureService({ split: { ...splitSet(), ranges: "yes" } }),
+      /`ranges` must be a boolean/,
+    );
   });
 });
 
@@ -768,6 +856,71 @@ describe("split acceptance: container model", () => {
 
 // -- the evidence record ----------------------------------------------------
 
+/** A `--max-filesize` observation that satisfies every -03 condition. */
+const passingRefusal = (overrides = {}) => ({
+  ceilingBytes: 53408,
+  declaredContentLengthBytes: 106817,
+  refusedHalf: "video",
+  threw: true,
+  acquisitionRuns: 1,
+  maxFilesizeArgument: "53408",
+  ytdlpExitCode: 0,
+  ytdlpRefusalLineWasFinal: true,
+  ytdlpStdoutBytes: 312,
+  ytdlpStderrBytes: 0,
+  finalFileExists: false,
+  partFileExists: false,
+  workDirEntries: [],
+  canonicalErrorCode: MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
+  requiredCanonicalErrorCode: MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
+  ...overrides,
+});
+
+/**
+ * A chunked refusal observation that satisfies every -04 condition. Shaped
+ * like the MP4 family: a 17572-byte audio half, so an 8786-byte remainder and
+ * 2928-byte chunks — three admitted, the fourth refused.
+ */
+const passingChunkedRefusal = (overrides = {}) => ({
+  refusedHalf: "audio",
+  chunkSizeSource: CHUNKED_REFUSAL_CHUNK_SIZE_SOURCE,
+  httpChunkSizeBytes: 2928,
+  httpFormatCount: 2,
+  chunkedFormatCount: 2,
+  paramsHttpChunkSizePassed: false,
+  harnessArgumentAdded: CHUNKED_REFUSAL_HARNESS_ARGUMENT,
+  manifestGetsDuringAcquisition: 0,
+  threw: true,
+  acquisitionRuns: 2,
+  combinedLimitBytes: 115603,
+  videoBytes: 106817,
+  audioAllowanceBytes: 8786,
+  maxFilesizeArguments: ["115603", "8786"],
+  videoRangedGets: 37,
+  videoRangesContiguous: true,
+  videoArtifactMatchesFixture: true,
+  audioRangedGets: 4,
+  audioRangesContiguous: true,
+  expectedEarlierChunks: 3,
+  earlierChunksServed: 3,
+  refusedRangeStartBytes: 8700,
+  refusedRangeContentLengthBytes: 2928,
+  declaredBytes: 11628,
+  ytdlpExitCode: 0,
+  ytdlpRefusalLineWasFinal: true,
+  ytdlpStdoutBytes: 400,
+  ytdlpStderrBytes: 0,
+  finalFileExists: false,
+  partIsRegularFile: true,
+  partBytes: 8700,
+  partMatchesFixturePrefix: true,
+  workDirEntries: ["audio-source.m4a.part", "video-source.mp4"],
+  expectedWorkDirEntries: ["audio-source.m4a.part", "video-source.mp4"],
+  canonicalErrorCode: MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
+  requiredCanonicalErrorCode: MAX_FILESIZE_REFUSAL_REQUIRED_CODE,
+  ...overrides,
+});
+
 describe("split acceptance: evidence record", () => {
   const minimal = (overrides = {}) => ({
     verdict: "PASS",
@@ -810,7 +963,8 @@ describe("split acceptance: evidence record", () => {
     privacy: {},
     cleanup: {},
     negativeCases: {},
-    maxFilesizeCharacterization: {},
+    maxFilesizeRefusal: passingRefusal(),
+    maxFilesizeChunkedRefusal: passingChunkedRefusal(),
     ffmpegOverwriteRefusal: {},
     checks: [],
     ...overrides,
@@ -819,7 +973,7 @@ describe("split acceptance: evidence record", () => {
   it("stamps its own schema and states the network mode", () => {
     const record = buildSplitEvidence(minimal());
     assert.equal(record.schema, SPLIT06_EVIDENCE_SCHEMA);
-    assert.equal(record.schema, "split06-deterministic-full-path-02");
+    assert.equal(record.schema, "split06-deterministic-full-path-04");
     assert.equal(record.network.mode, "none");
     assert.equal(record.network.publicHostsContacted, 0);
     assert.equal(record.network.dnsLookups, 0);
@@ -893,7 +1047,8 @@ describe("split acceptance: evidence record", () => {
       "fixtures",
       "image",
       "lifecycle",
-      "maxFilesizeCharacterization",
+      "maxFilesizeChunkedRefusal",
+      "maxFilesizeRefusal",
       "negativeCases",
       "network",
       "plan",
@@ -915,6 +1070,247 @@ describe("split acceptance: evidence record", () => {
     assert.equal(JSON.parse(text).schema, SPLIT06_EVIDENCE_SCHEMA);
     assert.ok(text.endsWith("\n"));
   });
+
+  it("refuses a PASS whose --max-filesize refusal was not classified TOO_LARGE", () => {
+    // Exactly the -02 observation: the pinned refusal reported PROCESSING_FAILED.
+    assert.throws(
+      () =>
+        buildSplitEvidence(
+          minimal({
+            maxFilesizeRefusal: passingRefusal({ canonicalErrorCode: "PROCESSING_FAILED" }),
+          }),
+        ),
+      /PASS .* max-filesize refusal failed: max-filesize\/classified-canonical-too-large/,
+    );
+    for (const overrides of [
+      { threw: false },
+      { finalFileExists: true },
+      { partFileExists: true },
+      { acquisitionRuns: 2 },
+    ]) {
+      assert.throws(
+        () => buildSplitEvidence(minimal({ maxFilesizeRefusal: passingRefusal(overrides) })),
+        /refusing to emit a PASS/,
+      );
+    }
+    assert.throws(
+      () => buildSplitEvidence(minimal({ maxFilesizeRefusal: undefined })),
+      /refusing to emit a PASS/,
+    );
+  });
+
+  it("a FAIL record still carries the refusal it observed", () => {
+    const record = buildSplitEvidence(
+      minimal({
+        verdict: "FAIL",
+        maxFilesizeRefusal: passingRefusal({ canonicalErrorCode: "PROCESSING_FAILED" }),
+      }),
+    );
+    assert.equal(record.verdict, "FAIL");
+    assert.equal(record.maxFilesizeRefusal.canonicalErrorCode, "PROCESSING_FAILED");
+  });
+
+  it("refuses a PASS whose CHUNKED --max-filesize refusal failed — a -03-shaped record included", () => {
+    // A -03 record carried no chunked block: under -04 it can never be a PASS.
+    assert.throws(
+      () => buildSplitEvidence(minimal({ maxFilesizeChunkedRefusal: undefined })),
+      /PASS .* chunked max-filesize refusal failed/,
+    );
+    // The shape's behaviour before this correction: its partial .part made the
+    // Worker report PROCESSING_FAILED.
+    assert.throws(
+      () =>
+        buildSplitEvidence(
+          minimal({
+            maxFilesizeChunkedRefusal: passingChunkedRefusal({ canonicalErrorCode: "PROCESSING_FAILED" }),
+          }),
+        ),
+      /PASS .* chunked max-filesize refusal failed: max-filesize-chunked\/classified-canonical-too-large/,
+    );
+    for (const overrides of [
+      { partBytes: 0 },
+      { ytdlpExitCode: 1 },
+      { earlierChunksServed: 0 },
+      { paramsHttpChunkSizePassed: true },
+    ]) {
+      assert.throws(
+        () => buildSplitEvidence(minimal({ maxFilesizeChunkedRefusal: passingChunkedRefusal(overrides) })),
+        /refusing to emit a PASS/,
+        JSON.stringify(overrides),
+      );
+    }
+  });
+
+  it("a FAIL record still carries the chunked refusal it observed", () => {
+    const record = buildSplitEvidence(
+      minimal({
+        verdict: "FAIL",
+        maxFilesizeChunkedRefusal: passingChunkedRefusal({ canonicalErrorCode: "PROCESSING_FAILED" }),
+      }),
+    );
+    assert.equal(record.verdict, "FAIL");
+    assert.equal(record.maxFilesizeChunkedRefusal.canonicalErrorCode, "PROCESSING_FAILED");
+  });
+});
+
+// -- the -03 `--max-filesize` acceptance condition ---------------------------
+
+describe("split acceptance: the -03 --max-filesize acceptance condition", () => {
+  const failing = (overrides) =>
+    evaluateMaxFilesizeRefusal(passingRefusal(overrides)).filter((c) => !c.ok);
+
+  it("a refusal classified TOO_LARGE with nothing acquired satisfies every condition", () => {
+    const checks = evaluateMaxFilesizeRefusal(passingRefusal());
+    assert.deepEqual(checks.filter((c) => !c.ok), []);
+    assert.deepEqual(
+      checks.map((c) => c.name),
+      [
+        "max-filesize/declared-length-exceeds-allowance",
+        "max-filesize/acquisition-was-refused",
+        "max-filesize/one-yt-dlp-run-carrying-the-run-allowance",
+        "max-filesize/left-no-final-file",
+        "max-filesize/left-no-part-file",
+        "max-filesize/classified-canonical-too-large",
+      ],
+    );
+    assert.equal(MAX_FILESIZE_REFUSAL_REQUIRED_CODE, "TOO_LARGE");
+  });
+
+  it("the OLD behaviour no longer passes: PROCESSING_FAILED fails the condition", () => {
+    const unmet = failing({ canonicalErrorCode: "PROCESSING_FAILED" });
+    assert.deepEqual(
+      unmet.map((c) => c.name),
+      ["max-filesize/classified-canonical-too-large"],
+    );
+    assert.match(unmet[0].detail, /PROCESSING_FAILED/);
+  });
+
+  it("the yt-dlp exit code is recorded, never required", () => {
+    for (const ytdlpExitCode of [0, 1, null]) {
+      assert.deepEqual(failing({ ytdlpExitCode }), [], `exit ${ytdlpExitCode}`);
+    }
+  });
+
+  it("every other requirement is enforced", () => {
+    const cases = [
+      [{ threw: false }, "max-filesize/acquisition-was-refused"],
+      [{ finalFileExists: true }, "max-filesize/left-no-final-file"],
+      [{ partFileExists: true }, "max-filesize/left-no-part-file"],
+      // The audio half must never have started, and the one run that did must
+      // carry this run's own allowance.
+      [{ acquisitionRuns: 2 }, "max-filesize/one-yt-dlp-run-carrying-the-run-allowance"],
+      [{ acquisitionRuns: 0 }, "max-filesize/one-yt-dlp-run-carrying-the-run-allowance"],
+      [{ maxFilesizeArgument: "106817" }, "max-filesize/one-yt-dlp-run-carrying-the-run-allowance"],
+      [{ maxFilesizeArgument: null }, "max-filesize/one-yt-dlp-run-carrying-the-run-allowance"],
+      [{ declaredContentLengthBytes: 1 }, "max-filesize/declared-length-exceeds-allowance"],
+      [{ ceilingBytes: 0 }, "max-filesize/declared-length-exceeds-allowance"],
+    ];
+    for (const [overrides, expected] of cases) {
+      const names = failing(overrides).map((c) => c.name);
+      assert.ok(names.includes(expected), `${JSON.stringify(overrides)} -> ${names.join(",")}`);
+    }
+  });
+
+  it("an absent block satisfies nothing", () => {
+    assert.equal(
+      evaluateMaxFilesizeRefusal(undefined).every((c) => !c.ok),
+      true,
+    );
+  });
+});
+
+// -- the -04 CHUNKED `--max-filesize` acceptance condition -------------------
+
+describe("split acceptance: the -04 chunked --max-filesize acceptance condition", () => {
+  const failing = (overrides) =>
+    evaluateChunkedMaxFilesizeRefusal(passingChunkedRefusal(overrides)).filter((c) => !c.ok);
+
+  it("a LATER-chunk refusal classified TOO_LARGE, its partial .part left, satisfies every condition", () => {
+    const checks = evaluateChunkedMaxFilesizeRefusal(passingChunkedRefusal());
+    assert.deepEqual(checks.filter((c) => !c.ok), []);
+    assert.deepEqual(
+      checks.map((c) => c.name),
+      [
+        "max-filesize-chunked/chunk-size-was-extractor-owned",
+        "max-filesize-chunked/acquisition-used-the-loaded-info-document",
+        "max-filesize-chunked/audio-run-carried-the-remainder",
+        "max-filesize-chunked/video-half-was-acquired-in-chunks",
+        "max-filesize-chunked/earlier-chunks-landed-before-a-later-one-was-refused",
+        "max-filesize-chunked/declared-length-exceeds-allowance",
+        "max-filesize-chunked/pinned-exit-0-with-the-refusal-as-final-line",
+        "max-filesize-chunked/left-exactly-the-video-artifact-and-the-audio-part",
+        "max-filesize-chunked/part-is-a-regular-file-within-the-allowance",
+        "max-filesize-chunked/part-holds-exactly-the-earlier-chunks",
+        "max-filesize-chunked/classified-canonical-too-large",
+      ],
+    );
+    assert.equal(CHUNKED_REFUSAL_CHUNK_SIZE_SOURCE, "info_dict.downloader_options.http_chunk_size");
+    assert.equal(CHUNKED_REFUSAL_HARNESS_ARGUMENT, "--load-info-json");
+  });
+
+  it("the shape's behaviour before this correction no longer passes: PROCESSING_FAILED fails the condition", () => {
+    const unmet = failing({ canonicalErrorCode: "PROCESSING_FAILED" });
+    assert.deepEqual(
+      unmet.map((c) => c.name),
+      ["max-filesize-chunked/classified-canonical-too-large"],
+    );
+    assert.match(unmet[0].detail, /PROCESSING_FAILED/);
+  });
+
+  it("every requirement is enforced", () => {
+    const owned = "max-filesize-chunked/chunk-size-was-extractor-owned";
+    const remainder = "max-filesize-chunked/audio-run-carried-the-remainder";
+    const video = "max-filesize-chunked/video-half-was-acquired-in-chunks";
+    const earlier = "max-filesize-chunked/earlier-chunks-landed-before-a-later-one-was-refused";
+    const exit0 = "max-filesize-chunked/pinned-exit-0-with-the-refusal-as-final-line";
+    const left = "max-filesize-chunked/left-exactly-the-video-artifact-and-the-audio-part";
+    const part = "max-filesize-chunked/part-is-a-regular-file-within-the-allowance";
+    const cases = [
+      // The chunk size must arrive through the extractor-owned operand.
+      [{ chunkSizeSource: "params.http_chunk_size" }, owned],
+      [{ paramsHttpChunkSizePassed: true }, owned],
+      [{ chunkedFormatCount: 1 }, owned],
+      [{ httpFormatCount: 1, chunkedFormatCount: 1 }, owned],
+      [{ harnessArgumentAdded: "--http-chunk-size" }, owned],
+      [{ manifestGetsDuringAcquisition: 1 }, "max-filesize-chunked/acquisition-used-the-loaded-info-document"],
+      // The audio half, and only the audio half, carries the remainder.
+      [{ acquisitionRuns: 1 }, remainder],
+      [{ maxFilesizeArguments: ["115603", "115603"] }, remainder],
+      [{ audioAllowanceBytes: 8787 }, remainder],
+      [{ videoRangedGets: 1 }, video],
+      [{ videoRangesContiguous: false }, video],
+      [{ videoArtifactMatchesFixture: false }, video],
+      // A LATER chunk was refused, after exactly the predicted earlier ones.
+      [{ earlierChunksServed: 0 }, earlier],
+      [{ earlierChunksServed: 2 }, earlier],
+      [{ audioRangesContiguous: false }, earlier],
+      [{ refusedRangeStartBytes: 8699 }, earlier],
+      [{ declaredBytes: 8786 }, "max-filesize-chunked/declared-length-exceeds-allowance"],
+      [{ ytdlpExitCode: 1 }, exit0],
+      [{ ytdlpRefusalLineWasFinal: false }, exit0],
+      // Exactly the video artifact and the audio .part; nothing else.
+      [{ finalFileExists: true }, left],
+      [{ workDirEntries: ["video-source.mp4"] }, left],
+      [
+        { workDirEntries: ["audio-source.m4a.part", "audio-source.m4a.part-Frag1", "video-source.mp4"] },
+        left,
+      ],
+      [{ partIsRegularFile: false }, part],
+      [{ partBytes: 8787, refusedRangeStartBytes: 8787 }, part],
+      [{ partMatchesFixturePrefix: false }, "max-filesize-chunked/part-holds-exactly-the-earlier-chunks"],
+    ];
+    for (const [overrides, expected] of cases) {
+      const names = failing(overrides).map((c) => c.name);
+      assert.ok(names.includes(expected), `${JSON.stringify(overrides)} -> ${names.join(",")}`);
+    }
+  });
+
+  it("an absent block satisfies nothing", () => {
+    assert.equal(
+      evaluateChunkedMaxFilesizeRefusal(undefined).every((c) => !c.ok),
+      true,
+    );
+  });
 });
 
 // -- the observers ----------------------------------------------------------
@@ -924,7 +1320,7 @@ describe("split acceptance: observers", () => {
     const calls = [];
     const ledger = createRunnerLedger(async (opts) => {
       calls.push(opts);
-      return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "héllo", stderr: "" };
     });
     ledger.setPhase("acquisition");
     const opts = {
