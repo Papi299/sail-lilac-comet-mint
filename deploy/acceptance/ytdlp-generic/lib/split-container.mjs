@@ -10,10 +10,12 @@
 // and the exact accepted FFmpeg/ffprobe. SPLIT-01..05 changed application
 // source only: `package.json`, `package-lock.json`, `Dockerfile.worker`, the
 // pinned runtime module and the alias loader are byte-identical between the
-// accepted image's source commit and the SPLIT-06 candidate (verified before
-// the overlay is built). Rebuilding Bookworm packages to test a source change
-// would introduce unrelated runtime drift into the one run that is supposed to
-// isolate the source.
+// accepted image's source commit and the SPLIT-06 candidate. That premise is
+// not assumed: `lib/split-provenance.mjs` checks it as Git objects on every run,
+// and the driver refuses to build the overlay when it no longer holds.
+// Rebuilding Bookworm packages to test a source change would introduce
+// unrelated runtime drift into the one run that is supposed to isolate the
+// source.
 //
 // ── Why the overlay is NOT a release artifact ──────────────────────────────
 //
@@ -31,6 +33,13 @@ export const OVERLAY_IMAGE_REPOSITORY = "videofetch-worker";
  * somewhere a deployment reads it.
  */
 export const FORBIDDEN_OVERLAY_TAGS = Object.freeze(["latest", "stable", "production", "current"]);
+
+/**
+ * The ONLY repository paths the overlay copies from the build context; every
+ * other file in the image is the accepted image's own. The provenance gate
+ * reads this same list, so what is verified clean is exactly what is copied.
+ */
+export const OVERLAY_COPIED_PATHS = Object.freeze(["src", "deploy/acceptance/ytdlp-generic"]);
 
 /**
  * The overlay tag for one candidate head.
@@ -69,8 +78,7 @@ export function overlayDockerfile(baseImage) {
     "# user and the environment — is inherited from the accepted image.",
     `FROM ${baseImage}`,
     "USER root",
-    "COPY --chown=node:node src /app/src",
-    "COPY --chown=node:node deploy/acceptance/ytdlp-generic /app/deploy/acceptance/ytdlp-generic",
+    ...OVERLAY_COPIED_PATHS.map((path) => `COPY --chown=node:node ${path} /app/${path}`),
     "# The trusted R2 credential broker is NOT part of the media container.",
     "RUN rm -rf /app/src/broker",
     "USER node",

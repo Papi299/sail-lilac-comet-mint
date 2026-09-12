@@ -20,6 +20,29 @@
 // that the Worker's upload lifecycle drove a conforming writer end to end with
 // exact byte fidelity.
 //
+// ── HEAD reports what is STORED, never what was declared ───────────────────
+//
+// `finalizeJobUpload` puts, then HEADs, then compares the head's
+// `contentLength` with the `fileSize` it expected. That comparison is the
+// lifecycle's proof that the provider holds what the Worker produced, and it
+// proves something only if the head is a second, INDEPENDENT observation of
+// the stored object. That is what R2 gives the real writer: `HeadObject`'s
+// `ContentLength` is R2's own measurement, not an echo of the PUT.
+//
+// So this writer keeps three numbers apart:
+//
+//   declaredLength        what the caller's put said it would send
+//   observedBytes         what this writer counted while consuming the body
+//   head().contentLength  `lstat()` of the persisted sink file, taken at HEAD
+//                         time — neither the declaration nor the counter
+//
+// A HEAD that echoed the declaration would let the lifecycle compare its
+// expectation with itself, and a truncated upload would reach `ready`.
+// Measuring the stored object is what lets the REAL lifecycle refuse it.
+//
+// `contentType` and `contentDisposition` are replayed from what the put stored,
+// as a real provider replays the metadata it persisted with the object.
+//
 // ── Why it validates its own input ─────────────────────────────────────────
 //
 // `finalizeJobUpload` already parses the put candidate through
@@ -35,7 +58,7 @@
 // one exact key and removes that key alone.
 
 import { createHash } from "node:crypto";
-import { mkdir, writeFile, rm } from "node:fs/promises";
+import { lstat, mkdir, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { ObjectStorePutInputSchema } from "../../../../src/worker/storage/writer.ts";
 import { WorkerObjectKeySchema } from "../../../../src/shared/worker/contracts.ts";
@@ -55,14 +78,29 @@ export function createLocalObjectStoreWriter({ sinkDir, onPut }) {
     throw new Error("the local object writer needs a task-owned sink directory");
   }
 
-  /** @type {Map<string, {objectKey:string, contentLength:number, contentType:string, contentDisposition:string, sha256:string, path:string, observedBytes:number}>} */
+  /** @type {Map<string, {objectKey:string, declaredLength:number, observedBytes:number, contentType:string, contentDisposition:string, sha256:string, path:string}>} */
   const objects = new Map();
   const puts = [];
+  const heads = [];
   const deletes = [];
 
   /** One object key becomes one flat filename; the key never becomes a path. */
   const sinkPathFor = (objectKey) =>
     join(sinkDir, `${createHash("sha256").update(objectKey).digest("hex")}.object`);
+
+  /** The stored object's size, measured now; null when it no longer exists. */
+  async function persistedSize(record) {
+    let info;
+    try {
+      info = await lstat(record.path);
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    // Anything but a plain file is an operational failure, not "missing".
+    if (!info.isFile()) throw new Error("the persisted object is not a regular file");
+    return info.size;
+  }
 
   return {
     async put(input) {
@@ -92,36 +130,43 @@ export function createLocalObjectStoreWriter({ sinkDir, onPut }) {
 
       const record = {
         objectKey: parsed.objectKey,
-        // `head` must answer with what the CALLER declared, because that is
-        // what `finalizeJobUpload` compares against — a provider that answered
-        // with its own measurement would make the lifecycle's verification
-        // step tautological. The measured length is recorded separately.
-        contentLength: parsed.contentLength,
+        // The caller's declaration, kept apart from every measurement. `head`
+        // never reads it.
+        declaredLength: parsed.contentLength,
+        observedBytes,
         contentType: parsed.contentType,
         contentDisposition: parsed.contentDisposition,
         sha256: hash.digest("hex"),
         path,
-        observedBytes,
       };
       objects.set(parsed.objectKey, record);
       puts.push({
         objectKey: parsed.objectKey,
         declaredLength: parsed.contentLength,
+        declaredContentType: parsed.contentType,
+        declaredContentDisposition: parsed.contentDisposition,
         observedBytes,
-        contentType: parsed.contentType,
       });
     },
 
     async head(objectKey) {
       const key = WorkerObjectKeySchema.parse(objectKey);
       const record = objects.get(key);
-      if (!record) return null;
-      return {
+      // A second, independent observation of the STORED object: its length
+      // comes from the persisted file, measured at HEAD time.
+      const contentLength = record ? await persistedSize(record) : null;
+      if (!record || contentLength === null) {
+        heads.push({ objectKey: key, contentLength: null, contentType: null, contentDisposition: null });
+        return null;
+      }
+      const head = {
         objectKey: record.objectKey,
-        contentLength: record.contentLength,
+        contentLength,
         contentType: record.contentType,
         contentDisposition: record.contentDisposition,
       };
+      heads.push({ ...head });
+      return head;
     },
 
     async delete(objectKey) {
@@ -150,6 +195,10 @@ export function createLocalObjectStoreWriter({ sinkDir, onPut }) {
     },
     putLog() {
       return puts.map((p) => ({ ...p }));
+    },
+    /** Every head answered, including the misses, in order. */
+    headLog() {
+      return heads.map((h) => ({ ...h }));
     },
     deleteLog() {
       return [...deletes];

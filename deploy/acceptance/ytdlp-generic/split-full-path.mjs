@@ -91,6 +91,7 @@ import {
   readStatusTrace,
 } from "./lib/split-observers.mjs";
 import { buildSplitEvidence, renderSplitEvidence } from "./lib/split-evidence.mjs";
+import { isFullGitSha } from "./lib/split-provenance.mjs";
 
 // ── Bounds ─────────────────────────────────────────────────────────────────
 
@@ -724,6 +725,39 @@ async function runFullPath(ctx) {
   const finalJob = store.getJob(jobId);
   note("ready committed", `status=${finalJob?.status}`);
 
+  // ── the provider boundary, as the REAL lifecycle drove it (§37/§40) ──────
+  // `finalizeJobUpload` puts, HEADs, compares the provider's own observation
+  // with what it expected, and only then commits `ready` — otherwise it deletes
+  // the object and refuses. The local writer's HEAD MEASURES the persisted
+  // object, so a provider that stored different bytes is refused here, by the
+  // product, before any harness assertion reads a byte. This check reports that
+  // boundary's outcome and names the head field that disagreed; it is not the
+  // mechanism that refuses.
+  const lifecycleHeads = writer.headLog();
+  const lifecycleHead = lifecycleHeads.length === 1 ? lifecycleHeads[0] : null;
+  const lifecyclePut = lifecycleHead
+    ? (writer.putLog().find((p) => p.objectKey === lifecycleHead.objectKey) ?? null)
+    : null;
+  const headDisagreements =
+    lifecycleHead && lifecyclePut
+      ? [
+          lifecycleHead.contentLength !== lifecyclePut.declaredLength ? "contentLength" : null,
+          lifecycleHead.contentType !== lifecyclePut.declaredContentType ? "contentType" : null,
+          lifecycleHead.contentDisposition !== lifecyclePut.declaredContentDisposition
+            ? "contentDisposition"
+            : null,
+        ].filter(Boolean)
+      : [`${lifecycleHeads.length} lifecycle heads`];
+  const cleanupDeletes = writer.deleteLog().length;
+  checks.require(
+    "upload/real-lifecycle-accepted-the-provider-head",
+    finalJob?.status === "ready" && cleanupDeletes === 0 && headDisagreements.length === 0,
+    `status=${finalJob?.status} error=${finalJob?.errorCode ?? "none"} ` +
+      `declared=${lifecyclePut?.declaredLength ?? "?"} stored=${lifecyclePut?.observedBytes ?? "?"} ` +
+      `head=${lifecycleHead?.contentLength ?? "?"} disagreed=[${headDisagreements.join(",")}] ` +
+      `cleanupDeletes=${cleanupDeletes}`,
+  );
+
   // ── lifecycle (§31/§32/§34/§39/§40) ──────────────────────────────────────
   const statusTrace = readStatusTrace(db, jobId);
   checks.require(
@@ -887,8 +921,14 @@ async function runFullPath(ctx) {
   checks.require("upload/object-recorded", Boolean(object));
   checks.require(
     "upload/declared-length-equals-observed",
-    object.contentLength === object.observedBytes,
-    `${object.contentLength} vs ${object.observedBytes}`,
+    object.declaredLength === object.observedBytes,
+    `${object.declaredLength} vs ${object.observedBytes}`,
+  );
+  checks.require(
+    "upload/provider-head-reported-the-persisted-length",
+    lifecycleHead?.contentLength === object.observedBytes &&
+      (await lstat(object.path)).size === object.observedBytes,
+    `${lifecycleHead?.contentLength} vs ${object.observedBytes}`,
   );
   checks.require(
     "upload/uploaded-digest-equals-pre-upload-digest",
@@ -897,7 +937,7 @@ async function runFullPath(ctx) {
   );
   checks.require(
     "upload/declared-length-equals-merged-size",
-    object.contentLength === observed.mergedSize,
+    object.declaredLength === observed.mergedSize,
   );
   checks.require(
     "upload/content-type-is-the-target-mime",
@@ -1047,6 +1087,7 @@ async function runFullPath(ctx) {
     trace,
     observed,
     object,
+    providerHead: { contentLength: lifecycleHead?.contentLength ?? null },
     outputProbe,
     packets: {
       sourceVideo: sourceVideoPackets,
@@ -1318,6 +1359,7 @@ async function characterizeMaxFilesize(ctx) {
 
 function parseArgv(argv) {
   const out = { family: null, evidence: null, sourceCommit: null, sourceTree: null,
+    acceptedBaseSource: null, sourceContextClean: false, overlayRuntimeCompatible: false,
     baseImage: null, baseDigest: null, overlayImage: null, overlayImageId: null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -1332,6 +1374,9 @@ function parseArgv(argv) {
       case "--evidence": take("evidence"); break;
       case "--source-commit": take("sourceCommit"); break;
       case "--source-tree": take("sourceTree"); break;
+      case "--accepted-base-source": take("acceptedBaseSource"); break;
+      case "--source-context-clean": out.sourceContextClean = true; break;
+      case "--overlay-runtime-compatible": out.overlayRuntimeCompatible = true; break;
       case "--base-image": take("baseImage"); break;
       case "--base-digest": take("baseDigest"); break;
       case "--overlay-image": take("overlayImage"); break;
@@ -1345,6 +1390,25 @@ function parseArgv(argv) {
   // Following the harness's existing rule: a run that produces a verdict must
   // name where the record goes, before it does any work.
   if (!out.evidence) throw new Error("--evidence <path> is required");
+  // Source provenance is OBSERVED by the host driver, which verifies the Docker
+  // build context before and after building this overlay. This process runs
+  // inside that overlay and cannot see Git, so it records exactly what the
+  // driver observed, and refuses to start without it: a record naming an
+  // unverified source would be a false statement.
+  for (const [flag, key] of [
+    ["--source-commit", "sourceCommit"],
+    ["--source-tree", "sourceTree"],
+    ["--accepted-base-source", "acceptedBaseSource"],
+  ]) {
+    if (!isFullGitSha(out[key])) {
+      throw new Error(`${flag} must be the full 40-hex value run-split-acceptance.mjs observed`);
+    }
+  }
+  if (!out.sourceContextClean || !out.overlayRuntimeCompatible) {
+    throw new Error(
+      "the build context was not verified clean and runtime-compatible by run-split-acceptance.mjs",
+    );
+  }
   return out;
 }
 
@@ -1471,7 +1535,14 @@ async function main(argv) {
     family: opts.family,
     startedAt,
     finishedAt: new Date().toISOString(),
-    source: { commit: opts.sourceCommit, tree: opts.sourceTree },
+    // Observed by the host driver in the Docker build context (see parseArgv).
+    source: {
+      commit: opts.sourceCommit,
+      tree: opts.sourceTree,
+      contextClean: opts.sourceContextClean,
+      acceptedBaseSourceCommit: opts.acceptedBaseSource,
+      overlayRuntimeCompatibilityVerified: opts.overlayRuntimeCompatible,
+    },
     image: {
       acceptedBaseImage: opts.baseImage,
       acceptedBaseDigest: opts.baseDigest,
@@ -1535,8 +1606,10 @@ async function main(argv) {
           objectKey: full.object.objectKey,
           contentType: full.object.contentType,
           contentDisposition: full.object.contentDisposition,
-          declaredContentLength: full.object.contentLength,
+          declaredContentLength: full.object.declaredLength,
           writerObservedLength: full.object.observedBytes,
+          providerHeadContentLength: full.providerHead.contentLength,
+          providerHeadMeasures: "lstat of the persisted object at HEAD time, never the put declaration",
           preUploadSha256: full.observed.preUploadSha256,
           uploadedSha256: full.object.sha256,
           bytesIdentical: full.object.sha256 === full.observed.preUploadSha256,

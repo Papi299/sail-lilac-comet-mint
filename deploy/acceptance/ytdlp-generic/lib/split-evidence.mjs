@@ -9,9 +9,19 @@
 // different claims indistinguishable to anyone reading the artifacts later.
 
 import { FORBIDDEN_EVIDENCE_KEYS, stripForbiddenKeys } from "./evidence.mjs";
+import { OVERLAY_RUNTIME_COMPATIBILITY_FILES, isFullGitSha } from "./split-provenance.mjs";
 
-/** The schema identifier. Bump it when the record's meaning changes. */
-export const SPLIT06_EVIDENCE_SCHEMA = "split06-deterministic-full-path-01";
+/**
+ * The schema identifier. Bump it when the record's meaning changes.
+ *
+ *   -01  `source` held whatever commit and tree the CALLER asserted.
+ *   -02  `source` holds what the host driver OBSERVED in the Docker build
+ *        context after verifying it: the exact commit, the exact tree, a clean
+ *        context, the accepted base source present, and every
+ *        runtime-compatibility file the same Git object as in that accepted
+ *        source. -01 records are historical and are never rewritten.
+ */
+export const SPLIT06_EVIDENCE_SCHEMA = "split06-deterministic-full-path-02";
 
 /**
  * Values that must not appear ANYWHERE in a serialized record.
@@ -41,10 +51,7 @@ export function buildSplitEvidence(input) {
     startedAt: input.startedAt,
     finishedAt: input.finishedAt,
 
-    source: {
-      commit: input.source.commit,
-      tree: input.source.tree,
-    },
+    source: verifiedSource(input.source),
     image: {
       acceptedBaseImage: input.image.acceptedBaseImage,
       acceptedBaseDigest: input.image.acceptedBaseDigest,
@@ -111,6 +118,36 @@ export function buildSplitEvidence(input) {
     );
   }
   return cleaned;
+}
+
+/**
+ * The `source` block, admitted only when it is the driver's VERIFIED
+ * observation. A -02 record naming an unverified source would be a false
+ * statement, so none is produced.
+ */
+function verifiedSource(source) {
+  const verified =
+    source !== null &&
+    typeof source === "object" &&
+    isFullGitSha(source.commit) &&
+    isFullGitSha(source.tree) &&
+    isFullGitSha(source.acceptedBaseSourceCommit) &&
+    source.contextClean === true &&
+    source.overlayRuntimeCompatibilityVerified === true;
+  if (!verified) {
+    throw new Error(
+      `refusing to emit a ${SPLIT06_EVIDENCE_SCHEMA} record without driver-verified source provenance`,
+    );
+  }
+  return {
+    commit: source.commit,
+    tree: source.tree,
+    contextClean: true,
+    acceptedBaseSourceCommit: source.acceptedBaseSourceCommit,
+    overlayRuntimeCompatibilityVerified: true,
+    runtimeCompatibilityFilesCompared: [...OVERLAY_RUNTIME_COMPATIBILITY_FILES],
+    verifiedBy: "run-split-acceptance.mjs: git against the build context, before and after the overlay build",
+  };
 }
 
 /** One deterministic JSON line, pretty-printed for review. */

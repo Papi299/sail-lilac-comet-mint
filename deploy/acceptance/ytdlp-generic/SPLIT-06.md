@@ -61,7 +61,9 @@ not on the Mac.
 sudo node /repo/deploy/acceptance/ytdlp-generic/run-split-acceptance.mjs \
   --base-image  videofetch-worker:<accepted source sha> \
   --base-digest sha256:<accepted image id> \
-  --head        <candidate head sha> \
+  --base-source <accepted image's full 40-hex source commit> \
+  --head        <full 40-hex candidate commit> \
+  --tree        <full 40-hex candidate tree> \
   --context     /repo \
   --report      /var/tmp/split06 \
   --family      mp4
@@ -70,9 +72,10 @@ sudo node /repo/deploy/acceptance/ytdlp-generic/run-split-acceptance.mjs \
 ... --family webm
 ```
 
-The driver verifies the accepted base image resolves to the exact expected
-digest, builds the overlay, runs the acceptance container, and removes the
-overlay again unless `--keep-image` is passed.
+The driver first verifies the build context (below), before any Docker command
+runs. It then verifies the accepted base image resolves to the exact expected
+digest, builds the overlay, re-verifies the context, runs the acceptance
+container, and removes the overlay again unless `--keep-image` is passed.
 
 Inside the container the single command is:
 
@@ -83,6 +86,30 @@ node --import ./scripts/register-ts-aliases.mjs --experimental-strip-types \
 
 There is no partial PASS: every stage of the chain, plus byte integrity, stream
 shape, packet identity, privacy and cleanup, must succeed in **one** run.
+
+### Source provenance: what the driver checks before it builds
+
+`--head`, `--tree` and `--base-source` are **expectations**, and each must be a
+full lowercase 40-hex SHA. Before any Docker command runs,
+`lib/split-provenance.mjs` checks them against Git in `--context` and refuses,
+fail-closed and with no image inspected, built or run, unless:
+
+| Gate | Requirement |
+| :--- | :--- |
+| A | `git rev-parse HEAD` is exactly `--head` |
+| B | that commit's tree is exactly `--tree` |
+| C | the context is clean: no tracked change and no untracked file anywhere (`git status --porcelain=v1 --untracked-files=all`), no ignored file inside the copied `src/` and `deploy/acceptance/ytdlp-generic/`, and no assume-unchanged or skip-worktree entry there |
+| D | `--base-source` exists as a commit (`git cat-file -e <sha>^{commit}`) |
+| E | `package.json`, `package-lock.json`, `Dockerfile.worker`, `src/worker/runtime/ytdlp-runtime.server.ts`, `scripts/register-ts-aliases.mjs` and `scripts/ts-alias-hooks.mjs` are the same Git object at `--base-source` and at the candidate |
+
+Gate E is the premise that makes an overlay of the accepted image equivalent to
+a build of the candidate. If any of those files differs, the overlay strategy
+does not apply and the driver stops; it never falls back to building an image.
+
+The same gates run again after `docker build` has read the context, so a
+context that changed underneath the build is refused and its overlay removed.
+The values handed to the container, and so recorded in the evidence, are what
+Git **observed**, never the command-line text.
 
 ---
 
@@ -122,6 +149,12 @@ the MIME, the content disposition, `finalizeJobUpload`'s put → head → compar
 commit sequence, and the `ready` transition. The writer parses
 `ObjectStorePutInputSchema` itself, has no list operation, no wildcard delete and
 no presigned URL.
+
+Its `head` reports the **persisted object's measured length** — `lstat` of the
+stored file at HEAD time — as R2's `HeadObject` reports what R2 stores rather
+than echoing the PUT. `declaredLength` and `observedBytes` are recorded apart,
+and HEAD never answers with the caller's declaration, so a provider that stored
+different bytes is refused by the real `finalizeJobUpload` comparison itself.
 
 **A SPLIT-06 PASS is not R2 acceptance.**
 
@@ -178,9 +211,16 @@ was relaxed to make the fixture work; the fixture conforms to the product.
 ## Evidence
 
 Every run writes one machine-readable record, schema
-`split06-deterministic-full-path-01` (`lib/split-evidence.mjs`), to the
+`split06-deterministic-full-path-02` (`lib/split-evidence.mjs`), to the
 `--evidence` path. Following the harness's existing rule, that path must be
 **present and unoccupied**: an existing artifact is refused, never replaced.
+
+`-02` changed what `source` means. A `-01` record carried whatever commit and
+tree its caller asserted; a `-02` record carries the driver's **verified
+observation** — `commit`, `tree`, `contextClean: true`,
+`acceptedBaseSourceCommit`, `overlayRuntimeCompatibilityVerified: true` and the
+files compared — and the builder refuses to emit one without it. `-01` records
+are historical artifacts of the pre-correction harness and are never rewritten.
 
 The record is assembled from an allowlist and refuses to be written if it would
 carry a forbidden field (`stderr`, `argv`, anything credential-shaped) or a raw
@@ -215,13 +255,14 @@ DNS or nftables, and no Production credential is read.
 
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
-| `run-split-acceptance.mjs` | where Docker is | Verifies the accepted base, builds the non-deployable overlay, runs the container. |
+| `run-split-acceptance.mjs` | where Docker is | Verifies the build context's provenance and the accepted base, builds the non-deployable overlay, runs the container. |
 | `split-full-path.mjs` | inside the acceptance container | The orchestrator. Preflight, fixtures, full path, negatives, characterizations, evidence. |
 | `lib/split-container.mjs` | — | The overlay Dockerfile and every `docker` argv. Pure; owns `--network none`. |
+| `lib/split-provenance.mjs` | — | The source-provenance gate: exact commit and tree, clean context, overlay runtime compatibility. |
 | `lib/split-fixture-url.mjs` | — | The exact-fixture URL validator. Test-only, and narrow by construction. |
 | `lib/local-object-writer.mjs` | — | The deterministic local `ObjectStoreWriter`. |
 | `lib/split-observers.mjs` | — | Spawn ledger, `/proc` media-tool sampler, SQLite status-audit trigger. |
-| `lib/split-evidence.mjs` | — | The `split06-…-01` record and its privacy refusals. |
+| `lib/split-evidence.mjs` | — | The `split06-…-02` record, its verified-provenance gate and its privacy refusals. |
 | `fixtures/split-media.mjs` | — | The four bit-exact fixture recipes and the DASH manifests. |
 | `fixtures/server.mjs` | loopback only | Extended with the optional, closed SPLIT-06 route set. |
 | `scripts/ytdlp-split-acceptance.test.mjs` | `npm test` | Harness self-tests. No Docker, no FFmpeg, no network. |

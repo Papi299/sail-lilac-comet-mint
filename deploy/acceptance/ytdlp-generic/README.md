@@ -146,13 +146,14 @@ prove.
 
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
-| `run-split-acceptance.mjs` | where Docker is | Verifies the accepted base, builds the non-deployable overlay, runs the container. |
+| `run-split-acceptance.mjs` | where Docker is | Verifies the build context's provenance and the accepted base, builds the non-deployable overlay, runs the container. |
 | `split-full-path.mjs` | inside the acceptance container | The deterministic full-path orchestrator. |
 | `lib/split-container.mjs` | — | The overlay Dockerfile and every `docker` argv. Owns `--network none`. |
+| `lib/split-provenance.mjs` | — | The source-provenance gate: exact commit and tree, clean context, overlay runtime compatibility. |
 | `lib/split-fixture-url.mjs` | — | The test-only exact-fixture URL validator. |
 | `lib/local-object-writer.mjs` | — | The deterministic local `ObjectStoreWriter` (NOT R2). |
 | `lib/split-observers.mjs` | — | Spawn ledger, media-tool sampler, SQLite status-audit trigger. |
-| `lib/split-evidence.mjs` | — | The `split06-deterministic-full-path-01` record. |
+| `lib/split-evidence.mjs` | — | The `split06-deterministic-full-path-02` record. |
 | `fixtures/split-media.mjs` | — | The four bit-exact split fixture recipes and the DASH manifests. |
 
 Tests: `scripts/ytdlp-acceptance.test.mjs` and `scripts/ytdlp-fixture.test.mjs`,

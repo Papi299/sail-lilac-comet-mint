@@ -2,21 +2,24 @@
 //
 // These prove the HARNESS, not the product. They spawn no container, no
 // FFmpeg, no ffprobe and no yt-dlp, and they reach no network: everything here
-// is either pure argv/document construction or a loopback HTTP fixture. The
-// full-path acceptance itself is a separate, explicitly invoked run --
-// `deploy/acceptance/ytdlp-generic/run-split-acceptance.mjs`.
+// is pure argv/document construction, a loopback HTTP fixture, or the REAL
+// upload lifecycle over an in-memory SQLite store. The one subprocess any of
+// them starts is `git`, in a throwaway repository, to prove the provenance gate
+// against Git's real output. The full-path acceptance itself is a separate,
+// explicitly invoked run -- `deploy/acceptance/ytdlp-generic/run-split-acceptance.mjs`.
 //
-// One runtime requirement: `lib/local-object-writer.mjs` imports the REAL
-// `ObjectStorePutInputSchema` from TypeScript source, because conforming to the
-// real interface is the whole point of that module. Node 22.18+ strips types
-// without a flag, which is what this repository's Worker image runs.
+// One runtime requirement: `lib/local-object-writer.mjs` and the lifecycle
+// suite import the REAL TypeScript source, because conforming to the real
+// interfaces is the whole point. Node 22.18+ strips types without a flag,
+// which is what this repository's Worker image runs.
 
-import { after, before, describe, it } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { devNull, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 import {
   createFixtureService,
@@ -44,10 +47,24 @@ import { createLocalObjectStoreWriter } from "../deploy/acceptance/ytdlp-generic
 import {
   acceptanceRunArgs,
   FORBIDDEN_OVERLAY_TAGS,
+  OVERLAY_COPIED_PATHS,
   overlayBuildArgs,
   overlayDockerfile,
   overlayImageTag,
 } from "../deploy/acceptance/ytdlp-generic/lib/split-container.mjs";
+import {
+  OVERLAY_RUNTIME_COMPATIBILITY_FILES,
+  ProvenanceError,
+  verifyOverlayContextProvenance,
+} from "../deploy/acceptance/ytdlp-generic/lib/split-provenance.mjs";
+import {
+  parseArgv as parseDriverArgv,
+  runSplitAcceptance,
+} from "../deploy/acceptance/ytdlp-generic/run-split-acceptance.mjs";
+import { finalizeJobUpload } from "../src/worker/storage/upload-lifecycle.server.ts";
+import { SQLiteJobStore } from "../src/worker/state/sqlite-job-store.server.ts";
+import { openWorkerDatabase } from "../src/worker/state/database.server.ts";
+import { applyMigrations } from "../src/worker/state/migrations.server.ts";
 import {
   buildSplitEvidence,
   renderSplitEvidence,
@@ -60,6 +77,8 @@ import {
 } from "../deploy/acceptance/ytdlp-generic/lib/split-observers.mjs";
 
 const HEAD = "b8f514e2916d1e323518f21fa1e272165ef3fdf4";
+const TREE = "779d5a21d8e4ef835831a2d53e93c4e9ea43009c";
+const ACCEPTED_BASE_SOURCE = "e4fa646bf7492e16fc8d2733982f708a1e243afb";
 
 // Small, obviously-not-media stand-ins. These tests never decode anything, so a
 // real encode would only make them slow and dependent on FFmpeg.
@@ -482,15 +501,48 @@ describe("split acceptance: local ObjectStoreWriter", () => {
     assert.equal(await readFile(object.path, "utf8"), "abc");
   });
 
-  it("answers head with what the CALLER declared, so verification is not tautological", async () => {
+  it("keeps the declared length apart from the bytes it stored", async () => {
     const writer = createLocalObjectStoreWriter({ sinkDir: join(dir, randomUUID()) });
-    // A caller that declares four bytes and streams three is a lifecycle bug;
-    // the writer must report the DECLARATION so `finalizeJobUpload` can catch
-    // the mismatch against its own expectation.
+    // A caller that declares four bytes and streams three.
     await writer.put(putInput(stream("abc"), { contentLength: 4 }));
-    const head = await writer.head(key(jobId));
-    assert.equal(head.contentLength, 4);
-    assert.equal(writer.soleObject().observedBytes, 3);
+    const object = writer.soleObject();
+    assert.equal(object.declaredLength, 4);
+    assert.equal(object.observedBytes, 3);
+    assert.ok(!("contentLength" in object), "no field conflates declaration and measurement");
+  });
+
+  it("answers head with the PERSISTED length, never the caller's declaration", async () => {
+    const writer = createLocalObjectStoreWriter({ sinkDir: join(dir, randomUUID()) });
+    await writer.put(putInput(stream("abc"), { contentLength: 4 }));
+    // What the provider holds, as R2's HeadObject would report it: 3, not 4.
+    assert.equal((await writer.head(key(jobId))).contentLength, 3);
+    assert.equal(writer.headLog()[0].contentLength, 3);
+  });
+
+  it("answers head with the same length when declaration and body agree", async () => {
+    const writer = createLocalObjectStoreWriter({ sinkDir: join(dir, randomUUID()) });
+    await writer.put(putInput(stream("abc"), { contentLength: 3 }));
+    assert.deepEqual(await writer.head(key(jobId)), {
+      objectKey: key(jobId),
+      contentLength: 3,
+      contentType: "video/mp4",
+      contentDisposition: 'attachment; filename="x.mp4"',
+    });
+  });
+
+  it("measures the stored object at HEAD time instead of replaying the put", async () => {
+    const writer = createLocalObjectStoreWriter({ sinkDir: join(dir, randomUUID()) });
+    await writer.put(putInput(stream("abc"), { contentLength: 3 }));
+    const object = writer.soleObject();
+
+    // The stored object changes after the put, and HEAD sees it: it is a
+    // second observation, not the put-time counter.
+    await writeFile(object.path, "ab");
+    assert.equal((await writer.head(object.objectKey)).contentLength, 2);
+
+    // A stored object that no longer exists is missing, not stale.
+    await rm(object.path);
+    assert.equal(await writer.head(object.objectKey), null);
   });
 
   it("enforces the real put schema at the provider boundary", async () => {
@@ -540,6 +592,99 @@ describe("split acceptance: local ObjectStoreWriter", () => {
 
   it("requires a task-owned sink directory", () => {
     assert.throws(() => createLocalObjectStoreWriter({ sinkDir: "" }), /task-owned sink directory/);
+  });
+});
+
+// -- the REAL upload lifecycle against the local writer ----------------------
+
+describe("split acceptance: real finalizeJobUpload against the local writer", () => {
+  // The production lifecycle, the production SQLite store, and this harness's
+  // writer. Nothing here re-implements the comparison: the question is whether
+  // the REAL put -> head -> compare boundary refuses a provider that stored
+  // fewer bytes than it was told to.
+  let db;
+  let store;
+  let dir;
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), "split06-lifecycle-"));
+  });
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+  beforeEach(() => {
+    db = openWorkerDatabase({ path: ":memory:" });
+    applyMigrations(db);
+    store = new SQLiteJobStore({ db });
+  });
+  afterEach(() => {
+    db.close();
+  });
+
+  // The arrangement the production lifecycle suite uses: a real job, claimed,
+  // then placed in `uploading`.
+  function uploadingJob() {
+    const created = store.createJob(
+      { url: "https://example.com/video", formatId: "preset:best", principalId: "private-access-user" },
+      randomUUID(),
+    );
+    store.claimNextQueuedJob();
+    db.prepare("UPDATE worker_jobs SET status = 'uploading' WHERE job_id = ?").run(created.job.jobId);
+    return created.job.jobId;
+  }
+  async function* bytes(text) {
+    yield new TextEncoder().encode(text);
+  }
+  const finalize = (jobId, writer, body, fileSize) =>
+    finalizeJobUpload({
+      jobId,
+      store,
+      writer,
+      body,
+      fileSize,
+      filename: "split-mp4-best.mp4",
+      mime: "video/mp4",
+      quality: "best",
+      container: "mp4",
+      randomSource: () => new Uint8Array(16).fill(0xab),
+    });
+
+  it("refuses a provider that stored fewer bytes than declared, and cleans up", async () => {
+    const jobId = uploadingJob();
+    const writer = createLocalObjectStoreWriter({ sinkDir: join(dir, randomUUID()) });
+
+    // Declared 4; streamed, stored and persisted 3.
+    const result = await finalize(jobId, writer, bytes("abc"), 4);
+
+    assert.deepEqual(result, { type: "storage_failure", code: "verification_failed", cleanup: "deleted" });
+    const [put] = writer.putLog();
+    assert.equal(put.declaredLength, 4);
+    assert.equal(put.observedBytes, 3);
+    // The one HEAD the REAL lifecycle issued reported the persisted size.
+    assert.equal(writer.headLog().length, 1);
+    assert.equal(writer.headLog()[0].contentLength, 3);
+    // The lifecycle's own cleanup removed exactly that object.
+    assert.deepEqual(writer.deleteLog(), [put.objectKey]);
+    assert.equal(writer.soleObject(), null);
+    assert.equal(await writer.head(put.objectKey), null);
+    // And `ready` was never committed.
+    const job = store.getJob(jobId);
+    assert.equal(job.status, "uploading");
+    assert.equal(job.objectKey, null);
+  });
+
+  it("commits ready when the stored bytes match the declaration", async () => {
+    const jobId = uploadingJob();
+    const writer = createLocalObjectStoreWriter({ sinkDir: join(dir, randomUUID()) });
+
+    const result = await finalize(jobId, writer, bytes("abc"), 3);
+
+    assert.equal(result.type, "ready");
+    assert.equal(writer.headLog()[0].contentLength, 3);
+    assert.deepEqual(writer.deleteLog(), []);
+    const job = store.getJob(jobId);
+    assert.equal(job.status, "ready");
+    assert.equal(job.fileSize, 3);
+    assert.equal(job.objectKey, writer.soleObject().objectKey);
   });
 });
 
@@ -608,6 +753,17 @@ describe("split acceptance: container model", () => {
     assert.deepEqual(argv, ["build", "-f", "/tmp/D", "-t", "i:t", "/repo"]);
     assert.ok(!argv.includes("--push"));
   });
+
+  it("copies exactly the paths the provenance gate verifies", () => {
+    const copies = overlayDockerfile("videofetch-worker:accepted")
+      .split("\n")
+      .filter((line) => line.startsWith("COPY "));
+    assert.deepEqual([...OVERLAY_COPIED_PATHS], ["src", "deploy/acceptance/ytdlp-generic"]);
+    assert.deepEqual(
+      copies,
+      OVERLAY_COPIED_PATHS.map((path) => `COPY --chown=node:node ${path} /app/${path}`),
+    );
+  });
 });
 
 // -- the evidence record ----------------------------------------------------
@@ -618,7 +774,13 @@ describe("split acceptance: evidence record", () => {
     family: "mp4",
     startedAt: "2026-09-12T00:00:00.000Z",
     finishedAt: "2026-09-12T00:00:10.000Z",
-    source: { commit: HEAD, tree: "779d5a21" },
+    source: {
+      commit: HEAD,
+      tree: TREE,
+      contextClean: true,
+      acceptedBaseSourceCommit: ACCEPTED_BASE_SOURCE,
+      overlayRuntimeCompatibilityVerified: true,
+    },
     image: {
       acceptedBaseImage: "videofetch-worker:accepted",
       acceptedBaseDigest: "sha256:abc",
@@ -657,11 +819,43 @@ describe("split acceptance: evidence record", () => {
   it("stamps its own schema and states the network mode", () => {
     const record = buildSplitEvidence(minimal());
     assert.equal(record.schema, SPLIT06_EVIDENCE_SCHEMA);
-    assert.equal(record.schema, "split06-deterministic-full-path-01");
+    assert.equal(record.schema, "split06-deterministic-full-path-02");
     assert.equal(record.network.mode, "none");
     assert.equal(record.network.publicHostsContacted, 0);
     assert.equal(record.network.dnsLookups, 0);
     assert.equal(record.image.deployable, false);
+  });
+
+  it("records the driver-verified provenance and what it compared", () => {
+    const record = buildSplitEvidence(minimal());
+    assert.deepEqual(record.source, {
+      commit: HEAD,
+      tree: TREE,
+      contextClean: true,
+      acceptedBaseSourceCommit: ACCEPTED_BASE_SOURCE,
+      overlayRuntimeCompatibilityVerified: true,
+      runtimeCompatibilityFilesCompared: [...OVERLAY_RUNTIME_COMPATIBILITY_FILES],
+      verifiedBy: record.source.verifiedBy,
+    });
+    assert.match(record.source.verifiedBy, /before and after the overlay build/);
+  });
+
+  it("refuses to emit a record whose source was not verified", () => {
+    const verified = minimal().source;
+    for (const source of [
+      undefined,
+      { ...verified, contextClean: false },
+      { ...verified, contextClean: "true" },
+      { ...verified, overlayRuntimeCompatibilityVerified: undefined },
+      { ...verified, commit: HEAD.slice(0, 12) },
+      { ...verified, tree: TREE.toUpperCase() },
+      { ...verified, acceptedBaseSourceCommit: null },
+    ]) {
+      assert.throws(
+        () => buildSplitEvidence(minimal({ source })),
+        /without driver-verified source provenance/,
+      );
+    }
   });
 
   it("refuses to emit a raw source identifier, and says where it found one", () => {
@@ -763,3 +957,322 @@ describe("split acceptance: observers", () => {
     assert.ok(MEDIA_TOOL_BASENAMES.includes("ffprobe"));
   });
 });
+
+// -- source provenance: the driver's gate ------------------------------------
+
+describe("split acceptance: source provenance gate (driver)", () => {
+  const CONTEXT = "/repo";
+  const CAND_HEAD = "c".repeat(40);
+  const CAND_TREE = "d".repeat(40);
+  const OTHER_SHA = "1234567890abcdef1234567890abcdef12345678";
+  const BASE_IMAGE = `videofetch-worker:${ACCEPTED_BASE_SOURCE}`;
+  const BASE_DIGEST = "sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa";
+  const OVERLAY_ID = `sha256:${"e".repeat(64)}`;
+
+  const blobFor = (path, salt = "") => createHash("sha1").update(`${salt}${path}`).digest("hex");
+  const sameBlobs = () =>
+    Object.fromEntries(OVERLAY_RUNTIME_COMPATIBILITY_FILES.map((path) => [path, blobFor(path)]));
+
+  /** A fake repository whose defaults pass every gate. */
+  function repoState(overrides = {}) {
+    return {
+      head: CAND_HEAD,
+      tree: CAND_TREE,
+      status: "",
+      untrackedInCopied: "",
+      lsFiles: "H src/worker/a.ts\nH deploy/acceptance/ytdlp-generic/split-full-path.mjs\n",
+      baseSourcePresent: true,
+      blobsAtBase: sameBlobs(),
+      blobsAtHead: sameBlobs(),
+      afterBuild: null,
+      ...overrides,
+    };
+  }
+
+  /** The only process runner the driver gets: git and docker, both answered here. */
+  function fakeProcesses(repo) {
+    const calls = [];
+    const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
+    const fail = (code) => ({ code, stdout: "", stderr: "" });
+    const git = (args) => {
+      assert.deepEqual(args.slice(0, 3), ["--no-optional-locks", "-C", CONTEXT]);
+      const [verb, ...rest] = args.slice(3);
+      if (verb === "rev-parse") {
+        const rev = rest.at(-1);
+        if (rev === "HEAD") return ok(`${repo.head}\n`);
+        if (rev === `${repo.head}^{tree}`) return ok(`${repo.tree}\n`);
+        const at = rev.indexOf(":");
+        const commit = rev.slice(0, at);
+        const table =
+          commit === ACCEPTED_BASE_SOURCE ? repo.blobsAtBase : commit === repo.head ? repo.blobsAtHead : {};
+        const blob = table[rev.slice(at + 1)];
+        return blob ? ok(`${blob}\n`) : fail(1);
+      }
+      if (verb === "status") return ok(rest.includes("--ignored=matching") ? repo.untrackedInCopied : repo.status);
+      if (verb === "ls-files") return ok(repo.lsFiles);
+      if (verb === "cat-file") return repo.baseSourcePresent ? ok() : fail(128);
+      throw new Error(`unexpected git ${verb}`);
+    };
+    const docker = (args) => {
+      if (args[0] === "image" && args[1] === "inspect") {
+        return ok(`${args[2] === BASE_IMAGE ? BASE_DIGEST : OVERLAY_ID}\n`);
+      }
+      if (args[0] === "build") {
+        if (repo.afterBuild) repo.afterBuild(repo);
+        return ok();
+      }
+      if (args[0] === "run" || (args[0] === "image" && args[1] === "rm")) return ok();
+      throw new Error(`unexpected docker ${args.join(" ")}`);
+    };
+    return {
+      calls,
+      dockerCalls: () => calls.filter((c) => c.command === "docker"),
+      run: async (command, args) => {
+        calls.push({ command, args });
+        if (command === "git") return git(args);
+        if (command === "docker") return docker(args);
+        throw new Error(`unexpected command ${command}`);
+      },
+    };
+  }
+
+  let scratch;
+  before(async () => {
+    scratch = await mkdtemp(join(tmpdir(), "split06-driver-"));
+  });
+  after(async () => {
+    await rm(scratch, { recursive: true, force: true });
+  });
+
+  function drive(repo) {
+    const processes = fakeProcesses(repo);
+    const result = runSplitAcceptance(
+      {
+        baseImage: BASE_IMAGE,
+        baseDigest: BASE_DIGEST,
+        baseSource: ACCEPTED_BASE_SOURCE,
+        head: CAND_HEAD,
+        tree: CAND_TREE,
+        context: CONTEXT,
+        report: join(scratch, "report"),
+        family: "mp4",
+        keepImage: false,
+        docker: "docker",
+      },
+      { run: processes.run, log: () => {}, scratchRoot: scratch, now: () => 1 },
+    );
+    return { processes, result };
+  }
+
+  it("P1: a correct, clean, runtime-compatible context passes and the container gets OBSERVATIONS", async () => {
+    const { processes, result } = drive(repoState());
+    const outcome = await result;
+    assert.equal(outcome.code, 0);
+    assert.deepEqual(
+      outcome.provenance.runtimeCompatibilityFiles.map((f) => f.state),
+      OVERLAY_RUNTIME_COMPATIBILITY_FILES.map(() => "SAME"),
+    );
+
+    // Every gate ran before the first Docker command...
+    const firstDocker = processes.calls.findIndex((c) => c.command === "docker");
+    const gitVerbsFirst = new Set(processes.calls.slice(0, firstDocker).map((c) => c.args[3]));
+    for (const verb of ["rev-parse", "status", "ls-files", "cat-file"]) assert.ok(gitVerbsFirst.has(verb), verb);
+
+    // ...and again after the build, before the container started.
+    const at = (verb) => processes.calls.findIndex((c) => c.command === "docker" && c.args[0] === verb);
+    assert.ok(
+      processes.calls.slice(at("build"), at("run")).some((c) => c.command === "git" && c.args[3] === "status"),
+      "the context is re-verified after the build",
+    );
+
+    const runArgv = processes.dockerCalls().find((c) => c.args[0] === "run").args;
+    const valueOf = (flag) => runArgv[runArgv.indexOf(flag) + 1];
+    assert.equal(valueOf("--source-commit"), CAND_HEAD);
+    assert.equal(valueOf("--source-tree"), CAND_TREE);
+    assert.equal(valueOf("--accepted-base-source"), ACCEPTED_BASE_SOURCE);
+    assert.equal(valueOf("--base-digest"), BASE_DIGEST);
+    assert.ok(runArgv.includes("--source-context-clean"));
+    assert.ok(runArgv.includes("--overlay-runtime-compatible"));
+    assert.deepEqual(processes.dockerCalls().at(-1).args.slice(0, 2), ["image", "rm"]);
+  });
+
+  const drift = (path) => ({ blobsAtHead: { ...sameBlobs(), [path]: blobFor(path, "drifted:") } });
+  const refusals = [
+    ["P2 wrong HEAD", { head: OTHER_SHA }, /HEAD is 1234567890abcdef.*not the expected c{40}/],
+    ["P3 wrong tree", { tree: OTHER_SHA }, /has tree 1234567890abcdef.*not the expected d{40}/],
+    ["P4 dirty tracked file", { status: " M src/worker/execution/job-executor.server.ts\n" }, /not clean/],
+    ["P5 untracked file in the copied harness", { status: "?? deploy/acceptance/ytdlp-generic/stray.mjs\n" }, /not clean/],
+    ["P5 ignored file inside copied source", { untrackedInCopied: "!! src/local.env\n" }, /does not track/],
+    ["P5 hidden index entry under copied source", { lsFiles: "h src/worker/a.ts\n" }, /assume-unchanged or skip-worktree/],
+    ["P6 accepted base source unavailable", { baseSourcePresent: false }, /not a commit in the build context/],
+    ["P7 package.json drift", drift("package.json"), /no longer justified: package\.json differ/],
+    ["P8 package-lock drift", drift("package-lock.json"), /no longer justified: package-lock\.json differ/],
+    ["P9 Dockerfile.worker drift", drift("Dockerfile.worker"), /no longer justified: Dockerfile\.worker differ/],
+    ["P10 yt-dlp runtime module drift", drift("src/worker/runtime/ytdlp-runtime.server.ts"), /ytdlp-runtime\.server\.ts differ/],
+    ["P11 alias-loader drift", drift("scripts/register-ts-aliases.mjs"), /register-ts-aliases\.mjs differ/],
+    ["P11 alias-hooks drift", drift("scripts/ts-alias-hooks.mjs"), /ts-alias-hooks\.mjs differ/],
+  ];
+  for (const [name, overrides, message] of refusals) {
+    it(`${name}: refused before any Docker command`, async () => {
+      const { processes, result } = drive(repoState(overrides));
+      await assert.rejects(result, (error) => error instanceof ProvenanceError && message.test(error.message));
+      assert.deepEqual(processes.dockerCalls(), [], "no docker inspect, build or run");
+    });
+  }
+
+  it("treats a compatibility file absent from both commits as DIFFERENT", async () => {
+    const missing = sameBlobs();
+    delete missing["Dockerfile.worker"];
+    const { processes, result } = drive(repoState({ blobsAtBase: missing, blobsAtHead: { ...missing } }));
+    await assert.rejects(result, /no longer justified: Dockerfile\.worker differ/);
+    assert.deepEqual(processes.dockerCalls(), []);
+  });
+
+  it("refuses a context that changed during the build: no container, overlay removed", async () => {
+    const { processes, result } = drive(
+      repoState({
+        afterBuild: (repo) => {
+          repo.status = "?? src/late.ts\n";
+        },
+      }),
+    );
+    await assert.rejects(result, /changed while the overlay was being built/);
+    const verbs = processes.dockerCalls().map((c) => c.args.slice(0, 2).join(" "));
+    assert.ok(verbs.some((v) => v.startsWith("build")));
+    assert.ok(!verbs.some((v) => v.startsWith("run")), "the acceptance container never started");
+    assert.equal(verbs.at(-1), "image rm");
+  });
+
+  it("requires full lowercase 40-hex --head, --tree and --base-source", () => {
+    const argv = [
+      "--base-image", BASE_IMAGE, "--base-digest", BASE_DIGEST, "--base-source", ACCEPTED_BASE_SOURCE,
+      "--head", CAND_HEAD, "--tree", CAND_TREE, "--context", CONTEXT, "--report", "/var/tmp/r",
+    ];
+    assert.equal(parseDriverArgv(argv).tree, CAND_TREE);
+    const without = (flag) => argv.filter((a, i) => a !== flag && argv[i - 1] !== flag);
+    const replacing = (flag, value) => argv.map((a, i) => (argv[i - 1] === flag ? value : a));
+    assert.throws(() => parseDriverArgv(without("--tree")), /--tree is required/);
+    assert.throws(() => parseDriverArgv(without("--base-source")), /--base-source is required/);
+    assert.throws(() => parseDriverArgv(replacing("--head", CAND_HEAD.slice(0, 12))), /--head must be a full lowercase 40-hex SHA/);
+    assert.throws(() => parseDriverArgv(replacing("--tree", CAND_TREE.toUpperCase())), /--tree must be a full/);
+    assert.throws(() => parseDriverArgv(replacing("--base-source", "e4fa646")), /--base-source must be a full/);
+  });
+});
+
+// -- source provenance: against REAL Git -------------------------------------
+
+const gitAvailable = spawnSync("git", ["--version"]).status === 0;
+
+describe(
+  "split acceptance: source provenance gate against real Git",
+  { skip: gitAvailable ? false : "git is not installed" },
+  () => {
+    // A throwaway repository, isolated from every user and system Git setting,
+    // so what is proven is Git's own output and not this machine's config.
+    const env = {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: devNull,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_AUTHOR_NAME: "split06",
+      GIT_AUTHOR_EMAIL: "split06@invalid",
+      GIT_COMMITTER_NAME: "split06",
+      GIT_COMMITTER_EMAIL: "split06@invalid",
+    };
+    let repo;
+    let base;
+    let head;
+    let tree;
+    const sh = (...args) =>
+      execFileSync("git", ["-C", repo, ...args], {
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    const git = (args) =>
+      new Promise((resolvePromise) => {
+        execFile("git", ["--no-optional-locks", "-C", repo, ...args], { env }, (error, stdout) =>
+          resolvePromise({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, stdout }),
+        );
+      });
+    const verify = (expectedHead = head, expectedTree = tree) =>
+      verifyOverlayContextProvenance({ git, expectedHead, expectedTree, baseSource: base });
+    const put = async (path, text) => {
+      await mkdir(dirname(join(repo, path)), { recursive: true });
+      await writeFile(join(repo, path), text);
+    };
+
+    before(async () => {
+      repo = await mkdtemp(join(tmpdir(), "split06-git-"));
+      sh("init", "-q");
+      for (const path of OVERLAY_RUNTIME_COMPATIBILITY_FILES) await put(path, `accepted ${path}\n`);
+      await put("src/app.ts", "export const v = 1;\n");
+      await put("deploy/acceptance/ytdlp-generic/harness.mjs", "export {};\n");
+      await put(".gitignore", "*.env\n");
+      sh("add", "-A");
+      sh("commit", "-q", "-m", "accepted source");
+      base = sh("rev-parse", "HEAD");
+      await put("src/app.ts", "export const v = 2;\n");
+      sh("commit", "-q", "-am", "candidate");
+      head = sh("rev-parse", "HEAD");
+      tree = sh("rev-parse", "HEAD^{tree}");
+    });
+    after(async () => {
+      await rm(repo, { recursive: true, force: true });
+    });
+
+    it("passes the clean candidate and reports every compatibility file SAME", async () => {
+      const observed = await verify();
+      assert.equal(observed.commit, head);
+      assert.equal(observed.tree, tree);
+      assert.equal(observed.acceptedBaseSourceCommit, base);
+      assert.ok(observed.runtimeCompatibilityFiles.every((f) => f.state === "SAME"));
+    });
+
+    it("refuses a modified tracked file", async () => {
+      await put("src/app.ts", "export const v = 333;\n");
+      await assert.rejects(verify(), /not clean/);
+      sh("checkout", "--", "src/app.ts");
+      await verify();
+    });
+
+    it("refuses an untracked file inside the copied harness", async () => {
+      await put("deploy/acceptance/ytdlp-generic/stray.mjs", "export {};\n");
+      await assert.rejects(verify(), /not clean/);
+      await rm(join(repo, "deploy/acceptance/ytdlp-generic/stray.mjs"));
+      await verify();
+    });
+
+    it("refuses an IGNORED file inside copied source, which plain status does not list", async () => {
+      await put("src/local.env", "X=1\n");
+      assert.equal(sh("status", "--porcelain"), "", "precondition: plain status hides it");
+      await assert.rejects(verify(), /does not track/);
+      await rm(join(repo, "src/local.env"));
+      await verify();
+    });
+
+    it("refuses a modification hidden behind assume-unchanged", async () => {
+      sh("update-index", "--assume-unchanged", "src/app.ts");
+      await put("src/app.ts", "export const v = 99999;\n");
+      assert.equal(sh("status", "--porcelain"), "", "precondition: status hides it");
+      await assert.rejects(verify(), /assume-unchanged or skip-worktree/);
+      sh("update-index", "--no-assume-unchanged", "src/app.ts");
+      sh("checkout", "--", "src/app.ts");
+      await verify();
+    });
+
+    it("refuses a candidate whose package.json drifted from the accepted source", async () => {
+      await put("package.json", "drifted\n");
+      sh("commit", "-q", "-am", "drift");
+      await assert.rejects(
+        verify(sh("rev-parse", "HEAD"), sh("rev-parse", "HEAD^{tree}")),
+        /no longer justified: package\.json differ/,
+      );
+      sh("reset", "-q", "--hard", head);
+      await verify();
+    });
+
+    it("refuses a HEAD other than the expected one", async () => {
+      await assert.rejects(verify(base, tree), /HEAD is .* not the expected/);
+    });
+  },
+);
