@@ -213,11 +213,93 @@ async function downloadDirect(
   };
 }
 
+/**
+ * The absolute-deadline timer seam (MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001).
+ * Production uses the real `setTimeout`; tests replace it so the deadline
+ * contract is proven without waiting on a wall clock.
+ */
+export type DirectDownloadDeadlineTimer = {
+  readonly set: (onDeadline: () => void, ms: number) => unknown;
+  readonly clear: (handle: unknown) => void;
+};
+
+const REAL_DEADLINE_TIMER: DirectDownloadDeadlineTimer = {
+  set: (onDeadline, ms) => setTimeout(onDeadline, ms),
+  clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+let deadlineTimer: DirectDownloadDeadlineTimer = REAL_DEADLINE_TIMER;
+
+export function setDirectDownloadDeadlineTimerForTests(timer: DirectDownloadDeadlineTimer | null): void {
+  deadlineTimer = timer ?? REAL_DEADLINE_TIMER;
+}
+
+/**
+ * Direct acquisition under ONE absolute deadline of `DOWNLOAD_TIMEOUT`
+ * (MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001).
+ *
+ * `safeGet`'s `timeoutMs` is a socket INACTIVITY timeout: a server trickling a
+ * byte just often enough never trips it, and before this deadline existed such
+ * a download could hold the single-flight Worker indefinitely. The generic path
+ * already shares one deadline across its whole subprocess phase; this gives
+ * the direct path the same whole-transfer bound.
+ *
+ * The deadline is armed ONCE, before the request, and covers resolution,
+ * redirects, headers and the entire body. Progress never re-arms it. Its timer
+ * is cleared and the caller's abort listener removed on every settlement.
+ *
+ * One operation-owned controller carries whichever abort comes FIRST — the
+ * caller's cancellation or the deadline — into the request and into the
+ * pipeline, which destroys both the response body and the file stream. The
+ * first cause is latched, so a cancellation stays a cancellation and an
+ * expired deadline is reported as `TIMEOUT`.
+ */
 async function streamDownload(url: string, dest: string, ctx: DownloadContext) {
+  const controller = new AbortController();
+  let abortCause = null as "caller" | "deadline" | null;
+  const abortOnce = (cause: "caller" | "deadline", reason: unknown) => {
+    if (abortCause !== null) return;
+    abortCause = cause;
+    controller.abort(reason);
+  };
+
+  const callerSignal = ctx.signal;
+  const relayCallerAbort = () => abortOnce("caller", callerSignal?.reason);
+  const deadline = deadlineTimer.set(
+    () => abortOnce("deadline", new AppError("TIMEOUT")),
+    config.downloadTimeoutMs,
+  );
+  if (callerSignal) {
+    if (callerSignal.aborted) relayCallerAbort();
+    else callerSignal.addEventListener("abort", relayCallerAbort, { once: true });
+  }
+
+  try {
+    await transferDirectBody(url, dest, ctx, controller.signal);
+  } catch (err) {
+    if (abortCause === "deadline") throw new AppError("TIMEOUT");
+    throw err;
+  } finally {
+    deadlineTimer.clear(deadline);
+    callerSignal?.removeEventListener("abort", relayCallerAbort);
+  }
+}
+
+async function transferDirectBody(
+  url: string,
+  dest: string,
+  ctx: DownloadContext,
+  signal: AbortSignal,
+) {
   const res = await safeGet(url, {
-    signal: ctx.signal,
+    signal,
     timeoutMs: config.downloadTimeoutMs,
   });
+  if (signal.aborted) {
+    // The response arrived after the operation was already aborted.
+    disposeHttpBody(res.body);
+    signal.throwIfAborted();
+  }
   if (res.status === 404) {
     disposeHttpBody(res.body);
     throw new AppError("VIDEO_UNAVAILABLE");
@@ -255,7 +337,9 @@ async function streamDownload(url: string, dest: string, ctx: DownloadContext) {
       stage: "downloading",
     });
   });
-  await pipeline(nodeReadable, createWriteStream(dest));
+  // `signal` destroys the body AND the file stream on abort, whichever of the
+  // caller's cancellation or the absolute deadline fired first.
+  await pipeline(nodeReadable, createWriteStream(dest), { signal });
 }
 
 function headerString(value: string | string[] | undefined): string | null {

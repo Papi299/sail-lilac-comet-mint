@@ -1,5 +1,9 @@
 import { pathToFileURL } from "node:url";
 import { loadWorkerRuntimeConfig, WorkerRuntimeConfigError } from "./config.server.ts";
+import {
+  MediaWorkspaceCapacityError,
+  verifyMediaWorkspaceAtStartup,
+} from "./media-workspace.server.ts";
 import { createWorkerRuntime, type WorkerRuntime } from "./runtime.server.ts";
 
 /**
@@ -11,8 +15,8 @@ import { createWorkerRuntime, type WorkerRuntime } from "./runtime.server.ts";
  *
  * Startup is strictly ordered and fails closed:
  *
- *   load/validate env → create runtime → start maintenance →
- *   listen → wake queue → install signal handlers
+ *   load/validate env → verify media-workspace capacity → create runtime →
+ *   start maintenance → listen → wake queue → install signal handlers
  *
  * If any step fails the process NEVER listens, emits exactly one bounded,
  * non-secret line, closes whatever it already opened, and exits nonzero.
@@ -33,6 +37,11 @@ export function describeStartupFailure(err: unknown): string {
       ? `startup blocked: invalid configuration for ${err.variables.join(", ")}`
       : "startup blocked: invalid configuration";
   }
+  if (err instanceof MediaWorkspaceCapacityError) {
+    // The invariant name is a closed, author-controlled vocabulary. No byte
+    // count and no path is ever rendered.
+    return `startup blocked: media workspace below 2 × MAX_FILE_SIZE (${err.invariant})`;
+  }
   const name =
     err instanceof Error && typeof err.name === "string" && err.name.length > 0
       ? err.name
@@ -48,6 +57,11 @@ export type MainDeps = {
   logError?: (line: string) => void;
   onSignal?: (signal: NodeJS.Signals, handler: () => void) => void;
   setExitCode?: (code: number) => void;
+  /**
+   * The startup media-workspace capacity gate. Production:
+   * `verifyMediaWorkspaceAtStartup`, measuring the executor's real temp root.
+   */
+  verifyMediaWorkspace?: (maxFileSizeBytes: number) => Promise<void>;
 };
 
 /**
@@ -64,10 +78,19 @@ export async function startWorker(deps: MainDeps = {}): Promise<WorkerRuntime | 
     ((signal: NodeJS.Signals, handler: () => void) => {
       process.once(signal, handler);
     });
+  const verifyMediaWorkspace =
+    deps.verifyMediaWorkspace ??
+    ((maxFileSizeBytes: number) => verifyMediaWorkspaceAtStartup(maxFileSizeBytes));
 
   let runtime: WorkerRuntime | null = null;
   try {
     const config = loadWorkerRuntimeConfig(env);
+
+    // MAX-FILE-SIZE-4GIB: refuse a media workspace that cannot hold one job's
+    // successful peak (2 × MAX_FILE_SIZE) BEFORE any durable state is opened or
+    // any listener exists. A 4 GiB image started on the retired 2 GiB tmpfs
+    // stops here instead of advertising downloads it cannot complete.
+    await verifyMediaWorkspace(config.media.maxFileSizeBytes);
 
     // Construction performs migrations and recovery. It does not listen.
     runtime = await createWorkerRuntime(config);

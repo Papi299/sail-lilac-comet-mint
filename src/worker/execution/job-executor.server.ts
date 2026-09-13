@@ -15,6 +15,7 @@ import {
   type SplitMergeTarget,
 } from "@/services/processing/ffmpeg.server";
 import { validateLocalOutput } from "./local-output.server.ts";
+import { requiredWorkspaceBytes, workspaceFootprintForPlan } from "./workspace-capacity.ts";
 import {
   deriveExecutionPlan,
   executionPlanRequestedFormatId,
@@ -211,7 +212,10 @@ export type JobExecutorDeps = {
   processLocally?: LocalProcessingFn;
   /** SPLIT-04: the two-input merge. Production: SPLIT-02's `mergeSplitMedia`. */
   mergeSplit?: MergeSplitMediaFn;
-  /** SPLIT-04: split temp-capacity preflight. Production: `statfs` on the workDir. */
+  /**
+   * The plan-aware media-workspace preflight's reader (SPLIT-04, generalized by
+   * MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001). Production: `statfs` on the workDir.
+   */
   availableWorkDirBytes?: AvailableWorkDirBytesFn;
   /** Bounds handed to generic acquisition. Defaults to the process config. */
   genericLimits?: GenericDownloadLimits;
@@ -568,6 +572,12 @@ export class JobExecutor {
     signal: AbortSignal,
     jobId: string,
   ): Promise<AcquiredExecutionMedia> {
+    // MAX-FILE-SIZE-4GIB: EVERY plan is preflighted against the workspace it is
+    // about to fill — after the trusted plan was derived, before any
+    // acquisition seam is reached, and on the canonical per-job workDir.
+    await this.assertWorkDirCapacity(workDir, plan);
+    this.checkCancelled(signal);
+
     if (plan.strategy === "direct") {
       const original = await this.downloadOriginal(url, {
         workDir,
@@ -601,9 +611,8 @@ export class JobExecutor {
     // exactly-empty directory before the video run and exactly `{video}` before
     // the audio run, and SPLIT-02 refuses any pre-existing merge output entry.
     // Neither primitive cleans up: partial artifacts stay until this executor
-    // unwinds.
-    await this.assertSplitWorkDirCapacity(workDir);
-    this.checkCancelled(signal);
+    // unwinds. The 2 × maxFileSizeBytes capacity this relies on was already
+    // proven by the plan-aware preflight at the top of this method.
 
     // Acquisition progress is live only while acquisition is. SPLIT-03 already
     // gates its own monitor; this gate is the executor's, so a late callback
@@ -632,24 +641,35 @@ export class JobExecutor {
   }
 
   /**
-   * SPLIT-04 §13: the split temp-capacity PREFLIGHT.
+   * The plan-aware media-workspace PREFLIGHT (SPLIT-04 §13, generalized from
+   * split-only by MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001).
    *
-   * A split job's local media footprint is bounded by policy at
-   * 2 × maxFileSizeBytes: SPLIT-03 proves video + audio <= max, and SPLIT-02
-   * proves the merged artifact <= max, and the three coexist until the executor
-   * unwinds. Those two hard bounds ARE the proof, so no padding is added.
+   * The requirement is derived SOLELY from the trusted execution plan, by
+   * `workspace-capacity.ts`: 1 × maxFileSizeBytes for keep-original (direct or
+   * generic), 2 × for every plan whose original and produced artifact coexist —
+   * direct convert / extract-m4a / extract-mp3, generic extract-m4a /
+   * extract-mp3, and generic merge-split. Those hard bounds of a successful job
+   * ARE the proof, so no padding is added.
    *
    * A lower-bound check at one instant — not a reservation, and no claim that
    * free space cannot change afterwards. Local disk is Worker capacity, not a
    * property of the media, so every refusal is PROCESSING_FAILED, never
-   * TOO_LARGE. The measured value is never logged, persisted or put in an error.
+   * TOO_LARGE. A ceiling with no honest requirement (not a positive safe
+   * integer, or one whose multiple overflows) is refused without reading the
+   * filesystem. The measured value is never logged, persisted or put in an
+   * error.
    */
-  private async assertSplitWorkDirCapacity(workDir: string): Promise<void> {
-    const max = this.genericLimits.maxFileSizeBytes;
-    const required = 2 * max;
-    if (!Number.isSafeInteger(max) || max <= 0 || !Number.isSafeInteger(required)) {
+  private async assertWorkDirCapacity(workDir: string, plan: ExecutionPlan): Promise<void> {
+    let required: number | null;
+    try {
+      required = requiredWorkspaceBytes(
+        this.genericLimits.maxFileSizeBytes,
+        workspaceFootprintForPlan(plan),
+      );
+    } catch {
       throw new AppError("PROCESSING_FAILED");
     }
+    if (required === null) throw new AppError("PROCESSING_FAILED");
 
     let available: number;
     try {

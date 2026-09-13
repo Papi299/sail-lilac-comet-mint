@@ -1,5 +1,6 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_MAX_FILE_SIZE_BYTES } from "@/shared/media-limits";
 
 function num(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -14,7 +15,9 @@ function str(name: string, fallback: string): string {
 }
 
 export const config = {
-  maxFileSize: num("MAX_FILE_SIZE", 500 * 1024 * 1024),
+  // The SAME default the strict Worker runtime loader applies (4 GiB); both
+  // read it from one shared constant so they cannot drift apart.
+  maxFileSize: num("MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE_BYTES),
   maxVideoDuration: num("MAX_VIDEO_DURATION", 2 * 60 * 60),
   fileExpirationMinutes: num("FILE_EXPIRATION_MINUTES", 45),
   maxConcurrentDownloads: num("MAX_CONCURRENT_DOWNLOADS", 3),

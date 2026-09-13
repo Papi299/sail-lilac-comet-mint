@@ -123,6 +123,32 @@ test("local-output containment completion", async (t) => {
     }
   });
 
+  await t.test("MAX-FILE-SIZE-4GIB: exactly 4,294,967,296 bytes is accepted, one more is TOO_LARGE", async () => {
+    assert.strictEqual(
+      config.maxFileSize,
+      4_294_967_296,
+      "the unset default must be exactly 4 GiB (run the suite without MAX_FILE_SIZE)",
+    );
+
+    // Sparse files only: stat() reports the size, no data block is written.
+    const atCeiling = join(workDir, "four-gib.mp4");
+    await (await open(atCeiling, "w")).close();
+    await truncate(atCeiling, 4_294_967_296);
+    const accepted = await validateLocalOutput(workDir, atCeiling);
+    assert.strictEqual(accepted.size, 4_294_967_296);
+    await rm(atCeiling, { force: true });
+
+    const overCeiling = join(workDir, "four-gib-plus-one.mp4");
+    await (await open(overCeiling, "w")).close();
+    await truncate(overCeiling, 4_294_967_297);
+    await assert.rejects(validateLocalOutput(workDir, overCeiling), (err: unknown) => {
+      assert.ok(err instanceof AppError);
+      assert.strictEqual(err.code, "TOO_LARGE");
+      return true;
+    });
+    await rm(overCeiling, { force: true });
+  });
+
   await t.test("§25: an oversized artifact is TOO_LARGE", async () => {
     const huge = join(workDir, "huge.mp4");
     const handle = await open(huge, "w");
