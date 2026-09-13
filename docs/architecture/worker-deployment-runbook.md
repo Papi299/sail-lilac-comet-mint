@@ -9,10 +9,13 @@ made by the Product Owner, because it determines persistent-volume semantics,
 TLS termination, external egress enforcement, network-namespace ownership and
 R2 placement/jurisdiction.
 
-**Status — current as of 2026-09-10, recorded by
-`POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`: Phase 9 and Phase 10 are
-complete and accepted, generic yt-dlp extraction is enabled in Production, and
-the execution plane runs on demand.**
+**Status — current as of 2026-09-13, recorded by
+`SPLIT-08F-PRODUCTION-CLOSURE-DOCUMENTATION-001`: Phase 9 and Phase 10 are
+complete and accepted, generic yt-dlp extraction is enabled in Production, the
+execution plane runs on demand, and the Production Worker image was promoted to
+the split-stream candidate on 2026-09-13 (§11h).** The Phase-10 rows below were
+recorded on 2026-09-10 by `POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`;
+the Worker-runtime, Worker-image and Vercel rows carry the current state.
 
 That reconciliation *recorded* previously accepted evidence and re-measured
 nothing. Each row below names its evidence class — *GitHub-verifiable*,
@@ -29,9 +32,10 @@ records are in §11 and §11a–§11h.
 | Phase 10E — persistent enablement | **COMPLETE / ACCEPTED** — `YTDLP_ENABLED=true` | operator-measured — §11h |
 | Phase 10F — 503 disambiguation | **CLOSED / PRODUCTION ACCEPTED** — PR #43 | GitHub-verifiable + operator-measured — §1b, §11h |
 | WorkerClient total-response deadline | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** — PR #44 | GitHub-verifiable + operator-measured — §1b, §11h |
-| Worker runtime source | `e4fa646bf7492e16fc8d2733982f708a1e243afb` (the PR #41 merge) | GitHub-verifiable |
-| Worker image | `sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa`, pinned yt-dlp `2026.08.19` | image operator-measured; pin source-verifiable |
-| Vercel Production | `dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC`, from `main` `45c625041389df7e1b37ef6d25a27b9e629ca134` | chain of custody — **not** Vercel Git-attested (§11h) |
+| Worker runtime source | `6ce4ce2b9146b226eea7751d69c45e7366ea46b9`, tree `c1c289cd9a38a102f0877adf58e1fc9e27a326a1` — promoted 2026-09-13 by SPLIT-08E | commit GitHub-verifiable; image↔source identity operator-measured — §11h |
+| Worker image | `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b` as `videofetch-worker:latest`, pinned yt-dlp `2026.08.19` | image operator-measured; pin source-verifiable — §11h |
+| Previous Worker image — rollback asset | `sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa`, retained locally as `videofetch-worker:e4fa646bf7492e16fc8d2733982f708a1e243afb` (source `e4fa646b…`, the PR #41 merge) | operator-measured — §9, §11h |
+| Vercel Production | `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, from `main` `397f238b9fe6b6ff430d6bf8e805bc0ee8082788` | chain of custody — **not** Vercel Git-attested (§11h) |
 | Execution plane | **on demand**; the idle state is **Stopped** | §3c, §11h |
 
 Precisely:
@@ -934,20 +938,23 @@ polling exists.
 
 #### Split-stream video
 
-> **Source capability, not deployed state.** The description below is of the
-> merged source after GENERIC-SPLIT-05. **The Worker image running in Production
-> does not contain it.** Enabling it in Production still requires an image build,
-> runtime acceptance, deployment and live verification — none of which this
-> record claims. Until then, Production behaves as the *Before SPLIT-05*
-> paragraph describes.
+> **Deployed in Production since 2026-09-13.** The description below is of the
+> merged source after GENERIC-SPLIT-05, and the Worker image running in
+> Production now contains it: `SPLIT-08E-PRODUCTION-PROMOTION-001` promoted the
+> candidate image `sha256:d3b951d5…`, built from `6ce4ce2b…`, to
+> `videofetch-worker:latest` (§11h). The *Before SPLIT-05* paragraph is now
+> **history**: it describes the previous Production image `sha256:c3995e18…`,
+> which is retained locally as the rollback asset (§9).
 >
-> The image-build and runtime-acceptance steps now have a committed gate:
+> The image-build and runtime-acceptance steps have a committed gate:
 > **SPLIT-07** (`deploy/acceptance/ytdlp-generic/SPLIT-07.md`) builds the image
 > with the real `Dockerfile.worker` from a verified clean commit and accepts it
 > offline — source-to-image identity, hardening, the pinned runtime, and the
-> SPLIT-06 full path for mp4 **and** webm. It is a **pre-deployment
-> candidate-image gate** only: it deploys nothing, never moves
+> SPLIT-06 full path for mp4 **and** webm. It remains a **pre-deployment
+> candidate-image gate**: it deploys nothing, never moves
 > `videofetch-worker:latest`, and a SPLIT-07 PASS is not Production acceptance.
+> The promotion that followed it is recorded in §11h, together with what the
+> SPLIT-08A–08D qualification runs did and did not establish.
 
 **Before SPLIT-05.** Video presets were built **only** from source formats that
 already contained video *and* audio in one format, so split-stream renditions
@@ -1453,9 +1460,12 @@ stderr alone classifies a non-zero exit, and neither stream is logged,
 persisted or returned. The byte watcher is unchanged and
 still required — an unknown, missing or misreported length never reaches
 `--max-filesize` at all — and no size ceiling or network policy changed. This
-is **source, not deployment**: the Production image built from `e4fa646b…`
-still passes `--quiet` and reports this refusal as `PROCESSING_FAILED` until a
-new Worker image is built, accepted and deployed.
+was **source, not deployment** until 2026-09-13: the previous Production image,
+built from `e4fa646b…`, passed `--quiet` and reported this refusal as
+`PROCESSING_FAILED`. The Production Worker image is now `sha256:d3b951d5…`,
+built from `6ce4ce2b…`, which contains this source (*image↔source identity
+operator-measured*, §11h). The promotion smoke did not exercise this refusal
+path in Production, so its live behaviour there is unproven.
 
 #### Durable lifecycle
 
@@ -3255,12 +3265,39 @@ the HTTP runtime.
 | **Broker unavailable** | The Worker's R2 operation **fails closed**. `BindsTo=` stops the Worker with the broker. There is never a fallback to a persistent Worker R2 credential — none exists, and supplying one is a startup failure. |
 | Local fallback | **Never.** Production must never fall back to running media processing or yt-dlp inside the Vercel runtime. |
 | Worker down at expiry | Vercel still refuses to sign new URLs; the provider TTL eventually removes the object. |
-| Rolling back the Worker | Deploy the previous image against the **same** persistent volume. Schema V1 is unchanged, so no data migration is involved. |
+| Rolling back the Worker | Retag the previous image **by image id** as `videofetch-worker:latest` and restart the unit against the **same** persistent volume. Schema V1 is unchanged, so no data migration is involved. No rebuild, no registry pull, no Vercel deployment and no Cloudflare change. |
 | Rolling forward | Never point a new Worker at a volume written by a **newer** schema — startup will refuse, by design. |
 
 Because the replica count is exactly 1, a deployment is a brief interruption,
 not a zero-downtime rollout. Queued jobs survive it; interrupted active jobs are
 failed deterministically and may be retried by the user.
+
+**Current rollback asset (2026-09-13).** `videofetch-worker:latest` resolves to
+the promoted `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b`
+(§11h). The previous Production image is retained locally as
+
+```
+videofetch-worker:e4fa646bf7492e16fc8d2733982f708a1e243afb
+  → sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa
+```
+
+Rolling back to it is a local retag, conceptually:
+
+1. confirm no active job — every `worker_jobs` row terminal;
+2. stop `videofetch-worker` cleanly;
+3. retag that exact historical image **id** as `videofetch-worker:latest`;
+4. start `videofetch-worker` normally, so the unit's own `ExecStartPre` gates —
+   broker GID and safe-egress policy — execute unchanged;
+5. verify broker, egress, DNS, Worker health and the control plane.
+
+**No rebuild, no network pull, no Vercel deployment and no Cloudflare change is
+involved.** Both durable schemas are version **1** and were proven
+rollback-compatible before the promotion: `WORKER_SCHEMA_VERSION` is `1` in both
+images, `src/worker/state/migrations.server.ts` is byte-identical between them,
+and a version-1 database receives read-only assertions only — no DDL or DML
+(SPLIT-08E preflight, §11h). Restoring a state snapshot is therefore **not** part
+of an image rollback; it belongs only to affirmative evidence of database
+corruption.
 
 ---
 
@@ -3392,7 +3429,8 @@ authorization.
       startup-fatal (*source-verifiable*), and the Phase-10D Stage-A gate
       `worker-env.forbidden-absent` audits both names. `YTDLP_ENABLED=true` is
       the persistent generic feature state (Phase 10E; accepted `worker.env`
-      SHA-256 `3583770c…`), and the accepted image `sha256:c3995e18…`
+      SHA-256 `3583770c…`), and the accepted Production image — `sha256:d3b951d5…`
+      since the SPLIT-08E promotion, `sha256:c3995e18…` before it —
       **contains** the pinned yt-dlp `2026.08.19` runtime (§11h — *accepted
       operator-measured*). This replaces the Phase-8/9 item that confirmed the
       retired variable false/unset and yt-dlp absent from the image and the VM,
@@ -3456,6 +3494,8 @@ authorization.
 | `PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001` | **COMPLETE / ACCEPTED** | `/etc/videofetch/worker.env` carries `YTDLP_ENABLED=true` exactly once, with the retired `YTDLP_NETWORK_ISOLATED` and `YTDLP_PATH` absent (accepted SHA-256 `3583770c…`), and the state survives a full VM stop/start. No image rebuild. `YTDLP_ENABLED` is now the operational kill switch — a feature switch, not the network boundary. The VM stays on demand. *Accepted operator-measured Production evidence.* See §11h. |
 | `PHASE-10F-CONTROL-PLANE-503-ERROR-DISAMBIGUATION-001` | **CLOSED / PRODUCTION ACCEPTED** | PR #43, merge `b4640ff6c92e92c0df2737d5a8c3bfc383837e70` (*GitHub-verifiable*). A canonical Worker `503` + `EXTRACTOR_UNAVAILABLE` is preserved by the control plane instead of collapsing to `WORKER_UNAVAILABLE` — a strict canonical shape/contract match, not authenticated provenance (§1b). Proven live through real Production (*accepted operator-measured*). See §11h. |
 | `WORKERCLIENT-TOTAL-RESPONSE-DEADLINE-HARDENING-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | PR #44, merge `45c625041389df7e1b37ef6d25a27b9e629ca134` (*GitHub-verifiable*). One `requestTimeoutMs` budget covers request start → headers → complete body consumption on every Worker response path (§1b). Deployed as Vercel `dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC` — chain of custody, not Vercel Git-attested. See §11h. |
+| `SPLIT-08E-PRODUCTION-PROMOTION-001` | **COMPLETE / PRODUCTION ACCEPTED** | The retained split-stream candidate `sha256:d3b951d5…` (source `6ce4ce2b…`) was promoted to `videofetch-worker:latest` on 2026-09-13, in one authorized transaction: quiescence check, clean stop, verified state snapshot, immutable retag, exact-candidate start through the unit's own gates, local boundary checks, and a bounded Production smoke over the unchanged Vercel → Cloudflare Access → named Tunnel → HMAC path. No Production job was created, and no Vercel or Cloudflare configuration changed. The previous image is retained as the rollback asset (§9). *Accepted operator-measured Production evidence*, digest `427896be…`. See §11h. |
+| `WORKER-UNIT-COMMENT-SYNC-001` | **OPEN — low / non-blocking** | The installed `/etc/systemd/system/videofetch-worker.service` carries an older **comment block** than the committed `deploy/systemd/videofetch-worker.service`. Its executable contract is identical: every non-comment directive matched the committed unit exactly when SPLIT-08E measured it, so there is no behavioural difference and nothing to fix in source. Scope: a future operator-only synchronisation of comments on the VM — reinstall the committed unit text and `daemon-reload` — with no behaviour change intended. Deliberately **not** performed during the promotion, which was forbidden from touching systemd. |
 
 ---
 
@@ -5028,12 +5068,18 @@ The next live `shutdown` case remains the load-bearing test. Generic remains
 
 ---
 
-## 11h. Phase-10 closure and current operating state
+## 11h. Phase-10 closure, the SPLIT-08E promotion, and current operating state
 
-**Recorded 2026-09-10 by `POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`.**
-This section *records* previously accepted evidence; it reproduces none of it.
-No VM was started, no `worker.env` was read, and no Worker, Vercel, Cloudflare
-or R2 state was re-measured to write it. Evidence classes are named inline —
+**Phase-10 records: recorded 2026-09-10 by
+`POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`. Split-stream qualification,
+the SPLIT-08E promotion and the current-state block: recorded 2026-09-13 by
+`SPLIT-08F-PRODUCTION-CLOSURE-DOCUMENTATION-001`, from that promotion's accepted
+operator evidence.**
+
+Both reconciliations *record* previously accepted evidence and reproduce none of
+it. Neither started a VM, read `worker.env`, or re-measured Worker, Vercel,
+Cloudflare or R2 state; SPLIT-08F performed no Production or runtime operation
+at all. Evidence classes are named inline —
 *GitHub-verifiable*, *repository/source-verifiable*, *accepted
 operator-measured Production evidence*, *accepted provider observation*,
 *operator-attested*. No secret, account identifier, bucket name, token, HMAC
@@ -5071,6 +5117,11 @@ memory. No artifact was modified, re-graded or resealed.
   `shutdown` FAIL that caught the §11f defect — are unchanged. They remain
   inadmissible under `10d-remediation-03` by design (§11g): Phase 10D closed on
   fresh runs, not on relabelled ones.
+- **Historical scope of this runtime.** Source `e4fa646b…` and image
+  `sha256:c3995e18…` were Production's Worker runtime from Phase 10D until the
+  SPLIT-08E promotion on 2026-09-13. They remain this phase's accepted evidence
+  and are now the retained rollback asset (§9); they are **not** the current
+  Production Worker. The current runtime is in *Current operating state* below.
 
 ### Phase 10E — COMPLETE / ACCEPTED
 
@@ -5086,6 +5137,11 @@ operator-measured Production evidence.*
 | `YTDLP_PATH` | **absent** — retired; startup-fatal if present |
 | Persistence | survives a full VM stop/start |
 | Worker image | unchanged — the accepted `sha256:c3995e18…` image; no rebuild |
+
+*Historical: `sha256:c3995e18…` remained Production's Worker image until the
+SPLIT-08E promotion on 2026-09-13. The accepted `worker.env` SHA-256 above is
+unchanged by that promotion — it was re-verified during it, and the promoted
+image parses the same file with byte-identical runtime configuration code.*
 
 The committed unit still sets no `Environment=YTDLP_ENABLED`; the value lives
 only in `worker.env` (§4i). *Enabled* is now the accepted baseline, so a
@@ -5157,16 +5213,148 @@ The same absence is also a safeguard: **a merge to `main` never deploys.** A
 Production deployment happens only on explicit Product Owner authorization,
 and merging any pull request is not that authorization.
 
+**Production has since moved.** Vercel Production is now
+`dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, deployed on 2026-09-11 from `main`
+`397f238b9fe6b6ff430d6bf8e805bc0ee8082788` — the same chain-of-custody basis,
+still not Git-attested. The SPLIT-08E Worker promotion performed **no** Vercel
+deployment and changed no Vercel configuration: the project's safe-state digest
+was byte-identical before and after
+(`8a85a0e111066fc4f4d2814f9b45187fa13a29cbfe3cd8394d221abb527ee3f0`, a
+values-free canonical digest of project, alias, deployment and env-row metadata).
+**Worker image identity and Vercel deployment identity are independent**: the
+Worker now runs `6ce4ce2b…`, while the control plane still serves
+`397f238b…`. Neither attests the other.
+
+### Split-stream candidate qualification — SPLIT-07 … SPLIT-08D
+
+*Accepted operator-measured evidence, except where marked. None of these
+records deployed anything; each ran against the retained candidate image while
+Production kept serving `sha256:c3995e18…`.*
+
+| Record | What it established |
+| :--- | :--- |
+| **SPLIT-07 / 07A** | Release-image acceptance of a real `Dockerfile.worker` build from a verified clean commit: source-to-image identity, container hardening, the pinned runtime, and the SPLIT-06 full path for mp4 **and** webm — offline, deploying nothing. |
+| **SPLIT-07B** | The accepted candidate was retained as `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` → `sha256:d3b951d5…`. Production untouched. |
+| **SPLIT-08A** | The retained candidate ran inside the **real** Production execution-plane topology — the live media network namespace and its safe-egress boundary — as an isolated shadow, with no Production mutation. |
+| **SPLIT-08B** | One controlled generic job through the candidate, the real media namespace, the real R2 broker and the real R2 upload lifecycle, ending in an exact-key delete. |
+| **SPLIT-08C** | Control-plane delivery integrity end to end: an exact-source Vercel application (a disposable Preview), routing to the candidate, R2 `PutObject`/`HeadObject`, an exact-object temporary `GetObject` signer, a signed GET, delivered SHA-256 equality against the fixture, and normal exact-key deletion — with Production unmutated. |
+| **SPLIT-08D** | One bounded **real public YouTube** job (`YE7VzlLtp-4`, `preset:144`) through the candidate's real safe-egress and R2 path. **This does not generalize**: it is one video, one quality and one site — not every YouTube video, not every quality, not every yt-dlp-supported site, and not authenticated YouTube. |
+| **SPLIT-08E preflight** | Read-only promotion readiness: zero in-flight jobs, durable-schema rollback compatibility, retention of the historical image, a safe state-snapshot plan, and an unchanged Access/HMAC ingress topology. Digest `866ef2e7…`. |
+
+### SPLIT-08E — Production promotion of the split-stream candidate
+
+`SPLIT-08E-PRODUCTION-PROMOTION-001`, 2026-09-13 — *accepted operator-measured
+Production evidence.*
+
+| | |
+| :--- | :--- |
+| Promoted image | `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b`, as `videofetch-worker:latest` |
+| Source | `6ce4ce2b9146b226eea7751d69c45e7366ea46b9`, tree `c1c289cd9a38a102f0877adf58e1fc9e27a326a1` (*GitHub-verifiable*; image↔source identity operator-measured) |
+| Retained RC tag | `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` → the same image |
+| Rollback asset | `sha256:c3995e18…` → `videofetch-worker:e4fa646bf7492e16fc8d2733982f708a1e243afb` |
+| Evidence digest | `427896be60159611c88f2452c69c0fa843502bd9ca5ce9bd2bd3114730845ad4` |
+
+What the transaction established:
+
+- **Data safety.** Every `worker_jobs` row was terminal before the stop; the
+  Worker stopped cleanly with no process holding the state files; a
+  byte-for-byte state snapshot was taken, manifest-verified and integrity-checked
+  on a disposable copy — all **before** `latest` moved.
+- **Immutable retag.** `latest` was retagged from the candidate's image **id**.
+  Nothing was pulled, built or removed, and the local image-id count was
+  unchanged.
+- **Exact startup.** The unit's own `ExecStartPre` gates ran unchanged. The new
+  container is the exact candidate image in a fresh epoch with zero restarts,
+  under the unchanged hardening contract: non-root, `CapDrop ALL`,
+  `no-new-privileges`, read-only root filesystem, the exact media tmpfs, state
+  mounted rw, the broker directory mounted ro, the numeric broker group, the
+  shared media namespace, no Docker socket and no published port.
+- **Boundaries.** The broker-GID, safe-egress-policy and designated-DNS verifiers
+  all passed after the start, with policy and route fingerprints unchanged, and
+  the Worker shares the holder's network namespace.
+- **Existing ingress.** The unchanged path — Vercel Production → Cloudflare
+  Access service authentication → the named Cloudflare Tunnel → the Worker →
+  VideoFetch HMAC — served `/api/diagnostics` and `/api/sites`, and one
+  non-durable public analysis returned split-backed presets with
+  `capabilities.merge = true`, which the previous image cannot produce.
+- **Scope discipline.** No Production download job was created, no R2 object was
+  written, no second public source was tested, and no Vercel or Cloudflare
+  configuration changed.
+- **Closure.** After a bounded stability observation, the transaction's temporary
+  assets were removed: the state snapshot was deleted and the dedicated rollback
+  tag was untagged, leaving the historical image pinned by its source-SHA tag.
+
+Evidence chain re-verified at promotion (operator-held artifacts; digests only):
+SPLIT-07 `50b23244…`, SPLIT-08A `6c03a7a2…`, SPLIT-08B `16e27b58…`, blocked
+SPLIT-08C `eaf5c7ca…`, SPLIT-08C0 `2048c87f…`, SPLIT-08C0B `7109ed88…`,
+successful SPLIT-08C `06b92473…`, SPLIT-08D `b99be1e4…`, SPLIT-08E preflight
+`866ef2e7…`, SPLIT-08E promotion `427896be…`.
+
+**What the promotion did not establish.** Not every YouTube video, quality or
+site; not authenticated YouTube; not every yt-dlp-supported site; not long-term
+uptime. No deliberate rollback drill was performed — rollback compatibility is
+proven by schema and source identity, not by an executed drill. And no Vercel
+deployment of `6ce4ce2b…` happened: the control plane is a separate identity and
+did not change.
+
 ### Current operating state
 
-| Plane | State |
+*Recorded 2026-09-13 by `SPLIT-08F-PRODUCTION-CLOSURE-DOCUMENTATION-001`.*
+
+| | |
 | :--- | :--- |
-| Control plane | Vercel Production `dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC` — deployed and accepted |
+| Worker source | `6ce4ce2b9146b226eea7751d69c45e7366ea46b9` |
+| Worker source tree | `c1c289cd9a38a102f0877adf58e1fc9e27a326a1` |
+| Worker image — `videofetch-worker:latest` | `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b` |
+| Retained RC tag | `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` → the same image |
+| Rollback image / tag | `sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa` → `videofetch-worker:e4fa646bf7492e16fc8d2733982f708a1e243afb` (§9) |
+| Pinned yt-dlp | `2026.08.19` — unchanged by the promotion |
+| Generic feature | `YTDLP_ENABLED=true`, persisted in `/etc/videofetch/worker.env` (Phase 10E; accepted SHA-256 unchanged, re-verified at promotion) |
+| Split-stream presets | live in Production since the promotion |
+| Control plane | Vercel Production `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, from `main` `397f238b…` — chain of custody, **not** Git-attested |
+| Vercel project safe-state | `8a85a0e1…` — byte-identical before and after the promotion |
 | Execution plane | the on-demand `videofetch` Lima VM — idle state **Stopped** |
-| Worker image | `sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa` |
-| Generic feature | enabled persistently — in effect whenever the VM runs |
+| Promotion date | 2026-09-13 |
+| Promotion evidence | `427896be60159611c88f2452c69c0fa843502bd9ca5ce9bd2bd3114730845ad4` |
 | Safe egress | enforced externally; Phase 9 accepted |
 | 24/7 requirement | **none** |
+
+The current control plane, with credential ownership made explicit:
+
+```
+Browser
+  ↓
+Vercel Production                  holds the Cloudflare Access service-token
+  ↓                                pair and the Worker HMAC key id + secret
+Cloudflare Access service authentication
+  ↓
+named Cloudflare Tunnel
+  ↓
+Production Worker                  holds the HMAC pair only — never an Access
+  ↓                                token, never a persistent R2 credential
+VideoFetch HMAC verification
+```
+
+Media execution stays inside the externally enforced boundary:
+
+```
+Worker  →  media network namespace + host-owned safe-egress policy
+           (the Worker can neither read nor alter it)
+```
+
+R2 writes and deletes go through the trusted broker:
+
+```
+Worker  →  AF_UNIX  →  R2 broker (outside the media namespace; holds the single
+                       parent writer credential)
+                    →  operation-scoped temporary credential  →  R2
+```
+
+Browser delivery uses the separate read-side signer:
+
+```
+Vercel  →  read-side R2 signer  →  presigned GET
+```
 
 ```
 VM Stopped  →  the execution plane is intentionally offline; the control
