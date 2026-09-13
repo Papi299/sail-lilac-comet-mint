@@ -469,9 +469,12 @@ const WORKDIR_PROBE_PATTERN =
 
 /**
  * The Worker's own default when `MAX_FILE_SIZE` is unset, mirroring
- * `MEDIA_DEFAULTS.maxFileSizeBytes` in `src/worker/runtime/config.server.ts`.
+ * `MEDIA_DEFAULTS.maxFileSizeBytes` in `src/worker/runtime/config.server.ts`
+ * (`DEFAULT_MAX_FILE_SIZE_BYTES` in `src/shared/media-limits.ts`): exactly
+ * 4 GiB since MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001. Historical evidence
+ * recorded against a Worker whose default was 500 MiB keeps its own values.
  */
-export const DEFAULT_MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024;
+export const DEFAULT_MAX_FILE_SIZE_BYTES = 4 * 1024 * 1024 * 1024;
 
 /**
  * The EFFECTIVE deployed byte limit, by the Worker's own grammar (§13 of
@@ -485,7 +488,7 @@ export const DEFAULT_MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024;
  * runtime's rules:
  *
  *   `optional()`        — trimmed; empty becomes absent
- *   absent              — the 500 MiB default
+ *   absent              — the 4 GiB default
  *   `boundedInt(1, …)`  — /^[0-9]{1,17}$/ and a safe integer >= 1
  *
  * An out-of-grammar value is NOT silently defaulted here even though

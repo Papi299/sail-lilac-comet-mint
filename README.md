@@ -66,10 +66,10 @@ See `.env.example`. Important knobs:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MAX_FILE_SIZE` | 500MB | Reject larger outputs |
+| `MAX_FILE_SIZE` | 4 GiB (4,294,967,296 bytes) | Reject delivered outputs larger than this. A capacity contract as well as a limit — see *Large files* below. |
 | `MAX_VIDEO_DURATION` | 2 hours | Reject longer videos |
 | `FILE_EXPIRATION_MINUTES` | 45 | Temporary file lifetime |
-| `MAX_CONCURRENT_DOWNLOADS` | 3 | Global worker cap |
+| `MAX_CONCURRENT_DOWNLOADS` | 3 | Cap of the legacy in-process download manager. The standalone Worker executes one job at a time regardless. |
 | `MAX_CONCURRENT_PER_PRINCIPAL` | 2 | Active downloads per authenticated operator. Process-local. |
 | `RATE_LIMIT` | 20/min | Analyze requests per authenticated operator. Process-local. Forwarded-IP headers are not used as identity. |
 | `TEMP_DIRECTORY` | OS temp `/videofetch` | Isolated job folders |
@@ -79,6 +79,12 @@ See `.env.example`. Important knobs:
 | `VIDEOFETCH_ACCESS_SECRET` | unset | Server-only private-access secret. Minimum 32 UTF-8 bytes. Required in production for downloader APIs; missing/short values fail closed (HTTP 503) instead of exposing the downloader. **`GET /api/diagnostics` requires a configured secret and a valid session in every environment**, including local development — the ordinary development bypass does not apply there. Rotating it invalidates active sessions. Generate with `openssl rand -base64 32`. Never expose via `VITE_*`. |
 
 Analyze/download rate limits and per-operator concurrency are keyed on the private-access principal after a successful gate, not on `X-Forwarded-For` or other client-address headers. Limits are process-local and are not shared across horizontally scaled instances.
+
+**Large files.** The delivered-file ceiling is 4 GiB, and it is a capacity contract as well as a limit:
+
+- The Worker executes one job at a time. A job keeps its original and its produced file side by side (or both split halves and the merge), so it can need up to **8 GiB** of local media space. The Worker refuses to start unless its media workspace can hold that. In Production the workspace is a bounded **10 GiB disk-backed ext4 filesystem**, not a memory-backed tmpfs (`deploy/README.md`, runbook §2a).
+- Size is not the only bound. Every acquisition — direct or generic — must finish within `DOWNLOAD_TIMEOUT` (600 s, absolute), so a 4 GiB file needs roughly 57 Mbit/s of sustained download. Local processing and the job's `FILE_EXPIRATION_MINUTES` lifetime are separate bounds too. Completion at arbitrary bandwidth is not guaranteed; a transfer that is too slow fails as `TIMEOUT`.
+- The finished file is stored with **one single-part upload**, which 4 GiB fits under the object store's single-part limit. There is no multipart upload and no upload resume; a failed upload fails the job. The browser downloads the file directly from object storage through a short-lived signed link — the control plane never proxies it.
 
 ## API
 

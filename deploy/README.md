@@ -23,6 +23,11 @@ The Worker may run **only when both** of two independent boundaries are present:
 They are independent: an `AF_UNIX` socket is not the network, so credential
 acquisition neither depends on nor widens the egress policy.
 
+The Worker additionally requires its **bounded Product media workspace**
+(`systemd/srv-videofetch-media.mount`, `bin/vf-media-workspace-verify`) — a
+capacity and filesystem-hardening precondition rather than a third security
+boundary. See [The Product media workspace](#the-product-media-workspace).
+
 ---
 
 ## The trusted R2 credential broker
@@ -346,6 +351,37 @@ else.
 
 ---
 
+## The Product media workspace
+
+`MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001` raised the delivered-media ceiling to
+**4 GiB** (4,294,967,296 bytes) and retired the Worker's 2 GiB
+`--tmpfs /tmp/videofetch`.
+
+| Fact | Value |
+| :--- | :--- |
+| Worker execution | one job at a time |
+| Hard successful media peak of one job | 2 × `MAX_FILE_SIZE` = **8 GiB** (original + produced artifact, or both split halves + merge) |
+| Why not tmpfs | the VM has 4 GiB of RAM and no swap |
+| Filesystem | loop-backed **ext4**, fixed **10 GiB**, preallocated: `/var/lib/videofetch-workspace/workspace.ext4` (root:root `0600`) |
+| Mount | `srv-videofetch-media.mount` → `/srv/videofetch/media`, `loop,rw,nodev,nosuid,noexec,noatime`, no `discard` |
+| Workspace | `/srv/videofetch/media/workspace`, owned `1000:1000`, mode `0700` |
+| Container | `--mount type=bind,source=/srv/videofetch/media/workspace,target=/tmp/videofetch` — never `-v`, never a tmpfs |
+| Pre-start gate | `vf-media-workspace-verify --wipe`: backing file, loop identity, mount flags, owner, mode, and ≥ 9,663,676,416 bytes (8 GiB peak + 1 GiB headroom) total and available — then empties the workspace |
+| Application gate | the Worker itself refuses to start unless the filesystem holding its temp root has ≥ 2 × `MAX_FILE_SIZE` total and available |
+
+The size bound is the filesystem: ENOSPC from a runaway FFmpeg output stays
+inside it and never reaches the root filesystem, the SQLite state volume or the
+container runtime. The mount unit never creates or formats its image; that is
+the explicit provisioning step below.
+
+**Prerequisite — not performed by anything in this directory.** The Lima VM's
+disk must first be grown from 24 GiB to **32 GiB**. The 24 GiB disk cannot hold
+the 10 GiB image while keeping a safe root-filesystem reserve for images,
+journald and state. Growing it stops the VM, and is a separate, authorized
+operation.
+
+---
+
 ## Install order
 
 The order is not a convenience — it is the fail-closed boundary.
@@ -478,6 +514,30 @@ The order is not a convenience — it is the fail-closed boundary.
    environment file — the holder publishes the port, the Worker binds it, and
    nothing cross-checks the two.
 
+4b. **Provision the Product media workspace** — only after the 32 GiB Lima disk
+   prerequisite above, and on a root filesystem with at least 16 GiB available
+   (the 10 GiB image plus a 6 GiB reserve).
+
+   ```
+   install -d -o root -g root -m 0700 /var/lib/videofetch-workspace
+   fallocate -l 10737418240 /var/lib/videofetch-workspace/workspace.ext4
+   chmod 0600 /var/lib/videofetch-workspace/workspace.ext4
+   # -E nodiscard: formatting a regular file with discard would punch holes in
+   # the preallocation. -m 0: the Worker is unprivileged, so reserved blocks
+   # would only hide capacity from it.
+   mkfs.ext4 -m 0 -T largefile -E nodiscard -L vf-media \
+     /var/lib/videofetch-workspace/workspace.ext4
+   stat -c '%s %b %B' /var/lib/videofetch-workspace/workspace.ext4   # blocks x unit >= size
+
+   install -m 0644 deploy/systemd/srv-videofetch-media.mount /etc/systemd/system/
+   install -m 0755 deploy/bin/vf-media-workspace-verify      /usr/local/sbin/
+   systemctl daemon-reload
+   systemctl enable --now srv-videofetch-media.mount
+   install -d -o 1000 -g 1000 -m 0700 /srv/videofetch/media/workspace
+
+   vf-media-workspace-verify   # must print OK before the Worker unit is installed
+   ```
+
 5. **Start the boundary, the broker, then the Worker.** systemd enforces the
    order; starting the Worker pulls the rest in.
 
@@ -487,13 +547,16 @@ The order is not a convenience — it is the fail-closed boundary.
    systemctl enable --now videofetch-egress-policy.service
    systemctl enable --now videofetch-egress-watchdog.service
    systemctl enable --now videofetch-r2-broker.service
+   systemctl enable --now srv-videofetch-media.mount
    systemctl enable --now videofetch-worker.service
    ```
 
    The Worker's `ExecStartPre` runs `vf-r2-broker-gid-verify`, which refuses to
    start it unless the configured GID numerically equals the group owning the
    socket and the socket is group-connectable but not world-accessible. A
-   drifted GID stops the Worker rather than starting it unable to mint.
+   drifted GID stops the Worker rather than starting it unable to mint. It then
+   runs `vf-media-workspace-verify --wipe`, which refuses to start it on anything
+   but the reviewed bounded workspace and empties that workspace first.
 
 ---
 
@@ -512,9 +575,19 @@ After=videofetch-media-netns.service videofetch-egress-policy.service videofetch
 BindsTo=videofetch-media-netns.service videofetch-egress-policy.service videofetch-egress-watchdog.service
 ```
 
-plus two pre-start gates whose failure is fatal — `vf-r2-broker-gid-verify` and
-`vf-egress-policy-verify`. Neither is prefixed with `-`, so neither can fail
-quietly.
+and the same three on its Product media workspace, plus the same dependency
+stated by path:
+
+```
+Requires=srv-videofetch-media.mount
+After=srv-videofetch-media.mount
+BindsTo=srv-videofetch-media.mount
+RequiresMountsFor=/srv/videofetch/media
+```
+
+plus three pre-start gates whose failure is fatal — `vf-r2-broker-gid-verify`,
+`vf-egress-policy-verify` and `vf-media-workspace-verify --wipe`. None is
+prefixed with `-`, so none can fail quietly.
 
 | Event | Consequence |
 | :--- | :--- |
@@ -524,6 +597,8 @@ quietly.
 | Namespace disappears later | Worker stops |
 | Broker disappears later | Worker stops |
 | Boundary invalid after a breach | Worker cannot be restarted |
+| Media workspace image absent, unmounted or failing verification | Worker cannot start |
+| Media workspace unmounted later | Worker stops |
 
 - `Requires` — the Worker will not start if the broker failed to start.
 - `After` — the Worker starts strictly afterwards, so the socket already exists.

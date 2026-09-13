@@ -37,6 +37,7 @@ records are in §11 and §11a–§11h.
 | Previous Worker image — rollback asset | `sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa`, retained locally as `videofetch-worker:e4fa646bf7492e16fc8d2733982f708a1e243afb` (source `e4fa646b…`, the PR #41 merge) | operator-measured — §9, §11h |
 | Vercel Production | `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, from `main` `397f238b9fe6b6ff430d6bf8e805bc0ee8082788` | chain of custody — **not** Vercel Git-attested (§11h) |
 | Execution plane | **on demand**; the idle state is **Stopped** | §3c, §11h |
+| Product media workspace — repository contract | **4 GiB delivered-media ceiling on a bounded 10 GiB ext4 bind** (`MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`) — **NOT deployed**: Production still runs the 500 MiB-default image on the 2 GiB tmpfs until the separately authorized rollout | repository/source-verifiable — §2a |
 
 Precisely:
 
@@ -216,7 +217,7 @@ path, and neither the partial body nor the abort reason is surfaced.
 
 ```
 /var/lib/videofetch    persistent volume   SQLite database + WAL/SHM sidecars ONLY
-/tmp/videofetch        ephemeral           media working files ONLY
+/tmp/videofetch        bounded scratch     media working files ONLY (§2a)
 ```
 
 These must never be merged. Media is never written to the durable volume, and
@@ -227,11 +228,14 @@ The image is compatible with:
 
 - a **read-only root filesystem**, plus
 - a **writable persistent state mount**, plus
-- a **writable ephemeral `/tmp`**.
+- a **writable media working directory at `/tmp/videofetch`** — in the committed
+  unit, an exact bind of the bounded disk workspace (§2a).
 
 Size the state volume for job metadata only (kilobytes to low megabytes). Size
-ephemeral storage for the largest concurrent media artefact, which is bounded by
-`MAX_FILE_SIZE`.
+the media workspace for ONE job's hard successful peak, **2 × `MAX_FILE_SIZE`**
+— 8 GiB at the 4 GiB default — because the Worker runs one job at a time and a
+job's original and produced artifact coexist. The Worker refuses to start below
+that (§2a).
 
 ---
 
@@ -246,11 +250,94 @@ ephemeral storage for the largest concurrent media artefact, which is bounded by
 | `CAP_NET_ADMIN` | **Never granted.** |
 | `CAP_SYS_ADMIN` | **Never granted.** |
 | Docker socket | **Never mounted.** |
-| Host filesystem | No writable host bind mounts beyond the state volume. |
+| Host filesystem | No writable host bind mounts beyond the state volume and the bounded Product media workspace (§2a). |
 | setuid helpers | None. |
 
 The Worker requires no elevated capability of any kind. If a deployment appears
 to need one, the deployment is wrong — not the image.
+
+### 2a. Product media workspace (`MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`)
+
+**Repository contract — not yet deployed.** The source raises the delivered-media
+ceiling to **4 GiB** (4,294,967,296 bytes) and replaces the 2 GiB
+`--tmpfs /tmp/videofetch` with a bounded, disk-backed workspace. Until the
+rollout below completes, deployed Production still runs image `d3b951d5…`
+(500 MiB default) on the 2 GiB tmpfs.
+
+**Capacity model.** Local media one successful job holds at once:
+
+| Plan | Footprint |
+| :--- | :--- |
+| keep-original, direct or generic | 1 × `MAX_FILE_SIZE` |
+| direct convert / extract-m4a / extract-mp3; generic extract-m4a / extract-mp3 | 2 × — the original plus the produced artifact |
+| generic merge-split | 2 × — video + audio (≤ max combined) plus the merged artifact (≤ max) |
+
+The Worker executes **one job at a time** (`WORKER_MAX_CONCURRENT_JOBS = 1`), so
+the hard successful media peak of the whole Worker is **8 GiB**. Two application
+gates enforce it:
+
+- a plan-aware per-job preflight, run after the trusted plan is derived and before
+  any acquisition, requiring 1 × or 2 × free. A refusal is `PROCESSING_FAILED`,
+  never `TOO_LARGE`, because local disk is Worker capacity, not a property of the
+  media;
+- a startup gate that refuses to start unless the filesystem holding the temp root
+  has ≥ 2 × `MAX_FILE_SIZE` both total and available. A 4 GiB image on the
+  retired 2 GiB tmpfs stops there.
+
+**Why not tmpfs.** The Lima VM has 4 GiB of RAM (4,093,939,712 bytes) and no swap,
+so an 8 GiB peak cannot live in memory.
+
+**The workspace.**
+
+| Element | Contract |
+| :--- | :--- |
+| Backing image | `/var/lib/videofetch-workspace/workspace.ext4`: root:root `0600`, exactly 10,737,418,240 bytes, fully preallocated |
+| Filesystem | ext4, made with `mkfs.ext4 -m 0 -T largefile -E nodiscard` |
+| Mount unit | `deploy/systemd/srv-videofetch-media.mount` → `/srv/videofetch/media`, `loop,rw,nodev,nosuid,noexec,noatime`, no `discard`. It fails visibly if the image is absent and never formats one. |
+| Workspace | `/srv/videofetch/media/workspace`, `1000:1000`, `0700` |
+| Container | `--mount type=bind,source=/srv/videofetch/media/workspace,target=/tmp/videofetch`. Never `-v`, so a missing source fails; never a tmpfs. |
+| Worker unit | `Requires=`, `After=` and `BindsTo=srv-videofetch-media.mount`, plus `RequiresMountsFor=/srv/videofetch/media` |
+| Verifier | `deploy/bin/vf-media-workspace-verify --wipe`, a fatal `ExecStartPre` that runs after `docker rm -f` |
+
+The verifier, in order:
+
+1. proves the backing file, loop identity, mount flags, owner, mode, and ≥ 9,663,676,416 bytes in total (8 GiB peak + 1 GiB headroom);
+2. only then empties the workspace — descendants only, `-xdev`, never through a link;
+3. re-proves the directory, that it is empty, and that the same available capacity is present.
+
+The bound is the filesystem: ENOSPC from a runaway FFmpeg output stays inside it.
+Available capacity is measured after the wipe, so residue from a killed job cannot
+block restarts. Nothing is wiped before identity and hardening pass.
+
+**Time and upload bounds are separate.**
+
+- Direct acquisition now has the same absolute deadline generic acquisition already
+  had: `DOWNLOAD_TIMEOUT`, 600 s for the whole transfer, never extended by
+  progress. A 4 GiB acquisition therefore needs about 57 Mbit/s sustained.
+- `FILE_EXPIRATION_MINUTES` (45) and `DOWNLOAD_TIMEOUT` are unchanged.
+- The upload is still one R2 `PutObject`. 4 GiB is below the provider's
+  single-part maximum (5 GiB, documented as 4.995 GiB), so no multipart upload,
+  new broker action or TTL change is involved.
+- The browser still downloads through the 303 → presigned R2 GET; Vercel never
+  proxies the body.
+
+**Rollout ordering (pending, each step separately authorized).**
+
+1. Grow the Lima disk from 24 GiB to **32 GiB**; this stops the VM. The 24 GiB disk
+   has 14,787,710,976 bytes free, short of the 10 GiB image plus a 6 GiB
+   root-filesystem reserve.
+2. Provision the 10 GiB image, install and enable the mount unit and verifier, and
+   create the workspace (`deploy/README.md`, step 4b).
+3. Storage-only validation: install the new Worker unit with the **current**
+   500 MiB-default image. Confirm every gate, health and one small job, and that
+   the workspace is empty afterwards.
+4. Build and accept a new Worker image from the merged source. Release-image
+   acceptance now requires `--media-workspace`.
+5. Promote it, retaining a rollback image.
+
+**Rollback constraint.** An image with the 4 GiB default refuses, by design, to
+start on the 2 GiB tmpfs. Roll the image back first (retag the previous id), then
+restore the tmpfs unit. The previous image runs normally on the new workspace.
 
 ---
 
@@ -3267,6 +3354,7 @@ the HTTP runtime.
 | Worker down at expiry | Vercel still refuses to sign new URLs; the provider TTL eventually removes the object. |
 | Rolling back the Worker | Retag the previous image **by image id** as `videofetch-worker:latest` and restart the unit against the **same** persistent volume. Schema V1 is unchanged, so no data migration is involved. No rebuild, no registry pull, no Vercel deployment and no Cloudflare change. |
 | Rolling forward | Never point a new Worker at a volume written by a **newer** schema — startup will refuse, by design. |
+| Rolling back the media workspace | Roll the Worker image back **first** — an image with the 4 GiB default refuses a 2 GiB workspace — then restore the tmpfs unit and `daemon-reload` (§2a). Growing the Lima disk is not reversed. |
 
 Because the replica count is exactly 1, a deployment is a brief interruption,
 not a zero-downtime rollout. Queued jobs survive it; interrupted active jobs are
@@ -3344,7 +3432,9 @@ authorization.
       `/var/lib/videofetch`, and a `noexec,nosuid` tmpfs at `/tmp/videofetch`
       owned by UID/GID 1000 (*repository-verifiable*). The live mount was
       verified and then exercised by a real Production job (§11c — *accepted
-      operator-measured*).
+      operator-measured*). *This records what Phase 8B accepted; in the
+      repository it is superseded by `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`,
+      whose unit binds a bounded disk workspace instead (§2a).*
 - [x] **All capabilities dropped; no privileged mode, host network or Docker
       socket.** The unit passes `--cap-drop=ALL` and `no-new-privileges`,
       carries no `--privileged` flag, joins only the media namespace
@@ -3496,6 +3586,7 @@ authorization.
 | `WORKERCLIENT-TOTAL-RESPONSE-DEADLINE-HARDENING-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | PR #44, merge `45c625041389df7e1b37ef6d25a27b9e629ca134` (*GitHub-verifiable*). One `requestTimeoutMs` budget covers request start → headers → complete body consumption on every Worker response path (§1b). Deployed as Vercel `dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC` — chain of custody, not Vercel Git-attested. See §11h. |
 | `SPLIT-08E-PRODUCTION-PROMOTION-001` | **COMPLETE / PRODUCTION ACCEPTED** | The retained split-stream candidate `sha256:d3b951d5…` (source `6ce4ce2b…`) was promoted to `videofetch-worker:latest` on 2026-09-13, in one authorized transaction: quiescence check, clean stop, verified state snapshot, immutable retag, exact-candidate start through the unit's own gates, local boundary checks, and a bounded Production smoke over the unchanged Vercel → Cloudflare Access → named Tunnel → HMAC path. No Production job was created, and no Vercel or Cloudflare configuration changed. The previous image is retained as the rollback asset (§9). *Accepted operator-measured Production evidence*, digest `427896be…`. See §11h. |
 | `WORKER-UNIT-COMMENT-SYNC-001` | **OPEN — low / non-blocking** | The installed `/etc/systemd/system/videofetch-worker.service` carries an older **comment block** than the committed `deploy/systemd/videofetch-worker.service`. Its executable contract is identical: every non-comment directive matched the committed unit exactly when SPLIT-08E measured it, so there is no behavioural difference and nothing to fix in source. Scope: a future operator-only synchronisation of comments on the VM — reinstall the committed unit text and `daemon-reload` — with no behaviour change intended. Deliberately **not** performed during the promotion, which was forbidden from touching systemd. |
+| `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001` | **IMPLEMENTED IN SOURCE — NOT DEPLOYED** | 4 GiB default from one shared constant, plan-aware and startup media-workspace gates, an absolute direct-acquisition deadline, the bounded disk workspace (mount unit + verifier + Worker unit bind), and release-image acceptance on a bind workspace (§2a). No R2, broker, Vercel, timeout or expiry change. Pending, each step separately authorized: Lima disk 24 → 32 GiB; provision the 10 GiB image; install the mount unit, verifier and Worker unit; storage-only validation on the current image; build and accept a new image; promote it with a retained rollback. |
 
 ---
 
