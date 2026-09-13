@@ -1,0 +1,243 @@
+#!/bin/bash
+# Fail-closed pre-start gate for the Product media workspace
+# (MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001).
+#
+# Usage:  vf-media-workspace-verify [--wipe]
+#
+# Exit 0 ONLY when /srv/videofetch/media is verifiably the reviewed bounded,
+# hardened workspace:
+#
+#   backing image  exactly /var/lib/videofetch-workspace/workspace.ext4: a
+#                  regular file (not a symlink), root:root, mode 0600, exactly
+#                  10,737,418,240 bytes, and FULLY allocated (st_blocks x 512 >=
+#                  size) — a sparse image could fail with ENOSPC mid-job when the
+#                  root filesystem fills;
+#   mount          exactly one ext4 mount at /srv/videofetch/media, on a loop
+#                  device whose backing file is exactly that image, with rw,
+#                  nodev, nosuid, noexec and noatime, and without discard, exec,
+#                  suid, dev or ro;
+#   workspace      /srv/videofetch/media/workspace is a real directory (not a
+#                  symlink) on that filesystem, owned 1000:1000, mode 0700;
+#   capacity       total and available bytes of that filesystem are each at least
+#                  9,663,676,416 — the 8 GiB hard media peak of one 4 GiB job plus
+#                  1 GiB of operational headroom.
+#
+# --wipe: after EVERY identity, mount, ownership and total-capacity check has
+# passed, remove every DESCENDANT of the workspace — never the directory itself,
+# never across a filesystem boundary, never through a symlink — then re-prove
+# the directory's identity and that it is empty. A fresh tmpfs gave every Worker
+# start an empty workspace; this gives the disk workspace the same property.
+#
+# AVAILABLE capacity is measured after the wipe, not before it. Residue from a
+# job that was killed mid-flight (SIGKILL, VM crash) is exactly what the wipe
+# removes; checking availability first would refuse every restart after such a
+# crash and require manual cleanup, while adding no safety, because nothing is
+# wiped until the filesystem's identity and hardening are proven.
+#
+# Every path, size and identity is a reviewed constant below. There are no path
+# arguments and no environment overrides. The only accepted argument is --wipe.
+#
+# Deliberately written for any bash >= 3.2 so its deployment tests run anywhere.
+# The probe functions are the only commands that inspect the system; the
+# deployment test suite sources this file and replaces them with fixtures. When
+# executed (as systemd does), nothing can be replaced.
+
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+VF_PROG=vf-media-workspace-verify
+
+# ── Reviewed constants ──────────────────────────────────────────────────────
+VF_BACKING_FILE=/var/lib/videofetch-workspace/workspace.ext4
+VF_MOUNT_POINT=/srv/videofetch/media
+VF_WORKSPACE=/srv/videofetch/media/workspace
+VF_BACKING_BYTES=10737418240
+VF_MIN_WORKSPACE_BYTES=9663676416
+VF_WORKSPACE_UID=1000
+VF_WORKSPACE_GID=1000
+VF_WORKSPACE_MODE=700
+VF_REQUIRED_MOUNT_OPTIONS="rw nodev nosuid noexec noatime"
+VF_FORBIDDEN_MOUNT_OPTIONS="discard exec suid dev ro"
+
+# ── Probes: read-only inspection, one command each ─────────────────────────
+vf_probe_euid() { id -u; }
+# type|uid|gid|mode|size|blocks|block-unit  (never follows a symlink)
+vf_probe_file_stat() { stat -c '%F|%u|%g|%a|%s|%b|%B' -- "$1"; }
+# type|uid|gid|mode|device  (never follows a symlink)
+vf_probe_dir_stat() { stat -c '%F|%u|%g|%a|%d' -- "$1"; }
+# source fstype options, for the mount at exactly this target
+vf_probe_mount() { findmnt -n -r -o SOURCE,FSTYPE,OPTIONS --mountpoint "$1"; }
+vf_probe_loop_backing() { losetup --list --noheadings --output BACK-FILE "$1"; }
+# fundamental-block-size|total-blocks|blocks-available-to-unprivileged
+vf_probe_fs_capacity() { stat -f -c '%S|%b|%a' -- "$1"; }
+vf_list_workspace() { find -P "$1" -mindepth 1 -maxdepth 1 -print; }
+
+# ── The one destructive action ──────────────────────────────────────────────
+# -P: never follow a symlink (a link is removed as a link). -xdev: never leave
+# the workspace filesystem. -mindepth 1: never the workspace directory itself.
+vf_wipe_workspace() { find -P "$1" -xdev -mindepth 1 -delete; }
+
+# ── Decisions ───────────────────────────────────────────────────────────────
+vf_fail() {
+  echo "$VF_PROG: FAIL: $*" >&2
+  exit 1
+}
+
+vf_usage() {
+  echo "usage: $VF_PROG [--wipe]" >&2
+  exit 2
+}
+
+# A plain decimal integer small enough that bash arithmetic cannot overflow.
+vf_is_count() {
+  case "$1" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ "${#1}" -le 18 ]
+}
+
+vf_single_line() {
+  case "$1" in
+    '' | *$'\n'*) return 1 ;;
+  esac
+  return 0
+}
+
+vf_has_option() {
+  case ",$1," in
+    *",$2,"*) return 0 ;;
+  esac
+  return 1
+}
+
+vf_verify_backing_file() {
+  local raw type uid gid mode size blocks unit
+  raw="$(vf_probe_file_stat "$VF_BACKING_FILE")" || vf_fail "backing image $VF_BACKING_FILE cannot be inspected"
+  vf_single_line "$raw" || vf_fail "backing image $VF_BACKING_FILE: unreadable status"
+  IFS='|' read -r type uid gid mode size blocks unit <<<"$raw"
+
+  [ "$type" = "regular file" ] || vf_fail "backing image $VF_BACKING_FILE is not a regular file ($type)"
+  [ "$uid" = "0" ] && [ "$gid" = "0" ] || vf_fail "backing image $VF_BACKING_FILE is not owned root:root ($uid:$gid)"
+  [ "$mode" = "600" ] || vf_fail "backing image $VF_BACKING_FILE mode $mode is not 600"
+  vf_is_count "$size" && vf_is_count "$blocks" && vf_is_count "$unit" ||
+    vf_fail "backing image $VF_BACKING_FILE: non-numeric size or allocation"
+  [ "$size" = "$VF_BACKING_BYTES" ] || vf_fail "backing image $VF_BACKING_FILE is $size bytes, not $VF_BACKING_BYTES"
+  [ $((blocks * unit)) -ge "$size" ] ||
+    vf_fail "backing image $VF_BACKING_FILE is not fully allocated ($((blocks * unit)) of $size bytes)"
+}
+
+vf_verify_mount() {
+  local raw source fstype options backing option
+  raw="$(vf_probe_mount "$VF_MOUNT_POINT")" || vf_fail "$VF_MOUNT_POINT is not a mountpoint"
+  vf_single_line "$raw" || vf_fail "$VF_MOUNT_POINT must carry exactly one mount"
+  read -r source fstype options <<<"$raw"
+
+  [ "$fstype" = "ext4" ] || vf_fail "$VF_MOUNT_POINT is $fstype, not ext4"
+  case "$source" in
+    /dev/loop[0-9] | /dev/loop[0-9][0-9] | /dev/loop[0-9][0-9][0-9]) ;;
+    *) vf_fail "$VF_MOUNT_POINT is not backed by a loop device ($source)" ;;
+  esac
+  backing="$(vf_probe_loop_backing "$source")" || vf_fail "$source backing file cannot be read"
+  [ "$backing" = "$VF_BACKING_FILE" ] ||
+    vf_fail "$source is backed by '$backing', not $VF_BACKING_FILE"
+
+  for option in $VF_REQUIRED_MOUNT_OPTIONS; do
+    vf_has_option "$options" "$option" || vf_fail "$VF_MOUNT_POINT is missing mount option $option"
+  done
+  for option in $VF_FORBIDDEN_MOUNT_OPTIONS; do
+    if vf_has_option "$options" "$option"; then
+      vf_fail "$VF_MOUNT_POINT carries forbidden mount option $option"
+    fi
+  done
+}
+
+vf_verify_workspace() {
+  local raw type uid gid mode device root root_type root_device
+  raw="$(vf_probe_dir_stat "$VF_WORKSPACE")" || vf_fail "workspace $VF_WORKSPACE cannot be inspected"
+  vf_single_line "$raw" || vf_fail "workspace $VF_WORKSPACE: unreadable status"
+  IFS='|' read -r type uid gid mode device <<<"$raw"
+
+  [ "$type" = "directory" ] || vf_fail "workspace $VF_WORKSPACE is not a real directory ($type)"
+  [ "$uid" = "$VF_WORKSPACE_UID" ] && [ "$gid" = "$VF_WORKSPACE_GID" ] ||
+    vf_fail "workspace $VF_WORKSPACE is owned $uid:$gid, not $VF_WORKSPACE_UID:$VF_WORKSPACE_GID"
+  [ "$mode" = "$VF_WORKSPACE_MODE" ] || vf_fail "workspace $VF_WORKSPACE mode $mode is not $VF_WORKSPACE_MODE"
+
+  root="$(vf_probe_dir_stat "$VF_MOUNT_POINT")" || vf_fail "$VF_MOUNT_POINT cannot be inspected"
+  vf_single_line "$root" || vf_fail "$VF_MOUNT_POINT: unreadable status"
+  IFS='|' read -r root_type _ _ _ root_device <<<"$root"
+  [ "$root_type" = "directory" ] || vf_fail "$VF_MOUNT_POINT is not a directory"
+  vf_is_count "$device" && [ "$device" = "$root_device" ] ||
+    vf_fail "workspace $VF_WORKSPACE is not on the $VF_MOUNT_POINT filesystem"
+}
+
+# Prints "<total bytes> <available bytes>" for the workspace filesystem.
+vf_filesystem_bytes() {
+  local raw block_size total_blocks available_blocks
+  raw="$(vf_probe_fs_capacity "$VF_WORKSPACE")" || vf_fail "workspace filesystem capacity cannot be read"
+  vf_single_line "$raw" || vf_fail "workspace filesystem capacity: unreadable status"
+  IFS='|' read -r block_size total_blocks available_blocks <<<"$raw"
+  vf_is_count "$block_size" && vf_is_count "$total_blocks" && vf_is_count "$available_blocks" ||
+    vf_fail "workspace filesystem capacity is not numeric"
+  [ "${#block_size}" -le 6 ] && [ "${#total_blocks}" -le 12 ] && [ "${#available_blocks}" -le 12 ] ||
+    vf_fail "workspace filesystem capacity is implausible"
+  echo "$((block_size * total_blocks)) $((block_size * available_blocks))"
+}
+
+vf_verify_total_capacity() {
+  local bytes total available
+  bytes="$(vf_filesystem_bytes)" || exit 1
+  read -r total available <<<"$bytes"
+  [ "$total" -ge "$VF_MIN_WORKSPACE_BYTES" ] ||
+    vf_fail "workspace filesystem holds $total bytes, below the required $VF_MIN_WORKSPACE_BYTES"
+}
+
+vf_verify_available_capacity() {
+  local bytes total available
+  bytes="$(vf_filesystem_bytes)" || exit 1
+  read -r total available <<<"$bytes"
+  [ "$available" -ge "$VF_MIN_WORKSPACE_BYTES" ] ||
+    vf_fail "workspace filesystem has $available bytes available, below the required $VF_MIN_WORKSPACE_BYTES"
+}
+
+vf_main() {
+  local wipe=0 listing
+  case "$#" in
+    0) ;;
+    1)
+      [ "$1" = "--wipe" ] || vf_usage
+      wipe=1
+      ;;
+    *) vf_usage ;;
+  esac
+
+  [ "$(vf_probe_euid)" = "0" ] || vf_fail "must run as root"
+
+  # 1. Identity, hardening and size. NOTHING is modified until all of these pass.
+  vf_verify_backing_file
+  vf_verify_mount
+  vf_verify_workspace
+  vf_verify_total_capacity
+
+  if [ "$wipe" -eq 1 ]; then
+    # 2. The wipe: descendants only, on this filesystem, never through a link.
+    vf_wipe_workspace "$VF_WORKSPACE" || vf_fail "wiping $VF_WORKSPACE failed"
+    # 3. The directory survived unchanged, and nothing is left in it.
+    vf_verify_workspace
+    listing="$(vf_list_workspace "$VF_WORKSPACE")" || vf_fail "$VF_WORKSPACE cannot be listed after the wipe"
+    [ -z "$listing" ] || vf_fail "$VF_WORKSPACE is not empty after the wipe"
+  fi
+
+  # 4. Room for one 4 GiB job's 8 GiB peak plus headroom, as it stands now.
+  vf_verify_available_capacity
+
+  if [ "$wipe" -eq 1 ]; then
+    echo "$VF_PROG: OK - $VF_MOUNT_POINT verified; $VF_WORKSPACE wiped"
+  else
+    echo "$VF_PROG: OK - $VF_MOUNT_POINT verified"
+  fi
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  vf_main "$@"
+fi

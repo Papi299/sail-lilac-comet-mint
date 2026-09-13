@@ -504,10 +504,13 @@ describe("safe-egress deployment policy", () => {
     it("retains every current container invariant", () => {
       const exec = values(workerUnit, "ExecStart").join("\n");
       assert.match(exec, /--read-only\b/);
-      // Presence only. The full /tmp/videofetch option contract — including the
-      // uid/gid ownership grant this assertion used to certify away — is
+      // Presence only. The full /tmp/videofetch contract — the Worker's uid/gid
+      // ownership and the hardened, bounded disk workspace behind the bind — is
       // asserted semantically in the two tests below.
-      assert.match(exec, /--tmpfs\s+\/tmp\/videofetch:/);
+      assert.match(
+        exec,
+        /--mount\s+type=bind,source=\/srv\/videofetch\/media\/workspace,target=\/tmp\/videofetch(\s|$)/,
+      );
       assert.match(exec, /--volume\s+\/var\/lib\/videofetch:\/var\/lib\/videofetch:rw\b/);
       assert.match(exec, /--volume\s+\/run\/videofetch-r2-broker:\/run\/videofetch-r2-broker:ro\b/);
       assert.match(exec, /--group-add\s+\$\{VIDEOFETCH_BROKER_GID\}/);
@@ -530,54 +533,60 @@ describe("safe-egress deployment policy", () => {
     // The old form of this suite asserted one exact option string and so
     // actively protected the broken declaration. These assert over the option
     // SET instead.
-    it("mounts the media temp tmpfs writable by the Worker's own uid/gid", () => {
+    //
+    // MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001 replaced that tmpfs with an exact
+    // bind of a bounded, disk-backed ext4 workspace (a 4 GiB ceiling needs an
+    // 8 GiB peak the VM's memory cannot hold). The lesson carries over
+    // unchanged: the bind shadows the image directory too, so the runtime
+    // identity must be carried by the mounted directory, and that is proven by
+    // the fatal pre-start verifier rather than by mount options.
+    it("mounts the Product media workspace writable by the Worker's own uid/gid", async () => {
       const exec = values(workerUnit, "ExecStart").join("\n");
-      const options = tmpfsOptions(exec, "/tmp/videofetch");
+      const binds = [...exec.matchAll(/--mount\s+(\S+)/g)].map((match) => match[1]);
+      assert.deepEqual(binds, ["type=bind,source=/srv/videofetch/media/workspace,target=/tmp/videofetch"]);
 
-      // uid/gid are the fix; rw/noexec/nosuid/size are what the fix must not
-      // cost. 1000:1000 is the `node` user of the node:22-bookworm-slim base
-      // that Dockerfile.worker switches to, written numerically because a
-      // kernel mount option takes ids, not names.
-      for (const required of ["rw", "noexec", "nosuid", "size=2g", "uid=1000", "gid=1000"]) {
-        assert.ok(
-          options.includes(required),
-          `the /tmp/videofetch tmpfs must be mounted ${required} (got ${options.join(",")})`,
-        );
+      // 1000:1000 is the `node` user of the node:22-bookworm-slim base that
+      // Dockerfile.worker switches to; mode 0700 grants nobody else anything.
+      const verifier = (await readFile(join(BIN, "vf-media-workspace-verify"), "utf8")).split("\n");
+      for (const constant of [
+        "VF_WORKSPACE=/srv/videofetch/media/workspace",
+        "VF_WORKSPACE_UID=1000",
+        "VF_WORKSPACE_GID=1000",
+        "VF_WORKSPACE_MODE=700",
+      ]) {
+        assert.ok(verifier.includes(constant), `the workspace verifier must enforce ${constant}`);
       }
+      assert.ok(
+        values(workerUnit, "ExecStartPre").includes("/usr/local/sbin/vf-media-workspace-verify --wipe"),
+        "ownership and mode are proven, fatally, before every start",
+      );
     });
 
-    it("buys that writability with no loss of temp-filesystem hardening", () => {
+    it("buys that writability with no loss of temp-filesystem hardening", async () => {
       const exec = values(workerUnit, "ExecStart").join("\n");
-      const options = tmpfsOptions(exec, "/tmp/videofetch");
+      const mountUnit = parseUnit(await readFile(join(SYSTEMD, "srv-videofetch-media.mount"), "utf8"));
+      const options = (values(mountUnit, "Options")[0] ?? "").split(",");
 
-      // Exact-token comparison, which is precisely what splitting on ',' buys:
-      // `noexec` must never be relaxed to `exec`, and a substring check could
-      // not tell those two apart.
-      for (const forbidden of ["exec", "suid", "ro"]) {
-        assert.equal(
-          options.includes(forbidden),
-          false,
-          `the /tmp/videofetch tmpfs must never be mounted ${forbidden}`,
-        );
+      // Exact-token comparison: `noexec` must never be relaxed to `exec`.
+      for (const required of ["rw", "nodev", "nosuid", "noexec", "noatime"]) {
+        assert.ok(options.includes(required), `the media workspace must be mounted ${required} (got ${options.join(",")})`);
+      }
+      for (const forbidden of ["exec", "suid", "dev", "ro", "discard"]) {
+        assert.equal(options.includes(forbidden), false, `the media workspace must never be mounted ${forbidden}`);
       }
 
-      // Writable by the WORKER is the fix. Writable by anyone is not: the
-      // correction is an ownership grant, never a permission broadening.
-      for (const option of options) {
-        const mode = /^mode=([0-7]+)$/.exec(option)?.[1];
-        if (mode === undefined) continue;
-        assert.equal(
-          Number.parseInt(mode.slice(-1), 8) & 0o2,
-          0,
-          `the /tmp/videofetch tmpfs must not be world-writable (${option})`,
-        );
-      }
+      // Writable by the WORKER is the fix. Writable by anyone is not.
+      const verifier = await readFile(join(BIN, "vf-media-workspace-verify"), "utf8");
+      const mode = /^VF_WORKSPACE_MODE=([0-7]+)$/m.exec(verifier)?.[1];
+      assert.ok(mode, "the verifier pins the workspace mode");
+      assert.equal(Number.parseInt(mode!, 8) & 0o022, 0, "the workspace must not be group- or world-writable");
 
-      // And it must stay an ephemeral tmpfs. Swapping it for a host bind mount
-      // would also "fix" the EACCES, by putting media working files on the VM
-      // disk, outside the size bound and outside the container's lifetime.
+      // And it must stay BOUNDED: never the retired tmpfs, and never a `-v`
+      // host directory Docker could silently create on the root disk, outside
+      // any size bound. The bind's source is the fixed-size ext4 image's mount.
+      assert.throws(() => tmpfsOptions(exec, "/tmp/videofetch"), "the Product media tmpfs is retired");
       assert.doesNotMatch(exec, /--volume\s+\S*:\/tmp\/videofetch\b/);
-      assert.doesNotMatch(exec, /--mount\s+\S*\/tmp\/videofetch\b/);
+      assert.deepEqual(values(mountUnit, "What"), ["/var/lib/videofetch-workspace/workspace.ext4"]);
     });
 
     it("acquires no privilege from the safe-egress merge", () => {

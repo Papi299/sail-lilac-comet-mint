@@ -109,14 +109,24 @@ export const RELEASE_HARDENING_ARGS = Object.freeze([
  * the deployment's posture and the control that makes "the pinned runtime
  * cannot be rewritten" observable rather than asserted.
  *
- * PRODUCT media temp is EXACTLY the Production unit's mount
+ * PRODUCT media workspace has the SHAPE of the Production unit's mount
  * (`deploy/systemd/videofetch-worker.service`), and a self-test reads the unit
- * to keep it that way. A tmpfs mounted over `/tmp/videofetch` shadows the
- * node-owned directory the image prepares, so its uid/gid options are
- * load-bearing, not cosmetic (WORKER-TEMP-TMPFS-OWNERSHIP-001). The first real
- * SPLIT-07A run put a tmpfs on `/tmp` instead, hid `/tmp/videofetch` from the
- * product, and both families failed `PROCESSING_FAILED` before upload — the
- * gate catching exactly the filesystem-layout drift it exists to catch.
+ * to keep it that way. Since MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001 that mount is
+ * no longer a tmpfs: a 4 GiB ceiling needs an 8 GiB successful peak, which the
+ * 4 GiB-RAM, swapless VM cannot hold in memory, so Production binds a bounded,
+ * disk-backed ext4 workspace with `--mount type=bind,...,target=/tmp/videofetch`.
+ * A candidate run binds a HOST-SUPPLIED, empty, disk-backed directory at the
+ * same target in the same `--mount type=bind` form — never `-v`, which would
+ * silently create a missing source — and never an 8+ GiB tmpfs. Only the source
+ * differs: the harness cannot use the host's Production workspace.
+ *
+ * A bind over `/tmp/videofetch` shadows the node-owned directory the image
+ * prepares exactly as the tmpfs did, so the host directory must be writable by
+ * the image's uid 1000 — the WORKER-TEMP-TMPFS-OWNERSHIP-001 lesson, unchanged.
+ * The first real SPLIT-07A run put a tmpfs on `/tmp` instead, hid
+ * `/tmp/videofetch` from the product, and both families failed
+ * `PROCESSING_FAILED` before upload — the gate catching exactly the
+ * filesystem-layout drift it exists to catch.
  *
  * HARNESS scratch: SPLIT-06 keeps its fixtures, temporary database and object
  * sink under `mkdtemp(tmpdir())`. That is a harness need, not a product one, so
@@ -130,17 +140,58 @@ export const RELEASE_HARDENING_ARGS = Object.freeze([
  * is the job's own workDir; only FFmpeg/ffprobe inherit it, for stream-copy and
  * probing, which write to explicit paths.
  *
- * Neither mount grants `exec`: nothing in the chain executes a file it wrote.
+ * Nothing in the chain executes a file it wrote: the harness scratch tmpfs is
+ * `noexec`, and Production's workspace mount is `noexec` on the host (a bind
+ * cannot set that itself; an operator runs this harness on a VM filesystem).
  * The pinned yt-dlp is the platform-independent zipimport artifact precisely so
  * it never unpacks itself into a temporary directory.
  */
-export const PRODUCT_MEDIA_TMPFS = "/tmp/videofetch:rw,noexec,nosuid,size=2g,uid=1000,gid=1000";
+export const PRODUCT_MEDIA_TARGET = "/tmp/videofetch";
 export const HARNESS_SCRATCH_TARGET = "/acceptance-scratch";
 export const HARNESS_SCRATCH_TMPFS =
   `${HARNESS_SCRATCH_TARGET}:rw,noexec,nosuid,nodev,size=512m,uid=1000,gid=1000`;
 
 /** The environment a candidate run may add. Deliberately tiny, and non-secret. */
 export const RELEASE_RUN_ENVIRONMENT = Object.freeze([`TMPDIR=${HARNESS_SCRATCH_TARGET}`]);
+
+/**
+ * The `--mount` operand binding a host-supplied Product media workspace at
+ * `/tmp/videofetch`, in exactly the Production unit's `type=bind` form.
+ *
+ * The source is an operand of a comma-separated option list, so a comma, a
+ * quote or a control character in it could smuggle an extra mount option; such
+ * a path is refused rather than escaped. So is anything that is not a clean
+ * absolute path below `/`.
+ */
+export function productMediaWorkspaceMount(hostDirectory) {
+  requireAbsoluteHostPath("the Product media workspace", hostDirectory);
+  if (
+    hostDirectory.replace(/\/+$/, "") === "" ||
+    // eslint-disable-next-line no-control-regex
+    /[,"'\u0000-\u001F\u007F]/.test(hostDirectory) ||
+    hostDirectory.split("/").some((segment) => segment === "." || segment === "..")
+  ) {
+    throw new Error(
+      "the Product media workspace must be a clean absolute directory: not /, no relative " +
+        "segment, and no comma, quote or control character",
+    );
+  }
+  return `type=bind,source=${hostDirectory},target=${PRODUCT_MEDIA_TARGET}`;
+}
+
+/**
+ * Component-aware containment, in either direction: true when `a` and `b` are
+ * the same path or one lies beneath the other. Not a string prefix test —
+ * `/var/tmp/split07-media` is not under `/var/tmp/split07`.
+ */
+export function hostPathsOverlap(a, b) {
+  const parts = (p) => String(p).split("/").filter((segment) => segment.length > 0);
+  const left = parts(a);
+  const right = parts(b);
+  const shorter = left.length <= right.length ? left : right;
+  const longer = shorter === left ? right : left;
+  return shorter.every((segment, index) => segment === longer[index]);
+}
 
 /**
  * The candidate tag for one release source commit.
@@ -427,7 +478,8 @@ export const POLICY_VERIFIERS = Object.freeze(["verify-selector.py", "verify-dow
  *     it, and mounted at its repository-relative path so `split-full-path.mjs`
  *     resolves `../../../src/...` to the IMAGE's `/app/src`;
  *   - `--read-only`, `--cap-drop=ALL` and `no-new-privileges` are added, with
- *     Production's exact media tmpfs and a separate harness scratch tmpfs;
+ *     the Product media workspace bound at `/tmp/videofetch` in Production's
+ *     exact `--mount type=bind` form and a separate harness scratch tmpfs;
  *   - `assertNoForbiddenMounts` runs over the finished argv, so a future edit
  *     that reached for `/app/src` fails here instead of silently producing a
  *     run that proves nothing about the release image.
@@ -442,6 +494,7 @@ export function releaseAcceptanceRunArgs({
   family,
   harnessDir,
   reportDir,
+  mediaWorkspaceDir,
   evidenceName,
   containerReportDir = REPORT_MOUNT_TARGET,
 }) {
@@ -449,6 +502,15 @@ export function releaseAcceptanceRunArgs({
   if (family !== "mp4" && family !== "webm") throw new Error("family must be mp4 or webm");
   requireAbsoluteHostPath("the harness directory", harnessDir);
   requireAbsoluteHostPath("the report directory", reportDir);
+  const productMediaMount = productMediaWorkspaceMount(mediaWorkspaceDir);
+  // The Product workspace is product scratch, wiped between runs: it is never
+  // the evidence directory, and never inside (or around) the harness.
+  if (hostPathsOverlap(mediaWorkspaceDir, reportDir)) {
+    throw new Error("the Product media workspace must not overlap the report directory");
+  }
+  if (hostPathsOverlap(mediaWorkspaceDir, harnessDir)) {
+    throw new Error("the Product media workspace must not overlap the harness directory");
+  }
   if (typeof evidenceName !== "string" || !/^[A-Za-z0-9._-]+$/.test(evidenceName)) {
     throw new Error("the evidence filename must be a plain basename");
   }
@@ -457,9 +519,10 @@ export function releaseAcceptanceRunArgs({
     "--rm",
     ...RELEASE_HARDENING_ARGS,
     "--read-only",
-    // The product's writable media surface, exactly as Production mounts it.
-    "--tmpfs",
-    PRODUCT_MEDIA_TMPFS,
+    // The product's writable media surface, bound exactly as Production binds
+    // its disk-backed workspace. `--mount`, never `-v`: a missing source fails.
+    "--mount",
+    productMediaMount,
     // The harness's own scratch, disjoint from every product path.
     "--tmpfs",
     HARNESS_SCRATCH_TMPFS,
@@ -467,7 +530,8 @@ export function releaseAcceptanceRunArgs({
     // The acceptance harness: test machinery the release image does not ship.
     "-v",
     `${harnessDir}:${HARNESS_MOUNT_TARGET}:ro`,
-    // The one WRITABLE surface, and the only thing the run writes off tmpfs.
+    // The evidence directory: the only writable surface besides the Product
+    // workspace and the harness scratch.
     "-v",
     `${reportDir}:${containerReportDir}`,
     "-w",

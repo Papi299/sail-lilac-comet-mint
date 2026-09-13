@@ -198,16 +198,20 @@ describe("videofetch-worker.service yt-dlp deployment contract", () => {
       assert.match(execStart, /--read-only\b/);
     });
 
-    it("still mounts the media scratch as a 2 GiB noexec,nosuid tmpfs", () => {
-      const tmpfs = execStart.match(/--tmpfs\s+\/tmp\/videofetch:(\S+)/);
-      assert.ok(tmpfs, "the /tmp/videofetch tmpfs is required");
-      const options = tmpfs![1].split(",");
-      for (const option of ["rw", "noexec", "nosuid", "size=2g", "uid=1000", "gid=1000"]) {
-        assert.ok(options.includes(option), `the tmpfs must keep ${option}`);
-      }
-      // Option-level, not substring: `noexec` must never be relaxed to `exec`.
-      assert.ok(!options.includes("exec"), "the media scratch must never be executable");
-      assert.ok(!options.includes("suid"));
+    it("mounts the Product media workspace as an exact bind of the bounded disk workspace, never a tmpfs", () => {
+      // MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001 retired the 2 GiB tmpfs: a 4 GiB
+      // ceiling needs an 8 GiB peak the VM's memory cannot hold. The mount's
+      // hardening (rw,nodev,nosuid,noexec,noatime) lives on
+      // srv-videofetch-media.mount and is asserted with that unit.
+      assert.doesNotMatch(execStart, /--tmpfs\b/, "no Product media tmpfs remains");
+      const mounts = [...execStart.matchAll(/--mount\s+(\S+)/g)].map((match) => match[1]);
+      assert.deepEqual(mounts, ["type=bind,source=/srv/videofetch/media/workspace,target=/tmp/videofetch"]);
+      assert.doesNotMatch(
+        execStart,
+        /(?:-v|--volume)\s+\S*:\/tmp\/videofetch\b/,
+        "never -v, which would silently create a missing source",
+      );
+      assert.ok(tokens(lines, "BindsTo").includes("srv-videofetch-media.mount"));
     });
 
     it("still mounts the state volume rw and the broker socket directory ro", () => {

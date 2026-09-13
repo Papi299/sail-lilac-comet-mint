@@ -45,10 +45,24 @@
 //     --harness-source <full 40-hex commit the harness checkout must be at> \
 //     --harness-tree   <full 40-hex tree of that commit> \
 //     --report   /var/tmp/split07 \
+//     --media-workspace /var/tmp/split07-media \
 //     [--docker docker] [--keep-image]
+//
+// ── The Product media workspace (MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001) ─────
+//
+// Production binds a bounded, disk-backed workspace at `/tmp/videofetch`; the
+// retired 2 GiB tmpfs could not hold a 4 GiB job's 8 GiB peak. Each SPLIT-06
+// child binds `--media-workspace` at that same target in that same
+// `--mount type=bind` form. It must be an EXISTING, EMPTY directory on disk,
+// writable by the image's uid 1000 and cleanable by the operator — for example
+// `sudo install -d -m 2770 -o 1000 -g 1000 /var/tmp/split07-media` for an
+// operator in gid 1000 — and never the report directory. The driver refuses to
+// start unless it is empty, re-checks that before each family, and explicitly
+// clears what each family left behind; a workspace it cannot clear stops the
+// run rather than contaminating the next family.
 
 import { spawn } from "node:child_process";
-import { mkdir, readFile, readdir, realpath } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -59,12 +73,14 @@ import {
   candidateImageTag,
   candidateRemoveArgs,
   dockerRunSubject,
+  hostPathsOverlap,
   IMAGE_ID_PATTERN,
   imageIdArgs,
   imageInspectArgs,
   POLICY_VERIFIERS,
   policyVerifierRunArgs,
   probeRunArgs,
+  productMediaWorkspaceMount,
   releaseAcceptanceRunArgs,
   releaseBuildArgs,
 } from "./lib/release-container.mjs";
@@ -128,6 +144,15 @@ function spawnRunner(command, args, { capture = false, binary = false } = {}) {
   });
 }
 
+/** The entries of a REAL directory; a symlink or a non-directory is refused. */
+async function listRealDirectory(directory) {
+  const status = await lstat(directory);
+  if (status.isSymbolicLink() || !status.isDirectory()) {
+    throw new Error(`${directory} is not a real directory`);
+  }
+  return readdir(directory);
+}
+
 /** Provenance arguments: full, lowercase Git object names, never abbreviations. */
 const FULL_SHA_ARGUMENTS = [
   ["--source", "source"],
@@ -139,7 +164,7 @@ const FULL_SHA_ARGUMENTS = [
 export function parseArgv(argv) {
   const out = {
     source: null, tree: null, context: null, harness: null, harnessSource: null, harnessTree: null,
-    report: null, docker: "docker", keepImage: false,
+    report: null, mediaWorkspace: null, docker: "docker", keepImage: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -157,6 +182,7 @@ export function parseArgv(argv) {
       case "--harness-source": take("harnessSource"); break;
       case "--harness-tree": take("harnessTree"); break;
       case "--report": take("report"); break;
+      case "--media-workspace": take("mediaWorkspace"); break;
       case "--docker": take("docker"); break;
       case "--keep-image": out.keepImage = true; break;
       default: throw new Error(`unknown argument: ${arg}`);
@@ -165,14 +191,24 @@ export function parseArgv(argv) {
   for (const [flag, key] of [
     ["--source", "source"], ["--tree", "tree"], ["--context", "context"], ["--harness", "harness"],
     ["--harness-source", "harnessSource"], ["--harness-tree", "harnessTree"], ["--report", "report"],
+    ["--media-workspace", "mediaWorkspace"],
   ]) {
     if (!out[key]) throw new Error(`${flag} is required`);
   }
   for (const [flag, key] of FULL_SHA_ARGUMENTS) {
     if (!isFullGitSha(out[key])) throw new Error(`${flag} must be a full lowercase 40-hex SHA`);
   }
-  for (const [flag, key] of [["--context", "context"], ["--harness", "harness"], ["--report", "report"]]) {
+  for (const [flag, key] of [
+    ["--context", "context"], ["--harness", "harness"], ["--report", "report"], ["--media-workspace", "mediaWorkspace"],
+  ]) {
     if (!out[key].startsWith("/")) throw new Error(`${flag} must be an absolute path`);
+  }
+  // Refuses a path that could not be expressed as a clean `--mount` source.
+  productMediaWorkspaceMount(out.mediaWorkspace);
+  for (const [flag, key] of [["--context", "context"], ["--harness", "harness"], ["--report", "report"]]) {
+    if (hostPathsOverlap(out.mediaWorkspace, out[key])) {
+      throw new Error(`--media-workspace must not overlap ${flag}`);
+    }
   }
   return out;
 }
@@ -224,6 +260,10 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
   const readFileBytes = deps.readFile ?? readFile;
   const makeDirectory = deps.mkdir ?? mkdir;
   const resolvePath = deps.realpath ?? realpath;
+  const listMediaWorkspace = deps.listMediaWorkspace ?? listRealDirectory;
+  const removeMediaWorkspaceEntry =
+    deps.removeMediaWorkspaceEntry ??
+    ((directory, name) => rm(join(directory, name), { recursive: true, force: true }));
   const startedAt = new Date(now()).toISOString();
 
   const checks = createChecks();
@@ -302,6 +342,39 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
   await makeDirectory(opts.report, { recursive: true });
   const evidencePath = join(opts.report, `split07-release-image-${now()}.json`);
   await admitEvidencePath(evidencePath, deps);
+
+  /**
+   * The Product media workspace must be an existing, real, EMPTY directory.
+   * Anything else is a refusal of the whole run, never a PASS-shaped record:
+   * residue would let one family's files stand in for the next family's.
+   */
+  const admitMediaWorkspace = async (point) => {
+    let entries;
+    try {
+      entries = await listMediaWorkspace(opts.mediaWorkspace);
+    } catch {
+      throw new Error(
+        `refusing to run: the Product media workspace ${opts.mediaWorkspace} is not an existing real directory (${point})`,
+      );
+    }
+    if (!Array.isArray(entries) || entries.length !== 0) {
+      throw new Error(
+        `refusing to run: the Product media workspace ${opts.mediaWorkspace} is not empty (${point}); clean it explicitly`,
+      );
+    }
+  };
+
+  /** Explicit cleanup of what one family left, then proof that it is empty. */
+  const clearMediaWorkspace = async (point) => {
+    for (const name of await listMediaWorkspace(opts.mediaWorkspace)) {
+      await removeMediaWorkspaceEntry(opts.mediaWorkspace, name);
+    }
+    await admitMediaWorkspace(point);
+    log(`[split07] Product media workspace cleared after ${point}\n`);
+  };
+
+  // Before ANY Docker command, like every other operator input.
+  await admitMediaWorkspace("before-docker");
 
   // The expected source manifest, read from the OBSERVED commit's Git objects.
   const expectedManifest = await buildExpectedSourceManifest({ git: contextGit, source: provenance.source });
@@ -568,9 +641,11 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
     const childObservations = [];
     for (const family of REQUIRED_SPLIT_FAMILIES) {
       await verifyHarnessAt(`before-split06-${family}`);
+      await admitMediaWorkspace(`before-split06-${family}`);
       const evidenceName = `split06-${family}-${now()}.json`;
       const args = releaseAcceptanceRunArgs({
-        imageId: runSubject, family, harnessDir, reportDir: opts.report, evidenceName,
+        imageId: runSubject, family, harnessDir, reportDir: opts.report,
+        mediaWorkspaceDir: opts.mediaWorkspace, evidenceName,
       });
       args.push(
         "--source-commit", provenance.source,
@@ -606,6 +681,7 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       childObservations.push({ ...child, path: evidenceName, exitCode: result.code });
       log(`[split07] SPLIT-06 ${family}: ${child.verdict ?? "UNREADABLE"} ` +
         `${child.checkCount} checks sha256=${child.sha256 ?? "n/a"}\n`);
+      await clearMediaWorkspace(`split06-${family}`);
     }
 
     // The children are re-read and re-hashed here, so the digests the parent
