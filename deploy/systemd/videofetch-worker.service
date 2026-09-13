@@ -76,6 +76,23 @@ Requires=videofetch-media-dns.service
 After=videofetch-media-dns.service
 BindsTo=videofetch-media-dns.service
 
+# ── THE PRODUCT MEDIA WORKSPACE ────────────────────────────────────────────
+# (MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001)
+#
+# /tmp/videofetch inside the container is an exact bind of the bounded,
+# disk-backed workspace srv-videofetch-media.mount provides. A 4 GiB
+# delivered-media ceiling needs up to 8 GiB of simultaneous local media for one
+# job, which the VM's memory cannot hold, so the 2 GiB tmpfs is retired.
+#
+# Requires/After    : the Worker never starts before the workspace is mounted.
+# BindsTo           : losing or unmounting it stops the Worker.
+# RequiresMountsFor : the same dependency stated by PATH, so it cannot be lost to
+#                     a unit rename.
+Requires=srv-videofetch-media.mount
+After=srv-videofetch-media.mount
+BindsTo=srv-videofetch-media.mount
+RequiresMountsFor=/srv/videofetch/media
+
 [Service]
 Type=simple
 Restart=on-failure
@@ -190,6 +207,14 @@ ExecStartPre=/usr/local/sbin/vf-egress-policy-verify
 
 ExecStartPre=-/usr/bin/docker rm -f videofetch-worker
 
+# FAIL-CLOSED GATE + WIPE: the media workspace must verifiably be the reviewed
+# bounded, hardened filesystem — backing image, loop identity, mount flags,
+# ownership, mode and capacity — and only then is it emptied, so every start
+# begins with an empty workspace exactly as a fresh tmpfs did. It runs AFTER
+# `docker rm -f`, so no Worker container can write during the wipe, and it is
+# NOT prefixed with '-': its failure is fatal.
+ExecStartPre=/usr/local/sbin/vf-media-workspace-verify --wipe
+
 ExecStart=/usr/bin/docker run --rm --name videofetch-worker \
   --env-file /etc/videofetch/worker.env \
   --env R2_BROKER_SOCKET_PATH=/run/videofetch-r2-broker/broker.sock \
@@ -197,7 +222,7 @@ ExecStart=/usr/bin/docker run --rm --name videofetch-worker \
   --cap-drop=ALL \
   --security-opt no-new-privileges \
   --read-only \
-  --tmpfs /tmp/videofetch:rw,noexec,nosuid,size=2g,uid=1000,gid=1000 \
+  --mount type=bind,source=/srv/videofetch/media/workspace,target=/tmp/videofetch \
   --volume /var/lib/videofetch:/var/lib/videofetch:rw \
   --volume /run/videofetch-r2-broker:/run/videofetch-r2-broker:ro \
   --group-add ${VIDEOFETCH_BROKER_GID} \
@@ -215,28 +240,34 @@ ExecStop=/usr/bin/docker stop --time 15 videofetch-worker
 #                   owning group by the ExecStartPre gate above. Neither
 #                   /etc/passwd nor /etc/group is mounted into the container.
 #
-# --tmpfs           uid=/gid= are REQUIRED, not cosmetic. A tmpfs is a fresh
-#                   filesystem mounted OVER /tmp/videofetch, so it SHADOWS the
-#                   image directory Dockerfile.worker prepares and chowns to
-#                   node:node. Without these options the kernel gives the new
-#                   mount root:root 0755, the Worker runs as the image's
-#                   non-root `node` user, and its first
-#                   `mkdir /tmp/videofetch/jobs` fails EACCES — which is
-#                   exactly how the first production direct-media job failed
-#                   (WORKER-TEMP-TMPFS-OWNERSHIP-001). Image-layer ownership
-#                   cannot fix this; only the mount can.
+# --mount           The Product media workspace
+#                   (MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001).
 #
-#                   1000:1000 is the `node` user of the node:22-bookworm-slim
-#                   base, which is this image's runtime identity. It is written
-#                   NUMERICALLY for the same reason --group-add is: the kernel
-#                   mount option takes ids, not names, and the container's
-#                   /etc/passwd is not consulted.
+#                   type=bind of /srv/videofetch/media/workspace, and never `-v`:
+#                   `--mount` refuses a missing source, where `-v` would silently
+#                   create an unbounded directory on the root disk.
 #
-#                   The grant is exactly the Worker's own uid/gid and nothing
-#                   wider — the mount is NOT world-writable — and rw,noexec,
-#                   nosuid,size=2g are retained unchanged, so media working
-#                   files still cannot be executed, cannot gain setuid and
-#                   cannot exhaust host memory.
+#                   Ownership is REQUIRED, not cosmetic. The bind shadows the
+#                   /tmp/videofetch directory Dockerfile.worker prepares and
+#                   chowns to node:node, exactly as the retired tmpfs did, so the
+#                   runtime identity must be carried by the mounted directory
+#                   itself — the lesson of WORKER-TEMP-TMPFS-OWNERSHIP-001, where
+#                   the first production direct-media job failed EACCES on
+#                   `mkdir /tmp/videofetch/jobs`. The workspace is owned 1000:1000,
+#                   the `node` user of the node:22-bookworm-slim base, and is mode
+#                   0700: writable by the Worker and by no other account.
+#
+#                   Its hardening lives on the HOST mount and a bind inherits it:
+#                   the ext4 workspace is mounted rw,nodev,nosuid,noexec,noatime,
+#                   so media working files still cannot be executed, gain setuid
+#                   or act as device nodes. Its bound is the 10 GiB filesystem,
+#                   not host memory, and it is never the durable state volume.
+#                   vf-media-workspace-verify proves all of this before every
+#                   start, and empties it.
+#
+#                   Why not a tmpfs any more: one 4 GiB job can hold 8 GiB of
+#                   media at once (original + produced artifact, or both split
+#                   halves + the merge). The VM has 4 GiB of RAM and no swap.
 #
 # --volume ...:ro   The broker's runtime DIRECTORY is mounted read-only. That
 #                   is what prevents socket hijacking: the container cannot

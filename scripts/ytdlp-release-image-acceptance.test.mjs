@@ -45,11 +45,13 @@ import {
   IMAGE_ID_PATTERN,
   imageIdArgs,
   imageInspectArgs,
+  hostPathsOverlap,
   mountTargets,
   POLICY_VERIFIERS,
   policyVerifierRunArgs,
   probeRunArgs,
-  PRODUCT_MEDIA_TMPFS,
+  PRODUCT_MEDIA_TARGET,
+  productMediaWorkspaceMount,
   RELEASE_DOCKERFILE,
   RELEASE_RUN_ENVIRONMENT,
   releaseAcceptanceRunArgs,
@@ -98,6 +100,8 @@ const HARNESS_COMMIT = "1111111111111111111111111111111111111111";
 const CONTEXT = "/build/vf-release";
 const HARNESS = "/build/vf-harness";
 const REPORT = "/var/tmp/split07";
+/** A host-supplied Product media workspace: a sibling of, never inside, REPORT. */
+const MEDIA_WORKSPACE = "/var/tmp/split07-media";
 const IMAGE_ID = "sha256:ea08b43366eede351dadf07b5f1bca69cd1da9911705e2cbd0040d737ea09173";
 const LATEST_ID = "sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa";
 /** A DIFFERENT image the candidate tag can be retargeted to mid-run. */
@@ -546,11 +550,17 @@ function createWorld(spec = {}) {
       readdir: async () => [...files.keys()].map((path) => path.slice(path.lastIndexOf("/") + 1)),
       driverPath: `${HARNESS}/${HARNESS_DRIVER_PATH}`,
       realpath: async (path) => String(path),
+      // The Product media workspace: empty whenever the driver looks, so the
+      // fake world never needs to clear anything unless a test opts in.
+      listMediaWorkspace: async () => [],
+      removeMediaWorkspaceEntry: async () => {
+        throw new Error("the fake Product media workspace had nothing to remove");
+      },
     },
     options: {
       source: SOURCE, tree: TREE, context: CONTEXT, harness: HARNESS,
       harnessSource: HARNESS_COMMIT, harnessTree: HARNESS_TREE,
-      report: REPORT, docker: "docker", keepImage: false,
+      report: REPORT, mediaWorkspace: MEDIA_WORKSPACE, docker: "docker", keepImage: false,
     },
   };
 }
@@ -767,8 +777,8 @@ describe("SPLIT-07 hardened container invocations", () => {
     ["probe", probeRunArgs({ imageId, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, mode: "manifest" })],
     ["selector verifier", policyVerifierRunArgs({ imageId, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, verifier: "verify-selector.py" })],
     ["download-policy verifier", policyVerifierRunArgs({ imageId, harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, verifier: "verify-download-policy.py" })],
-    ["mp4 acceptance", releaseAcceptanceRunArgs({ imageId, family: "mp4", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, reportDir: REPORT, evidenceName: "a.json" })],
-    ["webm acceptance", releaseAcceptanceRunArgs({ imageId, family: "webm", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, reportDir: REPORT, evidenceName: "b.json" })],
+    ["mp4 acceptance", releaseAcceptanceRunArgs({ imageId, family: "mp4", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE, evidenceName: "a.json" })],
+    ["webm acceptance", releaseAcceptanceRunArgs({ imageId, family: "webm", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`, reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE, evidenceName: "b.json" })],
   ];
 
   // §22 / §16 — `--network none` on every candidate container, SPLIT-06 included.
@@ -792,32 +802,70 @@ describe("SPLIT-07 hardened container invocations", () => {
     }
   });
 
-  // §16 — the SPLIT-06 run gets Production's media tmpfs, a disjoint harness
-  // scratch tmpfs, and exactly one writable bind: the report directory.
-  it("gives the SPLIT-06 run two tmpfs mounts and exactly one writable bind", () => {
+  // §16 + MAX-FILE-SIZE-4GIB — the SPLIT-06 run binds a host-supplied Product
+  // media workspace exactly as Production binds its disk workspace, keeps ONE
+  // disjoint harness scratch tmpfs, and its only writable binds are that
+  // workspace and the report directory.
+  it("binds the Product media workspace with --mount, keeps one harness tmpfs, and has no Product tmpfs", () => {
     const args = releaseAcceptanceRunArgs({
       imageId, family: "mp4", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`,
-      reportDir: REPORT, evidenceName: "a.json",
+      reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE, evidenceName: "a.json",
     });
-    assert.deepEqual(mountTargets(args), ["/tmp/videofetch", HARNESS_SCRATCH_TARGET, HARNESS_MOUNT_TARGET, "/report"]);
+    assert.deepEqual(mountTargets(args), [PRODUCT_MEDIA_TARGET, HARNESS_SCRATCH_TARGET, HARNESS_MOUNT_TARGET, "/report"]);
     const tmpfs = args.flatMap((arg, i) => (arg === "--tmpfs" ? [args[i + 1]] : []));
-    assert.deepEqual(tmpfs, [PRODUCT_MEDIA_TMPFS, HARNESS_SCRATCH_TMPFS]);
-    // The harness mount is READ-ONLY; the report directory is the writable one.
+    assert.deepEqual(tmpfs, [HARNESS_SCRATCH_TMPFS], "the Product media workspace must never be a tmpfs");
+    const mounts = args.flatMap((arg, i) => (arg === "--mount" ? [args[i + 1]] : []));
+    assert.deepEqual(mounts, [`type=bind,source=${MEDIA_WORKSPACE},target=/tmp/videofetch`]);
+    assert.ok(
+      !args.some((arg, i) => (arg === "-v" || arg === "--volume") && String(args[i + 1]).includes(":/tmp/videofetch")),
+      "the Product workspace is never bound with -v, which would create a missing source",
+    );
+    // The harness mount is READ-ONLY; the report directory stays writable.
     assert.ok(args.includes(`${HARNESS}/deploy/acceptance/ytdlp-generic:${HARNESS_MOUNT_TARGET}:ro`));
     assert.ok(args.includes(`${REPORT}:/report`));
     assert.deepEqual(RELEASE_RUN_ENVIRONMENT, [`TMPDIR=${HARNESS_SCRATCH_TARGET}`]);
   });
 
-  // WORKER-TEMP-TMPFS-OWNERSHIP-001 — the product's media tmpfs must be the one
-  // Production actually mounts, uid/gid included, or the run characterizes a
-  // filesystem layout nobody deploys.
-  it("mounts the product media tmpfs EXACTLY as the Production Worker unit does", () => {
+  // WORKER-TEMP-TMPFS-OWNERSHIP-001 / MAX-FILE-SIZE-4GIB — the Product media
+  // mount must have the shape Production actually uses, or the run
+  // characterizes a filesystem layout nobody deploys. Only the source differs.
+  it("models the Production Worker unit's Product media mount: same bind form and target, no tmpfs", () => {
     const unit = readFileSync(new URL("../deploy/systemd/videofetch-worker.service", import.meta.url), "utf8");
-    const declared = [...unit.matchAll(/^\s*--tmpfs\s+(\S+)/gm)].map((match) => match[1]);
-    assert.deepEqual(declared, [PRODUCT_MEDIA_TMPFS], "the unit's one --tmpfs must equal SPLIT-07's");
-    assert.match(PRODUCT_MEDIA_TMPFS, /(^|[:,])uid=1000(,|$)/);
-    assert.match(PRODUCT_MEDIA_TMPFS, /(^|[:,])gid=1000(,|$)/);
-    assert.match(PRODUCT_MEDIA_TMPFS, /(^|[:,])noexec(,|$)/);
+    assert.deepEqual(
+      [...unit.matchAll(/^\s*--tmpfs\s+(\S+)/gm)].map((match) => match[1]),
+      [],
+      "Production no longer mounts a Product media tmpfs",
+    );
+    const declared = [...unit.matchAll(/^\s*--mount\s+(\S+)/gm)].map((match) => match[1]);
+    assert.equal(declared.length, 1, "the unit declares exactly one --mount");
+    const fields = (spec) => Object.fromEntries(spec.split(",").map((field) => field.split("=")));
+    const production = fields(declared[0]);
+    const candidate = fields(productMediaWorkspaceMount(MEDIA_WORKSPACE));
+    assert.deepEqual(Object.keys(candidate), Object.keys(production));
+    assert.equal(production.type, "bind");
+    assert.equal(candidate.type, production.type);
+    assert.equal(production.target, PRODUCT_MEDIA_TARGET);
+    assert.equal(candidate.target, production.target);
+    assert.equal(production.source, "/srv/videofetch/media/workspace");
+    assert.equal(candidate.source, MEDIA_WORKSPACE);
+  });
+
+  it("requires an absolute, clean Product workspace that is neither the report nor the harness", () => {
+    const run = (mediaWorkspaceDir, reportDir = REPORT) =>
+      releaseAcceptanceRunArgs({ imageId, family: "mp4", harnessDir: "/h", reportDir, mediaWorkspaceDir, evidenceName: "a.json" });
+    for (const missing of [undefined, null, "", "relative/media", "media"]) {
+      assert.throws(() => run(missing), /must be an absolute host path/, String(missing));
+    }
+    for (const unclean of ["/", "//", "/var/tmp/../etc", "/var/tmp/./media", "/var/tmp/a,readonly", "/var/tmp/q\"x", "/var/tmp/new\nline"]) {
+      assert.throws(() => run(unclean), /clean absolute directory/, JSON.stringify(unclean));
+    }
+    assert.throws(() => run(REPORT), /must not overlap the report directory/);
+    assert.throws(() => run(`${REPORT}/media`), /report directory/);
+    assert.throws(() => run("/var/tmp"), /report directory/, "the report directory must not sit inside it either");
+    assert.throws(() => run("/h/media"), /harness directory/);
+    assert.doesNotThrow(() => run(`${REPORT}-media`), "a sibling sharing a string prefix is not an overlap");
+    assert.equal(hostPathsOverlap("/var/tmp/split07-media", "/var/tmp/split07"), false);
+    assert.equal(hostPathsOverlap("/var/tmp/split07/", "/var/tmp/split07"), true);
   });
 
   it("keeps harness scratch disjoint from every product path, and /tmp itself read-only", () => {
@@ -829,7 +877,7 @@ describe("SPLIT-07 hardened container invocations", () => {
       );
     }
     for (const family of ["mp4", "webm"]) {
-      const args = releaseAcceptanceRunArgs({ imageId, family, harnessDir: "/h", reportDir: REPORT, evidenceName: "a.json" });
+      const args = releaseAcceptanceRunArgs({ imageId, family, harnessDir: "/h", reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE, evidenceName: "a.json" });
       assert.ok(!mountTargets(args).includes("/tmp"), "a tmpfs on /tmp would hide /tmp/videofetch and loosen Production's posture");
       assert.match(HARNESS_SCRATCH_TMPFS, /(^|[:,])noexec(,|$)/);
     }
@@ -838,7 +886,7 @@ describe("SPLIT-07 hardened container invocations", () => {
   it("runs the harness from the image's own Node, entry point and /app workdir", () => {
     const args = releaseAcceptanceRunArgs({
       imageId, family: "webm", harnessDir: `${HARNESS}/deploy/acceptance/ytdlp-generic`,
-      reportDir: REPORT, evidenceName: "b.json",
+      reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE, evidenceName: "b.json",
     });
     assert.ok(args.includes("/usr/local/bin/node"));
     assert.ok(args.includes("./scripts/register-ts-aliases.mjs"));
@@ -873,11 +921,11 @@ describe("SPLIT-07 hardened container invocations", () => {
       /unknown policy verifier/,
     );
     assert.throws(
-      () => releaseAcceptanceRunArgs({ imageId, family: "mp4", harnessDir: "/h", reportDir: REPORT, evidenceName: "../escape.json" }),
+      () => releaseAcceptanceRunArgs({ imageId, family: "mp4", harnessDir: "/h", reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE, evidenceName: "../escape.json" }),
       /plain basename/,
     );
     assert.throws(
-      () => releaseAcceptanceRunArgs({ imageId, family: "mkv", harnessDir: "/h", reportDir: REPORT, evidenceName: "a.json" }),
+      () => releaseAcceptanceRunArgs({ imageId, family: "mkv", harnessDir: "/h", reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE, evidenceName: "a.json" }),
       /mp4 or webm/,
     );
   });
@@ -900,7 +948,8 @@ describe("SPLIT-07 forbidden mounts", () => {
   it("refuses a tmpfs over product source just as it refuses a bind", () => {
     assert.throws(() => assertNoForbiddenMounts(["run", "--tmpfs", "/app/src:rw", "i"]), /\/app\/src/);
     assert.throws(() => assertNoForbiddenMounts(["run", "--tmpfs=/app/node_modules", "i"]), /\/app\/node_modules/);
-    assert.doesNotThrow(() => assertNoForbiddenMounts(["run", "--tmpfs", PRODUCT_MEDIA_TMPFS, "i"]));
+    assert.doesNotThrow(() => assertNoForbiddenMounts(["run", "--tmpfs", HARNESS_SCRATCH_TMPFS, "i"]));
+    assert.doesNotThrow(() => assertNoForbiddenMounts(["run", "--mount", productMediaWorkspaceMount(MEDIA_WORKSPACE), "i"]));
   });
 
   it("refuses a mount UNDER a forbidden path, and the --mount long form", () => {
@@ -1372,6 +1421,7 @@ describe("SPLIT-07 driver argument handling", () => {
   const base = [
     "--source", SOURCE, "--tree", TREE, "--context", CONTEXT, "--harness", HARNESS,
     "--harness-source", HARNESS_COMMIT, "--harness-tree", HARNESS_TREE, "--report", REPORT,
+    "--media-workspace", MEDIA_WORKSPACE,
   ];
   const without = (flag) => {
     const copy = [...base];
@@ -1379,13 +1429,13 @@ describe("SPLIT-07 driver argument handling", () => {
     return copy;
   };
 
-  it("requires four full SHAs and three absolute paths", () => {
+  it("requires four full SHAs and four absolute paths", () => {
     assert.deepEqual(parseArgv(base), {
       source: SOURCE, tree: TREE, context: CONTEXT, harness: HARNESS,
       harnessSource: HARNESS_COMMIT, harnessTree: HARNESS_TREE, report: REPORT,
-      docker: "docker", keepImage: false,
+      mediaWorkspace: MEDIA_WORKSPACE, docker: "docker", keepImage: false,
     });
-    for (const flag of ["--source", "--tree", "--context", "--harness", "--harness-source", "--harness-tree", "--report"]) {
+    for (const flag of ["--source", "--tree", "--context", "--harness", "--harness-source", "--harness-tree", "--report", "--media-workspace"]) {
       assert.throws(() => parseArgv(without(flag)), new RegExp(`${flag} is required`));
     }
     assert.throws(() => parseArgv([...without("--source"), "--source", "7400a51b"]), /--source must be a full/);
@@ -1393,6 +1443,14 @@ describe("SPLIT-07 driver argument handling", () => {
     assert.throws(() => parseArgv([...without("--harness-tree"), "--harness-tree", "A".repeat(40)]), /--harness-tree must be a full/);
     assert.throws(() => parseArgv([...without("--context"), "--context", "rel"]), /--context must be an absolute path/);
     assert.throws(() => parseArgv([...base, "--tag", "x"]), /unknown argument: --tag/);
+  });
+
+  it("refuses a relative, unclean or overlapping --media-workspace", () => {
+    assert.throws(() => parseArgv([...without("--media-workspace"), "--media-workspace", "media"]), /--media-workspace must be an absolute path/);
+    assert.throws(() => parseArgv([...without("--media-workspace"), "--media-workspace", "/var/tmp/a,ro"]), /clean absolute directory/);
+    assert.throws(() => parseArgv([...without("--media-workspace"), "--media-workspace", REPORT]), /must not overlap --report/);
+    assert.throws(() => parseArgv([...without("--media-workspace"), "--media-workspace", `${HARNESS}/media`]), /must not overlap --harness/);
+    assert.throws(() => parseArgv([...without("--media-workspace"), "--media-workspace", `${CONTEXT}/media`]), /must not overlap --context/);
   });
 });
 
@@ -1417,6 +1475,93 @@ describe("SPLIT-07 driver", () => {
     // The candidate is removed, and `latest` was never written.
     assert.ok(dockerArgs(world).includes(`image rm ${world.tag}`));
     assert.ok(!dockerArgs(world).some((args) => args.startsWith("tag ")));
+  });
+
+  // MAX-FILE-SIZE-4GIB — the Product media workspace is admitted before ANY
+  // Docker command, re-admitted before each family, and explicitly cleared
+  // after each one. Residue is a refusal of the run, never a PASS.
+  for (const [label, listMediaWorkspace, reason] of [
+    ["a non-empty Product media workspace", async () => ["stale-job"], /is not empty \(before-docker\)/],
+    [
+      "a missing Product media workspace",
+      async () => {
+        const error = new Error("ENOENT");
+        error.code = "ENOENT";
+        throw error;
+      },
+      /is not an existing real directory \(before-docker\)/,
+    ],
+  ]) {
+    it(`starts NO docker command for ${label}`, async () => {
+      const { result, error, world } = await drive({}, {}, { listMediaWorkspace });
+      assert.equal(result, null);
+      assert.match(String(error?.message), reason);
+      assert.deepEqual(world.dockerCalls, [], "no docker command may run before the workspace is admitted");
+    });
+  }
+
+  it("clears what each SPLIT-06 family left in the Product workspace, and re-admits it empty", async () => {
+    const world = createWorld();
+    const entries = new Set();
+    const workspaceLog = [];
+    const deps = {
+      ...world.deps,
+      run: async (command, args, options) => {
+        const answer = await world.deps.run(command, args, options);
+        if (args[0] === "run" && args.includes("--family")) {
+          // What a real child leaves: the executor removes its job directory,
+          // but the `jobs/` root it created stays behind.
+          workspaceLog.push(`run:${args[args.indexOf("--family") + 1]}`);
+          entries.add("jobs");
+        }
+        return answer;
+      },
+      listMediaWorkspace: async (directory) => {
+        assert.equal(directory, MEDIA_WORKSPACE);
+        return [...entries];
+      },
+      removeMediaWorkspaceEntry: async (directory, name) => {
+        workspaceLog.push(`remove:${directory}/${name}`);
+        entries.delete(name);
+      },
+    };
+
+    const result = await runReleaseImageAcceptance(world.options, deps);
+
+    assert.equal(result.verdict, "PASS");
+    assert.deepEqual(workspaceLog, [
+      "run:mp4",
+      `remove:${MEDIA_WORKSPACE}/jobs`,
+      "run:webm",
+      `remove:${MEDIA_WORKSPACE}/jobs`,
+    ]);
+    assert.equal(entries.size, 0, "the Product workspace is empty after the run");
+    const childRuns = world.dockerCalls.filter((call) => call.args.includes("--family"));
+    assert.equal(childRuns.length, 2);
+    for (const call of childRuns) {
+      const mounts = call.args.flatMap((arg, i) => (arg === "--mount" ? [call.args[i + 1]] : []));
+      assert.deepEqual(mounts, [`type=bind,source=${MEDIA_WORKSPACE},target=/tmp/videofetch`]);
+      const tmpfs = call.args.flatMap((arg, i) => (arg === "--tmpfs" ? [call.args[i + 1]] : []));
+      assert.deepEqual(tmpfs, [HARNESS_SCRATCH_TMPFS], "the only tmpfs is the harness scratch");
+    }
+  });
+
+  it("refuses to run the next family on a Product workspace it could not clear", async () => {
+    const world = createWorld();
+    const deps = {
+      ...world.deps,
+      // Residue appears once a family has run, and removal cannot touch it —
+      // for example files a uid-1000 child left where the operator cannot write.
+      listMediaWorkspace: async () =>
+        world.dockerCalls.some((call) => call.args.includes("--family")) ? ["jobs"] : [],
+      removeMediaWorkspaceEntry: async () => {},
+    };
+    await assert.rejects(runReleaseImageAcceptance(world.options, deps), /is not empty \(split06-mp4\)/);
+    assert.equal(
+      world.dockerCalls.filter((call) => call.args.includes("--family") && call.args.includes("webm")).length,
+      0,
+      "the webm family never runs on the mp4 family's residue",
+    );
   });
 
   // §22.1 / §22.2 / §22.3 / §22.4 — no Docker command runs before provenance holds.
@@ -1783,8 +1928,8 @@ describe("SPLIT-07 immutable run subjects (container model)", () => {
     ["probe", (imageId) => probeRunArgs({ imageId, harnessDir, mode: "runtime" })],
     ["selector verifier", (imageId) => policyVerifierRunArgs({ imageId, harnessDir, verifier: "verify-selector.py" })],
     ["download-policy verifier", (imageId) => policyVerifierRunArgs({ imageId, harnessDir, verifier: "verify-download-policy.py" })],
-    ["mp4 acceptance", (imageId) => releaseAcceptanceRunArgs({ imageId, family: "mp4", harnessDir, reportDir: REPORT, evidenceName: "a.json" })],
-    ["webm acceptance", (imageId) => releaseAcceptanceRunArgs({ imageId, family: "webm", harnessDir, reportDir: REPORT, evidenceName: "b.json" })],
+    ["mp4 acceptance", (imageId) => releaseAcceptanceRunArgs({ imageId, family: "mp4", harnessDir, reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE, evidenceName: "a.json" })],
+    ["webm acceptance", (imageId) => releaseAcceptanceRunArgs({ imageId, family: "webm", harnessDir, reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE, evidenceName: "b.json" })],
   ];
   const notIds = [
     TAG, "videofetch-worker:latest", "latest", "sha256:ea08b43366ee", IMAGE_ID.slice("sha256:".length),

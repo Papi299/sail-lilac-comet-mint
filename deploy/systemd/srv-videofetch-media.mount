@@ -1,0 +1,49 @@
+# VideoFetch Product media workspace
+# (MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001)
+#
+# A bounded, disk-backed ext4 filesystem for the media Worker's working files.
+# It replaces the retired 2 GiB `--tmpfs /tmp/videofetch`:
+#
+#   - the delivered-media ceiling is 4 GiB (4,294,967,296 bytes);
+#   - one successful job can hold up to 2 x that at once — the original plus
+#     the produced artifact, or both split halves plus the merge — and the
+#     Worker runs one job at a time, so the hard media peak is 8 GiB;
+#   - the VM has 4 GiB of RAM and no swap, so that peak cannot live in memory.
+#
+# The filesystem is a fixed 10 GiB image: the 8 GiB peak plus 1 GiB of
+# operational headroom plus ext4 overhead. Its size is the bound; ENOSPC from a
+# runaway FFmpeg output stays inside it and never reaches the root filesystem,
+# the durable SQLite state or the container runtime.
+#
+# THIS UNIT ONLY MOUNTS. It never creates, formats, grows, trims or repairs the
+# backing image; provisioning is a separate, explicit operator action
+# (docs/architecture/worker-deployment-runbook.md, "Product media workspace").
+# A missing backing image fails the Assert below and the unit enters `failed`,
+# visibly; an invalid filesystem fails the mount itself. The Worker BindsTo=
+# this unit, so either failure keeps the Worker down.
+#
+# `discard` is deliberately absent: the backing image is preallocated, and a
+# discard would punch holes in it and silently give its reservation back to the
+# root filesystem. The unit is deliberately NOT in /etc/fstab, so the
+# `fstrim --listed-in /etc/fstab:…` timer never reaches it either.
+#
+# The mount flags are the security posture, and the Worker's bind of
+# /srv/videofetch/media/workspace inherits them: nothing written there can be
+# executed, gain setuid, or act as a device node.
+
+[Unit]
+Description=VideoFetch Product media workspace (loop-backed ext4)
+Documentation=file:/opt/videofetch/docs/architecture/worker-deployment-runbook.md
+RequiresMountsFor=/var/lib/videofetch-workspace
+AssertPathExists=/var/lib/videofetch-workspace/workspace.ext4
+
+[Mount]
+What=/var/lib/videofetch-workspace/workspace.ext4
+Where=/srv/videofetch/media
+Type=ext4
+Options=loop,rw,nodev,nosuid,noexec,noatime
+DirectoryMode=0755
+TimeoutSec=30
+
+[Install]
+WantedBy=multi-user.target

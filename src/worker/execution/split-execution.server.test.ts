@@ -634,8 +634,11 @@ describe("SPLIT-04: acquisition routing (§10/§42/§43)", () => {
   });
 
   for (const presetId of ["preset:1080", "preset:audio", "preset:mp3"] as const) {
-    it(`generic single-source ${presetId} still uses ONLY downloadGeneric and the one-input path (M4)`, async () => {
+    it(`generic single-source ${presetId} uses ONLY downloadGeneric and the one-input path, preflighted at its own footprint (M4)`, async () => {
       const job = claimJob(h.store, presetId);
+      // MAX-FILE-SIZE-4GIB: keep-original needs ONE ceiling; an extraction's
+      // original and output coexist, so it needs two. Exactly that is free.
+      const required = presetId === "preset:1080" ? MAX : 2 * MAX;
       let singleCalls = 0;
       let splitCalls = 0;
       let merges = 0;
@@ -660,7 +663,7 @@ describe("SPLIT-04: acquisition routing (§10/§42/§43)", () => {
         },
         availableWorkDirBytes: async () => {
           capacityCalls += 1;
-          return 1;
+          return required;
         },
         processLocally: async ({ workDir, target }) => {
           processed.push(`${target}@${h.raw.getJob(job.jobId)!.status}`);
@@ -675,14 +678,14 @@ describe("SPLIT-04: acquisition routing (§10/§42/§43)", () => {
       assert.equal(singleCalls, 1);
       assert.equal(splitCalls, 0);
       assert.equal(merges, 0);
-      assert.equal(capacityCalls, 0, "the split preflight is split-only: 1 free byte changes nothing");
+      assert.equal(capacityCalls, 1, "every plan is preflighted exactly once, before acquisition");
       const expected =
         presetId === "preset:1080" ? [] : [`${presetId === "preset:audio" ? "m4a" : "mp3"}@processing`];
       assert.deepEqual(processed, expected);
     });
   }
 
-  it("a DIRECT job with 1 free byte is untouched by the split preflight (§42/§50)", async () => {
+  it("a DIRECT keep-original job is preflighted at ONE ceiling, never the split requirement (§42/§50)", async () => {
     const job = claimJob(h.store, "direct-original");
     let capacityCalls = 0;
     let splitCalls = 0;
@@ -704,13 +707,14 @@ describe("SPLIT-04: acquisition routing (§10/§42/§43)", () => {
       },
       availableWorkDirBytes: async () => {
         capacityCalls += 1;
-        return 1;
+        // Exactly one ceiling: enough for keep-original, half of a split's need.
+        return MAX;
       },
     };
     await executorFor(h, deps).execute(job);
     assert.equal(h.raw.getJob(job.jobId)!.status, "ready");
     assert.equal(h.raw.getJob(job.jobId)!.extractor, "direct");
-    assert.equal(capacityCalls, 0);
+    assert.equal(capacityCalls, 1);
     assert.equal(splitCalls, 0);
     assert.equal(merges, 0);
   });
@@ -1027,6 +1031,150 @@ describe("SPLIT-04: malformed or mismatched acquisition results fail closed (§1
 // ─────────────────────────────────────────────────────────────────────────────
 // §60: canonical errors only — never raw subprocess text, paths or ids
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001: the plan-aware preflight at 4 GiB
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("MAX-FILE-SIZE-4GIB: plan-aware media-workspace preflight at the 4 GiB ceiling", () => {
+  const FOUR_GIB = 4_294_967_296;
+  const EIGHT_GIB = 8_589_934_592;
+  const GIB4_LIMITS: GenericDownloadLimits = { maxFileSizeBytes: FOUR_GIB, downloadTimeoutSeconds: 600 };
+
+  /** A direct source advertising ONE preset the direct planner must process. */
+  function directPresetAnalysis(preset: {
+    id: "preset:mp3" | "preset:audio" | "preset:720";
+    container: string;
+    hasVideo: boolean;
+  }): ExecutionAnalysis {
+    const base = directAnalysis();
+    return {
+      ...base,
+      video: VideoMetadataSchema.parse({
+        ...base.video,
+        presets: [
+          {
+            id: preset.id,
+            label: preset.id,
+            resolution: preset.hasVideo ? "1080p" : "audio",
+            container: preset.container,
+            fileSize: null,
+            hasVideo: preset.hasVideo,
+            hasAudio: true,
+            formatId: preset.id,
+            videoCodec: preset.hasVideo ? "h264" : null,
+            audioCodec: "aac",
+            fps: null,
+          },
+        ],
+      }),
+    };
+  }
+
+  type Seam = "direct" | "generic" | "split";
+  type Case = {
+    label: string;
+    formatId: WorkerRequestedFormatId;
+    analysis: () => ExecutionAnalysis;
+    required: number;
+    seam: Seam;
+  };
+
+  const CASES: readonly Case[] = [
+    { label: "direct keep-original", formatId: "direct-original", analysis: directAnalysis, required: FOUR_GIB, seam: "direct" },
+    {
+      label: "direct convert",
+      formatId: "preset:720",
+      analysis: () => directPresetAnalysis({ id: "preset:720", container: "webm", hasVideo: true }),
+      required: EIGHT_GIB,
+      seam: "direct",
+    },
+    {
+      label: "direct extract-m4a",
+      formatId: "preset:audio",
+      analysis: () => directPresetAnalysis({ id: "preset:audio", container: "m4a", hasVideo: false }),
+      required: EIGHT_GIB,
+      seam: "direct",
+    },
+    {
+      label: "direct extract-mp3",
+      formatId: "preset:mp3",
+      analysis: () => directPresetAnalysis({ id: "preset:mp3", container: "mp3", hasVideo: false }),
+      required: EIGHT_GIB,
+      seam: "direct",
+    },
+    { label: "generic keep-original", formatId: "preset:1080", analysis: () => singleAnalysis("preset:1080"), required: FOUR_GIB, seam: "generic" },
+    { label: "generic extract-m4a", formatId: "preset:audio", analysis: () => singleAnalysis("preset:audio"), required: EIGHT_GIB, seam: "generic" },
+    { label: "generic extract-mp3", formatId: "preset:mp3", analysis: () => singleAnalysis("preset:mp3"), required: EIGHT_GIB, seam: "generic" },
+    { label: "generic merge-split", formatId: "preset:1080", analysis: () => splitAnalysis("mp4"), required: EIGHT_GIB, seam: "split" },
+  ];
+
+  type Seen = { capacityReads: number; acquisitions: Seam[]; processed: number; merges: number };
+
+  function depsFor(c: Case, available: number, seen: Seen): JobExecutorDeps {
+    return {
+      genericLimits: GIB4_LIMITS,
+      analyzeForExecution: async () => c.analysis(),
+      availableWorkDirBytes: async () => {
+        seen.capacityReads += 1;
+        return available;
+      },
+      downloadOriginal: async (_url, ctx) => {
+        seen.acquisitions.push("direct");
+        const filePath = path.join(ctx.workDir, "source.mp4");
+        fs.writeFileSync(filePath, "DIRECT");
+        return { filePath, container: "mp4", mime: "video/mp4", fileSize: 6 };
+      },
+      downloadGeneric: async (_url, workDir) => {
+        seen.acquisitions.push("generic");
+        const filePath = path.join(workDir, "source.mp4");
+        fs.writeFileSync(filePath, "MUXED-SOURCE");
+        return { filePath, container: "mp4", mime: "video/mp4", fileSize: 12 };
+      },
+      downloadGenericSplit: async (_url, workDir) => {
+        seen.acquisitions.push("split");
+        return writeHalves(workDir, "mp4");
+      },
+      processLocally: async ({ workDir, target }) => {
+        seen.processed += 1;
+        const out = path.join(workDir, `converted.${target}`);
+        fs.writeFileSync(out, "CONVERTED");
+        return out;
+      },
+      mergeSplit: async ({ workDir, target }) => {
+        seen.merges += 1;
+        const out = path.join(workDir, `merged.${target}`);
+        fs.writeFileSync(out, mergedBytes(target));
+        return out;
+      },
+    };
+  }
+
+  for (const c of CASES) {
+    it(`${c.label}: exactly ${c.required} free bytes lets acquisition start`, async () => {
+      const job = claimJob(h.store, c.formatId);
+      const seen: Seen = { capacityReads: 0, acquisitions: [], processed: 0, merges: 0 };
+      await executorFor(h, depsFor(c, c.required, seen)).execute(job);
+      assert.equal(h.raw.getJob(job.jobId)!.status, "ready", c.label);
+      assert.equal(seen.capacityReads, 1);
+      assert.deepEqual(seen.acquisitions, [c.seam]);
+    });
+
+    it(`${c.label}: one byte short (${c.required - 1}) is PROCESSING_FAILED before any acquisition`, async () => {
+      const job = claimJob(h.store, c.formatId);
+      const seen: Seen = { capacityReads: 0, acquisitions: [], processed: 0, merges: 0 };
+      await executorFor(h, depsFor(c, c.required - 1, seen)).execute(job);
+      const view = h.raw.getJob(job.jobId)!;
+      assert.equal(view.status, "failed", c.label);
+      assert.equal(view.errorCode, "PROCESSING_FAILED", "local capacity is never TOO_LARGE");
+      assert.equal(seen.capacityReads, 1);
+      assert.deepEqual(seen.acquisitions, [], "no acquisition seam may be reached");
+      assert.equal(seen.processed, 0);
+      assert.equal(seen.merges, 0);
+      assert.equal(h.puts.length, 0);
+    });
+  }
+});
 
 describe("SPLIT-04: split-path errors are persisted canonically (§60)", () => {
   const RAW = `yt-dlp/ffmpeg said ${SENTINEL} at /private/jobs/video-source.mp4 for format 137 {"streams":[]}`;

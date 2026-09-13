@@ -175,9 +175,9 @@ See [`SPLIT-07.md`](SPLIT-07.md).
 
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
-| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, writes the `split07-release-image-candidate-02` record (`-01` records are historical). |
+| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, writes the `split07-release-image-candidate-02` record (`-01` records are historical). Requires `--media-workspace`: an existing, EMPTY, uid-1000-writable directory on disk, never the report directory — admitted before any Docker command and cleared after each family. |
 | `lib/release-provenance.mjs` | — | The clean-worktree gate for the release context and the harness, and the `/app` source manifest from Git objects. |
-| `lib/release-container.mjs` | — | Every `docker` argv: non-deployable tags, immutable-id run subjects, hardening, Production's media tmpfs, the forbidden-mount guard. |
+| `lib/release-container.mjs` | — | Every `docker` argv: non-deployable tags, immutable-id run subjects, hardening, the Product media workspace bound in Production's exact `--mount type=bind` form (the 2 GiB tmpfs is retired, `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`), the forbidden-mount guard. |
 | `lib/release-image-probe.mjs` | inside the candidate, at `/verify` | Import-free observer: manifest, forbidden tools, env names, runtime identity. |
 | `lib/release-evidence.mjs` | — | The parent record, SPLIT-06 child validation and re-hashing, and the PASS gate. |
 
@@ -1884,7 +1884,10 @@ Worker enforces, and requires the transfer to exceed it:
 
 ```
 effectiveMaxFileSizeBytes  : read from the deployment's own MAX_FILE_SIZE
-                             (absent -> the Worker's 500 MiB default)
+                             (absent -> the Worker's default: 4 GiB since
+                              MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001; records
+                              made against the earlier 500 MiB default keep
+                              their own recorded value)
 bytesServed > effectiveMaxFileSizeBytes
 ```
 

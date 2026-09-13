@@ -432,7 +432,9 @@ describe("Worker runtime configuration", () => {
   describe("media execution limits", () => {
     it("falls back to defaults when unset", () => {
       const media = loadWorkerRuntimeConfig(baseEnv()).media;
-      assert.equal(media.maxFileSizeBytes, 500 * 1024 * 1024);
+      // MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001: exactly 4 GiB, as a literal, so a
+      // change to the shared default cannot pass unnoticed.
+      assert.equal(media.maxFileSizeBytes, 4_294_967_296);
       assert.equal(media.maxVideoDurationSeconds, 7200);
       assert.equal(media.fileExpirationMinutes, 45);
       assert.equal(media.downloadTimeoutSeconds, 600);
@@ -464,6 +466,30 @@ describe("Worker runtime configuration", () => {
       assert.equal(media.maxRedirects, 0);
       assert.equal(media.tempDirectory, "/tmp/videofetch");
       assert.equal(media.ffmpegPath, "/usr/bin/ffmpeg");
+    });
+
+    it("accepts the exact 4 GiB ceiling and its neighbours, with no 32-bit cap", () => {
+      for (const raw of ["4294967295", "4294967296", "4294967297", "9007199254740991"]) {
+        assert.equal(
+          loadWorkerRuntimeConfig(baseEnv({ MAX_FILE_SIZE: raw })).media.maxFileSizeBytes,
+          Number(raw),
+          raw,
+        );
+      }
+      // An empty value is "unset", exactly as for every other optional field.
+      assert.equal(
+        loadWorkerRuntimeConfig(baseEnv({ MAX_FILE_SIZE: "" })).media.maxFileSizeBytes,
+        4_294_967_296,
+      );
+    });
+
+    it("keeps the strict decimal grammar at and beyond 4 GiB", () => {
+      // One past MAX_SAFE_INTEGER: sixteen digits pass the regex, the
+      // safe-integer refinement must still refuse it.
+      expectInvalid(baseEnv({ MAX_FILE_SIZE: "9007199254740992" }), "MAX_FILE_SIZE");
+      for (const raw of ["4294967296.0", "4GiB", "4 GiB", "0x100000000", "4_294_967_296", "+4294967296", "4.294967296e9"]) {
+        expectInvalid(baseEnv({ MAX_FILE_SIZE: raw }), "MAX_FILE_SIZE");
+      }
     });
 
     it("fails closed on malformed or out-of-range values rather than silently defaulting", () => {

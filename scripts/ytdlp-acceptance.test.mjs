@@ -330,8 +330,13 @@ function shutdownEvidence(overrides = {}) {
   };
 }
 
-/** The deployed default, as `MEDIA_DEFAULTS.maxFileSizeBytes` sets it. */
-const DEFAULT_LIMIT_BYTES = 500 * 1024 * 1024;
+/**
+ * The deployed default, as `MEDIA_DEFAULTS.maxFileSizeBytes` sets it: exactly
+ * 4 GiB since MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001.
+ */
+const DEFAULT_LIMIT_BYTES = 4 * 1024 * 1024 * 1024;
+/** A served byte count that crosses the 4 GiB default — a number, never a payload. */
+const OVER_DEFAULT_BYTES = 4_400_000_000;
 const CASE_ID = "9".repeat(32);
 
 /**
@@ -358,7 +363,7 @@ function byteLimitEvidence(overrides = {}) {
     mediaRequestCount: 1,
     contentLengthPresent: false,
     transferMode: "chunked",
-    bytesServed: 600_000_000,
+    bytesServed: OVER_DEFAULT_BYTES,
     effectiveMaxFileSizeBytes: DEFAULT_LIMIT_BYTES,
     limitSource: "default",
     exceededLimit: true,
@@ -1075,7 +1080,7 @@ function makeFakeWorld(options = {}) {
         mediaRequestCount: fixture.mediaRequestCount ?? 1,
         contentLengthPresent: fixture.contentLengthPresent ?? false,
         transferMode: fixture.transferMode ?? "chunked",
-        bytesServed: fixture.bytesServed ?? 600_000_000,
+        bytesServed: fixture.bytesServed ?? OVER_DEFAULT_BYTES,
         observedAt: "2026-01-01T00:00:00.000Z",
       });
     }
@@ -4462,7 +4467,7 @@ describe("byte-limit causal binding", () => {
     const payload = JSON.parse(run.files.get("/tmp/bl.json")).payload.byteLimitCase;
     assert.match(payload.caseId, /^[0-9a-f]{32}$/);
     assert.equal(payload.mediaRequestCount, 1);
-    assert.equal(payload.effectiveMaxFileSizeBytes, 500 * 1024 * 1024);
+    assert.equal(payload.effectiveMaxFileSizeBytes, 4_294_967_296);
     assert.equal(payload.limitSource, "default");
     assert.equal(payload.exceededLimit, true);
     assert.equal(payload.outcome, "TOO_LARGE");
@@ -4497,7 +4502,8 @@ describe("byte-limit causal binding", () => {
   });
 
   it("41e. bytes at or below the deployed limit are NOT a pass", async () => {
-    for (const bytesServed of [500 * 1024 * 1024, 400 * 1024 * 1024]) {
+    // Exactly the 4 GiB default is AT the limit, not over it.
+    for (const bytesServed of [4 * 1024 * 1024 * 1024, 400 * 1024 * 1024]) {
       const run = await runByteLimit({ byteLimitFixture: { bytesServed } });
       assert.equal(run.code, 2, `${bytesServed}`);
       assert.match(run.err, /never crossed the deployed threshold/);
@@ -4505,8 +4511,8 @@ describe("byte-limit causal binding", () => {
   });
 
   it("41f. a deployed MAX_FILE_SIZE override is what the case measures", async () => {
-    // 600 MB served, but the deployment raised the limit to 1 GiB: the transfer
-    // did NOT cross the threshold, and the default would have said it did.
+    // 600 MB served against a deployment-set 1 GiB limit: the transfer did NOT
+    // cross the threshold. The deployment's value, not the default, is compared.
     const raised = await runByteLimit({
       maxFileSize: String(1024 * 1024 * 1024),
       byteLimitFixture: { bytesServed: 600_000_000 },

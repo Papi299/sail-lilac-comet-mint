@@ -2,6 +2,7 @@
 import { Buffer } from "node:buffer";
 import { z } from "zod";
 import { WorkerKeyIdSchema } from "../../shared/worker/auth.ts";
+import { DEFAULT_MAX_FILE_SIZE_BYTES } from "../../shared/media-limits.ts";
 
 /**
  * Strict Worker runtime configuration boundary (Phase 8A §6/§7).
@@ -185,7 +186,10 @@ const ExecutablePathSchema = z
 
 /** Media-execution bounds this runtime owns. Absent means "use the default". */
 const MEDIA_DEFAULTS = {
-  maxFileSizeBytes: 500 * 1024 * 1024,
+  // 4 GiB, shared with `src/lib/config.ts` (MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001).
+  // The value is a capacity contract: the Worker refuses to start on a media
+  // workspace that cannot hold 2 × it.
+  maxFileSizeBytes: DEFAULT_MAX_FILE_SIZE_BYTES,
   maxVideoDurationSeconds: 2 * 60 * 60,
   fileExpirationMinutes: 45,
   downloadTimeoutSeconds: 600,
