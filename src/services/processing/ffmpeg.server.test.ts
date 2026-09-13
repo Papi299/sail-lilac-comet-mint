@@ -8,7 +8,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { config } from "../../lib/config.ts";
 import { AppError } from "../../lib/errors.ts";
-import { setProcessRunnerTestHooks, type SpawnImpl } from "./process-runner.server.ts";
+import {
+  setProcessRunnerTestHooks,
+  terminateOwnedProcessTree,
+  type SpawnImpl,
+} from "./process-runner.server.ts";
 import {
   assertLocalMediaPath,
   buildSplitMergeArgs,
@@ -49,6 +53,18 @@ describe("m4a audio extraction (worker Phase-6 plan target)", () => {
   });
 
   type SpawnCall = { command: string; args: readonly string[]; options: SpawnOptions };
+  type KillRequest = { pid: number; signal: NodeJS.Signals | number | undefined };
+
+  /**
+   * A clearly artificial PID, in the same test-only range the split-merge
+   * harness below uses.
+   *
+   * The PID being fake is NOT what makes this harness safe — `captureSpawn`
+   * always hooks `processKill` for that. A fabricated PID is still a real PID
+   * to the kernel, so the hook is the guard and this constant is only a
+   * convention.
+   */
+  const FAKE_CHILD_PID = 73_000;
 
   function createFakeChild(): EventEmitter & {
     pid?: number;
@@ -64,7 +80,7 @@ describe("m4a audio extraction (worker Phase-6 plan target)", () => {
       kill: (signal?: NodeJS.Signals) => boolean;
       killCalls: NodeJS.Signals[];
     };
-    child.pid = 4242;
+    child.pid = FAKE_CHILD_PID;
     child.stdout = new PassThrough();
     child.stderr = new PassThrough();
     child.killCalls = [];
@@ -75,12 +91,27 @@ describe("m4a audio extraction (worker Phase-6 plan target)", () => {
     return child;
   }
 
-  /** Captures the single spawn runProcess performs; nothing else may spawn. */
+  /**
+   * Captures the single spawn runProcess performs; nothing else may spawn.
+   *
+   * `processKill` is ALWAYS hooked. Without it `currentProcessKill()` falls
+   * back to the real `process.kill`, and every termination on this path
+   * (`platform: "linux"` means the runner spawns detached and therefore owns a
+   * process group) would ask the HOST to SIGKILL process group
+   * `-FAKE_CHILD_PID` — a group belonging to an unrelated process, or to none.
+   *
+   * The hook records each `(pid, signal)` request, reports success, and models
+   * the group death by closing the fake child, so the runner settles
+   * deterministically instead of relying on the host to reject the signal.
+   */
   function captureSpawn(onSpawn?: (child: ReturnType<typeof createFakeChild>) => void) {
     const calls: SpawnCall[] = [];
+    const children: ReturnType<typeof createFakeChild>[] = [];
+    const killRequests: KillRequest[] = [];
     const spawnImpl: SpawnImpl = (command, args, options) => {
       calls.push({ command, args, options });
       const child = createFakeChild();
+      children.push(child);
       if (onSpawn) {
         onSpawn(child);
       } else {
@@ -88,12 +119,21 @@ describe("m4a audio extraction (worker Phase-6 plan target)", () => {
       }
       return child as unknown as ChildProcess;
     };
-    setProcessRunnerTestHooks({ platform: "linux", spawn: spawnImpl });
-    return calls;
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: spawnImpl,
+      processKill: (pid, signal) => {
+        killRequests.push({ pid, signal });
+        const owner = children.find((child) => child.pid === -pid);
+        if (owner) queueMicrotask(() => owner.emit("close", null));
+        return true;
+      },
+    });
+    return { calls, children, killRequests };
   }
 
   it("extracts AAC audio with -vn into a controlled output path", async () => {
-    const calls = captureSpawn();
+    const { calls } = captureSpawn();
     const workDir = "/tmp/videofetch/jobs/abc";
     const inputPath = `${workDir}/source.mp4`;
 
@@ -125,7 +165,7 @@ describe("m4a audio extraction (worker Phase-6 plan target)", () => {
   });
 
   it("refuses a remote input before any subprocess is created", async () => {
-    const calls = captureSpawn();
+    const { calls } = captureSpawn();
 
     for (const remote of [
       "https://cdn.example.com/video.mp4",
@@ -155,17 +195,11 @@ describe("m4a audio extraction (worker Phase-6 plan target)", () => {
 
   it("propagates the AbortSignal into the m4a conversion subprocess", async () => {
     const controller = new AbortController();
-    const killed: NodeJS.Signals[][] = [];
 
-    const calls = captureSpawn((child) => {
-      // The process stays alive until the signal aborts it.
-      queueMicrotask(() => {
-        controller.abort();
-        queueMicrotask(() => {
-          killed.push(child.killCalls);
-          child.emit("close", null);
-        });
-      });
+    // The process stays alive until the signal aborts it; the intercepted
+    // group kill is then what closes it, exactly as a real SIGKILL would.
+    const { calls, children, killRequests } = captureSpawn(() => {
+      queueMicrotask(() => controller.abort());
     });
 
     await assert.rejects(
@@ -187,10 +221,62 @@ describe("m4a audio extraction (worker Phase-6 plan target)", () => {
 
     assert.equal(calls.length, 1);
     assert.equal(controller.signal.aborted, true);
+
+    // The behaviour the old test collected but never proved: exactly one
+    // process-GROUP termination, targeting the negated child PID with SIGKILL.
+    assert.equal(children.length, 1);
+    const child = children[0]!;
+    assert.deepEqual(killRequests, [{ pid: -(child.pid as number), signal: "SIGKILL" }]);
+
+    // The group signal succeeded, so the runner must NOT also fall back to a
+    // direct-child kill. Under the old unhooked harness the host rejected the
+    // fabricated group with ESRCH, that fallback fired, and the test passed
+    // either way — which is precisely what hid the missing assertion above.
+    assert.deepEqual(child.killCalls, []);
+  });
+
+  it("routes every fabricated-child termination through the harness, never the host", async () => {
+    // Regression guard for the harness itself, not for `convertMedia`.
+    //
+    // `terminateOwnedProcessTree` resolves its killer from the module-level
+    // test hook whenever the caller supplies none — which is exactly what
+    // `runProcess` does on the abort, timeout and output-ceiling paths. If
+    // `captureSpawn` ever stops installing `processKill`, that resolution
+    // silently falls back to the real `process.kill` and this harness's
+    // fabricated PID becomes a live host process group again.
+    //
+    // Asserting the request lands in the harness recorder proves the host
+    // fallback is unreachable from here, and proves it through the production
+    // seam rather than by monkey-patching global Node APIs.
+    const { children, killRequests } = captureSpawn();
+
+    await convertMedia({
+      inputPath: "/tmp/videofetch/jobs/abc/source.mp4",
+      workDir: "/tmp/videofetch/jobs/abc",
+      target: "m4a",
+      timeoutMs: 1_000,
+    });
+
+    const child = children[0]!;
+    assert.deepEqual(killRequests, [], "a clean exit signals nothing at all");
+
+    const result = terminateOwnedProcessTree({
+      child,
+      createdProcessGroup: true,
+      platform: "linux",
+      // Pinned so the assertion can never hinge on the runner's own PID.
+      selfPid: 1,
+    });
+
+    assert.deepEqual(killRequests, [{ pid: -(child.pid as number), signal: "SIGKILL" }]);
+    assert.equal(result.usedGroupSignal, true);
+    assert.equal(result.usedDirectKill, false);
+    assert.equal(result.groupTarget, -(child.pid as number));
+    assert.deepEqual(child.killCalls, [], "no direct-child fallback when the group signal lands");
   });
 
   it("rejects immediately when the signal is already aborted, without spawning", async () => {
-    const calls = captureSpawn();
+    const { calls } = captureSpawn();
     const controller = new AbortController();
     controller.abort();
 
@@ -244,7 +330,7 @@ describe("m4a audio extraction (worker Phase-6 plan target)", () => {
     };
 
     for (const [target, outPath] of Object.entries(expected)) {
-      const calls = captureSpawn();
+      const { calls } = captureSpawn();
       const result = await convertMedia({
         inputPath: `${workDir}/source.mkv`,
         workDir,
