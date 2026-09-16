@@ -292,12 +292,32 @@ so an 8 GiB peak cannot live in memory.
 | Element | Contract |
 | :--- | :--- |
 | Backing image | `/var/lib/videofetch-workspace/workspace.ext4`: root:root `0600`, exactly 10,737,418,240 bytes, fully preallocated |
-| Filesystem | ext4, made with `mkfs.ext4 -m 0 -T largefile -E nodiscard` |
+| Filesystem | ext4, made with `mkfs.ext4 -m 0 -T largefile -E nodiscard,lazy_itable_init=0,lazy_journal_init=0`: inode tables and journal are initialized while formatting, never after mount |
 | Mount unit | `deploy/systemd/srv-videofetch-media.mount` → `/srv/videofetch/media`, `loop,rw,nodev,nosuid,noexec,noatime`, no `discard`. It fails visibly if the image is absent and never formats one. |
 | Workspace | `/srv/videofetch/media/workspace`, `1000:1000`, `0700` |
 | Container | `--mount type=bind,source=/srv/videofetch/media/workspace,target=/tmp/videofetch`. Never `-v`, so a missing source fails; never a tmpfs. |
 | Worker unit | `Requires=`, `After=` and `BindsTo=srv-videofetch-media.mount`, plus `RequiresMountsFor=/srv/videofetch/media` |
 | Verifier | `deploy/bin/vf-media-workspace-verify --wipe`, a fatal `ExecStartPre` that runs after `docker rm -f` |
+
+**Eager ext4 initialization is part of the contract.**
+
+- The first Production provisioning attempt (`MAX-FILE-SIZE-4GIB-ROLLOUT-1B-WORKSPACE-PROVISION-001`)
+  formatted with `nodiscard` only, which leaves inode tables to be initialized lazily.
+- The image was fully allocated after formatting. Within about a minute of its first
+  mount, the kernel's background inode-table initialization punched holes in the
+  loop-backing file: 2,609,152 bytes of the reservation were lost.
+- The verifier refused the image, and that attempt was rolled back.
+- `MAX-FILE-SIZE-4GIB-ROLLOUT-1B0-EXT4-LAZY-INIT-EXPERIMENT-001` reproduced the loss on
+  a throwaway image formatted the old way: one hole in the inode-table range, about
+  10 seconds after mount.
+- The same experiment then validated `lazy_itable_init=0,lazy_journal_init=0`. With it,
+  every group's inode table was zeroed before the first mount, and the image stayed fully
+  allocated through two mounts and unmounts, with a clean `e2fsck`.
+- `lazy_itable_init=0` is what prevents the observed holes. `lazy_journal_init=0`
+  completes the same eager recipe.
+
+The verifier stays strict: a backing file that is not fully allocated is a provisioning
+defect, never something to accept.
 
 The verifier, in order:
 

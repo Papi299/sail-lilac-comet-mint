@@ -522,10 +522,11 @@ The order is not a convenience — it is the fail-closed boundary.
    install -d -o root -g root -m 0700 /var/lib/videofetch-workspace
    fallocate -l 10737418240 /var/lib/videofetch-workspace/workspace.ext4
    chmod 0600 /var/lib/videofetch-workspace/workspace.ext4
-   # -E nodiscard: formatting a regular file with discard would punch holes in
-   # the preallocation. -m 0: the Worker is unprivileged, so reserved blocks
-   # would only hide capacity from it.
-   mkfs.ext4 -m 0 -T largefile -E nodiscard -L vf-media \
+   # -m 0: the Worker is unprivileged, so reserved blocks would only hide
+   # capacity from it. Every extended option is load-bearing; see below.
+   mkfs.ext4 -m 0 -T largefile \
+     -E nodiscard,lazy_itable_init=0,lazy_journal_init=0 \
+     -L vf-media \
      /var/lib/videofetch-workspace/workspace.ext4
    stat -c '%s %b %B' /var/lib/videofetch-workspace/workspace.ext4   # blocks x unit >= size
 
@@ -537,6 +538,25 @@ The order is not a convenience — it is the fail-closed boundary.
 
    vf-media-workspace-verify   # must print OK before the Worker unit is installed
    ```
+
+   **The image must stay fully allocated after it is mounted, not just after
+   it is formatted.** The verifier refuses a backing file whose `st_blocks` ×
+   block unit is below its logical size. Each extended option protects that:
+
+   - `nodiscard`: formatting a regular file with discard would punch holes in
+     the preallocation.
+   - `lazy_itable_init=0`: mke2fs zeroes every inode table while formatting.
+     By default it leaves them for the kernel to zero in the background after
+     the first mount, and through the loop device that zeroing punched holes in
+     the backing file.
+   - `lazy_journal_init=0`: the journal is zeroed while formatting too, so
+     initialization is finished before the image is ever mounted.
+
+   `MAX-FILE-SIZE-4GIB-ROLLOUT-1B0-EXT4-LAZY-INIT-EXPERIMENT-001` validated
+   this exact set. The observed holes came from inode-table initialization;
+   `lazy_journal_init=0` is part of the same eager recipe, not a fix for a
+   separate observed loss. Never omit an option, and never relax the verifier
+   to accept a partly allocated image.
 
 5. **Start the boundary, the broker, then the Worker.** systemd enforces the
    order; starting the Worker pulls the rest in.
