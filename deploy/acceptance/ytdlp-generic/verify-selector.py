@@ -20,7 +20,11 @@ What it proves (§52):
   5. the audio half follows the private tri-state audio constraint
      (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001): a PRESENT constraint matches
      a present codec only, an ABSENT one matches `"none"` only, and an UNKNOWN
-     one matches an unknown or later-known codec but never `"none"`.
+     one matches an unknown or later-known codec but never `"none"`;
+  6. the UNKNOWN-audio progressive VIDEO shape that may now back an ordinary
+     video preset (GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001) is
+     re-selected by its UNCHANGED selector when `acodec` is missing, None or
+     later known, never when it is `"none"`, and never through an HLS twin.
 
 Exit status is 0 only when every expectation holds.
 
@@ -153,6 +157,37 @@ FORMATS = [
     {"format_id": "html5-noaudio", "ext": "mp4", "protocol": "https",
      "vcodec": None, "acodec": "none", "video_ext": "mp4", "audio_ext": "none",
      "height": None, "url": "https://example.invalid/14"},
+    # ── SYNTHETIC X-shaped progressive formats ─────────────────────────────
+    # GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001. A progressive
+    # variant carries NO `vcodec` key and NO `acodec` key at all; video is
+    # established by `video_ext` alone. Mirrors
+    # src/worker/analysis/testdata/synthetic-x-progressive-unknown-audio.json.
+    # Each drift state gets its own id so every expectation is one exact match.
+    {"format_id": "xprog", "ext": "mp4", "protocol": "https",
+     "video_ext": "mp4", "audio_ext": "none",
+     "height": 360, "url": "https://example.invalid/15"},
+    {"format_id": "xprog-acodec-null", "ext": "mp4", "protocol": "https",
+     "acodec": None, "video_ext": "mp4", "audio_ext": "none",
+     "height": 360, "url": "https://example.invalid/16"},
+    {"format_id": "xprog-acodec-known", "ext": "mp4", "protocol": "https",
+     "acodec": "mp4a.40.2", "video_ext": "mp4", "audio_ext": "none",
+     "height": 360, "url": "https://example.invalid/17"},
+    {"format_id": "xprog-acodec-none", "ext": "mp4", "protocol": "https",
+     "acodec": "none", "video_ext": "mp4", "audio_ext": "none",
+     "height": 360, "url": "https://example.invalid/18"},
+    # A NAMED video codec with the audio key still missing.
+    {"format_id": "xprog-vcodec", "ext": "mp4", "protocol": "https",
+     "vcodec": "avc1.42001E", "video_ext": "mp4", "audio_ext": "none",
+     "height": 240, "url": "https://example.invalid/19"},
+    # The HLS side of the same shape: a video-only rendition and an
+    # audio-rendition-like format with unknown audio. Both stay unselectable
+    # through an https-bound selector.
+    {"format_id": "xhls-video", "ext": "mp4", "protocol": "m3u8_native",
+     "vcodec": "avc1.64001F", "acodec": "none", "video_ext": "mp4", "audio_ext": "none",
+     "height": 720, "url": "https://example.invalid/20"},
+    {"format_id": "xhls-audio", "ext": "mp4", "protocol": "m3u8_native",
+     "vcodec": "none", "video_ext": "none", "audio_ext": "mp4",
+     "height": None, "url": "https://example.invalid/21"},
 ]
 
 
@@ -336,6 +371,36 @@ def main(artifact: str) -> int:
     expect("...and unknown promoted to present selects nothing either",
            select('b*[format_id="html5-noacodec"][protocol="https"][ext="mp4"]'
                   '[vcodec!=?"none"][video_ext="mp4"][acodec!="none"]'), [])
+
+    print("\n10. the SYNTHETIC X-shaped unknown-audio progressive VIDEO shape")
+    # GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001. The selector is
+    # UNCHANGED; this proves the shape now advertised as an audio-free video
+    # preset is re-selected exactly, and that drift to PROVEN absence refuses.
+    def xprog(fid: str, video_constraint: str = "video-ext") -> list[str] | str:
+        return select(build_selector(fid, "https", "mp4", "unknown", video_constraint))
+
+    xselector = build_selector("xprog", "https", "mp4", "unknown", "video-ext")
+    expect("the built selector is exactly the unknown-audio video-ext form",
+           xselector,
+           'b*[format_id="xprog"][protocol="https"][ext="mp4"]'
+           '[vcodec!=?"none"][video_ext="mp4"][acodec!=?"none"]')
+    expect("no `/` fallback and no `+` merge", ("/" in xselector, "+" in xselector), (False, False))
+
+    expect("MISSING acodec (and missing vcodec) matches", xprog("xprog"), ["xprog"])
+    expect("acodec=None matches", xprog("xprog-acodec-null"), ["xprog-acodec-null"])
+    expect("a LATER-known audio codec matches", xprog("xprog-acodec-known"), ["xprog-acodec-known"])
+    expect("explicit acodec='none' does NOT match", xprog("xprog-acodec-none"), [])
+    expect("a named video codec with missing acodec matches (codec-present video)",
+           xprog("xprog-vcodec", "codec-present"), ["xprog-vcodec"])
+    expect("the HLS video-only rendition is never selected over https",
+           xprog("xhls-video", "codec-present"), [])
+    expect("the HLS audio-rendition-like format is never selected as video",
+           xprog("xhls-audio"), [])
+    expect("...not even with its own protocol, because its video is PROVEN absent",
+           select(build_selector("xhls-audio", "m3u8_native", "mp4", "unknown", "video-ext")), [])
+    for incomplete in (False, True):
+        expect(f"b* performs no fallback for a vanished unknown source, incomplete_formats={incomplete}",
+               select(build_selector("xprog-gone", "https", "mp4", "unknown", "video-ext"), incomplete), [])
 
     print()
     if failures:

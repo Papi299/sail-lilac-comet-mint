@@ -3687,6 +3687,7 @@ authorization.
 | `WORKER-UNIT-COMMENT-SYNC-001` | **CLOSED — superseded by the 4 GiB rollout's Phase 1C unit installation** | *Finding, as recorded at SPLIT-08E:* the installed `/etc/systemd/system/videofetch-worker.service` carried an older **comment block** than the committed `deploy/systemd/videofetch-worker.service`. Every non-comment directive matched the committed unit exactly, so there was no behavioural difference and nothing to fix in source. SPLIT-08E deliberately did not synchronise it, because it was forbidden from touching systemd. *Closure:* the 4 GiB rollout's Phase 1C (storage-only cutover) installed the exact merged Worker unit — the `deploy/systemd/videofetch-worker.service` blob `ad43ab55f0353de97aedccfcd1820ec6bce71794`, which is also its content at `main` `2e6c0cf9…` (*GitHub-verifiable*). The installed file's SHA-256 `257971338d662606f562a1cb550226304dca3f0db3fd43792520b19d651c94d6` and blob identity were measured at Phase 1C and again at Phase 1E (*accepted operator-measured*). Comments and directives alike are byte-identical to the committed unit, so the comment-only drift no longer exists and no separate operator synchronisation remains pending. |
 | `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | *Source and deployment contract:* PR #58, merge `92d80d88473c8fbca2a1f70ad299b613754a672b`, contributed a 4 GiB default from one shared constant, plan-aware and startup media-workspace gates, an absolute direct-acquisition deadline, the bounded disk workspace (mount unit + verifier + Worker unit bind), and release-image acceptance on a bind workspace (§2a). *Eager ext4 initialization correction:* PR #59, merge `2e6c0cf97a50d06b5d3aebd902ab03c386c01ba4` (both *GitHub-verifiable*). No R2, broker, Vercel, timeout or expiry change. *Rollout (accepted operator-measured):* Phases 1A–1E complete. The initial Phase 1B and the first Phase 1C attempt were rolled back — the latter on an acceptance-harness false negative, not a Product defect (§2a). *Production since 2026-09-17:* source `2e6c0cf9…`; image `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0` as `videofetch-worker:latest`, retained as `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799`; limit 4 GiB (4,294,967,296 bytes) with `MAX_FILE_SIZE` absent; 10 GiB disk-backed ext4 workspace; Lima primary disk 32 GiB. Retained rollback image: `sha256:d3b951d5…` as `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (§9). Phase-1E evidence digest `aca50a8e0bb3ddb44d2348109d344fb5fa377d32184fe28327558d6e747f547d` (operator-held). Vercel was not redeployed and did not need to be (§11h). |
 | `YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001` | **OPEN — acceptance-harness drift / non-Production-blocking** | The Phase-10D unknown-length byte-limit fixture is still capped at **528 MiB** (`BYTE_LIMIT_TOTAL_BYTES` in `deploy/acceptance/ytdlp-generic/fixtures/server.mjs`), and `scripts/ytdlp-fixture.test.mjs` still asserts it against a 500 MiB limit — both as of `main` `2e6c0cf9…` (*GitHub-verifiable*). That was correct for the historical 500 MiB deployment Phase 10D measured. It does not cross today's 4 GiB limit (4,294,967,296 bytes; `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`), so a future live `byte-limit` case cannot currently prove the 4 GiB application threshold: the harness's `bytesServed > effectiveMaxFileSizeBytes` requirement would reject such a run as invalid fixture evidence rather than pass it, but only after a real job had run. This does **not** reopen or invalidate the completed 4 GiB Production rollout, and does **not** invalidate the historical Phase-10D record (`PHASE-10D-YTDLP-PRODUCTION-STAGED-DEPLOYMENT-AND-LIVE-ACCEPTANCE-001`). It blocks only reuse of that one live acceptance case as current byte-threshold evidence. No correction strategy is chosen here; it needs its own reviewed engineering task, and the fixture's `--byte-limit-bytes` override is not a reviewed substitute. See `deploy/acceptance/ytdlp-generic/README.md` and `deploy/acceptance/ytdlp-generic/fixtures/README.md`. |
+| `GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001` | **IMPLEMENTED IN SOURCE — NOT DEPLOYED** | Progressive HTTP(S) generic sources with established video and UNKNOWN audio (the X/Twitter shape found by `X-TWITTER-FORMAT-COMPATIBILITY-DIAGNOSTIC-001`) may back ordinary video presets as a whole-result fallback: only when no proven video fulfilment exists, with `hasAudio: false` / `audioCodec: null`, as `keep-original`. Audio/MP3 stay proven-only, split semantics and the selector are unchanged, HLS stays excluded, explicit absent-audio single sources stay out of scope, and the public contract and direct strategy are unchanged. No Vercel redeploy is required. The Production Worker does **not** have this capability until a separate authorized image build, acceptance and promotion. See §11d, "Later capability — unknown-audio video presets". |
 
 ---
 
@@ -4537,6 +4538,77 @@ product-level decision about the public contract — `WorkerQualityPreset.hasAud
 is a boolean and cannot state "unknown".
 
 The enum is Worker-private in exactly the same way as `videoConstraint`.
+
+#### Later capability — unknown-audio video presets (GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001, 2026-09-17)
+
+*Added after the correction above, which is left as it was found.*
+**State: IMPLEMENTED IN SOURCE — NOT DEPLOYED.** The Production Worker image does not
+contain this change, and this record does not claim that Production supports
+X/Twitter.
+
+**Motivation.** `X-TWITTER-FORMAT-COMPATIBILITY-DIAGNOSTIC-001` (evidence SHA-256
+`f199d10b4aeac1c185b866533a8f43f1b03445346773d062f9ef59030695352b`; the submitted URL
+is deliberately not recorded) found that an X/Twitter video's two progressive HTTPS
+MP4 formats passed every eligibility gate with established video, but carried no
+`acodec` in the pinned extractor, so the rule above left them with no preset:
+"No compatible download". HLS exclusion was not the decisive blocker. The design,
+`GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-DESIGN-001`, selected a Worker-only fallback tier
+(Design A).
+
+**What changed.**
+
+- **Unknown audio remains UNKNOWN.** The private `audioConstraint` keeps all three
+  states, `hasAudio` still means *proven* audio (`unknown` → `false`), and the
+  selector is unchanged (`[acodec!=?"none"]`). `verify-selector.py` §10 re-proves it
+  against the pinned binary for the X-shaped progressive format: missing, `None` or
+  later-known `acodec` matches, and `"none"` or an HLS twin does not.
+- **Fallback tier.** Analysis first builds the proven video fulfilment set: muxed
+  sources with a real `acodec`, plus approved split pairs when Worker FFmpeg is
+  available. **Only when that set is empty for the whole result** may single
+  progressive candidates with established video and `unknown` audio back the
+  ordinary video ids (`preset:best`, `preset:2160` … `preset:144`), using the
+  existing bucketing and ranking. When any proven fulfilment exists, unknown sources
+  affect no video preset, and output is deep-equal to the proven-only document.
+  With FFmpeg unavailable, a pair-only document has an empty proven set, so the
+  fallback may engage. That is intentional.
+- **Proven sources keep priority.** A higher-resolution unknown source never
+  displaces a lower proven one.
+- **Video-only capability.** Such a preset states `hasAudio: false` and
+  `audioCodec: null`. For a generic preset `false` means *not proven*, never *proven
+  absent*. The execution plan is `keep-original`, delivered verbatim, with no FFmpeg,
+  remux or probe. A silent file is therefore delivered rather than failed.
+- **Audio and MP3 remain proven-only.** `preset:audio` and `preset:mp3` still require
+  `codec-present`. An unknown source never becomes an audio or MP3 source, a split
+  half, or a reason to admit an otherwise-ineligible format.
+- **Explicit absent-audio single sources stay out of scope.** A single progressive
+  source with `acodec: "none"` is still advertised only as a split video half.
+- **HLS stays excluded.** `YTDLP_V1_NATIVE_PROTOCOLS` is still exactly `http`, `https`.
+- **Enforced three times.** `assertGenericPresetBuild` fails analysis closed on:
+  - a public/private audio mismatch;
+  - an unknown source behind audio or MP3;
+  - an absent single;
+  - an unknown video preset while a proven fulfilment exists.
+
+  The planner refuses every mismatched shape with `FORMAT_UNAVAILABLE`, reading the
+  private constraint rather than the boolean. `GenericExecutionPlanSchema` itself
+  now admits `keep-original` only for the video ladder (proven or unknown audio,
+  target equal to source) and for `preset:audio` (proven audio-only). Extractions
+  require proven audio.
+
+**Unchanged.**
+
+- the public schema (`src/shared/worker/contracts.ts`, `src/types/media.ts`);
+- the direct strategy;
+- the UI;
+- the acquisition, processing, runtime, systemd and SQLite layers.
+
+**Deployment.**
+
+- **Vercel redeploy: not required.** The source shape already validates under the
+  existing DTO: a generic preset with `hasAudio: false` is valid under the current
+  strict schema.
+- **Worker: not deployed.** Deploying needs a separate, authorized Worker release-image
+  build, acceptance and promotion. Rollback would be the image-only retag in §9.
 
 ### Temporary Quick-Tunnel verification
 

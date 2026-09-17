@@ -18,6 +18,7 @@ import {
   buildYtdlpAnalysisEnvironment,
   analyzeGenericMedia,
   analyzeGenericMediaInternal,
+  assertGenericPresetBuild,
   buildGenericPresets,
   buildYtdlpAnalysisArgv,
   classifyAnalysisFailure,
@@ -1806,7 +1807,12 @@ describe("unknown-codec video: the evidence required (§6)", () => {
 });
 
 describe("unknown audio never becomes a muxed claim (§8/§27)", () => {
-  it("a proven-video format with an unknown acodec produces no video preset", async () => {
+  // GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001 INVERTS the video half
+  // of these cases rather than deleting them. Unknown audio still never becomes
+  // a MUXED claim — no preset states `hasAudio: true` for it, and no audio or MP3
+  // preset is built on it — but with no proven video fulfilment in the document
+  // it now backs ordinary video presets that claim no audio.
+  it("a proven-video format with an unknown acodec backs video presets that claim NO audio", async () => {
     for (const acodec of [null, undefined, "", "null"]) {
       const format: Record<string, unknown> = {
         format_id: "v-only",
@@ -1824,16 +1830,22 @@ describe("unknown audio never becomes a muxed claim (§8/§27)", () => {
       assert.equal(candidates[0]!.audioCodec, null);
 
       const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: [format] }))));
-      const meta = await analyze(SAFE_URL, { runner });
+      const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
       assert.deepEqual(
-        meta.presets.filter((p) => p.hasVideo),
-        [],
-        "an mp4 container is not evidence of an audio stream",
+        meta.presets.map((p) => p.id),
+        ["preset:best", "preset:1080"],
+        "video presets only: no audio, no mp3",
       );
+      for (const preset of meta.presets) {
+        assert.equal(preset.hasVideo, true);
+        assert.equal(preset.hasAudio, false, "an mp4 container is not evidence of an audio stream");
+        assert.equal(preset.audioCodec, null);
+      }
+      assert.equal(meta.capabilities.mp3, false);
     }
   });
 
-  it("an unknown-codec video with unknown audio produces nothing at all", async () => {
+  it("an unknown-codec video with unknown audio produces ONE video preset and nothing else", async () => {
     const format = {
       format_id: "0",
       ext: "mp4",
@@ -1844,8 +1856,22 @@ describe("unknown audio never becomes a muxed claim (§8/§27)", () => {
       audio_ext: "none",
     };
     const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: [format] }))));
-    const meta = await analyze(SAFE_URL, { runner });
-    assert.deepEqual(meta.presets, []);
+    const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
+    assert.deepEqual(meta.presets, [
+      {
+        id: "preset:best",
+        label: "Best available",
+        resolution: null,
+        container: "mp4",
+        fileSize: null,
+        hasVideo: true,
+        hasAudio: false,
+        formatId: "preset:best",
+        videoCodec: null,
+        audioCodec: null,
+        fps: null,
+      },
+    ]);
   });
 });
 
@@ -2238,9 +2264,29 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
     });
   });
 
-  describe("unknown audio stays unadvertised (fail-closed policy unchanged)", () => {
+  describe("unknown audio: video fallback only, never an audio product", () => {
+    // Was "unknown audio stays unadvertised (fail-closed policy unchanged)".
+    // GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001 inverts ONLY the
+    // video half: with no proven video fulfilment, an unknown-audio progressive
+    // source backs ordinary video presets that claim no audio. The audio half is
+    // unchanged — no `preset:audio`, no `preset:mp3` — and so is the private state.
+    /** The one video preset a lone HTML5_UNDECLARED-shaped source yields. */
+    const UNKNOWN_BEST = {
+      id: "preset:best",
+      label: "Best available",
+      resolution: null,
+      container: "mp4",
+      fileSize: null,
+      hasVideo: true,
+      hasAudio: false,
+      formatId: "preset:best",
+      videoCodec: null,
+      audioCodec: null,
+      fps: null,
+    };
+
     for (const ffmpegAvailable of [false, true]) {
-      it(`an UNKNOWN-audio progressive video is classifiable but creates NO preset (ffmpeg=${ffmpegAvailable})`, () => {
+      it(`an UNKNOWN-audio progressive video backs ONLY a video preset claiming no audio (ffmpeg=${ffmpegAvailable})`, () => {
         const candidates = selectCandidates([HTML5_UNDECLARED], LIMITS);
         assert.equal(candidates.length, 1, "it remains an honest private candidate");
         assert.equal(candidates[0]!.videoConstraint, "video-ext");
@@ -2250,8 +2296,12 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
           ffmpegAvailable,
           maxFileSizeBytes: LIMITS.maxFileSizeBytes,
         });
-        assert.deepEqual(presets, [], "no video, audio or mp3 preset from unproven audio");
-        assert.deepEqual(selections, {});
+        assert.deepEqual(presets, [UNKNOWN_BEST], "a video preset, and no audio or mp3 preset");
+        assert.deepEqual(Object.keys(selections), ["preset:best"]);
+        const source = singleSource(selections["preset:best"]);
+        assert.equal(source.formatId, "h2");
+        assert.equal(source.audioConstraint, "unknown", "unknown stays unknown privately");
+        assert.equal(source.hasAudio, false);
       });
 
       it(`an ABSENT-audio video-bearing source creates no preset (ffmpeg=${ffmpegAvailable})`, () => {
@@ -2266,18 +2316,18 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
       });
     }
 
-    it("the full analyzer still returns presets: [] for the affected shape", async () => {
+    it("the full analyzer returns exactly the one audio-free video preset for the affected shape", async () => {
       const { runner } = fakeRunner(
         ok(JSON.stringify(singleVideoInfo({ formats: [HTML5_UNDECLARED] }))),
       );
       const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
-      assert.deepEqual(meta.presets, []);
+      assert.deepEqual(meta.presets, [UNKNOWN_BEST]);
       assert.deepEqual(meta.formats, []);
       assert.equal(meta.capabilities.mp3, false);
       assert.equal(meta.capabilities.merge, false);
     });
 
-    it("the captured pinned no-codecs document still yields presets: []", async () => {
+    it("the captured pinned no-codecs document now yields one video preset and no audio product", async () => {
       const doc = readFileSync(
         join(import.meta.dirname, "testdata", "pinned-generic-html5-no-audio-codec.json"),
         "utf8",
@@ -2296,31 +2346,56 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
 
       const { runner } = fakeRunner(ok(doc));
       const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
-      assert.deepEqual(meta.presets, [], "this correction must not enable the affected sources");
+      assert.deepEqual(meta.presets, [UNKNOWN_BEST], "video only, claiming no audio");
+      assert.equal(meta.capabilities.mp3, false);
     });
   });
 
-  describe("every emitted selection carries PROVEN audio", () => {
+  describe("every emitted selection carries the audio state its preset states", () => {
     /**
-     * The audio rule, in the form that applies to each SHAPE (SPLIT-05 §29).
+     * The audio rule, in the form that applies to each SHAPE (SPLIT-05 §29, and
+     * GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001).
      *
-     * The rule itself is unchanged: an `unknown` audio state may never back an
-     * advertised preset. What SPLIT-05 changes is that "the selection" may now
-     * name two sources, so the rule is stated per shape rather than flattened:
+     *   audio / mp3    one source, audio PROVEN PRESENT, exactly as before.
+     *   video, single  the public `hasAudio` equals the private proof: PROVEN
+     *                  PRESENT behind `true`, UNKNOWN behind `false` (with no
+     *                  audio codec). Never ABSENT — that is a split half's shape.
+     *   video, split   audio PROVEN ABSENT on the video half — that is what makes
+     *                  it a video half at all — and PROVEN PRESENT on the audio
+     *                  half; the preset claims audio.
      *
-     *   single  audio PROVEN PRESENT on the one source, exactly as before.
-     *   split   audio PROVEN ABSENT on the video half — that is what makes it a
-     *           video half at all — and PROVEN PRESENT on the audio half.
-     *
-     * `unknown` appears on neither side of either shape, which is the property
-     * the original flat assertion was really protecting.
+     * `unknown` may appear ONLY behind a single-source video preset that claims
+     * no audio. Returns whether this preset was unknown-backed, so callers can
+     * prove the new shape was actually exercised.
      */
-    function assertProvenAudio(id: string, value: GenericPresetSource, label: string) {
+    function assertAudioRule(
+      id: string,
+      value: GenericPresetSource,
+      preset: { hasVideo: boolean; hasAudio: boolean; audioCodec: string | null },
+      label: string,
+    ): boolean {
+      const audioProduct = id === "preset:audio" || id === "preset:mp3";
       if (value.kind === "single") {
-        assert.equal(value.source.audioConstraint, "codec-present", `${label} ${id}`);
-        assert.equal(value.source.hasAudio, true, `${label} ${id}`);
-        return;
+        const source = value.source;
+        if (audioProduct) {
+          assert.equal(source.audioConstraint, "codec-present", `${label} ${id}`);
+          assert.equal(source.hasAudio, true, `${label} ${id}`);
+          assert.equal(preset.hasAudio, true, `${label} ${id}`);
+          return false;
+        }
+        assert.equal(preset.hasAudio, source.hasAudio, `${label} ${id}: public claim == private proof`);
+        assert.notEqual(source.audioConstraint, "absent", `${label} ${id}: absent single`);
+        if (source.audioConstraint === "unknown") {
+          assert.equal(preset.hasAudio, false, `${label} ${id}`);
+          assert.equal(preset.audioCodec, null, `${label} ${id}`);
+          return true;
+        }
+        assert.equal(source.audioConstraint, "codec-present", `${label} ${id}`);
+        assert.equal(preset.hasAudio, true, `${label} ${id}`);
+        return false;
       }
+      assert.equal(audioProduct, false, `${label} ${id}: an audio product is never a pair`);
+      assert.equal(preset.hasAudio, true, `${label} ${id}: a pair claims audio`);
       const { video, audio } = value.pair;
       assert.equal(video.audioConstraint, "absent", `${label} ${id}: video half`);
       assert.equal(video.hasAudio, false, `${label} ${id}: video half`);
@@ -2332,25 +2407,30 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
         assert.notEqual(member.audioConstraint, "unknown", `${label} ${id}: unknown audio`);
         assert.notEqual(member.videoConstraint, "unknown", `${label} ${id}: unknown video`);
       }
+      return false;
     }
 
     for (const ffmpegAvailable of [false, true]) {
-      it(`buildGenericPresets emits only PROVEN-audio selections (ffmpeg=${ffmpegAvailable})`, () => {
+      it(`buildGenericPresets emits only shape-correct audio selections (ffmpeg=${ffmpegAvailable})`, () => {
         let emitted = 0;
+        let unknownBacked = 0;
         for (const [label, formats] of DOCUMENTS) {
-          const { selections } = buildGenericPresets(selectCandidates(formats, LIMITS), {
+          const { presets, selections } = buildGenericPresets(selectCandidates(formats, LIMITS), {
             ffmpegAvailable,
             maxFileSizeBytes: LIMITS.maxFileSizeBytes,
           });
           for (const [id, presetSource] of Object.entries(selections)) {
-            assertProvenAudio(id, presetSource, label);
+            const preset = presets.find((p) => p.id === id);
+            assert.ok(preset, `${label}: ${id} is advertised`);
+            if (assertAudioRule(id, presetSource, preset, label)) unknownBacked += 1;
             emitted += 1;
           }
         }
         assert.ok(emitted > 0, "the invariant must actually be exercised");
+        assert.ok(unknownBacked > 0, "the unknown-audio video shape must actually be exercised");
       });
 
-      it(`the internal analyzer emits only PROVEN-audio selections (ffmpeg=${ffmpegAvailable})`, async () => {
+      it(`the internal analyzer emits only shape-correct audio selections (ffmpeg=${ffmpegAvailable})`, async () => {
         for (const [label, formats] of DOCUMENTS) {
           const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats }))));
           const { video, selections } = await analyzeInternal(SAFE_URL, { runner, ffmpegAvailable });
@@ -2360,11 +2440,28 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
             `${label}: selections and presets stay in bijection`,
           );
           for (const [id, presetSource] of Object.entries(selections)) {
-            assertProvenAudio(id, presetSource, label);
+            assertAudioRule(id, presetSource, video.presets.find((p) => p.id === id)!, label);
           }
         }
       });
     }
+
+    it("proven video suppresses the unknown-audio tier in every mixed document", () => {
+      // "everything at once" carries muxed renditions, so the unknown-audio HTML5
+      // source must affect no preset there, with or without FFmpeg.
+      for (const ffmpegAvailable of [false, true]) {
+        const [, formats] = DOCUMENTS.find(([label]) => label === "everything at once")!;
+        const { selections } = buildGenericPresets(selectCandidates(formats, LIMITS), {
+          ffmpegAvailable,
+          maxFileSizeBytes: LIMITS.maxFileSizeBytes,
+        });
+        for (const value of Object.values(selections)) {
+          for (const member of selectionMembers(value)) {
+            assert.notEqual(member.audioConstraint, "unknown", `ffmpeg=${ffmpegAvailable}`);
+          }
+        }
+      }
+    });
 
     it("an UNKNOWN-audio video source is never promoted into a pair half", () => {
       // The single most important pairing regression (§29/M1). An unknown-audio
@@ -2374,16 +2471,21 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
         selectCandidates([HTML5_UNDECLARED, AUDIO_ONLY], LIMITS),
         { ffmpegAvailable: true, maxFileSizeBytes: LIMITS.maxFileSizeBytes },
       );
-      assert.equal(
-        presets.some((p) => p.hasVideo),
-        false,
-        "unknown audio is not absence, so there is no video half and no pair",
-      );
       for (const value of Object.values(selections)) {
-        assert.equal(value.kind, "single", "only the audio-only source may back a preset");
+        assert.equal(value.kind, "single", "unknown audio is not absence, so there is no pair");
       }
+      // The video rendition is the unknown source ALONE, claiming no audio — not
+      // the unknown source merged with the audio-only one.
+      const videoPresets = presets.filter((p) => p.hasVideo);
+      assert.deepEqual(videoPresets.map((p) => p.id), ["preset:best"]);
+      assert.equal(videoPresets[0]!.hasAudio, false);
+      assert.equal(singleSource(selections["preset:best"]).formatId, "h2");
+      assert.equal(singleSource(selections["preset:best"]).audioConstraint, "unknown");
       // The audio-only source is still independently usable.
       assert.ok(presets.some((p) => p.id === "preset:audio"));
+      assert.equal(singleSource(selections["preset:audio"]).formatId, "140");
+      assert.equal(presets.find((p) => p.id === "preset:best")?.container, "mp4");
+      assert.equal(presets.find((p) => p.id === "preset:best")?.audioCodec, null);
     });
 
     it("every reachable selector is byte-identical to the pre-correction one", () => {
@@ -2808,12 +2910,17 @@ describe("SPLIT-05: pairing eligibility", () => {
    * Every shape that must NOT become a pair.
    *
    * The third element says whether a VIDEO preset may still legitimately appear
-   * from a SINGLE source in that row — true only for the muxed row, where the
-   * "video half" is actually an ordinary muxed rendition. Everywhere else the
-   * absence of a video preset is itself part of the assertion, so a row cannot
-   * pass merely by producing nothing.
+   * from a SINGLE source in that row, and of which kind: `"muxed"` for the row
+   * whose "video half" is actually an ordinary muxed rendition, and
+   * `"unknown-audio"` for the row whose "video half" has unknown audio — which is
+   * not a pair half, but since GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001
+   * is an unknown-audio fallback video source claiming no audio. Everywhere else
+   * the absence of a video preset is itself part of the assertion, so a row
+   * cannot pass merely by producing nothing.
    */
-  const NOT_PAIRS: Array<[string, Array<Record<string, unknown>>, boolean?]> = [
+  const NOT_PAIRS: Array<
+    [string, Array<Record<string, unknown>>, ("muxed" | "unknown-audio")?]
+  > = [
     [
       "cross-family: mp4 video + webm audio",
       [videoOnly(), audioOnly({ format_id: "a-webm", ext: "webm", acodec: "opus", audio_ext: "webm" })],
@@ -2833,11 +2940,12 @@ describe("SPLIT-05: pairing eligibility", () => {
     [
       "video half with UNKNOWN audio",
       [videoOnly({ acodec: undefined, vcodec: null }), audioOnly()],
+      "unknown-audio",
     ],
     [
       "video half with PROVEN audio (it is muxed, not a half)",
       [videoOnly({ acodec: "mp4a.40.2" }), audioOnly({ format_id: "a2" })],
-      true,
+      "muxed",
     ],
     [
       "audio half with UNKNOWN video",
@@ -2869,20 +2977,21 @@ describe("SPLIT-05: pairing eligibility", () => {
     ],
   ];
 
-  for (const [label, formats, muxedVideoExpected = false] of NOT_PAIRS) {
+  for (const [label, formats, singleVideoExpected] of NOT_PAIRS) {
     it(`NOT a pair: ${label}`, () => {
       const { presets, selections } = build(formats);
       // Nothing may be fulfilled by a pair...
       for (const [id, value] of Object.entries(selections)) {
         assert.equal(value.kind, "single", `${label}: ${id} must not be a pair`);
       }
-      // ...and, except for the genuinely muxed row, no video preset may exist
-      // at all. Without this half the row could pass by accident.
-      assert.equal(
-        presets.some((p) => p.hasVideo),
-        muxedVideoExpected,
-        `${label}: video-preset presence`,
-      );
+      // ...and, except for the two single-source rows, no video preset may
+      // exist at all. Without this half the row could pass by accident.
+      const videoPresets = presets.filter((p) => p.hasVideo);
+      assert.equal(videoPresets.length > 0, singleVideoExpected !== undefined, `${label}: video-preset presence`);
+      // Where one exists, its audio claim is the single source's own proof.
+      for (const preset of videoPresets) {
+        assert.equal(preset.hasAudio, singleVideoExpected === "muxed", `${label}: ${preset.id} hasAudio`);
+      }
     });
   }
 
@@ -3535,5 +3644,430 @@ describe("SPLIT-05: the public/private boundary is unchanged (§35)", () => {
       assert.equal(value.pair.video.hasVideo, true, preset.id);
       assert.equal(value.pair.audio.hasAudio, true, preset.id);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001
+//
+// A progressive source with established video and UNKNOWN audio may back
+// ordinary VIDEO presets — `hasAudio: false`, `audioCodec: null` — as a
+// whole-result FALLBACK tier used only when no proven video fulfilment (muxed,
+// or a split pair with Worker FFmpeg) exists. It never becomes audio, MP3, a
+// split half, or a reason to admit an otherwise-ineligible format.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001", () => {
+  const MAX = LIMITS.maxFileSizeBytes;
+  const build = (formats: Array<Record<string, unknown>>, ffmpegAvailable: boolean) =>
+    buildGenericPresets(selectCandidates(formats, LIMITS), { ffmpegAvailable, maxFileSizeBytes: MAX });
+
+  /** An X-shaped progressive format: video by shape, no vcodec, no acodec. */
+  const unknownProgressive = (o: Record<string, unknown> = {}): Record<string, unknown> => ({
+    format_id: "unk",
+    ext: "mp4",
+    protocol: "https",
+    height: 1080,
+    video_ext: "mp4",
+    audio_ext: "none",
+    ...o,
+  });
+  const muxed = (o: Record<string, unknown> = {}): Record<string, unknown> => ({
+    format_id: "mux",
+    ext: "mp4",
+    protocol: "https",
+    height: 720,
+    vcodec: "avc1.64001F",
+    acodec: "mp4a.40.2",
+    video_ext: "mp4",
+    audio_ext: "none",
+    filesize: 5_000_000,
+    ...o,
+  });
+  const videoOnly = (o: Record<string, unknown> = {}): Record<string, unknown> => ({
+    format_id: "vid",
+    ext: "mp4",
+    protocol: "https",
+    height: 720,
+    vcodec: "avc1.64001F",
+    acodec: "none",
+    video_ext: "mp4",
+    audio_ext: "none",
+    ...o,
+  });
+  const audioOnly = (o: Record<string, unknown> = {}): Record<string, unknown> => ({
+    format_id: "aud",
+    ext: "m4a",
+    protocol: "https",
+    vcodec: "none",
+    acodec: "mp4a.40.2",
+    video_ext: "none",
+    audio_ext: "m4a",
+    ...o,
+  });
+
+  /** Every video preset is unknown-backed, claims no audio, and names no audio codec. */
+  function assertUnknownVideoOnly(
+    presets: Array<{ id: string; hasVideo: boolean; hasAudio: boolean; audioCodec: string | null }>,
+    selections: Record<string, GenericPresetSource>,
+    label: string,
+  ) {
+    const video = presets.filter((p) => p.hasVideo);
+    assert.ok(video.length > 0, `${label}: video presets are produced`);
+    for (const preset of video) {
+      assert.equal(preset.hasAudio, false, `${label} ${preset.id}`);
+      assert.equal(preset.audioCodec, null, `${label} ${preset.id}`);
+      const source = singleSource(selections[preset.id]);
+      assert.equal(source.audioConstraint, "unknown", `${label} ${preset.id}`);
+      assert.equal(source.hasAudio, false, `${label} ${preset.id}`);
+      assert.equal(source.hasVideo, true, `${label} ${preset.id}`);
+    }
+  }
+
+  // ── The SYNTHETIC X-shaped regression ──────────────────────────────────────
+
+  describe("the SYNTHETIC X-shaped document", () => {
+    const DOC = readFileSync(
+      join(import.meta.dirname, "testdata", "synthetic-x-progressive-unknown-audio.json"),
+      "utf8",
+    );
+    const FORMATS = JSON.parse(DOC).formats as Array<Record<string, unknown>>;
+
+    it("has exactly the decisive shape, and is sanitized", () => {
+      assert.equal(FORMATS.length, 6);
+      const progressive = FORMATS.filter((f) => f.protocol === "https");
+      const hlsVideo = FORMATS.filter((f) => f.protocol === "m3u8_native" && f.vcodec !== "none");
+      const hlsAudio = FORMATS.filter((f) => f.protocol === "m3u8_native" && f.vcodec === "none");
+      assert.equal(progressive.length, 2);
+      assert.equal(hlsVideo.length, 2);
+      assert.equal(hlsAudio.length, 2);
+      for (const f of progressive) {
+        assert.equal(f.ext, "mp4");
+        assert.equal(f.video_ext, "mp4");
+        assert.equal("vcodec" in f, false, "video codec identity unknown");
+        assert.equal("acodec" in f, false, "audio UNKNOWN: the key is absent");
+      }
+      assert.notEqual(progressive[0]!.height, progressive[1]!.height, "a lower and a higher rendition");
+      for (const f of hlsVideo) assert.equal(f.acodec, "none");
+      for (const f of hlsAudio) {
+        assert.equal(f.ext, "mp4");
+        assert.equal("acodec" in f, false, "audio-rendition-like, audio metadata unknown");
+      }
+      // Sanitization, with a positive control so an empty scan cannot pass.
+      assert.ok(DOC.includes("SYNTHETIC"));
+      for (const forbidden of ["http://", "https://", "//", "?", "token", "cookie", "x.com", "twitter", "twimg", "status", "url"]) {
+        assert.equal(DOC.toLowerCase().includes(forbidden), false, forbidden);
+      }
+      for (const f of FORMATS) assert.match(String(f.format_id), /^synthetic-[a-z-]+$/);
+    });
+
+    it("HLS stays excluded: only the two progressive formats are candidates", () => {
+      assert.deepEqual([...YTDLP_V1_NATIVE_PROTOCOLS], ["http", "https"]);
+      const candidates = selectCandidates(FORMATS, LIMITS);
+      assert.deepEqual(
+        candidates.map((c) => [c.formatId, c.protocol, c.videoConstraint, c.audioConstraint]),
+        [
+          ["synthetic-prog-low", "https", "video-ext", "unknown"],
+          ["synthetic-prog-high", "https", "video-ext", "unknown"],
+        ],
+      );
+    });
+
+    for (const ffmpegAvailable of [false, true]) {
+      it(`produces video presets claiming no audio, and no audio/mp3 (ffmpeg=${ffmpegAvailable})`, async () => {
+        const { runner } = fakeRunner(ok(DOC));
+        const { video, selections } = await analyzeGenericMediaInternal(SAFE_URL, {
+          limits: LIMITS,
+          runner,
+          probeRuntime: async () => OK_RUNTIME,
+          validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+          ffmpegAvailable,
+        });
+        const common = { container: "mp4", hasVideo: true, hasAudio: false, videoCodec: null, audioCodec: null, fps: null };
+        assert.deepEqual(video.presets, [
+          { id: "preset:best", label: "Best available", resolution: "360p", fileSize: 2_400_000, formatId: "preset:best", ...common },
+          { id: "preset:360", label: "360p", resolution: "360p", fileSize: 2_400_000, formatId: "preset:360", ...common },
+          { id: "preset:240", label: "240p", resolution: "240p", fileSize: 1_200_000, formatId: "preset:240", ...common },
+        ]);
+        assert.deepEqual(video.capabilities, { mp3: false, merge: false });
+        assert.equal(singleSource(selections["preset:best"]).formatId, "synthetic-prog-high");
+        assert.equal(singleSource(selections["preset:360"]).formatId, "synthetic-prog-high");
+        assert.equal(singleSource(selections["preset:240"]).formatId, "synthetic-prog-low");
+        assertUnknownVideoOnly(video.presets, selections, "synthetic X");
+        for (const value of Object.values(selections)) {
+          const selector = buildGenericFormatSelector(singleSource(value));
+          assert.match(selector, /\[protocol="https"\]/);
+          assert.match(selector, /\[acodec!=\?"none"\]$/);
+          assert.doesNotMatch(selector, /[/+]/);
+        }
+        // Nothing private reaches the HTTP body.
+        const body = JSON.stringify(WorkerAnalyzeSuccessSchema.parse({ success: true, video }));
+        for (const forbidden of ["synthetic-prog", "synthetic-hls", "audioConstraint", "videoConstraint", "b*["]) {
+          assert.equal(body.includes(forbidden), false, forbidden);
+        }
+      });
+    }
+  });
+
+  // ── The analysis matrix ──────────────────────────────────────────────────
+
+  it("matrix: http/https × codec-present/video-ext × missing/null/empty/'null' acodec × mp4/webm", () => {
+    let cases = 0;
+    for (const protocol of ["http", "https"]) {
+      for (const video of ["codec-present", "video-ext"] as const) {
+        for (const acodec of [undefined, null, "", "null"]) {
+          for (const ext of ["mp4", "webm"]) {
+            const format: Record<string, unknown> = unknownProgressive({ protocol, ext, video_ext: ext });
+            if (video === "codec-present") format.vcodec = ext === "mp4" ? "avc1.640028" : "vp09.00.40.08";
+            if (acodec !== undefined) format.acodec = acodec;
+            const label = `${protocol}/${video}/${JSON.stringify(acodec)}/${ext}`;
+
+            const candidates = selectCandidates([format], LIMITS);
+            assert.equal(candidates.length, 1, label);
+            assert.equal(candidates[0]!.videoConstraint, video, label);
+            assert.equal(candidates[0]!.audioConstraint, "unknown", label);
+
+            const { presets, selections } = buildGenericPresets(candidates, { ffmpegAvailable: true, maxFileSizeBytes: MAX });
+            assert.deepEqual(presets.map((p) => p.id), ["preset:best", "preset:1080"], label);
+            for (const preset of presets) {
+              assert.equal(preset.container, ext, label);
+              assert.equal(preset.videoCodec, video === "codec-present" ? (ext === "mp4" ? "h264" : "vp9") : null, label);
+            }
+            assertUnknownVideoOnly(presets, selections, label);
+            cases += 1;
+          }
+        }
+      }
+    }
+    assert.equal(cases, 32);
+  });
+
+  it("eligibility is not weakened: every refusal still holds, each with a positive control", () => {
+    const rows: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
+      ["HLS", unknownProgressive({ protocol: "m3u8_native" }), unknownProgressive()],
+      ["no protocol", unknownProgressive({ protocol: undefined }), unknownProgressive()],
+      ["unsupported container", unknownProgressive({ ext: "mkv", video_ext: "mkv" }), unknownProgressive()],
+      ["unsafe id", unknownProgressive({ format_id: "bv+ba" }), unknownProgressive({ format_id: "bv-ba" })],
+      ["over-limit known size", unknownProgressive({ filesize: MAX + 1 }), unknownProgressive({ filesize: MAX })],
+      ["video_ext differs from ext", unknownProgressive({ video_ext: "webm" }), unknownProgressive()],
+      ["video_ext missing", unknownProgressive({ video_ext: undefined }), unknownProgressive()],
+      ["vcodec none beside a video_ext", unknownProgressive({ vcodec: "none" }), unknownProgressive()],
+      ["named vcodec beside video_ext none", unknownProgressive({ vcodec: "avc1", video_ext: "none" }), unknownProgressive({ vcodec: "avc1" })],
+      ["storyboard", unknownProgressive({ format_note: "storyboard" }), unknownProgressive({ format_note: "sd" })],
+    ];
+    for (const [label, refusedFormat, control] of rows) {
+      for (const ffmpegAvailable of [false, true]) {
+        assert.deepEqual(build([refusedFormat], ffmpegAvailable).presets, [], `${label}: refused`);
+        const positive = build([control], ffmpegAvailable);
+        assert.ok(positive.presets.length > 0, `${label}: control advertises`);
+        assertUnknownVideoOnly(positive.presets, positive.selections, `${label} control`);
+      }
+    }
+  });
+
+  it("an explicit ABSENT-audio single progressive is NOT an ordinary silent-video fallback", () => {
+    for (const ffmpegAvailable of [false, true]) {
+      assert.deepEqual(build([unknownProgressive({ acodec: "none" })], ffmpegAvailable).presets, []);
+      assert.deepEqual(build([videoOnly()], ffmpegAvailable).presets, []);
+    }
+  });
+
+  // ── Proven fulfilments keep priority, byte for byte ─────────────────────────
+
+  it("proven 720p + unknown 1080p is DEEP-EQUAL to proven 720p alone (presets AND selections)", () => {
+    for (const ffmpegAvailable of [false, true]) {
+      const alone = build([muxed()], ffmpegAvailable);
+      for (const formats of [
+        [muxed(), unknownProgressive()],
+        [unknownProgressive(), muxed()],
+        [unknownProgressive({ format_id: "unk-a", height: 2160 }), muxed(), unknownProgressive({ format_id: "unk-b", height: 480 })],
+      ]) {
+        assert.deepEqual(build(formats, ffmpegAvailable), alone, `ffmpeg=${ffmpegAvailable}`);
+      }
+      assert.equal(alone.presets.find((p) => p.id === "preset:best")?.resolution, "720p");
+      assert.equal(alone.presets.every((p) => p.hasAudio), true);
+    }
+  });
+
+  it("the tier is whole-result: a proven source with NO height still suppresses every unknown rung", () => {
+    for (const ffmpegAvailable of [false, true]) {
+      const alone = build([muxed({ height: undefined })], ffmpegAvailable);
+      assert.deepEqual(build([muxed({ height: undefined }), unknownProgressive()], ffmpegAvailable), alone);
+    }
+  });
+
+  it("approved split pair + unknown higher rung is DEEP-EQUAL to pair-only analysis (FFmpeg available)", () => {
+    const pairOnly = build([videoOnly(), audioOnly()], true);
+    assert.equal(pairOnly.selections["preset:best"]?.kind, "split");
+    assert.deepEqual(build([videoOnly(), audioOnly(), unknownProgressive({ height: 2160 })], true), pairOnly);
+    assert.deepEqual(build([unknownProgressive({ height: 2160 }), audioOnly(), videoOnly()], true), pairOnly);
+  });
+
+  it("FFmpeg unavailable: a pair-only proven tier is EMPTY, so the unknown fallback MAY engage", () => {
+    // Intentional and documented: without Worker FFmpeg the pair cannot be
+    // offered, and the unknown progressive source is deliverable as-is.
+    const pairOnly = build([videoOnly(), audioOnly()], false);
+    assert.equal(pairOnly.presets.some((p) => p.hasVideo), false, "the pair is not offered");
+
+    const withUnknown = build([videoOnly(), audioOnly(), unknownProgressive({ height: 2160 })], false);
+    assertUnknownVideoOnly(withUnknown.presets, withUnknown.selections, "ffmpeg unavailable");
+    assert.deepEqual(withUnknown.presets.filter((p) => p.hasVideo).map((p) => p.id), ["preset:best", "preset:2160"]);
+    // The audio-only source still backs preset:audio independently; MP3 still needs FFmpeg.
+    assert.equal(singleSource(withUnknown.selections["preset:audio"]).formatId, "aud");
+    assert.equal(withUnknown.presets.some((p) => p.id === "preset:mp3"), false);
+
+    // ...and with FFmpeg back, the pair wins the whole result again.
+    const withFfmpeg = build([videoOnly(), audioOnly(), unknownProgressive({ height: 2160 })], true);
+    assert.deepEqual(withFfmpeg, build([videoOnly(), audioOnly()], true));
+  });
+
+  // ── Audio and MP3 stay proven-only ────────────────────────────────────────
+
+  it("unknown video fallback + an independent PROVEN audio-only source: independent identities", () => {
+    const { presets, selections } = build([unknownProgressive(), audioOnly()], true);
+    assert.deepEqual(presets.map((p) => p.id), ["preset:best", "preset:1080", "preset:audio", "preset:mp3"]);
+    assertUnknownVideoOnly(presets, selections, "with audio-only");
+    for (const id of ["preset:audio", "preset:mp3"]) {
+      const source = singleSource(selections[id]);
+      assert.equal(source.formatId, "aud", id);
+      assert.equal(source.audioConstraint, "codec-present", id);
+      assert.equal(source.hasVideo, false, id);
+    }
+    assert.equal(singleSource(selections["preset:best"]).formatId, "unk");
+    assert.equal(presets.find((p) => p.id === "preset:audio")?.hasAudio, true);
+    // Exactly the audio half an audio-only-alone document would produce.
+    const audioAlone = build([audioOnly()], true);
+    for (const id of ["preset:audio", "preset:mp3"]) {
+      assert.deepEqual(presets.find((p) => p.id === id), audioAlone.presets.find((p) => p.id === id), id);
+      assert.deepEqual(selections[id], audioAlone.selections[id], id);
+    }
+  });
+
+  it("an unknown-only document never yields preset:audio or preset:mp3, with or without FFmpeg", () => {
+    for (const ffmpegAvailable of [false, true]) {
+      const { presets, selections } = build(
+        [unknownProgressive({ format_id: "a", height: 720 }), unknownProgressive({ format_id: "b", height: 360, ext: "webm", video_ext: "webm" })],
+        ffmpegAvailable,
+      );
+      assert.equal(presets.some((p) => !p.hasVideo), false);
+      assert.equal("preset:audio" in selections, false);
+      assert.equal("preset:mp3" in selections, false);
+    }
+  });
+
+  it("fallback ranking reuses the existing single-source ranking, and is order-independent", () => {
+    const formats = [
+      unknownProgressive({ format_id: "webm-big", ext: "webm", video_ext: "webm", filesize: 9_000_000 }),
+      unknownProgressive({ format_id: "mp4-small", filesize: 1_000_000 }),
+      unknownProgressive({ format_id: "mp4-big", filesize: 2_000_000 }),
+    ];
+    const forward = build(formats, true);
+    // Container first (mp4 over webm), then the larger known size.
+    assert.equal(singleSource(forward.selections["preset:best"]).formatId, "mp4-big");
+    assert.deepEqual(build([...formats].reverse(), true).presets, forward.presets);
+  });
+
+  // ── The analyzer's own assertion fails closed ─────────────────────────────
+
+  describe("assertGenericPresetBuild fails closed", () => {
+    const ctx = (formats: Array<Record<string, unknown>>, ffmpegAvailable = true) => ({
+      candidates: selectCandidates(formats, LIMITS),
+      ffmpegAvailable,
+      maxFileSizeBytes: MAX,
+    });
+    const expectFail = (fn: () => void, label: string) =>
+      assert.throws(fn, (e: unknown) => e instanceof AppError && e.code === "EXTRACTION_FAILED", label);
+
+    /** A deep, mutable copy of a real build to tamper with. */
+    const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+
+    it("accepts every legitimate shape (positive controls)", () => {
+      for (const formats of [
+        [unknownProgressive()],
+        [unknownProgressive(), audioOnly()],
+        [muxed(), unknownProgressive()],
+        [videoOnly(), audioOnly(), unknownProgressive()],
+      ]) {
+        for (const ffmpegAvailable of [false, true]) {
+          assert.doesNotThrow(() => assertGenericPresetBuild(build(formats, ffmpegAvailable), ctx(formats, ffmpegAvailable)));
+        }
+      }
+    });
+
+    it("public/private audio mismatch, in both directions", () => {
+      const unknown = clone(build([unknownProgressive()], true));
+      unknown.presets[0]!.hasAudio = true;
+      expectFail(() => assertGenericPresetBuild(unknown, ctx([unknownProgressive()])), "unknown behind true");
+
+      const proven = clone(build([muxed()], true));
+      proven.presets[0]!.hasAudio = false;
+      expectFail(() => assertGenericPresetBuild(proven, ctx([muxed()])), "proven behind false");
+
+      const codec = clone(build([unknownProgressive()], true));
+      codec.presets[0]!.audioCodec = "aac";
+      expectFail(() => assertGenericPresetBuild(codec, ctx([unknownProgressive()])), "unknown with an audio codec");
+    });
+
+    it("an unknown source behind preset:audio or preset:mp3", () => {
+      const formats = [unknownProgressive(), audioOnly()];
+      for (const id of ["preset:audio", "preset:mp3"]) {
+        const tampered = clone(build(formats, true));
+        (tampered.selections as Record<string, GenericPresetSource>)[id] = clone(tampered.selections["preset:best"]!);
+        expectFail(() => assertGenericPresetBuild(tampered, ctx(formats)), id);
+      }
+    });
+
+    it("an unknown source admitted while a proven video fulfilment should have suppressed it", () => {
+      // Mixed on the ladder...
+      const mixedFormats = [muxed(), unknownProgressive()];
+      const mixed = clone(build(mixedFormats, true));
+      const unknownOnly = build([unknownProgressive()], true);
+      (mixed.selections as Record<string, GenericPresetSource>)["preset:1080"] = unknownOnly.selections["preset:1080"]!;
+      mixed.presets.push(unknownOnly.presets.find((p) => p.id === "preset:1080")!);
+      expectFail(() => assertGenericPresetBuild(mixed, ctx(mixedFormats)), "mixed tiers");
+
+      // ...and the whole ladder replaced while the candidates still offer proof.
+      expectFail(() => assertGenericPresetBuild(unknownOnly, ctx(mixedFormats)), "muxed candidate unused");
+      const pairFormats = [videoOnly(), audioOnly(), unknownProgressive()];
+      expectFail(() => assertGenericPresetBuild(unknownOnly, ctx(pairFormats, true)), "pair candidate unused");
+      // Control: without FFmpeg the pair is not a proven fulfilment, so it may engage.
+      assert.doesNotThrow(() => assertGenericPresetBuild(unknownOnly, ctx(pairFormats, false)));
+    });
+
+    it("an explicit ABSENT-audio single source behind a video preset", () => {
+      const tampered = clone(build([unknownProgressive()], true));
+      for (const id of Object.keys(tampered.selections)) {
+        const value = (tampered.selections as Record<string, GenericPresetSource>)[id]!;
+        if (value.kind === "single") value.source.audioConstraint = "absent";
+      }
+      expectFail(() => assertGenericPresetBuild(tampered, ctx([videoOnly()])), "absent single");
+    });
+
+    it("a malformed split source, and a split preset denying audio", () => {
+      const formats = [videoOnly(), audioOnly()];
+      const unknownHalf = clone(build(formats, true));
+      const pair = unknownHalf.selections["preset:best"];
+      assert.ok(pair && pair.kind === "split");
+      if (pair.kind === "split") {
+        pair.pair.video.audioConstraint = "unknown";
+      }
+      expectFail(() => assertGenericPresetBuild(unknownHalf, ctx(formats)), "unknown video half");
+
+      const denied = clone(build(formats, true));
+      denied.presets.find((p) => p.id === "preset:best")!.hasAudio = false;
+      expectFail(() => assertGenericPresetBuild(denied, ctx(formats)), "pair denying audio");
+
+      expectFail(() => assertGenericPresetBuild(build(formats, true), ctx(formats, false)), "pair without FFmpeg");
+    });
+
+    it("a video preset whose single source carries no video, and an orphan selection", () => {
+      const noVideo = clone(build([unknownProgressive(), audioOnly()], true));
+      (noVideo.selections as Record<string, GenericPresetSource>)["preset:best"] = clone(noVideo.selections["preset:audio"]!);
+      expectFail(() => assertGenericPresetBuild(noVideo, ctx([unknownProgressive(), audioOnly()])), "audio-only behind video");
+
+      const orphan = clone(build([unknownProgressive()], true));
+      (orphan.selections as Record<string, GenericPresetSource>)["preset:720"] = clone(orphan.selections["preset:best"]!);
+      expectFail(() => assertGenericPresetBuild(orphan, ctx([unknownProgressive()])), "orphan selection");
+    });
   });
 });

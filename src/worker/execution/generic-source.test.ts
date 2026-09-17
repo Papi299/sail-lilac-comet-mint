@@ -619,9 +619,11 @@ describe("private selection consistency rules (§12)", () => {
 // `acodec: None` format it came from. The private selection now carries the
 // three states as they are, and the selector's audio half follows them.
 //
-// None of this changes what is ADVERTISED: every generic preset still requires
-// PROVEN audio. These tests pin the representation; the analysis tests pin the
-// advertising policy.
+// None of this decides what is ADVERTISED. Every audio claim and every audio
+// product still requires PROVEN audio; since
+// GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001 an unknown-audio source
+// may back a video preset that claims NO audio. These tests pin the
+// representation; the analysis tests pin the advertising policy.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** One coherent private selection per audio state, on the same muxed source. */
@@ -877,6 +879,10 @@ describe("analysis -> selector round trip", () => {
         "pinned-generic-html5-no-audio-codec.json",
         captured("pinned-generic-html5-no-audio-codec.json"),
       ],
+      [
+        "synthetic-x-progressive-unknown-audio.json",
+        captured("synthetic-x-progressive-unknown-audio.json"),
+      ],
       ["a real-shaped mixed document", RAW],
       ...RAW.map((f): [string, Array<Record<string, unknown>>] => [`only ${String(f.format_id)}`, [f]]),
     ];
@@ -923,9 +929,10 @@ describe("analysis -> selector round trip", () => {
   }
 
   it("EVERY candidate — advertised or not — describes a selector that re-selects it", () => {
-    // Stronger than the emitted set: this includes the unknown-audio and
-    // video-only candidates analysis keeps privately but never advertises,
-    // which is exactly where the old boolean built an incoherent selector.
+    // Stronger than the emitted set: this includes the candidates analysis
+    // keeps privately without advertising — video-only halves with no partner,
+    // and unknown-audio sources a proven rendition suppressed — which is exactly
+    // where the old boolean built an incoherent selector.
     const states = new Set<string>();
     for (const [label, formats] of inputs()) {
       for (const c of selectCandidates(formats, LIMITS)) {
@@ -950,6 +957,39 @@ describe("analysis -> selector round trip", () => {
       }
     }
     assert.deepEqual([...states].sort(), ["absent", "codec-present", "unknown"]);
+  });
+
+  it("the SYNTHETIC X-shaped document: each emitted unknown-audio selector binds exactly its approved progressive source", () => {
+    // GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001. The selector itself
+    // is UNCHANGED by this task; this pins that the newly advertised shape uses
+    // it as designed, against the pinned filter model.
+    const formats = captured("synthetic-x-progressive-unknown-audio.json");
+    const { selections } = buildGenericPresets(selectCandidates(formats, LIMITS), {
+      ffmpegAvailable: true,
+      maxFileSizeBytes: LIMITS.maxFileSizeBytes,
+    });
+    const emitted = Object.values(selections);
+    assert.ok(emitted.length > 0, "the shape must be advertised");
+    for (const value of emitted) {
+      assert.equal(value.kind, "single");
+      if (value.kind !== "single") throw new Error("unreachable");
+      const selection = value.source;
+      assert.equal(selection.audioConstraint, "unknown");
+      const selector = buildGenericFormatSelector(selection);
+      assert.match(selector, /\[acodec!=\?"none"\]$/);
+      assert.doesNotMatch(selector, /[/+]/, "no fallback, no merge");
+
+      const origin = formats.find((f) => f.format_id === selection.formatId) as PinnedFormat;
+      assert.equal(selectsFormat(selector, origin), true, "missing acodec re-selects");
+      assert.equal(selectsFormat(selector, { ...origin, acodec: null }), true, "null acodec re-selects");
+      assert.equal(selectsFormat(selector, { ...origin, acodec: "mp4a.40.2" }), true, "a later-known codec re-selects");
+      assert.equal(selectsFormat(selector, { ...origin, acodec: "none" }), false, "PROVEN absence never re-selects");
+      assert.equal(selectsFormat(selector, { ...origin, protocol: "m3u8_native" }), false, "never an HLS twin");
+      // ...and no other format of the document satisfies it.
+      for (const other of formats.filter((f) => f.format_id !== selection.formatId)) {
+        assert.equal(selectsFormat(selector, other as PinnedFormat), false, String(other.format_id));
+      }
+    }
   });
 });
 

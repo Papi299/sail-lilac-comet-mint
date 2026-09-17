@@ -335,18 +335,90 @@ export const GENERIC_SPLIT_VIDEO_PRESET_IDS = [
 export const GenericSplitVideoPresetIdSchema = z.enum(GENERIC_SPLIT_VIDEO_PRESET_IDS);
 export type GenericSplitVideoPresetId = z.infer<typeof GenericSplitVideoPresetIdSchema>;
 
+/**
+ * GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001: the CLOSED set of
+ * requested ids a single-source `keep-original` plan may fulfil — the VIDEO
+ * ladder (the same closed vocabulary a merge may fulfil) plus `preset:audio`.
+ *
+ * Stated positively for the same reason as the split vocabulary above.
+ * `direct-original` was representable here through `WorkerRequestedFormatIdSchema`
+ * although derivation refuses it, and `preset:mp3` was representable although it
+ * is always an extraction. Neither is a member now, so neither needs refuting.
+ */
+const GenericKeepOriginalRequestedIdSchema = z.enum([
+  ...GENERIC_SPLIT_VIDEO_PRESET_IDS,
+  "preset:audio",
+]);
+
+/**
+ * An extraction reads an audio stream out of the acquired file with the
+ * Worker's own FFmpeg, so its source must carry PROVEN audio. An `unknown`
+ * source may be silent, and extracting from a silent file is a
+ * `PROCESSING_FAILED` rather than a download.
+ */
+function refineProvenAudioExtraction(
+  plan: { readonly source: GenericSourceSelection },
+  ctx: z.RefinementCtx,
+): void {
+  if (plan.source.audioConstraint !== "codec-present" || plan.source.hasAudio !== true) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["source", "audioConstraint"],
+      message: "an audio extraction requires a source with proven audio",
+    });
+  }
+}
+
 export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
   z
     .object({
       strategy: z.literal("yt-dlp"),
       operation: z.literal("keep-original"),
-      requestedFormatId: WorkerRequestedFormatIdSchema,
+      requestedFormatId: GenericKeepOriginalRequestedIdSchema,
       source: GenericSourceSelectionSchema,
       // Keeping the original means the delivered container IS the source
       // container. Any other value would be a silent substitution.
       targetContainer: GenericSourceContainerSchema,
     })
-    .strict(),
+    .strict()
+    .superRefine((plan, ctx) => {
+      const issue = (path: string[], message: string) =>
+        ctx.addIssue({ code: "custom", path, message });
+
+      // Stated as an invariant of the plan rather than left to derivation.
+      if (plan.targetContainer !== plan.source.container) {
+        issue(["targetContainer"], "keep-original must deliver the source container");
+      }
+
+      if (plan.requestedFormatId === "preset:audio") {
+        // Kept verbatim ONLY when the source is already audio-only, with PROVEN
+        // audio. A video-bearing source is an `extract-m4a`, never a keep.
+        if (plan.source.hasVideo || plan.source.videoConstraint !== "absent") {
+          issue(["source", "videoConstraint"], "preset:audio keeps only an audio-only source");
+        }
+        if (plan.source.audioConstraint !== "codec-present") {
+          issue(["source", "audioConstraint"], "preset:audio requires proven audio");
+        }
+        return;
+      }
+
+      // An ordinary VIDEO preset from ONE source: video established, and audio
+      // either PROVEN (a muxed source) or UNKNOWN (the unknown-audio fallback
+      // tier). `absent` is a split pair's video half; as a single ordinary video
+      // fulfilment it is outside the capability, so it is unrepresentable here.
+      if (!plan.source.hasVideo || plan.source.videoConstraint === "absent") {
+        issue(["source", "videoConstraint"], "a video preset requires a video-bearing source");
+      }
+      if (
+        plan.source.audioConstraint !== "codec-present" &&
+        plan.source.audioConstraint !== "unknown"
+      ) {
+        issue(
+          ["source", "audioConstraint"],
+          "a single-source video preset requires proven or unknown audio, never absent",
+        );
+      }
+    }),
   z
     .object({
       strategy: z.literal("yt-dlp"),
@@ -355,7 +427,8 @@ export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
       source: GenericSourceSelectionSchema,
       targetContainer: z.literal("m4a"),
     })
-    .strict(),
+    .strict()
+    .superRefine(refineProvenAudioExtraction),
   z
     .object({
       strategy: z.literal("yt-dlp"),
@@ -364,7 +437,8 @@ export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
       source: GenericSourceSelectionSchema,
       targetContainer: z.literal("mp3"),
     })
-    .strict(),
+    .strict()
+    .superRefine(refineProvenAudioExtraction),
   /**
    * SPLIT-01: a video preset fulfilled by an approved video-only + audio-only
    * PAIR, merged LOCALLY by the Worker's own FFmpeg after `beginProcessing()`
@@ -504,8 +578,13 @@ function buildGenericCandidate(
   source: GenericSourceSelection,
 ): Record<string, unknown> {
   // ── preset:mp3 — always a Worker-side transcode, after processing begins.
+  //
+  // Audio products are PROVEN-audio only, read from the private constraint
+  // rather than from the boolean alone: an `unknown` source may be silent.
   if (id === "preset:mp3") {
-    if (!source.hasAudio) throw new AppError("FORMAT_UNAVAILABLE");
+    if (source.audioConstraint !== "codec-present" || !source.hasAudio) {
+      throw new AppError("FORMAT_UNAVAILABLE");
+    }
     if (preset.hasVideo || !preset.hasAudio) throw new AppError("FORMAT_UNAVAILABLE");
     return {
       strategy: "yt-dlp",
@@ -518,7 +597,9 @@ function buildGenericCandidate(
 
   // ── preset:audio — keep a real audio-only source; extract from a muxed one.
   if (id === "preset:audio") {
-    if (!source.hasAudio) throw new AppError("FORMAT_UNAVAILABLE");
+    if (source.audioConstraint !== "codec-present" || !source.hasAudio) {
+      throw new AppError("FORMAT_UNAVAILABLE");
+    }
     if (preset.hasVideo || !preset.hasAudio) throw new AppError("FORMAT_UNAVAILABLE");
 
     if (source.hasVideo) {
@@ -543,13 +624,35 @@ function buildGenericCandidate(
     };
   }
 
-  // ── video presets — one muxed source, kept as-is (§37).
+  // ── video presets — one source, kept as-is (§37).
   //
   // Generic v1 performs NO video transcode or remux. A container the product
   // cannot return verbatim is simply not advertised, so reaching here with a
   // mismatch means the analysis and the plan disagree, which is a refusal.
-  if (!source.hasVideo || !source.hasAudio) throw new AppError("FORMAT_UNAVAILABLE");
-  if (!preset.hasVideo || !preset.hasAudio) throw new AppError("FORMAT_UNAVAILABLE");
+  if (!source.hasVideo || source.videoConstraint === "absent") {
+    throw new AppError("FORMAT_UNAVAILABLE");
+  }
+  if (!preset.hasVideo) throw new AppError("FORMAT_UNAVAILABLE");
+
+  // The PRIVATE audio constraint is the authority, and the public boolean must
+  // agree with it exactly (GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001).
+  // `hasAudio: false` alone cannot distinguish "not proven" from "proven absent",
+  // so it is never read as that distinction here.
+  switch (source.audioConstraint) {
+    case "codec-present":
+      // A muxed source: audio PROVEN, and the preset must say so.
+      if (!source.hasAudio || preset.hasAudio !== true) throw new AppError("FORMAT_UNAVAILABLE");
+      break;
+    case "unknown":
+      // The unknown-audio fallback tier: audio NOT proven, and the preset must
+      // not claim it. Delivered exactly as acquired — no probe, no processing.
+      if (source.hasAudio || preset.hasAudio !== false) throw new AppError("FORMAT_UNAVAILABLE");
+      break;
+    default:
+      // `absent` is a split pair's video half. As an ordinary single video
+      // fulfilment it is outside this capability.
+      throw new AppError("FORMAT_UNAVAILABLE");
+  }
   return {
     strategy: "yt-dlp",
     operation: "keep-original",

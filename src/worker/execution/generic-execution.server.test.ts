@@ -24,8 +24,13 @@ import type {
   GenericSourceSelections,
   GenericVideoConstraint,
 } from "./generic-source.ts";
-import { downloadGenericOriginal, type GenericDownloadLimits } from "./ytdlp-download.server.ts";
+import {
+  downloadGenericOriginal,
+  expectedSourcePath,
+  type GenericDownloadLimits,
+} from "./ytdlp-download.server.ts";
 import type { GenericExecutionPlan } from "./format-plan.ts";
+import { analyzeGenericMediaInternal } from "../analysis/ytdlp-analysis.server.ts";
 
 /**
  * Phase 10C3 §54/§55/§36/§40/§42: generic jobs on the ONE durable state machine.
@@ -1226,5 +1231,273 @@ describe("generic job: a pinned --max-filesize refusal (YTDLP-MAX-FILESIZE-REFUS
     assert.equal(h.store.getJob(job.jobId)?.status, "cancelled");
     assert.deepEqual(trace.failCodes, []);
     assert.equal(fs.existsSync(record.workDir), false, "the partial .part went with the workDir");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001: an unknown-audio video
+// preset through the REAL analyzer, the REAL planner and the REAL single-source
+// downloader. Only the two yt-dlp subprocesses are faked, and no network, no
+// public media site and no real yt-dlp is involved.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("generic job: unknown-audio progressive video (GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001)", () => {
+  const MAX = 10 * 1024 * 1024;
+  const DOWNLOAD_LIMITS: GenericDownloadLimits = { maxFileSizeBytes: MAX, downloadTimeoutSeconds: 60 };
+  const PINNED = { available: true, version: "2026.08.19", reason: "ok" as const };
+
+  const FIXTURE = JSON.parse(
+    fs.readFileSync(
+      path.join(import.meta.dirname, "..", "analysis", "testdata", "synthetic-x-progressive-unknown-audio.json"),
+      "utf8",
+    ),
+  ) as { formats: Array<Record<string, unknown>> } & Record<string, unknown>;
+
+  /** The fixture, with the progressive formats' `acodec` rewritten (or left absent). */
+  function doc(acodec?: string, extra: Array<Record<string, unknown>> = []): string {
+    return JSON.stringify({
+      ...FIXTURE,
+      formats: [
+        ...FIXTURE.formats.map((f) => (f.protocol === "https" && acodec !== undefined ? { ...f, acodec } : f)),
+        ...extra,
+      ],
+    });
+  }
+
+  /**
+   * A deterministic SYNTHETIC video-only MP4 payload: an ISO-BMFF `ftyp` box and
+   * a `free` box, with no audio track anywhere. Nothing on the keep-original
+   * path parses it, which is the point: actual absence of audio is not itself a
+   * reason to fail.
+   */
+  const SILENT_MP4 = Buffer.concat([
+    Buffer.from([0, 0, 0, 24]), Buffer.from("ftypisom"), Buffer.from([0, 0, 2, 0]), Buffer.from("isommp41"),
+    Buffer.from([0, 0, 0, 16]), Buffer.from("free"), Buffer.from("no-audio"),
+  ]);
+
+  /** The executor's analysis seam: the REAL internal analyzer over a canned yt-dlp document. */
+  function realAnalysis(stdout: string, ffmpegAvailable = true): JobExecutorDeps["analyzeForExecution"] {
+    return async (url, signal) => {
+      const { video, selections } = await analyzeGenericMediaInternal(url, {
+        limits: { analysisTimeoutSeconds: 45, maxVideoDurationSeconds: 7200, maxFileSizeBytes: MAX },
+        ffmpegAvailable,
+        runner: async () => ({ code: 0, stdout, stderr: "" }),
+        probeRuntime: async () => PINNED,
+        validateUrl: async (raw: string) => ({ url: raw, hostname: "example.invalid" }),
+        ...(signal ? { signal } : {}),
+      });
+      return { strategy: "yt-dlp", video, selections };
+    };
+  }
+
+  type AcquisitionRecord = { argvs: string[][]; plans: GenericExecutionPlan[] };
+
+  /** The executor's acquisition seam: the REAL downloader, with only yt-dlp faked. */
+  function realAcquisition(
+    record: AcquisitionRecord,
+    result: "write-silent-mp4" | "no-format-match",
+  ): NonNullable<JobExecutorDeps["downloadGeneric"]> {
+    return (async (url: string, workDir: string, plan: GenericExecutionPlan, ctx: { limits: GenericDownloadLimits; signal?: AbortSignal }) => {
+      record.plans.push(plan);
+      const res = await downloadGenericOriginal(url, workDir, plan, {
+        limits: ctx.limits,
+        ...(ctx.signal ? { signal: ctx.signal } : {}),
+        probeRuntime: async () => PINNED,
+        validateUrl: async (raw: string) => ({ url: raw, hostname: "example.invalid" }),
+        runner: async (call) => {
+          record.argvs.push([...call.args]);
+          if (result === "no-format-match") {
+            // What the pinned runtime reports when the bound selector matches no
+            // format of the re-extracted list (proven offline by verify-selector.py).
+            return { code: 1, stdout: "", stderr: "ERROR: [generic] synthetic: Requested format is not available. Use --list-formats for a list of available formats\n" };
+          }
+          fs.writeFileSync(expectedSourcePath(workDir, "mp4"), SILENT_MP4);
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      });
+      return { filePath: res.filePath, container: res.container, mime: "video/mp4", fileSize: res.fileSize };
+    }) as NonNullable<JobExecutorDeps["downloadGeneric"]>;
+  }
+
+  /** Every media-processing and alternative-acquisition seam, counted and forbidden. */
+  function forbiddenSeams(counters: { ffmpeg: number; merge: number; split: number; direct: number }): Partial<JobExecutorDeps> {
+    return {
+      processLocally: async () => {
+        counters.ffmpeg += 1;
+        throw new Error("keep-original must never invoke Worker FFmpeg");
+      },
+      mergeSplit: async () => {
+        counters.merge += 1;
+        throw new Error("no merge (and no merge-time ffprobe) for a single source");
+      },
+      downloadGenericSplit: async () => {
+        counters.split += 1;
+        throw new Error("a single source must never reach split acquisition");
+      },
+      downloadOriginal: async () => {
+        counters.direct += 1;
+        throw new Error("the direct downloader must never run for a generic job");
+      },
+    };
+  }
+
+  /** A writer that keeps the uploaded bytes, so delivery can be checked byte for byte. */
+  function recordingWriter(): { writer: ObjectStoreWriter; bodies: Buffer[] } {
+    const bodies: Buffer[] = [];
+    const writer: ObjectStoreWriter = {
+      ...h.writer,
+      async put(input) {
+        const chunks: Buffer[] = [];
+        for await (const chunk of input.body) chunks.push(Buffer.from(chunk as Uint8Array));
+        bodies.push(Buffer.concat(chunks));
+        h.puts.push(input);
+      },
+    };
+    return { writer, bodies };
+  }
+
+  const UNKNOWN_SELECTOR =
+    '--format=b*[format_id="synthetic-prog-high"][protocol="https"][ext="mp4"][vcodec!=?"none"][video_ext="mp4"][acodec!=?"none"]';
+
+  it("traverses real analysis -> planning -> acquisition to ready: keep-original, one acquisition, zero FFmpeg", async () => {
+    const job = claimJob(h.store, "preset:360");
+    const record: AcquisitionRecord = { argvs: [], plans: [] };
+    const counters = { ffmpeg: 0, merge: 0, split: 0, direct: 0 };
+    const { writer, bodies } = recordingWriter();
+
+    const deps: JobExecutorDeps = {
+      analyzeForExecution: realAnalysis(doc()),
+      genericLimits: DOWNLOAD_LIMITS,
+      downloadGeneric: realAcquisition(record, "write-silent-mp4"),
+      ...forbiddenSeams(counters),
+    };
+    await new JobExecutor(h.store, writer, () => Date.now(), new Map(), deps).execute(job);
+
+    const final = h.store.getJob(job.jobId);
+    assert.equal(final?.status, "ready", `job must reach ready, got ${final?.status}/${final?.errorCode}`);
+    assert.equal(final?.extractor, "yt-dlp");
+
+    // Exactly one progressive acquisition, of exactly the approved source.
+    assert.equal(record.argvs.length, 1, "exactly one acquisition subprocess");
+    assert.ok(record.argvs[0]!.includes(UNKNOWN_SELECTOR), "the selector binds the unknown-audio constraint");
+    assert.equal(record.argvs[0]!.some((a) => a.includes("+") && a.startsWith("--format=")), false, "no merge");
+
+    // The plan the executor derived for it.
+    assert.equal(record.plans.length, 1);
+    const plan = record.plans[0]!;
+    assert.equal(plan.operation, "keep-original");
+    if (plan.operation !== "keep-original") throw new Error("unreachable");
+    assert.equal(plan.requestedFormatId, "preset:360");
+    assert.equal(plan.targetContainer, "mp4");
+    assert.equal(plan.source.audioConstraint, "unknown");
+    assert.equal(plan.source.hasAudio, false);
+
+    // No media processing of any kind; the original container, byte for byte.
+    assert.deepEqual(counters, { ffmpeg: 0, merge: 0, split: 0, direct: 0 });
+    assert.equal(h.puts.length, 1);
+    assert.equal(h.puts[0]!.contentType, "video/mp4");
+    assert.equal(h.puts[0]!.contentLength, SILENT_MP4.length);
+    assert.deepEqual(bodies[0], SILENT_MP4, "the silent original is delivered verbatim");
+
+    // The private upstream id never became durable.
+    const row = JSON.stringify(h.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(job.jobId));
+    assert.equal(row.includes("synthetic-prog"), false);
+  });
+
+  it("re-analysis UNKNOWN -> PRESENT at job time: the proven source is acquired with the STRICT selector", async () => {
+    const job = claimJob(h.store, "preset:360");
+    const record: AcquisitionRecord = { argvs: [], plans: [] };
+    const counters = { ffmpeg: 0, merge: 0, split: 0, direct: 0 };
+    const deps: JobExecutorDeps = {
+      analyzeForExecution: realAnalysis(doc("mp4a.40.2")),
+      genericLimits: DOWNLOAD_LIMITS,
+      downloadGeneric: realAcquisition(record, "write-silent-mp4"),
+      ...forbiddenSeams(counters),
+    };
+    await new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps).execute(job);
+
+    assert.equal(h.store.getJob(job.jobId)?.status, "ready");
+    const plan = record.plans[0]!;
+    assert.equal(plan.operation, "keep-original");
+    if (plan.operation !== "keep-original") throw new Error("unreachable");
+    assert.equal(plan.source.audioConstraint, "codec-present", "the FRESH analysis is authoritative");
+    assert.ok(
+      record.argvs[0]!.includes(
+        '--format=b*[format_id="synthetic-prog-high"][protocol="https"][ext="mp4"][vcodec!=?"none"][video_ext="mp4"][acodec!="none"]',
+      ),
+    );
+    assert.deepEqual(counters, { ffmpeg: 0, merge: 0, split: 0, direct: 0 });
+  });
+
+  it("re-analysis UNKNOWN -> ABSENT with no split partner: FORMAT_UNAVAILABLE before any acquisition", async () => {
+    const job = claimJob(h.store, "preset:360");
+    const record: AcquisitionRecord = { argvs: [], plans: [] };
+    const counters = { ffmpeg: 0, merge: 0, split: 0, direct: 0 };
+    const deps: JobExecutorDeps = {
+      analyzeForExecution: realAnalysis(doc("none")),
+      genericLimits: DOWNLOAD_LIMITS,
+      downloadGeneric: realAcquisition(record, "write-silent-mp4"),
+      ...forbiddenSeams(counters),
+    };
+    await new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps).execute(job);
+
+    const final = h.store.getJob(job.jobId);
+    assert.equal(final?.status, "failed");
+    assert.equal(final?.errorCode, "FORMAT_UNAVAILABLE");
+    assert.equal(record.plans.length, 0, "no plan reached acquisition");
+    assert.equal(record.argvs.length, 0, "no acquisition subprocess");
+    assert.deepEqual(counters, { ffmpeg: 0, merge: 0, split: 0, direct: 0 });
+    assert.equal(h.puts.length, 0);
+  });
+
+  it("re-analysis UNKNOWN -> ABSENT with a valid split partner: routed to the existing merge-split path", async () => {
+    const job = claimJob(h.store, "preset:360");
+    const record: AcquisitionRecord = { argvs: [], plans: [] };
+    const splitPlans: GenericExecutionPlan[] = [];
+    const partner = {
+      format_id: "synthetic-audio-m4a", ext: "m4a", protocol: "https",
+      vcodec: "none", acodec: "mp4a.40.2", video_ext: "none", audio_ext: "m4a",
+    };
+    const deps: JobExecutorDeps = {
+      analyzeForExecution: realAnalysis(doc("none", [partner]), true),
+      genericLimits: DOWNLOAD_LIMITS,
+      downloadGeneric: realAcquisition(record, "write-silent-mp4"),
+      downloadGenericSplit: async (_url, _workDir, plan) => {
+        splitPlans.push(plan);
+        // Routing is what is under test here; SPLIT-04's own suites cover the rest.
+        throw new AppError("NETWORK_ERROR");
+      },
+    };
+    await new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps).execute(job);
+
+    assert.equal(record.plans.length, 0, "the single-source seam was not used");
+    assert.equal(splitPlans.length, 1);
+    const plan = splitPlans[0]!;
+    assert.equal(plan.operation, "merge-split");
+    if (plan.operation !== "merge-split") throw new Error("unreachable");
+    assert.equal(plan.pair.video.formatId, "synthetic-prog-high");
+    assert.equal(plan.pair.audio.formatId, "synthetic-audio-m4a");
+  });
+
+  it("drift AFTER job analysis, before acquisition: the unknown selector matches nothing -> FORMAT_UNAVAILABLE, no substitution", async () => {
+    const job = claimJob(h.store, "preset:360");
+    const record: AcquisitionRecord = { argvs: [], plans: [] };
+    const counters = { ffmpeg: 0, merge: 0, split: 0, direct: 0 };
+    const deps: JobExecutorDeps = {
+      analyzeForExecution: realAnalysis(doc()),
+      genericLimits: DOWNLOAD_LIMITS,
+      downloadGeneric: realAcquisition(record, "no-format-match"),
+      ...forbiddenSeams(counters),
+    };
+    await new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps).execute(job);
+
+    const final = h.store.getJob(job.jobId);
+    assert.equal(final?.status, "failed");
+    assert.equal(final?.errorCode, "FORMAT_UNAVAILABLE");
+    assert.equal(record.argvs.length, 1, "one attempt at the approved source, and no other");
+    assert.ok(record.argvs[0]!.includes(UNKNOWN_SELECTOR));
+    assert.equal(record.argvs[0]!.some((a) => a.startsWith("--format=") && a.includes("/")), false, "no fallback");
+    assert.deepEqual(counters, { ffmpeg: 0, merge: 0, split: 0, direct: 0 });
+    assert.equal(h.puts.length, 0);
   });
 });
