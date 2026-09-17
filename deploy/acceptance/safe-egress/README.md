@@ -104,9 +104,11 @@ anything about the run was not clean.
 
 ## Getting the probes into the container
 
-The Worker container is `--read-only` with a `noexec` tmpfs at
-`/tmp/videofetch`, so a script copied there cannot be executed as a program —
-but `node <file>` reads it, which is all these probes need.
+The Worker container is `--read-only` with a `noexec` media workspace at
+`/tmp/videofetch` — since `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, a bind of the
+host's `noexec` disk workspace rather than the retired tmpfs — so a script copied
+there cannot be executed as a program. `node <file>` still reads it, which is all
+these probes need.
 
 ```sh
 docker cp probe-one.mjs videofetch-worker:/tmp/videofetch/probe-one.mjs
