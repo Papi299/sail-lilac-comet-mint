@@ -9,13 +9,16 @@ made by the Product Owner, because it determines persistent-volume semantics,
 TLS termination, external egress enforcement, network-namespace ownership and
 R2 placement/jurisdiction.
 
-**Status — current as of 2026-09-13, recorded by
-`SPLIT-08F-PRODUCTION-CLOSURE-DOCUMENTATION-001`: Phase 9 and Phase 10 are
+**Status — current as of 2026-09-17, recorded by
+`MAX-FILE-SIZE-4GIB-ROLLOUT-CLOSURE-DOCS-001`: Phase 9 and Phase 10 are
 complete and accepted, generic yt-dlp extraction is enabled in Production, the
-execution plane runs on demand, and the Production Worker image was promoted to
-the split-stream candidate on 2026-09-13 (§11h).** The Phase-10 rows below were
+execution plane runs on demand, the Production Worker image was promoted to
+the split-stream candidate on 2026-09-13, and the 4 GiB Product media rollout
+completed on 2026-09-17 — the 4 GiB limit is live on a 10 GiB disk-backed
+workspace (§2a, §11h).** The Phase-10 rows below were
 recorded on 2026-09-10 by `POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`;
-the Worker-runtime, Worker-image and Vercel rows carry the current state.
+the Worker-runtime, Worker-image, rollback, Vercel and Product media workspace
+rows carry the current state.
 
 That reconciliation *recorded* previously accepted evidence and re-measured
 nothing. Each row below names its evidence class — *GitHub-verifiable*,
@@ -32,12 +35,12 @@ records are in §11 and §11a–§11h.
 | Phase 10E — persistent enablement | **COMPLETE / ACCEPTED** — `YTDLP_ENABLED=true` | operator-measured — §11h |
 | Phase 10F — 503 disambiguation | **CLOSED / PRODUCTION ACCEPTED** — PR #43 | GitHub-verifiable + operator-measured — §1b, §11h |
 | WorkerClient total-response deadline | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** — PR #44 | GitHub-verifiable + operator-measured — §1b, §11h |
-| Worker runtime source | `6ce4ce2b9146b226eea7751d69c45e7366ea46b9`, tree `c1c289cd9a38a102f0877adf58e1fc9e27a326a1` — promoted 2026-09-13 by SPLIT-08E | commit GitHub-verifiable; image↔source identity operator-measured — §11h |
-| Worker image | `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b` as `videofetch-worker:latest`, pinned yt-dlp `2026.08.19` | image operator-measured; pin source-verifiable — §11h |
-| Previous Worker image — rollback asset | `sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa`, retained locally as `videofetch-worker:e4fa646bf7492e16fc8d2733982f708a1e243afb` (source `e4fa646b…`, the PR #41 merge) | operator-measured — §9, §11h |
-| Vercel Production | `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, from `main` `397f238b9fe6b6ff430d6bf8e805bc0ee8082788` | chain of custody — **not** Vercel Git-attested (§11h) |
+| Worker runtime source | `2e6c0cf97a50d06b5d3aebd902ab03c386c01ba4`, tree `d1ea2ec5ac653e3cd3fddde259a82e3dc47a55ab` — promoted 2026-09-17 by the 4 GiB rollout's Phase 1E, superseding SPLIT-08E's `6ce4ce2b…` (2026-09-13) | commit GitHub-verifiable; image↔source identity operator-measured — §2a, §11h |
+| Worker image | `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0` as `videofetch-worker:latest`, also retained as `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799`; pinned yt-dlp `2026.08.19` | image operator-measured; pin source-verifiable — §11h |
+| Previous Worker image — rollback asset | `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b`, retained as `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (source `6ce4ce2b…`, the SPLIT-08E image). Rollback is an image retag onto the same disk-backed unit and workspace | operator-measured — §9, §11h |
+| Vercel Production | `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, from `main` `397f238b9fe6b6ff430d6bf8e805bc0ee8082788` — older than the Worker source, and **not** redeployed for the 4 GiB rollout, which did not require it | chain of custody — **not** Vercel Git-attested (§11h) |
 | Execution plane | **on demand**; the idle state is **Stopped** | §3c, §11h |
-| Product media workspace — repository contract | **4 GiB delivered-media ceiling on a bounded 10 GiB ext4 bind** (`MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`) — **NOT deployed**: Production still runs the 500 MiB-default image on the 2 GiB tmpfs until the separately authorized rollout | repository/source-verifiable — §2a |
+| Product media workspace | **4 GiB delivered-media limit (4,294,967,296 bytes) LIVE** on the bounded 10 GiB disk-backed ext4 workspace bound at `/tmp/videofetch` — no Product media tmpfs. `MAX_FILE_SIZE` is absent, so the image default applies. `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, rollout Phases 1A–1E complete, Production accepted 2026-09-17 | contract repository/source-verifiable; deployment operator-measured — §2a, §11h |
 
 Precisely:
 
@@ -258,11 +261,11 @@ to need one, the deployment is wrong — not the image.
 
 ### 2a. Product media workspace (`MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`)
 
-**Repository contract — not yet deployed.** The source raises the delivered-media
-ceiling to **4 GiB** (4,294,967,296 bytes) and replaces the 2 GiB
-`--tmpfs /tmp/videofetch` with a bounded, disk-backed workspace. Until the
-rollout below completes, deployed Production still runs image `d3b951d5…`
-(500 MiB default) on the 2 GiB tmpfs.
+**Deployed and Production accepted (2026-09-17).** The source raises the
+delivered-media ceiling to **4 GiB** (4,294,967,296 bytes) and replaces the retired
+2 GiB `--tmpfs /tmp/videofetch` with a bounded, disk-backed workspace. The
+rollout below is complete: Production runs image `sha256:a3b062a2…` (source
+`2e6c0cf9…`) on the 10 GiB disk-backed workspace, and the 4 GiB limit is live.
 
 **Capacity model.** Local media one successful job holds at once:
 
@@ -341,29 +344,76 @@ block restarts. Nothing is wiped before identity and hardening pass.
 - The browser still downloads through the 303 → presigned R2 GET; Vercel never
   proxies the body.
 
-**Rollout ordering (in progress; each remaining step separately authorized).** The
-4 GiB Production limit is not live.
+**4 GiB rollout — COMPLETE / PRODUCTION ACCEPTED (2026-09-17).** Every phase was
+separately authorized. Each result below is *accepted operator-measured evidence*
+unless marked otherwise. The two rollbacks are kept as historical facts.
 
-1. **COMPLETE — Phase 1A:** the Lima primary disk was grown from 24 GiB to
-   **32 GiB**; the guest's primary block device grew and its root filesystem
-   expanded automatically. The existing Production deployment recovered unchanged,
-   still on image `d3b951d5…` with the 500 MiB effective limit. No workspace was
-   provisioned.
-2. **PENDING — Phase 1B retry:** provision the 10 GiB image with the eager-init
-   recipe, install and enable the mount unit and verifier, and create the workspace
-   (`deploy/README.md`, step 4b). The first Phase 1B attempt was rolled back and left
-   no workspace behind; Phase 1B0 then validated the corrected recipe (above). The
-   retry has not happened yet.
-3. **PENDING — storage-only validation:** install the new Worker unit with the
-   **current** 500 MiB-default image. Confirm every gate, health and one small job,
-   and that the workspace is empty afterwards.
-4. **PENDING — new image:** build and accept a new Worker image from the merged
-   source. Release-image acceptance now requires `--media-workspace`.
-5. **PENDING — promotion:** promote it, retaining a rollback image.
+1. **COMPLETE — Phase 1A (Lima disk):** the Lima primary disk was grown from
+   24 GiB to **32 GiB**. The guest's primary block device grew and its root
+   filesystem expanded automatically. The Production deployment recovered
+   unchanged, still on image `d3b951d5…` with the 500 MiB limit of the time.
+2. **ROLLED BACK — initial Phase 1B (workspace provisioning):** the image was
+   formatted with `nodiscard` only. Lazy inode-table initialization after the first
+   mount punched holes in the loop-backing file. The strict verifier correctly
+   refused the image, and the attempt was rolled back without leaving a workspace
+   (above).
+3. **COMPLETE — Phase 1B0 (experiment):** a controlled experiment reproduced the
+   old recipe's allocation loss on throwaway images. It then validated the eager
+   recipe `nodiscard,lazy_itable_init=0,lazy_journal_init=0`.
+4. **COMPLETE / MERGED — Phase 1B1 (recipe fix):** PR #59, merged as `main`
+   `2e6c0cf97a50d06b5d3aebd902ab03c386c01ba4` (*GitHub-verifiable*), corrected the
+   provisioning recipe in `deploy/README.md` step 4b and this section. It also added
+   the regression guard in `src/worker/runtime/media-workspace-deployment-policy.test.ts`.
+5. **COMPLETE — Phase 1B retry (workspace provisioning):** the real 10 GiB
+   Product image was provisioned with the eager recipe. It stayed fully allocated
+   through an extended observation window, a remount and an unmounted `e2fsck`.
+   The mount unit and verifier were installed and enabled, and the storage
+   substrate was retained for Phase 1C.
+6. **COMPLETE — Phase 1C (storage-only cutover):** the committed disk-workspace
+   Worker unit was installed and the existing `d3b951d5…` image was moved onto the
+   10 GiB workspace, still with its 500 MiB limit.
+   - The first attempt was rolled back on an acceptance-**harness** false negative,
+     not a Product defect. The cleanup was correct: the Worker leaves an empty
+     `jobs/` root. The harness, however, compared `find -printf '%u:%g'` output, which
+     prints owner **names**, with numeric ids. Numeric checks (`find -printf '%U:%G'`,
+     `stat -c '%u:%g'`) proved compliant `1000:1000` ownership.
+   - The retry, with numeric checks, succeeded.
+7. **COMPLETE — Phase 1D (candidate image):** an immutable candidate
+   `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0` was
+   built from `2e6c0cf9…` and retained as
+   `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799`. Its acceptance included:
+   - release-image acceptance `split07-release-image-candidate-02`: 42/42 checks,
+     SPLIT-06 mp4 141/141 and webm 141/141;
+   - an exact source-to-image manifest;
+   - the exact 4 GiB default in the image;
+   - a real ≥ 8 GiB startup-capacity gate that passed;
+   - the retired 2 GiB tmpfs refused fail-closed (`total-below-minimum`).
+8. **COMPLETE / PRODUCTION ACCEPTED — Phase 1E (promotion):** on 2026-09-17,
+   `videofetch-worker:latest` was retagged from the candidate's immutable id,
+   moving from `d3b951d5…` to `a3b062a2…`. The Worker restarted through the existing
+   disk-backed unit, whose gates all passed, including `vf-media-workspace-verify
+   --wipe` and the Worker's own startup-capacity gate.
+   - An in-container probe of the live Worker reported `MAX_FILE_SIZE` absent,
+     `DEFAULT_MAX_FILE_SIZE_BYTES=4294967296`, and an effective configuration of
+     `4294967296` from both configuration readers.
+   - One controlled direct-media Production job reached `ready`, with no Worker
+     restart or failure.
+   - Production stayed stable through the acceptance window.
+   - Rollback assets were retained.
+   - Evidence: `production-promotion.txt`, SHA-256
+     `aca50a8e0bb3ddb44d2348109d344fb5fa377d32184fe28327558d6e747f547d`, an operator-held
+     artifact that is not committed.
 
-**Rollback constraint.** An image with the 4 GiB default refuses, by design, to
-start on the 2 GiB tmpfs. Roll the image back first (retag the previous id), then
-restore the tmpfs unit. The previous image runs normally on the new workspace.
+**Rollback rule.** The normal rollback from the 4 GiB image is an **image**
+rollback: retag the retained
+`sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b`
+(`videofetch-worker:rc-6ce4ce2b9146-d3b951d51896`) as `videofetch-worker:latest`.
+Then restart through the **same** accepted disk-backed unit and workspace. That
+image runs normally on the workspace; it is the Phase-1C state. The operator
+backup of the pre-cutover tmpfs unit is only a deeper recovery asset, for an
+independent failure of the disk-backed unit or workspace itself. It is **not**
+the first rollback. A 4 GiB image refuses the 2 GiB tmpfs by design, so the
+image must always be rolled back before any tmpfs unit is restored. See §9.
 
 ---
 
@@ -693,7 +743,7 @@ as of `PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001`.*
 
 The PyInstaller builds (`yt-dlp_linux_aarch64` and friends) are deliberately
 **not** used: they unpack themselves into a temporary directory on every run,
-which this container's read-only root and `noexec` media tmpfs would break.
+which this container's read-only root and `noexec` media workspace would break.
 
 There is no `pip`, no virtual environment and no package installer anywhere in
 the image, so nothing inside it can add, upgrade or replace a Python package.
@@ -1055,9 +1105,11 @@ polling exists.
 > merged source after GENERIC-SPLIT-05, and the Worker image running in
 > Production now contains it: `SPLIT-08E-PRODUCTION-PROMOTION-001` promoted the
 > candidate image `sha256:d3b951d5…`, built from `6ce4ce2b…`, to
-> `videofetch-worker:latest` (§11h). The *Before SPLIT-05* paragraph is now
-> **history**: it describes the previous Production image `sha256:c3995e18…`,
-> which is retained locally as the rollback asset (§9).
+> `videofetch-worker:latest` (§11h). Production has since moved to
+> `sha256:a3b062a2…`, built from `2e6c0cf9…`, which also contains it (4 GiB
+> rollout Phase 1E, 2026-09-17, §2a). The *Before SPLIT-05* paragraph is now
+> **history**: it describes the Production image before SPLIT-08E,
+> `sha256:c3995e18…` (§9).
 >
 > The image-build and runtime-acceptance steps have a committed gate:
 > **SPLIT-07** (`deploy/acceptance/ytdlp-generic/SPLIT-07.md`) builds the image
@@ -1575,10 +1627,11 @@ still required — an unknown, missing or misreported length never reaches
 `--max-filesize` at all — and no size ceiling or network policy changed. This
 was **source, not deployment** until 2026-09-13: the previous Production image,
 built from `e4fa646b…`, passed `--quiet` and reported this refusal as
-`PROCESSING_FAILED`. The Production Worker image is now `sha256:d3b951d5…`,
-built from `6ce4ce2b…`, which contains this source (*image↔source identity
-operator-measured*, §11h). The promotion smoke did not exercise this refusal
-path in Production, so its live behaviour there is unproven.
+`PROCESSING_FAILED`. The Production Worker image became `sha256:d3b951d5…`,
+built from `6ce4ce2b…`, on 2026-09-13, and is now `sha256:a3b062a2…`, built
+from `2e6c0cf9…`, since 2026-09-17. Both contain this source (*image↔source
+identity operator-measured*, §2a, §11h). Neither promotion's smoke exercised this
+refusal path in Production, so its live behaviour there is unproven.
 
 #### Durable lifecycle
 
@@ -1851,8 +1904,12 @@ the retired claim is absent from the unit's comments in any wording, and that
 the accepted functional controls are unchanged — the safe-egress and broker
 `Requires`/`After`/`BindsTo` edges, both fatal `ExecStartPre` gates, the media
 namespace with no fallback, `--cap-drop=ALL`, `no-new-privileges`, the read-only
-root, the 2 GiB `noexec,nosuid` tmpfs, the read-only broker socket directory,
-the numeric `--group-add`, and the absence of any Docker socket mount.
+root, the Product media mount, the read-only broker socket directory, the
+numeric `--group-add`, and the absence of any Docker socket mount. The media
+mount was the 2 GiB `noexec,nosuid` tmpfs when this was written. Since
+`MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001` the test instead asserts an exact
+`--mount type=bind` of the bounded disk workspace and no Product media tmpfs
+(§2a).
 
 #### Privacy contract of the harness
 
@@ -3380,38 +3437,51 @@ the HTTP runtime.
 | Worker down at expiry | Vercel still refuses to sign new URLs; the provider TTL eventually removes the object. |
 | Rolling back the Worker | Retag the previous image **by image id** as `videofetch-worker:latest` and restart the unit against the **same** persistent volume. Schema V1 is unchanged, so no data migration is involved. No rebuild, no registry pull, no Vercel deployment and no Cloudflare change. |
 | Rolling forward | Never point a new Worker at a volume written by a **newer** schema — startup will refuse, by design. |
-| Rolling back the media workspace | Roll the Worker image back **first** — an image with the 4 GiB default refuses a 2 GiB workspace — then restore the tmpfs unit and `daemon-reload` (§2a). Growing the Lima disk is not reversed. |
+| Rolling back the media workspace | **Not part of a normal rollback.** The disk-backed unit and workspace were accepted on their own in Phase 1C, and the previous image runs on them, so a 4 GiB rollback is an image rollback only (below, §2a). Only an independent failure of the disk-backed unit or workspace itself would justify restoring the old tmpfs unit. That is a separately authorized recovery: roll the image back **first**, because an image with the 4 GiB default refuses a 2 GiB workspace, then restore the tmpfs unit and `daemon-reload`. Growing the Lima disk is not reversed. |
 
 Because the replica count is exactly 1, a deployment is a brief interruption,
 not a zero-downtime rollout. Queued jobs survive it; interrupted active jobs are
 failed deterministically and may be retried by the user.
 
-**Current rollback asset (2026-09-13).** `videofetch-worker:latest` resolves to
-the promoted `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b`
-(§11h). The previous Production image is retained locally as
+**Current rollback asset (2026-09-17).** `videofetch-worker:latest` resolves to
+the 4 GiB image
+`sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0`
+(§2a, §11h), also retained as `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799`. The
+previous Production image — the SPLIT-08E image, with the 500 MiB default — is
+retained locally as
 
 ```
-videofetch-worker:e4fa646bf7492e16fc8d2733982f708a1e243afb
-  → sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa
+videofetch-worker:rc-6ce4ce2b9146-d3b951d51896
+  → sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b
 ```
 
-Rolling back to it is a local retag, conceptually:
+Rolling back to it is a local retag onto the **current** disk-backed unit and
+workspace, conceptually:
 
 1. confirm no active job — every `worker_jobs` row terminal;
 2. stop `videofetch-worker` cleanly;
-3. retag that exact historical image **id** as `videofetch-worker:latest`;
+3. retag that exact image **id** as `videofetch-worker:latest`;
 4. start `videofetch-worker` normally, so the unit's own `ExecStartPre` gates —
-   broker GID and safe-egress policy — execute unchanged;
-5. verify broker, egress, DNS, Worker health and the control plane.
+   broker GID, safe-egress policy and `vf-media-workspace-verify --wipe` — execute
+   unchanged;
+5. verify that the running image is `d3b951d5…`, that the disk-backed workspace
+   is still in use, and that broker, egress, DNS, Worker health and the control
+   plane are healthy.
+
+The result is the Phase-1C state: the previous image with its 500 MiB limit on the
+accepted 10 GiB workspace. **Neither the Worker unit nor the workspace is rolled
+back** (§2a). The older SPLIT-08E rollback image
+`sha256:c3995e18…` (`videofetch-worker:e4fa646bf7492e16fc8d2733982f708a1e243afb`)
+was still present in the Phase-1D image listing (*operator-measured*). It has not
+been re-validated as a rollback target on the disk-backed workspace.
 
 **No rebuild, no network pull, no Vercel deployment and no Cloudflare change is
-involved.** Both durable schemas are version **1** and were proven
-rollback-compatible before the promotion: `WORKER_SCHEMA_VERSION` is `1` in both
-images, `src/worker/state/migrations.server.ts` is byte-identical between them,
-and a version-1 database receives read-only assertions only — no DDL or DML
-(SPLIT-08E preflight, §11h). Restoring a state snapshot is therefore **not** part
-of an image rollback; it belongs only to affirmative evidence of database
-corruption.
+involved.** The durable schema is version **1** on both sides:
+`src/worker/state` is identical between `6ce4ce2b…` and `2e6c0cf9…`
+(*repository-verifiable*), and a version-1 database receives read-only assertions
+only — no DDL or DML. SPLIT-08E's preflight proved the same compatibility for its
+own promotion (§11h). Restoring a state snapshot is therefore **not** part of an
+image rollback; it belongs only to affirmative evidence of database corruption.
 
 ---
 
@@ -3458,9 +3528,11 @@ authorization.
       `/var/lib/videofetch`, and a `noexec,nosuid` tmpfs at `/tmp/videofetch`
       owned by UID/GID 1000 (*repository-verifiable*). The live mount was
       verified and then exercised by a real Production job (§11c — *accepted
-      operator-measured*). *This records what Phase 8B accepted; in the
-      repository it is superseded by `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`,
-      whose unit binds a bounded disk workspace instead (§2a).*
+      operator-measured*). *This records what Phase 8B accepted. It is
+      superseded by `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, whose unit binds a
+      bounded disk workspace instead. That unit has been installed in Production
+      since the rollout's Phase 1C, and the 4 GiB image has run on it since
+      Phase 1E, 2026-09-17 (§2a).*
 - [x] **All capabilities dropped; no privileged mode, host network or Docker
       socket.** The unit passes `--cap-drop=ALL` and `no-new-privileges`,
       carries no `--privileged` flag, joins only the media namespace
@@ -3545,10 +3617,11 @@ authorization.
       startup-fatal (*source-verifiable*), and the Phase-10D Stage-A gate
       `worker-env.forbidden-absent` audits both names. `YTDLP_ENABLED=true` is
       the persistent generic feature state (Phase 10E; accepted `worker.env`
-      SHA-256 `3583770c…`), and the accepted Production image — `sha256:d3b951d5…`
-      since the SPLIT-08E promotion, `sha256:c3995e18…` before it —
-      **contains** the pinned yt-dlp `2026.08.19` runtime (§11h — *accepted
-      operator-measured*). This replaces the Phase-8/9 item that confirmed the
+      SHA-256 `3583770c…`), and the accepted Production image —
+      `sha256:a3b062a2…` since the 4 GiB rollout's Phase 1E (2026-09-17),
+      `sha256:d3b951d5…` from the SPLIT-08E promotion before it, and
+      `sha256:c3995e18…` before that — **contains** the pinned yt-dlp
+      `2026.08.19` runtime (§2a, §11h — *accepted operator-measured*). This replaces the Phase-8/9 item that confirmed the
       retired variable false/unset and yt-dlp absent from the image and the VM,
       which was true then and is no longer the contract.
 - [x] **Termination grace period >= Worker shutdown grace.** The unit sets
@@ -3610,9 +3683,10 @@ authorization.
 | `PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001` | **COMPLETE / ACCEPTED** | `/etc/videofetch/worker.env` carries `YTDLP_ENABLED=true` exactly once, with the retired `YTDLP_NETWORK_ISOLATED` and `YTDLP_PATH` absent (accepted SHA-256 `3583770c…`), and the state survives a full VM stop/start. No image rebuild. `YTDLP_ENABLED` is now the operational kill switch — a feature switch, not the network boundary. The VM stays on demand. *Accepted operator-measured Production evidence.* See §11h. |
 | `PHASE-10F-CONTROL-PLANE-503-ERROR-DISAMBIGUATION-001` | **CLOSED / PRODUCTION ACCEPTED** | PR #43, merge `b4640ff6c92e92c0df2737d5a8c3bfc383837e70` (*GitHub-verifiable*). A canonical Worker `503` + `EXTRACTOR_UNAVAILABLE` is preserved by the control plane instead of collapsing to `WORKER_UNAVAILABLE` — a strict canonical shape/contract match, not authenticated provenance (§1b). Proven live through real Production (*accepted operator-measured*). See §11h. |
 | `WORKERCLIENT-TOTAL-RESPONSE-DEADLINE-HARDENING-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | PR #44, merge `45c625041389df7e1b37ef6d25a27b9e629ca134` (*GitHub-verifiable*). One `requestTimeoutMs` budget covers request start → headers → complete body consumption on every Worker response path (§1b). Deployed as Vercel `dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC` — chain of custody, not Vercel Git-attested. See §11h. |
-| `SPLIT-08E-PRODUCTION-PROMOTION-001` | **COMPLETE / PRODUCTION ACCEPTED** | The retained split-stream candidate `sha256:d3b951d5…` (source `6ce4ce2b…`) was promoted to `videofetch-worker:latest` on 2026-09-13, in one authorized transaction: quiescence check, clean stop, verified state snapshot, immutable retag, exact-candidate start through the unit's own gates, local boundary checks, and a bounded Production smoke over the unchanged Vercel → Cloudflare Access → named Tunnel → HMAC path. No Production job was created, and no Vercel or Cloudflare configuration changed. The previous image is retained as the rollback asset (§9). *Accepted operator-measured Production evidence*, digest `427896be…`. See §11h. |
-| `WORKER-UNIT-COMMENT-SYNC-001` | **OPEN — low / non-blocking** | The installed `/etc/systemd/system/videofetch-worker.service` carries an older **comment block** than the committed `deploy/systemd/videofetch-worker.service`. Its executable contract is identical: every non-comment directive matched the committed unit exactly when SPLIT-08E measured it, so there is no behavioural difference and nothing to fix in source. Scope: a future operator-only synchronisation of comments on the VM — reinstall the committed unit text and `daemon-reload` — with no behaviour change intended. Deliberately **not** performed during the promotion, which was forbidden from touching systemd. |
-| `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001` | **IMPLEMENTED IN SOURCE — NOT DEPLOYED** | 4 GiB default from one shared constant, plan-aware and startup media-workspace gates, an absolute direct-acquisition deadline, the bounded disk workspace (mount unit + verifier + Worker unit bind), and release-image acceptance on a bind workspace (§2a). No R2, broker, Vercel, timeout or expiry change. Rollout in progress: the Lima disk 24 → 32 GiB step is complete (Phase 1A). Pending, each step separately authorized: provision the 10 GiB image (the first attempt was rolled back; Phase 1B0 validated the corrected eager-init recipe); install the mount unit, verifier and Worker unit; storage-only validation on the current image; build and accept a new image; promote it with a retained rollback. |
+| `SPLIT-08E-PRODUCTION-PROMOTION-001` | **COMPLETE / PRODUCTION ACCEPTED** | The retained split-stream candidate `sha256:d3b951d5…` (source `6ce4ce2b…`) was promoted to `videofetch-worker:latest` on 2026-09-13, in one authorized transaction: quiescence check, clean stop, verified state snapshot, immutable retag, exact-candidate start through the unit's own gates, local boundary checks, and a bounded Production smoke over the unchanged Vercel → Cloudflare Access → named Tunnel → HMAC path. No Production job was created, and no Vercel or Cloudflare configuration changed. The previous image was retained as the rollback asset (§9). *Accepted operator-measured Production evidence*, digest `427896be…`. See §11h. *Superseded as current Production on 2026-09-17 by the 4 GiB rollout's Phase 1E (`MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, below); `sha256:d3b951d5…` is now the retained rollback image.* |
+| `WORKER-UNIT-COMMENT-SYNC-001` | **CLOSED — superseded by the 4 GiB rollout's Phase 1C unit installation** | *Finding, as recorded at SPLIT-08E:* the installed `/etc/systemd/system/videofetch-worker.service` carried an older **comment block** than the committed `deploy/systemd/videofetch-worker.service`. Every non-comment directive matched the committed unit exactly, so there was no behavioural difference and nothing to fix in source. SPLIT-08E deliberately did not synchronise it, because it was forbidden from touching systemd. *Closure:* the 4 GiB rollout's Phase 1C (storage-only cutover) installed the exact merged Worker unit — the `deploy/systemd/videofetch-worker.service` blob `ad43ab55f0353de97aedccfcd1820ec6bce71794`, which is also its content at `main` `2e6c0cf9…` (*GitHub-verifiable*). The installed file's SHA-256 `257971338d662606f562a1cb550226304dca3f0db3fd43792520b19d651c94d6` and blob identity were measured at Phase 1C and again at Phase 1E (*accepted operator-measured*). Comments and directives alike are byte-identical to the committed unit, so the comment-only drift no longer exists and no separate operator synchronisation remains pending. |
+| `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | *Source and deployment contract:* PR #58, merge `92d80d88473c8fbca2a1f70ad299b613754a672b`, contributed a 4 GiB default from one shared constant, plan-aware and startup media-workspace gates, an absolute direct-acquisition deadline, the bounded disk workspace (mount unit + verifier + Worker unit bind), and release-image acceptance on a bind workspace (§2a). *Eager ext4 initialization correction:* PR #59, merge `2e6c0cf97a50d06b5d3aebd902ab03c386c01ba4` (both *GitHub-verifiable*). No R2, broker, Vercel, timeout or expiry change. *Rollout (accepted operator-measured):* Phases 1A–1E complete. The initial Phase 1B and the first Phase 1C attempt were rolled back — the latter on an acceptance-harness false negative, not a Product defect (§2a). *Production since 2026-09-17:* source `2e6c0cf9…`; image `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0` as `videofetch-worker:latest`, retained as `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799`; limit 4 GiB (4,294,967,296 bytes) with `MAX_FILE_SIZE` absent; 10 GiB disk-backed ext4 workspace; Lima primary disk 32 GiB. Retained rollback image: `sha256:d3b951d5…` as `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (§9). Phase-1E evidence digest `aca50a8e0bb3ddb44d2348109d344fb5fa377d32184fe28327558d6e747f547d` (operator-held). Vercel was not redeployed and did not need to be (§11h). |
+| `YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001` | **OPEN — acceptance-harness drift / non-Production-blocking** | The Phase-10D unknown-length byte-limit fixture is still capped at **528 MiB** (`BYTE_LIMIT_TOTAL_BYTES` in `deploy/acceptance/ytdlp-generic/fixtures/server.mjs`), and `scripts/ytdlp-fixture.test.mjs` still asserts it against a 500 MiB limit — both as of `main` `2e6c0cf9…` (*GitHub-verifiable*). That was correct for the historical 500 MiB deployment Phase 10D measured. It does not cross today's 4 GiB limit (4,294,967,296 bytes; `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`), so a future live `byte-limit` case cannot currently prove the 4 GiB application threshold: the harness's `bytesServed > effectiveMaxFileSizeBytes` requirement would reject such a run as invalid fixture evidence rather than pass it, but only after a real job had run. This does **not** reopen or invalidate the completed 4 GiB Production rollout, and does **not** invalidate the historical Phase-10D record (`PHASE-10D-YTDLP-PRODUCTION-STAGED-DEPLOYMENT-AND-LIVE-ACCEPTANCE-001`). It blocks only reuse of that one live acceptance case as current byte-threshold evidence. No correction strategy is chosen here; it needs its own reviewed engineering task, and the fixture's `--byte-limit-bytes` override is not a reviewed substitute. See `deploy/acceptance/ytdlp-generic/README.md` and `deploy/acceptance/ytdlp-generic/fixtures/README.md`. |
 
 ---
 
@@ -5185,18 +5259,20 @@ The next live `shutdown` case remains the load-bearing test. Generic remains
 
 ---
 
-## 11h. Phase-10 closure, the SPLIT-08E promotion, and current operating state
+## 11h. Phase-10 closure, the SPLIT-08E promotion, the 4 GiB rollout, and current operating state
 
 **Phase-10 records: recorded 2026-09-10 by
-`POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`. Split-stream qualification,
-the SPLIT-08E promotion and the current-state block: recorded 2026-09-13 by
+`POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`. Split-stream qualification
+and the SPLIT-08E promotion: recorded 2026-09-13 by
 `SPLIT-08F-PRODUCTION-CLOSURE-DOCUMENTATION-001`, from that promotion's accepted
-operator evidence.**
+operator evidence. The 4 GiB rollout record and the current-state block:
+recorded 2026-09-17 by `MAX-FILE-SIZE-4GIB-ROLLOUT-CLOSURE-DOCS-001`, from the
+rollout's accepted operator evidence.**
 
-Both reconciliations *record* previously accepted evidence and reproduce none of
-it. Neither started a VM, read `worker.env`, or re-measured Worker, Vercel,
-Cloudflare or R2 state; SPLIT-08F performed no Production or runtime operation
-at all. Evidence classes are named inline —
+All three reconciliations *record* previously accepted evidence and reproduce none
+of it. None started a VM, read `worker.env`, or re-measured Worker, Vercel,
+Cloudflare or R2 state; SPLIT-08F and the 4 GiB closure performed no Production
+or runtime operation at all. Evidence classes are named inline —
 *GitHub-verifiable*, *repository/source-verifiable*, *accepted
 operator-measured Production evidence*, *accepted provider observation*,
 *operator-attested*. No secret, account identifier, bucket name, token, HMAC
@@ -5339,8 +5415,14 @@ was byte-identical before and after
 (`8a85a0e111066fc4f4d2814f9b45187fa13a29cbfe3cd8394d221abb527ee3f0`, a
 values-free canonical digest of project, alias, deployment and env-row metadata).
 **Worker image identity and Vercel deployment identity are independent**: the
-Worker now runs `6ce4ce2b…`, while the control plane still serves
-`397f238b…`. Neither attests the other.
+Worker ran `6ce4ce2b…` after SPLIT-08E and has run `2e6c0cf9…` since the 4 GiB
+rollout's Phase 1E (2026-09-17), while the control plane still serves
+`397f238b…`. Neither attests the other, and Vercel Production is **not**
+source-aligned with current `main`. Phase 1E also performed no Vercel
+deployment: a read-only `vercel inspect` of the Production alias returned the same
+READY deployment `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` before and after
+(*accepted operator-measured*). It did not re-measure the project safe-state
+digest.
 
 ### Split-stream candidate qualification — SPLIT-07 … SPLIT-08D
 
@@ -5414,27 +5496,102 @@ proven by schema and source identity, not by an executed drill. And no Vercel
 deployment of `6ce4ce2b…` happened: the control plane is a separate identity and
 did not change.
 
-### Current operating state
+### MAX-FILE-SIZE-4GIB — Production rollout of the 4 GiB limit
 
-*Recorded 2026-09-13 by `SPLIT-08F-PRODUCTION-CLOSURE-DOCUMENTATION-001`.*
+`MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, rollout Phases 1A–1E, completed
+2026-09-17. The phase-by-phase record, including the two historical rollbacks,
+is in §2a.
+
+*Evidence classes.* **GitHub-verifiable:** the PR #58 merge `92d80d88…`, the PR #59
+merge `2e6c0cf9…` (tree `d1ea2ec5…`), and the committed unit, mount unit, verifier
+and documentation contents. **Accepted operator-measured:** the Lima resize, the
+workspace provisioning, the installed unit identity, the image identities, the
+movement of `latest`, the Production job, and every evidence SHA-256 below. The
+evidence files themselves are operator-held and not committed.
 
 | | |
 | :--- | :--- |
-| Worker source | `6ce4ce2b9146b226eea7751d69c45e7366ea46b9` |
-| Worker source tree | `c1c289cd9a38a102f0877adf58e1fc9e27a326a1` |
-| Worker image — `videofetch-worker:latest` | `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b` |
-| Retained RC tag | `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` → the same image |
-| Rollback image / tag | `sha256:c3995e18dd3c51d6ddb186e3a3186360d24a2053439e067b71c7dec029f878fa` → `videofetch-worker:e4fa646bf7492e16fc8d2733982f708a1e243afb` (§9) |
-| Pinned yt-dlp | `2026.08.19` — unchanged by the promotion |
-| Generic feature | `YTDLP_ENABLED=true`, persisted in `/etc/videofetch/worker.env` (Phase 10E; accepted SHA-256 unchanged, re-verified at promotion) |
-| Split-stream presets | live in Production since the promotion |
-| Control plane | Vercel Production `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, from `main` `397f238b…` — chain of custody, **not** Git-attested |
-| Vercel project safe-state | `8a85a0e1…` — byte-identical before and after the promotion |
+| Promoted image | `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0`, as `videofetch-worker:latest` |
+| Source | `2e6c0cf97a50d06b5d3aebd902ab03c386c01ba4`, tree `d1ea2ec5ac653e3cd3fddde259a82e3dc47a55ab` (*GitHub-verifiable*; image↔source identity operator-measured by release-image acceptance) |
+| Retained candidate tag | `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799` → the same image |
+| Rollback image | `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b` → `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896`, restarted onto the same disk-backed unit (§9) |
+| Product limit | 4 GiB — 4,294,967,296 bytes; `MAX_FILE_SIZE` absent, so the reviewed image default is authoritative |
+| Product media workspace | 10 GiB disk-backed ext4 at `/srv/videofetch/media/workspace`, bound at `/tmp/videofetch`; no Product media tmpfs |
+| Phase-1D candidate acceptance | `worker-image-acceptance.txt` `ad578c914eb159e8e324468b8d08246f90be84e7ad7b631253cce3fc81833e4a`; release record `3de45866a86d62d46876c3cd6ce9f8599f6a74fdb695100d9a524f5c0279100f` |
+| Phase-1E promotion evidence | `production-promotion.txt` `aca50a8e0bb3ddb44d2348109d344fb5fa377d32184fe28327558d6e747f547d` |
+
+What Phase 1E established:
+
+- **Immutable retag.** `latest` moved from `d3b951d5…` to `a3b062a2…` by retagging
+  the candidate's image **id**, after a quiescence check. The candidate and
+  rollback tags were unchanged.
+- **Exact startup through the accepted unit.** The Worker restarted through the
+  existing disk-backed unit, with no unit edit. The broker-GID and safe-egress
+  gates, stale-container removal and `vf-media-workspace-verify --wipe` all ran,
+  and the Worker's own startup-capacity gate (≥ 2 × `MAX_FILE_SIZE`) passed. The
+  new container runs the exact candidate id with zero restarts, bound to the disk
+  workspace with no tmpfs.
+- **The live limit.** A read-only probe inside the running Worker reported
+  `MAX_FILE_SIZE` absent, `DEFAULT_MAX_FILE_SIZE_BYTES=4294967296`, and an
+  effective configuration of `4294967296` from both configuration readers.
+- **One controlled Production job.** One direct-media job reached `ready`
+  through the normal broker upload, with no Worker restart or failure. The
+  workspace was left in its documented post-job form: an empty `jobs/` root owned
+  `1000:1000`, checked numerically. Its R2 object was left to normal expiry.
+- **Stability.** The broker, egress, DNS and workspace verifiers, Worker health
+  and the named tunnel stayed healthy through a post-job observation window, with
+  the same container epoch.
+- **Scope discipline.** No Worker unit, `worker.env`, Vercel, Cloudflare or R2
+  configuration changed. No multi-GiB transfer was run: the live 4 GiB state rests
+  on source and image identity, the live configuration probe, the startup-capacity
+  gate, the workspace verifier and the small real job.
+
+**What the rollout did not establish.** No 4 GiB object was transferred, so
+end-to-end bandwidth and time behaviour at the ceiling is unexercised in
+Production. The `DOWNLOAD_TIMEOUT` of 600 s implies about 57 Mbit/s sustained
+for a full 4 GiB direct acquisition (§2a). No deliberate rollback drill was
+performed.
+
+### Current operating state
+
+*Recorded 2026-09-17 by `MAX-FILE-SIZE-4GIB-ROLLOUT-CLOSURE-DOCS-001`,
+superseding the 2026-09-13 record of `SPLIT-08F-PRODUCTION-CLOSURE-DOCUMENTATION-001`.*
+
+| | |
+| :--- | :--- |
+| Worker source | `2e6c0cf97a50d06b5d3aebd902ab03c386c01ba4` |
+| Worker source tree | `d1ea2ec5ac653e3cd3fddde259a82e3dc47a55ab` |
+| Worker image — `videofetch-worker:latest` | `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0` |
+| Retained candidate tag | `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799` → the same image |
+| Rollback image / tag | `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b` → `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` — an image-only rollback onto the same disk-backed unit (§9) |
+| Product limit | **4 GiB** (4,294,967,296 bytes) — `MAX_FILE_SIZE` absent; the image default is authoritative |
+| Product media workspace | 10 GiB disk-backed ext4 (`srv-videofetch-media.mount`), bound at `/tmp/videofetch`; no Product media tmpfs |
+| Worker unit | the committed `deploy/systemd/videofetch-worker.service` (blob `ad43ab55…`), installed byte-identically |
+| Lima primary disk | 32 GiB |
+| Pinned yt-dlp | `2026.08.19` — unchanged by both promotions |
+| Generic feature | `YTDLP_ENABLED=true`, persisted in `/etc/videofetch/worker.env` (Phase 10E; accepted SHA-256 `3583770c…` unchanged, re-verified at both promotions) |
+| Split-stream presets | live in Production since the SPLIT-08E promotion (2026-09-13), and contained in the current image |
+| Control plane | Vercel Production `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, from `main` `397f238b…` — chain of custody, **not** Git-attested, **not** source-aligned with current `main`, and unchanged by the 4 GiB rollout |
+| Vercel project safe-state | `8a85a0e1…` — byte-identical across the SPLIT-08E promotion; not re-measured at Phase 1E, whose read-only check confirmed the deployment id unchanged |
 | Execution plane | the on-demand `videofetch` Lima VM — idle state **Stopped** |
-| Promotion date | 2026-09-13 |
-| Promotion evidence | `427896be60159611c88f2452c69c0fa843502bd9ca5ce9bd2bd3114730845ad4` |
+| Latest promotion | 2026-09-17 — 4 GiB rollout Phase 1E; evidence `aca50a8e0bb3ddb44d2348109d344fb5fa377d32184fe28327558d6e747f547d` |
+| Previous promotion | 2026-09-13 — SPLIT-08E; evidence `427896be60159611c88f2452c69c0fa843502bd9ca5ce9bd2bd3114730845ad4` |
 | Safe egress | enforced externally; Phase 9 accepted |
 | 24/7 requirement | **none** |
+
+**Why the 4 GiB rollout needed no Vercel deployment.** The control plane holds no
+media-byte ceiling on the Worker path:
+
+- browser analysis is forwarded to the Worker (`getWorkerClient().analyze`);
+- durable job creation is forwarded to the Worker (`getWorkerClient().createJob`);
+- a ready download is a `303` to a presigned R2 GET, so Vercel never carries the
+  bytes;
+- the Worker request/response contract did not change: `src/shared/worker`, `src/web`,
+  `src/routes` and `src/lib/security` are identical between `397f238b…` and
+  `2e6c0cf9…` (*repository-verifiable*).
+
+The limit is therefore entirely Worker-owned. Aligning Vercel's source with current
+`main` remains an optional, separate task.
 
 The current control plane, with credential ownership made explicit:
 

@@ -197,7 +197,9 @@ mount whose target is, or is under:
 /usr/bin/python3   /usr/bin/ffmpeg   /usr/bin/ffprobe
 ```
 
-What **is** mounted, all read-only except the report directory:
+What **is** mounted from the repository and the report directory, all read-only
+except the report directory (the Product media workspace and the harness scratch
+are the other writable surfaces, below):
 
 | Mount | Target | Why there |
 | :--- | :--- | :--- |
@@ -207,33 +209,97 @@ What **is** mounted, all read-only except the report directory:
 
 ### The writable surfaces mirror Production
 
-The SPLIT-06 runs also get two tmpfs mounts, and `/tmp` itself stays read-only:
+Besides the report directory, the SPLIT-06 runs get two writable surfaces, and
+`/tmp` itself stays read-only:
 
-| tmpfs | Options | Whose |
+| Target | Mount | Whose |
 | :--- | :--- | :--- |
-| `/tmp/videofetch` | `rw,noexec,nosuid,size=2g,uid=1000,gid=1000` | the **product's** — byte-identical to the Production unit's `--tmpfs`, which a self-test reads `deploy/systemd/videofetch-worker.service` to enforce |
-| `/acceptance-scratch` | `rw,noexec,nosuid,nodev,size=512m,uid=1000,gid=1000` | the **harness's** — SPLIT-06 keeps fixtures, its temporary database and its object sink under `mkdtemp(tmpdir())`, and `TMPDIR` points here |
+| `/tmp/videofetch` | `--mount type=bind,source=<--media-workspace>,target=/tmp/videofetch` | the **product's** — a caller-supplied, disk-backed host directory. The mount has the same `type=bind` form, the same fields and the same target as the Production unit's `--mount` of its disk workspace; only the source differs. A self-test reads `deploy/systemd/videofetch-worker.service` to enforce that and to confirm the unit declares no `--tmpfs`. |
+| `/acceptance-scratch` | `--tmpfs /acceptance-scratch:rw,noexec,nosuid,nodev,size=512m,uid=1000,gid=1000` | the **harness's** — SPLIT-06 keeps fixtures, its temporary database and its object sink under `mkdtemp(tmpdir())`, and `TMPDIR` points here. This is the run's only tmpfs. |
 
-The media tmpfs is copied from Production rather than approximated because a
-tmpfs over `/tmp/videofetch` **shadows** the node-owned directory the image
-prepares, so its `uid`/`gid` options are load-bearing
-(`WORKER-TEMP-TMPFS-OWNERSHIP-001`). The first real SPLIT-07A run proved the
-point: it put one tmpfs on `/tmp`, which hid `/tmp/videofetch` from the product,
-and **both** families failed `PROCESSING_FAILED` before upload. The same image
-passed with a writable root and then with the Production layout, so the gate
-caught a filesystem-layout mistake — not an image defect — which is exactly the
-kind of drift a release gate must not paper over. The harness now refuses a
-`--tmpfs` over any product path just as it refuses a bind.
+#### The Product media workspace — `--media-workspace`
+
+Since `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, Production binds a bounded,
+disk-backed ext4 workspace at `/tmp/videofetch`. A 4 GiB ceiling needs an 8 GiB
+successful peak, which the 4 GiB-RAM, swapless VM cannot hold in memory. The
+harness therefore never mounts a Product media tmpfs. It binds the host
+directory the required `--media-workspace` names, at the same target, in the
+same form. The flag has no default.
+
+What the driver enforces (`run-release-image-acceptance.mjs`,
+`lib/release-container.mjs`):
+
+- **A clean absolute path.** It is not `/`, has no `.` or `..` segment, and has
+  no comma, quote or control character — any of which could smuggle an extra
+  mount option.
+- **No overlap with the provenance inputs or the evidence.** It must not be, or
+  be inside or around, `--context`, `--harness` or `--report`. The comparison is
+  component-aware, so `/var/tmp/split07-media` beside `/var/tmp/split07` is
+  allowed.
+- **An existing, real, empty directory.** A symlink or non-directory is
+  refused. Emptiness is checked before any Docker command and again before each
+  family.
+- **Cleared between families.** After each family the driver removes what the
+  child left — normally the executor's empty `jobs/` root — and re-proves the
+  directory empty. A workspace it cannot clear stops the run instead of letting
+  one family's residue stand in for the next.
+- **A bind, never a copy of the source or a tmpfs.** It is always bound with
+  `--mount`, never `-v`, so a missing source fails instead of being created. The
+  finished argv still passes the forbidden-mount guard, so the workspace
+  cannot become a source or runtime overlay.
+
+A refusal of any of these exits `2` with no record written.
+
+What the operator must provide, because the driver does not measure it:
+
+- **A directory on disk, not a tmpfs** — the shape Production uses.
+- **Writable by the image's uid 1000, and clearable by whoever runs the
+  driver.** A bind over `/tmp/videofetch` shadows the node-owned directory the
+  image prepares, just as a tmpfs did, so the host directory's ownership is
+  load-bearing (`WORKER-TEMP-TMPFS-OWNERSHIP-001`). The driver's own usage note
+  suggests `sudo install -d -m 2770 -o 1000 -g 1000 /var/tmp/split07-media` for
+  an operator in gid 1000.
+
+A bind carries its host filesystem's mount flags and cannot add `noexec` itself.
+Production's workspace is `noexec` on its host mount, and the harness scratch
+tmpfs is `noexec`. Nothing in the chain executes a file it wrote, and the pinned
+yt-dlp is the zipimport artifact precisely so it never unpacks itself into a
+temporary directory.
 
 Keeping `/tmp` read-only matters: a product write to `/tmp` outside
 `TEMP_DIRECTORY` fails here exactly as it would in Production. The one ambient
-difference from Production is `TMPDIR`, and it is bounded: the product never
-reads it for its own placement (`config.tempDirectory` is the image's baked
-`TEMP_DIRECTORY`), yt-dlp receives a sealed environment whose `TMPDIR` is the
-job's own work directory, and only FFmpeg/ffprobe inherit it — for stream-copy
-muxing and probing, which write to explicit paths.
+difference from Production is `TMPDIR`, and it is bounded:
 
-Neither tmpfs grants `exec`: nothing in the chain executes a file it wrote.
+- the product never reads it for its own placement (`config.tempDirectory` is
+  the image's baked `TEMP_DIRECTORY`);
+- yt-dlp receives a sealed environment whose `TMPDIR` is the job's own work
+  directory;
+- only FFmpeg/ffprobe inherit it — for stream-copy muxing and probing, which
+  write to explicit paths.
+
+#### History — the retired tmpfs layout
+
+*Historical. Neither item describes the current harness or the current
+Production contract.*
+
+- **The first real SPLIT-07A run used the wrong `/tmp` arrangement.** It put one
+  tmpfs on `/tmp`, which hid `/tmp/videofetch` from the product, and **both**
+  families failed `PROCESSING_FAILED` before upload. The same image passed with a
+  writable root and then with the Production layout of the time. The gate had
+  caught a filesystem-layout mistake — not an image defect — which is exactly
+  the kind of drift a release gate must not paper over. The harness now refuses a
+  `--tmpfs` over any product source or runtime path just as it refuses a bind,
+  and a self-test keeps `/tmp` itself unmounted.
+- **Until `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, the Product media workspace
+  was a 2 GiB tmpfs.** The Production unit mounted
+  `/tmp/videofetch:rw,noexec,nosuid,size=2g,uid=1000,gid=1000`, and the harness
+  copied that tmpfs byte for byte, enforced by the same kind of unit-reading
+  self-test. That layout exposed the ownership issue: a tmpfs over
+  `/tmp/videofetch` shadows the node-owned directory the image prepares, so its
+  `uid`/`gid` options were load-bearing (`WORKER-TEMP-TMPFS-OWNERSHIP-001`). The
+  2 GiB tmpfs is **retired** — in the repository contract, in this harness, and
+  (since the 4 GiB rollout, completed 2026-09-17) in Production. Its ownership
+  lesson carries over unchanged to the disk bind above.
 
 ## How SPLIT-06's flags are satisfied in release mode — without a schema bump
 
@@ -374,18 +440,28 @@ git clone --branch <harness branch> /repo ~/vf-split07-harness
 # 3. A report directory the container's uid 1000 can write, and the VM user too.
 sudo install -d -m 2775 -o 1000 -g 1000 /var/tmp/split07
 
-# 4. The run — the driver runs FROM the harness checkout it names.
+# 4. The Product media workspace: an EXISTING, EMPTY directory on disk (never a
+#    tmpfs), writable by uid 1000 and clearable by the operator, outside the
+#    context, the harness and the report directory.
+sudo install -d -m 2770 -o 1000 -g 1000 /var/tmp/split07-media
+
+# 5. The run — the driver runs FROM the harness checkout it names.
 cd ~/vf-split07-harness
 node deploy/acceptance/ytdlp-generic/run-release-image-acceptance.mjs \
-  --source         <full 40-hex release commit> \
-  --tree           <full 40-hex release tree> \
-  --context        ~/vf-build-<sha12> \
-  --harness        ~/vf-split07-harness \
-  --harness-source <full 40-hex commit the harness checkout must be at> \
-  --harness-tree   <full 40-hex tree of that commit> \
-  --report         /var/tmp/split07 \
+  --source          <full 40-hex release commit> \
+  --tree            <full 40-hex release tree> \
+  --context         ~/vf-build-<sha12> \
+  --harness         ~/vf-split07-harness \
+  --harness-source  <full 40-hex commit the harness checkout must be at> \
+  --harness-tree    <full 40-hex tree of that commit> \
+  --report          /var/tmp/split07 \
+  --media-workspace /var/tmp/split07-media \
   [--docker <docker command>] [--keep-image]
 ```
+
+Every flag outside the brackets is required. `--context`, `--harness`,
+`--report` and `--media-workspace` must be absolute paths; the shell expands
+`~` before the driver sees it.
 
 `--context` and `--harness` are two **provenance roles**, each verified against
 its own explicit expectations. The context is what `Dockerfile.worker` builds.
@@ -396,9 +472,11 @@ checkout or a commit.
 Exit status:
 - `0` — PASS.
 - `1` — a recorded FAIL.
-- `2` — a refusal before a verdict could be recorded: release-context or harness
-  provenance, the driver binding, an invalid image id, the build, a harness that
-  changed mid-run, or an occupied or lost evidence path.
+- `2` — a refusal before a verdict could be recorded: a missing or invalid
+  argument, release-context or harness provenance, the driver binding, a Product
+  media workspace that is missing, not empty or could not be cleared, an invalid
+  image id, the build, a harness that changed mid-run, or an occupied or lost
+  evidence path.
 
 ## Temporary pre-merge validation vs. the retained candidate
 
@@ -422,7 +500,9 @@ support SPLIT-07B; the earlier `-01` SPLIT-07A PASS records do not.
 | :--- | :--- |
 | the candidate image | removed unless `--keep-image` |
 | probe, verifier and SPLIT-06 containers | removed (`--rm`) |
-| SPLIT-06 temporary media and database | gone with the containers' two tmpfs mounts |
+| SPLIT-06 media in the Product media workspace | removed by the driver after each family, which re-proves the directory empty |
+| the `--media-workspace` directory itself | **kept**, empty; the operator removes it |
+| SPLIT-06 fixtures, temporary database and object sink | gone with the containers' harness scratch tmpfs |
 | the two SPLIT-06 child records | **kept**, in the report directory |
 | the SPLIT-07 parent record | **kept**, in the report directory |
 | `videofetch-worker:latest`, the running Worker | untouched, and measured as such |
@@ -433,9 +513,9 @@ support SPLIT-07B; the earlier `-01` SPLIT-07A PASS records do not.
 
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
-| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, writes the parent record. |
+| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, writes the parent record. Admits the required `--media-workspace` empty and clears it after each family. |
 | `lib/release-provenance.mjs` | — | The shared clean-worktree gate, applied to the release context and to the harness; the release-input identities; the `/app` source manifest from Git objects. |
-| `lib/release-container.mjs` | — | Every `docker` argv. Non-deployable tags for build and cleanup; the immutable-id grammar for every run subject; `dockerRunSubject`; the real Dockerfile; the hardening flags; the forbidden-mount guard. |
+| `lib/release-container.mjs` | — | Every `docker` argv. Non-deployable tags for build and cleanup; the immutable-id grammar for every run subject; `dockerRunSubject`; the real Dockerfile; the hardening flags; the Product media workspace `--mount type=bind` and the harness scratch tmpfs; the forbidden-mount guard. |
 | `lib/release-image-probe.mjs` | inside the candidate, at `/verify` | Import-free observer: `/app` manifest, forbidden tools, env names, runtime identity. Observes; never judges. |
 | `lib/release-evidence.mjs` | — | The `split07-release-image-candidate-02` record, child validation and re-verification, the verified-harness gate, and the PASS gate (including the immutable-run-subject ledger). |
 | `lib/provenance.mjs` | — | Shared with the Phase-10D harness; SPLIT-07 uses only its `writeEvidenceExclusive`, the `wx` exclusive-create writer. |

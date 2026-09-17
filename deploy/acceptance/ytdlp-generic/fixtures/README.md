@@ -260,11 +260,29 @@ pinned `HttpFD.real_download` consults `--max-filesize` only inside
 `if data_len is not None`, so a declared length would let yt-dlp's own option
 stop the transfer and the case would be evidence for the wrong gate.
 
-The stream's ceiling is **528 MiB** against a deployed `MAX_FILE_SIZE` whose
-default is 500 MiB. It is a ceiling, not an allocation: the body is the real MP4
-followed by one reused 64 KiB block written with backpressure, so the whole
-stream costs kilobytes of memory. The expected outcome is that the Worker closes
-the connection well before the ceiling.
+The stream's ceiling is **528 MiB** (553,648,128 bytes). It is a ceiling, not an
+allocation: the body is the real MP4 followed by one reused 64 KiB block written
+with backpressure, so the whole stream costs kilobytes of memory.
+
+**Historical — why 528 MiB.** The ceiling was chosen, with a deliberately small
+margin, when Production's effective `MAX_FILE_SIZE` was the 500 MiB default. The
+expected outcome then was that the Worker closed the connection well before the
+ceiling, and because 528 MiB exceeds 500 MiB, the accepted Phase-10D
+`byte-limit` run could establish that the application threshold had actually
+been crossed. That evidence remains valid for the 500 MiB deployment it measured.
+
+**Current — insufficient against 4 GiB (`YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001`,
+OPEN).** Production has enforced 4 GiB — 4,294,967,296 bytes — since 2026-09-17,
+and the unchanged 528 MiB stream never reaches that threshold. The route itself
+is still deterministic fixture infrastructure: the correlation grammar, the
+absent `Content-Length`, the byte counting and the per-case evidence are
+unaffected. Only its ceiling, relative to the new Product limit, is the problem.
+It is therefore insufficient for a fresh live byte-limit acceptance against the
+4 GiB Production limit, and a separate reviewed fixture/test correction is
+required before this case is reused as current threshold evidence. Until then,
+`BYTE_LIMIT_TOTAL_BYTES` and `scripts/ytdlp-fixture.test.mjs` intentionally still
+encode the 500 MiB design, and the `--byte-limit-bytes` override in `server.mjs`
+is not a reviewed substitute for that correction.
 
 ### 4. Safe-egress fixture — `/safe-egress`
 
