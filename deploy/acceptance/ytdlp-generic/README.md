@@ -263,7 +263,7 @@ There is no unreviewed layer between Production and the acceptance logic.
 | `--stage A` | **disabled** | Every Stage A gate, including the direct-media regression. Writes the Stage A record and begins the run. |
 | `--stage B --case success` | **enabled** | Generic analysis, job lifecycle, durable evidence, the downloading window, R2, signed GET, sentinel sweep. |
 | `--stage B --case cancellation` | **enabled** | Captures the owned PGID, cancels, proves that exact group died. |
-| `--stage B --case byte-limit` | **enabled** | This case's own unknown-declared-length **media GET** serves more than the deployed limit and aborts as `TOO_LARGE`. |
+| `--stage B --case byte-limit` | **enabled** | This case's own unknown-declared-length **media GET** must serve more than the deployed limit and abort as `TOO_LARGE`. **Not current 4 GiB acceptance:** the fixture was designed for the historical 500 MiB limit and tops out at 528 MiB, below today's 4 GiB — see [the fixture no longer crosses the live limit](#the-528-mib-fixture-no-longer-crosses-the-live-4-gib-limit). |
 | `--stage B --case shutdown` | **enabled** | Captures the owned PGID, the operator restarts, that exact group must be gone. |
 | `--stage B --case safe-egress` | **enabled** | Forbidden later destination denied, attributed by the **deny counter** named with `--egress-deny-class` (a closed deny-only enum). |
 | `--stage B --case direct-regression` | **enabled** | Post-enable direct job with no yt-dlp process. |
@@ -1229,6 +1229,26 @@ rather than bytes queued. A `HEAD` on that route opens no case and increments
 nothing; a second `GET` is reported as `mediaRequestCount: 2` rather than
 clamped, so an ambiguous transfer stays `BLOCKED` instead of passing.
 
+#### The 528 MiB fixture no longer crosses the live 4 GiB limit
+
+> **Open drift — `YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001`** (runbook §11).
+>
+> - **Historical.** This case was designed, and accepted in Phase 10D, while
+>   Production enforced the 500 MiB default. The fixture's 528 MiB ceiling
+>   (553,648,128 bytes) crossed that limit on purpose, and the accepted Phase-10D
+>   `byte-limit` record remains valid evidence for the 500 MiB deployment it
+>   measured.
+> - **Current.** Production has enforced 4 GiB (4,294,967,296 bytes, with
+>   `MAX_FILE_SIZE` absent) since 2026-09-17. The fixture still tops out at
+>   528 MiB, so it does **not** cross the live Product threshold.
+> - **Consequence.** The `byte-limit` case **must not** be treated as current
+>   4 GiB threshold acceptance until its fixture and test design are corrected
+>   by a separate reviewed task. A run today could not pass by accident — the
+>   requirement below rejects a transfer that never crossed the measured limit
+>   as invalid fixture evidence — but it would still create and drive a real
+>   job before being rejected. The `--byte-limit-bytes` override in
+>   `server.mjs` is not a reviewed procedure and is not that correction.
+
 ### Cancellation and shutdown
 
 Cancellation needs a deterministic window while the job is actively
@@ -1903,6 +1923,12 @@ the bytes served did not exceed the deployed limit (invalid fixture, not
 acceptance evidence), and is `BLOCKED` — `LIVE UNKNOWN-LENGTH BYTE-GUARD CASE
 NOT PROVEN` — if the correlation, the media request, or the effective limit
 cannot be established at all.
+
+**Against the current 4 GiB Production limit, the existing fixture cannot meet
+this requirement:** its 528 MiB ceiling was sized for the historical 500 MiB
+limit. See
+[the fixture no longer crosses the live limit](#the-528-mib-fixture-no-longer-crosses-the-live-4-gib-limit)
+(`YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001`).
 
 ## The direct regression is a negative claim too
 
