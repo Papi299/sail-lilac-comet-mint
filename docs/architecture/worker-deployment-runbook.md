@@ -341,19 +341,25 @@ block restarts. Nothing is wiped before identity and hardening pass.
 - The browser still downloads through the 303 → presigned R2 GET; Vercel never
   proxies the body.
 
-**Rollout ordering (pending, each step separately authorized).**
+**Rollout ordering (in progress; each remaining step separately authorized).** The
+4 GiB Production limit is not live.
 
-1. Grow the Lima disk from 24 GiB to **32 GiB**; this stops the VM. The 24 GiB disk
-   has 14,787,710,976 bytes free, short of the 10 GiB image plus a 6 GiB
-   root-filesystem reserve.
-2. Provision the 10 GiB image, install and enable the mount unit and verifier, and
-   create the workspace (`deploy/README.md`, step 4b).
-3. Storage-only validation: install the new Worker unit with the **current**
-   500 MiB-default image. Confirm every gate, health and one small job, and that
-   the workspace is empty afterwards.
-4. Build and accept a new Worker image from the merged source. Release-image
-   acceptance now requires `--media-workspace`.
-5. Promote it, retaining a rollback image.
+1. **COMPLETE — Phase 1A:** the Lima primary disk was grown from 24 GiB to
+   **32 GiB**; the guest's primary block device grew and its root filesystem
+   expanded automatically. The existing Production deployment recovered unchanged,
+   still on image `d3b951d5…` with the 500 MiB effective limit. No workspace was
+   provisioned.
+2. **PENDING — Phase 1B retry:** provision the 10 GiB image with the eager-init
+   recipe, install and enable the mount unit and verifier, and create the workspace
+   (`deploy/README.md`, step 4b). The first Phase 1B attempt was rolled back and left
+   no workspace behind; Phase 1B0 then validated the corrected recipe (above). The
+   retry has not happened yet.
+3. **PENDING — storage-only validation:** install the new Worker unit with the
+   **current** 500 MiB-default image. Confirm every gate, health and one small job,
+   and that the workspace is empty afterwards.
+4. **PENDING — new image:** build and accept a new Worker image from the merged
+   source. Release-image acceptance now requires `--media-workspace`.
+5. **PENDING — promotion:** promote it, retaining a rollback image.
 
 **Rollback constraint.** An image with the 4 GiB default refuses, by design, to
 start on the 2 GiB tmpfs. Roll the image back first (retag the previous id), then
@@ -3606,7 +3612,7 @@ authorization.
 | `WORKERCLIENT-TOTAL-RESPONSE-DEADLINE-HARDENING-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | PR #44, merge `45c625041389df7e1b37ef6d25a27b9e629ca134` (*GitHub-verifiable*). One `requestTimeoutMs` budget covers request start → headers → complete body consumption on every Worker response path (§1b). Deployed as Vercel `dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC` — chain of custody, not Vercel Git-attested. See §11h. |
 | `SPLIT-08E-PRODUCTION-PROMOTION-001` | **COMPLETE / PRODUCTION ACCEPTED** | The retained split-stream candidate `sha256:d3b951d5…` (source `6ce4ce2b…`) was promoted to `videofetch-worker:latest` on 2026-09-13, in one authorized transaction: quiescence check, clean stop, verified state snapshot, immutable retag, exact-candidate start through the unit's own gates, local boundary checks, and a bounded Production smoke over the unchanged Vercel → Cloudflare Access → named Tunnel → HMAC path. No Production job was created, and no Vercel or Cloudflare configuration changed. The previous image is retained as the rollback asset (§9). *Accepted operator-measured Production evidence*, digest `427896be…`. See §11h. |
 | `WORKER-UNIT-COMMENT-SYNC-001` | **OPEN — low / non-blocking** | The installed `/etc/systemd/system/videofetch-worker.service` carries an older **comment block** than the committed `deploy/systemd/videofetch-worker.service`. Its executable contract is identical: every non-comment directive matched the committed unit exactly when SPLIT-08E measured it, so there is no behavioural difference and nothing to fix in source. Scope: a future operator-only synchronisation of comments on the VM — reinstall the committed unit text and `daemon-reload` — with no behaviour change intended. Deliberately **not** performed during the promotion, which was forbidden from touching systemd. |
-| `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001` | **IMPLEMENTED IN SOURCE — NOT DEPLOYED** | 4 GiB default from one shared constant, plan-aware and startup media-workspace gates, an absolute direct-acquisition deadline, the bounded disk workspace (mount unit + verifier + Worker unit bind), and release-image acceptance on a bind workspace (§2a). No R2, broker, Vercel, timeout or expiry change. Pending, each step separately authorized: Lima disk 24 → 32 GiB; provision the 10 GiB image; install the mount unit, verifier and Worker unit; storage-only validation on the current image; build and accept a new image; promote it with a retained rollback. |
+| `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001` | **IMPLEMENTED IN SOURCE — NOT DEPLOYED** | 4 GiB default from one shared constant, plan-aware and startup media-workspace gates, an absolute direct-acquisition deadline, the bounded disk workspace (mount unit + verifier + Worker unit bind), and release-image acceptance on a bind workspace (§2a). No R2, broker, Vercel, timeout or expiry change. Rollout in progress: the Lima disk 24 → 32 GiB step is complete (Phase 1A). Pending, each step separately authorized: provision the 10 GiB image (the first attempt was rolled back; Phase 1B0 validated the corrected eager-init recipe); install the mount unit, verifier and Worker unit; storage-only validation on the current image; build and accept a new image; promote it with a retained rollback. |
 
 ---
 
