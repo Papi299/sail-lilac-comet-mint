@@ -219,8 +219,12 @@ export type GenericVideoConstraint = z.infer<typeof GenericVideoConstraintSchema
  * Unlike `GenericVideoConstraint`, `unknown` IS a member. An unknown audio state
  * can be re-selected honestly (`[acodec!=?"none"]`), so it is a coherent private
  * description of a source. Whether such a source may be ADVERTISED is a
- * separate question, answered by preset construction: under generic v1 it may
- * not, because nothing proves it carries audio.
+ * separate question, answered by preset construction: it may never back an
+ * audio claim, an audio or MP3 preset, or a split half, because nothing proves
+ * it carries audio. Since GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001
+ * a single progressive source with established video and `unknown` audio may
+ * back an ordinary VIDEO preset that claims no audio, as a whole-result fallback
+ * used only when no proven video rendition exists.
  */
 export const GENERIC_AUDIO_CONSTRAINTS = Object.freeze([
   "codec-present",
@@ -253,10 +257,12 @@ export const GenericSourceSelectionSchema = z
     /**
      * Audio presence is PROVEN — exactly `audioConstraint === "codec-present"`.
      *
-     * Retained for the execution planner, which gates every current generic
-     * plan on proven audio. It does NOT mean "might have audio": an unknown
-     * audio state is `false` here and `unknown` in `audioConstraint`, and the
-     * selector reads only the latter.
+     * Retained for the execution planner, which gates every audio claim and
+     * every audio product on proven audio. It does NOT mean "might have audio",
+     * and `false` does NOT mean "proven absent": both unknown and absent audio
+     * are `false` here, and only `audioConstraint` tells them apart. The
+     * selector, and the planner's unknown-vs-absent decisions, read only the
+     * latter.
      */
     hasAudio: z.boolean(),
     /**

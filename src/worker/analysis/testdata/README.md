@@ -77,8 +77,13 @@ output at all, which is why this file omits it rather than writing `null`. The
 raw format also carried no `asr` and no `audio_channels`, and its `abr` and `tbr`
 were `null`, so nothing in the document positively establishes an audio stream.
 The Worker therefore classifies the format as unknown-codec VIDEO (coherent
-`video_ext`) with UNKNOWN audio. It keeps the format as an honest private
-candidate and advertises no preset for it.
+`video_ext`) with UNKNOWN audio. Under `GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001`
+it kept the format as an honest private candidate and advertised no preset for
+it. Since `GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001` the same
+document, having no proven video fulfilment, advertises exactly one ordinary
+video preset (`preset:best`, unknown resolution) with `hasAudio: false` and
+`audioCodec: null`, and still no audio or MP3 preset; the private selection
+stays `audioConstraint: "unknown"`.
 
 **Sanitization.** Only the fields the Worker's raw schema reads are kept, using
 the same allowlist and order as the capture above. A field the runtime did not
@@ -87,3 +92,46 @@ emit is omitted, never filled in; that includes the top-level `duration`,
 `http_headers`, `webpage_url`, `original_url`, the loopback host and every other
 key are removed. The title is the fixture page's own `<title>`, exactly as the
 pinned runtime reported it, including the trailing ` (1)` it appended.
+
+## `synthetic-x-progressive-unknown-audio.json` — SYNTHETIC
+
+**This file is SYNTHETIC. It is not a capture.** It was written by hand for
+`GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001` to reproduce the OUTPUT
+SHAPE that `X-TWITTER-FORMAT-COMPATIBILITY-DIAGNOSTIC-001` found for an X/Twitter
+video under the pinned runtime. It describes no real post and contains no data
+from one: no submitted URL, status id, username, media/CDN or manifest URL,
+query string, token, cookie, real upstream `format_id` or real title. Every
+`format_id` is a neutral application-test literal (`synthetic-…`) that satisfies
+the safe grammar, heights and sizes are round illustrative values, and the title
+says what the file is.
+
+The diagnostic's decisive finding, which the file preserves as a shape:
+
+```
+2 × progressive  protocol https, ext mp4, video_ext mp4, NO vcodec key,
+                 NO acodec key                       <- video established by shape,
+                                                        audio UNKNOWN
+2 × HLS video    protocol m3u8_native, ext mp4, real vcodec, acodec "none"
+2 × HLS audio    protocol m3u8_native, ext mp4, vcodec "none", video_ext "none",
+                 NO acodec key                       <- audio-rendition-like, audio UNKNOWN
+```
+
+In the pinned Twitter extractor a progressive variant carries only its URL, id
+and bitrate, so `acodec` is never set; the HLS audio renditions get
+`vcodec: "none"` but no `acodec` either. `video_ext`/`audio_ext` follow
+`_fill_sorting_fields`, exactly as in the captures above.
+
+What the Worker must conclude from it:
+
+- the four HLS formats are ineligible on protocol alone
+  (`YTDLP_V1_NATIVE_PROTOCOLS` stays `http`/`https`);
+- the two progressive formats are eligible, with `videoConstraint: "video-ext"`
+  and `audioConstraint: "unknown"`;
+- no PROVEN video fulfilment exists (nothing is muxed with a real `acodec`, and
+  unknown audio is neither a split video half nor an audio half), so the
+  unknown-audio fallback tier backs ordinary video presets — `hasAudio: false`,
+  `audioCodec: null` — and nothing else: no `preset:audio`, no `preset:mp3`.
+
+Being synthetic, it proves nothing about the pinned binary by itself. What the
+pinned runtime does with the resulting selector is proven offline by
+`deploy/acceptance/ytdlp-generic/verify-selector.py`.

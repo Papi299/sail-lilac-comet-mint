@@ -530,8 +530,10 @@ type Candidate = {
   readonly hasVideo: boolean;
   /**
    * Audio presence is PROVEN: exactly `audioConstraint === "codec-present"`.
-   * Every generic preset is gated on this, so an unknown audio state can never
-   * be advertised as carrying audio.
+   * Every audio claim a generic preset makes is gated on this, so an unknown
+   * audio state can never be advertised as carrying audio. `false` means "not
+   * proven", never "proven absent" — that distinction lives in
+   * `audioConstraint` alone.
    */
   readonly hasAudio: boolean;
   readonly height: number | null;
@@ -1066,7 +1068,43 @@ function bestFulfillment(fulfillments: readonly VideoFulfillment[]): VideoFulfil
 }
 
 /**
- * Builds every advertisable VIDEO fulfilment for one candidate set.
+ * Is this candidate a MUXED video source: video plus PROVEN audio, in one file?
+ *
+ * The only single-source shape the proven video tier accepts, and the only
+ * video-bearing shape Worker FFmpeg may extract audio from. `hasAudio` is
+ * exactly `audioConstraint === "codec-present"` (see `selectCandidates`), so an
+ * unknown-audio source is never muxed as far as advertising is concerned.
+ */
+function isMuxedVideoCandidate(c: Candidate): boolean {
+  return c.hasVideo && c.hasAudio;
+}
+
+/**
+ * Is this candidate usable as an UNKNOWN-AUDIO single video source?
+ * (GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001)
+ *
+ * Video is established, and nothing establishes audio EITHER way: `acodec` was
+ * missing, null, empty or `"null"`. Every eligibility gate in `selectCandidates`
+ * has already been passed — protocol, safe id, container, coherent video shape,
+ * known size — so this adds no admission of its own; it only names the shape.
+ *
+ * All four conditions are stated explicitly, mirroring `isSplitVideoCandidate`,
+ * because the unknown-vs-absent distinction is the whole point. An `absent`
+ * audio state is `hasAudio: false` too, and it is deliberately NOT accepted
+ * here: a proven video-only rendition stays governed by the split rules alone,
+ * and ordinary silent-video advertising is outside this capability.
+ */
+function isUnknownAudioVideoCandidate(c: Candidate): boolean {
+  return (
+    c.hasVideo &&
+    c.videoConstraint !== "absent" &&
+    c.hasAudio === false &&
+    c.audioConstraint === "unknown"
+  );
+}
+
+/**
+ * Builds every advertisable VIDEO fulfilment backed by PROVEN audio.
  *
  * Muxed candidates become `single` fulfilments unconditionally, exactly as
  * before. Split fulfilments are additionally built only when the WORKER's own
@@ -1081,11 +1119,14 @@ function bestFulfillment(fulfillments: readonly VideoFulfillment[]): VideoFulfil
  * which video rung the user picked, which is per-preset source substitution by
  * another name.
  */
-function buildVideoFulfillments(
+function buildProvenVideoFulfillments(
   candidates: readonly Candidate[],
   opts: { readonly ffmpegAvailable: boolean; readonly maxFileSizeBytes: number },
-  muxedVideo: readonly Candidate[],
 ): VideoFulfillment[] {
+  // Muxed single-source video candidates only — video plus PROVEN audio. An
+  // unknown-audio candidate is not muxed as far as advertising is concerned.
+  const muxedVideo = candidates.filter(isMuxedVideoCandidate);
+
   const fulfillments: VideoFulfillment[] = muxedVideo.map((c) => ({
     kind: "single",
     video: c,
@@ -1137,6 +1178,48 @@ function buildVideoFulfillments(
 }
 
 /**
+ * Chooses the ONE video fulfilment tier the whole result advertises from
+ * (GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001).
+ *
+ *   proven    every muxed and split fulfilment, exactly as before this task.
+ *   unknown   ONLY when the proven tier is EMPTY: every single progressive
+ *             candidate whose video is established and whose audio is unknown.
+ *
+ * The tier is chosen for the WHOLE result, never per rung. The moment any
+ * proven fulfilment exists, unknown-audio candidates affect no video preset at
+ * all — not `preset:best`, not an otherwise-empty rung — so every source that
+ * was advertisable before keeps a byte-identical preset list. A higher-resolution
+ * unknown source never displaces a lower proven one, because "has audio" is not
+ * a property the user should silently lose by picking a sharper rung.
+ *
+ * The proven tier depends on Worker FFmpeg (a pair needs its merge), so a
+ * result whose ONLY proven fulfilment was a pair has an empty proven tier when
+ * FFmpeg is unavailable, and the unknown tier may then engage. That is
+ * intentional: the pair cannot be offered, and the unknown source is exactly as
+ * deliverable as it is anywhere else.
+ *
+ * Fallback fulfilments are ordinary `single` fulfilments, ranked by the same
+ * `compareFulfillments` → `compareCandidates` path. Within the unknown tier every
+ * candidate is single with a null audio codec, so ranking is exactly the
+ * existing single-source video ranking; nothing site-specific is added.
+ */
+function selectVideoFulfillments(
+  candidates: readonly Candidate[],
+  opts: { readonly ffmpegAvailable: boolean; readonly maxFileSizeBytes: number },
+): VideoFulfillment[] {
+  const proven = buildProvenVideoFulfillments(candidates, opts);
+  if (proven.length > 0) return proven;
+
+  return candidates.filter(isUnknownAudioVideoCandidate).map((c) => ({
+    kind: "single",
+    video: c,
+    source: toSingleSource(c),
+    targetContainer: c.container,
+    fileSize: c.fileSize,
+  }));
+}
+
+/**
  * The result of preset construction: the browser-safe presets, plus the PRIVATE
  * per-preset source selections execution needs.
  *
@@ -1175,12 +1258,19 @@ export type GenericPresetBuild = {
  * rankings, not a coupling.
  *
  * "Carries audio" still means PROVEN audio: `hasAudio`, i.e. an
- * `audioConstraint` of `codec-present`. A source whose `acodec` is unknown is a
- * coherent private candidate but is never advertised — as muxed video, as a
- * split video half, as audio, or as MP3 — because nothing establishes that it
- * has an audio stream at all. `analyzeGenericMediaInternal` asserts this over
- * every selection it emits, in the form that applies to each shape
+ * `audioConstraint` of `codec-present`. A source whose `acodec` is unknown is
+ * never advertised as muxed video, as a split video half, as audio, or as MP3,
+ * because nothing establishes that it has an audio stream at all
  * (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001, §29).
+ *
+ * It MAY back an ordinary VIDEO preset as a whole-result FALLBACK tier, used
+ * only when no proven video fulfilment exists (see `selectVideoFulfillments`;
+ * GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001). Such a preset states
+ * `hasAudio: false` and `audioCodec: null`, which for a generic preset means
+ * "audio is not proven", never "audio is proven absent"; the private selection
+ * keeps `audioConstraint: "unknown"`, which is the only place the distinction
+ * lives. `analyzeGenericMediaInternal` asserts every emitted preset/selection
+ * pair against the rule for its shape (`assertGenericPresetBuild`).
  *
  * `maxFileSizeBytes` is needed for the PAIR-level combined-size gate (§13/§16).
  * It is injected rather than imported so this module still cannot reach
@@ -1199,12 +1289,14 @@ export function buildGenericPresets(
   // upstream identity at all.
   const selections: Record<string, GenericPresetSource> = {};
 
-  // Muxed single-source video candidates only — video plus PROVEN audio. An
-  // unknown-audio candidate is not muxed as far as advertising is concerned.
-  const muxedVideo = candidates.filter((c) => c.hasVideo && c.hasAudio);
+  // Muxed single-source video candidates only — video plus PROVEN audio. Also
+  // the only video-bearing sources audio may be extracted from, below.
+  const muxedVideo = candidates.filter(isMuxedVideoCandidate);
 
-  // Every advertisable video rendition, muxed and split alike, ranked together.
-  const videoFulfillments = buildVideoFulfillments(candidates, opts, muxedVideo);
+  // Every advertisable video rendition of the ONE tier this result uses: muxed
+  // and split alike, ranked together — or, only when neither exists, the
+  // unknown-audio singles.
+  const videoFulfillments = selectVideoFulfillments(candidates, opts);
 
   const videoPreset = (
     id: string,
@@ -1223,14 +1315,20 @@ export function buildGenericPresets(
     // fulfilment, `null` when anything is unknown (§15).
     fileSize: f.fileSize,
     hasVideo: true,
-    hasAudio: true,
+    // DERIVED from the member that would carry the audio stream — the single
+    // source itself, or the pair's AUDIO member — never hard-coded. That member's
+    // `hasAudio` is PROVEN audio, so this is `true` for a muxed source and for
+    // every pair, and `false` for an unknown-audio fallback source, whose audio
+    // is simply not proven. It is never a claim of absence.
+    hasAudio: f.kind === "single" ? f.video.hasAudio : f.audio.hasAudio,
     // The product contract is `id === formatId`, and both are
     // application-owned. No upstream identifier is involved in either — a pair
     // holds two of them, and neither appears here (§12).
     formatId: id,
     videoCodec: f.video.videoCodec,
     // The half that actually carries the stream: the muxed source itself, or
-    // the pair's AUDIO member.
+    // the pair's AUDIO member. `null` for an unknown-audio source, whose
+    // candidate carries no audio codec because none was proven.
     audioCodec: f.kind === "single" ? f.video.audioCodec : f.audio.audioCodec,
     fps: f.video.fps,
   });
@@ -1282,6 +1380,12 @@ export function buildGenericPresets(
   // gets its audio. When a pair's family partner also wins here, that is the
   // same candidate winning two independent rankings — not a coupling, and not a
   // shared selection.
+  //
+  // Equally UNTOUCHED by the unknown-audio video tier. Both source pools below
+  // require PROVEN audio (`hasAudio`), so an unknown-audio candidate — even one
+  // currently backing every video preset — can never become an audio or MP3
+  // source: extracting from a silent file is a `PROCESSING_FAILED`, not a
+  // download.
   const audioOnly = candidates.filter((c) => c.hasAudio && !c.hasVideo);
   const bestAudioOnly = bestOf(audioOnly);
   const audioSource = bestAudioOnly ?? (opts.ffmpegAvailable ? bestOf(muxedVideo) : null);
@@ -1326,6 +1430,154 @@ export function buildGenericPresets(
   }
 
   return { presets, selections };
+}
+
+/**
+ * Structural assertions on preset construction's OWN output.
+ *
+ * These cannot be triggered by upstream data; they exist so that a future edit
+ * which widened the preset vocabulary, leaked an upstream identifier, or quietly
+ * widened what the Worker can acquire fails loudly HERE — as one canonical
+ * `EXTRACTION_FAILED` — rather than silently at the browser or mid-job.
+ *
+ * The audio rules are SHAPE-AWARE, not relaxed. Each preset is checked against
+ * the private selection behind it, with the rule that actually applies to that
+ * pairing:
+ *
+ *   `preset:audio` / `preset:mp3`   one source with PROVEN audio. Unchanged.
+ *   video preset, one source        the public `hasAudio` equals the private
+ *                                   PROOF, and the private state is exactly
+ *                                   `codec-present` (true) or `unknown` (false,
+ *                                   with no audio codec). `absent` is a split
+ *                                   half's shape and is refused as a single.
+ *   video preset, pair              public `hasAudio: true`; the pair invariants.
+ *
+ * Writing this as one flat "every selection has proven audio" check would be
+ * wrong in both directions: it would reject every valid split pair and every
+ * unknown-audio fallback preset, and the obvious "fix" for that — dropping the
+ * check — would let an unknown or absent audio state reach an audio product, or
+ * a public audio claim drift from its proof, unnoticed.
+ *
+ * The unknown-audio tier is additionally asserted to be a FALLBACK: it may not
+ * coexist with a proven-backed video preset, and it may not be used at all when
+ * the candidate set has a proven video fulfilment to offer
+ * (GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001).
+ */
+export function assertGenericPresetBuild(
+  build: GenericPresetBuild,
+  context: {
+    readonly candidates: readonly Candidate[];
+    readonly ffmpegAvailable: boolean;
+    readonly maxFileSizeBytes: number;
+  },
+): void {
+  const { presets, selections } = build;
+  const fail = (): never => {
+    throw new AppError("EXTRACTION_FAILED");
+  };
+
+  if (presets.length > YTDLP_ANALYSIS_MAX_PRESETS) fail();
+  for (const preset of presets) {
+    if (!GENERIC_PRESET_ID_PATTERN.test(preset.id)) fail();
+    if (preset.formatId !== preset.id) fail();
+    // Every advertised preset must be acquirable. A preset without a private
+    // selection could only fail later, after the user had chosen it.
+    if (!selections[preset.id]) fail();
+  }
+  // ...and nothing may be selectable that was never advertised.
+  for (const id of Object.keys(selections)) {
+    if (!presets.some((p) => p.id === id)) fail();
+  }
+
+  let provenVideoPresets = 0;
+  let unknownAudioVideoPresets = 0;
+
+  for (const preset of presets) {
+    const value = selections[preset.id]!;
+    const audioProduct = preset.id === "preset:audio" || preset.id === "preset:mp3";
+
+    if (value.kind === "single") {
+      const source = value.source;
+
+      if (audioProduct) {
+        // An audio product is built on PROVEN audio and on nothing else. An
+        // unknown source here would be an extraction from a file that may well
+        // be silent (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
+        if (preset.hasVideo !== false || preset.hasAudio !== true) fail();
+        if (source.audioConstraint !== "codec-present" || source.hasAudio !== true) fail();
+        continue;
+      }
+
+      // An ordinary VIDEO preset fulfilled by ONE source.
+      if (preset.hasVideo !== true) fail();
+      if (source.hasVideo !== true || source.videoConstraint === "absent") fail();
+      // The public audio claim IS the private proof — in both directions. A
+      // proven source behind `false` would hide audio the user is getting; an
+      // unproven source behind `true` would promise audio nothing established.
+      if (preset.hasAudio !== source.hasAudio) fail();
+
+      switch (source.audioConstraint) {
+        case "codec-present":
+          if (source.hasAudio !== true) fail();
+          provenVideoPresets += 1;
+          break;
+        case "unknown":
+          if (source.hasAudio !== false || preset.audioCodec !== null) fail();
+          unknownAudioVideoPresets += 1;
+          break;
+        default:
+          // `absent`: proven video-only. That is a split pair's VIDEO half, and
+          // advertising it as an ordinary single video is outside this
+          // capability — whatever the public boolean would have said.
+          fail();
+      }
+      continue;
+    }
+
+    // ── SPLIT (SPLIT-05 §33) ──────────────────────────────────────────────────
+    //
+    // SPLIT-01 fail-closed here unconditionally, because no acquisition or merge
+    // path existed. SPLIT-02..04 built that path, so the unconditional rejection
+    // is replaced by the assertions that actually apply to a pair — not removed.
+
+    // A merge is only ever how a VIDEO preset gets its audio, and a pair always
+    // carries proven audio through its audio member.
+    if (audioProduct) fail();
+    if (preset.hasVideo !== true || preset.hasAudio !== true) fail();
+
+    // `GenericSplitSourceSelectionSchema` is invoked rather than re-implemented:
+    // it is the authority on all six pair invariants (video present, video audio
+    // proven absent, audio video proven absent, audio proven present, different
+    // upstream ids, closed container combination), and re-deriving them here
+    // would create a second, driftable copy of the rules.
+    if (!GenericSplitSourceSelectionSchema.safeParse(value.pair).success) fail();
+
+    // Restated at THIS level, deliberately and narrowly: the two unknown-vs-absent
+    // facts are the ones a future relaxation would be most tempted to soften, and
+    // they are the ones that make a pair a pair rather than a silent substitution
+    // (§29/§30). The container table and the id-difference are left to the schema
+    // alone, which is the only place they are stated.
+    if (value.pair.video.audioConstraint !== "absent") fail();
+    if (value.pair.audio.videoConstraint !== "absent") fail();
+    if (value.pair.audio.audioConstraint !== "codec-present") fail();
+
+    // A pair can only be fulfilled by the Worker's OWN FFmpeg. Advertising one
+    // without it would promise a merge nothing can perform (§8). Construction is
+    // already gated on this; asserting it makes the gate a property of the
+    // analyzer's output rather than of one filter inside preset building.
+    if (!context.ffmpegAvailable) fail();
+
+    provenVideoPresets += 1;
+  }
+
+  // The unknown-audio tier is a FALLBACK for the whole result. It may not share
+  // the video ladder with a proven-backed rung, and it may not be used while the
+  // candidates offer ANY proven video fulfilment — advertised or not — because
+  // that is exactly the case in which it must affect no video preset at all.
+  if (unknownAudioVideoPresets > 0) {
+    if (provenVideoPresets > 0) fail();
+    if (buildProvenVideoFulfillments(context.candidates, context).length > 0) fail();
+  }
 }
 
 // ── Sanitization ─────────────────────────────────────────────────────────────
@@ -1601,78 +1853,13 @@ export async function analyzeGenericMediaInternal(
     maxFileSizeBytes: deps.limits.maxFileSizeBytes,
   });
 
-  // Structural assertions on this module's OWN output. These cannot be
-  // triggered by upstream data; they exist so that a future edit which widened
-  // the preset vocabulary or leaked an upstream identifier fails loudly here
-  // rather than silently at the browser.
-  if (presets.length > YTDLP_ANALYSIS_MAX_PRESETS) throw new AppError("EXTRACTION_FAILED");
-  for (const preset of presets) {
-    if (!GENERIC_PRESET_ID_PATTERN.test(preset.id)) throw new AppError("EXTRACTION_FAILED");
-    if (preset.formatId !== preset.id) throw new AppError("EXTRACTION_FAILED");
-    // Every advertised preset must be acquirable. A preset without a private
-    // selection could only fail later, after the user had chosen it.
-    if (!selections[preset.id]) throw new AppError("EXTRACTION_FAILED");
-  }
-  // ...and nothing may be selectable that was never advertised.
-  for (const id of Object.keys(selections)) {
-    if (!presets.some((p) => p.id === id)) throw new AppError("EXTRACTION_FAILED");
-  }
-  // Every preset this analyzer advertises is built on PROVEN audio, so every
-  // private selection behind one must record exactly that. Asserted here rather
-  // than left as a consequence of the candidate filters: an unknown or absent
-  // audio state reaching execution would mean analysis had quietly widened what
-  // the Worker can acquire (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001).
-  //
-  // The check is SHAPE-AWARE, not relaxed. Each form gets the rule that actually
-  // applies to it — a split pair's VIDEO member legitimately records
-  // `audioConstraint: "absent"`, because its audio is proven absent and is
-  // supplied by the other member, while the PAIR as a whole still carries proven
-  // audio.
-  //
-  // Writing this as one flat "every selection has proven audio" check would be
-  // wrong in both directions: it would reject every valid split pair, and the
-  // obvious "fix" for that — dropping the check — would let an unknown-audio
-  // source reach execution unnoticed.
-  for (const value of Object.values(selections)) {
-    if (value.kind === "single") {
-      if (value.source.audioConstraint !== "codec-present" || value.source.hasAudio !== true) {
-        throw new AppError("EXTRACTION_FAILED");
-      }
-      continue;
-    }
-
-    // ── SPLIT (SPLIT-05 §33) ────────────────────────────────────────────────
-    //
-    // SPLIT-01 fail-closed here unconditionally, because no acquisition or merge
-    // path existed. SPLIT-02..04 built that path, so the unconditional rejection
-    // is replaced by the assertions that actually apply to a pair — not removed.
-    //
-    // `GenericSplitSourceSelectionSchema` is invoked rather than re-implemented:
-    // it is the authority on all six pair invariants (video present, video audio
-    // proven absent, audio video proven absent, audio proven present, different
-    // upstream ids, closed container combination), and re-deriving them here
-    // would create a second, driftable copy of the rules.
-    if (!GenericSplitSourceSelectionSchema.safeParse(value.pair).success) {
-      throw new AppError("EXTRACTION_FAILED");
-    }
-
-    // Restated at THIS level, deliberately and narrowly: the two unknown-vs-absent
-    // facts are the ones a future relaxation would be most tempted to soften, and
-    // they are the ones that make a pair a pair rather than a silent substitution
-    // (§29/§30). The container table and the id-difference are left to the schema
-    // alone, which is the only place they are stated.
-    if (value.pair.video.audioConstraint !== "absent") throw new AppError("EXTRACTION_FAILED");
-    if (value.pair.audio.videoConstraint !== "absent") throw new AppError("EXTRACTION_FAILED");
-    if (value.pair.audio.audioConstraint !== "codec-present") {
-      throw new AppError("EXTRACTION_FAILED");
-    }
-
-    // A pair can only be fulfilled by the Worker's OWN FFmpeg. Advertising one
-    // without it would promise a merge nothing can perform (§8). Construction is
-    // already gated on this; asserting it makes the gate a property of the
-    // analyzer's output rather than of one filter inside preset building.
-    if (!ffmpegAvailable) throw new AppError("EXTRACTION_FAILED");
-  }
+  // Structural and shape-aware audio assertions on this module's OWN output,
+  // including the fallback-only rule for the unknown-audio video tier. Any
+  // violation is one canonical EXTRACTION_FAILED; see `assertGenericPresetBuild`.
+  assertGenericPresetBuild(
+    { presets, selections },
+    { candidates, ffmpegAvailable, maxFileSizeBytes: deps.limits.maxFileSizeBytes },
+  );
 
   const video = VideoMetadataSchema.parse({
     title: sanitizeUpstreamText(info.title, YTDLP_ANALYSIS_MAX_TITLE_LENGTH, "Video"),

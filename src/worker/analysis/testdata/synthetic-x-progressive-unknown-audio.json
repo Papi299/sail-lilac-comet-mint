@@ -1,0 +1,69 @@
+{
+  "_type": "video",
+  "title": "SYNTHETIC unknown-audio progressive fixture",
+  "duration": 30,
+  "formats": [
+    {
+      "format_id": "synthetic-hls-audio-a",
+      "ext": "mp4",
+      "protocol": "m3u8_native",
+      "vcodec": "none",
+      "video_ext": "none",
+      "audio_ext": "mp4",
+      "height": null,
+      "width": null
+    },
+    {
+      "format_id": "synthetic-hls-audio-b",
+      "ext": "mp4",
+      "protocol": "m3u8_native",
+      "vcodec": "none",
+      "video_ext": "none",
+      "audio_ext": "mp4",
+      "height": null,
+      "width": null
+    },
+    {
+      "format_id": "synthetic-prog-low",
+      "ext": "mp4",
+      "protocol": "https",
+      "video_ext": "mp4",
+      "audio_ext": "none",
+      "height": 240,
+      "width": 426,
+      "filesize_approx": 1200000
+    },
+    {
+      "format_id": "synthetic-hls-video-low",
+      "ext": "mp4",
+      "protocol": "m3u8_native",
+      "vcodec": "avc1.4D401E",
+      "acodec": "none",
+      "video_ext": "mp4",
+      "audio_ext": "none",
+      "height": 480,
+      "width": 854
+    },
+    {
+      "format_id": "synthetic-prog-high",
+      "ext": "mp4",
+      "protocol": "https",
+      "video_ext": "mp4",
+      "audio_ext": "none",
+      "height": 360,
+      "width": 640,
+      "filesize_approx": 2400000
+    },
+    {
+      "format_id": "synthetic-hls-video-high",
+      "ext": "mp4",
+      "protocol": "m3u8_native",
+      "vcodec": "avc1.64001F",
+      "acodec": "none",
+      "video_ext": "mp4",
+      "audio_ext": "none",
+      "height": 720,
+      "width": 1280
+    }
+  ]
+}
