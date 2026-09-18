@@ -1,0 +1,1159 @@
+[
+ {
+  "name": "case01-deliverable-progressive-ladder",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "p1080",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 1080,
+     "width": 1920,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 40000000
+    },
+    {
+     "format_id": "p2160",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 80000000
+    }
+   ]
+  }
+ },
+ {
+  "name": "case02-clear-hls-above-progressive",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "hls-1080",
+     "ext": "mp4",
+     "protocol": "m3u8_native",
+     "height": 1080,
+     "width": 1920,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    },
+    {
+     "format_id": "hls-2160",
+     "ext": "mp4",
+     "protocol": "m3u8_native",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    },
+    {
+     "format_id": "hls-audio-en",
+     "ext": "mp4",
+     "protocol": "m3u8_native",
+     "vcodec": "none",
+     "acodec": "mp4a.40.2",
+     "video_ext": "none",
+     "audio_ext": "mp4"
+    }
+   ]
+  }
+ },
+ {
+  "name": "case03-segmented-dash-above-progressive",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "dash-video=5000000",
+     "ext": "mp4",
+     "protocol": "http_dash_segments",
+     "height": 1080,
+     "width": 1920,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "none",
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    },
+    {
+     "format_id": "dash-video=16000000",
+     "ext": "mp4",
+     "protocol": "http_dash_segments",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "none",
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    },
+    {
+     "format_id": "dash-audio=128000",
+     "ext": "m4a",
+     "protocol": "http_dash_segments",
+     "vcodec": "none",
+     "acodec": "mp4a.40.2",
+     "video_ext": "none",
+     "audio_ext": "m4a"
+    }
+   ]
+  }
+ },
+ {
+  "name": "case04-unsupported-container",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "orig-mov",
+     "ext": "mov",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mov",
+     "audio_ext": "none"
+    },
+    {
+     "format_id": "mov-shape",
+     "ext": "mov",
+     "protocol": "https",
+     "height": 1440,
+     "width": 2560,
+     "fps": 30,
+     "vcodec": null,
+     "acodec": null,
+     "video_ext": "mov",
+     "audio_ext": "none"
+    }
+   ]
+  }
+ },
+ {
+  "name": "case05-split-pair-unsupported",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "v2160",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "none",
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    },
+    {
+     "format_id": "opus-251",
+     "ext": "webm",
+     "protocol": "https",
+     "vcodec": "none",
+     "acodec": "opus",
+     "video_ext": "none",
+     "audio_ext": "webm"
+    }
+   ]
+  }
+ },
+ {
+  "name": "case05b-audio-pair-unavailable",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "v2160",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "none",
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    }
+   ]
+  }
+ },
+ {
+  "name": "case05c-no-worker-merge",
+  "ffmpegAvailable": false,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "v2160",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "none",
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    },
+    {
+     "format_id": "m4a-140",
+     "ext": "m4a",
+     "protocol": "https",
+     "vcodec": "none",
+     "acodec": "mp4a.40.2",
+     "video_ext": "none",
+     "audio_ext": "m4a"
+    }
+   ]
+  }
+ },
+ {
+  "name": "case06-size-declared-over-limit",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "p2160",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 5368709120
+    }
+   ]
+  }
+ },
+ {
+  "name": "case06b-size-estimated-over-limit",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "p2160",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize_approx": 5368709120
+    }
+   ]
+  }
+ },
+ {
+  "name": "case06c-pair-size-over-limit",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "v2160",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "none",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 3221225472
+    },
+    {
+     "format_id": "m4a-140",
+     "ext": "m4a",
+     "protocol": "https",
+     "vcodec": "none",
+     "acodec": "mp4a.40.2",
+     "video_ext": "none",
+     "audio_ext": "m4a",
+     "filesize": 2147483648
+    }
+   ]
+  }
+ },
+ {
+  "name": "case08-protected-unenumerated",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p480",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 480,
+     "width": 853,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    }
+   ],
+   "_has_drm": true
+  }
+ },
+ {
+  "name": "case09-maybe-protected-surviving",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000,
+     "has_drm": "maybe"
+    }
+   ]
+  }
+ },
+ {
+  "name": "case10-unknown-audio-suppressed",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "u2160",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": null,
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    }
+   ]
+  }
+ },
+ {
+  "name": "case10b-unknown-audio-suppressed-key-absent",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "u2160",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    }
+   ]
+  }
+ },
+ {
+  "name": "case11-not-selected-within-rung",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "h2160",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 80000000
+    },
+    {
+     "format_id": "av1-4320",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 4320,
+     "width": 7680,
+     "fps": 30,
+     "vcodec": "av01.0.16M.08",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 160000000
+    },
+    {
+     "format_id": "h1080",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 1080,
+     "width": 1920,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 40000000
+    },
+    {
+     "format_id": "vp9-1080",
+     "ext": "webm",
+     "protocol": "https",
+     "height": 1080,
+     "width": 1920,
+     "fps": 30,
+     "vcodec": "vp9",
+     "acodec": "opus",
+     "video_ext": "webm",
+     "audio_ext": "none",
+     "filesize": 60000000
+    }
+   ]
+  }
+ },
+ {
+  "name": "case12-unsafe-selector-identity",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "http 1080/a",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 1080,
+     "width": 1920,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 40000000
+    }
+   ]
+  }
+ },
+ {
+  "name": "case13-contradictory-stream-shape",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "x1080",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 1080,
+     "width": 1920,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "none",
+     "audio_ext": "none",
+     "filesize": 40000000
+    }
+   ]
+  }
+ },
+ {
+  "name": "case14-junk-rows-never-observed",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "sb0",
+     "ext": "mhtml",
+     "protocol": "mhtml",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "none",
+     "acodec": "none",
+     "video_ext": "none",
+     "audio_ext": "none",
+     "format_note": "storyboard"
+    },
+    {
+     "format_id": "img",
+     "ext": "jpg",
+     "protocol": "https",
+     "height": 4320,
+     "width": 7680,
+     "fps": 30,
+     "vcodec": null,
+     "acodec": null,
+     "video_ext": "jpg",
+     "audio_ext": "none"
+    },
+    {
+     "format_id": "m4a-tall",
+     "ext": "m4a",
+     "protocol": "https",
+     "vcodec": "none",
+     "acodec": "mp4a.40.2",
+     "video_ext": "none",
+     "audio_ext": "m4a",
+     "height": 9999
+    }
+   ]
+  }
+ },
+ {
+  "name": "case15-split-ladder",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "18",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 360,
+     "width": 640,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "136",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "none",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "137",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 1080,
+     "width": 1920,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "none",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 40000000
+    },
+    {
+     "format_id": "400",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 1440,
+     "width": 2560,
+     "fps": 30,
+     "vcodec": "av01.0.12M.08",
+     "acodec": "none",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 60000000
+    },
+    {
+     "format_id": "401",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "av01.0.12M.08",
+     "acodec": "none",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 100000000
+    },
+    {
+     "format_id": "248",
+     "ext": "webm",
+     "protocol": "https",
+     "height": 1080,
+     "width": 1920,
+     "fps": 30,
+     "vcodec": "vp9",
+     "acodec": "none",
+     "video_ext": "webm",
+     "audio_ext": "none",
+     "filesize": 40000000
+    },
+    {
+     "format_id": "313",
+     "ext": "webm",
+     "protocol": "https",
+     "height": 2160,
+     "width": 3840,
+     "fps": 30,
+     "vcodec": "vp9",
+     "acodec": "none",
+     "video_ext": "webm",
+     "audio_ext": "none",
+     "filesize": 120000000
+    },
+    {
+     "format_id": "140",
+     "ext": "m4a",
+     "protocol": "https",
+     "vcodec": "none",
+     "acodec": "mp4a.40.2",
+     "video_ext": "none",
+     "audio_ext": "m4a",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "251",
+     "ext": "webm",
+     "protocol": "https",
+     "vcodec": "none",
+     "acodec": "opus",
+     "video_ext": "none",
+     "audio_ext": "webm",
+     "filesize": 20000000
+    }
+   ]
+  }
+ },
+ {
+  "name": "case16-unknown-height-not-selected",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "nh",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": null,
+     "width": null,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    }
+   ]
+  }
+ },
+ {
+  "name": "case17-unknown-tier-when-merge-unavailable",
+  "ffmpegAvailable": false,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "v1080",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 1080,
+     "width": 1920,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "none",
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    },
+    {
+     "format_id": "m4a-140",
+     "ext": "m4a",
+     "protocol": "https",
+     "vcodec": "none",
+     "acodec": "mp4a.40.2",
+     "video_ext": "none",
+     "audio_ext": "m4a"
+    },
+    {
+     "format_id": "u480",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 480,
+     "width": 853,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": null,
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    }
+   ]
+  }
+ },
+ {
+  "name": "case18-hostile-height-not-a-fact",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "hls-huge",
+     "ext": "mp4",
+     "protocol": "m3u8_native",
+     "height": 99999,
+     "width": 177776,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none"
+    }
+   ]
+  }
+ },
+ {
+  "name": "case19-protocol-missing",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "p720",
+     "ext": "mp4",
+     "protocol": "https",
+     "height": 720,
+     "width": 1280,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 20000000
+    },
+    {
+     "format_id": "noproto",
+     "ext": "mp4",
+     "height": 1080,
+     "width": 1920,
+     "fps": 30,
+     "vcodec": "avc1.640028",
+     "acodec": "mp4a.40.2",
+     "video_ext": "mp4",
+     "audio_ext": "none",
+     "filesize": 40000000
+    }
+   ]
+  }
+ },
+ {
+  "name": "case20-audio-only-result",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "document": {
+   "_type": "video",
+   "title": "Synthetic inventory scenario",
+   "duration": 120,
+   "live_status": "not_live",
+   "formats": [
+    {
+     "format_id": "m4a-140",
+     "ext": "m4a",
+     "protocol": "https",
+     "vcodec": "none",
+     "acodec": "mp4a.40.2",
+     "video_ext": "none",
+     "audio_ext": "m4a",
+     "filesize": 20000000
+    }
+   ]
+  }
+ },
+ {
+  "name": "case07-pinned-generic-html5-no-audio-codec-ffmpeg",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "fixture": "pinned-generic-html5-no-audio-codec.json"
+ },
+ {
+  "name": "case07-pinned-generic-html5-no-audio-codec-no-ffmpeg",
+  "ffmpegAvailable": false,
+  "maxFileSizeBytes": 4294967296,
+  "fixture": "pinned-generic-html5-no-audio-codec.json"
+ },
+ {
+  "name": "x-synthetic-x-progressive-unknown-audio-ffmpeg",
+  "ffmpegAvailable": true,
+  "maxFileSizeBytes": 4294967296,
+  "fixture": "synthetic-x-progressive-unknown-audio.json"
+ },
+ {
+  "name": "x-synthetic-x-progressive-unknown-audio-no-ffmpeg",
+  "ffmpegAvailable": false,
+  "maxFileSizeBytes": 4294967296,
+  "fixture": "synthetic-x-progressive-unknown-audio.json"
+ }
+]

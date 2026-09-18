@@ -95,6 +95,49 @@ Safe for transmission to Vercel. When ready, it contains:
 
 **Important:** `objectKey` travels from the Worker to the authenticated Vercel control plane, but it MUST NOT appear in the browser-facing/public VideoFetch job DTO. Vercel strictly strips `objectKey` before returning the public response to the browser.
 
+**3. `VideoMetadata.sourceQuality` (OPTIONAL; analysis only)**
+
+`GENERIC-SOURCE-RENDITION-INVENTORY-001` — **IMPLEMENTED IN SOURCE — NOT DEPLOYED.**
+
+Generic analysis reports what one run OBSERVED against what it can DELIVER, so a
+lower rendition is never presented as the source maximum:
+
+- `observedMaxHeight` — the tallest video rendition observed in that run's
+  sanitized inventory, deliverable or not. It is **not** a claim about the
+  provider's absolute maximum: renditions stripped for DRM, visible only to an
+  authenticated session, or offered through a provider-only download path are
+  not observed, and metadata without a height is not a height.
+- `deliverableMaxHeight` — the tallest source height behind an advertised video
+  preset, by the rendition's own height rather than its rung label.
+- `withheld[]` — observed video renditions that are not delivered, aggregated by
+  a closed reason vocabulary (`unsupported_protocol`, `unsupported_container`,
+  `unsupported_stream_shape`, `unsafe_selector_identity`, `size_limit_exceeded`,
+  `audio_pair_unavailable`, `split_pair_unsupported`, `fallback_suppressed`,
+  `not_selected`, `protected`, `other_unsupported`) with a count and the tallest
+  height per reason. No upstream identifier, protocol string, URL or message
+  appears in it.
+- `protectedUnenumerated` — the extractor reported that protected renditions
+  existed and were removed before their qualities were listed. It never implies
+  a height.
+- `maybeProtectedObserved` — a surviving rendition carried the upstream
+  "maybe protected" marker. Delivery is unaffected by it.
+
+The field is INFORMATIONAL. Nothing selects, plans, or acquires from it; HLS and
+segmented-DASH renditions appear in it and remain non-executable. Direct
+analysis omits the field, which is why it is optional.
+
+**Deployment order — VERCEL FIRST.** `VideoMetadataSchema` is strict, so a
+control plane that predates this field REJECTS a Worker response that carries it
+(`PROCESSING_FAILED`), while the new control plane accepts a Worker that omits
+it. The rollout is therefore:
+
+1. deploy the control plane containing the optional field, and verify the
+   currently live Worker still analyzes and downloads through it;
+2. build and accept a Worker candidate from that same source;
+3. only then promote the Worker.
+
+Neither step has been performed: this contract change exists in source only.
+
 ---
 
 ## Job-Create Idempotency

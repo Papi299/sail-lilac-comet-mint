@@ -7,8 +7,12 @@ import {
   type RunResult,
 } from "../../services/processing/process-runner.server.ts";
 import {
+  SOURCE_QUALITY_MAX_HEIGHT,
+  SOURCE_QUALITY_WITHHELD_REASONS,
   VideoMetadataSchema,
   WorkerAnalyzeRequestSchema,
+  type SourceQuality,
+  type SourceQualityWithheldReason,
   type WorkerQualityPreset,
   type WorkerVideoMetadata,
 } from "../../shared/worker/contracts.ts";
@@ -432,6 +436,19 @@ const RawFormatSchema = z.object({
    * against a stated `vcodec` fail closed (§7).
    */
   video_ext: z.string().nullish(),
+  /**
+   * The upstream per-format protection marker, read for the rendition
+   * inventory ONLY (GENERIC-SOURCE-RENDITION-INVENTORY-001).
+   *
+   * Declared as `unknown` so that no value can make parsing fail: before this
+   * field was read, Zod stripped it, and a document must not become invalid
+   * merely because the inventory now looks at it. Only the exact string
+   * `"maybe"` means anything, and nothing on the acquisition side reads it.
+   * The pinned runtime REMOVES formats whose marker is otherwise truthy before
+   * `-J` prints (`YoutubeDL.py` `process_video_result`), so "maybe" is the only
+   * value a surviving format carries.
+   */
+  has_drm: z.unknown().optional(),
 });
 type RawFormat = z.infer<typeof RawFormatSchema>;
 
@@ -455,6 +472,13 @@ const RawInfoSchema = z.object({
   entries: z.unknown().optional(),
   formats: z.array(RawFormatSchema).nullish(),
   ext: z.string().nullish(),
+  /**
+   * The pinned runtime's own record that protected formats EXISTED and were
+   * removed before `-J` printed (`info_dict['_has_drm']`, `True` or `None`).
+   * `unknown` for the same reason as the per-format `has_drm`; only an exact
+   * `true` means anything, and it states existence, never a quality.
+   */
+  _has_drm: z.unknown().optional(),
 });
 type RawInfo = z.infer<typeof RawInfoSchema>;
 
@@ -732,122 +756,184 @@ export function normalizeCodecName(codec: string | null | undefined): string | n
  * video shape makes the whole format ineligible rather than being downgraded to
  * a weaker claim, because a claim the acquisition selector cannot re-select is
  * a preset that fails after the user has already chosen it.
+ *
+ * Each format is judged by `evaluateRawFormat`, which also reports WHICH gate
+ * refused it so the rendition inventory can account for it. This function keeps
+ * only the accepted candidates; the accept/reject decision is the evaluator's
+ * alone, so the two cannot drift apart.
  */
 export function selectCandidates(
   formats: readonly RawFormat[],
   limits: { readonly maxFileSizeBytes: number },
 ): Candidate[] {
+  return acceptedCandidates(evaluateRawFormats(formats, limits));
+}
+
+/**
+ * The gate that refused one raw format, in the order the gates run. PRIVATE:
+ * it feeds the rendition inventory, whose public summary maps it onto the
+ * closed withheld-reason vocabulary. The first failing gate is the one reported.
+ */
+export type CandidateRejection =
+  | "protocol-missing"
+  | "protocol-unsupported"
+  | "unsafe-format-id"
+  | "non-media-note"
+  | "video-shape-contradiction"
+  | "video-shape-unestablished"
+  | "no-stream"
+  | "container-not-allowed"
+  | "size-over-limit";
+
+export type FormatEvaluation =
+  | { readonly ok: true; readonly candidate: Candidate }
+  | { readonly ok: false; readonly rejection: CandidateRejection };
+
+/** One evaluation per raw format, index-aligned with `formats`. */
+export function evaluateRawFormats(
+  formats: readonly RawFormat[],
+  limits: { readonly maxFileSizeBytes: number },
+): FormatEvaluation[] {
+  return formats.map((raw, index) => evaluateRawFormat(raw, index, limits));
+}
+
+function acceptedCandidates(evaluations: readonly FormatEvaluation[]): Candidate[] {
   const out: Candidate[] = [];
-  formats.forEach((raw, index) => {
-    const protocol = typeof raw.protocol === "string" ? raw.protocol.toLowerCase() : null;
-    if (protocol === null) return;
-    if (!(YTDLP_V1_NATIVE_PROTOCOLS as readonly string[]).includes(protocol)) return;
+  for (const evaluation of evaluations) {
+    if (evaluation.ok) out.push(evaluation.candidate);
+  }
+  return out;
+}
 
-    // §11: a candidate whose upstream identifier does not satisfy the approved
-    // literal grammar is NOT executable, so it must not be advertised either.
-    // Advertising a preset the download path would refuse to acquire would move
-    // the failure from analysis (where it is one clear FORMAT_UNAVAILABLE) to
-    // mid-job, after the user already chose it.
-    if (!isSafeFormatId(raw.format_id)) return;
-    const formatId = raw.format_id;
+/** The storyboard / preview-image rule, shared with the rendition inventory. */
+function isNonMediaNote(raw: RawFormat): boolean {
+  const note = (raw.format_note ?? "").toLowerCase();
+  return note.includes("storyboard") || note.includes("preview image");
+}
 
-    const note = (raw.format_note ?? "").toLowerCase();
-    if (note.includes("storyboard") || note.includes("preview image")) return;
+/**
+ * Judges ONE raw format against every eligibility gate of `selectCandidates`,
+ * in order, returning the approved candidate or the first gate that refused it.
+ */
+function evaluateRawFormat(
+  raw: RawFormat,
+  index: number,
+  limits: { readonly maxFileSizeBytes: number },
+): FormatEvaluation {
+  const reject = (rejection: CandidateRejection): FormatEvaluation => ({ ok: false, rejection });
+  const protocol = typeof raw.protocol === "string" ? raw.protocol.toLowerCase() : null;
+  if (protocol === null) return reject("protocol-missing");
+  if (!(YTDLP_V1_NATIVE_PROTOCOLS as readonly string[]).includes(protocol)) {
+    return reject("protocol-unsupported");
+  }
 
-    // ── Audio presence ───────────────────────────────────────────────────
-    //
-    // `acodec` is the SOLE authority (§5). `audio_ext` takes no part, in either
-    // direction, because `_fill_sorting_fields` in the pinned release sets it
-    // to "none" on EVERY format whose `vcodec != "none"`:
-    //
-    //     else:
-    //         format['video_ext'] = format['ext']
-    //         format['audio_ext'] = 'none'
-    //
-    // It is a sorting/container helper, not a muxed-audio-presence flag. Gating
-    // on it made `hasVideo && hasAudio` structurally impossible for real output
-    // from ANY site, so no generic video preset could ever be built (§D1).
-    //
-    // The three states survive as they are. `hasAudio` is the NARROWER
-    // statement — audio is PROVEN — so unknown is `false` there while staying
-    // `unknown` in the private constraint; it is never rewritten as absent to
-    // fit the boolean. Nothing correlational (container, `tbr`, `abr`, `asr`,
-    // `audio_channels`, `format_note`) substitutes for a present `acodec`.
-    const audioConstraint = toAudioConstraint(classifyCodecState(raw.acodec));
-    const hasAudio = audioConstraint === "codec-present";
+  // §11: a candidate whose upstream identifier does not satisfy the approved
+  // literal grammar is NOT executable, so it must not be advertised either.
+  // Advertising a preset the download path would refuse to acquire would move
+  // the failure from analysis (where it is one clear FORMAT_UNAVAILABLE) to
+  // mid-job, after the user already chose it.
+  if (!isSafeFormatId(raw.format_id)) return reject("unsafe-format-id");
+  const formatId = raw.format_id;
 
-    // ── Video presence ───────────────────────────────────────────────────
-    //
-    // Three inputs, in decreasing order of authority: the codec state, the
-    // normalized `video_ext` shape, and the source `ext`. A candidate becomes
-    // executable only when they agree; where they contradict each other the
-    // format is refused outright rather than resolved in whichever direction
-    // happens to make it usable (§7).
-    const videoState = classifyCodecState(raw.vcodec);
-    const sourceExt = normalizeExtField(raw.ext);
-    const videoExt = normalizeExtField(raw.video_ext);
+  if (isNonMediaNote(raw)) return reject("non-media-note");
 
-    let videoConstraint: GenericVideoConstraint;
-    if (videoState === "present") {
-      // A named video codec alongside `video_ext: "none"` is a contradiction:
-      // one field says the stream exists, the other says the normalized shape
-      // has no video part. Neither may be preferred over the other.
-      if (videoExt === "none") return;
-      videoConstraint = "codec-present";
-    } else if (videoState === "absent") {
-      // Proven audio-only. `video_ext` may be absent (hand-written documents)
-      // or "none" (real pinned output); anything else contradicts `vcodec`.
-      if (videoExt !== null && videoExt !== "none") return;
-      videoConstraint = "absent";
-    } else {
-      // UNKNOWN codec identity. Do NOT invent a codec, and do NOT read this as
-      // absence. Video may be established here only from coherent source-shape
-      // evidence (§6): `video_ext` must be a real container, it must equal the
-      // source `ext`, and that container must be in the generic VIDEO
-      // allowlist. This is the pinned Generic HTML5 case, where
-      // `_parse_html5_media_entries` clobbers the parsed `vcodec` with `None`
-      // via `f.update(formats[0])` (§D2).
-      const coherent =
-        videoExt !== null &&
-        videoExt !== "none" &&
-        sourceExt !== null &&
-        videoExt === sourceExt &&
-        (GENERIC_VIDEO_SOURCE_CONTAINERS as readonly string[]).includes(sourceExt);
-      // Without that evidence the video shape is simply not established. It is
-      // NOT downgraded to `absent`: claiming absence would emit a
-      // `[vcodec="none"]` constraint that the real (null-vcodec) format could
-      // never satisfy, so the Worker would advertise a preset acquisition is
-      // guaranteed to fail on. Refusing the candidate is the honest outcome
-      // and keeps "advertise only what can actually be acquired" true (§8).
-      if (!coherent) return;
-      videoConstraint = "video-ext";
+  // ── Audio presence ───────────────────────────────────────────────────
+  //
+  // `acodec` is the SOLE authority (§5). `audio_ext` takes no part, in either
+  // direction, because `_fill_sorting_fields` in the pinned release sets it
+  // to "none" on EVERY format whose `vcodec != "none"`:
+  //
+  //     else:
+  //         format['video_ext'] = format['ext']
+  //         format['audio_ext'] = 'none'
+  //
+  // It is a sorting/container helper, not a muxed-audio-presence flag. Gating
+  // on it made `hasVideo && hasAudio` structurally impossible for real output
+  // from ANY site, so no generic video preset could ever be built (§D1).
+  //
+  // The three states survive as they are. `hasAudio` is the NARROWER
+  // statement — audio is PROVEN — so unknown is `false` there while staying
+  // `unknown` in the private constraint; it is never rewritten as absent to
+  // fit the boolean. Nothing correlational (container, `tbr`, `abr`, `asr`,
+  // `audio_channels`, `format_note`) substitutes for a present `acodec`.
+  const audioConstraint = toAudioConstraint(classifyCodecState(raw.acodec));
+  const hasAudio = audioConstraint === "codec-present";
+
+  // ── Video presence ───────────────────────────────────────────────────
+  //
+  // Three inputs, in decreasing order of authority: the codec state, the
+  // normalized `video_ext` shape, and the source `ext`. A candidate becomes
+  // executable only when they agree; where they contradict each other the
+  // format is refused outright rather than resolved in whichever direction
+  // happens to make it usable (§7).
+  const videoState = classifyCodecState(raw.vcodec);
+  const sourceExt = normalizeExtField(raw.ext);
+  const videoExt = normalizeExtField(raw.video_ext);
+
+  let videoConstraint: GenericVideoConstraint;
+  if (videoState === "present") {
+    // A named video codec alongside `video_ext: "none"` is a contradiction:
+    // one field says the stream exists, the other says the normalized shape
+    // has no video part. Neither may be preferred over the other.
+    if (videoExt === "none") return reject("video-shape-contradiction");
+    videoConstraint = "codec-present";
+  } else if (videoState === "absent") {
+    // Proven audio-only. `video_ext` may be absent (hand-written documents)
+    // or "none" (real pinned output); anything else contradicts `vcodec`.
+    if (videoExt !== null && videoExt !== "none") return reject("video-shape-contradiction");
+    videoConstraint = "absent";
+  } else {
+    // UNKNOWN codec identity. Do NOT invent a codec, and do NOT read this as
+    // absence. Video may be established here only from coherent source-shape
+    // evidence (§6): `video_ext` must be a real container, it must equal the
+    // source `ext`, and that container must be in the generic VIDEO
+    // allowlist. This is the pinned Generic HTML5 case, where
+    // `_parse_html5_media_entries` clobbers the parsed `vcodec` with `None`
+    // via `f.update(formats[0])` (§D2).
+    const shaped =
+      videoExt !== null && videoExt !== "none" && sourceExt !== null && videoExt === sourceExt;
+    // Without that evidence the video shape is simply not established. It is
+    // NOT downgraded to `absent`: claiming absence would emit a
+    // `[vcodec="none"]` constraint that the real (null-vcodec) format could
+    // never satisfy, so the Worker would advertise a preset acquisition is
+    // guaranteed to fail on. Refusing the candidate is the honest outcome
+    // and keeps "advertise only what can actually be acquired" true (§8).
+    // A coherent shape in a container outside the allowlist is refused just the
+    // same; it is reported apart only so the inventory can name the container.
+    if (!shaped) return reject("video-shape-unestablished");
+    if (!(GENERIC_VIDEO_SOURCE_CONTAINERS as readonly string[]).includes(sourceExt)) {
+      return reject("container-not-allowed");
     }
+    videoConstraint = "video-ext";
+  }
 
-    const hasVideo = videoConstraint !== "absent";
-    if (!hasVideo && !hasAudio) return;
+  const hasVideo = videoConstraint !== "absent";
+  if (!hasVideo && !hasAudio) return reject("no-stream");
 
-    // §15: the source container comes from a closed allowlist, chosen by stream
-    // shape, and an unknown or absent extension is a REJECTION rather than a
-    // silent default to mp4. The value becomes a real file suffix, a MIME
-    // decision and an `[ext=...]` selector constraint, so guessing it would
-    // make all three wrong at once. This also subsumes the old non-media
-    // extension denylist: storyboards, images and subtitle tracks simply are
-    // not in the allowlist.
-    const container = toGenericSourceContainer(raw.ext, { hasVideo });
-    if (container === null) return;
+  // §15: the source container comes from a closed allowlist, chosen by stream
+  // shape, and an unknown or absent extension is a REJECTION rather than a
+  // silent default to mp4. The value becomes a real file suffix, a MIME
+  // decision and an `[ext=...]` selector constraint, so guessing it would
+  // make all three wrong at once. This also subsumes the old non-media
+  // extension denylist: storyboards, images and subtitle tracks simply are
+  // not in the allowlist.
+  const container = toGenericSourceContainer(raw.ext, { hasVideo });
+  if (container === null) return reject("container-not-allowed");
 
-    // A known size already over the limit must not be advertised. An UNKNOWN
-    // size is not a rejection: the download path enforces an actual byte limit
-    // independently, and metadata size is not a security boundary.
-    const fileSize =
-      typeof raw.filesize === "number" && raw.filesize > 0
-        ? raw.filesize
-        : typeof raw.filesize_approx === "number" && raw.filesize_approx > 0
-          ? raw.filesize_approx
-          : null;
-    if (fileSize !== null && fileSize > limits.maxFileSizeBytes) return;
+  // A known size already over the limit must not be advertised. An UNKNOWN
+  // size is not a rejection: the download path enforces an actual byte limit
+  // independently, and metadata size is not a security boundary.
+  const fileSize =
+    typeof raw.filesize === "number" && raw.filesize > 0
+      ? raw.filesize
+      : typeof raw.filesize_approx === "number" && raw.filesize_approx > 0
+        ? raw.filesize_approx
+        : null;
+  if (fileSize !== null && fileSize > limits.maxFileSizeBytes) return reject("size-over-limit");
 
-    out.push({
+  return {
+    ok: true,
+    candidate: {
       hasVideo,
       hasAudio,
       height: typeof raw.height === "number" && raw.height > 0 ? Math.floor(raw.height) : null,
@@ -861,9 +947,8 @@ export function selectCandidates(
       videoConstraint,
       audioConstraint,
       index,
-    });
-  });
-  return out;
+    },
+  };
 }
 
 /**
@@ -1119,10 +1204,10 @@ function isUnknownAudioVideoCandidate(c: Candidate): boolean {
  * which video rung the user picked, which is per-preset source substitution by
  * another name.
  */
-function buildProvenVideoFulfillments(
+function planProvenVideoFulfillments(
   candidates: readonly Candidate[],
   opts: { readonly ffmpegAvailable: boolean; readonly maxFileSizeBytes: number },
-): VideoFulfillment[] {
+): ProvenVideoPlan {
   // Muxed single-source video candidates only — video plus PROVEN audio. An
   // unknown-audio candidate is not muxed as far as advertising is concerned.
   const muxedVideo = candidates.filter(isMuxedVideoCandidate);
@@ -1135,7 +1220,13 @@ function buildProvenVideoFulfillments(
     fileSize: c.fileSize,
   }));
 
-  if (!opts.ffmpegAvailable) return fulfillments;
+  const shortfalls = new Map<Candidate, SplitShortfall>();
+  const splitVideo = candidates.filter(isSplitVideoCandidate);
+
+  if (!opts.ffmpegAvailable) {
+    for (const video of splitVideo) shortfalls.set(video, "no-merge");
+    return { fulfillments, shortfalls };
+  }
 
   // The ONE partner per family, chosen once, by the existing deterministic
   // candidate ranking. Keyed by the VIDEO container it serves.
@@ -1146,23 +1237,35 @@ function buildProvenVideoFulfillments(
     if (partner) partners.set(family.video, partner);
   }
 
-  for (const video of candidates.filter(isSplitVideoCandidate)) {
+  for (const video of splitVideo) {
     const audio = partners.get(video.container);
-    if (!audio) continue;
+    if (!audio) {
+      shortfalls.set(video, "no-partner");
+      continue;
+    }
 
     // The target is derived from the closed table and from nowhere else, so a
     // family row that drifted from the table produces no pair rather than a
     // pair with an invented target (§19).
     const targetContainer = splitTargetContainer(video.container, audio.container);
-    if (targetContainer === null) continue;
+    if (targetContainer === null) {
+      shortfalls.set(video, "pair-invalid");
+      continue;
+    }
 
     const size = pairKnownSize(video, audio, opts.maxFileSizeBytes);
-    if (!size.advertisable) continue;
+    if (!size.advertisable) {
+      shortfalls.set(video, "pair-size");
+      continue;
+    }
 
     // The schema is the last word. A rejection reduces capability; it is never
     // caught and worked around (§11).
     const source = toSplitSource(video, audio);
-    if (source === null) continue;
+    if (source === null) {
+      shortfalls.set(video, "pair-invalid");
+      continue;
+    }
 
     fulfillments.push({
       kind: "split",
@@ -1174,7 +1277,32 @@ function buildProvenVideoFulfillments(
     });
   }
 
-  return fulfillments;
+  return { fulfillments, shortfalls };
+}
+
+/**
+ * Why a proven-video-only candidate yielded NO split fulfilment. PRIVATE, read
+ * only by the rendition inventory; recording it changes no fulfilment.
+ *
+ *   no-merge      Worker FFmpeg is unavailable, so no pair is built at all;
+ *   no-partner    no proven audio-only candidate in this video's family;
+ *   pair-size     the pair's known combined size is over the limit;
+ *   pair-invalid  the closed table or the pair schema refused the pair.
+ */
+type SplitShortfall = "no-merge" | "no-partner" | "pair-size" | "pair-invalid";
+
+/** The proven tier, plus why each proven-video-only candidate did not pair. */
+type ProvenVideoPlan = {
+  readonly fulfillments: VideoFulfillment[];
+  readonly shortfalls: ReadonlyMap<Candidate, SplitShortfall>;
+};
+
+/** The proven tier's fulfilments alone, for callers that need nothing else. */
+function buildProvenVideoFulfillments(
+  candidates: readonly Candidate[],
+  opts: { readonly ffmpegAvailable: boolean; readonly maxFileSizeBytes: number },
+): VideoFulfillment[] {
+  return planProvenVideoFulfillments(candidates, opts).fulfillments;
 }
 
 /**
@@ -1203,21 +1331,28 @@ function buildProvenVideoFulfillments(
  * candidate is single with a null audio codec, so ranking is exactly the
  * existing single-source video ranking; nothing site-specific is added.
  */
-function selectVideoFulfillments(
+function planVideoFulfillments(
   candidates: readonly Candidate[],
   opts: { readonly ffmpegAvailable: boolean; readonly maxFileSizeBytes: number },
-): VideoFulfillment[] {
-  const proven = buildProvenVideoFulfillments(candidates, opts);
-  if (proven.length > 0) return proven;
+): VideoFulfillmentPlan {
+  const proven = planProvenVideoFulfillments(candidates, opts);
+  if (proven.fulfillments.length > 0) return { tier: "proven", ...proven };
 
-  return candidates.filter(isUnknownAudioVideoCandidate).map((c) => ({
-    kind: "single",
-    video: c,
-    source: toSingleSource(c),
-    targetContainer: c.container,
-    fileSize: c.fileSize,
-  }));
+  return {
+    tier: "unknown",
+    shortfalls: proven.shortfalls,
+    fulfillments: candidates.filter(isUnknownAudioVideoCandidate).map((c) => ({
+      kind: "single",
+      video: c,
+      source: toSingleSource(c),
+      targetContainer: c.container,
+      fileSize: c.fileSize,
+    })),
+  };
 }
+
+/** The tier the whole result advertises from, and its fulfilments. */
+type VideoFulfillmentPlan = ProvenVideoPlan & { readonly tier: "proven" | "unknown" };
 
 /**
  * The result of preset construction: the browser-safe presets, plus the PRIVATE
@@ -1264,7 +1399,7 @@ export type GenericPresetBuild = {
  * (GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001, §29).
  *
  * It MAY back an ordinary VIDEO preset as a whole-result FALLBACK tier, used
- * only when no proven video fulfilment exists (see `selectVideoFulfillments`;
+ * only when no proven video fulfilment exists (see `planVideoFulfillments`;
  * GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001). Such a preset states
  * `hasAudio: false` and `audioCodec: null`, which for a generic preset means
  * "audio is not proven", never "audio is proven absent"; the private selection
@@ -1281,6 +1416,25 @@ export function buildGenericPresets(
   candidates: readonly Candidate[],
   opts: { readonly ffmpegAvailable: boolean; readonly maxFileSizeBytes: number },
 ): GenericPresetBuild {
+  const { presets, selections } = constructGenericPresets(candidates, opts);
+  return { presets, selections };
+}
+
+/**
+ * `buildGenericPresets`, plus the PRIVATE provenance the rendition inventory
+ * reads: which candidates back an advertised VIDEO preset, and the fulfilment
+ * plan (tier and split shortfalls) the presets were built from. It is the one
+ * construction; nothing here is re-derived for the inventory.
+ */
+type GenericPresetConstruction = GenericPresetBuild & {
+  readonly advertisedVideo: ReadonlySet<Candidate>;
+  readonly videoPlan: VideoFulfillmentPlan;
+};
+
+function constructGenericPresets(
+  candidates: readonly Candidate[],
+  opts: { readonly ffmpegAvailable: boolean; readonly maxFileSizeBytes: number },
+): GenericPresetConstruction {
   const presets: WorkerQualityPreset[] = [];
   // PRIVATE, and parallel to `presets` by construction: every preset pushed
   // below records the exact candidate it was derived from, in the same step.
@@ -1296,14 +1450,19 @@ export function buildGenericPresets(
   // Every advertisable video rendition of the ONE tier this result uses: muxed
   // and split alike, ranked together — or, only when neither exists, the
   // unknown-audio singles.
-  const videoFulfillments = selectVideoFulfillments(candidates, opts);
+  const videoPlan = planVideoFulfillments(candidates, opts);
+  const videoFulfillments = videoPlan.fulfillments;
+
+  // PRIVATE: the video half of every fulfilment an advertised video preset
+  // names. Recorded in the same step as the selection, like it.
+  const advertisedVideo = new Set<Candidate>();
 
   const videoPreset = (
     id: string,
     label: string,
     resolution: string | null,
     f: VideoFulfillment,
-  ): WorkerQualityPreset => ((selections[id] = f.source), {
+  ): WorkerQualityPreset => ((selections[id] = f.source), advertisedVideo.add(f.video), {
     id,
     label,
     resolution,
@@ -1429,7 +1588,7 @@ export function buildGenericPresets(
     }
   }
 
-  return { presets, selections };
+  return { presets, selections, advertisedVideo, videoPlan };
 }
 
 /**
@@ -1578,6 +1737,355 @@ export function assertGenericPresetBuild(
     if (provenVideoPresets > 0) fail();
     if (buildProvenVideoFulfillments(context.candidates, context).length > 0) fail();
   }
+}
+
+// ── Rendition inventory (GENERIC-SOURCE-RENDITION-INVENTORY-001) ─────────────
+//
+// Everything above decides what VideoFetch ADVERTISES, and a format that fails
+// a gate simply disappears. The inventory keeps a bounded record of every
+// VIDEO-LIKE format it observed and of the one boundary that kept it from being
+// delivered, so the public summary can say "2160p was observed, 720p is
+// deliverable" instead of presenting 720p as the best there is.
+//
+// It OBSERVES and CLASSIFIES only. It reads the same evaluations and the same
+// construction the presets came from, it never feeds a preset, a selection or a
+// plan, and it is transient: summarized into `sourceQuality`, then dropped.
+
+/**
+ * Containers the inventory accepts as VIDEO evidence when a format names no
+ * video codec. An OBSERVATION vocabulary, deliberately wider than the generic
+ * acquisition allowlist: a `mov` rendition is observed here and then withheld
+ * as an unsupported container. Widening it changes what is reported, never
+ * what is acquired.
+ */
+const OBSERVED_VIDEO_CONTAINERS = Object.freeze([
+  "mp4", "m4v", "webm", "mov", "mkv", "flv", "f4v", "3gp",
+  "ts", "m2ts", "mts", "avi", "ogv", "wmv", "mpg", "mpeg",
+] as const);
+type ObservedVideoContainer = (typeof OBSERVED_VIDEO_CONTAINERS)[number];
+
+/** Extensions that are never a video rendition, whatever the codec fields say. */
+const NON_MEDIA_EXTENSIONS = Object.freeze([
+  "mhtml", "jpg", "jpeg", "png", "webp", "gif", "avif",
+  "vtt", "srt", "ass", "ssa", "ttml", "json", "html", "xml",
+] as const);
+
+/** Private bound on a recorded frame rate. Anything above it is not a fact. */
+const MAX_OBSERVED_FPS = 1_000;
+
+function isObservedVideoContainer(ext: string): ext is ObservedVideoContainer {
+  return (OBSERVED_VIDEO_CONTAINERS as readonly string[]).includes(ext);
+}
+
+/**
+ * One VIDEO-LIKE rendition the analysis observed, deliverable or not.
+ *
+ * PRIVATE and transient. Every field is a bounded number or a closed
+ * application-owned value: no format id, protocol string, URL, note or codec
+ * string survives into it.
+ */
+export type ObservedVideoRendition = {
+  /** Position in the upstream list, which is also the evaluation's. */
+  readonly index: number;
+  readonly height: number | null;
+  readonly width: number | null;
+  readonly fps: number | null;
+  readonly protocol: "progressive" | "hls" | "dash-segmented" | "other" | "unknown";
+  readonly container: ObservedVideoContainer | "other" | "unknown";
+  /** How video was established: a named codec, or a coherent container shape. */
+  readonly videoEvidence: "codec" | "shape";
+  readonly audio: CodecState;
+  /** `exact` is a declared `filesize`; `estimated` is `filesize_approx` alone. */
+  readonly size: "exact" | "estimated" | "unknown";
+  readonly maybeProtected: boolean;
+};
+
+/**
+ * What current capability did with one observed rendition, finer-grained than
+ * the public reason it maps to (`withheldReasonFor`).
+ *
+ *   deliverable          an advertised VIDEO preset is fulfilled by it — alone,
+ *                        or as the video half of a pair;
+ *   CandidateRejection   the first eligibility gate that refused it;
+ *   SplitShortfall       a proven-video-only candidate that did not pair;
+ *   no-audio             ditto, and the result has no proven audio-only
+ *                        candidate at all;
+ *   fallback-suppressed  an unknown-audio candidate the proven tier displaced;
+ *   not-selected         in the advertised tier, but another rendition won its
+ *                        rung, or it has no height while others do;
+ *   unclassified         none of the above. Unreachable for an observed
+ *                        rendition; kept so the mapping stays total.
+ */
+export type RenditionDisposition =
+  | "deliverable"
+  | CandidateRejection
+  | SplitShortfall
+  | "no-audio"
+  | "fallback-suppressed"
+  | "not-selected"
+  | "unclassified";
+
+type WithheldCause = Exclude<RenditionDisposition, "deliverable">;
+
+export type InventoriedRendition = {
+  readonly observed: ObservedVideoRendition;
+  readonly disposition: RenditionDisposition;
+};
+
+export type RenditionInventory = {
+  readonly renditions: readonly InventoriedRendition[];
+  /** The document's top-level `_has_drm` was exactly `true`. */
+  readonly protectedUnenumerated: boolean;
+  /** Some surviving format's `has_drm` was exactly `"maybe"`. */
+  readonly maybeProtectedObserved: boolean;
+};
+
+function observedDimension(value: number | null | undefined): number | null {
+  if (typeof value !== "number" || !(value > 0)) return null;
+  const whole = Math.floor(value);
+  return whole >= 1 && whole <= SOURCE_QUALITY_MAX_HEIGHT ? whole : null;
+}
+
+function observedProtocol(protocol: string | null | undefined): ObservedVideoRendition["protocol"] {
+  if (typeof protocol !== "string" || protocol.length === 0) return "unknown";
+  switch (protocol.toLowerCase()) {
+    case "http":
+    case "https":
+      return "progressive";
+    case "m3u8":
+    case "m3u8_native":
+      return "hls";
+    case "http_dash_segments":
+    case "http_dash_segments_generator":
+      return "dash-segmented";
+    default:
+      return "other";
+  }
+}
+
+/**
+ * Is this raw format a VIDEO-LIKE rendition, and if so what was observed?
+ *
+ * The evidence standard is the one the eligibility gates already use, applied
+ * without the acquisition-only conditions (protocol, id grammar, acquisition
+ * container allowlist, size):
+ *
+ *   - never a storyboard / preview-image note, and never a non-media extension;
+ *   - a PRESENT `vcodec`: a named codec is positive video evidence;
+ *   - an ABSENT `vcodec` ("none"): not video, whatever else it says;
+ *   - an UNKNOWN `vcodec`: video only when `video_ext` equals `ext` and that
+ *     extension is a known video container — the Generic-HTML5 shape rule,
+ *     widened from the acquisition allowlist to the observation vocabulary.
+ *
+ * Audio-only, image and other junk rows therefore never inflate the observed
+ * height. Every candidate that can back a video preset satisfies this rule, so
+ * whatever is deliverable is also observed.
+ */
+function observeVideoRendition(raw: RawFormat, index: number): ObservedVideoRendition | null {
+  if (isNonMediaNote(raw)) return null;
+  const ext = normalizeExtField(raw.ext);
+  if (ext !== null && (NON_MEDIA_EXTENSIONS as readonly string[]).includes(ext)) return null;
+
+  let videoEvidence: ObservedVideoRendition["videoEvidence"];
+  switch (classifyCodecState(raw.vcodec)) {
+    case "present":
+      videoEvidence = "codec";
+      break;
+    case "absent":
+      return null;
+    case "unknown":
+      if (ext === null || normalizeExtField(raw.video_ext) !== ext || !isObservedVideoContainer(ext)) {
+        return null;
+      }
+      videoEvidence = "shape";
+      break;
+  }
+
+  return {
+    index,
+    height: observedDimension(raw.height),
+    width: observedDimension(raw.width),
+    fps:
+      typeof raw.fps === "number" && raw.fps > 0 && raw.fps <= MAX_OBSERVED_FPS
+        ? Math.round(raw.fps * 100) / 100
+        : null,
+    protocol: observedProtocol(raw.protocol),
+    container: ext === null ? "unknown" : isObservedVideoContainer(ext) ? ext : "other",
+    videoEvidence,
+    audio: classifyCodecState(raw.acodec),
+    // The same precedence the size gate uses, so an estimate is never recorded
+    // as a declared size.
+    size:
+      typeof raw.filesize === "number" && raw.filesize > 0
+        ? "exact"
+        : typeof raw.filesize_approx === "number" && raw.filesize_approx > 0
+          ? "estimated"
+          : "unknown",
+    maybeProtected: raw.has_drm === "maybe",
+  };
+}
+
+/**
+ * Reads one observed rendition's outcome off the REAL evaluation and the REAL
+ * construction. Nothing here re-decides eligibility, pairing or tiering.
+ */
+function dispositionOf(
+  evaluation: FormatEvaluation,
+  construction: GenericPresetConstruction,
+  hasProvenAudioOnly: boolean,
+): RenditionDisposition {
+  if (!evaluation.ok) return evaluation.rejection;
+  const c = evaluation.candidate;
+  if (construction.advertisedVideo.has(c)) return "deliverable";
+
+  if (isSplitVideoCandidate(c)) {
+    const shortfall = construction.videoPlan.shortfalls.get(c);
+    // No shortfall means it DID pair; the pair simply lost its rung.
+    if (shortfall === undefined) return "not-selected";
+    if ((shortfall === "no-merge" || shortfall === "no-partner") && !hasProvenAudioOnly) {
+      return "no-audio";
+    }
+    return shortfall;
+  }
+  if (isUnknownAudioVideoCandidate(c)) {
+    return construction.videoPlan.tier === "proven" ? "fallback-suppressed" : "not-selected";
+  }
+  if (isMuxedVideoCandidate(c)) return "not-selected";
+  return "unclassified";
+}
+
+/** Maps a private cause onto the closed public vocabulary. Total by construction. */
+function withheldReasonFor(cause: WithheldCause): SourceQualityWithheldReason {
+  switch (cause) {
+    case "protocol-missing":
+    case "protocol-unsupported":
+      return "unsupported_protocol";
+    case "container-not-allowed":
+      return "unsupported_container";
+    case "video-shape-contradiction":
+      return "unsupported_stream_shape";
+    case "unsafe-format-id":
+      return "unsafe_selector_identity";
+    case "size-over-limit":
+    case "pair-size":
+      return "size_limit_exceeded";
+    case "no-audio":
+      return "audio_pair_unavailable";
+    case "no-merge":
+    case "no-partner":
+      return "split_pair_unsupported";
+    case "fallback-suppressed":
+      return "fallback_suppressed";
+    case "not-selected":
+      return "not_selected";
+    // `pair-invalid` is reachable; the four after it are not, because the
+    // observation rule already excludes storyboards, stream-less rows and
+    // unestablished video shapes. They are listed so the mapping stays total.
+    case "pair-invalid":
+    case "non-media-note":
+    case "no-stream":
+    case "video-shape-unestablished":
+    case "unclassified":
+      return "other_unsupported";
+  }
+}
+
+/**
+ * The generic eligibility → construction → inventory pass for ONE document.
+ *
+ * Pure, and exactly what `analyzeGenericMediaInternal` runs: the presets and
+ * selections are those `buildGenericPresets` would produce from the same
+ * formats, and the inventory is read off that same construction.
+ */
+export function analyzeGenericFormats(
+  formats: readonly RawFormat[],
+  opts: {
+    readonly ffmpegAvailable: boolean;
+    readonly maxFileSizeBytes: number;
+    /** The document's top-level `_has_drm`, uninterpreted. */
+    readonly protectionSignal?: unknown;
+  },
+): {
+  readonly candidates: readonly Candidate[];
+  readonly build: GenericPresetBuild;
+  readonly inventory: RenditionInventory;
+} {
+  const evaluations = evaluateRawFormats(formats, opts);
+  const candidates = acceptedCandidates(evaluations);
+  const construction = constructGenericPresets(candidates, opts);
+  const hasProvenAudioOnly = candidates.some(isSplitAudioCandidate);
+
+  const renditions: InventoriedRendition[] = [];
+  formats.forEach((raw, index) => {
+    const observed = observeVideoRendition(raw, index);
+    if (observed === null) return;
+    renditions.push({
+      observed,
+      disposition: dispositionOf(evaluations[index]!, construction, hasProvenAudioOnly),
+    });
+  });
+
+  return {
+    candidates,
+    build: { presets: construction.presets, selections: construction.selections },
+    inventory: {
+      renditions,
+      protectedUnenumerated: opts.protectionSignal === true,
+      maybeProtectedObserved: formats.some((raw) => raw.has_drm === "maybe"),
+    },
+  };
+}
+
+/**
+ * Aggregates the private inventory into the tiny public `sourceQuality`.
+ *
+ *   observedMaxHeight     the tallest observed rendition, whatever its outcome;
+ *   deliverableMaxHeight  the tallest rendition behind an advertised VIDEO
+ *                         preset, by its OWN height — an 848×384 source behind
+ *                         `preset:360` counts as 384, not 360. Audio presets
+ *                         never count;
+ *   withheld              one entry per reason present, in vocabulary order.
+ *
+ * Every observed rendition is either deliverable or withheld, so the observed
+ * maximum is always the larger of the other two — the invariant
+ * `SourceQualitySchema` enforces. No height is inferred from a protection
+ * signal, and nothing identifies an individual rendition.
+ */
+export function summarizeSourceQuality(inventory: RenditionInventory): SourceQuality {
+  const taller = (a: number | null, b: number | null) =>
+    a === null ? b : b === null ? a : Math.max(a, b);
+
+  let observedMaxHeight: number | null = null;
+  let deliverableMaxHeight: number | null = null;
+  const withheld = new Map<
+    SourceQualityWithheldReason,
+    { readonly count: number; readonly maxObservedHeight: number | null }
+  >();
+
+  for (const { observed, disposition } of inventory.renditions) {
+    observedMaxHeight = taller(observedMaxHeight, observed.height);
+    if (disposition === "deliverable") {
+      deliverableMaxHeight = taller(deliverableMaxHeight, observed.height);
+      continue;
+    }
+    const reason = withheldReasonFor(disposition);
+    const entry = withheld.get(reason) ?? { count: 0, maxObservedHeight: null };
+    withheld.set(reason, {
+      count: entry.count + 1,
+      maxObservedHeight: taller(entry.maxObservedHeight, observed.height),
+    });
+  }
+
+  return {
+    observedMaxHeight,
+    deliverableMaxHeight,
+    withheld: SOURCE_QUALITY_WITHHELD_REASONS.flatMap((reason) => {
+      const entry = withheld.get(reason);
+      return entry ? [{ reason, ...entry }] : [];
+    }),
+    protectedUnenumerated: inventory.protectedUnenumerated,
+    maybeProtectedObserved: inventory.maybeProtectedObserved,
+  };
 }
 
 // ── Sanitization ─────────────────────────────────────────────────────────────
@@ -1844,14 +2352,18 @@ export async function analyzeGenericMediaInternal(
     throw new AppError("TOO_LONG");
   }
 
-  const candidates = selectCandidates(info.formats ?? [], deps.limits);
   const ffmpegAvailable = deps.ffmpegAvailable ?? false;
-  const { presets, selections } = buildGenericPresets(candidates, {
+  // Eligibility, preset construction and the rendition inventory, in one pass:
+  // the presets and selections are exactly what `selectCandidates` +
+  // `buildGenericPresets` produce, and the inventory only reads that result.
+  const { candidates, build, inventory } = analyzeGenericFormats(info.formats ?? [], {
     ffmpegAvailable,
-    // The PAIR-level combined-size budget (§13/§16). The same ceiling
-    // `selectCandidates` already applied to each half individually.
+    // The per-format size gate, and the PAIR-level combined-size budget
+    // (§13/§16) — one ceiling for both.
     maxFileSizeBytes: deps.limits.maxFileSizeBytes,
+    protectionSignal: info._has_drm,
   });
+  const { presets, selections } = build;
 
   // Structural and shape-aware audio assertions on this module's OWN output,
   // including the fallback-only rule for the unknown-audio video tier. Any
@@ -1905,6 +2417,10 @@ export async function analyzeGenericMediaInternal(
       merge:
         ffmpegAvailable && Object.values(selections).some((value) => value.kind === "split"),
     },
+    // What this run OBSERVED versus what it can deliver, aggregated into
+    // bounded numbers and closed reasons (GENERIC-SOURCE-RENDITION-INVENTORY-001).
+    // Informational only: nothing selects, plans or acquires from it.
+    sourceQuality: summarizeSourceQuality(inventory),
   });
 
   return { video, selections };

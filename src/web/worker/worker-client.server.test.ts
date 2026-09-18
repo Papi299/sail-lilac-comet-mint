@@ -1544,3 +1544,88 @@ describe("WorkerClient", () => {
     });
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC-SOURCE-RENDITION-INVENTORY-001
+//
+// The control plane parses the Worker's analyze response strictly. These prove
+// the new build accepts BOTH a Worker that predates `sourceQuality` and one
+// that sends it, passes a valid summary through untouched, and still refuses a
+// malformed one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("WorkerClient analyze: optional sourceQuality", () => {
+  const TEST_SECRET = "01234567890123456789012345678901";
+  const TEST_KEY_ID = "test-key-id";
+
+  const VIDEO = {
+    title: "Test",
+    thumbnail: null,
+    duration: 120,
+    source: "example.invalid",
+    extractor: "yt-dlp",
+    webpageUrl: "https://example.invalid/watch",
+    formats: [],
+    presets: [],
+    capabilities: { mp3: false, merge: false },
+  };
+
+  const QUALITY = {
+    observedMaxHeight: 2160,
+    deliverableMaxHeight: 720,
+    withheld: [{ reason: "unsupported_protocol", count: 2, maxObservedHeight: 2160 }],
+    protectedUnenumerated: true,
+    maybeProtectedObserved: false,
+  };
+
+  const answering = (video: unknown) => {
+    const body = JSON.stringify({ success: true, video });
+    return new WorkerClient({
+      baseUrl: "http://localhost:8080",
+      currentKeyId: TEST_KEY_ID,
+      currentSecret: TEST_SECRET,
+      requestTimeoutMs: 1000,
+      fetchImplementation: (async () =>
+        new Response(body, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": String(Buffer.byteLength(body, "utf8")),
+          },
+        })) as unknown as typeof fetch,
+    });
+  };
+
+  it("accepts a Worker response WITHOUT the field (the live Worker today)", async () => {
+    const result = await answering(VIDEO).analyze({ url: "https://example.invalid/watch" } as never);
+    assert.equal("sourceQuality" in result.video, false);
+    assert.equal(result.video.title, "Test");
+  });
+
+  it("accepts a Worker response WITH the field and passes it through unchanged", async () => {
+    const result = await answering({ ...VIDEO, sourceQuality: QUALITY }).analyze({
+      url: "https://example.invalid/watch",
+    } as never);
+    assert.deepEqual(result.video.sourceQuality, QUALITY);
+  });
+
+  it("still refuses a malformed summary", async () => {
+    const malformed = [
+      { ...QUALITY, withheld: [{ reason: "unsupported_codec", count: 1, maxObservedHeight: 2160 }] },
+      { ...QUALITY, withheld: [{ reason: "unsupported_protocol", count: -1, maxObservedHeight: 2160 }] },
+      { ...QUALITY, observedMaxHeight: -5 },
+      // An unexplained gap between observed and deliverable.
+      { ...QUALITY, withheld: [] },
+      // An upstream identifier smuggled into the summary.
+      { ...QUALITY, formatId: "137" },
+      "2160p",
+    ];
+    for (const sourceQuality of malformed) {
+      await assert.rejects(
+        answering({ ...VIDEO, sourceQuality }).analyze({ url: "https://example.invalid/watch" } as never),
+        (e: unknown) => (e as { code?: string }).code === "PROCESSING_FAILED",
+        JSON.stringify(sourceQuality),
+      );
+    }
+  });
+});
