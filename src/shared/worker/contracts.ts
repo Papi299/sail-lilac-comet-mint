@@ -206,6 +206,141 @@ export const QualityPresetSchema = z
   .strict();
 export type WorkerQualityPreset = z.infer<typeof QualityPresetSchema>;
 
+// --- Source quality (GENERIC-SOURCE-RENDITION-INVENTORY-001) ---
+
+/**
+ * Why an OBSERVED video rendition is not what VideoFetch currently delivers.
+ *
+ * A closed, application-owned vocabulary. Each value names a boundary of the
+ * CURRENT generic capability, never an upstream string, and every observed
+ * video rendition that is not delivered carries exactly one of them — the
+ * first boundary it met, in the analyzer's existing gate order.
+ *
+ *   unsupported_protocol      its delivery protocol is absent, or is not one the
+ *                             current acquisition path supports (single-file
+ *                             http/https). HLS and segmented DASH land here.
+ *   unsupported_container     its container is outside the closed set current
+ *                             generic delivery keeps verbatim (mp4, webm).
+ *   unsupported_stream_shape  a video codec is named, but the reported stream
+ *                             shape contradicts it, so no closed selector can
+ *                             re-select it.
+ *   unsafe_selector_identity  its upstream identifier falls outside the safe
+ *                             literal grammar, so it can never be named to
+ *                             yt-dlp.
+ *   size_limit_exceeded       a known size — declared or estimated, alone or as
+ *                             the sum of a split pair — is over the delivered
+ *                             size limit.
+ *   audio_pair_unavailable    it carries no audio, and the result offers no
+ *                             audio-only rendition with proven audio at all.
+ *   split_pair_unsupported    it carries no audio, proven audio-only renditions
+ *                             exist, but the current split capability cannot
+ *                             combine them with it: no partner in its container
+ *                             family, or no Worker merge capability.
+ *   fallback_suppressed       its audio is unknown, and the unknown-audio tier is
+ *                             not used because a proven-audio video rendition
+ *                             exists elsewhere in the result.
+ *   not_selected              deliverable under current capability, but preset
+ *                             construction advertised a different rendition: it
+ *                             lost its resolution rung's ranking, or its height
+ *                             is unknown while other renditions have heights.
+ *   protected                 RESERVED. A positively protected rendition that a
+ *                             later reviewed phase enumerates. Never emitted
+ *                             today: the pinned runtime removes positively
+ *                             protected formats before analysis sees them.
+ *   other_unsupported         a pair the closed split table or pair schema
+ *                             refuses for any other reason.
+ *
+ * Declaration order is the public ordering of `withheld[]`.
+ */
+export const SOURCE_QUALITY_WITHHELD_REASONS = [
+  "unsupported_protocol",
+  "unsupported_container",
+  "unsupported_stream_shape",
+  "unsafe_selector_identity",
+  "size_limit_exceeded",
+  "audio_pair_unavailable",
+  "split_pair_unsupported",
+  "fallback_suppressed",
+  "not_selected",
+  "protected",
+  "other_unsupported",
+] as const;
+
+export const SourceQualityWithheldReasonSchema = z.enum(SOURCE_QUALITY_WITHHELD_REASONS);
+export type SourceQualityWithheldReason = z.infer<typeof SourceQualityWithheldReasonSchema>;
+
+/** Largest height the public summary will state. Anything taller is not a fact. */
+export const SOURCE_QUALITY_MAX_HEIGHT = 16_384;
+
+/** Upper bound on any count, and on all counts together. */
+export const SOURCE_QUALITY_MAX_COUNT = 512;
+
+const SourceQualityHeightSchema = z.number().int().min(1).max(SOURCE_QUALITY_MAX_HEIGHT);
+
+export const SourceQualityWithheldSchema = z
+  .object({
+    reason: SourceQualityWithheldReasonSchema,
+    count: z.number().int().min(1).max(SOURCE_QUALITY_MAX_COUNT),
+    maxObservedHeight: SourceQualityHeightSchema.nullable(),
+  })
+  .strict();
+export type SourceQualityWithheld = z.infer<typeof SourceQualityWithheldSchema>;
+
+/**
+ * What ONE generic analysis observed about source quality, versus what
+ * VideoFetch can currently deliver.
+ *
+ *   observedMaxHeight       the tallest video rendition observed in THIS run's
+ *                           sanitized inventory, deliverable or not. Not a claim
+ *                           about renditions the run could not see.
+ *   deliverableMaxHeight    the tallest SOURCE height behind an advertised video
+ *                           preset — the real rendition, not its rung label.
+ *   withheld                observed video renditions that are not delivered,
+ *                           aggregated by reason, in vocabulary order.
+ *   protectedUnenumerated   the extractor reported that protected renditions
+ *                           existed and were removed before their qualities were
+ *                           listed. No height is inferred from it.
+ *   maybeProtectedObserved  a surviving rendition carried the upstream "maybe
+ *                           protected" marker. Delivery is unaffected.
+ *
+ * The refinements make the summary self-consistent: every observed height above
+ * the deliverable one is explained by a withheld reason, and nothing states a
+ * height the observed maximum does not cover.
+ */
+export const SourceQualitySchema = z
+  .object({
+    observedMaxHeight: SourceQualityHeightSchema.nullable(),
+    deliverableMaxHeight: SourceQualityHeightSchema.nullable(),
+    withheld: z.array(SourceQualityWithheldSchema).max(SOURCE_QUALITY_WITHHELD_REASONS.length),
+    protectedUnenumerated: z.boolean(),
+    maybeProtectedObserved: z.boolean(),
+  })
+  .strict()
+  .superRefine((q, ctx) => {
+    const issue = (message: string) => ctx.addIssue({ code: "custom", message });
+
+    let previous = -1;
+    let total = 0;
+    let withheldMax: number | null = null;
+    for (const entry of q.withheld) {
+      const position = SOURCE_QUALITY_WITHHELD_REASONS.indexOf(entry.reason);
+      if (position <= previous) issue("withheld reasons must be unique and in vocabulary order");
+      previous = position;
+      total += entry.count;
+      if (entry.maxObservedHeight !== null) {
+        withheldMax = Math.max(withheldMax ?? 0, entry.maxObservedHeight);
+      }
+    }
+    if (total > SOURCE_QUALITY_MAX_COUNT) issue("withheld counts exceed the bound");
+
+    const heights = [q.deliverableMaxHeight, withheldMax].filter((h): h is number => h !== null);
+    const explained = heights.length === 0 ? null : Math.max(...heights);
+    if (q.observedMaxHeight !== explained) {
+      issue("observedMaxHeight must equal the tallest deliverable or withheld height");
+    }
+  });
+export type SourceQuality = z.infer<typeof SourceQualitySchema>;
+
 export const VideoMetadataSchema = z
   .object({
     title: z.string(),
@@ -223,6 +358,11 @@ export const VideoMetadataSchema = z
         merge: z.boolean(),
       })
       .strict(),
+    // OPTIONAL, so a Worker that predates it still validates. Generic analysis
+    // sends it; direct analysis does not know source quality and omits it.
+    // Because this schema is strict, a control plane that predates the field
+    // REJECTS a Worker that sends it: the control plane must deploy first.
+    sourceQuality: SourceQualitySchema.optional(),
   })
   .strict();
 export type WorkerVideoMetadata = z.infer<typeof VideoMetadataSchema>;

@@ -363,3 +363,158 @@ test("historical vs current Worker diagnostics contract compatibility", async (t
     assert.equal(WorkerDiagnosticsSuccessSchema.safeParse(job).success, false);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC-SOURCE-RENDITION-INVENTORY-001
+//
+// `sourceQuality` is ADDITIVE and OPTIONAL, which is what lets the control
+// plane deploy before the Worker that fills it in. The reverse does not hold,
+// and the last test here pins that as a deployment-order fact rather than
+// leaving it to be discovered in Production.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("Worker Contracts - Source quality", async (t) => {
+  const metadata = {
+    title: "Test",
+    thumbnail: null,
+    duration: 120,
+    source: "example.invalid",
+    extractor: "yt-dlp",
+    webpageUrl: "https://example.invalid/watch",
+    formats: [],
+    presets: [],
+    capabilities: { mp3: false, merge: false },
+  };
+  const quality = {
+    observedMaxHeight: 2160,
+    deliverableMaxHeight: 720,
+    withheld: [{ reason: "unsupported_protocol", count: 2, maxObservedHeight: 2160 }],
+    protectedUnenumerated: false,
+    maybeProtectedObserved: false,
+  };
+  const withQuality = (overrides: Record<string, unknown> = {}) => ({
+    ...metadata,
+    sourceQuality: { ...quality, ...overrides },
+  });
+
+  await t.test("accepts metadata WITHOUT the field (a Worker that predates it)", () => {
+    assert.doesNotThrow(() => VideoMetadataSchema.parse(metadata));
+  });
+
+  await t.test("accepts a well-formed summary", () => {
+    assert.doesNotThrow(() => VideoMetadataSchema.parse(withQuality()));
+  });
+
+  await t.test("accepts an empty inventory and a fully unknown one", () => {
+    for (const value of [
+      { observedMaxHeight: null, deliverableMaxHeight: null, withheld: [] },
+      { observedMaxHeight: 1080, deliverableMaxHeight: 1080, withheld: [] },
+      { observedMaxHeight: 1080, deliverableMaxHeight: null, withheld: [{ reason: "protected", count: 1, maxObservedHeight: 1080 }] },
+    ]) {
+      assert.doesNotThrow(() => VideoMetadataSchema.parse(withQuality(value)));
+    }
+  });
+
+  await t.test("rejects a reason outside the closed vocabulary", () => {
+    for (const reason of ["unsupported_codec", "UNSUPPORTED_PROTOCOL", "m3u8_native", ""]) {
+      assert.throws(() =>
+        VideoMetadataSchema.parse(withQuality({ withheld: [{ reason, count: 1, maxObservedHeight: 2160 }] })),
+      );
+    }
+  });
+
+  await t.test("rejects malformed counts and heights", () => {
+    const bad = [
+      { withheld: [{ reason: "unsupported_protocol", count: 0, maxObservedHeight: 2160 }] },
+      { withheld: [{ reason: "unsupported_protocol", count: -2, maxObservedHeight: 2160 }] },
+      { withheld: [{ reason: "unsupported_protocol", count: 1.5, maxObservedHeight: 2160 }] },
+      { withheld: [{ reason: "unsupported_protocol", count: 513, maxObservedHeight: 2160 }] },
+      { observedMaxHeight: -1, deliverableMaxHeight: null, withheld: [] },
+      { observedMaxHeight: 0, deliverableMaxHeight: null, withheld: [] },
+      { observedMaxHeight: 16_385, deliverableMaxHeight: null, withheld: [] },
+      { observedMaxHeight: 1080.5, deliverableMaxHeight: null, withheld: [] },
+      { observedMaxHeight: "2160", deliverableMaxHeight: null, withheld: [] },
+    ];
+    for (const overrides of bad) {
+      assert.throws(() => VideoMetadataSchema.parse(withQuality(overrides)), `accepted ${JSON.stringify(overrides)}`);
+    }
+  });
+
+  await t.test("rejects unexpected properties, nested and top level", () => {
+    assert.throws(() => VideoMetadataSchema.parse(withQuality({ extra: "field" })));
+    assert.throws(() =>
+      VideoMetadataSchema.parse(
+        withQuality({ withheld: [{ reason: "unsupported_protocol", count: 1, maxObservedHeight: 2160, formatId: "137" }] }),
+      ),
+    );
+    assert.throws(() => VideoMetadataSchema.parse({ ...withQuality(), sourceQuality: null }));
+  });
+
+  await t.test("rejects duplicated or out-of-order reasons", () => {
+    for (const withheld of [
+      [
+        { reason: "unsupported_protocol", count: 1, maxObservedHeight: 2160 },
+        { reason: "unsupported_protocol", count: 1, maxObservedHeight: 1080 },
+      ],
+      [
+        { reason: "not_selected", count: 1, maxObservedHeight: 2160 },
+        { reason: "unsupported_protocol", count: 1, maxObservedHeight: 1080 },
+      ],
+    ]) {
+      assert.throws(() => VideoMetadataSchema.parse(withQuality({ withheld })));
+    }
+  });
+
+  await t.test("rejects a summary that does not explain its own observed maximum", () => {
+    // A gap with no reason is exactly the silent degradation this field exists
+    // to end, so the contract refuses to carry one.
+    assert.throws(() =>
+      VideoMetadataSchema.parse(withQuality({ observedMaxHeight: 2160, deliverableMaxHeight: 720, withheld: [] })),
+    );
+    // A withheld height above the observed maximum is incoherent too.
+    assert.throws(() =>
+      VideoMetadataSchema.parse(
+        withQuality({
+          observedMaxHeight: 1080,
+          deliverableMaxHeight: 720,
+          withheld: [{ reason: "unsupported_protocol", count: 1, maxObservedHeight: 2160 }],
+        }),
+      ),
+    );
+    // As is claiming a deliverable height nothing observed.
+    assert.throws(() =>
+      VideoMetadataSchema.parse(withQuality({ observedMaxHeight: null, deliverableMaxHeight: 720, withheld: [] })),
+    );
+  });
+
+  await t.test("rejects counts that together exceed the bound", () => {
+    assert.throws(() =>
+      VideoMetadataSchema.parse(
+        withQuality({
+          observedMaxHeight: 2160,
+          deliverableMaxHeight: null,
+          withheld: [
+            { reason: "unsupported_protocol", count: 500, maxObservedHeight: 2160 },
+            { reason: "unsupported_container", count: 500, maxObservedHeight: 1080 },
+          ],
+        }),
+      ),
+    );
+  });
+
+  // ── The deployment-order fact ──────────────────────────────────────────────
+  await t.test("a control plane that predates the field REJECTS a Worker that sends it", () => {
+    // The pre-P1 contract, reconstructed from the current one: same strict
+    // object, without the new key.
+    const preP1 = VideoMetadataSchema.omit({ sourceQuality: true });
+
+    assert.equal(preP1.safeParse(metadata).success, true, "old accepts old");
+    assert.equal(VideoMetadataSchema.safeParse(metadata).success, true, "new accepts old");
+    assert.equal(VideoMetadataSchema.safeParse(withQuality()).success, true, "new accepts new");
+    assert.equal(
+      preP1.safeParse(withQuality()).success,
+      false,
+      "old REJECTS new -> the control plane must be deployed before the Worker",
+    );
+  });
+});

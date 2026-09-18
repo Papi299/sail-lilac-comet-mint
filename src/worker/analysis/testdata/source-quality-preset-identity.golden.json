@@ -1,0 +1,5983 @@
+{
+ "case01-deliverable-progressive-ladder": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "2160p",
+     "container": "mp4",
+     "fileSize": 80000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:2160",
+     "label": "2160p / 4K",
+     "resolution": "2160p",
+     "container": "mp4",
+     "fileSize": 80000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:2160",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:1080",
+     "label": "1080p",
+     "resolution": "1080p",
+     "container": "mp4",
+     "fileSize": 40000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:1080",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p2160",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 80000000
+    }
+   },
+   "preset:2160": {
+    "kind": "single",
+    "source": {
+     "formatId": "p2160",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 80000000
+    }
+   },
+   "preset:1080": {
+    "kind": "single",
+    "source": {
+     "formatId": "p1080",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 40000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p2160",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 80000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p2160",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 80000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p2160",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 80000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:2160": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:2160",
+     "source": {
+      "formatId": "p2160",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 80000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:1080": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:1080",
+     "source": {
+      "formatId": "p1080",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 40000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p2160",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 80000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p2160",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 80000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p2160\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:2160": [
+    "b*[format_id=\"p2160\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:1080": [
+    "b*[format_id=\"p1080\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p2160\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p2160\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case02-clear-hls-above-progressive": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case03-segmented-dash-above-progressive": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case04-unsupported-container": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case05-split-pair-unsupported": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "webm",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "opus",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "opus-251",
+     "protocol": "https",
+     "container": "webm",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": null
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "opus-251",
+     "protocol": "https",
+     "container": "webm",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": null
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "opus-251",
+      "protocol": "https",
+      "container": "webm",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": null
+     },
+     "targetContainer": "webm"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "opus-251",
+      "protocol": "https",
+      "container": "webm",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": null
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"opus-251\"][protocol=\"https\"][ext=\"webm\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"opus-251\"][protocol=\"https\"][ext=\"webm\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case05b-audio-pair-unavailable": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case05c-no-worker-merge": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": false,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "m4a-140",
+     "protocol": "https",
+     "container": "m4a",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": null
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "m4a-140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": null
+     },
+     "targetContainer": "m4a"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"m4a-140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case06-size-declared-over-limit": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case06b-size-estimated-over-limit": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case06c-pair-size-over-limit": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": 2147483648,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "m4a-140",
+     "protocol": "https",
+     "container": "m4a",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": 2147483648
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "m4a-140",
+     "protocol": "https",
+     "container": "m4a",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": 2147483648
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "m4a-140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": 2147483648
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "m4a-140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": 2147483648
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"m4a-140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"m4a-140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case08-protected-unenumerated": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:480",
+     "label": "480p",
+     "resolution": "480p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:480",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:480": {
+    "kind": "single",
+    "source": {
+     "formatId": "p480",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p480",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p480",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:480": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:480",
+     "source": {
+      "formatId": "p480",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p480",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p480",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:480": [
+    "b*[format_id=\"p480\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p480\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p480\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case09-maybe-protected-surviving": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case10-unknown-audio-suppressed": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case10b-unknown-audio-suppressed-key-absent": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case11-not-selected-within-rung": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "2160p",
+     "container": "mp4",
+     "fileSize": 80000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:2160",
+     "label": "2160p / 4K",
+     "resolution": "2160p",
+     "container": "mp4",
+     "fileSize": 80000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:2160",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:1080",
+     "label": "1080p",
+     "resolution": "1080p",
+     "container": "mp4",
+     "fileSize": 40000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:1080",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "h2160",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 80000000
+    }
+   },
+   "preset:2160": {
+    "kind": "single",
+    "source": {
+     "formatId": "h2160",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 80000000
+    }
+   },
+   "preset:1080": {
+    "kind": "single",
+    "source": {
+     "formatId": "h1080",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 40000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "h2160",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 80000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "h2160",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 80000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "h2160",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 80000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:2160": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:2160",
+     "source": {
+      "formatId": "h2160",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 80000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:1080": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:1080",
+     "source": {
+      "formatId": "h1080",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 40000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "h2160",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 80000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "h2160",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 80000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"h2160\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:2160": [
+    "b*[format_id=\"h2160\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:1080": [
+    "b*[format_id=\"h1080\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"h2160\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"h2160\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case12-unsafe-selector-identity": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case13-contradictory-stream-shape": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case14-junk-rows-never-observed": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "m4a-tall",
+     "protocol": "https",
+     "container": "m4a",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": null
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "m4a-tall",
+     "protocol": "https",
+     "container": "m4a",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": null
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "m4a-tall",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": null
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "m4a-tall",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": null
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"m4a-tall\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"m4a-tall\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case15-split-ladder": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "2160p",
+     "container": "mp4",
+     "fileSize": 120000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "av1",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:2160",
+     "label": "2160p / 4K",
+     "resolution": "2160p",
+     "container": "mp4",
+     "fileSize": 120000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:2160",
+     "videoCodec": "av1",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:1440",
+     "label": "1440p",
+     "resolution": "1440p",
+     "container": "mp4",
+     "fileSize": 80000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:1440",
+     "videoCodec": "av1",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:1080",
+     "label": "1080p",
+     "resolution": "1080p",
+     "container": "mp4",
+     "fileSize": 60000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:1080",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 40000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:360",
+     "label": "360p",
+     "resolution": "360p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:360",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": 20000000,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": true
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "split",
+    "pair": {
+     "video": {
+      "formatId": "401",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "absent",
+      "fileSize": 100000000
+     },
+     "audio": {
+      "formatId": "140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     }
+    }
+   },
+   "preset:2160": {
+    "kind": "split",
+    "pair": {
+     "video": {
+      "formatId": "401",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "absent",
+      "fileSize": 100000000
+     },
+     "audio": {
+      "formatId": "140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     }
+    }
+   },
+   "preset:1440": {
+    "kind": "split",
+    "pair": {
+     "video": {
+      "formatId": "400",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "absent",
+      "fileSize": 60000000
+     },
+     "audio": {
+      "formatId": "140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     }
+    }
+   },
+   "preset:1080": {
+    "kind": "split",
+    "pair": {
+     "video": {
+      "formatId": "137",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "absent",
+      "fileSize": 40000000
+     },
+     "audio": {
+      "formatId": "140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     }
+    }
+   },
+   "preset:720": {
+    "kind": "split",
+    "pair": {
+     "video": {
+      "formatId": "136",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "absent",
+      "fileSize": 20000000
+     },
+     "audio": {
+      "formatId": "140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     }
+    }
+   },
+   "preset:360": {
+    "kind": "single",
+    "source": {
+     "formatId": "18",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "140",
+     "protocol": "https",
+     "container": "m4a",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "140",
+     "protocol": "https",
+     "container": "m4a",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "merge-split",
+     "requestedFormatId": "preset:best",
+     "pair": {
+      "video": {
+       "formatId": "401",
+       "protocol": "https",
+       "container": "mp4",
+       "hasVideo": true,
+       "hasAudio": false,
+       "videoConstraint": "codec-present",
+       "audioConstraint": "absent",
+       "fileSize": 100000000
+      },
+      "audio": {
+       "formatId": "140",
+       "protocol": "https",
+       "container": "m4a",
+       "hasVideo": false,
+       "hasAudio": true,
+       "videoConstraint": "absent",
+       "audioConstraint": "codec-present",
+       "fileSize": 20000000
+      }
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:2160": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "merge-split",
+     "requestedFormatId": "preset:2160",
+     "pair": {
+      "video": {
+       "formatId": "401",
+       "protocol": "https",
+       "container": "mp4",
+       "hasVideo": true,
+       "hasAudio": false,
+       "videoConstraint": "codec-present",
+       "audioConstraint": "absent",
+       "fileSize": 100000000
+      },
+      "audio": {
+       "formatId": "140",
+       "protocol": "https",
+       "container": "m4a",
+       "hasVideo": false,
+       "hasAudio": true,
+       "videoConstraint": "absent",
+       "audioConstraint": "codec-present",
+       "fileSize": 20000000
+      }
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:1440": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "merge-split",
+     "requestedFormatId": "preset:1440",
+     "pair": {
+      "video": {
+       "formatId": "400",
+       "protocol": "https",
+       "container": "mp4",
+       "hasVideo": true,
+       "hasAudio": false,
+       "videoConstraint": "codec-present",
+       "audioConstraint": "absent",
+       "fileSize": 60000000
+      },
+      "audio": {
+       "formatId": "140",
+       "protocol": "https",
+       "container": "m4a",
+       "hasVideo": false,
+       "hasAudio": true,
+       "videoConstraint": "absent",
+       "audioConstraint": "codec-present",
+       "fileSize": 20000000
+      }
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:1080": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "merge-split",
+     "requestedFormatId": "preset:1080",
+     "pair": {
+      "video": {
+       "formatId": "137",
+       "protocol": "https",
+       "container": "mp4",
+       "hasVideo": true,
+       "hasAudio": false,
+       "videoConstraint": "codec-present",
+       "audioConstraint": "absent",
+       "fileSize": 40000000
+      },
+      "audio": {
+       "formatId": "140",
+       "protocol": "https",
+       "container": "m4a",
+       "hasVideo": false,
+       "hasAudio": true,
+       "videoConstraint": "absent",
+       "audioConstraint": "codec-present",
+       "fileSize": 20000000
+      }
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "merge-split",
+     "requestedFormatId": "preset:720",
+     "pair": {
+      "video": {
+       "formatId": "136",
+       "protocol": "https",
+       "container": "mp4",
+       "hasVideo": true,
+       "hasAudio": false,
+       "videoConstraint": "codec-present",
+       "audioConstraint": "absent",
+       "fileSize": 20000000
+      },
+      "audio": {
+       "formatId": "140",
+       "protocol": "https",
+       "container": "m4a",
+       "hasVideo": false,
+       "hasAudio": true,
+       "videoConstraint": "absent",
+       "audioConstraint": "codec-present",
+       "fileSize": 20000000
+      }
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:360": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:360",
+     "source": {
+      "formatId": "18",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"401\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec=\"none\"]",
+    "b*[format_id=\"140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:2160": [
+    "b*[format_id=\"401\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec=\"none\"]",
+    "b*[format_id=\"140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:1440": [
+    "b*[format_id=\"400\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec=\"none\"]",
+    "b*[format_id=\"140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:1080": [
+    "b*[format_id=\"137\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec=\"none\"]",
+    "b*[format_id=\"140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"136\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec=\"none\"]",
+    "b*[format_id=\"140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:360": [
+    "b*[format_id=\"18\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case16-unknown-height-not-selected": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case17-unknown-tier-when-merge-unavailable": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "480p",
+     "container": "mp4",
+     "fileSize": null,
+     "hasVideo": true,
+     "hasAudio": false,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": null,
+     "fps": 30
+    },
+    {
+     "id": "preset:480",
+     "label": "480p",
+     "resolution": "480p",
+     "container": "mp4",
+     "fileSize": null,
+     "hasVideo": true,
+     "hasAudio": false,
+     "formatId": "preset:480",
+     "videoCodec": "h264",
+     "audioCodec": null,
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": false,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "u480",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": false,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "unknown",
+     "fileSize": null
+    }
+   },
+   "preset:480": {
+    "kind": "single",
+    "source": {
+     "formatId": "u480",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": false,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "unknown",
+     "fileSize": null
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "m4a-140",
+     "protocol": "https",
+     "container": "m4a",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": null
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "u480",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "unknown",
+      "fileSize": null
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:480": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:480",
+     "source": {
+      "formatId": "u480",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "unknown",
+      "fileSize": null
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "m4a-140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": null
+     },
+     "targetContainer": "m4a"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"u480\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=?\"none\"]"
+   ],
+   "preset:480": [
+    "b*[format_id=\"u480\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=?\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"m4a-140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case18-hostile-height-not-a-fact": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case19-protocol-missing": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:best",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:720",
+     "label": "720p",
+     "resolution": "720p",
+     "container": "mp4",
+     "fileSize": 20000000,
+     "hasVideo": true,
+     "hasAudio": true,
+     "formatId": "preset:720",
+     "videoCodec": "h264",
+     "audioCodec": "aac",
+     "fps": 30
+    },
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:720": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "p720",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": true,
+     "videoConstraint": "codec-present",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:720": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:720",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-m4a",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "p720",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoConstraint": "codec-present",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:720": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:audio": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"p720\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case20-audio-only-result": {
+  "ok": true,
+  "video": {
+   "title": "Synthetic inventory scenario",
+   "thumbnail": null,
+   "duration": 120,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:audio",
+     "label": "Audio only",
+     "resolution": "audio",
+     "container": "m4a",
+     "fileSize": 20000000,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:audio",
+     "videoCodec": null,
+     "audioCodec": "aac",
+     "fps": null
+    },
+    {
+     "id": "preset:mp3",
+     "label": "Audio only (MP3)",
+     "resolution": "audio",
+     "container": "mp3",
+     "fileSize": null,
+     "hasVideo": false,
+     "hasAudio": true,
+     "formatId": "preset:mp3",
+     "videoCodec": null,
+     "audioCodec": "mp3",
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": true,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:audio": {
+    "kind": "single",
+    "source": {
+     "formatId": "m4a-140",
+     "protocol": "https",
+     "container": "m4a",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   },
+   "preset:mp3": {
+    "kind": "single",
+    "source": {
+     "formatId": "m4a-140",
+     "protocol": "https",
+     "container": "m4a",
+     "hasVideo": false,
+     "hasAudio": true,
+     "videoConstraint": "absent",
+     "audioConstraint": "codec-present",
+     "fileSize": 20000000
+    }
+   }
+  },
+  "plans": {
+   "preset:audio": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:audio",
+     "source": {
+      "formatId": "m4a-140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "m4a"
+    }
+   },
+   "preset:mp3": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "extract-mp3",
+     "requestedFormatId": "preset:mp3",
+     "source": {
+      "formatId": "m4a-140",
+      "protocol": "https",
+      "container": "m4a",
+      "hasVideo": false,
+      "hasAudio": true,
+      "videoConstraint": "absent",
+      "audioConstraint": "codec-present",
+      "fileSize": 20000000
+     },
+     "targetContainer": "mp3"
+    }
+   }
+  },
+  "selectors": {
+   "preset:audio": [
+    "b*[format_id=\"m4a-140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ],
+   "preset:mp3": [
+    "b*[format_id=\"m4a-140\"][protocol=\"https\"][ext=\"m4a\"][vcodec=\"none\"][acodec!=\"none\"]"
+   ]
+  }
+ },
+ "case07-pinned-generic-html5-no-audio-codec-ffmpeg": {
+  "ok": true,
+  "video": {
+   "title": "VideoFetch acceptance — generic progressive fixture, no audio codec declared (1)",
+   "thumbnail": null,
+   "duration": null,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": null,
+     "container": "mp4",
+     "fileSize": null,
+     "hasVideo": true,
+     "hasAudio": false,
+     "formatId": "preset:best",
+     "videoCodec": null,
+     "audioCodec": null,
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": false,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "0",
+     "protocol": "http",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": false,
+     "videoConstraint": "video-ext",
+     "audioConstraint": "unknown",
+     "fileSize": null
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "0",
+      "protocol": "http",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "video-ext",
+      "audioConstraint": "unknown",
+      "fileSize": null
+     },
+     "targetContainer": "mp4"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"0\"][protocol=\"http\"][ext=\"mp4\"][vcodec!=?\"none\"][video_ext=\"mp4\"][acodec!=?\"none\"]"
+   ]
+  }
+ },
+ "case07-pinned-generic-html5-no-audio-codec-no-ffmpeg": {
+  "ok": true,
+  "video": {
+   "title": "VideoFetch acceptance — generic progressive fixture, no audio codec declared (1)",
+   "thumbnail": null,
+   "duration": null,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": null,
+     "container": "mp4",
+     "fileSize": null,
+     "hasVideo": true,
+     "hasAudio": false,
+     "formatId": "preset:best",
+     "videoCodec": null,
+     "audioCodec": null,
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": false,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "0",
+     "protocol": "http",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": false,
+     "videoConstraint": "video-ext",
+     "audioConstraint": "unknown",
+     "fileSize": null
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "0",
+      "protocol": "http",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "video-ext",
+      "audioConstraint": "unknown",
+      "fileSize": null
+     },
+     "targetContainer": "mp4"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"0\"][protocol=\"http\"][ext=\"mp4\"][vcodec!=?\"none\"][video_ext=\"mp4\"][acodec!=?\"none\"]"
+   ]
+  }
+ },
+ "x-synthetic-x-progressive-unknown-audio-ffmpeg": {
+  "ok": true,
+  "video": {
+   "title": "SYNTHETIC unknown-audio progressive fixture",
+   "thumbnail": null,
+   "duration": 30,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "360p",
+     "container": "mp4",
+     "fileSize": 2400000,
+     "hasVideo": true,
+     "hasAudio": false,
+     "formatId": "preset:best",
+     "videoCodec": null,
+     "audioCodec": null,
+     "fps": null
+    },
+    {
+     "id": "preset:360",
+     "label": "360p",
+     "resolution": "360p",
+     "container": "mp4",
+     "fileSize": 2400000,
+     "hasVideo": true,
+     "hasAudio": false,
+     "formatId": "preset:360",
+     "videoCodec": null,
+     "audioCodec": null,
+     "fps": null
+    },
+    {
+     "id": "preset:240",
+     "label": "240p",
+     "resolution": "240p",
+     "container": "mp4",
+     "fileSize": 1200000,
+     "hasVideo": true,
+     "hasAudio": false,
+     "formatId": "preset:240",
+     "videoCodec": null,
+     "audioCodec": null,
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": false,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "synthetic-prog-high",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": false,
+     "videoConstraint": "video-ext",
+     "audioConstraint": "unknown",
+     "fileSize": 2400000
+    }
+   },
+   "preset:360": {
+    "kind": "single",
+    "source": {
+     "formatId": "synthetic-prog-high",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": false,
+     "videoConstraint": "video-ext",
+     "audioConstraint": "unknown",
+     "fileSize": 2400000
+    }
+   },
+   "preset:240": {
+    "kind": "single",
+    "source": {
+     "formatId": "synthetic-prog-low",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": false,
+     "videoConstraint": "video-ext",
+     "audioConstraint": "unknown",
+     "fileSize": 1200000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "synthetic-prog-high",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "video-ext",
+      "audioConstraint": "unknown",
+      "fileSize": 2400000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:360": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:360",
+     "source": {
+      "formatId": "synthetic-prog-high",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "video-ext",
+      "audioConstraint": "unknown",
+      "fileSize": 2400000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:240": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:240",
+     "source": {
+      "formatId": "synthetic-prog-low",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "video-ext",
+      "audioConstraint": "unknown",
+      "fileSize": 1200000
+     },
+     "targetContainer": "mp4"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"synthetic-prog-high\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=?\"none\"][video_ext=\"mp4\"][acodec!=?\"none\"]"
+   ],
+   "preset:360": [
+    "b*[format_id=\"synthetic-prog-high\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=?\"none\"][video_ext=\"mp4\"][acodec!=?\"none\"]"
+   ],
+   "preset:240": [
+    "b*[format_id=\"synthetic-prog-low\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=?\"none\"][video_ext=\"mp4\"][acodec!=?\"none\"]"
+   ]
+  }
+ },
+ "x-synthetic-x-progressive-unknown-audio-no-ffmpeg": {
+  "ok": true,
+  "video": {
+   "title": "SYNTHETIC unknown-audio progressive fixture",
+   "thumbnail": null,
+   "duration": 30,
+   "source": "example.invalid",
+   "extractor": "yt-dlp",
+   "webpageUrl": "https://example.invalid/watch/abc",
+   "formats": [],
+   "presets": [
+    {
+     "id": "preset:best",
+     "label": "Best available",
+     "resolution": "360p",
+     "container": "mp4",
+     "fileSize": 2400000,
+     "hasVideo": true,
+     "hasAudio": false,
+     "formatId": "preset:best",
+     "videoCodec": null,
+     "audioCodec": null,
+     "fps": null
+    },
+    {
+     "id": "preset:360",
+     "label": "360p",
+     "resolution": "360p",
+     "container": "mp4",
+     "fileSize": 2400000,
+     "hasVideo": true,
+     "hasAudio": false,
+     "formatId": "preset:360",
+     "videoCodec": null,
+     "audioCodec": null,
+     "fps": null
+    },
+    {
+     "id": "preset:240",
+     "label": "240p",
+     "resolution": "240p",
+     "container": "mp4",
+     "fileSize": 1200000,
+     "hasVideo": true,
+     "hasAudio": false,
+     "formatId": "preset:240",
+     "videoCodec": null,
+     "audioCodec": null,
+     "fps": null
+    }
+   ],
+   "capabilities": {
+    "mp3": false,
+    "merge": false
+   }
+  },
+  "selections": {
+   "preset:best": {
+    "kind": "single",
+    "source": {
+     "formatId": "synthetic-prog-high",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": false,
+     "videoConstraint": "video-ext",
+     "audioConstraint": "unknown",
+     "fileSize": 2400000
+    }
+   },
+   "preset:360": {
+    "kind": "single",
+    "source": {
+     "formatId": "synthetic-prog-high",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": false,
+     "videoConstraint": "video-ext",
+     "audioConstraint": "unknown",
+     "fileSize": 2400000
+    }
+   },
+   "preset:240": {
+    "kind": "single",
+    "source": {
+     "formatId": "synthetic-prog-low",
+     "protocol": "https",
+     "container": "mp4",
+     "hasVideo": true,
+     "hasAudio": false,
+     "videoConstraint": "video-ext",
+     "audioConstraint": "unknown",
+     "fileSize": 1200000
+    }
+   }
+  },
+  "plans": {
+   "preset:best": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:best",
+     "source": {
+      "formatId": "synthetic-prog-high",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "video-ext",
+      "audioConstraint": "unknown",
+      "fileSize": 2400000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:360": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:360",
+     "source": {
+      "formatId": "synthetic-prog-high",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "video-ext",
+      "audioConstraint": "unknown",
+      "fileSize": 2400000
+     },
+     "targetContainer": "mp4"
+    }
+   },
+   "preset:240": {
+    "strategy": "yt-dlp",
+    "generic": {
+     "strategy": "yt-dlp",
+     "operation": "keep-original",
+     "requestedFormatId": "preset:240",
+     "source": {
+      "formatId": "synthetic-prog-low",
+      "protocol": "https",
+      "container": "mp4",
+      "hasVideo": true,
+      "hasAudio": false,
+      "videoConstraint": "video-ext",
+      "audioConstraint": "unknown",
+      "fileSize": 1200000
+     },
+     "targetContainer": "mp4"
+    }
+   }
+  },
+  "selectors": {
+   "preset:best": [
+    "b*[format_id=\"synthetic-prog-high\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=?\"none\"][video_ext=\"mp4\"][acodec!=?\"none\"]"
+   ],
+   "preset:360": [
+    "b*[format_id=\"synthetic-prog-high\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=?\"none\"][video_ext=\"mp4\"][acodec!=?\"none\"]"
+   ],
+   "preset:240": [
+    "b*[format_id=\"synthetic-prog-low\"][protocol=\"https\"][ext=\"mp4\"][vcodec!=?\"none\"][video_ext=\"mp4\"][acodec!=?\"none\"]"
+   ]
+  }
+ }
+}

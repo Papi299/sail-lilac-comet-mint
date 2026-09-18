@@ -2548,7 +2548,9 @@ describe("GENERIC-V1-AUDIO-CONSTRAINT-CORRECTION-001", () => {
       const meta = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
       assert.deepEqual(Object.keys(meta).sort(), [
         "capabilities", "duration", "extractor", "formats", "presets",
-        "source", "thumbnail", "title", "webpageUrl",
+        // The one deliberate addition (GENERIC-SOURCE-RENDITION-INVENTORY-001):
+        // bounded numbers and closed reasons, carrying no private audio state.
+        "source", "sourceQuality", "thumbnail", "title", "webpageUrl",
       ]);
       assert.ok(meta.presets.length > 0);
       for (const preset of meta.presets) {
@@ -3577,7 +3579,8 @@ describe("SPLIT-05: the public/private boundary is unchanged (§35)", () => {
     assert.equal(meta.capabilities.merge, true);
     assert.deepEqual(Object.keys(meta).sort(), [
       "capabilities", "duration", "extractor", "formats", "presets",
-      "source", "thumbnail", "title", "webpageUrl",
+      // The one deliberate addition (GENERIC-SOURCE-RENDITION-INVENTORY-001).
+      "source", "sourceQuality", "thumbnail", "title", "webpageUrl",
     ]);
     assert.equal("selections" in meta, false, "no private half may be reachable here");
     for (const preset of meta.presets) {
