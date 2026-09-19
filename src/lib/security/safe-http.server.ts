@@ -248,6 +248,27 @@ export function disposeHttpBody(body: IncomingMessage | Readable | null | undefi
 
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 
+/**
+ * Refuse to begin another safe-HTTP step once `signal` has aborted.
+ *
+ * Throws the SAME application error an aborted request already produced —
+ * `nodeRequestOnce` maps Node's AbortError to NETWORK_ERROR — so callers see no
+ * new error semantic. `signal.reason` is never read: it is caller-supplied and
+ * could carry anything. No URL or hostname is named either.
+ */
+function assertNotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new AppError("NETWORK_ERROR");
+}
+
+/**
+ * One validated request, following at most `maxRedirects` redirects.
+ *
+ * Abort invariant: once `opts.signal` has aborted, no NEW step begins — no
+ * destination resolution for any hop, no request object, no socket, no request
+ * byte. A DNS lookup ALREADY in flight when the abort lands cannot be
+ * cancelled (`dns.promises.lookup` takes no signal) and may still finish, but
+ * nothing is built on its answer.
+ */
 export async function safeHttpRequest(opts: SafeHttpRequestOptions): Promise<SafeHttpResponse> {
   const method = opts.method ?? "GET";
   const timeoutMs = opts.timeoutMs ?? config.analysisTimeoutMs;
@@ -256,7 +277,16 @@ export async function safeHttpRequest(opts: SafeHttpRequestOptions): Promise<Saf
 
   let current = opts.url;
   for (let hop = 0; hop <= maxRedirects; hop += 1) {
+    // Before resolving this hop's destination — the first request and every
+    // redirect — so no new DNS lookup starts after an abort.
+    assertNotAborted(opts.signal);
     const dest = await resolveSafeDestination(current);
+    // Load-bearing: the lookup above may have answered AFTER an abort. Checked
+    // immediately before the request is built, so no request object, socket or
+    // byte is ever created from that answer. Handing the aborted signal to
+    // http.request is not relied on: Node can begin connecting before it
+    // destroys a request created with an already-aborted signal.
+    assertNotAborted(opts.signal);
     const result = await requestOnceImpl({
       url: dest.url,
       method,
