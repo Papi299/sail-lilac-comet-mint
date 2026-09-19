@@ -178,7 +178,18 @@ It never selects from it:
 - no option is ever created from `observedMaxHeight`, `withheld[]` or the
   protection flags.
 
-Without the field, the browser display is exactly the legacy one.
+Without `sourceQuality`, preset labels and source-quality messaging keep their
+legacy behaviour: no label is rewritten, and no quality notice is added.
+
+**Advanced availability is separate, and independent of `sourceQuality`.** It is
+derived from whether `video.formats` actually carries selectable advanced formats:
+
+- generic analysis sends `formats: []`, so Advanced is unavailable — including for
+  a pre-P1 generic response that carries no `sourceQuality` at all;
+- direct sources, which do list a format, keep Advanced available.
+
+That is a deliberate P2 truthfulness rule, not a regression: the switch previously
+stayed enabled and opened an empty Advanced list.
 
 ---
 

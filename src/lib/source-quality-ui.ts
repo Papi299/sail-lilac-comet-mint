@@ -18,8 +18,13 @@ import type {
  * withheld groups and protection flags are facts to show, never formats to
  * select.
  *
- * Without `sourceQuality` (direct analysis, or a Worker that predates P1) every
- * function here reproduces the legacy display exactly.
+ * Without `sourceQuality` (direct analysis, or a Worker that predates P1) the
+ * source-quality helpers here keep the legacy presentation: preset labels are
+ * returned unchanged and no quality notice is produced.
+ *
+ * `isAdvancedAvailable` is deliberately NOT part of that compatibility. It reads
+ * `video.formats` alone, so a generic response with `formats: []` reports Advanced
+ * as unavailable whether or not `sourceQuality` is present.
  */
 
 export const BEST_PRESET_ID = "preset:best";
