@@ -1034,34 +1034,46 @@ describe("clear-HLS preflight: caller cancellation", () => {
     assert.equal(getEventListeners(caller.signal, "abort").length, 0);
   });
 
-  it("cancels during DNS resolution, and destroys a response that arrives afterwards", async () => {
+  it("cancels during DNS resolution and starts no request when the lookup later answers", async () => {
     const caller = new AbortController();
-    const seen: { release?: (answers: DnsAnswer[]) => void; signal?: AbortSignal } = {};
+    const seen: { release?: (answers: DnsAnswer[]) => void } = {};
+    let lookups = 0;
+    let requests = 0;
+    // Staged, so that a request which never happens can be told apart from one
+    // that happened and returned nothing. Hardened safe-HTTP never asks for it.
     const late = bodyOf(playlist(["a.ts"]));
     setSafeHttpTestHooks({
-      lookup: () =>
-        new Promise<DnsAnswer[]>((resolveLookup) => {
+      lookup: () => {
+        lookups += 1;
+        return new Promise<DnsAnswer[]>((resolveLookup) => {
           seen.release = resolveLookup;
-        }),
-      requestOnce: async (args) => {
-        seen.signal = args.signal;
+        });
+      },
+      requestOnce: async () => {
+        requests += 1;
         return { status: 200, headers: {}, body: late.stream };
       },
     });
     const pending = preflight(PLAYLIST_URL, { signal: caller.signal });
     await settle();
+    assert.equal(lookups, 1);
     assert.equal(typeof seen.release, "function", "the lookup is in flight");
     caller.abort();
     await refusedWith(pending, "cancelled");
 
-    // The resolver answers only after the caller was answered. Safe-HTTP then
-    // creates its request with the already-aborted signal, and the preflight
-    // destroys whatever body that produced, unread.
+    // An OS lookup already in flight cannot be cancelled, so this one answers —
+    // with a perfectly usable public address — only after the caller has been
+    // answered. That answer is not authoritative: safe-HTTP rechecks the signal
+    // after destination resolution and before building a request, so nothing is
+    // started from it. No socket, no request, no fragment work, no late body.
     seen.release?.([PUBLIC]);
     await settle();
-    assert.equal(seen.signal?.aborted, true);
-    assert.equal(late.stats.destroyed, true);
+    assert.equal(lookups, 1, "the late answer starts no further resolution");
+    assert.equal(requests, 0, "the late answer starts no request");
     assert.equal(late.stats.pulled, 0);
+    assert.equal(late.stats.ended, false);
+    assert.equal(late.stats.destroyed, false, "no response body was ever produced to dispose");
+    assert.equal(getEventListeners(caller.signal, "abort").length, 0);
   });
 
   it("cancels between redirect hops, and follows no further hop", async () => {

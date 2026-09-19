@@ -454,16 +454,19 @@ function classify(err: unknown, signal: AbortSignal): ClearHlsPreflightError {
  *
  * Lifetime: one local controller carries both stop causes into `safeGet()` and
  * the body read. The function returns no later than the deadline even if an
- * interrupted operation is slow to unwind, and on every exit the timer is
- * cleared, the caller-signal listener removed and the local controller aborted,
- * so nothing it started is left running.
+ * interrupted operation is slow to unwind. Every resource this module owns is
+ * released on every exit: the deadline timer is cleared, the caller-signal
+ * listener removed, the local controller aborted, and a response body disposed
+ * whenever one exists.
  *
- * One limit sits inside `safeGet()`, not here: an operating-system DNS query
- * already in flight cannot be cancelled, and safe-HTTP does not re-check the
- * signal before connecting, so a lookup that finishes after a stop is followed
- * by a pinned connection to the already-validated address that Node destroys
- * at once, because its signal is already aborted. No request is completed from
- * it, and any response it produced would be destroyed on arrival.
+ * One resource is NOT this module's to release: an operating-system lookup
+ * already in flight cannot be cancelled, since `dns.promises.lookup` takes no
+ * signal. The preflight may therefore return on its deadline, or on caller
+ * cancellation, while such a lookup is still unwinding. That is bounded rather
+ * than open-ended, because safe-HTTP re-checks the abort signal after
+ * destination resolution and before a request is built: if the lookup answers
+ * later, it is refused there, and no request object, socket or request byte is
+ * created from that answer. Cancelling DNS itself is not claimed.
  */
 export async function preflightClearHlsMediaPlaylist(
   request: ClearHlsPreflightRequest,
