@@ -10,7 +10,7 @@ TLS termination, external egress enforcement, network-namespace ownership and
 R2 placement/jurisdiction.
 
 **Status — current as of 2026-09-19, recorded by
-`SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001`.**
+`SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001-PRODUCTION-CLOSURE-DOCS`.**
 
 - Phase 9 and Phase 10 are complete and accepted. Generic yt-dlp extraction is
   enabled in Production, and the execution plane runs on demand.
@@ -23,6 +23,8 @@ R2 placement/jurisdiction.
 - The P1 source rendition inventory (`sourceQuality`) went live on 2026-09-18,
   Vercel first. The Worker promotion was rolled back once on a false-negative gate
   and succeeded on the retry (§11h).
+- The P2 source-vs-downloadable quality UI went live on Vercel on 2026-09-19 and
+  was accepted in Production. The Worker did not change (§11h).
 
 The Phase-10 rows below were recorded on 2026-09-10 by
 `POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`. The Worker-runtime,
@@ -46,11 +48,11 @@ records are in §11 and §11a–§11h.
 | WorkerClient total-response deadline | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** — PR #44 | GitHub-verifiable + operator-measured — §1b, §11h |
 | Unknown-audio video presets | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** — PR #61, promoted 2026-09-18, original X/Twitter failure case accepted end to end | GitHub-verifiable + operator-measured — §11d, §11h |
 | Source rendition inventory (P1, `sourceQuality`) | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** — PR #63, Vercel first, Worker promoted 2026-09-18 on the retry; live `sourceQuality` accepted through Vercel | GitHub-verifiable + operator-measured — §11h |
-| Source-vs-downloadable quality UI (P2) | **IMPLEMENTED IN SOURCE / NOT DEPLOYED** — browser presentation only; needs a separately authorized Vercel deployment | repository/source-verifiable — §11 |
+| Source-vs-downloadable quality UI (P2) | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** — PR #64, browser presentation only; Vercel `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq` deployed 2026-09-19; the Worker did not change | GitHub-verifiable + operator-measured — §11h |
 | Worker runtime source | `593f47dfffe79f166d40af6575c6130668e56af0`, tree `758ff83ff9d1505b71f24d20b6f2ac71bf240dca` (PR #63 merge) — promoted 2026-09-18 by `GENERIC-SOURCE-RENDITION-INVENTORY-001-PRODUCTION-PROMOTION-RETRY-001`. It superseded the unknown-audio promotion's `8b59cdff…` (2026-09-18). Before that came the 4 GiB rollout's `2e6c0cf9…` (2026-09-17) and SPLIT-08E's `6ce4ce2b…` (2026-09-13) | commit GitHub-verifiable; image↔source identity operator-measured — §11h |
 | Worker image | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest`, also retained as `videofetch-worker:rc-593f47dfffe7-5925515fb002`; pinned yt-dlp `2026.08.19` | image operator-measured; pin source-verifiable — §11h |
 | Previous Worker image — rollback asset | **Immediate:** `sha256:d6aa8b404d015e72bb216f364b900271521d44f66bae672bd012d4239fc52b0e`, retained as `videofetch-worker:rc-8b59cdffbfe5-d6aa8b404d01` (source `8b59cdff…`, the unknown-audio image, without `sourceQuality`). **Deeper:** `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0`, retained as `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799` (source `2e6c0cf9…`, the 4 GiB rollout image), then `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b`, retained as `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (source `6ce4ce2b…`, the SPLIT-08E image, 500 MiB default). Rollback is an image retag onto the same disk-backed unit and workspace | operator-measured — §9, §11h |
-| Vercel Production | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from `main` `593f47dfffe79f166d40af6575c6130668e56af0`, deployed 2026-09-18 as P1's Vercel-first step. Rollback target `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` (from `397f238b…`) is retained, but it predates `sourceQuality`: roll the Worker back **before** using it (§9) | chain of custody — **not** Vercel Git-attested (§11h) |
+| Vercel Production | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478`, deployed 2026-09-19 for P2. **Immediate rollback:** `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` (from `593f47df…`, P1's Vercel-first step), which accepts `sourceQuality`, so it needs no Worker rollback. **Deeper:** `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` (from `397f238b…`) predates `sourceQuality`: roll the Worker back **before** using it (§9) | source by chain of custody — **not** Vercel Git-attested; deployment and alias state provider-observable (§11h) |
 | Execution plane | **on demand**; the idle state is **Stopped** | §3c, §11h |
 | Product media workspace | **4 GiB delivered-media limit (4,294,967,296 bytes) LIVE** on the bounded 10 GiB disk-backed ext4 workspace bound at `/tmp/videofetch` — no Product media tmpfs. `MAX_FILE_SIZE` is absent, so the image default applies. `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, rollout Phases 1A–1E complete, Production accepted 2026-09-17 | contract repository/source-verifiable; deployment operator-measured — §2a, §11h |
 
@@ -3502,14 +3504,24 @@ promotion. Analysis stops sending `sourceQuality`, and nothing else changes:
 - presets, selections, execution plans and selectors are identical across the
   28-scenario identity corpus (*operator-measured*, candidate acceptance);
 - the accepted X/Twitter job delivered the same bytes on both images (§11h);
-- current Vercel `dpl_AFFCLwLi…` accepts a Worker that omits the field. P1's
-  Vercel-first step proved it against this exact image.
+- current Vercel `dpl_BcefWQ…` and its immediate rollback `dpl_AFFCLwLi…` both
+  accept a Worker that omits the field. P1's Vercel-first step proved it for
+  `dpl_AFFCLwLi…` against this exact image. `dpl_BcefWQ…` carries the same shared
+  contract: PR #64 changed no file under `src/shared`, `src/web`,
+  `src/lib/security` or `src/routes/api` (*repository-verifiable*).
 
-**Vercel rollback ordering.** Vercel rollback target
-`dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` predates `sourceQuality`, and its strict schema
-rejects a Worker response that carries the field. So while `5925515f…` is live,
-rolling back Vercel alone would fail every generic analysis. Roll the Worker back to
-`d6aa8b40…` first, and only then Vercel.
+**Vercel rollback ordering.** Vercel Production is `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`
+(P2, 2026-09-19). There are two Vercel rollback layers, and they are NOT alike:
+
+- **Immediate — `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`**, P1's control plane. It
+  already accepts the optional `sourceQuality`, so P2 rolls back on Vercel alone
+  (`vercel rollback dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU --yes`), and the Worker stays
+  on `5925515f…`. The browser returns to the pre-P2 presentation.
+- **Deeper — `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`.** It predates `sourceQuality`,
+  and its strict schema rejects a Worker response that carries the field. So while
+  `5925515f…` is live, rolling Vercel back this far on its own would fail every
+  generic analysis. Roll the Worker back to `d6aa8b40…` first, and only then
+  Vercel.
 
 Rolling back to `a3b062a2…` restores the 2026-09-17 Phase-1E state: the same 4 GiB
 limit and workspace, but without the unknown-audio fallback, so an X/Twitter-shaped
@@ -3739,11 +3751,13 @@ authorization.
 | `GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-PRODUCTION-PROMOTION-001` | **COMPLETE / PRODUCTION ACCEPTED** | 2026-09-18: `videofetch-worker:latest` retagged from the immutable candidate id `d6aa8b404d01…` (prior Production `a3b062a24799…`); only `videofetch-worker.service` restarted, measured health downtime ≈ 2.928 s; every boundary and health check passed; the stability window passed; no rollback. On the original X/Twitter post the old image returned 0 presets and the new one `preset:best` / `preset:360` / `preset:240`, and one real job reached `ready` (774,763 bytes). Evidence `0d7a8251…` (*accepted operator-measured*). See §11h. |
 | `GENERIC-SOURCE-RENDITION-INVENTORY-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | Phase P1 of the full-quality coverage program. Generic analysis adds an optional, strict `VideoMetadata.sourceQuality`: the tallest height observed in that run, the tallest height behind an advertised video preset, observed renditions that are withheld (grouped by a closed 11-reason vocabulary), and two protection flags. It is informational only, and no selection, plan, selector or acquisition reads it. HLS and segmented DASH appear in it but remain non-executable. *Source:* PR #63, merge `593f47dfffe79f166d40af6575c6130668e56af0`, tree `758ff83ff9d1505b71f24d20b6f2ac71bf240dca` (*GitHub-verifiable*). *Rollout (accepted operator-measured):* Vercel first, because the strict schema rejects an unknown field. Vercel `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` was deployed from `593f47df…` and accepted with the then-live Worker `d6aa8b40…` (evidence `71330e0850ee5172397875e4dc8b32177e040e51a8175dbec276f563f7203b52`). Candidate `sha256:5925515f…` was accepted (evidence `cbce939fb4dc8c5fc2082692eee4c81bc01afc2cb084c3a59c82d9f1bc442a8b`). The Worker was then promoted (next row). The contract is in `docs/architecture/worker-api-contract.md`. See §11h. |
 | `GENERIC-SOURCE-RENDITION-INVENTORY-001-PRODUCTION-PROMOTION` / `…-RETRY-001` | **FIRST ATTEMPT ROLLED BACK; RETRY COMPLETE / PRODUCTION ACCEPTED** | *First attempt, 2026-09-18 20:30Z — ROLLED_BACK.* Its only failing gate compared Docker's `HostConfig.Binds` as an ordered list, and Docker records those binds in a nondeterministic order: a false negative, not a Product defect. It rolled back automatically to `d6aa8b40…`. No public analyze or job ran, so it proved nothing about `sourceQuality` (evidence `2a95f80619b800e9652999c31575856c9733abd47d579ad8e871bd0626ce804e`). That record stands unchanged. *Retry, 2026-09-18 21:00Z — SUCCESS.* It used an order-insensitive posture comparison. `latest` was retagged to `5925515f…` and only `videofetch-worker.service` restarted, with ≈ 1.896 s of health downtime. Live `sourceQuality` returned through Vercel, and one `preset:best` job reached `ready`, byte-identical to the pre-P1 deliveries. No rollback was needed (evidence `f143de781e4a28e004af4f12479d6fd82c6e633b4a2d9eb112e111b1db13ba2d`). See §11h. |
-| `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001` | **IMPLEMENTED IN SOURCE / NOT DEPLOYED** | Phase P2. The browser uses `sourceQuality` to tell apart the quality it OBSERVED from the quality it can DOWNLOAD. `preset:best` is displayed as "Best downloadable — <rung>" (its id, `formatId` and job payload are unchanged). A higher observed quality is reported only when it is strictly taller. Withheld reasons get application-owned copy. A missing resolution is explained honestly. Advanced is disabled when there is no raw format list (generic analysis sends `formats: []`). No unsupported quality ever becomes selectable. Browser-only: no Worker, preset, selector, payload or acquisition change. Going live needs a separately authorized Vercel deployment; none has been made. |
+| `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | Phase P2. The browser uses `sourceQuality` to tell apart the quality it OBSERVED from the quality it can DOWNLOAD. `preset:best` is displayed as "Best downloadable — <rung>" (its id, `formatId` and job payload are unchanged). A higher observed quality is reported only when it is strictly taller. Withheld reasons get application-owned copy. A missing resolution is explained honestly. Advanced is disabled when there is no raw format list (generic analysis sends `formats: []`). No unsupported quality ever becomes selectable. Browser-only: no Worker, preset, selector, payload or acquisition change. *Source:* PR #64, merge `02b3f15f4e4838a64b4ec64c9dd9036145d88478`, tree `44abfe6e…` (*GitHub-verifiable*). *Deployment:* Vercel `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq` on 2026-09-19, accepted in Production; the Worker did not change (see the deployment row below). Recorded here on 2026-09-19 as "IMPLEMENTED IN SOURCE / NOT DEPLOYED"; that state is now history. See §11h. |
 | `X-TWITTER-PROGRESSIVE-VS-PLAYER-QUALITY-DIAGNOSTIC-001` | **COMPLETE — interim conclusion SUPERSEDED** | 2026-09-18, anonymous (no-cookie) comparison of the accepted file of the original post with X's public HLS ladder. Its classification `PLAYER_RENDERING_DIFFERENCE` was an interim reading bounded to the anonymous ladder and is **not** the final conclusion: the authenticated-browser diagnostic below closes that post as **NO PLAYBACK DEFECT FOUND**. Evidence `d7e18480…` (*accepted operator-measured*). See §11h. |
 | `X-TWITTER-AUTHENTICATED-BROWSER-STREAM-DIAGNOSTIC-001` | **COMPLETE — NO PRODUCT DEFECT FOUND** | Original post, a real logged-in browser session: the same 2-variant ladder as anonymous, active top rendition 848×384, exactly 30 fps presented with 0 dropped or corrupted frames, no 60 fps rendition, and the accepted VideoFetch file presented identically in the same browser. Final closure for that post: **NO PLAYBACK DEFECT FOUND**. Evidence `a6b9d22d…` (*accepted operator-measured*). See §11h. |
 | `X-TWITTER-JONATHAN-TIMING-RENDITION-DIAGNOSTIC-001` | **COMPLETE — SOURCE_ALREADY_IRREGULAR / NO PRODUCT DEFECT** | A second, separately authorized X/Twitter post whose download plays unevenly. The exact progressive 1560×720 source VideoFetch selects is byte-identical to the downloaded file, and every observed X rendition carries the same irregular frame timing: no VideoFetch timing alteration and no inferior observed rendition selected. Logged-in-only renditions were **not** directly observed for this source, because X refused the temporary-browser login. Evidence `a1c8050b…` (*accepted operator-measured*). See §11h. |
 | `NODE22-GENERIC-EXECUTION-TEST-LIVENESS-001` | **OPEN — TEST-HARNESS COMPATIBILITY / NON-PRODUCTION-BLOCKING** | Under the image's Node 22 test runner, the late-byte-monitor test "reaches ready even when a suspended stat resolves after acquisition returned" in `src/worker/execution/generic-execution.server.test.ts` does not settle ("Promise resolution is still pending but the event loop has already resolved"), which cancels the rest of that file. It predates PR #61: the test was introduced by `28c04c7…` (2026-09-02) and is present at the prior Production source `2e6c0cf9…` (*repository-verifiable*); its describe block is byte-identical there and at `8b59cdff…`, and the prior Production image `a3b062a2…` reproduces the cancellation (*accepted operator-measured*, release decision `961649ec…`). PR #61's new tests pass independently. Cancelled tests are **not** counted as passed. The candidate's semantic and release gates passed. A separate test-maintenance task remains; no Product behaviour is implicated. |
+| `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001-VERCEL-PRODUCTION-DEPLOYMENT` | **COMPLETE / PRODUCTION ACCEPTED** | 2026-09-19: exactly one Vercel Production deployment, `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from a pristine detached worktree of `main` `02b3f15f…` (tree `44abfe6e…`), with no env, project or domain change. On the authorized X/Twitter case (`authorized-original-x-case`) the live browser showed "Best downloadable — 360p", no higher-quality notice (observed 384 = deliverable 384) and Advanced unavailable (`formats: []`), and it submitted `preset:best`. One job reached `ready`, and the file route's `303` delivered 774,763 bytes, byte-identical to the P1 acceptance. The higher-quality notice and the unknown-resolution state were verified deterministically on the deployed source, not on a live third-party source. No rollback was required, and the Worker did not change. Evidence `7fce201ed8fa4ba844b2730ec2fe7dc04ae97def0168d627134e684a9471e5f1` (*accepted operator-measured*). See §11h. |
+| `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` | **OPEN / NON-PRODUCTION-BLOCKING** | Upstream bitrate-derived approximate sizes can materially overestimate the bytes actually delivered. Observed at the P2 acceptance (*accepted operator-measured*): for the authorized X/Twitter case the browser's estimated size was about 5.9 MB (preset `fileSize` 6,226,064 bytes), while the delivered object was 774,763 bytes (≈ 757 KiB). When the extractor declares no exact `filesize`, the Worker reports its `filesize_approx` (`src/worker/analysis/ytdlp-analysis.server.ts`, *repository-verifiable*). For this source that approximation derives from upstream nominal bitrate metadata, not from the real bitrate (*accepted operator-measured*, 2026-09-18 X/Twitter diagnostics). It is not a P2 defect: P2 only displays the size the Worker reports. Nothing is changed here. Later work may distinguish an exact size, an upstream approximate size, a bitrate-derived estimate and an unknown size. |
 
 ---
 
@@ -5393,7 +5407,7 @@ The next live `shutdown` case remains the load-bearing test. Generic remains
 
 ---
 
-## 11h. Phase-10 closure, the SPLIT-08E promotion, the 4 GiB rollout, the unknown-audio promotion, the P1 rendition-inventory rollout, and current operating state
+## 11h. Phase-10 closure, the SPLIT-08E promotion, the 4 GiB rollout, the unknown-audio promotion, the P1 rendition-inventory rollout, the P2 quality-UI deployment, and current operating state
 
 **Phase-10 records: recorded 2026-09-10 by
 `POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`. Split-stream qualification
@@ -5404,11 +5418,13 @@ operator evidence. The 4 GiB rollout record: recorded 2026-09-17 by
 evidence. The unknown-audio promotion record, the X/Twitter media-quality
 diagnostics and the current-state block: recorded 2026-09-18 by
 `GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-PRODUCTION-CLOSURE-DOCS-002`, from accepted
-operator evidence. The P1 rendition-inventory record and the refreshed
-current-state block: recorded 2026-09-19 by `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001`,
-from accepted operator evidence.**
+operator evidence. The P1 rendition-inventory record: recorded 2026-09-19 by
+`SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001`, from accepted operator evidence. The P2
+deployment record and the current-state block: recorded 2026-09-19 by
+`SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001-PRODUCTION-CLOSURE-DOCS`, from that
+deployment's accepted operator evidence.**
 
-All five reconciliations *record* previously accepted evidence and reproduce none
+All six reconciliations *record* previously accepted evidence and reproduce none
 of it. None started a VM, read `worker.env`, or re-measured Cloudflare or R2 state. SPLIT-08F, the
 4 GiB closure and the unknown-audio closure performed no Production or runtime
 operation at all. `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001` performed read-only
@@ -5419,7 +5435,10 @@ identity checks only, and they matched the accepted evidence:
 - the running Worker container's image id and start time;
 - the SHA-256 of each evidence file cited below.
 
-It changed nothing. Evidence classes are named inline —
+It changed nothing. `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001-PRODUCTION-CLOSURE-DOCS`
+also changed nothing. It performed read-only GitHub checks, a read-only
+`vercel inspect` of the Production alias (*accepted provider observation*), and a
+SHA-256 of the P2 evidence file, which matched. Evidence classes are named inline —
 *GitHub-verifiable*, *repository/source-verifiable*, *accepted
 operator-measured Production evidence*, *accepted provider observation*,
 *operator-attested*. No secret, account identifier, bucket name, token, HMAC
@@ -5553,7 +5572,7 @@ The same absence is also a safeguard: **a merge to `main` never deploys.** A
 Production deployment happens only on explicit Product Owner authorization,
 and merging any pull request is not that authorization.
 
-**Production has since moved.** Vercel Production is now
+**Production has since moved.** Vercel Production then became
 `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, deployed on 2026-09-11 from `main`
 `397f238b9fe6b6ff430d6bf8e805bc0ee8082788` — the same chain-of-custody basis,
 still not Git-attested. The SPLIT-08E Worker promotion performed **no** Vercel
@@ -5585,9 +5604,27 @@ The P1 Worker promotion that followed performed no Vercel deployment. Its
 stability window sampled the alias on `dpl_AFFCLwLi…` throughout (*accepted
 operator-measured*).
 
-Vercel Production and the Worker are now built from the same source, `593f47df…`,
-which is also `main`. **Merging the P2 browser change will put `main` ahead of
-Production again** until a separately authorized Vercel deployment.
+From then until 2026-09-19, Vercel Production and the Worker were built from the
+same source, `593f47df…`. Merging P2 (PR #64, `02b3f15f…`) put `main` ahead of
+Production until P2's separately authorized Vercel deployment.
+
+**Production moved again on 2026-09-19.** P2 deployed
+`dpl_BcefWQBrtw7bJuubiQrTr9h38cvq` (created `2026-09-19T06:57:56Z`) from a
+pristine detached worktree of `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478`,
+tree `44abfe6e…`. That is the same chain-of-custody basis, still not
+Git-attested. One corroboration goes beyond custody: after the deployment, the
+alias served client assets whose content-hashed names (`index-D-Aa4fjD.js`,
+`routes-gVYt2Xcf.js`) are identical to a local build of that exact tree, and
+different from the previous deployment's (*accepted operator-measured*).
+`dpl_AFFCLwLi…` is retained, READY, as the immediate rollback, and it needs no
+Worker rollback. `dpl_BAnK2x…` is retained as the deeper rollback, with the Worker
+ordering of §9.
+
+Vercel Production now serves `main` `02b3f15f…`, while the Worker still runs
+`593f47df…`. That is expected: PR #64 changed no file under `src/worker`,
+`src/shared`, `src/services`, `src/web` or `deploy`. Its only change reachable from
+Worker code is type-level in `src/types/media.ts` (a type-only import and an
+optional field), which is erased at runtime (*repository-verifiable*).
 
 ### Split-stream candidate qualification — SPLIT-07 … SPLIT-08D
 
@@ -5938,10 +5975,121 @@ What the retry established:
 the selection by the preset's rung, "Best downloadable — 360p". It shows no
 higher-quality notice, because the withheld renditions are the same height.
 
+### SOURCE-VS-DOWNLOADABLE-QUALITY-UI — Vercel Production deployment and acceptance
+
+`SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001`, 2026-09-19 — **CLOSED / DEPLOYED /
+PRODUCTION ACCEPTED**. The browser semantics are described in
+`docs/architecture/worker-api-contract.md` (browser presentation of
+`VideoMetadata.sourceQuality`).
+
+*Evidence classes.*
+
+- **GitHub-verifiable:** PR #64, merge `02b3f15f…` (tree `44abfe6e…`, parents
+  `593f47df…` and `63145af7…`, signature valid).
+- **Repository/source-verifiable:** the P2 semantics and their tests at that
+  commit: `src/lib/source-quality-ui.ts` with its unit tests, the render tests, and
+  the download-option identity tests.
+- **Accepted provider observation:** Vercel reports `dpl_BcefWQ…` READY, target
+  production, behind `videofetcher.vercel.app`. This closure re-observed it
+  read-only.
+- **Accepted operator-measured Production evidence:** everything else below. The
+  record is
+  `/var/tmp/p2-quality-ui-vercel-production-20260919T072939Z/production-deployment.txt`,
+  SHA-256 `7fce201ed8fa4ba844b2730ec2fe7dc04ae97def0168d627134e684a9471e5f1`. The
+  file is operator-held and not committed; this repository cannot verify it.
+
+| | |
+| :--- | :--- |
+| Production source | `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478`, tree `44abfe6e90c0d9ce5bd9eae8af6140e3f39e7ff9` |
+| Production Vercel | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq` (`videofetcher-b3kai5ndw-…`), created 2026-09-19T06:57:56Z, READY, production |
+| Immediate Vercel rollback | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` — retained, READY, not used; needs no Worker rollback (§9) |
+| Production Worker | unchanged: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`, `videofetch-worker:rc-593f47dfffe7-5925515fb002`) |
+| Immediate Worker rollback | unchanged: `videofetch-worker:rc-8b59cdffbfe5-d6aa8b404d01` → `sha256:d6aa8b404d015e72bb216f364b900271521d44f66bae672bd012d4239fc52b0e` |
+
+What the deployment established:
+
+- **Exact source, one deployment.** Before deploying, the gate at the exact
+  commit passed: `tsc --noEmit` exit 0, the focused P2 tests 60 pass / 0 fail, a
+  successful build, and a clean `git diff --check`. A sourcemapped client build
+  carried no module from `src/worker`, `src/web`, `src/services` or any
+  `*.server.ts`. The type-only contract import was erased: `src/types/media.ts`
+  does not appear in the client bundle. Exactly one Vercel Production deployment
+  was made, with no env, project or domain change.
+- **Smoke.** The shell and `/api/health` returned 200. Without a session,
+  `/api/sites`, `/api/diagnostics` and `/api/analyze` returned 401
+  `ACCESS_REQUIRED`, which is the correct gating. The private login succeeded,
+  and with the session `/api/sites` and `/api/diagnostics` returned 200. The
+  diagnostics described the existing Worker.
+- **Live P1 data.** One authenticated analysis of `authorized-original-x-case`
+  (the established X/Twitter case; its URL is deliberately not recorded) returned
+  `formats: []`, the presets `preset:best`, `preset:360` and `preset:240`, and
+  `{observedMaxHeight: 384, deliverableMaxHeight: 384, withheld: [unsupported_protocol ×2, max 384], protectedUnenumerated: false, maybeProtectedObserved: false}`,
+  unchanged from the P1 acceptance.
+- **Live P2 page.** Measured in a real authenticated browser running the
+  deployed bundle:
+  - The selection read "Best downloadable — 360p", and no "Best available" label
+    was shown for `preset:best`.
+  - There were exactly three options, one per preset.
+  - "Higher source quality detected" was **not** shown, because 384 equals 384.
+  - The Advanced switch was disabled, with the visible copy "Advanced unavailable
+    for this source".
+  - No 384p option and no HLS or DASH option was selectable.
+  - There were no console or page errors.
+- **Selection identity.** The displayed "Best downloadable — 360p" was the option
+  for `preset:best`, and the one create request submitted
+  `formatId: "preset:best"`.
+- **One Product job.** `analyzing → downloading → uploading → ready`. The file
+  route answered `303` to a presigned R2 GET, which delivered 774,763 bytes,
+  byte-identical to the P1 acceptance (SHA-256 `8ee08a22…`). The file validated
+  as MP4 with H.264 Main 848×384 at 30 fps and AAC-LC stereo, ≈ 59.9 s.
+- **Stability.** 12 samples over 6 m 19 s. The alias stayed on `dpl_BcefWQ…`,
+  READY, and the shell, `/api/health` and Worker health returned 200 throughout.
+  The deployment's runtime logs showed 0 5xx and 0 error-level rows. Every 401 was
+  a deliberate probe.
+- **Worker continuity.** The image, container and start time were the same before
+  and after, with 0 restarts, Worker health at 200 and all three boundary
+  verifiers passing: PRODUCTION WORKER — UNCHANGED. No rollback was required.
+
+**Positive-gap proof — `HIGHER-QUALITY NOTICE — DEPLOYED SOURCE VERIFIED / NOT
+LIVE-THIRD-PARTY EXERCISED`.** The live case cannot show the notice, because
+384 = 384. The deployed source was therefore rendered deterministically for
+observed 2160 and deliverable 720. It shows "Best downloadable — 720p" and
+"Higher source quality detected", with "Highest observed: 2160p" and
+"Best downloadable: 720p", plus the application-owned explanation for an
+unsupported stream type. No 2160p option is created. This is a render of the
+deployed source, **not** a live observation of a third-party source.
+
+**Unknown-resolution proof — `UNKNOWN-RESOLUTION UI — DEPLOYED SOURCE VERIFIED`.**
+For one executable `preset:best` with no resolution, the deployed source shows
+"Best downloadable" with no invented resolution, and the notice "Resolution
+unavailable". Download stays enabled, and Advanced is unavailable because the
+analysis returned `formats: []`.
+
+**Direct / legacy behavior, as deployed.** Without `sourceQuality`, preset labels
+keep their legacy values and no source-quality notice is added. Advanced
+availability does not depend on `sourceQuality`; it follows `formats`. With
+`formats: []` Advanced is unavailable, and with real formats (direct analysis) it
+is available. So a page without `sourceQuality` is not byte-for-byte legacy:
+Advanced is the deliberate difference.
+
+**Scope.** P2 made the existing capability more truthful and added none:
+
+- HLS and segmented DASH remain not implemented and inventory-only;
+- `observedMaxHeight` is not a provider's absolute maximum;
+- protected (DRM) renditions are not downloadable;
+- acquisition, processing and Worker execution are unchanged;
+- Advanced is not a browser for every generic yt-dlp format.
+
+One operator-side finding: an operator-owned historical acceptance secret file was
+found stale. It is not a Product or deployment defect and is outside repository
+state. The acceptance used a freshly supplied secret, which was deleted afterwards.
+The one open observation is the size estimate, `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`
+(§11).
+
 ### Current operating state
 
-*Recorded 2026-09-19 by `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001`, superseding the
-2026-09-18 record of `GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-PRODUCTION-CLOSURE-DOCS-002`.*
+*Recorded 2026-09-19 by `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001-PRODUCTION-CLOSURE-DOCS`,
+superseding the earlier 2026-09-19 record of `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001`.*
 
 | | |
 | :--- | :--- |
@@ -5960,10 +6108,12 @@ higher-quality notice, because the withheld renditions are the same height.
 | Split-stream presets | live in Production since the SPLIT-08E promotion (2026-09-13), and contained in the current image |
 | Unknown-audio video presets | live in Production since 2026-09-18 (`GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001`, §11d), and contained in the current image; the original X/Twitter failure case accepted end to end |
 | Source rendition inventory | `sourceQuality` live in Production since 2026-09-18 21:00Z (`GENERIC-SOURCE-RENDITION-INVENTORY-001`); informational only, and no execution path reads it |
-| Source-vs-downloadable quality UI | `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001` — implemented in source, **not deployed**; the live browser still shows the legacy labels |
-| Control plane | Vercel Production `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from `main` `593f47df…` (2026-09-18, P1's Vercel-first step) — chain of custody, **not** Git-attested. Rollback target `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` (`397f238b…`) predates `sourceQuality`: roll the Worker back first (§9) |
+| Source-vs-downloadable quality UI | `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001` — **live in Production since 2026-09-19** (Vercel only; browser presentation of `sourceQuality`; the Worker did not change) |
+| HLS / segmented DASH | **not implemented** — such renditions appear only in `sourceQuality`, as withheld, and never as a download |
+| Control plane | Vercel Production `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from `main` `02b3f15f…` (2026-09-19, P2) — chain of custody, **not** Git-attested. Immediate rollback `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` (`593f47df…`) accepts `sourceQuality`: no Worker rollback needed. Deeper rollback `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` (`397f238b…`) predates `sourceQuality`: roll the Worker back first (§9) |
 | Vercel project safe-state | `8a85a0e1…` — byte-identical across the SPLIT-08E promotion; not re-measured since, and not by this record |
 | Execution plane | the on-demand `videofetch` Lima VM — idle state **Stopped** |
+| Latest control-plane deployment | 2026-09-19 06:57Z — P2 quality UI, `dpl_BcefWQ…`; evidence `7fce201ed8fa4ba844b2730ec2fe7dc04ae97def0168d627134e684a9471e5f1` |
 | Latest promotion | 2026-09-18 21:00Z — P1 rendition inventory, on the retry; evidence `f143de781e4a28e004af4f12479d6fd82c6e633b4a2d9eb112e111b1db13ba2d` |
 | Rolled-back attempt | 2026-09-18 20:30Z — P1 first attempt, ROLLED_BACK on a false-negative gate; evidence `2a95f80619b800e9652999c31575856c9733abd47d579ad8e871bd0626ce804e` |
 | Previous promotion | 2026-09-18 04:56Z — unknown-audio video presets; evidence `0d7a8251c285a4bd37587145617e8c6e845f63a7315914e1d793ab6a5b88e837` |
@@ -5990,6 +6140,9 @@ The limit and the unknown-audio fallback are therefore entirely Worker-owned.
 to the Worker's analyze response, and the control plane validates that response
 with a strict schema. The control plane therefore had to learn the optional field
 before any Worker sent it (§11h, above).
+
+**P2 needed only a Vercel deployment.** It is browser presentation over a field
+the control plane already accepted, so the Worker did not change (§11h, above).
 
 The current control plane, with credential ownership made explicit:
 

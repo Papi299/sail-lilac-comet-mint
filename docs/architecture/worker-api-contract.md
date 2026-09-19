@@ -104,7 +104,7 @@ Safe for transmission to Vercel. When ready, it contains:
 | :--- | :--- |
 | Source | `main` `593f47dfffe79f166d40af6575c6130668e56af0` (PR #63 merge) |
 | Production Worker | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest` |
-| Production Vercel | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from the same source |
+| Vercel (P1 rollout) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from the same source. Superseded on 2026-09-19 by the P2 deployment below, and now the immediate Vercel rollback |
 
 It was recorded here as "IMPLEMENTED IN SOURCE — NOT DEPLOYED" until then; that
 state is now history. The rollout record is in the deployment runbook (§11h).
@@ -159,15 +159,37 @@ All three steps were performed on 2026-09-18, in that order:
 After that, a live Production analysis returned `sourceQuality` through Vercel,
 and the strict schema accepted it.
 
-**The ordering constraint still holds for rollback.** The live Worker now sends
-the field, so rolling Vercel back to a deployment that predates it, such as
-`dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, would reject every generic analysis. Roll the
-Worker back first. A Worker rollback on its own is safe: the current control plane
-accepts a Worker that omits the field.
+**The ordering constraint still holds for rollback, and Vercel now has two
+rollback layers.** Vercel Production is the P2 deployment
+`dpl_BcefWQBrtw7bJuubiQrTr9h38cvq` (below).
 
-**Browser presentation — `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001`, IMPLEMENTED IN
-SOURCE / NOT DEPLOYED.** The browser reads the field only to *describe* quality.
-It never selects from it:
+- Its immediate rollback, `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, already accepts
+  the optional field, so P2 can be rolled back on Vercel alone, with the Worker
+  left in place.
+- The deeper rollback, `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, predates the field.
+  While the live Worker sends it, that deployment would reject every generic
+  analysis, so roll the Worker back first.
+
+A Worker rollback on its own is safe: `dpl_BcefWQ…` and `dpl_AFFCLwLi…` both
+accept a Worker that omits the field. The field is optional in the shared
+contract, which P2 did not change, and P1's Vercel-first step measured it for
+`dpl_AFFCLwLi…`.
+
+**Browser presentation — `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001`, DEPLOYED /
+PRODUCTION ACCEPTED (2026-09-19).**
+
+| | |
+| :--- | :--- |
+| Source | `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478` (PR #64 merge), tree `44abfe6e90c0d9ce5bd9eae8af6140e3f39e7ff9` |
+| Production Vercel | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from that source by chain of custody (the project has no Git integration, so Vercel does not attest the commit) |
+| Immediate Vercel rollback | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` — needs no Worker rollback (above) |
+| Production Worker | unchanged by P2: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`) |
+
+It was recorded here as "IMPLEMENTED IN SOURCE / NOT DEPLOYED" until then; that
+state is now history. The deployment and acceptance record is in the deployment
+runbook (§11h).
+
+The browser reads the field only to *describe* quality. It never selects from it:
 
 - when the field is present, `preset:best` is shown as **Best downloadable**, with
   the preset's own rung label (e.g. "Best downloadable — 720p"). Its id,
@@ -189,7 +211,28 @@ derived from whether `video.formats` actually carries selectable advanced format
 - direct sources, which do list a format, keep Advanced available.
 
 That is a deliberate P2 truthfulness rule, not a regression: the switch previously
-stayed enabled and opened an empty Advanced list.
+stayed enabled and opened an empty Advanced list. Advanced lists the formats the
+analysis actually returns; it is not a browser for every format a source offers.
+
+**Accepted in Production** (*accepted operator-measured*; runbook §11h). On the
+authorized X/Twitter case, recorded only as `authorized-original-x-case`:
+
+- The live analysis returned `observedMaxHeight` 384 and `deliverableMaxHeight`
+  384, with two `unsupported_protocol` renditions withheld at height 384.
+- The browser showed "Best downloadable — 360p". It showed no "Higher source
+  quality detected" notice, because the heights are equal.
+- Advanced was disabled, with "Advanced unavailable for this source", because the
+  analysis returned `formats: []`.
+- No 384p option and no HLS or DASH option was selectable.
+- The one job still submitted `preset:best` and delivered the same bytes as the P1
+  acceptance.
+
+The higher-quality notice and the unknown-resolution state were verified on the
+deployed source by deterministic render tests, not on a live third-party source.
+
+P2 changes presentation only. HLS and segmented DASH remain not implemented and
+inventory-only. `observedMaxHeight` is still not a claim about a provider's
+absolute maximum, and protected renditions are still not downloadable.
 
 ---
 
