@@ -1,3 +1,13 @@
+// TYPE-ONLY: the authoritative P1 schema stays in the shared Worker contract,
+// and this import erases from the browser bundle, so no Worker code ships.
+import type {
+  SourceQuality,
+  SourceQualityWithheld,
+  SourceQualityWithheldReason,
+} from "@/shared/worker/contracts";
+
+export type { SourceQuality, SourceQualityWithheld, SourceQualityWithheldReason };
+
 export type ResolutionLabel =
   | "2160p"
   | "1440p"
@@ -53,6 +63,9 @@ export type VideoMetadata = {
     mp3: boolean;
     merge: boolean;
   };
+  // What generic analysis OBSERVED versus what it can deliver. Informational
+  // only: nothing selectable is ever derived from it. Direct analysis omits it.
+  sourceQuality?: SourceQuality;
 };
 
 export type AnalyzeSuccess = {

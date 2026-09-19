@@ -97,7 +97,17 @@ Safe for transmission to Vercel. When ready, it contains:
 
 **3. `VideoMetadata.sourceQuality` (OPTIONAL; analysis only)**
 
-`GENERIC-SOURCE-RENDITION-INVENTORY-001` — **IMPLEMENTED IN SOURCE — NOT DEPLOYED.**
+`GENERIC-SOURCE-RENDITION-INVENTORY-001` — **DEPLOYED / PRODUCTION ACCEPTED**
+(2026-09-18).
+
+| | |
+| :--- | :--- |
+| Source | `main` `593f47dfffe79f166d40af6575c6130668e56af0` (PR #63 merge) |
+| Production Worker | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest` |
+| Production Vercel | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from the same source |
+
+It was recorded here as "IMPLEMENTED IN SOURCE — NOT DEPLOYED" until then; that
+state is now history. The rollout record is in the deployment runbook (§11h).
 
 Generic analysis reports what one run OBSERVED against what it can DELIVER, so a
 lower rendition is never presented as the source maximum:
@@ -136,7 +146,39 @@ it. The rollout is therefore:
 2. build and accept a Worker candidate from that same source;
 3. only then promote the Worker.
 
-Neither step has been performed: this contract change exists in source only.
+All three steps were performed on 2026-09-18, in that order:
+
+1. Vercel `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` was deployed from `593f47df…`, and
+   the then-live Worker `sha256:d6aa8b40…`, which omits the field, analyzed and
+   delivered through it;
+2. the candidate `sha256:5925515f…` (`videofetch-worker:rc-593f47dfffe7-5925515fb002`)
+   was built from `593f47df…` and accepted;
+3. the Worker was promoted. The first attempt rolled back on a false-negative
+   acceptance gate; the retry succeeded.
+
+After that, a live Production analysis returned `sourceQuality` through Vercel,
+and the strict schema accepted it.
+
+**The ordering constraint still holds for rollback.** The live Worker now sends
+the field, so rolling Vercel back to a deployment that predates it, such as
+`dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, would reject every generic analysis. Roll the
+Worker back first. A Worker rollback on its own is safe: the current control plane
+accepts a Worker that omits the field.
+
+**Browser presentation — `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001`, IMPLEMENTED IN
+SOURCE / NOT DEPLOYED.** The browser reads the field only to *describe* quality.
+It never selects from it:
+
+- when the field is present, `preset:best` is shown as **Best downloadable**, with
+  the preset's own rung label (e.g. "Best downloadable — 720p"). Its id,
+  `formatId` and job payload are unchanged;
+- a higher observed quality is reported only when `observedMaxHeight` is strictly
+  greater than `deliverableMaxHeight`, or when no deliverable height is known;
+- withheld reasons are shown only through application-owned copy;
+- no option is ever created from `observedMaxHeight`, `withheld[]` or the
+  protection flags.
+
+Without the field, the browser display is exactly the legacy one.
 
 ---
 

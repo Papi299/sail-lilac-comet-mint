@@ -3,6 +3,13 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { SourceQualityNotice } from "@/components/video/source-quality-notice";
+import {
+  isAdvancedAvailable,
+  presentSourceQuality,
+  presetDisplayLabel,
+  qualityOptions,
+} from "@/lib/source-quality-ui";
 import { formatBytes } from "@/lib/utils";
 import type { VideoMetadata } from "@/types/media";
 
@@ -32,18 +39,37 @@ export function FormatSelector({
   const codec = selectedPreset?.videoCodec ?? selectedFormat?.videoCodec;
   const audio = selectedPreset?.audioCodec ?? selectedFormat?.audioCodec;
   const advancedGroups = useMemo(() => groupAdvanced(video), [video]);
+  const options = useMemo(() => qualityOptions(video), [video]);
+  const quality = useMemo(() => presentSourceQuality(video), [video]);
+  // No raw format list means Advanced has nothing to show, whatever the switch
+  // last said.
+  const advancedAvailable = isAdvancedAvailable(video);
+  const showSimple = simpleMode || !advancedAvailable;
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-sm text-muted-foreground">Choose quality and format</p>
-        <label className="flex items-center gap-2 text-sm">
-          <span className="text-muted-foreground">Advanced</span>
-          <Switch checked={!simpleMode} onCheckedChange={(v) => onSimpleMode(!v)} />
-        </label>
+      <div className="space-y-1">
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-sm text-muted-foreground">Choose quality and format</p>
+          <label className="flex items-center gap-2 text-sm">
+            <span className="text-muted-foreground">Advanced</span>
+            <Switch
+              checked={!showSimple}
+              disabled={!advancedAvailable}
+              className="disabled:cursor-not-allowed disabled:opacity-50"
+              aria-describedby={advancedAvailable ? undefined : "advanced-unavailable"}
+              onCheckedChange={(v) => onSimpleMode(!v)}
+            />
+          </label>
+        </div>
+        {advancedAvailable ? null : (
+          <p id="advanced-unavailable" className="text-xs text-muted-foreground sm:text-right">
+            Advanced unavailable for this source
+          </p>
+        )}
       </div>
 
-      {simpleMode ? (
+      {showSimple ? (
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">
             <Label htmlFor="quality">Quality</Label>
@@ -52,10 +78,9 @@ export function FormatSelector({
                 <SelectValue placeholder="Select quality" />
               </SelectTrigger>
               <SelectContent>
-                {video.presets.map((preset) => (
-                  <SelectItem key={preset.id} value={preset.id}>
-                    {preset.label}
-                    {preset.fileSize ? ` · ${formatBytes(preset.fileSize)}` : ""}
+                {options.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -82,7 +107,7 @@ export function FormatSelector({
                 .filter((p) => p.id === "preset:best" || p.id === "preset:mp3")
                 .map((preset) => (
                   <SelectItem key={preset.id} value={preset.id}>
-                    {preset.label}
+                    {presetDisplayLabel(preset, video)}
                   </SelectItem>
                 ))}
               {advancedGroups.map((group) =>
@@ -101,6 +126,8 @@ export function FormatSelector({
           </Select>
         </div>
       )}
+
+      {quality?.notice ? <SourceQualityNotice notice={quality.notice} /> : null}
 
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div className="text-sm text-muted-foreground">
