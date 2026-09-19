@@ -457,6 +457,13 @@ export function parseClearHlsMediaPlaylist(input: string): ClearHlsMediaPlaylist
 
     if (BLANK_LINE_PATTERN.test(line)) continue;
 
+    // `#EXT-X-ENDLIST` closes the document. Blank lines may follow it — that is
+    // ordinary text serialisation, including the empty element a terminal
+    // newline produces — but nothing else may, not even an ordinary comment.
+    // This runs BEFORE any comment, tag or fragment handling, so nothing after
+    // the terminator is ever interpreted.
+    if (sawEndList) refuse("content_after_endlist");
+
     if (line.startsWith("#")) {
       // An ordinary comment is ignorable ONLY because it cannot influence
       // acquisition. Anything that even looks like a tag must not slip through
@@ -470,10 +477,6 @@ export function parseClearHlsMediaPlaylist(input: string): ClearHlsMediaPlaylist
       if (refusal !== undefined) refuse(refusal);
 
       if (!ALLOWED_TAGS.has(name)) refuse("unknown_tag");
-
-      // Nothing may follow the terminator. A fragment after it would mean the
-      // document disagrees with itself about being finite.
-      if (sawEndList) refuse("content_after_endlist");
 
       // §21 — every allowed tag except `#EXTINF` occurs at most once, and a
       // repeat is refused whether or not it contradicts the first. Choosing
@@ -521,7 +524,6 @@ export function parseClearHlsMediaPlaylist(input: string): ClearHlsMediaPlaylist
     }
 
     // Anything else is a media fragment reference.
-    if (sawEndList) refuse("content_after_endlist");
     if (!pendingExtinf) refuse("fragment_without_extinf");
     validateFragmentReference(line);
     if (fragments.length >= HLS_V1_MAX_FRAGMENTS) refuse("too_many_fragments");

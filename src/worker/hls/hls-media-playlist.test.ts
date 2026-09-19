@@ -212,9 +212,11 @@ describe("clear-HLS playlist parser: the approved v1 subset", () => {
   });
 
   it("accepts a playlist of exactly the maximum byte size", () => {
+    // The padding is a comment INSIDE the document: nothing but blank lines may
+    // follow the terminator, so padding after it would be a second defect.
     const base = validPlaylist(1);
     const padding = HLS_V1_MAX_PLAYLIST_BYTES - Buffer.byteLength(base, "utf8") - 2;
-    const source = `${base}#${"p".repeat(padding)}\n`;
+    const source = validPlaylist(1, { extra: [`#${"p".repeat(padding)}`] });
     assert.equal(Buffer.byteLength(source, "utf8"), HLS_V1_MAX_PLAYLIST_BYTES);
     assert.equal(parseClearHlsMediaPlaylist(source).fragmentCount, 1);
   });
@@ -377,6 +379,40 @@ describe("clear-HLS playlist parser: structural refusals", () => {
     refusedWith(`${validPlaylist(1)}late.ts\n`, "content_after_endlist");
     refusedWith(`${validPlaylist(1)}#EXT-X-ENDLIST\n`, "content_after_endlist");
   });
+
+  it("accepts only blank lines after the terminator", () => {
+    const closed = "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nseg.ts\n#EXT-X-ENDLIST";
+    // End of input, one terminal newline, and further blank or space-only lines
+    // are ordinary text serialisation, not content.
+    for (const source of [closed, `${closed}\n`, `${closed}\n\n   \n\n`, `${closed}\r\n\r\n`]) {
+      assert.equal(parseClearHlsMediaPlaylist(source).fragmentCount, 1);
+    }
+  });
+
+  it("refuses an ordinary comment after the terminator, without echoing it", () => {
+    // The comment door must not reopen once the document is closed. Before
+    // this was fixed, both of these were accepted as ignorable prose.
+    const closed = validPlaylist(1);
+    for (const comment of ["# trailing-comment-TRAILSENTINEL", "#not-an-ext-tag-TRAILSENTINEL"]) {
+      const err = refusedWith(`${closed}${comment}\n`, "content_after_endlist");
+      leaksNothing(err, "TRAILSENTINEL", "trailing-comment", "not-an-ext-tag");
+    }
+    // Trailing blank lines before the comment do not help it through.
+    refusedWith(`${closed}\n\n# TRAILSENTINEL\n`, "content_after_endlist");
+  });
+
+  it("refuses a tag or arbitrary text after the terminator without interpreting it", () => {
+    // Even a tag that would be refused on its own terms is not classified: it
+    // is simply content after the end, and nothing after the end is read.
+    for (const tail of [
+      "#EXT-X-VERSION:3",
+      "#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.example/TRAILSENTINEL\"",
+      "arbitrary text TRAILSENTINEL",
+    ]) {
+      const err = refusedWith(`${validPlaylist(1)}${tail}\n`, "content_after_endlist");
+      leaksNothing(err, "TRAILSENTINEL", "keys.example");
+    }
+  });
 });
 
 describe("clear-HLS playlist parser: encryption is categorically refused (§11)", () => {
@@ -447,7 +483,7 @@ describe("clear-HLS playlist parser: bounds (§7, §17, §18)", () => {
   it("refuses a playlist over the byte ceiling", () => {
     const base = validPlaylist(1);
     const padding = HLS_V1_MAX_PLAYLIST_BYTES - Buffer.byteLength(base, "utf8") - 1;
-    const source = `${base}#${"p".repeat(padding)}\n`;
+    const source = validPlaylist(1, { extra: [`#${"p".repeat(padding)}`] });
     assert.equal(Buffer.byteLength(source, "utf8"), HLS_V1_MAX_PLAYLIST_BYTES + 1);
     refusedWith(source, "too_large");
   });
@@ -457,7 +493,7 @@ describe("clear-HLS playlist parser: bounds (§7, §17, §18)", () => {
     // under the ceiling while its real size is far over it. A code-unit check
     // would admit this.
     const filler = "\u20ac".repeat(900_000);
-    const source = `${validPlaylist(1)}# ${filler}\n`;
+    const source = validPlaylist(1, { extra: [`# ${filler}`] });
     assert.ok(source.length < HLS_V1_MAX_PLAYLIST_BYTES, "the code-unit count must look safe");
     assert.ok(Buffer.byteLength(source, "utf8") > HLS_V1_MAX_PLAYLIST_BYTES);
     refusedWith(source, "too_large");
