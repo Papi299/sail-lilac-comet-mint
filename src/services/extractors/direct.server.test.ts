@@ -250,12 +250,26 @@ describe("direct acquisition absolute deadline", () => {
   it("an already-cancelled caller never transfers a body", async () => {
     const deadline = fakeDeadline();
     const body = tricklingBody();
-    serve(body);
+    let lookups = 0;
+    let requests = 0;
+    setSafeHttpTestHooks({
+      lookup: async () => {
+        lookups += 1;
+        return [{ address: "8.8.8.8", family: 4 }];
+      },
+      requestOnce: async () => {
+        requests += 1;
+        return { status: 200, headers: { "content-type": "video/mp4" }, body };
+      },
+    });
     const caller = new AbortController();
     caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
 
     await assert.rejects(downloadDirectOriginalWorker(MEDIA_URL, { workDir, signal: caller.signal }));
-    assert.equal(body.destroyed, true);
+    // Safe-HTTP refuses an aborted operation before resolving or requesting
+    // anything, so no body is ever produced — there is nothing to dispose.
+    assert.equal(lookups, 0);
+    assert.equal(requests, 0);
     assert.deepEqual(deadline.cleared, [deadline.armed[0]!.handle]);
   });
 });
