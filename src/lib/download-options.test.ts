@@ -107,3 +107,32 @@ describe("initial selection", () => {
     }
   });
 });
+
+describe("P1 sourceQuality is informational only", () => {
+  const observed2160: VideoMetadata["sourceQuality"] = {
+    observedMaxHeight: 2160,
+    deliverableMaxHeight: 720,
+    withheld: [{ reason: "unsupported_protocol", count: 2, maxObservedHeight: 2160 }],
+    protectedUnenumerated: false,
+    maybeProtectedObserved: false,
+  };
+
+  it("never changes option detection or the initial selection", () => {
+    const shapes = [
+      analyzed([preset("preset:best"), preset("preset:720")], []),
+      analyzed([], [format("22")]),
+      analyzed([], []),
+    ];
+    for (const video of shapes) {
+      const withQuality: VideoMetadata = { ...video, sourceQuality: observed2160 };
+      assert.equal(hasDownloadOptions(withQuality), hasDownloadOptions(video));
+      assert.equal(initialSelectionId(withQuality), initialSelectionId(video));
+    }
+  });
+
+  it("does not make an observed-only quality downloadable", () => {
+    const video = { ...analyzed([], []), sourceQuality: observed2160 };
+    assert.equal(hasDownloadOptions(video), false);
+    assert.equal(initialSelectionId(video), "");
+  });
+});

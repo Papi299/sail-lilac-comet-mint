@@ -234,7 +234,10 @@ function Downloader() {
                     downloading={starting}
                   />
                 ) : (
-                  <NoCompatibleDownload onTryAnother={tryAnotherUrl} />
+                  <NoCompatibleDownload
+                    sourceQuality={video.sourceQuality}
+                    onTryAnother={tryAnotherUrl}
+                  />
                 )
               ) : null}
               {phase === "processing" && job ? <ProgressCard job={job} /> : null}
