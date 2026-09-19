@@ -790,14 +790,25 @@ describe("clear-HLS playlist parser: the module is inert", () => {
 
   it("is reachable from no production module", () => {
     // HLS stays dormant: the parser exists, and nothing in the shipping graph
-    // can call it. The later atomic activation task is what changes this.
+    // can call it. Its only importers are its dormant siblings in
+    // `src/worker/hls/` (HLS-2 onwards), so the rule is held by that directory
+    // as a SET: no production module outside it may name ANY module in it. The
+    // later atomic activation task is what changes this.
+    const hlsDir = dirname(MODULE_PATH);
+    const dormantModules = readdirSync(hlsDir)
+      .filter((name) => /\.ts$/.test(name) && !/\.test\.ts$/.test(name))
+      .map((name) => name.replace(/\.ts$/, ""));
+    assert.ok(dormantModules.includes("hls-media-playlist"));
     for (const file of productionSourceFiles()) {
-      if (file === MODULE_PATH) continue;
-      assert.equal(
-        readFileSync(file, "utf8").includes("hls-media-playlist"),
-        false,
-        `${relative(ROOT, file)} must not import the dormant HLS parser`,
-      );
+      if (dirname(file) === hlsDir) continue;
+      const source = readFileSync(file, "utf8");
+      for (const stem of dormantModules) {
+        assert.equal(
+          source.includes(stem),
+          false,
+          `${relative(ROOT, file)} must not import the dormant HLS module ${stem}`,
+        );
+      }
     }
   });
 
