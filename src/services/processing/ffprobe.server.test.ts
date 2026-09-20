@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { AppError } from "../../lib/errors.ts";
 import { setProcessRunnerTestHooks, type SpawnImpl } from "./process-runner.server.ts";
 import {
+  LOCAL_MEDIA_FAMILIES,
   assertContainedRegularFile,
   buildProbeArgs,
   hasExactStreamShape,
@@ -401,6 +402,103 @@ describe("ffprobe format_name normalization (pinned runtime behaviour)", () => {
   });
 });
 
+describe("ffprobe MPEG-TS family (HLS-4 extension)", () => {
+  it("normalizes the exact single-token name the pinned runtime emits for MPEG-TS", () => {
+    // MPEG-TS registers no demuxer aliases, so unlike every other family its
+    // reported name really is one token. That is the same exact-sequence rule
+    // applied to a one-element sequence, not an exception to it.
+    assert.equal(normalizeProbeFormatFamily("mpegts"), "mpegts");
+  });
+
+  it("still rejects anything that merely contains the mpegts token", () => {
+    for (const value of ["mpegts,evil", "evil,mpegts", "mpegtsraw", "MPEGTS", "mpeg ts", "mpegts,", ",mpegts"]) {
+      assert.equal(normalizeProbeFormatFamily(value), null, `${value} must not normalize`);
+    }
+  });
+
+  it("selects the mpegts demuxer explicitly, with a file-only protocol whitelist", () => {
+    const args = buildProbeArgs({ family: "mpegts", inputPath: "/jobs/abc/hls-source.ts" });
+    assert.deepEqual(args, [
+      "-v",
+      "error",
+      "-protocol_whitelist",
+      "file",
+      "-f",
+      "mpegts",
+      "-print_format",
+      "json",
+      "-show_entries",
+      "format=format_name:stream=codec_type",
+      "-i",
+      "/jobs/abc/hls-source.ts",
+    ]);
+  });
+
+  it("counts only top-level streams, not the ones MPEG-TS repeats inside programs", async () => {
+    // The MPEG-TS captures are the only ones with a NON-empty `programs`
+    // array, and it repeats every elementary stream. Counting those too would
+    // turn an ordinary muxed transport stream into a four-stream file.
+    const raw = await pinned("mpegts-muxed");
+    const document = JSON.parse(raw) as { programs: { streams: unknown[] }[] };
+    assert.equal(document.programs.length, 1);
+    assert.equal(document.programs[0].streams.length, 2);
+    assert.deepEqual(parseProbeDocument(raw).streams, ["video", "audio"]);
+  });
+
+  it("does not let an MPEG-TS file satisfy an ISO-BMFF or WebM expectation", () => {
+    // Adding a family widens WHICH demuxer this probe can select and nothing
+    // else. The shape check compares the family for equality, so the split
+    // merge — whose closed targets still map only onto iso-bmff and webm —
+    // cannot be handed a transport stream.
+    const probe = parseProbeDocument('{"streams":[{"codec_type":"video"},{"codec_type":"audio"}],"format":{"format_name":"mpegts"}}');
+    assert.equal(probe.family, "mpegts");
+    for (const family of ["iso-bmff", "webm"] as const) {
+      assert.equal(hasExactStreamShape(probe, { family, video: 1, audio: 1 }), false, family);
+    }
+    assert.equal(hasExactStreamShape(probe, { family: "mpegts", video: 1, audio: 1 }), true);
+  });
+
+  it("leaves the existing ISO-BMFF and WebM behaviour exactly as it was", () => {
+    assert.deepEqual([...LOCAL_MEDIA_FAMILIES], ["iso-bmff", "webm", "mpegts"]);
+    assert.equal(normalizeProbeFormatFamily("mov,mp4,m4a,3gp,3g2,mj2"), "iso-bmff");
+    assert.equal(normalizeProbeFormatFamily("matroska,webm"), "webm");
+    // The naive spellings that never occur are still refused, and adding a
+    // single-token family did not make any of them normalize.
+    for (const value of ["mp4", "webm", "mov", "m4a", "matroska"]) {
+      assert.equal(normalizeProbeFormatFamily(value), null, value);
+    }
+    assert.deepEqual(buildProbeArgs({ family: "iso-bmff", inputPath: "/a/v.mp4" }).slice(4, 6), ["-f", "mov"]);
+    assert.deepEqual(buildProbeArgs({ family: "webm", inputPath: "/a/v.webm" }).slice(4, 6), ["-f", "matroska"]);
+  });
+
+  it("refuses a family outside the closed set before spawning anything", async () => {
+    const calls: string[] = [];
+    setProcessRunnerTestHooks({
+      platform: "linux",
+      spawn: (command) => {
+        calls.push(command);
+        throw new Error("nothing may spawn");
+      },
+      processKill: () => true,
+    });
+    try {
+      await assert.rejects(
+        () =>
+          probeLocalMedia({
+            inputPath: "/jobs/abc/x.ts",
+            workDir: "/jobs/abc",
+            family: "mpegtsraw" as unknown as "mpegts",
+            timeoutMs: 1_000,
+          }),
+        (err: unknown) => err instanceof AppError && err.code === "PROCESSING_FAILED",
+      );
+      assert.deepEqual(calls, []);
+    } finally {
+      setProcessRunnerTestHooks(null);
+    }
+  });
+});
+
 describe("ffprobe document parser", () => {
   it("accepts every pinned capture from the accepted Worker image", async () => {
     const cases: ReadonlyArray<[string, string, readonly string[]]> = [
@@ -410,6 +508,9 @@ describe("ffprobe document parser", () => {
       ["webm-video-only", "webm", ["video"]],
       ["webm-audio-only", "webm", ["audio"]],
       ["webm-merged", "webm", ["video", "audio"]],
+      ["mpegts-video-only", "mpegts", ["video"]],
+      ["mpegts-audio-only", "mpegts", ["audio"]],
+      ["mpegts-muxed", "mpegts", ["video", "audio"]],
     ];
     for (const [name, family, streams] of cases) {
       const probe = parseProbeDocument(await pinned(name));

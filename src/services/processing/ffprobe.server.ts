@@ -26,10 +26,22 @@ import { runProcess } from "@/services/processing/process-runner.server";
  *
  * These are APPLICATION-owned names, not FFmpeg's. FFmpeg reports a demuxer's
  * whole alias group rather than the specific subtype, so an upstream string is
- * never carried forward — it is normalized into one of these two values or
+ * never carried forward — it is normalized into one of these values or
  * rejected outright. See `FFPROBE_FORMAT_TOKENS` for why that matters.
+ *
+ * `mpegts` was added by HLS-4 so the dormant clear-HLS processing primitive can
+ * validate the raw MPEG-TS artifact HLS-3 acquires before remuxing it. Adding a
+ * family here widens exactly one thing — which explicit demuxer this probe is
+ * able to select — and nothing else:
+ *
+ *   - the split merge targets (`SPLIT_MERGE_TARGETS`) are a separate closed
+ *     union that still maps only onto `iso-bmff` and `webm`, so no split plan
+ *     can ask for an MPEG-TS probe;
+ *   - `hasExactStreamShape()` compares the family for EQUALITY, so a file that
+ *     normalizes to `mpegts` can never satisfy an ISO-BMFF or WebM expectation;
+ *   - nothing in Product execution reaches the HLS foundation at all.
  */
-export const LOCAL_MEDIA_FAMILIES = ["iso-bmff", "webm"] as const;
+export const LOCAL_MEDIA_FAMILIES = ["iso-bmff", "webm", "mpegts"] as const;
 export type LocalMediaFamily = (typeof LOCAL_MEDIA_FAMILIES)[number];
 
 /** The only stream kinds this v1 validator will accept in a probed file. */
@@ -59,10 +71,20 @@ export type LocalMediaProbe = {
  * Verified in the pinned image: `-f mov` on a WebM file fails with "moov atom
  * not found", so the explicit demuxer really does refuse cross-family input
  * rather than silently re-detecting.
+ *
+ * MPEG-TS (HLS-4) has no alias group at all: its demuxer is registered under
+ * the single name `mpegts`. Re-verified offline against the pinned FFmpeg
+ * build, 5.1.9-0+deb12u1, in both directions — `-f mov` on a real MPEG-TS file
+ * fails with "moov atom not found", and `-f mpegts` on a real MP4 fails with
+ * "End of file". See `testdata/README.md` for exactly which image that capture
+ * came from. The separate `mpegtsraw` demuxer is deliberately NOT used: it
+ * exposes raw transport packets rather than the elementary streams this
+ * validator has to count.
  */
 const FFPROBE_INPUT_FORMAT: Record<LocalMediaFamily, string> = {
   "iso-bmff": "mov",
   webm: "matroska",
+  mpegts: "mpegts",
 };
 
 /**
@@ -77,6 +99,12 @@ const FFPROBE_INPUT_FORMAT: Record<LocalMediaFamily, string> = {
  *   WebM video-only  -> "matroska,webm"
  *   WebM audio-only  -> "matroska,webm"
  *   merged WebM      -> "matroska,webm"
+ *   MPEG-TS          -> "mpegts"
+ *
+ * MPEG-TS is the one family whose reported name is a SINGLE token, because its
+ * demuxer registers no aliases. That is not an exception to the exact-sequence
+ * rule, it is the same rule applied to a one-element sequence: `"mpegts"`
+ * matches, and `"mpegts,evil"`, `"evil,mpegts"` and `"mpegtsraw"` do not.
  *
  * So `format_name === "mp4"` is simply never true, and a substring test for
  * "mp4" would also accept "3gp" media and anything else sharing the group.
@@ -92,6 +120,7 @@ const FFPROBE_INPUT_FORMAT: Record<LocalMediaFamily, string> = {
 const FFPROBE_FORMAT_TOKENS: Record<LocalMediaFamily, readonly string[]> = {
   "iso-bmff": ["mov", "mp4", "m4a", "3gp", "3g2", "mj2"],
   webm: ["matroska", "webm"],
+  mpegts: ["mpegts"],
 };
 
 /**
