@@ -138,13 +138,43 @@ function webmPlan(sizes: Sizes = {}): GenericSplitExecutionPlan {
 type Deps = Parameters<typeof downloadGenericSplitSources>[3];
 type RunnerCall = Parameters<NonNullable<Deps["runner"]>>[0];
 
+/**
+ * NODE22-GENERIC-EXECUTION-TEST-LIVENESS-001 — event-loop liveness.
+ *
+ * A real yt-dlp child process holds the event loop open for exactly as long as
+ * it runs. These tests replace that child with a promise, which holds nothing,
+ * and `runMonitoredAcquisition` deliberately unrefs its poll timer so a stuck
+ * monitor can never keep the Worker alive on its own (§31). With no other
+ * ref'd handle, Node 22 can drain the loop before the first sample fires, and
+ * node:test then reports "Promise resolution is still pending but the event
+ * loop has already resolved" and cancels the remainder of the file.
+ *
+ * This restores that ONE real property for the duration of each test and
+ * nothing else: no barrier, ordering, timeout or assertion is changed. The
+ * ceiling sits far above any legitimate test here, so a genuine deadlock still
+ * surfaces instead of hanging forever.
+ */
+const EVENT_LOOP_HOLD_CEILING_MS = 30_000;
+let eventLoopHold: ReturnType<typeof setTimeout> | null = null;
+const holdEventLoop = () => {
+  eventLoopHold = setTimeout(() => {}, EVENT_LOOP_HOLD_CEILING_MS);
+};
+const releaseEventLoop = () => {
+  if (eventLoopHold !== null) {
+    clearTimeout(eventLoopHold);
+    eventLoopHold = null;
+  }
+};
+
 let workDir = "";
 beforeEach(() => {
+  holdEventLoop();
   workDir = mkdtempSync(join(tmpdir(), "ytdlp-split-"));
 });
 afterEach(() => {
   setProcessRunnerTestHooks(null);
   rmSync(workDir, { recursive: true, force: true });
+  releaseEventLoop();
 });
 
 const containerOf = (plan: GenericSplitExecutionPlan, role: GenericSplitRole) =>
