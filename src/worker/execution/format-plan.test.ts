@@ -40,10 +40,22 @@ function single(source: GenericSourceSelection): GenericPresetSource {
  * `source`. Nothing builds one yet, so every plan these cases derive must still
  * be a single-source operation — asserting it keeps each case proving what it
  * always proved, and fails loudly if derivation ever starts producing a merge.
+ *
+ * HLS-6 added a `clear-hls-remux` variant whose `source` is a private media
+ * PLAYLIST rather than a yt-dlp selection. Ordinary derivation must never
+ * produce one — that is the HLS-6 dormancy invariant — so it is refused here on
+ * exactly the same terms, and every case below keeps proving what it proved.
  */
 function planSource(plan: GenericExecutionPlan): GenericSourceSelection {
   assert.notEqual(plan.operation, "merge-split", "this plan must name exactly one source");
-  if (plan.operation === "merge-split") throw new Error("unreachable");
+  assert.notEqual(
+    plan.operation,
+    "clear-hls-remux",
+    "ordinary generic derivation must never produce a clear-HLS plan",
+  );
+  if (plan.operation === "merge-split" || plan.operation === "clear-hls-remux") {
+    throw new Error("unreachable");
+  }
   return plan.source;
 }
 
@@ -1138,6 +1150,8 @@ describe("generic SPLIT execution plan (SPLIT-01)", () => {
           // ONE fixed family partner across every split rung.
           assert.equal(plan.pair.audio.formatId, "aud", id);
           assert.equal(plan.targetContainer, "mp4", id);
+        } else if (plan.operation === "clear-hls-remux") {
+          assert.fail(`${id}: ordinary derivation must never produce a clear-HLS plan`);
         } else {
           assert.equal(plan.source.formatId, "720m", id);
         }

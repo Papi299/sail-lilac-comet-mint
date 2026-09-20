@@ -398,11 +398,17 @@ describe("split download: plan boundary (§8/§47/§48)", () => {
   });
 
   it("downloadGenericOriginal still refuses a merge-split plan, MP4 and WebM alike (§47)", async () => {
+    // CORRECTION-01: the single-source downloader's parameter is
+    // `GenericSingleSourceExecutionPlan`, so this call is a compile error
+    // without the deliberate test-only cast below — the sibling case above
+    // pins that exclusion with `@ts-expect-error` in the other direction. What
+    // remains under test here is the RUNTIME refusal, which still stands for a
+    // value that crossed the boundary untyped.
     for (const plan of [mp4Plan(), webmPlan()]) {
       const { runner, calls } = forbiddenRunner();
       const probe = countingProbe();
       await rejectsWith("FORMAT_UNAVAILABLE", () =>
-        downloadGenericOriginal(SAFE_URL, workDir, plan, {
+        downloadGenericOriginal(SAFE_URL, workDir, plan as unknown as GenericSingleSourceExecutionPlan, {
           ...baseDeps({ runner }),
           probeRuntime: probe.probeRuntime,
         }),

@@ -19,7 +19,6 @@ import {
 import { buildGenericFormatSelector, type GenericSourceSelection } from "./generic-source.ts";
 import {
   GenericExecutionPlanSchema,
-  type GenericExecutionPlan,
   type GenericSingleSourceExecutionPlan,
   type GenericSplitExecutionPlan,
 } from "./format-plan.ts";
@@ -314,6 +313,12 @@ export function buildYtdlpDownloadArgv(opts: {
    * SPLIT-01: a SINGLE-source plan only. `merge-split` names two upstream
    * sources and has no single `source` to bind, so it is excluded by type
    * rather than by a runtime check that a future edit could drop.
+   *
+   * HLS-6: `clear-hls-remux` is excluded the same way, and it matters more here
+   * than anywhere else — its `source` holds a SIGNED media-playlist URL, and
+   * this function's whole job is to turn a source into yt-dlp argv. The
+   * partition is what makes "the playlist URL can never become a subprocess
+   * argument" a compile-time fact.
    */
   readonly plan: GenericSingleSourceExecutionPlan;
   readonly maxFileSizeBytes: number;
@@ -677,7 +682,7 @@ async function defaultStatSize(path: string): Promise<number | null> {
 export async function downloadGenericOriginal(
   url: string,
   workDir: string,
-  plan: GenericExecutionPlan,
+  plan: GenericSingleSourceExecutionPlan,
   deps: GenericDownloadDeps,
 ): Promise<GenericOriginalDownload> {
   const runner = deps.runner ?? runProcess;
@@ -693,17 +698,38 @@ export async function downloadGenericOriginal(
   const checkedPlan = GenericExecutionPlanSchema.safeParse(plan);
   if (!checkedPlan.success) throw new AppError("FORMAT_UNAVAILABLE");
 
-  // SPLIT-01: this primitive acquires exactly ONE source, and says so. A
-  // `merge-split` plan names two, so it is REFUSED here rather than partially
-  // honoured — acquiring only the video half would hand the executor a silently
-  // audio-less artifact, which is precisely the substitution §17 forbids.
+  // SPLIT-01: this primitive acquires exactly ONE source with yt-dlp, and says
+  // so. A `merge-split` plan names two, so it is REFUSED here rather than
+  // partially honoured — acquiring only the video half would hand the executor a
+  // silently audio-less artifact, which is precisely the substitution §17
+  // forbids.
   //
-  // Unreachable today: no analysis path builds a split preset source, so
-  // `deriveGenericExecutionPlan` cannot produce this operation. The refusal is
-  // the type narrowing AND the guarantee: `downloadGenericSplitSources` is the
-  // ONLY acquisition API that consumes a pair, so a pair routed here by mistake
-  // fails closed instead of downloading half a video.
-  if (checkedPlan.data.operation === "merge-split") {
+  // HLS-6 adds the second refusal on the same terms. A `clear-hls-remux` plan
+  // names a media PLAYLIST, not a media file: it has no `source.container`, no
+  // declared size and no yt-dlp format selector, and its bytes are acquired by
+  // VideoFetch's own fragment transport with no yt-dlp subprocess at all. There
+  // is no partial honouring available even in principle.
+  //
+  // CORRECTION-01: both refusals are ALSO unreachable by type. The `plan`
+  // parameter is `GenericSingleSourceExecutionPlan`, so no legitimate
+  // TypeScript caller can supply either operation — not through the executor's
+  // `DownloadGenericOriginalFn` seam, and not by calling this exported function
+  // directly. A compile-time assertion in the test suite pins that, so widening
+  // this parameter back to the whole union fails `tsc` rather than silently
+  // reopening the boundary.
+  //
+  // The runtime refusal is NOT redundant and is deliberately kept. This is a
+  // module boundary, and a narrow signature binds only callers the compiler
+  // checked: JavaScript callers, deliberate casts and stale compiled callers
+  // can all still arrive here. The re-parse above widens back to the whole
+  // union precisely so a forged value has a discriminant to be refused by, and
+  // that refusal lands BEFORE URL validation, before the runtime probe, and
+  // therefore before any DNS, network or subprocess work. Tests exercise both
+  // refusals through explicit test-only casts.
+  if (
+    checkedPlan.data.operation === "merge-split" ||
+    checkedPlan.data.operation === "clear-hls-remux"
+  ) {
     throw new AppError("FORMAT_UNAVAILABLE");
   }
   const validPlan = checkedPlan.data;

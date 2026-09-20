@@ -795,26 +795,46 @@ describe("clear-HLS playlist parser: the module is inert", () => {
     // production module outside it may name ANY module in it. The later atomic
     // activation task is what changes this.
     //
-    // ONE narrow exception, added by HLS-5. `hls-source-selection` is the
-    // dormant channel's SOURCE end, not part of its execution capability: it
-    // is a pure vocabulary that turns one already-parsed yt-dlp format into a
-    // private media-playlist URL on an application-owned preset rung. It holds
-    // no acquisition, no processing, no I/O and no HLS import of its own, so
-    // naming it cannot make HLS reachable. Analysis MUST name it — that is the
-    // provenance HLS-6 will consume — and the allowlist below is exact, so a
-    // future edit that let any other module (or any other HLS module) into the
-    // shipping graph still fails here.
+    // TWO narrow exceptions, and no others.
+    //
+    // (1) HLS-5 added `hls-source-selection`: the dormant channel's SOURCE end,
+    //     not part of its execution capability. It is a pure vocabulary that
+    //     turns one already-parsed yt-dlp format into a private media-playlist
+    //     URL on an application-owned preset rung. It holds no acquisition, no
+    //     processing, no I/O and no HLS import of its own, so naming it cannot
+    //     make HLS reachable. Analysis MUST name it, and HLS-6 added the
+    //     execution planner, which needs its URL-acceptance policy to validate
+    //     a retained selection before that selection may authorise a request.
+    //
+    // (2) HLS-6 added `hls-execution.server`: the ONE orchestration seam, and
+    //     the ONLY module outside this directory's own siblings that may reach
+    //     an HLS execution primitive. It exists so the JobExecutor never names
+    //     HLS-2, HLS-3 or HLS-4 and never learns a private HLS failure enum.
+    //
+    // Both allowlists are EXACT, in both directions: only these files may name
+    // these stems, and these files may name NOTHING else from this directory.
+    // Reachability from the executor is expected after HLS-6 — dormancy is now
+    // held at plan derivation, which `hls-shadow-selection.server.test.ts` pins
+    // — but the graph must still narrow to exactly these edges.
     const hlsDir = dirname(MODULE_PATH);
     const dormantModules = readdirSync(hlsDir)
       .filter((name) => /\.ts$/.test(name) && !/\.test\.ts$/.test(name))
       .map((name) => name.replace(/\.ts$/, ""));
     assert.ok(dormantModules.includes("hls-media-playlist"));
     assert.ok(dormantModules.includes("hls-source-selection"));
+    assert.ok(dormantModules.includes("hls-execution.server"));
 
-    /** The only production modules permitted to name the HLS-5 vocabulary. */
-    const SELECTION_IMPORTERS = new Set([
-      "src/worker/analysis/ytdlp-analysis.server.ts",
-      "src/worker/analysis/media-analyzer.server.ts",
+    /** stem -> the only production modules permitted to name it. */
+    const ALLOWED_IMPORTERS = new Map<string, ReadonlySet<string>>([
+      [
+        "hls-source-selection",
+        new Set([
+          "src/worker/analysis/ytdlp-analysis.server.ts",
+          "src/worker/analysis/media-analyzer.server.ts",
+          "src/worker/execution/format-plan.ts",
+        ]),
+      ],
+      ["hls-execution.server", new Set(["src/worker/execution/job-executor.server.ts"])],
     ]);
 
     for (const file of productionSourceFiles()) {
@@ -822,7 +842,7 @@ describe("clear-HLS playlist parser: the module is inert", () => {
       const rel = relative(ROOT, file).split("\\").join("/");
       const source = readFileSync(file, "utf8");
       for (const stem of dormantModules) {
-        if (stem === "hls-source-selection" && SELECTION_IMPORTERS.has(rel)) continue;
+        if (ALLOWED_IMPORTERS.get(stem)?.has(rel)) continue;
         assert.equal(
           source.includes(stem),
           false,
@@ -831,14 +851,16 @@ describe("clear-HLS playlist parser: the module is inert", () => {
       }
     }
 
-    // The exception is not a loophole: neither allowed importer may reach any
-    // HLS EXECUTION primitive, and the router's edge is type-only, so only the
-    // analyzer has a runtime dependency on the HLS directory at all.
-    for (const rel of SELECTION_IMPORTERS) {
-      const source = readFileSync(join(ROOT, rel), "utf8");
-      for (const stem of dormantModules) {
-        if (stem === "hls-source-selection") continue;
-        assert.equal(source.includes(stem), false, `${rel} must not name ${stem}`);
+    // The exceptions are not loopholes: each allowed importer may name its OWN
+    // stem and nothing else from this directory.
+    for (const [allowedStem, importers] of ALLOWED_IMPORTERS) {
+      for (const rel of importers) {
+        const source = readFileSync(join(ROOT, rel), "utf8");
+        for (const stem of dormantModules) {
+          if (stem === allowedStem) continue;
+          if (ALLOWED_IMPORTERS.get(stem)?.has(rel)) continue;
+          assert.equal(source.includes(stem), false, `${rel} must not name ${stem}`);
+        }
       }
     }
     assert.match(

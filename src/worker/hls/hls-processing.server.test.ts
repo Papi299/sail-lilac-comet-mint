@@ -29,9 +29,11 @@ import {
 import { DEFAULT_MAX_FILE_SIZE_BYTES } from "@/shared/media-limits.ts";
 import { YTDLP_V1_NATIVE_PROTOCOLS } from "../analysis/ytdlp-analysis.server.ts";
 import { GENERIC_SOURCE_PROTOCOLS } from "../execution/generic-source.ts";
+import { deriveClearHlsExecutionPlan } from "../execution/format-plan.ts";
 import {
   STARTUP_WORKSPACE_FOOTPRINT,
   requiredWorkspaceBytes,
+  workspaceFootprintForPlan,
 } from "../execution/workspace-capacity.ts";
 import { AGGREGATE_FILE_NAME } from "./hls-fragment-acquisition.server.ts";
 import {
@@ -1595,15 +1597,36 @@ describe("HLS-4 workspace footprint: 2x, stated outside the Product plan policy"
     assert.ok(startup >= hls, "no capacity change is required to run HLS v1 processing");
   });
 
-  it("adds no HLS operation to the Product execution-plan vocabulary", () => {
-    // The plan-footprint switch is exhaustive over operations a Product plan
-    // can actually carry. HLS has none, and inventing one purely so the switch
-    // could return 2 would put a non-executable operation into a closed
-    // Product vocabulary.
-    for (const file of ["src/worker/execution/format-plan.ts", "src/worker/execution/workspace-capacity.ts"]) {
-      const source = readFileSync(join(ROOT, file), "utf8");
-      assert.equal(/\bhls\b/i.test(source), false, `${file} must not gain an HLS operation`);
-    }
+  /**
+   * HLS-6 REPLACED the assertion that used to stand here.
+   *
+   * HLS-4 wrote this footprint beside the primitive, and asserted that the
+   * Product plan policy named no HLS operation at all, because at that point
+   * there was none: inventing one purely so a switch could return 2 would have
+   * put a non-executable operation into a closed Product vocabulary.
+   *
+   * HLS-6 makes `clear-hls-remux` a REAL execution plan, so that reason has
+   * expired and the plan-aware policy is now the right place for the
+   * requirement. What replaces the old assertion is the stronger statement: the
+   * two accepted numbers must be the SAME number, derived independently, so
+   * neither can drift without this failing.
+   */
+  it("HLS-6: the plan-aware policy states the SAME footprint, derived independently", () => {
+    const plan = deriveClearHlsExecutionPlan(
+      {
+        "preset:1080": Object.freeze({
+          playlistUrl: "https://cdn.example.invalid/hls/1080/media.m3u8",
+          height: 1080,
+        }),
+      },
+      "preset:1080",
+    );
+    assert.equal(plan.operation, "clear-hls-remux");
+    assert.equal(
+      workspaceFootprintForPlan({ strategy: "yt-dlp", generic: plan }),
+      HLS_V1_PROCESSING_WORKSPACE_FOOTPRINT,
+      "the execution policy and HLS-4 must never disagree about the HLS footprint",
+    );
   });
 });
 

@@ -588,20 +588,87 @@ describe("HLS-5 public equivalence: HLS is still not a capability", () => {
 describe("HLS-5 dormancy: the channel exists and nothing consumes it", () => {
   const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
 
-  it("is not read by the execution planner", () => {
+  /**
+   * HLS-6 NARROWED THE NEXT TWO CASES, and the narrowing is exact.
+   *
+   * HLS-5 could assert the crudest possible thing — that the planner and the
+   * executor did not contain the substring "hls" at all — because neither had
+   * any HLS concept. HLS-6 gives both one: the planner gains a `clear-hls-remux`
+   * plan and its own SEPARATE derivation entry point, and the executor gains a
+   * routing branch behind one orchestration seam.
+   *
+   * What must still hold, and is what these cases now pin, is the thing that
+   * actually keeps HLS dormant: the ORDINARY planner never sees the shadow map,
+   * and the executor has no way to reach it either. HLS-7 is the reviewed change
+   * that connects them.
+   */
+
+  /** The body of a top-level function, by brace matching from its signature. */
+  const functionBody = (source: string, signature: string): string => {
+    const start = source.indexOf(signature);
+    assert.notEqual(start, -1, `${signature} must exist`);
+    const open = source.indexOf("{", start + signature.length - 1);
+    assert.notEqual(open, -1);
+    let depth = 0;
+    for (let i = open; i < source.length; i += 1) {
+      if (source[i] === "{") depth += 1;
+      else if (source[i] === "}") {
+        depth -= 1;
+        if (depth === 0) return source.slice(open, i + 1);
+      }
+    }
+    assert.fail(`${signature} has no balanced body`);
+  };
+
+  it("is not read by the ORDINARY execution planner", () => {
     const source = read("src/worker/execution/format-plan.ts");
-    assert.equal(source.includes("hlsSelections"), false);
-    assert.equal(source.includes("hls"), false, "no HLS operation exists in the planner");
+
+    // The dormant machinery exists…
+    assert.ok(
+      source.includes("export function deriveClearHlsExecutionPlan"),
+      "HLS-6 added a SEPARATE derivation entry point",
+    );
+
+    // …and the ordinary planner cannot reach it. Its whole body — including its
+    // parameter list, which is what makes `hlsSelections` invisible to it — is
+    // free of every HLS name.
+    const ordinary = functionBody(source, "export function deriveExecutionPlan(");
+    for (const forbidden of ["hlsSelections", "ClearHls", "clear-hls"]) {
+      assert.equal(
+        ordinary.includes(forbidden),
+        false,
+        `deriveExecutionPlan must not name ${forbidden}`,
+      );
+    }
+
+    // Nor may the ordinary GENERIC derivation it delegates to.
+    const generic = functionBody(source, "export function deriveGenericExecutionPlan(");
+    for (const forbidden of ["hlsSelections", "ClearHls", "clear-hls"]) {
+      assert.equal(
+        generic.includes(forbidden),
+        false,
+        `deriveGenericExecutionPlan must not name ${forbidden}`,
+      );
+    }
   });
 
-  it("is not read by the JobExecutor, which names no HLS module", () => {
+  it("is not read by the JobExecutor, whose only HLS edge is the HLS-6 seam", () => {
     const source = read("src/worker/execution/job-executor.server.ts");
     // The direct path STATES an empty map — that is the contract — but nothing
-    // reads one, and no HLS module is imported.
+    // reads one.
     assert.equal(source.includes("hlsSelections: {}"), true);
     assert.equal(source.includes("analysis.hlsSelections"), false);
+    // The executor cannot even name the HLS-5 vocabulary, so it has no type with
+    // which to read a selection, let alone a map to read it from.
     assert.equal(source.includes("hls-source-selection"), false);
-    assert.equal(source.includes("ClearHls"), false);
+
+    // Exactly ONE HLS import: the HLS-6 orchestration seam. Every HLS-2/3/4
+    // primitive stays behind it — the case below proves that separately.
+    const imports = [...source.matchAll(/^import[^;]*?from\s+"([^"]+)"/gm)].map((m) => m[1]);
+    assert.deepEqual(
+      imports.filter((specifier) => specifier.includes("hls")),
+      ["../hls/hls-execution.server.ts"],
+    );
   });
 
   it("calls no HLS-2/3/4 primitive from Product execution", () => {
