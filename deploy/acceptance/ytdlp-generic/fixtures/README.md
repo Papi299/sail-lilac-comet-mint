@@ -156,7 +156,8 @@ bodies separately — never one shared digest describing both:
  "genericMediaBytes":10872896,"genericMediaSha256":"…",
  "genericMediaSourcePath":"…/acceptance-generic-fixture.mp4",
  "genericMediaThrottleMs":14000,
- "byteLimitPath":"/byte-limit","byteEvidencePath":"/byte-evidence",
+ "byteLimitPath":"/byte-limit","byteLimitMediaPath":"/byte-limit-media.mp4",
+ "byteLimitMaxBytes":4563402752,"byteEvidencePath":"/byte-evidence",
  "safeEgressPath":"/safe-egress","safeEgressExpectedDenyClass":"deny-v4", …}
 ```
 
@@ -176,6 +177,7 @@ VIDEOFETCH_ACCEPT_GENERIC_URL=https://<random>.trycloudflare.com/generic
 VIDEOFETCH_ACCEPT_GENERIC_SHA256=<the manifest's genericMediaSha256>
 VIDEOFETCH_ACCEPT_BYTELIMIT_URL=https://<random>.trycloudflare.com/byte-limit
 VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL=https://<random>.trycloudflare.com/byte-evidence
+VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES=<the manifest's byteLimitMaxBytes>
 VIDEOFETCH_ACCEPT_EGRESS_REDIRECT_URL=https://<random>.trycloudflare.com/safe-egress
 ```
 
@@ -260,29 +262,104 @@ pinned `HttpFD.real_download` consults `--max-filesize` only inside
 `if data_len is not None`, so a declared length would let yt-dlp's own option
 stop the transfer and the case would be evidence for the wrong gate.
 
-The stream's ceiling is **528 MiB** (553,648,128 bytes). It is a ceiling, not an
-allocation: the body is the real MP4 followed by one reused 64 KiB block written
-with backpressure, so the whole stream costs kilobytes of memory.
+The stream's ceiling is **4.25 GiB** (4,563,402,752 bytes), composed in source
+as:
 
-**Historical — why 528 MiB.** The ceiling was chosen, with a deliberately small
-margin, when Production's effective `MAX_FILE_SIZE` was the 500 MiB default. The
-expected outcome then was that the Worker closed the connection well before the
-ceiling, and because 528 MiB exceeds 500 MiB, the accepted Phase-10D
+```
+BYTE_LIMIT_REFERENCE_MAX_BYTES  4 * 1024 * 1024 * 1024  = 4,294,967,296   4 GiB
+BYTE_LIMIT_HEADROOM_BYTES       256 * 1024 * 1024       =   268,435,456   256 MiB
+BYTE_LIMIT_TOTAL_BYTES          reference + headroom    = 4,563,402,752   4.25 GiB
+```
+
+The **reference** mirrors the current Product default
+(`DEFAULT_MAX_FILE_SIZE_BYTES` in `src/shared/media-limits.ts`). The
+**headroom** is bounded observation margin: the Production actual-byte monitor
+polls every 150 ms, so a transfer does not stop at the exact threshold byte but
+at the first poll after it, and 256 MiB is enough room for that poll to land
+while the fixture is still serving. A larger margin would only make a runaway
+transfer more expensive without making the assertion any stronger.
+
+It is a **ceiling, not an allocation**, and nothing here is proportional to it:
+the body is the real MP4 followed by one reused 64 KiB block written with
+backpressure, so the whole 4.25 GiB stream costs kilobytes of memory. Nothing
+ever allocates a 4.25 GiB buffer, and **no automated repository test reads,
+buffers or writes a 4.25 GiB body** — the offline fixture tests assert the
+default from constants and from the manifest, and every test that actually
+transfers a body starts its service with a small deterministic
+`byteLimitTotalBytes` override.
+
+**The reference is not the authority.** The acceptance harness compares against
+the limit it MEASURES from the deployed Worker's own `MAX_FILE_SIZE`, not
+against this constant, because a deployment may legitimately override the limit
+in either direction. See "Advertising the ceiling" below.
+
+> `YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001` (runbook §11) is the correction
+> this section describes. The ledger row stays **OPEN** until it is
+> independently reviewed and merged, and **no live 4 GiB threshold acceptance
+> has been performed** with this ceiling.
+
+**Historical — why this was 528 MiB.** The ceiling was chosen, with a
+deliberately small margin, when Production's effective `MAX_FILE_SIZE` was the
+500 MiB default. Because 528 MiB exceeded 500 MiB, the accepted Phase-10D
 `byte-limit` run could establish that the application threshold had actually
-been crossed. That evidence remains valid for the 500 MiB deployment it measured.
+been crossed. **That evidence remains valid for the 500 MiB deployment it
+measured.** Raising the ceiling here does not restate that record against 4 GiB
+and does not retroactively upgrade it — it only makes a FUTURE run capable of
+crossing today's limit.
 
-**Current — insufficient against 4 GiB (`YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001`,
-OPEN).** Production has enforced 4 GiB — 4,294,967,296 bytes — since 2026-09-17,
-and the unchanged 528 MiB stream never reaches that threshold. The route itself
-is still deterministic fixture infrastructure: the correlation grammar, the
-absent `Content-Length`, the byte counting and the per-case evidence are
-unaffected. Only its ceiling, relative to the new Product limit, is the problem.
-It is therefore insufficient for a fresh live byte-limit acceptance against the
-4 GiB Production limit, and a separate reviewed fixture/test correction is
-required before this case is reused as current threshold evidence. Until then,
-`BYTE_LIMIT_TOTAL_BYTES` and `scripts/ytdlp-fixture.test.mjs` intentionally still
-encode the 500 MiB design, and the `--byte-limit-bytes` override in `server.mjs`
-is not a reviewed substitute for that correction.
+### Advertising the ceiling
+
+The manifest's `byteLimitMaxBytes` states what THIS service is configured to
+serve — the reviewed default, or whatever `--byte-limit-bytes` overrode it
+with. It is the operator-to-harness binding:
+
+```
+VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES=<the manifest's byteLimitMaxBytes>
+```
+
+For the reviewed default that is `4563402752`. The harness parses it with a
+strict positive-decimal safe-integer grammar — no sign, units, separators,
+decimal point or surrounding whitespace — and a missing or malformed value is a
+**usage error that refuses the `byte-limit` case before it submits anything**.
+It is never silently defaulted to the repository constant, because a fixture
+started with `--byte-limit-bytes 262144` would then be gated against a ceiling
+it never had.
+
+Before the case analyzes or creates its job, the harness measures the deployed
+effective limit and requires:
+
+```
+fixtureMaxBytes > effectiveMaxFileSizeBytes
+```
+
+strictly. A fixture that could not cross the deployed threshold is refused
+**before a job exists**, because such a run could only end in a rejection that a
+real job had to be created to reach.
+
+**This preflight is a gate, not evidence.** An advertised ceiling is a claim the
+fixture makes about itself, and a fixture advertising 4.25 GiB while serving
+2 MiB would sail through it. A successful live proof still requires the
+correlated post-transfer evidence, and in particular that the bytes **actually
+served** exceeded the deployed effective limit — see `bytesServed` below.
+
+**The `--byte-limit-bytes` override** remains for small automated fixture tests,
+deterministic local characterization, and separately reviewed special acceptance
+circumstances. It is **not** needed to compensate for the default any more, and
+an operator-chosen value does not become trustworthy acceptance evidence by
+being passed through it: the harness binds whatever the manifest advertises and
+then verifies the bytes actually served.
+
+### Crossing 4 GiB within the Product deadline
+
+The Product's absolute acquisition timeout is **600 s** and is unchanged. A real
+threshold proof therefore requires transferring more than the deployed effective
+limit within that deadline — for the 4 GiB default, sustained throughput of
+roughly 7.2 MiB/s end to end, before the Worker's own poll interval and the
+tunnel are accounted for. If the threshold is not reached in time, the harness
+must report **TIMEOUT/BLOCKED honestly**; a run that timed out short of the
+threshold is not byte-guard acceptance, and the `bytesServed >
+effectiveMaxFileSizeBytes` requirement will refuse it as invalid fixture
+evidence rather than pass it.
 
 ### 4. Safe-egress fixture — `/safe-egress`
 
@@ -313,7 +390,7 @@ request:
   "mediaRequestCount": 1,
   "contentLengthPresent": false,
   "transferMode": "chunked",
-  "bytesServed": 553648128,
+  "bytesServed": 4295098368,
   "observedAt": "<iso timestamp>"
 }
 ```

@@ -45,6 +45,13 @@
 //                                     from the generated file BEFORE it was
 //                                     exposed and before any job existed
 //                                     (required by the Stage-B success case)
+//   VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES
+//                                     the controlled fixture's advertised
+//                                     ceiling, taken from its manifest's
+//                                     byteLimitMaxBytes (required by the
+//                                     Stage-B byte-limit case; gates it out
+//                                     when the fixture could not cross the
+//                                     deployed limit)
 //   VF_CONTROL_KEY_ID / VF_CONTROL_SECRET / VF_WORKER_ORIGIN
 //                                     for the Worker's own cancel route
 
@@ -74,10 +81,12 @@ import {
   ytdlpIdentified,
 } from "./lib/download-window.mjs";
 import {
+  BYTELIMIT_MAX_BYTES_ENV,
   CASE_PRODUCERS,
   GENERIC_EXPECTED_DIGEST_ENV,
   buildCaseRecord,
   caseNames,
+  parseByteLimitFixtureMaxBytes,
   parseGenericExpectedDigest,
   describeFeatureState,
   evaluateCaseFeatureState,
@@ -607,6 +616,9 @@ async function runStageBCase(ctx, caseName) {
   const producer = CASE_PRODUCERS[caseName];
   // Parsed once, before the context is built and before any producer runs.
   const genericDigest = parseGenericExpectedDigest(env[GENERIC_EXPECTED_DIGEST_ENV]);
+  // Likewise for the controlled byte-limit fixture's ADVERTISED ceiling, which
+  // the operator takes from the fixture manifest's own `byteLimitMaxBytes`.
+  const byteLimitMax = parseByteLimitFixtureMaxBytes(env[BYTELIMIT_MAX_BYTES_ENV]);
   const caseCtx = {
     ...ctx,
     genericUrl: env.VIDEOFETCH_ACCEPT_GENERIC_URL ?? null,
@@ -616,6 +628,10 @@ async function runStageBCase(ctx, caseName) {
     // into the record is provably the digest this command admitted.
     genericExpectedDigest: genericDigest.ok ? genericDigest.digest : null,
     byteLimitUrl: env.VIDEOFETCH_ACCEPT_BYTELIMIT_URL ?? null,
+    // Admitted ONCE, here, and carried — the producer reads it from the
+    // context and never re-reads the environment, so the ceiling the capacity
+    // preflight gates on is provably the one this command admitted.
+    byteLimitFixtureMaxBytes: byteLimitMax.ok ? byteLimitMax.bytes : null,
     egressRedirectUrl: env.VIDEOFETCH_ACCEPT_EGRESS_REDIRECT_URL ?? null,
     cloudflaredUnit: readOption(argv, "--cloudflared-unit") ?? "vf-cloudflared",
     sleep: ctx.deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
@@ -658,6 +674,21 @@ async function runStageBCase(ctx, caseName) {
   // them would be a usage failure with no finding behind it.
   if ((producer.needs ?? []).includes("genericExpectedDigest") && !genericDigest.ok) {
     errorLog(`usage error: case '${caseName}' — ${genericDigest.reason}`);
+    return EXIT.USAGE;
+  }
+
+  // ── The controlled fixture's advertised ceiling, refused precisely ──────
+  //
+  // Same placement and the same reason: ahead of the `needs` sweep so a
+  // MALFORMED value is named as such rather than reported as absent, and ahead
+  // of `producer.run` so neither a missing nor a malformed value can reach a
+  // case that would then submit a real analysis and create a real job whose
+  // capacity to cross the deployed threshold was never established.
+  //
+  // Only the case that consumes it is gated. The other Stage-B cases make no
+  // claim about the byte threshold.
+  if ((producer.needs ?? []).includes("byteLimitFixtureMaxBytes") && !byteLimitMax.ok) {
+    errorLog(`usage error: case '${caseName}' — ${byteLimitMax.reason}`);
     return EXIT.USAGE;
   }
 

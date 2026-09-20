@@ -104,6 +104,76 @@ export function parseGenericExpectedDigest(raw) {
   }
   return { ok: true, digest: raw };
 }
+
+/**
+ * The grammar for the operator-supplied controlled-fixture ceiling.
+ *
+ * An exact positive decimal integer, safely representable in JavaScript, with
+ * no sign, no separators, no unit suffix, no fractional part and no surrounding
+ * whitespace. The value is compared against a measured byte count, so anything
+ * this parser had to GUESS at — `4GiB`, `12.5`, `4294967296x`, ` 4563402752 `
+ * — would be a guess about whether the fixture can cross the deployed
+ * threshold. It is refused instead.
+ *
+ * The 17-digit bound mirrors the Worker's own `MAX_FILE_SIZE` grammar in
+ * `parseMaxFileSize`, so the two sides of the comparison cannot admit
+ * magnitudes the other would reject.
+ */
+export const BYTELIMIT_MAX_BYTES_PATTERN = /^[0-9]{1,17}$/;
+
+/** The environment variable carrying it into a live run. Never a secret. */
+export const BYTELIMIT_MAX_BYTES_ENV = "VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES";
+
+/**
+ * Admits the controlled fixture's ADVERTISED maximum (§6 of
+ * YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001).
+ *
+ * The operator sets it from the fixture manifest's own `byteLimitMaxBytes`,
+ * which is the fixture's single statement of what it is configured to serve.
+ * It is NOT inferred from a URL, not fetched from an extra public endpoint and
+ * not defaulted to the repository constant: a run whose fixture was started
+ * with `--byte-limit-bytes 262144` would then be gated against a ceiling the
+ * fixture never had, and the gate would admit a case that cannot possibly
+ * produce threshold evidence.
+ *
+ * Fail-closed, and deliberately NOT a fallback. For the live `byte-limit` case
+ * this value is required.
+ *
+ * ── What this value is NOT ────────────────────────────────────────────────
+ *
+ * It is an ADVERTISED capacity, and advertising is not evidence. Admitting it
+ * only lets the case run; the case still has to obtain correlated transfer
+ * evidence and show that the bytes ACTUALLY served crossed the measured
+ * deployed limit. See `runByteLimitCase` step 4.
+ */
+export function parseByteLimitFixtureMaxBytes(raw) {
+  if (raw === undefined || raw === null || raw === "") {
+    return {
+      ok: false,
+      reason:
+        `${BYTELIMIT_MAX_BYTES_ENV} is required: the byte-limit case must know, BEFORE it submits ` +
+        "anything, whether the controlled fixture is even configured to serve more bytes than the " +
+        "deployed limit, and a run without it cannot make that comparison at all",
+    };
+  }
+  if (typeof raw !== "string" || !BYTELIMIT_MAX_BYTES_PATTERN.test(raw)) {
+    return {
+      ok: false,
+      reason:
+        `${BYTELIMIT_MAX_BYTES_ENV} must be an exact positive decimal integer in bytes, taken from ` +
+        "the fixture manifest's byteLimitMaxBytes (no sign, units, separators, decimal point or " +
+        "surrounding whitespace)",
+    };
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    return {
+      ok: false,
+      reason: `${BYTELIMIT_MAX_BYTES_ENV} must be a positive, safely representable integer number of bytes`,
+    };
+  }
+  return { ok: true, bytes: parsed };
+}
 const isCaseId = (v) => typeof v === "string" && CASE_ID_PATTERN.test(v);
 /** A Docker container object id, as a STRING — never a coerced value (§27). */
 const isInstanceId = (v) => typeof v === "string" && CONTAINER_INSTANCE_PATTERN.test(v);
@@ -1212,27 +1282,49 @@ function requireGenericStrategy(video, caseName) {
  * private-selector boundary, so the controlled fixture reports the transfer
  * semantics of the media GET it actually served. That keeps the raw selector
  * private while making the claim about the right request.
+ *
+ * ── The capacity preflight is a GATE, not evidence ──────────────────────
+ *
+ * Step 0 refuses a fixture that could not cross the deployed limit even in
+ * principle, so a run known in advance to be incapable of producing threshold
+ * evidence never creates a job. It does the opposite of establishing the
+ * threshold was crossed: an ADVERTISED ceiling is a claim by the fixture about
+ * itself, and a fixture that advertises 4.25 GiB while serving 2 MiB would sail
+ * through it. Step 4's `bytesServed > effectiveMaxFileSizeBytes` remains the
+ * authoritative, post-transfer proof, and passing step 0 never substitutes for
+ * it.
  */
 export async function runByteLimitCase(ctx) {
   const { session, byteLimitUrl } = ctx;
 
-  // 0. Mint the correlation identity and bind the submitted URL to it, so the
-  //    fixture's later evidence is about THIS case's transfer and nothing else.
-  //    Not a secret: it grants nothing and authenticates nothing.
-  const caseId = mintCaseId();
-  const submittedUrl = withCaseId(byteLimitUrl, caseId);
+  // 0. CAPACITY PREFLIGHT — before ANY submission.
+  //
+  //    Runs ahead of the analysis request, not merely ahead of job creation.
+  //    A fixture that cannot serve more bytes than the deployed Worker allows
+  //    can never produce threshold evidence, so submitting its page for
+  //    analysis and then driving a real job to a foregone rejection is work
+  //    whose outcome is already known. The only thing such a run could add is
+  //    a real job in the Production durable store.
+  //
+  //    Both sides of this comparison are established without submitting
+  //    anything: the fixture's advertised ceiling was admitted by the CLI from
+  //    the manifest value the operator supplied, and the deployed limit is a
+  //    read-only observation of the Worker's own `MAX_FILE_SIZE`.
+  const fixtureMaxBytes = ctx.byteLimitFixtureMaxBytes;
+  if (!Number.isSafeInteger(fixtureMaxBytes) || fixtureMaxBytes < 1) {
+    // Defence in depth. The CLI refuses a missing or malformed value as a usage
+    // error before this producer is reached; a producer driven directly must
+    // still not be able to skip the gate by omitting the input.
+    throw new Error(
+      `the controlled fixture's advertised maximum was not admitted (${BYTELIMIT_MAX_BYTES_ENV}); ` +
+        "the byte-limit case cannot establish that the fixture is able to cross the deployed " +
+        "threshold (LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)",
+    );
+  }
 
-  // 1. Establish the fixture is genuinely generic before anything else.
-  const video = await session.analyze(submittedUrl);
-  requireGenericStrategy(video, "byte-limit");
-
-  const preset = pickPreset(video?.presets);
-  if (!preset) throw new Error("the byte-limit fixture advertised no application preset");
-
-  // 2. The EFFECTIVE limit the deployed Worker enforces. Measured BEFORE the
-  //    job runs, so a comparison is possible at all — and measured from the
+  //    The EFFECTIVE limit the deployed Worker enforces — measured from the
   //    deployment rather than assumed from the repository default, because a
-  //    deployment may legitimately override it.
+  //    deployment may legitimately override it in either direction.
   const limit = await ctx.effectiveMaxFileSize();
   if (limit.measured !== true) {
     throw new Error(
@@ -1241,6 +1333,33 @@ export async function runByteLimitCase(ctx) {
     );
   }
   const effectiveMaxFileSizeBytes = limit.value.bytes;
+
+  //    STRICTLY greater. Equality is not sufficient: the assertion the case
+  //    has to reach is `bytesServed > effectiveMaxFileSizeBytes`, and a fixture
+  //    whose entire ceiling equals the limit cannot satisfy a strict `>` even
+  //    if it served every byte it has.
+  if (fixtureMaxBytes <= effectiveMaxFileSizeBytes) {
+    throw new Error(
+      `the controlled fixture advertises a ceiling of ${fixtureMaxBytes} bytes against a deployed ` +
+        `effective limit of ${effectiveMaxFileSizeBytes} bytes (source: ${limit.value.source}); the ` +
+        "fixture cannot cross the deployed threshold, so no job was created — raise the fixture's " +
+        "ceiling for this deployment rather than accepting evidence it cannot produce " +
+        "(LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)",
+    );
+  }
+
+  // 1. Mint the correlation identity and bind the submitted URL to it, so the
+  //    fixture's later evidence is about THIS case's transfer and nothing else.
+  //    Not a secret: it grants nothing and authenticates nothing.
+  const caseId = mintCaseId();
+  const submittedUrl = withCaseId(byteLimitUrl, caseId);
+
+  // 2. Establish the fixture is genuinely generic before anything else.
+  const video = await session.analyze(submittedUrl);
+  requireGenericStrategy(video, "byte-limit");
+
+  const preset = pickPreset(video?.presets);
+  if (!preset) throw new Error("the byte-limit fixture advertised no application preset");
 
   const created = await session.createJob(submittedUrl, preset.formatId);
   const jobId = created.jobId;
@@ -1636,7 +1755,11 @@ export const CASE_PRODUCERS = Object.freeze({
     run: runByteLimitCase,
     live: true,
     expectedFeatureState: "enabled",
-    needs: ["byteLimitUrl"],
+    // `byteLimitFixtureMaxBytes` is the fixture's advertised ceiling, admitted
+    // from the manifest by the CLI. Declared as a NEED so a run that omits it
+    // is a usage error before anything is submitted, rather than a producer
+    // that discovers it is ungated once a job already exists.
+    needs: ["byteLimitUrl", "byteLimitFixtureMaxBytes"],
     operatorTransition: false,
     spansOneRestart: false,
     summary: "unknown-declared-length over-limit source aborts as TOO_LARGE",
