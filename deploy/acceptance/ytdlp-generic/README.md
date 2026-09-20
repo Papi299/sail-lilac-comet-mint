@@ -263,7 +263,7 @@ There is no unreviewed layer between Production and the acceptance logic.
 | `--stage A` | **disabled** | Every Stage A gate, including the direct-media regression. Writes the Stage A record and begins the run. |
 | `--stage B --case success` | **enabled** | Generic analysis, job lifecycle, durable evidence, the downloading window, R2, signed GET, sentinel sweep. |
 | `--stage B --case cancellation` | **enabled** | Captures the owned PGID, cancels, proves that exact group died. |
-| `--stage B --case byte-limit` | **enabled** | This case's own unknown-declared-length **media GET** must serve more than the deployed limit and abort as `TOO_LARGE`. **Not current 4 GiB acceptance:** the fixture was designed for the historical 500 MiB limit and tops out at 528 MiB, below today's 4 GiB — see [the fixture no longer crosses the live limit](#the-528-mib-fixture-no-longer-crosses-the-live-4-gib-limit). |
+| `--stage B --case byte-limit` | **enabled** | This case's own unknown-declared-length **media GET** must serve more than the deployed limit and abort as `TOO_LARGE`. The fixture ceiling is **4.25 GiB** (4 GiB reference + 256 MiB headroom), and a capacity preflight refuses the case before any submission unless that ceiling strictly exceeds the **measured** deployed limit — see [the fixture ceiling](#the-fixture-ceiling-is-sized-against-the-current-4-gib-limit). Requires `VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES`. |
 | `--stage B --case shutdown` | **enabled** | Captures the owned PGID, the operator restarts, that exact group must be gone. |
 | `--stage B --case safe-egress` | **enabled** | Forbidden later destination denied, attributed by the **deny counter** named with `--egress-deny-class` (a closed deny-only enum). |
 | `--stage B --case direct-regression` | **enabled** | Post-enable direct job with no yt-dlp process. |
@@ -1195,7 +1195,15 @@ test, and do not fabricate evidence. The gap is made explicit on purpose.
 ```
 VIDEOFETCH_ACCEPT_BYTELIMIT_URL=<https URL of the controlled fixture page>
 VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL=<https URL of its evidence endpoint>
+VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES=<the fixture manifest's byteLimitMaxBytes>
 ```
+
+`VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES` is the controlled fixture's **advertised
+ceiling**, copied from its own manifest — not inferred from a URL, not fetched
+from an extra endpoint, and never defaulted to the repository constant. It is
+parsed with a strict positive-decimal safe-integer grammar, and a missing or
+malformed value is a **usage error that stops the `byte-limit` case before it
+submits anything**. See "The capacity preflight" below.
 
 The harness appends `?vf_case=<128-bit hex>` to the submitted URL. The fixture
 must:
@@ -1222,32 +1230,80 @@ not match, or whose `mediaRequestCount` is not exactly `1`, is `BLOCKED`.
 
 This contract is implemented by `fixtures/server.mjs` — see
 [`fixtures/README.md`](fixtures/README.md). Its `/byte-limit-media.mp4` sends no
-`Content-Length` (so Node frames it `chunked`), streams up to **528 MiB** from
+`Content-Length` (so Node frames it `chunked`), streams up to **4.25 GiB** from
 one reused 64 KiB block under backpressure, and counts `bytesServed` in the
 `res.write` flush callback so the number describes bytes handed to the socket
 rather than bytes queued. A `HEAD` on that route opens no case and increments
 nothing; a second `GET` is reported as `mediaRequestCount: 2` rather than
 clamped, so an ambiguous transfer stays `BLOCKED` instead of passing.
 
-#### The 528 MiB fixture no longer crosses the live 4 GiB limit
+#### The fixture ceiling is sized against the current 4 GiB limit
 
-> **Open drift — `YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001`** (runbook §11).
->
-> - **Historical.** This case was designed, and accepted in Phase 10D, while
->   Production enforced the 500 MiB default. The fixture's 528 MiB ceiling
->   (553,648,128 bytes) crossed that limit on purpose, and the accepted Phase-10D
->   `byte-limit` record remains valid evidence for the 500 MiB deployment it
->   measured.
-> - **Current.** Production has enforced 4 GiB (4,294,967,296 bytes, with
->   `MAX_FILE_SIZE` absent) since 2026-09-17. The fixture still tops out at
->   528 MiB, so it does **not** cross the live Product threshold.
-> - **Consequence.** The `byte-limit` case **must not** be treated as current
->   4 GiB threshold acceptance until its fixture and test design are corrected
->   by a separate reviewed task. A run today could not pass by accident — the
->   requirement below rejects a transfer that never crossed the measured limit
->   as invalid fixture evidence — but it would still create and drive a real
->   job before being rejected. The `--byte-limit-bytes` override in
->   `server.mjs` is not a reviewed procedure and is not that correction.
+> `YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001` (runbook §11) is the correction
+> described here. The ledger row stays **OPEN** until this change is
+> independently reviewed and merged; closing it is a separate bounded
+> documentation task. Nothing below has been exercised against Production —
+> **no live 4 GiB threshold acceptance has been performed.**
+
+```
+reference limit (current Product default)   4,294,967,296   4 GiB
+bounded headroom                              268,435,456   256 MiB
+fixture ceiling (BYTE_LIMIT_TOTAL_BYTES)    4,563,402,752   4.25 GiB
+```
+
+The headroom exists because the Production actual-byte monitor polls every
+150 ms: a transfer stops at the first poll after the threshold, not at the
+threshold byte, so the fixture needs bounded room to still be serving when that
+poll lands. It is a **ceiling, not an allocation** — the stream is one reused
+64 KiB block, nothing is proportional to the ceiling, and no automated
+repository test transfers a 4.25 GiB body.
+
+**The historical record is unchanged.** This case was designed, and accepted in
+Phase 10D, while Production enforced the 500 MiB default, against a 528 MiB
+fixture that crossed that limit on purpose. The accepted Phase-10D `byte-limit`
+record **remains valid evidence for the 500 MiB deployment it measured**. The
+new ceiling does not retroactively upgrade it into 4 GiB evidence; it makes a
+FUTURE run capable of producing current-limit evidence.
+
+#### The capacity preflight
+
+Before the `byte-limit` case analyzes or creates a job, the harness:
+
+1. admits the fixture's advertised ceiling from
+   `VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES` (strict grammar, fail-closed);
+2. measures the deployed effective `maxFileSizeBytes` through the existing
+   narrow read-only `MAX_FILE_SIZE` observer;
+3. requires `fixtureMaxBytes > effectiveMaxFileSizeBytes`, **strictly**.
+
+If the fixture could not cross the deployed threshold, the case stops **before a
+job exists** — a run whose outcome is already known can only add a real job to
+the Production durable store on its way to a foregone rejection. Equality is not
+enough: the case's own assertion is a strict `>`, which a fixture whose entire
+ceiling equals the limit could not satisfy even by serving every byte it has.
+
+The **deployed** value is the authority, not the repository default. A
+deployment that lowered `MAX_FILE_SIZE` to 1 GiB still admits the case; one that
+raised it to 5 GiB is refused, because the default fixture proves the limit it
+was sized for and never an arbitrary future one.
+
+**The preflight is not acceptance evidence.** It is a gate on a claim the
+fixture makes about itself. The case must still obtain the correlated transfer
+evidence and satisfy every requirement below — in particular
+`bytesServed > effectiveMaxFileSizeBytes` — so a fixture that advertises a
+sufficient ceiling and then serves fewer bytes is still refused, after the fact,
+as invalid fixture evidence.
+
+**Throughput, and reporting it honestly.** The Product's absolute acquisition
+timeout is **600 s** and is unchanged by this correction. Crossing 4 GiB inside
+that deadline requires roughly 7.2 MiB/s sustained end to end. If the threshold
+is not reached, the run must be reported as **TIMEOUT/BLOCKED** — not as a pass,
+and not as a smaller-than-intended threshold proof.
+
+The `--byte-limit-bytes` override in `server.mjs` is **not** how the default is
+made sufficient (it already is). It remains bounded to small automated fixture
+tests, deterministic local characterization, and separately reviewed special
+acceptance circumstances, and passing a value through it does not make that
+value trustworthy acceptance evidence.
 
 ### Cancellation and shutdown
 
@@ -1924,11 +1980,14 @@ acceptance evidence), and is `BLOCKED` — `LIVE UNKNOWN-LENGTH BYTE-GUARD CASE
 NOT PROVEN` — if the correlation, the media request, or the effective limit
 cannot be established at all.
 
-**Against the current 4 GiB Production limit, the existing fixture cannot meet
-this requirement:** its 528 MiB ceiling was sized for the historical 500 MiB
-limit. See
-[the fixture no longer crosses the live limit](#the-528-mib-fixture-no-longer-crosses-the-live-4-gib-limit)
-(`YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001`).
+**Before any of that, the case must be capable of producing the evidence at
+all.** The capacity preflight compares the fixture's advertised ceiling against
+the measured deployed limit and refuses the case — before the analysis request
+and before any job — unless the ceiling is strictly greater. Clearing it proves
+nothing on its own: the post-transfer `bytesServed > effectiveMaxFileSizeBytes`
+requirement above is still what decides acceptance. See
+[the fixture ceiling](#the-fixture-ceiling-is-sized-against-the-current-4-gib-limit) and
+[the capacity preflight](#the-capacity-preflight).
 
 ## The direct regression is a negative claim too
 

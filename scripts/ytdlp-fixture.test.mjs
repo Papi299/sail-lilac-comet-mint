@@ -31,6 +31,8 @@ import {
   genericFfmpegArgs,
 } from "../deploy/acceptance/ytdlp-generic/fixtures/prepare-media.mjs";
 import {
+  BYTE_LIMIT_HEADROOM_BYTES,
+  BYTE_LIMIT_REFERENCE_MAX_BYTES,
   BYTE_LIMIT_TOTAL_BYTES,
   CASE_ID_PATTERN,
   GENERIC_THROTTLE_TARGET_MS,
@@ -418,15 +420,53 @@ describe("acceptance fixture: byte-limit transfer semantics", () => {
     await res.arrayBuffer();
   });
 
-  it("can exceed the deployed 500 MiB limit by default, without allocating it", () => {
+  it("can exceed the current 4 GiB limit by default, without allocating it", () => {
+    // NOTE: this service is never listened on and its byte-limit body is never
+    // requested. The default ceiling is asserted from CONSTANTS and from the
+    // manifest — no automated test streams 4.25 GiB, and every test that
+    // actually transfers a body uses a small deterministic override.
     const fx = createFixtureService({ media: MEDIA, genericMedia: GENERIC_MEDIA, log: () => {} });
-    assert.equal(BYTE_LIMIT_TOTAL_BYTES, 528 * 1024 * 1024);
-    assert.ok(BYTE_LIMIT_TOTAL_BYTES > 500 * 1024 * 1024, "must be able to cross the deployed limit");
-    assert.ok(BYTE_LIMIT_TOTAL_BYTES <= 540 * 1024 * 1024, "no larger than the case needs");
+
+    // The reference is the CURRENT Product default (`DEFAULT_MAX_FILE_SIZE_BYTES`
+    // in `src/shared/media-limits.ts`), not the historical 500 MiB one.
+    assert.equal(BYTE_LIMIT_REFERENCE_MAX_BYTES, 4 * 1024 * 1024 * 1024);
+    assert.equal(BYTE_LIMIT_REFERENCE_MAX_BYTES, 4_294_967_296);
+    assert.equal(BYTE_LIMIT_HEADROOM_BYTES, 256 * 1024 * 1024);
+    assert.equal(BYTE_LIMIT_HEADROOM_BYTES, 268_435_456);
+
+    assert.equal(BYTE_LIMIT_TOTAL_BYTES, BYTE_LIMIT_REFERENCE_MAX_BYTES + BYTE_LIMIT_HEADROOM_BYTES);
+    assert.equal(BYTE_LIMIT_TOTAL_BYTES, 4_563_402_752);
+    assert.ok(
+      BYTE_LIMIT_TOTAL_BYTES > BYTE_LIMIT_REFERENCE_MAX_BYTES,
+      "must be able to cross the current Product limit",
+    );
+    // Still bounded: headroom for the 150 ms actual-byte poll to land after the
+    // threshold, not an arbitrarily large runaway.
+    assert.equal(BYTE_LIMIT_TOTAL_BYTES - BYTE_LIMIT_REFERENCE_MAX_BYTES, BYTE_LIMIT_HEADROOM_BYTES);
+
+    // The manifest is the operator-to-harness binding for
+    // `VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES`, so it must state the ceiling the
+    // service is actually configured with.
     assert.equal(fx.manifest().byteLimitMaxBytes, BYTE_LIMIT_TOTAL_BYTES);
+
     // The ceiling is produced incrementally from one small reused block; the
     // service holds the fixture media and nothing proportional to the ceiling.
-    assert.ok(process.memoryUsage().heapUsed < BYTE_LIMIT_TOTAL_BYTES);
+    assert.ok(process.memoryUsage().heapUsed < BYTE_LIMIT_REFERENCE_MAX_BYTES);
+  });
+
+  it("advertises an OVERRIDDEN ceiling honestly, so the harness gates on what it will serve", () => {
+    // The `--byte-limit-bytes` override exists for small deterministic
+    // ceilings. A manifest that kept advertising the reviewed default while
+    // serving 256 KiB would let the capacity preflight admit a case the fixture
+    // cannot possibly satisfy — the binding has to describe THIS service.
+    const fx = createFixtureService({
+      media: MEDIA,
+      genericMedia: GENERIC_MEDIA,
+      log: () => {},
+      byteLimitTotalBytes: 256 * 1024,
+    });
+    assert.equal(fx.manifest().byteLimitMaxBytes, 256 * 1024);
+    assert.notEqual(fx.manifest().byteLimitMaxBytes, BYTE_LIMIT_TOTAL_BYTES);
   });
 
   it("starts the stream with the real media bytes", async () => {

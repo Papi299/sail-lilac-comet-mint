@@ -110,17 +110,46 @@ export const SAFE_EGRESS_FIXTURE_FAMILY = "private-v4";
 export const SAFE_EGRESS_EXPECTED_DENY_CLASS = "deny-v4";
 
 /**
+ * The CURRENT Product limit this fixture is sized against.
+ *
+ * Mirrors `DEFAULT_MAX_FILE_SIZE_BYTES` in `src/shared/media-limits.ts`, which
+ * has been 4 GiB since MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001. It is a
+ * REFERENCE, not an authority: the acceptance harness compares against the
+ * limit it measures from the DEPLOYED Worker, because a deployment may
+ * legitimately override `MAX_FILE_SIZE` in either direction.
+ */
+export const BYTE_LIMIT_REFERENCE_MAX_BYTES = 4 * 1024 * 1024 * 1024;
+
+/**
+ * Bounded observation margin above that reference.
+ *
+ * The Production byte watcher polls actual bytes every 150 ms, so the transfer
+ * does not stop at the exact threshold byte — it stops at the first poll after
+ * it. 256 MiB is enough post-threshold room for that poll to land while the
+ * fixture is still serving, and small enough that a runaway transfer stays
+ * bounded. A far larger margin would only make a runaway more expensive
+ * without making the assertion any stronger.
+ */
+export const BYTE_LIMIT_HEADROOM_BYTES = 256 * 1024 * 1024;
+
+/**
  * How many bytes the unknown-length stream will produce if nobody stops it.
  *
- * 528 MiB, against a deployed `MAX_FILE_SIZE` whose default is 500 MiB. The
- * margin is deliberately small: the fixture exists to let the Worker's byte
- * watcher fire, and the normal outcome is that the Worker closes the connection
- * well before this ceiling is reached. A far larger ceiling would only make a
- * runaway transfer more expensive without making the assertion any stronger.
+ * 4.25 GiB (4,563,402,752 bytes) — the current 4 GiB reference plus the bounded
+ * headroom above. The fixture exists to let the Worker's byte watcher fire, and
+ * the normal outcome is that the Worker closes the connection shortly after the
+ * threshold, well before this ceiling is reached.
  *
- * This is a CEILING, not an allocation — see `streamUnknownLengthMedia`.
+ * HISTORICAL: this was 528 MiB while the deployed default was 500 MiB, and the
+ * accepted Phase-10D `byte-limit` record remains valid evidence for THAT
+ * deployment. Raising the ceiling does not restate that record against 4 GiB
+ * — it only makes a FUTURE run capable of crossing today's limit.
+ *
+ * This is a CEILING, not an allocation — see `streamUnknownLengthMedia`, which
+ * emits it from one reused `BYTE_LIMIT_BLOCK_BYTES` block under backpressure.
+ * Nothing here is proportional to the ceiling, and nothing ever allocates it.
  */
-export const BYTE_LIMIT_TOTAL_BYTES = 528 * 1024 * 1024;
+export const BYTE_LIMIT_TOTAL_BYTES = BYTE_LIMIT_REFERENCE_MAX_BYTES + BYTE_LIMIT_HEADROOM_BYTES;
 
 /** The single reused block the unknown-length stream is emitted in. */
 export const BYTE_LIMIT_BLOCK_BYTES = 64 * 1024;
@@ -332,7 +361,8 @@ function createWriter(res) {
  * So the response is a plausible progressive mp4 from its first byte rather
  * than an obvious wall of filler. The remainder is one 64 KiB block written
  * repeatedly: at no point does this hold more than that block plus Node's own
- * socket buffer, so a 528 MiB ceiling costs kilobytes of memory.
+ * socket buffer, so even the 4.25 GiB default ceiling costs kilobytes of
+ * memory. Nothing here is proportional to `totalBytes`.
  */
 async function streamUnknownLengthMedia(writer, { prefix, totalBytes, blockBytes, onBytes }) {
   const block = Buffer.alloc(Math.min(blockBytes, Math.max(1, totalBytes)), 0x00);
@@ -1197,6 +1227,16 @@ function parseArgv(argv) {
       case "--generic-throttle-ms":
         out.genericThrottleMs = Number.parseInt(next(), 10);
         break;
+      // A BOUNDED override, and never the reviewed default.
+      //
+      // Its proper uses are the small deterministic ceilings the offline
+      // fixture tests start services with, local characterization, and a
+      // separately reviewed special acceptance circumstance. It is NOT a way to
+      // make the default sufficient — `BYTE_LIMIT_TOTAL_BYTES` already is — and
+      // an operator-chosen value does not become trustworthy acceptance
+      // evidence by being passed here: the harness binds whatever ceiling the
+      // manifest advertises and then proves the bytes ACTUALLY served against
+      // the limit it measured from the deployed Worker.
       case "--byte-limit-bytes":
         out.byteLimitTotalBytes = Number.parseInt(next(), 10);
         break;

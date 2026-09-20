@@ -139,9 +139,12 @@ import {
   CONTAINER_INSTANCE_PATTERN,
   CASE_PRODUCERS,
   CASE_SCHEMA_VERSION,
+  BYTELIMIT_MAX_BYTES_ENV,
   GENERIC_EXPECTED_DIGEST_ENV,
   HARNESS_ID,
+  parseByteLimitFixtureMaxBytes,
   parseGenericExpectedDigest,
+  runByteLimitCase,
   runSuccessCase,
 } from "../deploy/acceptance/ytdlp-generic/lib/cases.mjs";
 import {
@@ -4440,10 +4443,21 @@ describe("multi-state aggregation", () => {
 // ── CORRECTION-04 §10-§16: byte-limit causal binding ───────────────────────
 
 describe("byte-limit causal binding", () => {
+  /**
+   * The reviewed default the fixture manifest advertises: 4 GiB + 256 MiB.
+   *
+   * The operator copies this out of the manifest's `byteLimitMaxBytes`, so the
+   * tests state it as the literal the manifest would carry rather than
+   * recomputing it from the fixture module — a fixture that silently changed
+   * its ceiling must not be able to change the harness's expectation with it.
+   */
+  const FIXTURE_MAX_BYTES = 4_563_402_752;
+
   const byteLimitEnv = (extra = {}) =>
     LIVE_ENV({
       VIDEOFETCH_ACCEPT_BYTELIMIT_URL: "https://media.invalid/generic/bytelimit",
       VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL: "https://media.invalid/byte-evidence",
+      VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES: String(FIXTURE_MAX_BYTES),
       ...extra,
     });
 
@@ -4454,11 +4468,37 @@ describe("byte-limit causal binding", () => {
       ...worldOptions,
     });
     const files = seedRun();
-    return runCli(
+    const run = await runCli(
       ["--stage", "B", "--case", "byte-limit", ...LIVE_ARGS, "--evidence", "/tmp/bl.json"],
       byteLimitEnv(envExtra),
       { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
     );
+    // The world comes back so a test can make the LOAD-BEARING negative claim
+    // directly: not "no evidence file was written", but "no byte-limit job was
+    // created" — see `assertNoByteLimitJob`.
+    return { ...run, world };
+  }
+
+  /**
+   * Asserts the controlled byte-limit case never reached the control plane.
+   *
+   * `POST /api/download` IS job creation for this harness, and
+   * `POST /api/analyze` is the submission that precedes it. Both are asserted,
+   * because the capacity preflight is specified to stop the case before even
+   * the analysis request — a gate that only skipped job creation would still
+   * have submitted the fixture page.
+   *
+   * Deliberately NOT asserted: the read-only deployment observations the CLI
+   * performs for EVERY Stage-B case (service state, image identity,
+   * `MAX_FILE_SIZE`). Those are not job creation, they are how the limit side
+   * of the comparison is established at all.
+   */
+  function assertNoByteLimitJob(run) {
+    const submissions = run.world.calls.fetches.filter(
+      (call) => call === "POST /api/download" || call === "POST /api/analyze",
+    );
+    assert.deepEqual(submissions, [], `nothing may be submitted; saw ${submissions.join(", ")}`);
+    assert.equal(run.files.has("/tmp/bl.json"), false, "and no record is written");
   }
 
   it("41. a correlated over-limit transfer produces a PASS candidate", async () => {
@@ -4573,6 +4613,251 @@ describe("byte-limit causal binding", () => {
     // Out of grammar: the Worker could not have started, so nothing is assumed.
     for (const raw of ["0", "-1", "12.5", "500MB", "1".repeat(18)]) {
       assert.equal(parseMaxFileSize(raw).measured, false, raw);
+    }
+  });
+
+  // ── YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001: the capacity preflight ─────
+  //
+  // The fixture's ADVERTISED ceiling is bound before the case runs and compared
+  // against the limit MEASURED from the deployment. A fixture that could not
+  // cross the deployed threshold is refused before anything is submitted,
+  // because such a run can only end in a rejection that a real job had to be
+  // created to reach.
+
+  it("41j. A. the reviewed default fixture clears the current 4 GiB deployment", async () => {
+    // 4,563,402,752 advertised against the 4,294,967,296 default: admitted, and
+    // the existing actual-byte evidence then produces a PASS candidate.
+    const run = await runByteLimit();
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+
+    const payload = JSON.parse(run.files.get("/tmp/bl.json")).payload.byteLimitCase;
+    assert.equal(payload.effectiveMaxFileSizeBytes, 4_294_967_296);
+    assert.ok(FIXTURE_MAX_BYTES > payload.effectiveMaxFileSizeBytes);
+    assert.equal(payload.exceededLimit, true);
+
+    // The gate admitted the case; it did not decide it. The PASS still rests on
+    // bytes the fixture reported actually serving.
+    assert.ok(payload.bytesServed > payload.effectiveMaxFileSizeBytes);
+    const stageB = evaluateStageB(
+      passingStageBObservations({ byteLimitCase: measured(payload) }),
+      passingStageA(),
+    );
+    assert.equal(
+      stageB.checks.find((c) => c.id === "limit.actual-byte-guard").outcome,
+      OUTCOMES.PASS,
+    );
+  });
+
+  it("41k. B. a MISSING advertised ceiling refuses the case before it runs", async () => {
+    const run = await runByteLimit({}, { VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES: undefined });
+    assert.equal(run.code, 3, `${run.out}\n${run.err}`);
+    assert.match(run.err, /usage error: case 'byte-limit'/);
+    assert.match(run.err, /VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES is required/);
+    // Never defaulted to the repository constant.
+    assert.doesNotMatch(run.err, /4563402752/);
+    assertNoByteLimitJob(run);
+  });
+
+  it("41l. C. a MALFORMED advertised ceiling is refused fail-closed", async () => {
+    for (const raw of [
+      "",
+      "0",
+      "-1",
+      "12.5",
+      "4GiB",
+      "4294967296x",
+      " 4563402752",
+      "4563402752 ",
+      "4_563_402_752",
+      "+4563402752",
+      "0x10",
+      "4.563402752e9",
+      "1".repeat(18),
+    ]) {
+      const run = await runByteLimit({}, { VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES: raw });
+      assert.equal(run.code, 3, `${JSON.stringify(raw)}: ${run.out}\n${run.err}`);
+      assert.match(run.err, /VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES/);
+      assertNoByteLimitJob(run);
+    }
+  });
+
+  it("41m. the advertised-ceiling grammar admits only exact positive safe integers", () => {
+    assert.deepEqual(parseByteLimitFixtureMaxBytes("4563402752"), {
+      ok: true,
+      bytes: 4_563_402_752,
+    });
+    assert.deepEqual(parseByteLimitFixtureMaxBytes("1"), { ok: true, bytes: 1 });
+
+    for (const raw of [
+      undefined, null, "", "0", "-1", "12.5", "4GiB", "4294967296x",
+      " 4563402752", "4563402752 ", "4_563_402_752", "+4563402752",
+      "0x10", "4.563402752e9", "1".repeat(18), 4563402752,
+      // The realistic operator hazard: the value pasted or piped out of the
+      // manifest with its line ending still attached. `$` in a JavaScript
+      // regexp without `m` matches only the true end of input, so this is
+      // refused rather than quietly trimmed into a number.
+      "4563402752\n", "4563402752\r\n", "\t4563402752",
+    ]) {
+      const parsed = parseByteLimitFixtureMaxBytes(raw);
+      assert.equal(parsed.ok, false, JSON.stringify(String(raw)));
+      assert.match(parsed.reason, /VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES/);
+    }
+
+    // A safe-integer boundary the 17-digit pattern alone would let through.
+    assert.equal(parseByteLimitFixtureMaxBytes(String(Number.MAX_SAFE_INTEGER)).ok, true);
+    assert.equal(parseByteLimitFixtureMaxBytes(String(Number.MAX_SAFE_INTEGER + 2)).ok, false);
+    assert.equal(BYTELIMIT_MAX_BYTES_ENV, "VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES");
+  });
+
+  it("41n. D. a ceiling EXACTLY equal to the effective limit is refused", async () => {
+    // Strictly greater is required: the case's own assertion is a strict `>`,
+    // so a fixture whose whole ceiling equals the limit could not satisfy it
+    // even by serving every byte it has.
+    const equal = 1024 * 1024 * 1024;
+    const run = await runByteLimit(
+      { maxFileSize: String(equal) },
+      { VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES: String(equal) },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /cannot cross the deployed threshold/);
+    assert.match(run.err, new RegExp(String(equal)));
+    assertNoByteLimitJob(run);
+  });
+
+  it("41o. E. a ceiling BELOW the effective limit is refused before the job", async () => {
+    // The historical 528 MiB fixture against today's 4 GiB default: exactly the
+    // drift this correction exists to stop, and it now stops before a job.
+    const run = await runByteLimit(
+      {},
+      { VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES: String(528 * 1024 * 1024) },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /553648128/);
+    assert.match(run.err, /4294967296/);
+    assert.match(run.err, /cannot cross the deployed threshold/);
+    assertNoByteLimitJob(run);
+  });
+
+  it("41p. F. a deployment override ABOVE the fixture's capacity is refused", async () => {
+    // 5 GiB deployed against the 4.25 GiB reviewed default. The default fixture
+    // proves the limit it was sized for, never an arbitrary future one.
+    const run = await runByteLimit({ maxFileSize: String(5 * 1024 * 1024 * 1024) });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /5368709120/);
+    assert.match(run.err, /4563402752/);
+    assert.match(run.err, /cannot cross the deployed threshold/);
+    assertNoByteLimitJob(run);
+  });
+
+  it("41q. G. a deployment override BELOW the fixture's capacity is admitted", async () => {
+    // The MEASURED deployment value is the comparison authority, not the
+    // repository default: 1 MiB deployed, 2 MiB actually served.
+    const run = await runByteLimit({
+      maxFileSize: String(1024 * 1024),
+      byteLimitFixture: { bytesServed: 2 * 1024 * 1024 },
+    });
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    const payload = JSON.parse(run.files.get("/tmp/bl.json")).payload.byteLimitCase;
+    assert.equal(payload.effectiveMaxFileSizeBytes, 1024 * 1024);
+    assert.equal(payload.limitSource, "deployment");
+    assert.equal(payload.exceededLimit, true);
+  });
+
+  it("41r. H. an advertised ceiling cannot manufacture acceptance evidence", async () => {
+    // The lying-fixture case: it advertises 4.25 GiB, clears the preflight, and
+    // then serves 2 MiB against the 4 GiB default. The post-transfer proof —
+    // not the preflight — is what refuses it.
+    const run = await runByteLimit({ byteLimitFixture: { bytesServed: 2 * 1024 * 1024 } });
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /never crossed the deployed threshold/);
+    assert.match(run.err, /2097152 bytes/);
+    assert.equal(run.files.has("/tmp/bl.json"), false, "no record is written");
+
+    // And this one DID run: the distinction the preflight tests rely on is that
+    // their refusals submitted nothing, while this refusal came after a job.
+    assert.ok(
+      run.world.calls.fetches.includes("POST /api/download"),
+      "the preflight admitted this case, so a job was created and later refused",
+    );
+  });
+
+  it("41s. the preflight stops the case BEFORE any submission, not after a job", async () => {
+    // §14: the load-bearing negative claim, observed directly from the producer
+    // rather than inferred from a missing evidence file. Every collaborator the
+    // case could submit through is a counter here, so "nothing was submitted"
+    // is a fact about the calls.
+    const calls = { analyze: 0, createJob: 0, effectiveMaxFileSize: 0 };
+    const ctx = {
+      byteLimitUrl: "https://fixture.invalid/byte-limit",
+      byteLimitFixtureMaxBytes: 528 * 1024 * 1024,
+      session: {
+        analyze: async () => {
+          calls.analyze += 1;
+          throw new Error("the case must not analyze after a failed capacity preflight");
+        },
+        createJob: async () => {
+          calls.createJob += 1;
+          throw new Error("the case must not create a job after a failed capacity preflight");
+        },
+      },
+      effectiveMaxFileSize: async () => {
+        calls.effectiveMaxFileSize += 1;
+        return { measured: true, value: { bytes: 4 * 1024 * 1024 * 1024, source: "default" } };
+      },
+      mediaTransferEvidence: async () => {
+        throw new Error("the case must not ask for transfer evidence");
+      },
+      workDirPresent: async () => {
+        throw new Error("the case must not probe a work directory");
+      },
+    };
+
+    await assert.rejects(
+      () => runByteLimitCase(ctx),
+      (error) => {
+        assert.match(error.message, /cannot cross the deployed threshold/);
+        assert.match(error.message, /no job was created/);
+        return true;
+      },
+    );
+
+    assert.equal(calls.analyze, 0, "no analysis may be submitted");
+    assert.equal(calls.createJob, 0, "no byte-limit job may be created");
+    // The read-only deployment measurement is NOT job creation — it is how the
+    // limit side of the comparison is established, and it must have happened.
+    assert.equal(calls.effectiveMaxFileSize, 1, "the deployed limit is still measured");
+  });
+
+  it("41t. a producer driven without an admitted ceiling still cannot skip the gate", async () => {
+    // Defence in depth. The CLI refuses this as a usage error, but a producer
+    // called directly must not become ungated by omitting the input.
+    for (const byteLimitFixtureMaxBytes of [undefined, null, 0, -1, 12.5, "4563402752", NaN]) {
+      const calls = { analyze: 0, createJob: 0 };
+      const ctx = {
+        byteLimitUrl: "https://fixture.invalid/byte-limit",
+        byteLimitFixtureMaxBytes,
+        session: {
+          analyze: async () => {
+            calls.analyze += 1;
+            return { extractor: "yt-dlp", presets: APP_PRESETS };
+          },
+          createJob: async () => {
+            calls.createJob += 1;
+            return { jobId: "b".repeat(32), status: "queued" };
+          },
+        },
+        effectiveMaxFileSize: async () => ({
+          measured: true,
+          value: { bytes: 1024, source: "deployment" },
+        }),
+      };
+      await assert.rejects(
+        () => runByteLimitCase(ctx),
+        /advertised maximum was not admitted/,
+        String(byteLimitFixtureMaxBytes),
+      );
+      assert.equal(calls.analyze, 0, String(byteLimitFixtureMaxBytes));
+      assert.equal(calls.createJob, 0, String(byteLimitFixtureMaxBytes));
     }
   });
 });
