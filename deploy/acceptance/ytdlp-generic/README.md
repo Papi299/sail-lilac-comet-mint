@@ -1240,10 +1240,13 @@ clamped, so an ambiguous transfer stays `BLOCKED` instead of passing.
 #### The fixture ceiling is sized against the current 4 GiB limit
 
 > `YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001` (runbook §11) is the correction
-> described here. The ledger row stays **OPEN** until this change is
-> independently reviewed and merged; closing it is a separate bounded
-> documentation task. Nothing below has been exercised against Production —
-> **no live 4 GiB threshold acceptance has been performed.**
+> described here, and it is now **CLOSED** following the independently reviewed
+> implementation in PR #75.
+>
+> Closure means the acceptance **fixture/harness drift is corrected**. It does
+> **not** mean the current limit has been exercised live: nothing below has been
+> run against Production, and **no live 4 GiB threshold acceptance has been
+> performed.**
 
 ```
 reference limit (current Product default)   4,294,967,296   4 GiB
@@ -1251,10 +1254,20 @@ bounded headroom                              268,435,456   256 MiB
 fixture ceiling (BYTE_LIMIT_TOTAL_BYTES)    4,563,402,752   4.25 GiB
 ```
 
-The headroom exists because the Production actual-byte monitor polls every
-150 ms: a transfer stops at the first poll after the threshold, not at the
-threshold byte, so the fixture needs bounded room to still be serving when that
-poll lands. It is a **ceiling, not an allocation** — the stream is one reused
+The headroom is a **bounded practical observation margin** above the reference.
+Some post-threshold room is necessary because the Production actual-byte monitor
+polls every 150 ms, so a transfer stops at the first poll after the threshold
+rather than at the threshold byte. 256 MiB is not, however, a mathematical
+guarantee derived from 150 ms alone — how many bytes arrive within a polling
+interval depends on actual throughput and scheduling.
+
+The 256 MiB value is therefore a **bounded practical margin, not a proven
+throughput guarantee**. Its real adequacy will be established only by a future
+live current-limit acceptance run. If such a run reaches the fixture ceiling or
+the Product timeout before producing valid threshold evidence, it must report
+**BLOCKED/TIMEOUT** rather than treating the configured margin as proof.
+
+The 4.25 GiB figure is a **ceiling, not an allocation** — the stream is one reused
 64 KiB block, nothing is proportional to the ceiling, and no automated
 repository test transfers a 4.25 GiB body.
 
