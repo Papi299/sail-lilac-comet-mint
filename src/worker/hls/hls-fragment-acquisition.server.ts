@@ -120,8 +120,17 @@ function fragmentRedirectCeiling(): number {
  * query parameter, playlist datum or upstream index participates in any path
  * this module opens, renames or unlinks — the only caller-supplied component is
  * the server-owned job workDir itself.
+ *
+ * `AGGREGATE_FILE_NAME` is EXPORTED for HLS-4 alone, which must prove that the
+ * artifact it was handed really is the one this module produces rather than
+ * merely some regular file that happens to sit in the same directory. Sharing
+ * the constant keeps that identity check single-sourced; restating the literal
+ * in the processing module would let the two drift apart silently. This is an
+ * added export and nothing else: no behaviour, no path, no bound and no
+ * lifecycle step of HLS-3 changes with it, and HLS-3 still performs no local
+ * media processing of any kind.
  */
-const AGGREGATE_FILE_NAME = "hls-source.ts";
+export const AGGREGATE_FILE_NAME = "hls-source.ts";
 const PARTIAL_FILE_NAME = "hls-source.ts.part";
 
 // ── The acquired artifact ────────────────────────────────────────────────────

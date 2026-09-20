@@ -1,0 +1,25 @@
+{
+    "programs": [
+        {
+            "streams": [
+                {
+                    "codec_type": "video"
+                },
+                {
+                    "codec_type": "audio"
+                }
+            ]
+        }
+    ],
+    "streams": [
+        {
+            "codec_type": "video"
+        },
+        {
+            "codec_type": "audio"
+        }
+    ],
+    "format": {
+        "format_name": "mpegts"
+    }
+}
