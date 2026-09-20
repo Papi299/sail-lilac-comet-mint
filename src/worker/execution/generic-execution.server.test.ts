@@ -29,7 +29,10 @@ import {
   expectedSourcePath,
   type GenericDownloadLimits,
 } from "./ytdlp-download.server.ts";
-import type { GenericExecutionPlan } from "./format-plan.ts";
+import type {
+  GenericExecutionPlan,
+  GenericSingleSourceExecutionPlan,
+} from "./format-plan.ts";
 import { analyzeGenericMediaInternal } from "../analysis/ytdlp-analysis.server.ts";
 
 /**
@@ -779,7 +782,7 @@ describe("generic job: a late byte-monitor sample cannot break a succeeding job 
       downloadGeneric: (async (
         url: string,
         workDir: string,
-        plan: GenericExecutionPlan,
+        plan: GenericSingleSourceExecutionPlan,
         ctx: { limits: GenericDownloadLimits; signal?: AbortSignal; onProgress?: (p: unknown) => void },
       ) => {
         const res = await downloadGenericOriginal(url, workDir, plan, {
@@ -996,7 +999,7 @@ describe("generic job: a pinned --max-filesize refusal (YTDLP-MAX-FILESIZE-REFUS
     return (async (
       url: string,
       workDir: string,
-      plan: GenericExecutionPlan,
+      plan: GenericSingleSourceExecutionPlan,
       ctx: { limits: GenericDownloadLimits; signal?: AbortSignal },
     ) => {
       record.workDir = workDir;
@@ -1300,7 +1303,7 @@ describe("generic job: unknown-audio progressive video (GENERIC-UNKNOWN-AUDIO-VI
     record: AcquisitionRecord,
     result: "write-silent-mp4" | "no-format-match",
   ): NonNullable<JobExecutorDeps["downloadGeneric"]> {
-    return (async (url: string, workDir: string, plan: GenericExecutionPlan, ctx: { limits: GenericDownloadLimits; signal?: AbortSignal }) => {
+    return (async (url: string, workDir: string, plan: GenericSingleSourceExecutionPlan, ctx: { limits: GenericDownloadLimits; signal?: AbortSignal }) => {
       record.plans.push(plan);
       const res = await downloadGenericOriginal(url, workDir, plan, {
         limits: ctx.limits,

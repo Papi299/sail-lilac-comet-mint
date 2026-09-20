@@ -19,7 +19,6 @@ import {
 import { buildGenericFormatSelector, type GenericSourceSelection } from "./generic-source.ts";
 import {
   GenericExecutionPlanSchema,
-  type GenericExecutionPlan,
   type GenericSingleSourceExecutionPlan,
   type GenericSplitExecutionPlan,
 } from "./format-plan.ts";
@@ -683,7 +682,7 @@ async function defaultStatSize(path: string): Promise<number | null> {
 export async function downloadGenericOriginal(
   url: string,
   workDir: string,
-  plan: GenericExecutionPlan,
+  plan: GenericSingleSourceExecutionPlan,
   deps: GenericDownloadDeps,
 ): Promise<GenericOriginalDownload> {
   const runner = deps.runner ?? runProcess;
@@ -711,12 +710,22 @@ export async function downloadGenericOriginal(
   // VideoFetch's own fragment transport with no yt-dlp subprocess at all. There
   // is no partial honouring available even in principle.
   //
-  // Unreachable through the executor, which binds this function behind
-  // `DownloadGenericOriginalFn` — typed on the single-source partition, so
-  // neither plan can be passed there at all. This parameter stays the WHOLE
-  // union deliberately: the refusal is then a behaviour that can be exercised
-  // rather than a type that merely forbids writing the call, and the existing
-  // tests do exercise it.
+  // CORRECTION-01: both refusals are ALSO unreachable by type. The `plan`
+  // parameter is `GenericSingleSourceExecutionPlan`, so no legitimate
+  // TypeScript caller can supply either operation — not through the executor's
+  // `DownloadGenericOriginalFn` seam, and not by calling this exported function
+  // directly. A compile-time assertion in the test suite pins that, so widening
+  // this parameter back to the whole union fails `tsc` rather than silently
+  // reopening the boundary.
+  //
+  // The runtime refusal is NOT redundant and is deliberately kept. This is a
+  // module boundary, and a narrow signature binds only callers the compiler
+  // checked: JavaScript callers, deliberate casts and stale compiled callers
+  // can all still arrive here. The re-parse above widens back to the whole
+  // union precisely so a forged value has a discriminant to be refused by, and
+  // that refusal lands BEFORE URL validation, before the runtime probe, and
+  // therefore before any DNS, network or subprocess work. Tests exercise both
+  // refusals through explicit test-only casts.
   if (
     checkedPlan.data.operation === "merge-split" ||
     checkedPlan.data.operation === "clear-hls-remux"

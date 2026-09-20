@@ -32,6 +32,7 @@ import {
   type GenericSplitExecutionPlan,
 } from "./format-plan.ts";
 import { workspaceFootprintForPlan } from "./workspace-capacity.ts";
+import type { downloadGenericOriginal } from "./ytdlp-download.server.ts";
 import { VideoMetadataSchema, type WorkerVideoMetadata } from "@/shared/worker/contracts";
 
 /**
@@ -454,7 +455,42 @@ describe("HLS-6 derivation: the exact rung, or nothing", () => {
 // D. TYPE PARTITIONS (§11)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * CORRECTION-01: the plan parameter of the EXPORTED progressive downloader, read
+ * off the function itself rather than restated.
+ *
+ * Taking it from `Parameters<typeof downloadGenericOriginal>[2]` is the whole
+ * point: widening that signature back to `GenericExecutionPlan` changes this
+ * type, and the three assertions below then fail `tsc`. A test that named the
+ * partition type directly would keep passing while the real boundary was open.
+ */
+type ProgressiveDownloadPlan = Parameters<typeof downloadGenericOriginal>[2];
+
+/** `false` unless the plan family is assignable to that parameter. */
+type HlsFitsProgressiveDownloader =
+  ClearHlsExecutionPlan extends ProgressiveDownloadPlan ? true : false;
+type SplitFitsProgressiveDownloader =
+  GenericSplitExecutionPlan extends ProgressiveDownloadPlan ? true : false;
+type SingleFitsProgressiveDownloader =
+  GenericSingleSourceExecutionPlan extends ProgressiveDownloadPlan ? true : false;
+
+// THE COMPILE-TIME BOUNDARY. Each annotation is checked by `tsc`, so these three
+// lines fail the typecheck — not merely an assertion — the moment the exported
+// downloader readmits a plan family it must not accept.
+const hlsRejectedByDownloader: false = false as HlsFitsProgressiveDownloader;
+const splitRejectedByDownloader: false = false as SplitFitsProgressiveDownloader;
+const singleAcceptedByDownloader: true = true as SingleFitsProgressiveDownloader;
+
 describe("HLS-6 partitions: three disjoint plan families", () => {
+  it("keeps an HLS plan out of the EXPORTED progressive downloader, at compile time", () => {
+    // The real assertions are the three annotations above, which `tsc` checks.
+    // These runtime reads exist so the case appears in the suite and so the
+    // constants cannot be deleted as unused.
+    assert.equal(hlsRejectedByDownloader, false, "an HLS plan must not fit the yt-dlp downloader");
+    assert.equal(splitRejectedByDownloader, false, "a split plan must not fit it either");
+    assert.equal(singleAcceptedByDownloader, true, "the single-source partition must still fit");
+  });
+
   it("keeps an HLS plan out of the single-source yt-dlp partition", () => {
     // A compile-time statement, asserted here so the intent is visible in the
     // suite too: if `GenericSingleSourceExecutionPlan` ever readmitted

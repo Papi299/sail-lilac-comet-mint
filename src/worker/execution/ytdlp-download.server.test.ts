@@ -35,7 +35,7 @@ import {
   outputTemplateFor,
 } from "./ytdlp-download.server.ts";
 import { YTDLP_RUNTIME, type YtdlpRuntimeStatus } from "../runtime/ytdlp-runtime.server.ts";
-import { GenericExecutionPlanSchema } from "./format-plan.ts";
+import { GenericExecutionPlanSchema, deriveClearHlsExecutionPlan } from "./format-plan.ts";
 import type {
   GenericExecutionPlan,
   GenericSingleSourceExecutionPlan,
@@ -2075,11 +2075,18 @@ describe("generic download: a split plan is refused, never half-honoured (SPLIT-
     // Acquiring only the video half would hand the executor a silently
     // audio-less artifact — a substitution the user never asked for. The
     // primitive refuses the whole plan instead.
+    //
+    // CORRECTION-01: the parameter is `GenericSingleSourceExecutionPlan`, so a
+    // legitimate TypeScript caller cannot write this call at all — proved
+    // separately as a compile-time assertion. The cast below is deliberate and
+    // test-only: what this case exercises is the RUNTIME defence against a
+    // value that reached the boundary anyway (a JavaScript caller, a cast, or a
+    // stale compiled caller).
     const { runner, calls } = forbiddenRunner();
     let probed = 0;
     await assert.rejects(
       () =>
-        downloadGenericOriginal(SAFE_URL, workDir, SPLIT_PLAN, {
+        downloadGenericOriginal(SAFE_URL, workDir, SPLIT_PLAN as unknown as GenericSingleSourceExecutionPlan, {
           ...baseDeps({ runner }),
           probeRuntime: async () => {
             probed += 1;
@@ -2091,5 +2098,90 @@ describe("generic download: a split plan is refused, never half-honoured (SPLIT-
     assert.equal(calls.length, 0, "no acquisition subprocess");
     assert.equal(probed, 0, "not even the version probe may run");
     assert.deepEqual(readdirSync(workDir), [], "no artifact and no side file");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HLS-6 CORRECTION-01: this primitive is yt-dlp's, and refuses a clear-HLS plan
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("generic download: a clear-HLS plan is refused (HLS-6)", () => {
+  const HLS_PLAN = deriveClearHlsExecutionPlan(
+    {
+      "preset:1080": Object.freeze({
+        playlistUrl: "https://media.example.invalid/hls/1080/media.m3u8?sig=VERY_PRIVATE_HLS_TOKEN",
+        height: 1080,
+      }),
+    },
+    "preset:1080",
+  );
+
+  it("the plan is well-formed, so the refusal is attributable to the OPERATION", () => {
+    // The positive control, exactly as for the split case: whatever the next
+    // case rejects, it is not rejecting a malformed object.
+    assert.equal(GenericExecutionPlanSchema.safeParse(HLS_PLAN).success, true);
+    assert.equal(HLS_PLAN.operation, "clear-hls-remux");
+  });
+
+  it("FORMAT_UNAVAILABLE, and NOTHING is spawned", async () => {
+    // A clear-HLS plan names a media PLAYLIST, not a media file: no
+    // `source.container`, no declared size, no yt-dlp format selector. There is
+    // nothing for this primitive to acquire even in principle.
+    //
+    // The cast is deliberate and test-only. A legitimate TypeScript caller
+    // cannot write this call — the parameter is
+    // `GenericSingleSourceExecutionPlan`, pinned by a compile-time assertion in
+    // `hls-execution-plan.test.ts`. What is under test here is the RUNTIME
+    // defence for a value that arrived untyped anyway.
+    const { runner, calls } = forbiddenRunner();
+    let probed = 0;
+    let urlsValidated = 0;
+    await assert.rejects(
+      () =>
+        downloadGenericOriginal(
+          SAFE_URL,
+          workDir,
+          HLS_PLAN as unknown as GenericSingleSourceExecutionPlan,
+          {
+            ...baseDeps({ runner }),
+            validateUrl: async (raw: string) => {
+              urlsValidated += 1;
+              return { url: raw, hostname: "example.invalid" };
+            },
+            probeRuntime: async () => {
+              probed += 1;
+              return OK_RUNTIME;
+            },
+          },
+        ),
+      (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
+    );
+    assert.equal(calls.length, 0, "no acquisition subprocess");
+    assert.equal(probed, 0, "not even the version probe may run");
+    // The refusal lands BEFORE the URL is validated, so no DNS or network work
+    // is attributable to it either.
+    assert.equal(urlsValidated, 0, "no destination resolution may run");
+    assert.deepEqual(readdirSync(workDir), [], "no artifact and no side file");
+  });
+
+  it("puts no playlist URL in the refusal it actually throws", async () => {
+    const { runner } = forbiddenRunner();
+    let thrown: unknown;
+    try {
+      await downloadGenericOriginal(
+        SAFE_URL,
+        workDir,
+        HLS_PLAN as unknown as GenericSingleSourceExecutionPlan,
+        baseDeps({ runner }),
+      );
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown instanceof AppError, "the refusal must be an AppError");
+    assert.equal(thrown.code, "FORMAT_UNAVAILABLE");
+    const text = `${thrown.message}\n${thrown.stack ?? ""}\n${JSON.stringify(thrown, Object.getOwnPropertyNames(thrown))}`;
+    assert.equal(text.includes("VERY_PRIVATE_HLS_TOKEN"), false, "no signed token");
+    assert.equal(text.includes("media.example.invalid"), false, "no playlist host");
+    assert.equal(text.includes("m3u8"), false, "no playlist reference");
   });
 });
