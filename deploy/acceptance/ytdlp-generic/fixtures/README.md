@@ -273,11 +273,14 @@ BYTE_LIMIT_TOTAL_BYTES          reference + headroom    = 4,563,402,752   4.25 G
 
 The **reference** mirrors the current Product default
 (`DEFAULT_MAX_FILE_SIZE_BYTES` in `src/shared/media-limits.ts`). The
-**headroom** is bounded observation margin: the Production actual-byte monitor
-polls every 150 ms, so a transfer does not stop at the exact threshold byte but
-at the first poll after it, and 256 MiB is enough room for that poll to land
-while the fixture is still serving. A larger margin would only make a runaway
-transfer more expensive without making the assertion any stronger.
+**headroom** is a bounded *practical* observation margin. Some post-threshold
+room is necessary because the Production actual-byte monitor polls every 150 ms,
+so a transfer does not stop at the exact threshold byte but at the first poll
+after it. 256 MiB is not a mathematical guarantee derived from 150 ms alone —
+how many bytes arrive within a polling interval depends on actual throughput —
+but it is comfortably sufficient at ordinary public-tunnel throughput, while a
+larger margin would only make a runaway transfer more expensive without making
+the assertion any stronger.
 
 It is a **ceiling, not an allocation**, and nothing here is proportional to it:
 the body is the real MP4 followed by one reused 64 KiB block written with
@@ -294,9 +297,11 @@ against this constant, because a deployment may legitimately override the limit
 in either direction. See "Advertising the ceiling" below.
 
 > `YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001` (runbook §11) is the correction
-> this section describes. The ledger row stays **OPEN** until it is
-> independently reviewed and merged, and **no live 4 GiB threshold acceptance
-> has been performed** with this ceiling.
+> this section describes. The implementation was independently reviewed and
+> merged in **PR #75**, and the ledger row is now **CLOSED**.
+>
+> That closes the fixture/harness drift only. **No live 4 GiB threshold
+> acceptance has been performed** with this ceiling.
 
 **Historical — why this was 528 MiB.** The ceiling was chosen, with a
 deliberately small margin, when Production's effective `MAX_FILE_SIZE` was the
