@@ -790,26 +790,62 @@ describe("clear-HLS playlist parser: the module is inert", () => {
 
   it("is reachable from no production module", () => {
     // HLS stays dormant: the parser exists, and nothing in the shipping graph
-    // can call it. Its only importers are its dormant siblings in
-    // `src/worker/hls/` (HLS-2 onwards), so the rule is held by that directory
-    // as a SET: no production module outside it may name ANY module in it. The
-    // later atomic activation task is what changes this.
+    // can call it. Its importers are its dormant siblings in `src/worker/hls/`
+    // (HLS-2 onwards), so the rule is held by that directory as a SET: no
+    // production module outside it may name ANY module in it. The later atomic
+    // activation task is what changes this.
+    //
+    // ONE narrow exception, added by HLS-5. `hls-source-selection` is the
+    // dormant channel's SOURCE end, not part of its execution capability: it
+    // is a pure vocabulary that turns one already-parsed yt-dlp format into a
+    // private media-playlist URL on an application-owned preset rung. It holds
+    // no acquisition, no processing, no I/O and no HLS import of its own, so
+    // naming it cannot make HLS reachable. Analysis MUST name it — that is the
+    // provenance HLS-6 will consume — and the allowlist below is exact, so a
+    // future edit that let any other module (or any other HLS module) into the
+    // shipping graph still fails here.
     const hlsDir = dirname(MODULE_PATH);
     const dormantModules = readdirSync(hlsDir)
       .filter((name) => /\.ts$/.test(name) && !/\.test\.ts$/.test(name))
       .map((name) => name.replace(/\.ts$/, ""));
     assert.ok(dormantModules.includes("hls-media-playlist"));
+    assert.ok(dormantModules.includes("hls-source-selection"));
+
+    /** The only production modules permitted to name the HLS-5 vocabulary. */
+    const SELECTION_IMPORTERS = new Set([
+      "src/worker/analysis/ytdlp-analysis.server.ts",
+      "src/worker/analysis/media-analyzer.server.ts",
+    ]);
+
     for (const file of productionSourceFiles()) {
       if (dirname(file) === hlsDir) continue;
+      const rel = relative(ROOT, file).split("\\").join("/");
       const source = readFileSync(file, "utf8");
       for (const stem of dormantModules) {
+        if (stem === "hls-source-selection" && SELECTION_IMPORTERS.has(rel)) continue;
         assert.equal(
           source.includes(stem),
           false,
-          `${relative(ROOT, file)} must not import the dormant HLS module ${stem}`,
+          `${rel} must not import the dormant HLS module ${stem}`,
         );
       }
     }
+
+    // The exception is not a loophole: neither allowed importer may reach any
+    // HLS EXECUTION primitive, and the router's edge is type-only, so only the
+    // analyzer has a runtime dependency on the HLS directory at all.
+    for (const rel of SELECTION_IMPORTERS) {
+      const source = readFileSync(join(ROOT, rel), "utf8");
+      for (const stem of dormantModules) {
+        if (stem === "hls-source-selection") continue;
+        assert.equal(source.includes(stem), false, `${rel} must not name ${stem}`);
+      }
+    }
+    assert.match(
+      readFileSync(join(ROOT, "src/worker/analysis/media-analyzer.server.ts"), "utf8"),
+      /import type \{ ClearHlsMediaPlaylistSelections \} from "\.\.\/hls\/hls-source-selection\.ts";/,
+      "the router's HLS edge must be type-only",
+    );
   });
 
   it("lives in a Worker-private location, not a shared or browser one", () => {

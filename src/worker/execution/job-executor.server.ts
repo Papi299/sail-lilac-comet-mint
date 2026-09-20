@@ -221,12 +221,20 @@ export type JobExecutorDeps = {
   genericLimits?: GenericDownloadLimits;
 };
 
-/** Wraps a direct-only analyzer as a direct `ExecutionAnalysis`. */
+/**
+ * Wraps a direct-only analyzer as a direct `ExecutionAnalysis`.
+ *
+ * Both private maps are empty literals. The executor names no HLS module at
+ * all — it does not import the HLS-5 selection type, does not read
+ * `hlsSelections`, and has no HLS branch — so the dormant channel stays
+ * entirely upstream of it (HLS-6 is what changes that).
+ */
 function asDirectExecutionAnalysis(fn: AnalyzeDirectMediaFn): AnalyzeForExecutionFn {
   return async (url, signal) => ({
     strategy: "direct",
     video: await fn(url, signal),
     selections: {},
+    hlsSelections: {},
   });
 }
 

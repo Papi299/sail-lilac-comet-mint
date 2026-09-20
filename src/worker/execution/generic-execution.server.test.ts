@@ -117,7 +117,9 @@ function genericAnalysis(
   presets: PresetSpec[],
   selections: GenericSourceSelections,
 ): ExecutionAnalysis {
-  return { strategy: "yt-dlp", video: genericMeta(presets), selections };
+  // HLS-5: the executor never reads this map, so every generic fixture here
+  // states it empty. `generic-execution` is a dormancy witness for that.
+  return { strategy: "yt-dlp", video: genericMeta(presets), selections, hlsSelections: {} };
 }
 
 type Harness = {
@@ -521,6 +523,7 @@ describe("generic job: strategy authority (§17/§42)", () => {
           capabilities: { mp3: false, merge: false },
         }),
         selections: {},
+        hlsSelections: {},
       }),
       downloadOriginal: async (_url, ctx) => {
         directCalls += 1;
@@ -1278,7 +1281,7 @@ describe("generic job: unknown-audio progressive video (GENERIC-UNKNOWN-AUDIO-VI
   /** The executor's analysis seam: the REAL internal analyzer over a canned yt-dlp document. */
   function realAnalysis(stdout: string, ffmpegAvailable = true): JobExecutorDeps["analyzeForExecution"] {
     return async (url, signal) => {
-      const { video, selections } = await analyzeGenericMediaInternal(url, {
+      const { video, selections, hlsSelections } = await analyzeGenericMediaInternal(url, {
         limits: { analysisTimeoutSeconds: 45, maxVideoDurationSeconds: 7200, maxFileSizeBytes: MAX },
         ffmpegAvailable,
         runner: async () => ({ code: 0, stdout, stderr: "" }),
@@ -1286,7 +1289,7 @@ describe("generic job: unknown-audio progressive video (GENERIC-UNKNOWN-AUDIO-VI
         validateUrl: async (raw: string) => ({ url: raw, hostname: "example.invalid" }),
         ...(signal ? { signal } : {}),
       });
-      return { strategy: "yt-dlp", video, selections };
+      return { strategy: "yt-dlp", video, selections, hlsSelections };
     };
   }
 
@@ -1402,6 +1405,69 @@ describe("generic job: unknown-audio progressive video (GENERIC-UNKNOWN-AUDIO-VI
     // The private upstream id never became durable.
     const row = JSON.stringify(h.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(job.jobId));
     assert.equal(row.includes("synthetic-prog"), false);
+  });
+
+  /**
+   * HLS-5: the same real traversal, with a clear-HLS rendition present.
+   *
+   * The analyzer now builds a private media-playlist selection for it, so this
+   * is the end-to-end proof that the selection goes NOWHERE — not into the
+   * durable row, not into an object key, not into the delivered metadata, not
+   * into the acquisition argv — while the progressive job is unaffected and
+   * still reaches `ready`.
+   */
+  it("HLS-5: a private HLS playlist URL reaches no durable row, object key or argv", async () => {
+    const TOKEN = "VERY_PRIVATE_HLS_TOKEN";
+    const hlsRendition = {
+      format_id: "synthetic-hls-1080",
+      ext: "mp4",
+      video_ext: "mp4",
+      height: 1080,
+      width: 1920,
+      protocol: "m3u8_native",
+      vcodec: "avc1.640028",
+      acodec: "mp4a.40.2",
+      url: `https://media.example.invalid/hls/1080/media.m3u8?sig=${TOKEN}`,
+    };
+
+    const job = claimJob(h.store, "preset:360");
+    const record: AcquisitionRecord = { argvs: [], plans: [] };
+    const counters = { ffmpeg: 0, merge: 0, split: 0, direct: 0 };
+    const { writer, bodies } = recordingWriter();
+
+    const deps: JobExecutorDeps = {
+      analyzeForExecution: realAnalysis(doc(undefined, [hlsRendition])),
+      genericLimits: DOWNLOAD_LIMITS,
+      downloadGeneric: realAcquisition(record, "write-silent-mp4"),
+      ...forbiddenSeams(counters),
+    };
+    await new JobExecutor(h.store, writer, () => Date.now(), new Map(), deps).execute(job);
+
+    // The progressive job is entirely unaffected by the dormant HLS rendition.
+    const final = h.store.getJob(job.jobId);
+    assert.equal(final?.status, "ready", `got ${final?.status}/${final?.errorCode}`);
+    assert.equal(record.argvs.length, 1, "still exactly one progressive acquisition");
+    assert.ok(record.argvs[0]!.includes(UNKNOWN_SELECTOR), "the same approved source");
+    assert.deepEqual(counters, { ffmpeg: 0, merge: 0, split: 0, direct: 0 });
+    assert.deepEqual(bodies[0], SILENT_MP4);
+
+    // The sentinel reached none of the durable or outward surfaces.
+    const row = JSON.stringify(h.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(job.jobId));
+    assert.equal(row.includes(TOKEN), false, "the playlist URL became durable state");
+    assert.equal(row.includes("m3u8"), false);
+    assert.equal(row.includes("synthetic-hls"), false);
+
+    assert.equal(h.puts.length, 1);
+    const put = h.puts[0]!;
+    assert.equal(put.objectKey.includes(TOKEN), false, "the playlist URL became an object key");
+    assert.equal(put.objectKey.includes("m3u8"), false);
+    assert.equal(put.contentDisposition.includes(TOKEN), false);
+    assert.equal(JSON.stringify(final).includes(TOKEN), false, "it reached the job view");
+
+    // Nor the acquisition command line, which is built from the progressive
+    // selection alone and never from an upstream URL.
+    assert.equal(JSON.stringify(record.argvs).includes(TOKEN), false);
+    assert.equal(JSON.stringify(record.plans).includes(TOKEN), false);
   });
 
   it("re-analysis UNKNOWN -> PRESENT at job time: the proven source is acquired with the STRICT selector", async () => {

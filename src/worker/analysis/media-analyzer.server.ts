@@ -4,6 +4,14 @@ import type {
   WorkerVideoMetadata,
 } from "../../shared/worker/contracts.ts";
 import type { GenericSourceSelections } from "../execution/generic-source.ts";
+/**
+ * TYPE-ONLY, deliberately. HLS-5's private selection map has to be NAMED in
+ * `ExecutionAnalysis`, but this router must acquire no runtime dependency on
+ * the dormant HLS directory: the edge disappears entirely at build time, so
+ * nothing here can call into HLS, and the direct path's empty map is an
+ * ordinary literal rather than an imported constant.
+ */
+import type { ClearHlsMediaPlaylistSelections } from "../hls/hls-source-selection.ts";
 import { analyzeDirectMedia } from "../execution/direct-media.server.ts";
 import {
   analyzeGenericMedia,
@@ -265,11 +273,24 @@ export async function analyzeMedia(
  * the one raw upstream `format_id` per advertised preset. It must never cross
  * Worker HTTP, enter `WorkerVideoMetadata`, enter SQLite, reach Vercel or the
  * browser, be logged, or appear in an error message (§9).
+ *
+ * `hlsSelections` (HLS-5) is the second private map and is populated only on
+ * the generic path too. It carries the exact clear-HLS media-playlist URL for
+ * one rendition per would-be video rung, which is SENSITIVE — signed query
+ * parameters and expiring tokens — and is subject to every restriction above
+ * plus one more: it may not be PERSISTED or reused across attempts. The URL
+ * belongs to THIS fresh analysis. A restart or retry must obtain a new one.
+ *
+ * It is a shadow channel. A key in it is not a capability: HLS is not
+ * downloadable, no execution plan can express it, and the public rendition
+ * inventory still reports HLS as `unsupported_protocol`. HLS-6 is what begins
+ * to consume it.
  */
 export type ExecutionAnalysis = {
   readonly strategy: WorkerExtractorStrategy;
   readonly video: WorkerVideoMetadata;
   readonly selections: GenericSourceSelections;
+  readonly hlsSelections: ClearHlsMediaPlaylistSelections;
 };
 
 /** The internal generic analyzer, injectable exactly like the public one. */
@@ -283,6 +304,7 @@ export type GenericExecutionAnalyzeFn = (
 ) => Promise<{
   readonly video: WorkerVideoMetadata;
   readonly selections: GenericSourceSelections;
+  readonly hlsSelections: ClearHlsMediaPlaylistSelections;
 }>;
 
 export type ExecutionAnalyzerOptions = Omit<MediaAnalyzerOptions, "analyzeGeneric"> & {
@@ -321,12 +343,15 @@ export async function analyzeForExecution(
 
   if (routed.strategy === "direct") {
     // Direct advertises concrete formats and needs no private selection map.
-    return { strategy: "direct", video: routed.video, selections: {} };
+    // It has no HLS shadow channel either: direct media is one already-known
+    // file location, so there is no rendition ladder to shadow.
+    return { strategy: "direct", video: routed.video, selections: {}, hlsSelections: {} };
   }
   return {
     strategy: "yt-dlp",
     video: routed.generic.video,
     selections: routed.generic.selections,
+    hlsSelections: routed.generic.hlsSelections,
   };
 }
 

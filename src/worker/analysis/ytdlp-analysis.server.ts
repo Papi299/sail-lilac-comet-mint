@@ -33,6 +33,13 @@ import {
   type GenericVideoConstraint,
 } from "../execution/generic-source.ts";
 import {
+  acceptClearHlsPlaylistUrl,
+  buildClearHlsMediaPlaylistSelections,
+  isClearHlsShadowProtocol,
+  type ClearHlsMediaPlaylistSelections,
+  type ClearHlsShadowCandidate,
+} from "../hls/hls-source-selection.ts";
+import {
   YTDLP_PROBE_TIMEOUT_MS,
   YTDLP_RUNTIME,
   buildYtdlpEnvironment,
@@ -449,6 +456,32 @@ const RawFormatSchema = z.object({
    * value a surviving format carries.
    */
   has_drm: z.unknown().optional(),
+  /**
+   * The raw per-format media location (HLS-5).
+   *
+   * SENSITIVE and PRIVATE. For an `m3u8_native` rendition this is the media
+   * playlist the extractor selected, routinely carrying a signed query string,
+   * an expiring token and opaque CDN identity. It exists here for exactly one
+   * purpose: clear-HLS acquisition cannot re-run yt-dlp as its downloader, so
+   * the exact playlist location is the only provenance HLS-6 can act on.
+   *
+   * It is emphatically NOT read on the progressive path, which keeps its
+   * existing behaviour of re-selecting the source through a validated
+   * application-owned yt-dlp selector rather than trusting an upstream URL.
+   *
+   * Declared as `unknown` for the same reason as `has_drm`: before this field
+   * was read Zod stripped it, and one rendition's junk `url` — a number, an
+   * object, anything — must not make an otherwise valid document invalid. A
+   * bad value means "this HLS shadow candidate does not exist", never "the
+   * whole analysis fails". `acceptClearHlsPlaylistUrl` is the only reader, and
+   * it establishes the string type itself.
+   *
+   * Governing rule, narrower than the one for `format_id`: this value may exist
+   * only inside the private HLS selection map of ONE execution analysis. It is
+   * never browser-facing, never durable, never logged, never interpolated into
+   * an error, and never re-read from a previous attempt.
+   */
+  url: z.unknown().optional(),
 });
 type RawFormat = z.infer<typeof RawFormatSchema>;
 
@@ -812,6 +845,23 @@ function isNonMediaNote(raw: RawFormat): boolean {
 }
 
 /**
+ * The ONE size-precedence rule: a declared positive size, else a positive
+ * estimate, else unknown. Extracted so the progressive gate and the HLS shadow
+ * gate cannot drift onto different readings of the same two fields.
+ *
+ * `null` means UNKNOWN, never zero and never "no limit". Metadata size is not
+ * a security boundary in either path: the byte ceilings that matter are
+ * enforced during acquisition.
+ */
+function knownFileSize(raw: RawFormat): number | null {
+  if (typeof raw.filesize === "number" && raw.filesize > 0) return raw.filesize;
+  if (typeof raw.filesize_approx === "number" && raw.filesize_approx > 0) {
+    return raw.filesize_approx;
+  }
+  return null;
+}
+
+/**
  * Judges ONE raw format against every eligibility gate of `selectCandidates`,
  * in order, returning the approved candidate or the first gate that refused it.
  */
@@ -923,12 +973,7 @@ function evaluateRawFormat(
   // A known size already over the limit must not be advertised. An UNKNOWN
   // size is not a rejection: the download path enforces an actual byte limit
   // independently, and metadata size is not a security boundary.
-  const fileSize =
-    typeof raw.filesize === "number" && raw.filesize > 0
-      ? raw.filesize
-      : typeof raw.filesize_approx === "number" && raw.filesize_approx > 0
-        ? raw.filesize_approx
-        : null;
+  const fileSize = knownFileSize(raw);
   if (fileSize !== null && fileSize > limits.maxFileSizeBytes) return reject("size-over-limit");
 
   return {
@@ -1990,12 +2035,96 @@ function withheldReasonFor(cause: WithheldCause): SourceQualityWithheldReason {
   }
 }
 
+// ── Clear-HLS shadow admission (HLS-5) ───────────────────────────────────────
+
+/**
+ * Judges ONE raw format for the PRIVATE clear-HLS v1 shadow channel.
+ *
+ * This runs entirely beside the progressive path and changes nothing about it.
+ * An HLS format is still refused by `evaluateRawFormat` as
+ * `protocol-unsupported` and still reaches the public source-quality summary
+ * as `unsupported_protocol`. The apparent contradiction is the point of HLS-5:
+ * a private shadow selection may exist while the public capability still says
+ * HLS is not downloadable, because the private half is future execution
+ * provenance and the public half is current Product truth.
+ *
+ * The gates, in order, and every one of them conservative:
+ *
+ *   PROTOCOL   exactly `m3u8_native`. See `CLEAR_HLS_V1_SHADOW_PROTOCOL`.
+ *
+ *   VIDEO      established by the SAME evidence standard analysis already
+ *              applies to every rendition (`observeVideoRendition`): a named
+ *              `vcodec`, or — when the codec identity is unknown — coherent
+ *              `video_ext`/`ext` shape in a known video container. A format
+ *              with video PROVEN absent is not a candidate, and storyboards,
+ *              preview images, subtitle rows and other non-media observations
+ *              are excluded by that same function. No video presence is
+ *              invented here.
+ *
+ *              One gate is applied ON TOP of the observation standard: a named
+ *              `vcodec` alongside `video_ext: "none"` is a self-contradiction —
+ *              one field says the stream exists, the other says the normalized
+ *              shape has no video part — and the acquisition evaluator already
+ *              refuses it outright rather than preferring either side. The
+ *              inventory tolerates it because its job is to COUNT what was
+ *              seen; a shadow selection is a statement about what could be
+ *              acquired, so it fails closed here too.
+ *
+ *   AUDIO      PROVEN present: `classifyCodecState(acodec) === "present"`.
+ *              Unknown is not enough and absent is not enough. HLS v1 has no
+ *              audio pairing, and HLS-4's approved local media shape is
+ *              exactly one video plus exactly one audio — so a rendition whose
+ *              audio nothing establishes has no viable path through the rest
+ *              of the chain. This is a metadata screen, not a claim that
+ *              metadata proves segment stream shape; HLS-2 and HLS-4 remain
+ *              the semantic authorities at their own boundaries.
+ *
+ *   SIZE       a KNOWN size already over the ceiling is not shadow-selected.
+ *              Unknown size stays permissible because HLS-3 enforces actual
+ *              bytes, and metadata size is not a security boundary.
+ *
+ *   URL        statically accepted and bounded by `acceptClearHlsPlaylistUrl`.
+ *              No DNS, no request, no redirect, no manifest read.
+ *
+ * Any failed gate returns `null`, meaning simply "there is no HLS shadow
+ * candidate here". It is never an analysis failure: ordinary metadata for this
+ * document stays available regardless of how bad one dormant rendition's
+ * private provenance is.
+ */
+function clearHlsShadowCandidate(
+  raw: RawFormat,
+  index: number,
+  limits: { readonly maxFileSizeBytes: number },
+): ClearHlsShadowCandidate | null {
+  if (!isClearHlsShadowProtocol(raw.protocol)) return null;
+
+  const observed = observeVideoRendition(raw, index);
+  if (observed === null) return null;
+  if (observed.videoEvidence === "codec" && normalizeExtField(raw.video_ext) === "none") {
+    return null;
+  }
+  if (observed.audio !== "present") return null;
+
+  const size = knownFileSize(raw);
+  if (size !== null && size > limits.maxFileSizeBytes) return null;
+
+  const playlistUrl = acceptClearHlsPlaylistUrl(raw.url);
+  if (playlistUrl === null) return null;
+
+  return { playlistUrl, height: observed.height, index };
+}
+
 /**
  * The generic eligibility → construction → inventory pass for ONE document.
  *
  * Pure, and exactly what `analyzeGenericMediaInternal` runs: the presets and
  * selections are those `buildGenericPresets` would produce from the same
  * formats, and the inventory is read off that same construction.
+ *
+ * `hlsSelections` is the HLS-5 PRIVATE shadow channel, computed in the same
+ * pass and touching nothing above: it is not consulted by eligibility, by
+ * preset construction, or by the inventory, and none of those is consulted by
+ * it. Removing it would leave every other value here bit-for-bit identical.
  */
 export function analyzeGenericFormats(
   formats: readonly RawFormat[],
@@ -2009,6 +2138,7 @@ export function analyzeGenericFormats(
   readonly candidates: readonly Candidate[];
   readonly build: GenericPresetBuild;
   readonly inventory: RenditionInventory;
+  readonly hlsSelections: ClearHlsMediaPlaylistSelections;
 } {
   const evaluations = evaluateRawFormats(formats, opts);
   const candidates = acceptedCandidates(evaluations);
@@ -2016,7 +2146,11 @@ export function analyzeGenericFormats(
   const hasProvenAudioOnly = candidates.some(isSplitAudioCandidate);
 
   const renditions: InventoriedRendition[] = [];
+  const hlsCandidates: ClearHlsShadowCandidate[] = [];
   formats.forEach((raw, index) => {
+    const hls = clearHlsShadowCandidate(raw, index, opts);
+    if (hls !== null) hlsCandidates.push(hls);
+
     const observed = observeVideoRendition(raw, index);
     if (observed === null) return;
     renditions.push({
@@ -2033,6 +2167,9 @@ export function analyzeGenericFormats(
       protectedUnenumerated: opts.protectionSignal === true,
       maybeProtectedObserved: formats.some((raw) => raw.has_drm === "maybe"),
     },
+    // The SAME rung boundaries the public video presets are built from, passed
+    // rather than restated, so the two ladders cannot drift apart.
+    hlsSelections: buildClearHlsMediaPlaylistSelections(hlsCandidates, RESOLUTION_STEPS),
   };
 }
 
@@ -2204,13 +2341,23 @@ export type GenericAnalysisDeps = {
  * half: one validated source descriptor per advertised preset, each carrying
  * the raw upstream `format_id` the Worker approved.
  *
+ * `hlsSelections` (HLS-5) is a SECOND, separate private channel: the exact
+ * media-playlist URL of one clear-HLS rendition per would-be video rung. It is
+ * deliberately not merged into `selections`, because a key there means "this
+ * preset is advertised and acquirable now", while a key here means only "if
+ * HLS were downloadable, this is where that rung would come from". HLS is not
+ * downloadable, so the two maps must not be confusable.
+ *
  * This type is returned by `analyzeGenericMediaInternal` and by nothing else.
- * `selections` must never cross Worker HTTP, enter `WorkerVideoMetadata`, enter
- * SQLite, reach Vercel or the browser, be logged, or appear in an error.
+ * Neither private map may cross Worker HTTP, enter `WorkerVideoMetadata`, enter
+ * SQLite, reach Vercel or the browser, be logged, or appear in an error — and
+ * `hlsSelections` additionally may not be persisted or reused across attempts,
+ * because a signed playlist URL expires.
  */
 export type GenericInternalAnalysis = {
   readonly video: WorkerVideoMetadata;
   readonly selections: GenericSourceSelections;
+  readonly hlsSelections: ClearHlsMediaPlaylistSelections;
 };
 
 /**
@@ -2356,7 +2503,7 @@ export async function analyzeGenericMediaInternal(
   // Eligibility, preset construction and the rendition inventory, in one pass:
   // the presets and selections are exactly what `selectCandidates` +
   // `buildGenericPresets` produce, and the inventory only reads that result.
-  const { candidates, build, inventory } = analyzeGenericFormats(info.formats ?? [], {
+  const { candidates, build, inventory, hlsSelections } = analyzeGenericFormats(info.formats ?? [], {
     ffmpegAvailable,
     // The per-format size gate, and the PAIR-level combined-size budget
     // (§13/§16) — one ceiling for both.
@@ -2423,7 +2570,11 @@ export async function analyzeGenericMediaInternal(
     sourceQuality: summarizeSourceQuality(inventory),
   });
 
-  return { video, selections };
+  // `video` was built by `VideoMetadataSchema.parse`, whose closed schema has
+  // no place for either private map, so the public half cannot carry one even
+  // by accident. The two private maps ride beside it and go no further than
+  // the execution analysis that requested them.
+  return { video, selections, hlsSelections };
 }
 
 /**

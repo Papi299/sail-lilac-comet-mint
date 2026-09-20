@@ -139,6 +139,9 @@ function splitAnalysis(target: SplitTarget, ids?: PairIds): ExecutionAnalysis {
     strategy: "yt-dlp",
     video: presetMeta({ id: shape.preset, container: target, hasVideo: true }),
     selections: { [shape.preset]: splitSource(target, ids) },
+    // HLS-5: no execution path reads this map, so every fixture here states
+    // it empty. These suites are dormancy witnesses for that.
+    hlsSelections: {},
   };
 }
 
@@ -165,6 +168,7 @@ function singleAnalysis(presetId: SinglePreset): ExecutionAnalysis {
         },
       }),
     },
+    hlsSelections: {},
   };
 }
 
@@ -199,6 +203,7 @@ function directAnalysis(): ExecutionAnalysis {
       capabilities: { mp3: false, merge: false },
     }),
     selections: {},
+    hlsSelections: {},
   };
 }
 
