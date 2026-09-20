@@ -144,8 +144,8 @@ export type ClearHlsAcquiredTs = {
  *
  * Authority is `completedFragments / fragmentCount`, with ONE reservation: the
  * terminal 100 is not emitted when the last fragment's bytes land, but only
- * once the aggregate artifact has been finalized and verified and the
- * acquisition is about to return it. A caller that sees 100 has a finished
+ * once the aggregate artifact has been finalized, verified and COMMITTED and
+ * the acquisition is about to return it. A caller that sees 100 has a finished
  * file; an acquisition that fails never reports 100. Byte totals are NOT
  * inferred: a clear-VOD playlist declares durations, not sizes, so the total
  * transfer size is genuinely unknown until the last fragment ends. `totalBytes`
@@ -529,7 +529,7 @@ async function transferFragments(
   const ctx: FragmentContext = { handle, signal, budgetMs, aggregateLimit };
   let aggregateBytes = 0;
   let completed = 0;
-  report(onProgress, completed, aggregateBytes, plan.fragmentCount);
+  reportSafely(onProgress, completed, aggregateBytes, plan.fragmentCount);
   for (const fragment of plan.fragments) {
     // No next fragment begins once the operation has been stopped.
     signal.throwIfAborted();
@@ -540,7 +540,7 @@ async function transferFragments(
     // artifact, not to a transfer that still has to be verified, renamed and
     // re-verified. `acquireClearHlsTs` emits it once all of that has succeeded.
     if (completed < plan.fragmentCount) {
-      report(onProgress, completed, aggregateBytes, plan.fragmentCount);
+      reportSafely(onProgress, completed, aggregateBytes, plan.fragmentCount);
     }
   }
   return aggregateBytes;
@@ -548,23 +548,44 @@ async function transferFragments(
 
 /**
  * One truthful report. Never emitted for a fragment that did not complete, and
- * never at 100 for an acquisition that has not finalized its artifact.
+ * never at 100 for an acquisition that has not committed its artifact.
+ *
+ * Progress is an OBSERVATION channel, never transport authority. `onProgress`
+ * is caller-supplied synchronous code, and a caller-side defect in it must not
+ * decide whether media was acquired: a reporter that throws would otherwise
+ * abort a transfer that was going fine, or — worse, once 100 is reserved for a
+ * finalized artifact — delete an artifact that had already been verified and
+ * turn a reported success into a failure.
+ *
+ * So the exception is dropped WHOLE. It is not propagated, not attached as a
+ * cause, not logged, and not mapped onto the failure vocabulary: it is the
+ * caller's own error and its text could name anything, including a host or a
+ * path this module is forbidden to surface.
+ *
+ * This is not a cancellation channel either. A caller that wants to stop the
+ * acquisition aborts the `AbortSignal` it supplied; that still takes effect at
+ * the next stop boundary, and swallowing the reporter's exception neither
+ * swallows nor undoes it.
  */
-function report(
+function reportSafely(
   onProgress: ClearHlsAcquisitionRequest["onProgress"],
   completed: number,
   aggregateBytes: number,
   fragmentCount: number,
 ): void {
   if (onProgress === undefined) return;
-  onProgress({
-    progress: Math.min(100, Math.round((completed / fragmentCount) * 100)),
-    downloadedBytes: aggregateBytes,
-    totalBytes: null,
-    speed: null,
-    eta: null,
-    stage: "downloading",
-  });
+  try {
+    onProgress({
+      progress: Math.min(100, Math.round((completed / fragmentCount) * 100)),
+      downloadedBytes: aggregateBytes,
+      totalBytes: null,
+      speed: null,
+      eta: null,
+      stage: "downloading",
+    });
+  } catch {
+    // Best-effort observer output. The caller's exception is dropped whole.
+  }
 }
 
 // ── Budget and stop causes ───────────────────────────────────────────────────
@@ -641,7 +662,8 @@ function atFinalizationStep(step: FinalizationStep): Promise<void> | void {
  *   6. require the operation not to have been stopped;
  *   7. rename the partial onto the aggregate name and verify its size, with a
  *      stop gate after every one of those awaits;
- *   8. emit the terminal 100 report and return the artifact.
+ *   8. COMMIT — disarm the deadline and the caller-abort listener, build the
+ *      result, emit the terminal 100 report and return.
  *
  * On ANY failure before finalization the partial is removed, and on a failure
  * after finalization the aggregate is removed too: a failed call never leaves a
@@ -663,6 +685,16 @@ function atFinalizationStep(step: FinalizationStep): Promise<void> | void {
  * created — partial or final — is removed. The last gate is the last
  * asynchronous thing the function does; only the synchronous terminal report
  * and the frozen result follow it.
+ *
+ * That gate is also the COMMIT POINT. Past it the acquisition detaches from
+ * its stop sources and nothing can turn the finished artifact back into a
+ * failure — not a late abort, not an expired timer, and not the terminal
+ * progress callback, which is observer-only and whose exceptions are dropped.
+ * Between the commit point and the return there is no await, no filesystem
+ * operation, no network operation and nothing else that can fail. The
+ * invariant this buys is exact: an acquisition that rejects never reported
+ * 100, and a reported 100 always means a committed artifact that remains on
+ * disk.
  *
  * Unlike HLS-2, this function does not race its deadline against the work it
  * started: it owns an open file, and returning while the transfer loop was
@@ -704,6 +736,18 @@ export async function acquireClearHlsTs(
   const onCallerAbort = () => stop("cancelled");
   signal.addEventListener("abort", onCallerAbort, { once: true });
   const timer = setTimeout(() => stop("timeout"), budgetMs);
+
+  /**
+   * Detach this acquisition from everything that could still stop it.
+   *
+   * Idempotent on purpose: it runs once at the commit point and again in the
+   * `finally`, and both `clearTimeout` on a cleared timer and
+   * `removeEventListener` for a listener that is already gone are no-ops.
+   */
+  const disarmStopSources = () => {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", onCallerAbort);
+  };
 
   /**
    * Map anything thrown onto the closed vocabulary. The original error is
@@ -796,20 +840,40 @@ export async function acquireClearHlsTs(
     await atFinalizationStep("before-return");
     controller.signal.throwIfAborted();
 
-    // 100 means exactly one thing: the artifact was finalized and verified.
-    report(onProgress, plan.fragmentCount, aggregateBytes, plan.fragmentCount);
-    return Object.freeze({
+    // ── THE COMMIT POINT ────────────────────────────────────────────────────
+    //
+    // Everything that defines a successful acquisition has now happened: all
+    // fragment bytes were transferred, the source size was verified against
+    // the streamed counter, the partial was closed, the no-clobber check
+    // passed, the rename completed, the final artifact became this call's, its
+    // size was verified, and the final stop gate passed. From here the media
+    // acquisition is COMMITTED and nothing may undo it.
+    //
+    // So the acquisition detaches from its external stop sources first. A
+    // synchronous terminal report is post-commit code: a caller that aborts
+    // its signal from inside that callback is cancelling an operation that has
+    // already finished, and must not retroactively delete a verified artifact.
+    // This changes nothing before this line — cancellation and the deadline
+    // are fully authoritative right up to the gate above.
+    disarmStopSources();
+
+    // Built BEFORE the observer runs, so the result cannot depend on it.
+    const result = Object.freeze({
       filePath: paths.aggregatePath,
       segmentType: "mpegts" as const,
       fileSize,
     });
+
+    // 100 means exactly one thing: a finalized, verified, committed artifact.
+    // Observer-only — a reporter that throws cannot take it back.
+    reportSafely(onProgress, plan.fragmentCount, aggregateBytes, plan.fragmentCount);
+    return result;
   } catch (err) {
     const failure = classify(err);
     if (owned !== null) await removeQuietly(owned);
     throw failure;
   } finally {
-    clearTimeout(timer);
-    signal.removeEventListener("abort", onCallerAbort);
+    disarmStopSources();
     controller.abort();
   }
 }

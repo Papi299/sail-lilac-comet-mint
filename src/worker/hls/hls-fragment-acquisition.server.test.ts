@@ -1846,6 +1846,198 @@ describe("clear-HLS acquisition: cancellation and the deadline own finalization 
   });
 });
 
+// ── Progress is an observer, not transport authority ─────────────────────────
+
+/** Anything a caller's own reporter failure could put into an HLS error. */
+const REPORTER_SECRET = "TERMINAL-REPORTER-FAILURE-TEXT";
+
+describe("clear-HLS acquisition: the commit point, and progress as an observer", () => {
+  it("resolves, and keeps the artifact, when the TERMINAL reporter throws", async () => {
+    fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    const seen: number[] = [];
+    const result = await acquire(planOf([F1]), {
+      onProgress: (p) => {
+        seen.push(p.progress);
+        if (p.progress === 100) throw new Error(REPORTER_SECRET);
+      },
+    });
+
+    assert.deepEqual(seen, [0, 100], "the terminal event was delivered");
+    assert.equal(seen.filter((p) => p === 100).length, 1, "exactly one terminal report");
+    assert.equal(result.fileSize, 8, "the committed artifact is unchanged");
+    assert.deepEqual([...readFileSync(result.filePath)], [...payload("A", 8)], "byte for byte");
+    assert.deepEqual(workDirEntries(), [AGGREGATE_NAME], "the artifact remains, with no partial");
+  });
+
+  it("never turns a reporter failure into an acquisition error, or leaks its text", async () => {
+    fakeNetwork({ [F1]: serve(payload("A", 8)), [F2]: { status: 500 } });
+    const err = await refusedWith(
+      acquire(planOf([F1, F2]), {
+        onProgress: () => {
+          throw new Error(REPORTER_SECRET);
+        },
+      }),
+      "fragment_http_status",
+    );
+    leaksNothing(err, REPORTER_SECRET);
+    noArtifacts();
+  });
+
+  it("continues transferring when an INTERMEDIATE reporter throws", async () => {
+    const net = fakeNetwork({
+      [F1]: serve(payload("A", 8)),
+      [F2]: serve(payload("B", 8)),
+      [F3]: serve(payload("C", 8)),
+    });
+    const seen: number[] = [];
+    const result = await acquire(planOf([F1, F2, F3]), {
+      onProgress: (p) => {
+        seen.push(p.progress);
+        if (p.progress !== 100) throw new Error(REPORTER_SECRET);
+      },
+    });
+
+    assert.deepEqual(seen, [0, 33, 67, 100], "every event was still attempted, terminal once");
+    assert.equal(result.fileSize, 24);
+    assert.deepEqual(
+      net.requests.map((r) => r.url),
+      [F1, F2, F3],
+      "each fragment was downloaded exactly once",
+    );
+    assert.deepEqual(
+      [...readFileSync(result.filePath)],
+      [...Buffer.concat([payload("A", 8), payload("B", 8), payload("C", 8)])],
+    );
+    assert.deepEqual(workDirEntries(), [AGGREGATE_NAME]);
+  });
+
+  it("is already committed when the terminal reporter cancels the caller", async () => {
+    const caller = new AbortController();
+    fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    const seen: number[] = [];
+    const result = await acquire(planOf([F1]), {
+      signal: caller.signal,
+      onProgress: (p) => {
+        seen.push(p.progress);
+        if (p.progress === 100) caller.abort();
+      },
+    });
+
+    assert.deepEqual(seen, [0, 100]);
+    assert.equal(result.fileSize, 8, "a post-commit abort cannot undo the acquisition");
+    assert.deepEqual(workDirEntries(), [AGGREGATE_NAME], "the artifact remains");
+    await settle();
+    assert.equal(
+      getEventListeners(caller.signal, "abort").length,
+      0,
+      "no abort listener remained attached",
+    );
+  });
+
+  it("has already disarmed both stop sources when the terminal reporter runs", async () => {
+    const caller = new AbortController();
+    const before = activeTimeouts();
+    fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    let listenersAtCommit = -1;
+    let timersAtCommit = -1;
+    await acquire(planOf([F1]), {
+      signal: caller.signal,
+      onProgress: (p) => {
+        if (p.progress !== 100) return;
+        listenersAtCommit = getEventListeners(caller.signal, "abort").length;
+        timersAtCommit = activeTimeouts();
+      },
+    });
+
+    assert.equal(listenersAtCommit, 0, "the caller-abort listener was removed at the commit point");
+    assert.equal(timersAtCommit, before, "the deadline timer was cleared at the commit point");
+  });
+
+  it("still cancels at the next stop boundary when an intermediate reporter aborts", async () => {
+    const caller = new AbortController();
+    const net = fakeNetwork({ [F1]: serve(payload("A", 8)), [F2]: serve(payload("B", 8)) });
+    const seen: number[] = [];
+    await refusedWith(
+      acquire(planOf([F1, F2]), {
+        signal: caller.signal,
+        onProgress: (p) => {
+          seen.push(p.progress);
+          if (p.progress === 50) {
+            caller.abort();
+            // A reporter may BOTH abort and be broken; the abort still counts.
+            throw new Error(REPORTER_SECRET);
+          }
+        },
+      }),
+      "cancelled",
+    );
+
+    assert.deepEqual(seen, [0, 50], "the terminal report was never reached");
+    assert.deepEqual(net.requests.map((r) => r.url), [F1], "no second fragment was requested");
+    noArtifacts();
+  });
+
+  it("holds the invariant both ways across every controlled failure path", async () => {
+    const cases: Array<[string, () => Promise<unknown>, ClearHlsAcquisitionFailure]> = [
+      [
+        "a refused status",
+        () => {
+          fakeNetwork({ [F1]: { status: 404 } });
+          return acquire(planOf([F1]), { onProgress: record });
+        },
+        "fragment_http_status",
+      ],
+      [
+        "a refused content coding",
+        () => {
+          fakeNetwork({ [F1]: { status: 200, headers: { "content-encoding": "gzip" } } });
+          return acquire(planOf([F1]), { onProgress: record });
+        },
+        "fragment_encoding",
+      ],
+      [
+        "a fragment past its hard bound",
+        () => {
+          fakeNetwork({
+            [F1]: { status: 200, headers: { "content-length": String(HLS_V1_MAX_FRAGMENT_BYTES + 1) } },
+          });
+          return acquire(planOf([F1]), { onProgress: record });
+        },
+        "fragment_too_large",
+      ],
+      [
+        "a private DNS answer",
+        () => {
+          fakeNetwork({ [F1]: serve(payload("A", 8)) }, { dns: { "origin.example": [PRIVATE] } });
+          return acquire(planOf([F1]), { onProgress: record });
+        },
+        "destination_rejected",
+      ],
+      [
+        "a forged plan",
+        () => acquire({ ...planOf([F1]) } as ClearHlsAcquisitionPlan, { onProgress: record }),
+        "invalid_plan",
+      ],
+      [
+        "an unusable workDir",
+        () => acquire(planOf([F1]), { workDir: "not/absolute", onProgress: record }),
+        "output_error",
+      ],
+    ];
+
+    let seen: number[] = [];
+    const record = (p: ClearHlsAcquisitionProgress) => seen.push(p.progress);
+
+    for (const [label, run, reason] of cases) {
+      seen = [];
+      await rm(aggregatePath(), { force: true });
+      await refusedWith(run(), reason);
+      assert.equal(seen.includes(100), false, `${label}: a rejected acquisition never reported 100`);
+      noArtifacts();
+    }
+  });
+});
+
 // ── The private error vocabulary (§34) ───────────────────────────────────────
 
 describe("clear-HLS acquisition: refusals reveal nothing", () => {
@@ -2039,17 +2231,51 @@ describe("clear-HLS acquisition: dormant, and inside its boundary", () => {
     );
   });
 
-  it("emits terminal progress only after the last stop gate, with nothing async between", () => {
+  it("commits, then observes: the terminal path has nothing that can fail", () => {
     const gate = code.lastIndexOf("controller.signal.throwIfAborted();");
-    const terminal = code.indexOf("report(onProgress, plan.fragmentCount");
-    const returned = code.indexOf("return Object.freeze({");
-    assert.ok(gate > 0 && terminal > gate, "the terminal report follows the final gate");
-    assert.ok(returned > terminal, "the result follows the terminal report");
+    const disarm = code.indexOf("disarmStopSources();", gate);
+    const built = code.indexOf("Object.freeze({", gate);
+    const terminal = code.indexOf("reportSafely(onProgress, plan.fragmentCount", gate);
+    const returned = code.indexOf("return result;", gate);
+    assert.ok(gate > 0, "there is a final stop gate");
+    assert.ok(disarm > gate, "stop sources are disarmed at the commit point");
+    assert.ok(built > disarm, "the result is built after the commit point");
+    assert.ok(terminal > built, "the observer runs after the result exists");
+    assert.ok(returned > terminal, "the already-built result is returned");
+    const tail = code.slice(gate + "controller.signal.throwIfAborted();".length, returned);
+    for (const forbidden of ["await ", "refuse(", "throwIfAborted", "removeQuietly"]) {
+      assert.equal(
+        tail.includes(forbidden),
+        false,
+        `nothing that can fail may follow the commit point, saw ${forbidden}`,
+      );
+    }
+  });
+
+  it("disarms both stop sources exactly through one idempotent helper", () => {
+    assert.equal(code.split("clearTimeout(").length - 1, 1, "one clearTimeout, inside the helper");
     assert.equal(
-      code.slice(gate, returned).includes("await "),
-      false,
-      "no asynchronous work may separate the final gate from the successful return",
+      code.split('signal.removeEventListener("abort", onCallerAbort)').length - 1,
+      1,
+      "one caller-listener removal, inside the helper",
     );
+    assert.equal(
+      code.split("disarmStopSources();").length - 1,
+      2,
+      "called at the commit point and again in the finally",
+    );
+  });
+
+  it("reaches the caller's reporter only through the guarded helper", () => {
+    assert.equal(code.split("onProgress?.(").length - 1, 0, "no unguarded optional call");
+    assert.equal(code.split("onProgress({").length - 1, 1, "exactly one invocation site");
+    const helper = code.slice(code.indexOf("function reportSafely("));
+    const body = helper.slice(0, helper.indexOf("\n}"));
+    const call = body.indexOf("onProgress({");
+    assert.ok(body.indexOf("try {") < call, "the invocation is inside a try");
+    assert.ok(body.indexOf("} catch {") > call, "and its exception is caught");
+    assert.equal(body.includes("cause"), false, "a reporter failure is never attached as a cause");
+    assert.equal(body.includes("refuse("), false, "a reporter failure is never a transport failure");
   });
 
   it("never reports 100 from inside the transfer loop", () => {
@@ -2057,7 +2283,7 @@ describe("clear-HLS acquisition: dormant, and inside its boundary", () => {
       code.indexOf("for (const fragment of plan.fragments)"),
       code.indexOf("return aggregateBytes;"),
     );
-    assert.ok(loop.includes("report(onProgress"), "the loop still reports completed fragments");
+    assert.ok(loop.includes("reportSafely(onProgress"), "the loop still reports completed fragments");
     assert.ok(
       loop.includes("if (completed < plan.fragmentCount)"),
       "the last fragment's report is withheld for finalization",
