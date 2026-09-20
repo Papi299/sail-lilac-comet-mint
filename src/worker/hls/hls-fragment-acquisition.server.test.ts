@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { getEventListeners } from "node:events";
-import { chmodSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, readdirSync, statSync, truncateSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import type { IncomingHttpHeaders } from "node:http";
 import { tmpdir } from "node:os";
@@ -34,9 +34,11 @@ import {
   HLS_V1_MAX_FRAGMENT_REDIRECTS,
   acquireClearHlsTs,
   hlsV1EffectiveAggregateLimitBytes,
+  setClearHlsFinalizationBarrierForTests,
   type ClearHlsAcquiredTs,
   type ClearHlsAcquisitionFailure,
   type ClearHlsAcquisitionProgress,
+  type FinalizationStep,
 } from "./hls-fragment-acquisition.server.ts";
 
 /**
@@ -83,6 +85,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   setSafeHttpTestHooks(null);
+  setClearHlsFinalizationBarrierForTests(null);
   try {
     chmodSync(workDir, 0o700);
   } catch {
@@ -389,6 +392,53 @@ async function waitFor(predicate: () => boolean, label: string, limitMs = 5000):
 /** The partial artifact's current size, or -1 while it does not exist. */
 function partialSize(): number {
   return existsSync(partialPath()) ? statSync(partialPath()).size : -1;
+}
+
+/**
+ * Hold the acquisition at ONE finalization step until the test releases it.
+ *
+ * The acquisition parks INSIDE finalization, so the stop under test lands while
+ * a named filesystem await is in flight — no wall-clock luck, and no guessing
+ * at where a stop happened to arrive. `steps` records every step the
+ * acquisition actually reached, which is how "the rename never began" is
+ * proved: `after-rename` sits immediately after the rename call.
+ */
+type HeldFinalization = {
+  /** Every finalization step the acquisition reached, in order. */
+  readonly steps: FinalizationStep[];
+  /** Resolves once the acquisition is parked at the held step. */
+  readonly reached: Promise<void>;
+  /** Let the acquisition continue past the held step. */
+  release(): void;
+};
+
+function holdFinalizationAt(step: FinalizationStep): HeldFinalization {
+  const steps: FinalizationStep[] = [];
+  let announce: () => void = () => {};
+  const reached = new Promise<void>((resolve) => {
+    announce = resolve;
+  });
+  let release: () => void = () => {};
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  setClearHlsFinalizationBarrierForTests(async (at) => {
+    steps.push(at);
+    if (at !== step) return;
+    announce();
+    await released;
+  });
+  return { steps, reached, release };
+}
+
+/**
+ * Wait out a budget that has already been armed while the acquisition is parked
+ * at a barrier. This is not a race: the acquisition cannot advance until the
+ * test releases it, so the only question is whether the timer has fired, and
+ * waiting several times the budget settles that.
+ */
+async function letTheDeadlinePass(budgetMs: number): Promise<void> {
+  await sleep(budgetMs * 4);
 }
 
 function activeTimeouts(): number {
@@ -1399,7 +1449,8 @@ describe("clear-HLS acquisition: the output boundary", () => {
     if (IS_ROOT) return t.skip("directory permissions do not bind a superuser");
     const body = manualBody();
     fakeNetwork({ [F1]: { status: 200, body: body.stream } });
-    const pending = acquire(planOf([F1]));
+    const seen: number[] = [];
+    const pending = acquire(planOf([F1]), { onProgress: (p) => seen.push(p.progress) });
     await waitFor(() => existsSync(partialPath()), "the partial artifact");
     body.push(payload("A", 8));
     await waitFor(() => partialSize() === 8, "the accepted bytes");
@@ -1408,6 +1459,11 @@ describe("clear-HLS acquisition: the output boundary", () => {
     try {
       await refusedWith(pending, "output_error");
       assert.equal(existsSync(aggregatePath()), false, "no final artifact was produced");
+      assert.equal(
+        seen.includes(100),
+        false,
+        "an acquisition that never finalized never reported 100",
+      );
     } finally {
       chmodSync(workDir, 0o700);
     }
@@ -1606,6 +1662,190 @@ describe("clear-HLS acquisition: truthful fragment-count progress", () => {
   });
 });
 
+// ── Finalization is inside the deadline ──────────────────────────────────────
+
+describe("clear-HLS acquisition: cancellation and the deadline own finalization too", () => {
+  it("stops a caller cancellation that lands during the final no-clobber check", async () => {
+    const caller = new AbortController();
+    const held = holdFinalizationAt("before-rename");
+    const net = fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    const seen: number[] = [];
+    const pending = acquire(planOf([F1]), {
+      signal: caller.signal,
+      onProgress: (p) => seen.push(p.progress),
+    });
+
+    await held.reached;
+    assert.equal(partialSize(), 8, "every fragment byte reached the partial");
+    assert.equal(existsSync(aggregatePath()), false, "the rename has not begun");
+
+    caller.abort();
+    held.release();
+
+    await refusedWith(pending, "cancelled");
+    assert.deepEqual(held.steps, ["before-rename"], "the rename never began");
+    noArtifacts();
+    assert.deepEqual(seen, [0], "a stopped acquisition never reports 100");
+    assert.equal(net.requests.length, 1, "no request followed the stop");
+  });
+
+  it("stops a deadline that lands while the rename is in flight, and removes the artifact", async () => {
+    const held = holdFinalizationAt("after-rename");
+    fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    const seen: number[] = [];
+    const pending = acquire(planOf([F1]), {
+      timeoutMs: 50,
+      onProgress: (p) => seen.push(p.progress),
+    });
+
+    await held.reached;
+    assert.equal(existsSync(aggregatePath()), true, "the rename completed");
+    assert.equal(existsSync(partialPath()), false, "the partial was renamed away");
+
+    await letTheDeadlinePass(50);
+    held.release();
+
+    await refusedWith(pending, "timeout");
+    assert.deepEqual(held.steps, ["before-rename", "after-rename"], "nothing ran past the stop");
+    noArtifacts();
+    assert.deepEqual(seen, [0], "a stopped acquisition never reports 100");
+  });
+
+  it("stops a deadline that lands while the final size check is in flight", async () => {
+    const held = holdFinalizationAt("before-return");
+    fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    const seen: number[] = [];
+    const pending = acquire(planOf([F1]), {
+      timeoutMs: 50,
+      onProgress: (p) => seen.push(p.progress),
+    });
+
+    await held.reached;
+    assert.equal(statSync(aggregatePath()).size, 8, "the artifact was finalized and measured");
+
+    await letTheDeadlinePass(50);
+    held.release();
+
+    await refusedWith(pending, "timeout");
+    assert.deepEqual(held.steps, ["before-rename", "after-rename", "before-return"]);
+    noArtifacts();
+    assert.deepEqual(seen, [0], "a verified-but-stopped acquisition still reports no 100");
+  });
+
+  it("removes the final artifact when the caller cancels after the rename", async () => {
+    const caller = new AbortController();
+    const held = holdFinalizationAt("after-rename");
+    fakeNetwork({ [F1]: serve(payload("A", 8)), [F2]: serve(payload("B", 8)) });
+    const seen: number[] = [];
+    const pending = acquire(planOf([F1, F2]), {
+      signal: caller.signal,
+      onProgress: (p) => seen.push(p.progress),
+    });
+
+    await held.reached;
+    assert.equal(statSync(aggregatePath()).size, 16, "both fragments were finalized");
+
+    caller.abort();
+    held.release();
+
+    await refusedWith(pending, "cancelled");
+    assert.equal(existsSync(aggregatePath()), false, "the finalized artifact was removed");
+    assert.equal(existsSync(partialPath()), false, "no partial survived either");
+    noArtifacts();
+    assert.deepEqual(seen, [0, 50], "the last fragment's 100 was never emitted");
+  });
+
+  it("keeps the caller as the first cause even when the deadline follows in finalization", async () => {
+    const caller = new AbortController();
+    const held = holdFinalizationAt("after-rename");
+    fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    const pending = acquire(planOf([F1]), { signal: caller.signal, timeoutMs: 50 });
+
+    await held.reached;
+    caller.abort();
+    await letTheDeadlinePass(50);
+    held.release();
+
+    await refusedWith(pending, "cancelled");
+    noArtifacts();
+  });
+
+  it("keeps the deadline as the first cause even when the caller follows in finalization", async () => {
+    const caller = new AbortController();
+    const held = holdFinalizationAt("after-rename");
+    fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    const pending = acquire(planOf([F1]), { signal: caller.signal, timeoutMs: 50 });
+
+    await held.reached;
+    await letTheDeadlinePass(50);
+    caller.abort();
+    held.release();
+
+    await refusedWith(pending, "timeout");
+    noArtifacts();
+  });
+
+  it("fails closed, with no artifact and no 100, when post-rename verification disagrees", async () => {
+    const held = holdFinalizationAt("after-rename");
+    fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    const seen: number[] = [];
+    const pending = acquire(planOf([F1]), { onProgress: (p) => seen.push(p.progress) });
+
+    await held.reached;
+    // Something other than this acquisition changed the finalized artifact.
+    truncateSync(aggregatePath(), 4);
+    held.release();
+
+    await refusedWith(pending, "output_error");
+    noArtifacts();
+    assert.deepEqual(seen, [0], "a size that does not verify is not a success");
+  });
+
+  it("leaves no timer and no listener when a stop lands in finalization", async () => {
+    const caller = new AbortController();
+    const before = activeTimeouts();
+    const held = holdFinalizationAt("after-rename");
+    fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    const pending = acquire(planOf([F1]), { signal: caller.signal, timeoutMs: 50 });
+
+    await held.reached;
+    caller.abort();
+    held.release();
+
+    await refusedWith(pending, "cancelled");
+    await settle();
+    assert.equal(activeTimeouts(), before, "the deadline timer was cleared");
+    assert.equal(getEventListeners(caller.signal, "abort").length, 0, "no listener was left");
+  });
+
+  it("finalizes normally, and reports 100 exactly once, with no barrier installed", async () => {
+    setClearHlsFinalizationBarrierForTests(null);
+    fakeNetwork({ [F1]: serve(payload("A", 8)), [F2]: serve(payload("B", 8)) });
+    const seen: number[] = [];
+    const result = await acquire(planOf([F1, F2]), { onProgress: (p) => seen.push(p.progress) });
+    assert.equal(result.fileSize, 16);
+    assert.deepEqual(seen, [0, 50, 100]);
+    assert.deepEqual(workDirEntries(), [AGGREGATE_NAME]);
+  });
+
+  it("reports 100 only after the artifact exists at its final name and verified size", async () => {
+    fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    const observed: Array<{ progress: number; finalized: boolean; size: number }> = [];
+    await acquire(planOf([F1]), {
+      onProgress: (p) =>
+        observed.push({
+          progress: p.progress,
+          finalized: existsSync(aggregatePath()),
+          size: existsSync(aggregatePath()) ? statSync(aggregatePath()).size : -1,
+        }),
+    });
+    const terminal = observed.filter((row) => row.progress === 100);
+    assert.equal(terminal.length, 1, "exactly one terminal report");
+    assert.equal(terminal[0]!.finalized, true, "the final artifact already existed");
+    assert.equal(terminal[0]!.size, 8, "at its verified size");
+  });
+});
+
 // ── The private error vocabulary (§34) ───────────────────────────────────────
 
 describe("clear-HLS acquisition: refusals reveal nothing", () => {
@@ -1766,6 +2006,62 @@ describe("clear-HLS acquisition: dormant, and inside its boundary", () => {
     assert.ok(admit >= 0, "the chunk loop admits bytes through the bound check");
     assert.ok(write >= 0, "the chunk loop writes through writeAll");
     assert.ok(admit < write, "the bound check must precede the write");
+  });
+
+  it("gates the acquisition immediately after every finalization await", () => {
+    const steps: FinalizationStep[] = ["before-rename", "after-rename", "before-return"];
+    for (const step of steps) {
+      const call = `atFinalizationStep("${step}")`;
+      const at = code.indexOf(call);
+      assert.ok(at > 0, `${step} must be a real finalization step`);
+      const after = code.slice(at + call.length).replace(/\s+/g, " ").trimStart();
+      assert.ok(
+        after.startsWith("; controller.signal.throwIfAborted();"),
+        `${step} must be followed immediately by a stop gate, saw ${after.slice(0, 60)}`,
+      );
+    }
+  });
+
+  it("keeps the finalization barrier inert and reachable only from its setter", () => {
+    assert.ok(
+      code.includes("let finalizationBarrier: ((step: FinalizationStep) => Promise<void>) | null = null"),
+      "the barrier ships null",
+    );
+    assert.equal(
+      code.split("finalizationBarrier").length - 1,
+      4,
+      "declared, assigned by the test-only setter, null-checked and called — nothing else",
+    );
+    assert.equal(
+      code.split("setClearHlsFinalizationBarrierForTests").length - 1,
+      1,
+      "the module never installs a barrier on itself",
+    );
+  });
+
+  it("emits terminal progress only after the last stop gate, with nothing async between", () => {
+    const gate = code.lastIndexOf("controller.signal.throwIfAborted();");
+    const terminal = code.indexOf("report(onProgress, plan.fragmentCount");
+    const returned = code.indexOf("return Object.freeze({");
+    assert.ok(gate > 0 && terminal > gate, "the terminal report follows the final gate");
+    assert.ok(returned > terminal, "the result follows the terminal report");
+    assert.equal(
+      code.slice(gate, returned).includes("await "),
+      false,
+      "no asynchronous work may separate the final gate from the successful return",
+    );
+  });
+
+  it("never reports 100 from inside the transfer loop", () => {
+    const loop = code.slice(
+      code.indexOf("for (const fragment of plan.fragments)"),
+      code.indexOf("return aggregateBytes;"),
+    );
+    assert.ok(loop.includes("report(onProgress"), "the loop still reports completed fragments");
+    assert.ok(
+      loop.includes("if (completed < plan.fragmentCount)"),
+      "the last fragment's report is withheld for finalization",
+    );
   });
 
   it("arms exactly one deadline for the whole acquisition", () => {

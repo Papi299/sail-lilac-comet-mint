@@ -142,7 +142,11 @@ export type ClearHlsAcquiredTs = {
 /**
  * Truthful fragment-count progress.
  *
- * Authority is `completedFragments / fragmentCount`. Byte totals are NOT
+ * Authority is `completedFragments / fragmentCount`, with ONE reservation: the
+ * terminal 100 is not emitted when the last fragment's bytes land, but only
+ * once the aggregate artifact has been finalized and verified and the
+ * acquisition is about to return it. A caller that sees 100 has a finished
+ * file; an acquisition that fails never reports 100. Byte totals are NOT
  * inferred: a clear-VOD playlist declares durations, not sizes, so the total
  * transfer size is genuinely unknown until the last fragment ends. `totalBytes`
  * is therefore always null, and so are `speed` and `eta` — an invented ETA is
@@ -531,13 +535,21 @@ async function transferFragments(
     signal.throwIfAborted();
     aggregateBytes = await acquireFragment(fragment.url, aggregateBytes, ctx);
     completed += 1;
-    // Only a fragment whose whole body was accepted AND written counts.
-    report(onProgress, completed, aggregateBytes, plan.fragmentCount);
+    // Only a fragment whose whole body was accepted AND written counts, and
+    // the LAST one is deliberately withheld here: 100 belongs to a finalized
+    // artifact, not to a transfer that still has to be verified, renamed and
+    // re-verified. `acquireClearHlsTs` emits it once all of that has succeeded.
+    if (completed < plan.fragmentCount) {
+      report(onProgress, completed, aggregateBytes, plan.fragmentCount);
+    }
   }
   return aggregateBytes;
 }
 
-/** One truthful report. Never emitted for a fragment that did not complete. */
+/**
+ * One truthful report. Never emitted for a fragment that did not complete, and
+ * never at 100 for an acquisition that has not finalized its artifact.
+ */
 function report(
   onProgress: ClearHlsAcquisitionRequest["onProgress"],
   completed: number,
@@ -574,6 +586,44 @@ function acquisitionBudgetMs(requested: number | undefined): number | null {
   return Number.isFinite(budget) && budget > 0 ? budget : null;
 }
 
+// ── The finalization barrier ─────────────────────────────────────────────────
+
+/**
+ * The points inside finalization where a stop may land: while the final
+ * no-clobber check is in flight, while the rename is in flight, and while the
+ * final size verification is in flight.
+ */
+export type FinalizationStep = "before-rename" | "after-rename" | "before-return";
+
+/**
+ * A test-only barrier, inert in Production.
+ *
+ * Finalization is three short filesystem awaits, and a cancellation or a
+ * deadline landing inside any of them must still stop the acquisition. Proving
+ * that with wall-clock timing would be luck rather than a test, so this module
+ * offers the smallest seam that makes it deterministic: a module-private hook a
+ * test can use to hold one await open, stop the acquisition, and release it.
+ *
+ * It is not a production abstraction. Nothing in Production imports this module
+ * at all, so no production caller can reach the setter, and while the barrier
+ * is null the finalization path is byte-for-byte what it would be without the
+ * seam.
+ */
+let finalizationBarrier: ((step: FinalizationStep) => Promise<void>) | null = null;
+
+/** Install or clear the barrier. Passing null restores the production path. */
+export function setClearHlsFinalizationBarrierForTests(
+  barrier: ((step: FinalizationStep) => Promise<void>) | null,
+): void {
+  finalizationBarrier = barrier;
+}
+
+/** Nothing at all unless a test installed a barrier. */
+function atFinalizationStep(step: FinalizationStep): Promise<void> | void {
+  if (finalizationBarrier === null) return;
+  return finalizationBarrier(step);
+}
+
 // ── The acquisition ──────────────────────────────────────────────────────────
 
 /**
@@ -589,8 +639,9 @@ function acquisitionBudgetMs(requested: number | undefined): number | null {
  *   4. download and append every fragment, sequentially;
  *   5. verify the open handle's size equals the streamed counter, then close;
  *   6. require the operation not to have been stopped;
- *   7. rename the partial onto the aggregate name and verify its size;
- *   8. return the artifact.
+ *   7. rename the partial onto the aggregate name and verify its size, with a
+ *      stop gate after every one of those awaits;
+ *   8. emit the terminal 100 report and return the artifact.
  *
  * On ANY failure before finalization the partial is removed, and on a failure
  * after finalization the aggregate is removed too: a failed call never leaves a
@@ -603,6 +654,15 @@ function acquisitionBudgetMs(requested: number | undefined): number | null {
  * overwrite it, and the caller's own `AbortSignal.reason` is never read or
  * surfaced. The deadline is armed once, before the first fragment, and nothing
  * re-arms it.
+ *
+ * That one deadline covers finalization as well as transfer. Every await in
+ * steps 5 to 8 is followed by a stop gate, so an acquisition whose caller
+ * cancelled, or whose deadline expired, while the no-clobber check, the rename
+ * or the final `stat` was in flight cannot still return success: it is
+ * classified as the latched first cause, and the artifact it had already
+ * created — partial or final — is removed. The last gate is the last
+ * asynchronous thing the function does; only the synchronous terminal report
+ * and the frozen result follow it.
  *
  * Unlike HLS-2, this function does not race its deadline against the work it
  * started: it owns an open file, and returning while the transfer loop was
@@ -705,12 +765,22 @@ export async function acquireClearHlsTs(
     // the whole guarantee: it is not a claim of resistance against another
     // process racing the rename on a hostile filesystem.
     if (await exists(paths.aggregatePath)) refuse("output_error");
+
+    // A stop that landed while that check was in flight must not let the
+    // rename begin.
+    await atFinalizationStep("before-rename");
+    controller.signal.throwIfAborted();
     try {
       await rename(paths.partialPath, paths.aggregatePath);
     } catch {
       refuse("output_error");
     }
+    // The aggregate belongs to this call from the instant the rename succeeds,
+    // so a stop arriving from here on removes it rather than leaving a
+    // successful-looking artifact behind for an acquisition that failed.
     owned = paths.aggregatePath;
+    await atFinalizationStep("after-rename");
+    controller.signal.throwIfAborted();
 
     let fileSize: number;
     try {
@@ -720,6 +790,14 @@ export async function acquireClearHlsTs(
     }
     if (fileSize !== aggregateBytes) refuse("output_error");
 
+    // The LAST await of the acquisition, and the last gate. Nothing
+    // asynchronous may follow it: the terminal report and the result are
+    // synchronous, so no stop can land between this check and the return.
+    await atFinalizationStep("before-return");
+    controller.signal.throwIfAborted();
+
+    // 100 means exactly one thing: the artifact was finalized and verified.
+    report(onProgress, plan.fragmentCount, aggregateBytes, plan.fragmentCount);
     return Object.freeze({
       filePath: paths.aggregatePath,
       segmentType: "mpegts" as const,
