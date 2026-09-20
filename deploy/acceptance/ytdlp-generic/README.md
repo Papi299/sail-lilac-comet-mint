@@ -1259,11 +1259,17 @@ Some post-threshold room is necessary because the Production actual-byte monitor
 polls every 150 ms, so a transfer stops at the first poll after the threshold
 rather than at the threshold byte. 256 MiB is not, however, a mathematical
 guarantee derived from 150 ms alone — how many bytes arrive within a polling
-interval depends on actual throughput. It is a margin chosen to be comfortably
-sufficient in practice while keeping a runaway transfer bounded. It is a
-**ceiling, not an allocation** — the stream is one reused 64 KiB block, nothing
-is proportional to the ceiling, and no automated repository test transfers a
-4.25 GiB body.
+interval depends on actual throughput and scheduling.
+
+The 256 MiB value is therefore a **bounded practical margin, not a proven
+throughput guarantee**. Its real adequacy will be established only by a future
+live current-limit acceptance run. If such a run reaches the fixture ceiling or
+the Product timeout before producing valid threshold evidence, it must report
+**BLOCKED/TIMEOUT** rather than treating the configured margin as proof.
+
+The 4.25 GiB figure is a **ceiling, not an allocation** — the stream is one reused
+64 KiB block, nothing is proportional to the ceiling, and no automated
+repository test transfers a 4.25 GiB body.
 
 **The historical record is unchanged.** This case was designed, and accepted in
 Phase 10D, while Production enforced the 500 MiB default, against a 528 MiB

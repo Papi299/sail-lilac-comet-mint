@@ -277,10 +277,15 @@ The **reference** mirrors the current Product default
 room is necessary because the Production actual-byte monitor polls every 150 ms,
 so a transfer does not stop at the exact threshold byte but at the first poll
 after it. 256 MiB is not a mathematical guarantee derived from 150 ms alone —
-how many bytes arrive within a polling interval depends on actual throughput —
-but it is comfortably sufficient at ordinary public-tunnel throughput, while a
-larger margin would only make a runaway transfer more expensive without making
-the assertion any stronger.
+how many bytes arrive within a polling interval depends on actual throughput and
+scheduling. A larger margin would only make a runaway transfer more expensive
+without making the assertion any stronger.
+
+The 256 MiB value is therefore a **bounded practical margin rather than a
+guarantee**. Its adequacy for the real end-to-end current-limit case remains to
+be demonstrated by a future live acceptance run, and that run must **fail
+closed** — reporting BLOCKED/TIMEOUT — if the fixture ceiling or the Product
+timeout is reached before valid threshold evidence is obtained.
 
 It is a **ceiling, not an allocation**, and nothing here is proportional to it:
 the body is the real MP4 followed by one reused 64 KiB block written with
