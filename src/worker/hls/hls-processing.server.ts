@@ -221,35 +221,98 @@ export function remainingBudgetMs(deadlineMs: number, nowMs: number): number | n
 // ── Input authority ──────────────────────────────────────────────────────────
 
 /**
- * Is this really an artifact HLS-3 produced?
+ * The module-owned SNAPSHOT of an acquired artifact.
+ *
+ * Structurally identical to HLS-3's `ClearHlsAcquiredTs`, and deliberately a
+ * distinct type: holding one of these means holding values this module already
+ * captured and validated, not a reference to an object supplied by a caller.
+ */
+export type ValidatedClearHlsAcquiredTs = {
+  readonly filePath: string;
+  readonly segmentType: "mpegts";
+  readonly fileSize: number;
+};
+
+/** The three fields HLS-3's frozen result carries, and the only three. */
+const ACQUIRED_TS_FIELDS = ["filePath", "segmentType", "fileSize"] as const;
+
+/**
+ * PARSE an acquired artifact into a validated snapshot, or refuse it.
  *
  * Defence in depth before ANY filesystem work and long before any spawn. An
  * object reaching here should always be one `acquireClearHlsTs()` froze, so
  * this is not a second acquisition policy — it is a structural gate that
  * refuses a forged, mutated or hand-built object outright.
  *
- * Every field is read ONCE into a local. A frozen object may still expose
- * accessor properties, and a value that was validated on one read and used on
- * another would be validated in name only.
+ * ─── Why this PARSES rather than answering yes/no ───────────────────────────
+ *
+ * A boolean type guard validates the values it read and then hands the CALLER
+ * back the original object, which the caller must read again to use. That is
+ * only sound if a second read is guaranteed to return what the first one did,
+ * and on a JavaScript object it is not: `Object.freeze` makes accessor
+ * properties non-configurable but does NOT convert them into data properties,
+ * so a frozen object may still expose a getter that answers differently every
+ * time. Validating one getter result and then acting on another is a
+ * TOCTOU-shaped hole, and no amount of care at the call site closes it.
+ *
+ * So this function returns the CAPTURED PRIMITIVES instead. Past the call, the
+ * caller holds three strings and numbers of its own and the supplied object is
+ * never consulted again — there is nothing left for a getter to answer.
+ *
+ * ─── The representation it requires ─────────────────────────────────────────
+ *
+ * Exactly what `acquireClearHlsTs()` actually constructs, which is a frozen
+ * object literal:
+ *
+ *   - a non-null object, frozen;
+ *   - the ordinary `Object.prototype`, so a null-prototype object, a class
+ *     instance and a Proxy-backed exotic shape are all refused rather than
+ *     probed;
+ *   - an own property set of EXACTLY the three fields. Counted with
+ *     `Reflect.ownKeys()`, not `Object.keys()`: the latter sees only
+ *     enumerable STRING keys, so a symbol-keyed or non-enumerable extra would
+ *     sail past a `length === 3` check while the object still carried payload
+ *     this module has not reasoned about;
+ *   - each of the three an own DATA property. An accessor is refused outright,
+ *     and note that refusing it never invokes it —
+ *     `Object.getOwnPropertyDescriptor()` reports a getter without calling it,
+ *     so a hostile getter gets no execution at all;
+ *   - inherited substitutes are refused by the same exact-own-set rule: a
+ *     value supplied through the prototype is not an own property and cannot
+ *     satisfy it.
+ *
+ * Only then are the three captured values themselves checked, and the returned
+ * snapshot is frozen so the caller cannot mutate what it validated either.
  */
-function isAcquiredTsArtifact(value: unknown): value is ClearHlsAcquiredTs {
-  if (typeof value !== "object" || value === null) return false;
-  if (!Object.isFrozen(value)) return false;
-  // Exactly the three fields HLS-3 freezes. An extra field means the object
-  // came from somewhere else and is carrying something this module has not
-  // reasoned about.
-  if (Object.keys(value).length !== 3) return false;
+export function parseAcquiredTsArtifact(value: unknown): ValidatedClearHlsAcquiredTs | null {
+  if (typeof value !== "object" || value === null) return null;
+  if (!Object.isFrozen(value)) return null;
+  if (Object.getPrototypeOf(value) !== Object.prototype) return null;
 
-  const { filePath, segmentType, fileSize } = value as {
-    filePath: unknown;
-    segmentType: unknown;
-    fileSize: unknown;
-  };
-  if (segmentType !== "mpegts") return false;
-  if (typeof filePath !== "string" || filePath.length === 0) return false;
-  if (typeof fileSize !== "number") return false;
-  if (!Number.isSafeInteger(fileSize) || fileSize <= 0) return false;
-  return true;
+  // The COMPLETE own-property set: strings and symbols, enumerable or not.
+  if (Reflect.ownKeys(value).length !== ACQUIRED_TS_FIELDS.length) return null;
+
+  const captured: Record<string, unknown> = {};
+  for (const field of ACQUIRED_TS_FIELDS) {
+    // An OWN descriptor, so an inherited value can never stand in for one.
+    const descriptor = Object.getOwnPropertyDescriptor(value, field);
+    if (descriptor === undefined) return null;
+    // A data descriptor carries `value`; an accessor descriptor carries
+    // `get`/`set` instead. This is the single read of the stored value, and
+    // there is no second one.
+    if (!("value" in descriptor)) return null;
+    captured[field] = descriptor.value;
+  }
+  // Three own descriptors were found and the own set has exactly three
+  // members, so the set is exactly these three fields.
+
+  const { filePath, segmentType, fileSize } = captured;
+  if (segmentType !== "mpegts") return null;
+  if (typeof filePath !== "string" || filePath.length === 0) return null;
+  if (typeof fileSize !== "number") return null;
+  if (!Number.isSafeInteger(fileSize) || fileSize <= 0) return null;
+
+  return Object.freeze({ filePath, segmentType: "mpegts" as const, fileSize });
 }
 
 // ── Filesystem helpers ───────────────────────────────────────────────────────
@@ -445,8 +508,9 @@ function stopFailure(cause: StopCause): AppError {
  *
  * Lifecycle:
  *
- *    1. validate the request bounds and the artifact's structure, before ANY
- *       I/O;
+ *    1. validate the request bounds, and PARSE the supplied artifact into a
+ *       validated snapshot, before ANY I/O — past that point the caller's
+ *       object is never read again;
  *    2. resolve the real work directory and prove the source is a contained,
  *       regular, non-symlink file at the FIXED HLS-3 artifact location;
  *    3. prove the on-disk size equals the artifact's declared `fileSize`;
@@ -486,7 +550,9 @@ function stopFailure(cause: StopCause): AppError {
 export async function processClearHlsTsToMp4(
   request: ClearHlsProcessingRequest,
 ): Promise<ClearHlsProcessedMp4> {
-  const { source, workDir, timeoutMs, maxOutputBytes, signal } = request;
+  // Destructuring is itself a snapshot: every request field is read exactly
+  // once here and only the locals are used afterwards.
+  const { workDir, timeoutMs, maxOutputBytes, signal } = request;
 
   // Nothing starts for a caller that has already gone: no probe, no FFmpeg and
   // no filesystem work at all.
@@ -497,7 +563,11 @@ export async function processClearHlsTsToMp4(
   if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) {
     throw new AppError("PROCESSING_FAILED");
   }
-  if (!isAcquiredTsArtifact(source)) throw new AppError("PROCESSING_FAILED");
+  // THE PARSING BOUNDARY. `request.source` is read exactly once, right here,
+  // and every later mention of `source` is this module's own validated
+  // snapshot. The supplied object is never consulted again.
+  const source = parseAcquiredTsArtifact(request.source);
+  if (source === null) throw new AppError("PROCESSING_FAILED");
 
   const deadlineMs = monotonicNowMs() + timeoutMs;
 
@@ -590,8 +660,10 @@ export async function processClearHlsTsToMp4(
 
     // ── 3. The declared size must be the real size ─────────────────────────
     //
-    // A mismatch means the artifact object and the bytes on disk disagree, so
-    // one of them is stale or forged; neither is safe to process.
+    // A mismatch means the artifact snapshot and the bytes on disk disagree,
+    // so one of them is stale or forged; neither is safe to process. The
+    // comparison is against the CAPTURED size, not a fresh read of the
+    // caller's object.
     const sourceSize = await regularFileSize(sourcePath);
     if (sourceSize <= 0) throw new AppError("PROCESSING_FAILED");
     if (sourceSize !== source.fileSize) throw new AppError("PROCESSING_FAILED");

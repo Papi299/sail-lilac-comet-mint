@@ -41,6 +41,7 @@ import {
   HLS_V1_PROCESSING_WORKSPACE_FOOTPRINT,
   HLS_V1_TS_STREAM_SHAPE,
   buildClearHlsRemuxArgs,
+  parseAcquiredTsArtifact,
   processClearHlsTsToMp4,
   remainingBudgetMs,
   setClearHlsProcessingBarrierForTests,
@@ -530,6 +531,214 @@ describe("HLS-4 input authority: only the HLS-3 artifact, proven before any spaw
       );
     }
     assert.equal(calls.length, 0, "an invalid bound must be refused before any spawn");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A2. THE ARTIFACT SNAPSHOT BOUNDARY
+//     (HLS-4-ARTIFACT-SNAPSHOT-INTEGRITY-CORRECTION-001)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("HLS-4 artifact parsing: one read, captured, never consulted again", () => {
+  const GOOD = "/jobs/abc/hls-source.ts";
+
+  /** Exactly what `acquireClearHlsTs()` constructs: a frozen object literal. */
+  function hls3Artifact(filePath = GOOD, fileSize = 4_096): unknown {
+    return Object.freeze({
+      filePath,
+      segmentType: "mpegts" as const,
+      fileSize,
+    });
+  }
+
+  it("accepts the exact frozen shape HLS-3 returns, and captures its values", () => {
+    const snapshot = parseAcquiredTsArtifact(hls3Artifact());
+    assert.notEqual(snapshot, null);
+    assert.deepEqual({ ...snapshot! }, {
+      filePath: GOOD,
+      segmentType: "mpegts",
+      fileSize: 4_096,
+    });
+    assert.ok(Object.isFrozen(snapshot), "the snapshot is frozen too");
+  });
+
+  it("returns a SNAPSHOT, not the supplied object", () => {
+    const supplied = hls3Artifact();
+    const snapshot = parseAcquiredTsArtifact(supplied);
+    assert.notEqual(snapshot, null);
+    assert.notEqual(
+      snapshot as unknown,
+      supplied,
+      "the caller's object must not be handed back for a second read",
+    );
+  });
+
+  it("refuses accessor properties WITHOUT ever invoking them", () => {
+    // The original defect: a boolean guard validated one getter result and the
+    // caller then read the getter AGAIN to use it. `Object.freeze` makes an
+    // accessor non-configurable but does not turn it into a data property, so
+    // the second read could answer differently.
+    let reads = 0;
+    const trap = Object.freeze({
+      get filePath() {
+        reads += 1;
+        return reads === 1 ? GOOD : "/etc/shadow";
+      },
+      segmentType: "mpegts" as const,
+      fileSize: 4_096,
+    });
+    // The trap really is frozen, really is a plain object, and really does
+    // present exactly three own keys — everything except the data-property
+    // rule would wave it through.
+    assert.equal(Object.isFrozen(trap), true);
+    assert.equal(Object.getPrototypeOf(trap), Object.prototype);
+    assert.equal(Reflect.ownKeys(trap).length, 3);
+
+    assert.equal(parseAcquiredTsArtifact(trap), null);
+    assert.equal(reads, 0, "a hostile getter must not get to run at all");
+  });
+
+  it("refuses a setter-only and a get/set pair just as firmly", () => {
+    for (const descriptor of [
+      { get: () => GOOD, configurable: false, enumerable: true },
+      { set: () => {}, configurable: false, enumerable: true },
+      { get: () => GOOD, set: () => {}, configurable: false, enumerable: true },
+    ]) {
+      const object = Object.freeze(
+        Object.defineProperty(
+          { segmentType: "mpegts", fileSize: 4_096 },
+          "filePath",
+          descriptor,
+        ),
+      );
+      assert.equal(parseAcquiredTsArtifact(object), null, JSON.stringify(Object.keys(descriptor)));
+    }
+  });
+
+  it("refuses a symbol-keyed extra that Object.keys() cannot see", () => {
+    const hidden = Symbol("payload");
+    const object = Object.freeze({
+      filePath: GOOD,
+      segmentType: "mpegts" as const,
+      fileSize: 4_096,
+      [hidden]: "something this module has not reasoned about",
+    });
+    // The precise reason the old `Object.keys(value).length !== 3` check was
+    // not enough: it still says three.
+    assert.equal(Object.keys(object).length, 3);
+    assert.equal(Reflect.ownKeys(object).length, 4);
+    assert.equal(parseAcquiredTsArtifact(object), null);
+  });
+
+  it("refuses a NON-ENUMERABLE extra that Object.keys() cannot see either", () => {
+    const object = Object.freeze(
+      Object.defineProperty(
+        { filePath: GOOD, segmentType: "mpegts", fileSize: 4_096 },
+        "hidden",
+        { value: "payload", enumerable: false },
+      ),
+    );
+    assert.equal(Object.keys(object).length, 3);
+    assert.equal(Reflect.ownKeys(object).length, 4);
+    assert.equal(parseAcquiredTsArtifact(object), null);
+  });
+
+  it("refuses fields supplied through the prototype instead of owned", () => {
+    const prototype = { filePath: GOOD, segmentType: "mpegts", fileSize: 4_096 };
+
+    // Three unrelated own keys, with the expected fields inherited.
+    const decoy = Object.freeze(
+      Object.create(prototype, {
+        a: { value: 1, enumerable: true },
+        b: { value: 2, enumerable: true },
+        c: { value: 3, enumerable: true },
+      }),
+    );
+    assert.equal(Object.keys(decoy).length, 3, "the decoy does present three enumerable keys");
+    assert.equal((decoy as { filePath: string }).filePath, GOOD, "and inherits a valid path");
+    assert.equal(parseAcquiredTsArtifact(decoy), null);
+
+    // Everything inherited, nothing owned.
+    const empty = Object.freeze(Object.create(prototype));
+    assert.equal((empty as { fileSize: number }).fileSize, 4_096);
+    assert.equal(parseAcquiredTsArtifact(empty), null);
+  });
+
+  it("refuses anything that is not an ordinary frozen plain object", () => {
+    class Artifact {
+      readonly filePath = GOOD;
+      readonly segmentType = "mpegts" as const;
+      readonly fileSize = 4_096;
+    }
+    const nullProto = Object.assign(Object.create(null) as Record<string, unknown>, {
+      filePath: GOOD,
+      segmentType: "mpegts",
+      fileSize: 4_096,
+    });
+
+    for (const [label, value] of [
+      ["not frozen", { filePath: GOOD, segmentType: "mpegts", fileSize: 4_096 }],
+      ["class instance", Object.freeze(new Artifact())],
+      ["null prototype", Object.freeze(nullProto)],
+      ["array", Object.freeze([GOOD, "mpegts", 4_096])],
+      ["null", null],
+      ["undefined", undefined],
+      ["string", GOOD],
+      ["number", 4_096],
+    ] as const) {
+      assert.equal(parseAcquiredTsArtifact(value), null, label);
+    }
+  });
+
+  it("still checks the captured values themselves", () => {
+    for (const [label, value] of [
+      ["empty path", hls3Artifact("", 4_096)],
+      ["zero size", hls3Artifact(GOOD, 0)],
+      ["negative size", hls3Artifact(GOOD, -1)],
+      ["fractional size", hls3Artifact(GOOD, 1.5)],
+      ["NaN size", hls3Artifact(GOOD, Number.NaN)],
+      ["unsafe size", hls3Artifact(GOOD, Number.MAX_SAFE_INTEGER + 2)],
+      ["wrong segment type", Object.freeze({ filePath: GOOD, segmentType: "fmp4", fileSize: 16 })],
+      ["missing field", Object.freeze({ filePath: GOOD, segmentType: "mpegts" })],
+      ["extra field", Object.freeze({ filePath: GOOD, segmentType: "mpegts", fileSize: 16, x: 1 })],
+    ] as const) {
+      assert.equal(parseAcquiredTsArtifact(value), null, label);
+    }
+  });
+
+  it("an accessor-backed artifact never reaches the filesystem or a subprocess", () => {
+    // End to end, not just at the parser: the swap the getter is trying to
+    // perform cannot happen because the object is refused before any I/O.
+    const { calls } = harness([{ kind: "probe", stdout: doc(MPEGTS, ["video", "audio"]) }]);
+    let reads = 0;
+    const real = sourcePath();
+    const trap = Object.freeze({
+      get filePath() {
+        reads += 1;
+        return real;
+      },
+      segmentType: "mpegts" as const,
+      fileSize: 4_096,
+    });
+    return (async () => {
+      await writeFile(real, Buffer.alloc(4_096, 0x47));
+      await rejectsWith("PROCESSING_FAILED", async () => run({ source: trap }));
+      assert.equal(calls.length, 0);
+      assert.equal(reads, 0, "the getter was never invoked, not even once");
+    })();
+  });
+
+  it("uses the SNAPSHOT for the on-disk size comparison", async () => {
+    // The snapshot's fileSize is what the measured size must equal; the
+    // filesystem authority is unchanged by the correction.
+    const { calls } = harness(await happyScript());
+    await writeFile(sourcePath(), Buffer.alloc(4_096, 0x47));
+    await rejectsWith("PROCESSING_FAILED", async () =>
+      run({ source: hls3Artifact(sourcePath(), 4_095) }),
+    );
+    assert.equal(calls.length, 0);
+    const result = await run({ source: hls3Artifact(sourcePath(), 4_096) });
+    assert.equal(result.filePath, outputPath());
   });
 });
 
@@ -1564,6 +1773,34 @@ describe("HLS-4 processing: dormant, and inside its boundary", () => {
     // The caller's whole timeout never reaches a subprocess directly.
     assert.equal(code.includes("timeoutMs: timeoutMs"), false);
     assert.equal(code.includes("timeoutMs,\n"), false);
+  });
+
+  it("reads the caller's artifact object exactly once, at the parsing boundary", () => {
+    // HLS-4-ARTIFACT-SNAPSHOT-INTEGRITY-CORRECTION-001. Everything after the
+    // parse must use the module's own validated snapshot.
+    assert.equal(
+      code.split("request.source").length - 1,
+      1,
+      "the supplied artifact object is referenced exactly once",
+    );
+    assert.ok(code.includes("const source = parseAcquiredTsArtifact(request.source);"));
+    assert.equal(code.split("parseAcquiredTsArtifact(").length - 1, 2, "declared, and called once");
+    // No re-read of the original through any other spelling.
+    for (const forbidden of [
+      "request.source.",
+      "request[\"source\"]",
+      "source: requestSource",
+      "isAcquiredTsArtifact",
+    ]) {
+      assert.equal(code.includes(forbidden), false, `the original must not be re-read via ${forbidden}`);
+    }
+    // The parser itself reads each field through an own DATA descriptor and
+    // counts the COMPLETE own-property set.
+    assert.ok(code.includes("Reflect.ownKeys(value).length !== ACQUIRED_TS_FIELDS.length"));
+    assert.ok(code.includes("Object.getOwnPropertyDescriptor(value, field)"));
+    assert.ok(code.includes('if (!("value" in descriptor)) return null;'));
+    assert.ok(code.includes("Object.getPrototypeOf(value) !== Object.prototype"));
+    assert.equal(code.includes("Object.keys(value)"), false, "Object.keys cannot see the whole set");
   });
 
   it("arms exactly one deadline for the whole primitive", () => {
