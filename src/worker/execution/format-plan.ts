@@ -1,10 +1,16 @@
 import { z } from "zod";
 import { AppError } from "@/lib/errors";
 import {
+  SOURCE_QUALITY_MAX_HEIGHT,
   WorkerRequestedFormatIdSchema,
   type WorkerRequestedFormatId,
   type WorkerVideoMetadata,
 } from "@/shared/worker/contracts";
+import {
+  CLEAR_HLS_V1_MAX_PLAYLIST_URL_BYTES,
+  acceptClearHlsPlaylistUrl,
+  type ClearHlsMediaPlaylistSelections,
+} from "../hls/hls-source-selection.ts";
 import {
   GenericPresetSourceSchema,
   GenericSourceContainerSchema,
@@ -369,6 +375,162 @@ function refineProvenAudioExtraction(
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CLEAR-HLS EXECUTION PLANNING — HLS-6 §5/§6/§7
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * HLS-6: the CLOSED set of requested ids a clear-HLS plan may fulfil.
+ *
+ * Deliberately the SAME closed list a split merge may fulfil, reused rather than
+ * restated. Both mean exactly one thing — "the application's VIDEO ladder" — and
+ * a third copy of the nine rungs would be a third place to forget when the
+ * ladder changes. What the reuse must NOT be read as is any coupling to split
+ * merging: the two operations share a vocabulary, not a capability.
+ *
+ * `preset:audio` and `preset:mp3` are not members, so an HLS audio product is
+ * unrepresentable rather than merely refused — HLS v1 has no audio pairing and
+ * no independent HLS audio capability. `direct-original` is not a member either:
+ * HLS analysis advertises no concrete formats.
+ */
+export const ClearHlsVideoPresetIdSchema = z.enum(GENERIC_SPLIT_VIDEO_PRESET_IDS);
+export type ClearHlsVideoPresetId = z.infer<typeof ClearHlsVideoPresetIdSchema>;
+
+/**
+ * The ONE container a clear-HLS plan can ever deliver.
+ *
+ * Not a caller choice and not derived from the source: HLS-4 remuxes MPEG-TS
+ * into MP4 with a fixed argv that names the `mp4` muxer explicitly, so any other
+ * value here would be a claim the processing primitive cannot honour.
+ */
+export const CLEAR_HLS_TARGET_CONTAINER = "mp4" as const;
+
+/**
+ * HLS-6 §7: the EXECUTION-AUTHORITY view of one HLS-5 private selection.
+ *
+ * Structurally identical to `ClearHlsMediaPlaylistSelection`, and deliberately a
+ * distinct type: holding one of these means holding values this module already
+ * captured and validated, not a reference to an object analysis handed over.
+ */
+export type ClearHlsExecutionSource = {
+  readonly playlistUrl: string;
+  readonly height: number | null;
+};
+
+/** The two fields an HLS-5 selection carries, and the only two. */
+const CLEAR_HLS_SELECTION_FIELDS = ["playlistUrl", "height"] as const;
+
+/**
+ * HLS-6 §7: PARSE one HLS-5 private selection into a validated snapshot, or
+ * refuse it.
+ *
+ * ─── Why this exists at all ─────────────────────────────────────────────────
+ *
+ * An HLS execution plan is the authority for real network acquisition: the
+ * string inside it becomes the ONE URL HLS-2 requests. A structurally typed
+ * JavaScript object is not evidence of anything, so it is not trusted merely
+ * because TypeScript says it has the right shape.
+ *
+ * ─── Why it PARSES rather than answering yes/no ─────────────────────────────
+ *
+ * Exactly HLS-4's reasoning for `parseAcquiredTsArtifact()`. A boolean guard
+ * validates the values it read and hands the caller back the original object,
+ * which the caller must read AGAIN to use. `Object.freeze` makes accessor
+ * properties non-configurable but does NOT convert them into data properties, so
+ * a frozen object may still expose a getter that answers differently every time.
+ * Validating one URL and then requesting another is precisely the TOCTOU shape
+ * §7 forbids, and no care at the call site closes it.
+ *
+ * So this returns the CAPTURED PRIMITIVES. Past the call the caller holds a
+ * string and a number of its own, and the supplied object is never consulted
+ * again — there is nothing left for a getter to answer.
+ *
+ * ─── The representation it requires ─────────────────────────────────────────
+ *
+ * Exactly what `buildClearHlsMediaPlaylistSelections()` actually constructs,
+ * which is a frozen object literal:
+ *
+ *   - a non-null object, frozen;
+ *   - the ordinary `Object.prototype`, so a null-prototype object, a class
+ *     instance and a Proxy-backed exotic shape are all refused rather than
+ *     probed;
+ *   - an own property set of EXACTLY the two fields, counted with
+ *     `Reflect.ownKeys()` rather than `Object.keys()`: the latter sees only
+ *     enumerable STRING keys, so a symbol-keyed or non-enumerable extra would
+ *     sail past a length check while the object still carried payload this
+ *     module has not reasoned about;
+ *   - each field an own DATA property. An accessor is refused outright, and
+ *     refusing it never invokes it — `getOwnPropertyDescriptor()` reports a
+ *     getter without calling it.
+ *
+ * ─── What the captured values must then satisfy ─────────────────────────────
+ *
+ *   playlistUrl  a string that HLS-5's own static acceptance returns UNCHANGED.
+ *                The re-acceptance is what proves the retained value still
+ *                satisfies the accepted canonical/static URL policy — absolute
+ *                http(s), no credentials, a public host, within the byte
+ *                ceiling. The `===` comparison is load-bearing: a value that
+ *                would be accepted only AFTER canonicalisation is refused
+ *                rather than silently rewritten, so this function can never
+ *                validate one URL and hand back another.
+ *
+ *   height       `null`, or a whole number on HLS-5's observed-height contract
+ *                (1 … SOURCE_QUALITY_MAX_HEIGHT) — the exact bound
+ *                `observedDimension()` applies before a candidate can exist.
+ *
+ * Every refusal is `null`, with no interpolation anywhere: the sensitive URL is
+ * never echoed into a message, a log or a thrown error from here.
+ */
+export function snapshotClearHlsSelection(value: unknown): ClearHlsExecutionSource | null {
+  if (typeof value !== "object" || value === null) return null;
+  if (!Object.isFrozen(value)) return null;
+  if (Object.getPrototypeOf(value) !== Object.prototype) return null;
+
+  // The COMPLETE own-property set: strings and symbols, enumerable or not.
+  if (Reflect.ownKeys(value).length !== CLEAR_HLS_SELECTION_FIELDS.length) return null;
+
+  const captured: Record<string, unknown> = {};
+  for (const field of CLEAR_HLS_SELECTION_FIELDS) {
+    // An OWN descriptor, so an inherited value can never stand in for one.
+    const descriptor = Object.getOwnPropertyDescriptor(value, field);
+    if (descriptor === undefined) return null;
+    // A data descriptor carries `value`; an accessor carries `get`/`set`
+    // instead. This is the single read of the stored value, and there is no
+    // second one.
+    if (!("value" in descriptor)) return null;
+    captured[field] = descriptor.value;
+  }
+
+  const { playlistUrl, height } = captured;
+  if (typeof playlistUrl !== "string" || playlistUrl.length === 0) return null;
+  // Re-run HLS-5's own acceptance and require it to return this EXACT string.
+  if (acceptClearHlsPlaylistUrl(playlistUrl) !== playlistUrl) return null;
+
+  if (height !== null) {
+    if (typeof height !== "number") return null;
+    if (!Number.isSafeInteger(height)) return null;
+    if (height < 1 || height > SOURCE_QUALITY_MAX_HEIGHT) return null;
+  }
+
+  return Object.freeze({ playlistUrl, height });
+}
+
+/**
+ * The plan-shaped view of a validated selection.
+ *
+ * The bounds restate what `snapshotClearHlsSelection()` already proved, because
+ * the schema is what makes a hand-built plan unrepresentable rather than merely
+ * unbuilt. The string ceiling is in UTF-16 code units and HLS-5's is in UTF-8
+ * bytes, so this is a coarser outer bound on top of the exact one, never a
+ * replacement for it.
+ */
+const ClearHlsExecutionSourceSchema = z
+  .object({
+    playlistUrl: z.string().min(1).max(CLEAR_HLS_V1_MAX_PLAYLIST_URL_BYTES),
+    height: z.number().int().min(1).max(SOURCE_QUALITY_MAX_HEIGHT).nullable(),
+  })
+  .strict();
+
 export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
   z
     .object({
@@ -491,21 +653,62 @@ export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
       // explicit audio-preset refusal in `buildGenericSplitCandidate`, both
       // unchanged.
     }),
+  /**
+   * HLS-6 §5: a video preset fulfilled by ONE clear-HLS media playlist that
+   * VideoFetch acquires itself and remuxes, by stream copy, into MP4.
+   *
+   * `strategy: "yt-dlp"` is deliberate and is not a description of the
+   * transport. yt-dlp remains the fresh ANALYSIS/extractor strategy that
+   * produced the rendition, and the durable extractor vocabulary is exactly
+   * `direct | yt-dlp`; gaining an `"hls"` member would change a persisted,
+   * public-facing value for an internal acquisition detail. What is
+   * VideoFetch-owned is the acquisition itself, and that is what `operation`
+   * says: no yt-dlp subprocess runs on this path.
+   *
+   * NOT REACHABLE FROM ORDINARY PRODUCT DERIVATION. `deriveExecutionPlan()`
+   * never reads `hlsSelections` and never calls `deriveClearHlsExecutionPlan()`,
+   * so nothing a browser can ask for produces this variant. HLS-7 owns that
+   * activation decision.
+   *
+   * `source.playlistUrl` is SENSITIVE Worker-private data — routinely a signed,
+   * expiring location. It lives in this in-memory plan and in the HLS-2 request
+   * it becomes, and nowhere else: never durable, never logged, never in an
+   * error, never in a filename, object key or subprocess argv.
+   */
+  z
+    .object({
+      strategy: z.literal("yt-dlp"),
+      operation: z.literal("clear-hls-remux"),
+      // The CLOSED video ladder, stated positively. Audio presets and
+      // `direct-original` are not members, so neither needs refuting.
+      requestedFormatId: ClearHlsVideoPresetIdSchema,
+      source: ClearHlsExecutionSourceSchema,
+      // Fixed, never derived and never a caller choice.
+      targetContainer: z.literal(CLEAR_HLS_TARGET_CONTAINER),
+    })
+    .strict(),
 ]);
 
 export type GenericExecutionPlan = z.infer<typeof GenericExecutionPlanSchema>;
 
 /**
- * The plan variants that name EXACTLY ONE upstream source.
+ * The plan variants the ORDINARY yt-dlp single-source downloader can accept.
  *
  * The single-source acquisition primitive takes this rather than the whole
- * union, so "this function acquires one source" is a TYPE statement rather than
- * a comment — a `merge-split` plan cannot be handed to it even by mistake, and
- * a future edit cannot quietly teach it to acquire half a pair.
+ * union, so "this function acquires one source with yt-dlp" is a TYPE statement
+ * rather than a comment — a `merge-split` plan cannot be handed to it even by
+ * mistake, and a future edit cannot quietly teach it to acquire half a pair.
+ *
+ * HLS-6 subtracts `clear-hls-remux` here EXPLICITLY rather than leaving it to
+ * fall in by default. A clear-HLS plan names a media playlist, not a media
+ * file; its acquisition is VideoFetch's own fragment transport and runs no
+ * yt-dlp subprocess at all. Had it stayed a member, passing one to
+ * `downloadGenericOriginal()` would have type-checked, and the whole point of
+ * this partition is that such a call is a compile error.
  */
 export type GenericSingleSourceExecutionPlan = Exclude<
   GenericExecutionPlan,
-  { operation: "merge-split" }
+  { operation: "merge-split" } | { operation: "clear-hls-remux" }
 >;
 
 /**
@@ -520,6 +723,20 @@ export type GenericSingleSourceExecutionPlan = Exclude<
 export type GenericSplitExecutionPlan = Extract<
   GenericExecutionPlan,
   { operation: "merge-split" }
+>;
+
+/**
+ * HLS-6 §11: the ONE plan variant fulfilled by VideoFetch's own clear-HLS
+ * acquisition and remux — disjoint from both yt-dlp partitions above.
+ *
+ * The three types together exactly cover `GenericExecutionPlan`, and no plan is
+ * a member of two. That is what makes "an HLS plan cannot reach a progressive
+ * yt-dlp acquisition seam, and a progressive plan cannot reach the HLS one" a
+ * statement the compiler enforces rather than a convention tests hope for.
+ */
+export type ClearHlsExecutionPlan = Extract<
+  GenericExecutionPlan,
+  { operation: "clear-hls-remux" }
 >;
 
 /**
@@ -704,6 +921,78 @@ function buildGenericSplitCandidate(
   };
 }
 
+/**
+ * HLS-6 §8: derives the clear-HLS execution plan for ONE requested video preset.
+ *
+ * Deliberately a SEPARATE entry point from `deriveGenericExecutionPlan()`, and
+ * deliberately NOT called by `deriveExecutionPlan()`. That separation IS the
+ * HLS-6 dormancy invariant: the machinery below is executable, and the ordinary
+ * Product planner still has no way to reach it. HLS-7 is the reviewed change
+ * that wires it in.
+ *
+ * The steps, in order:
+ *
+ *   1. the requested id must be a member of the closed VIDEO vocabulary;
+ *   2. exactly that key must be an OWN data property of the FRESH HLS-5 map —
+ *      an inherited value, an accessor and a missing key are all refusals;
+ *   3. the selection is parsed into a module-owned frozen snapshot (§7);
+ *   4. the fixed MP4 plan is built from the snapshot and re-parsed by the plan
+ *      schema, which is the representation every later phase trusts.
+ *
+ * There is NO substitution, in any direction. A requested `preset:1080` whose
+ * HLS key is absent is `FORMAT_UNAVAILABLE`, even when `preset:720`,
+ * `preset:best` or a progressive source could have been delivered instead:
+ * silently handing back a rendition nobody asked for is exactly what the
+ * existing derivation rules forbid, and HLS is not an exception to them.
+ *
+ * The returned plan and its source are frozen. The snapshot is already detached
+ * from the caller's map — mutating either afterwards cannot change what this
+ * plan will acquire.
+ *
+ * Nothing here interpolates the playlist URL into an error: every refusal is a
+ * bare `FORMAT_UNAVAILABLE` carrying the canonical safe message.
+ */
+export function deriveClearHlsExecutionPlan(
+  hlsSelections: ClearHlsMediaPlaylistSelections,
+  requestedFormatId: string,
+): ClearHlsExecutionPlan {
+  const requested = ClearHlsVideoPresetIdSchema.safeParse(requestedFormatId);
+  if (!requested.success) throw new AppError("FORMAT_UNAVAILABLE");
+  const id = requested.data;
+
+  if (typeof hlsSelections !== "object" || hlsSelections === null) {
+    throw new AppError("FORMAT_UNAVAILABLE");
+  }
+
+  // EXACTLY this key, as an OWN DATA property. `getOwnPropertyDescriptor()`
+  // reports an accessor without invoking it, so a hostile getter on the map
+  // gets no execution either.
+  const entry = Object.getOwnPropertyDescriptor(hlsSelections, id);
+  if (entry === undefined || !("value" in entry)) throw new AppError("FORMAT_UNAVAILABLE");
+
+  const source = snapshotClearHlsSelection(entry.value);
+  if (source === null) throw new AppError("FORMAT_UNAVAILABLE");
+
+  const parsed = GenericExecutionPlanSchema.safeParse({
+    strategy: "yt-dlp",
+    operation: "clear-hls-remux",
+    requestedFormatId: id,
+    source,
+    targetContainer: CLEAR_HLS_TARGET_CONTAINER,
+  });
+  // The discriminant is re-read rather than assumed: this function's return
+  // type is the HLS partition, and the only honest way to produce one from a
+  // whole-union parse is to check which member came back.
+  if (!parsed.success || parsed.data.operation !== "clear-hls-remux") {
+    throw new AppError("FORMAT_UNAVAILABLE");
+  }
+
+  // `safeParse` already returned a fresh object rather than the input, so this
+  // freeze is about what the CALLER can do next, not about detaching from the
+  // analysis map.
+  return Object.freeze({ ...parsed.data, source: Object.freeze(parsed.data.source) });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // STRATEGY-AWARE WRAPPER — §19
 // ─────────────────────────────────────────────────────────────────────────────
@@ -746,6 +1035,25 @@ export function executionPlanRequiresProcessing(plan: ExecutionPlan): boolean {
  * The strategy comes from the FRESH execution analysis — never from the browser
  * and never from the durable `extractor` column, which records what a previous
  * attempt chose rather than what this one should (§42).
+ *
+ * ─── HLS-6 DORMANCY GATE ────────────────────────────────────────────────────
+ *
+ * This function derives ONLY the currently advertised Product capabilities:
+ * direct, progressive generic, and split. It does not read `hlsSelections`, it
+ * does not call `deriveClearHlsExecutionPlan()`, and it has no HLS fallback of
+ * any kind — not when progressive selection is absent, not for an HLS-only
+ * document, and not for a hand-written durable row.
+ *
+ * The parameter type is the enforcement, not the comment: `analysis` declares
+ * `strategy`, `video` and `selections` and NOTHING else, so an
+ * `ExecutionAnalysis` is accepted while its `hlsSelections` member is simply
+ * not visible here. An HLS-only document therefore fails the ordinary
+ * `meta.presets` / `selections` lookup below and yields `FORMAT_UNAVAILABLE`,
+ * and a mixed document is fulfilled from the progressive source that is
+ * actually advertised.
+ *
+ * HLS-6 assembles execution machinery but does not activate it. HLS-7 is the
+ * single reviewed change that consumes `hlsSelections` here.
  */
 export function deriveExecutionPlan(
   analysis: {

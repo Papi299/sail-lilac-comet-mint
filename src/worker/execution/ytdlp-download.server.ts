@@ -314,6 +314,12 @@ export function buildYtdlpDownloadArgv(opts: {
    * SPLIT-01: a SINGLE-source plan only. `merge-split` names two upstream
    * sources and has no single `source` to bind, so it is excluded by type
    * rather than by a runtime check that a future edit could drop.
+   *
+   * HLS-6: `clear-hls-remux` is excluded the same way, and it matters more here
+   * than anywhere else — its `source` holds a SIGNED media-playlist URL, and
+   * this function's whole job is to turn a source into yt-dlp argv. The
+   * partition is what makes "the playlist URL can never become a subprocess
+   * argument" a compile-time fact.
    */
   readonly plan: GenericSingleSourceExecutionPlan;
   readonly maxFileSizeBytes: number;
@@ -693,17 +699,28 @@ export async function downloadGenericOriginal(
   const checkedPlan = GenericExecutionPlanSchema.safeParse(plan);
   if (!checkedPlan.success) throw new AppError("FORMAT_UNAVAILABLE");
 
-  // SPLIT-01: this primitive acquires exactly ONE source, and says so. A
-  // `merge-split` plan names two, so it is REFUSED here rather than partially
-  // honoured — acquiring only the video half would hand the executor a silently
-  // audio-less artifact, which is precisely the substitution §17 forbids.
+  // SPLIT-01: this primitive acquires exactly ONE source with yt-dlp, and says
+  // so. A `merge-split` plan names two, so it is REFUSED here rather than
+  // partially honoured — acquiring only the video half would hand the executor a
+  // silently audio-less artifact, which is precisely the substitution §17
+  // forbids.
   //
-  // Unreachable today: no analysis path builds a split preset source, so
-  // `deriveGenericExecutionPlan` cannot produce this operation. The refusal is
-  // the type narrowing AND the guarantee: `downloadGenericSplitSources` is the
-  // ONLY acquisition API that consumes a pair, so a pair routed here by mistake
-  // fails closed instead of downloading half a video.
-  if (checkedPlan.data.operation === "merge-split") {
+  // HLS-6 adds the second refusal on the same terms. A `clear-hls-remux` plan
+  // names a media PLAYLIST, not a media file: it has no `source.container`, no
+  // declared size and no yt-dlp format selector, and its bytes are acquired by
+  // VideoFetch's own fragment transport with no yt-dlp subprocess at all. There
+  // is no partial honouring available even in principle.
+  //
+  // Unreachable through the executor, which binds this function behind
+  // `DownloadGenericOriginalFn` — typed on the single-source partition, so
+  // neither plan can be passed there at all. This parameter stays the WHOLE
+  // union deliberately: the refusal is then a behaviour that can be exercised
+  // rather than a type that merely forbids writing the call, and the existing
+  // tests do exercise it.
+  if (
+    checkedPlan.data.operation === "merge-split" ||
+    checkedPlan.data.operation === "clear-hls-remux"
+  ) {
     throw new AppError("FORMAT_UNAVAILABLE");
   }
   const validPlan = checkedPlan.data;

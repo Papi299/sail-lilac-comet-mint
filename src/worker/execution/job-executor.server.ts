@@ -20,11 +20,19 @@ import {
   deriveExecutionPlan,
   executionPlanRequestedFormatId,
   executionPlanTargetContainer,
+  type ClearHlsExecutionPlan,
   type DirectExecutionPlan,
   type ExecutionPlan,
   type GenericSingleSourceExecutionPlan,
   type GenericSplitExecutionPlan,
 } from "./format-plan.ts";
+import {
+  acquireSelectedClearHlsTs,
+  processAcquiredClearHlsTs,
+  type ClearHlsAcquiredTs,
+  type ClearHlsAcquisitionProgress,
+  type ClearHlsProcessedMp4,
+} from "../hls/hls-execution.server.ts";
 import {
   downloadGenericOriginal,
   downloadGenericSplitSources,
@@ -132,6 +140,68 @@ export type DownloadGenericSplitFn = (
 ) => Promise<GenericSplitSourcesDownload>;
 
 /**
+ * HLS-6: acquires the ONE clear-HLS rendition a `clear-hls-remux` plan names —
+ * HLS-2's bounded playlist preflight, then HLS-3's sequential fragment
+ * transport into one local MPEG-TS aggregate.
+ *
+ * Typed on the HLS plan partition, the exact complement of the two yt-dlp
+ * seams above, so none of the three can be asked to do another's job.
+ *
+ * It takes NO `url`. The two yt-dlp seams receive the job's stored page URL
+ * because yt-dlp re-extracts from it; clear-HLS acquisition does not, and must
+ * not: the only location it may contact is the media playlist inside the plan,
+ * chosen by THIS execution's fresh analysis. Passing the page URL here would be
+ * an input with no use and a second thing to keep honest.
+ *
+ * Like every acquisition seam it performs no local media work at all: no
+ * ffprobe, no FFmpeg, no container inspection. Remuxing is a separate seam,
+ * reachable only after `beginProcessing()` commits.
+ */
+export type AcquireClearHlsFn = (
+  plan: ClearHlsExecutionPlan,
+  workDir: string,
+  ctx: {
+    signal: AbortSignal;
+    onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
+  },
+) => Promise<ClearHlsAcquiredTs>;
+
+/**
+ * HLS-6: the clear-HLS MPEG-TS → MP4 stream-copy remux, dependency-injected for
+ * the same reason as `LocalProcessingFn` — so an acceptance test can observe the
+ * durable job status at the exact moment HLS-4 would be invoked.
+ *
+ * Deliberately a SEPARATE seam from `processLocally`. `convertMedia` takes a
+ * target from a four-member union and would happily be handed an MPEG-TS; this
+ * one takes the HLS-3 artifact by its own type and always produces MP4. Reusing
+ * the generic seam would have made "HLS never reaches convertMedia" a
+ * convention rather than a type.
+ */
+export type ProcessClearHlsFn = (opts: {
+  source: ClearHlsAcquiredTs;
+  workDir: string;
+  timeoutMs: number;
+  maxOutputBytes: number;
+  signal: AbortSignal;
+}) => Promise<ClearHlsProcessedMp4>;
+
+/**
+ * HLS-6 §24: the execution plan derivation, as an INTERNAL seam.
+ *
+ * Production is always `deriveExecutionPlan`, and `runtime.server.ts` never
+ * supplies an alternative — a structural test pins that. The seam exists only
+ * so HLS-6's dormant branch can be exercised end to end: the ordinary planner
+ * cannot produce a `clear-hls-remux` plan by design, so without it the HLS
+ * lifecycle would be untestable until HLS-7 activated it, which is exactly the
+ * wrong order to review these changes in.
+ *
+ * It is NOT a feature flag. It cannot be set by a user, a request, the
+ * environment or configuration; it changes no default behaviour; and injecting
+ * one does not activate HLS for anything else.
+ */
+export type DerivePlanForExecutionFn = typeof deriveExecutionPlan;
+
+/**
  * §12: local processing is dependency-injected so acceptance tests can observe
  * the durable job status at the exact moment FFmpeg would be invoked.
  */
@@ -189,6 +259,25 @@ type AcquiredExecutionMedia =
       readonly kind: "split";
       readonly plan: GenericSplitExecutionPlan;
       readonly sources: GenericSplitSourcesDownload;
+    }
+  /**
+   * HLS-6: one acquired clear-HLS MPEG-TS aggregate, bound to the plan it was
+   * acquired for — deliberately its OWN member rather than an
+   * `OriginalDownloadResult`.
+   *
+   * `OriginalDownloadResult` represents a DELIVERABLE source: a container and a
+   * MIME the upload lifecycle may act on. An MPEG-TS aggregate is neither. It is
+   * an intermediate that only becomes deliverable media once HLS-4 has remuxed
+   * it, so flattening it into that type — which would mean giving it
+   * `container: "mp4"` and `mime: "video/mp4"` before a single frame had been
+   * rewritten — would be a statement that is simply false at the moment it is
+   * made, and false in the one direction that could reach a user: it is exactly
+   * the value the filename, the Content-Type and the object metadata come from.
+   */
+  | {
+      readonly kind: "clear-hls";
+      readonly plan: ClearHlsExecutionPlan;
+      readonly source: ClearHlsAcquiredTs;
     };
 
 export type JobExecutorDeps = {
@@ -213,6 +302,18 @@ export type JobExecutorDeps = {
   /** SPLIT-04: the two-input merge. Production: SPLIT-02's `mergeSplitMedia`. */
   mergeSplit?: MergeSplitMediaFn;
   /**
+   * HLS-6: clear-HLS acquisition. Production: HLS-2 preflight + HLS-3 transport
+   * through the `worker/hls` orchestration seam.
+   */
+  acquireClearHls?: AcquireClearHlsFn;
+  /** HLS-6: the clear-HLS remux. Production: HLS-4 through the same seam. */
+  processClearHls?: ProcessClearHlsFn;
+  /**
+   * HLS-6 §24: plan derivation. Production: `deriveExecutionPlan` — the default,
+   * which `runtime.server.ts` never overrides.
+   */
+  derivePlanForExecution?: DerivePlanForExecutionFn;
+  /**
    * The plan-aware media-workspace preflight's reader (SPLIT-04, generalized by
    * MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001). Production: `statfs` on the workDir.
    */
@@ -224,10 +325,13 @@ export type JobExecutorDeps = {
 /**
  * Wraps a direct-only analyzer as a direct `ExecutionAnalysis`.
  *
- * Both private maps are empty literals. The executor names no HLS module at
- * all — it does not import the HLS-5 selection type, does not read
- * `hlsSelections`, and has no HLS branch — so the dormant channel stays
- * entirely upstream of it (HLS-6 is what changes that).
+ * Both private maps are empty literals. Direct media is one already-known file
+ * location, so it has no rendition ladder and no HLS shadow channel.
+ *
+ * HLS-6 gave the executor an HLS branch, but it did NOT give it a way to reach
+ * `hlsSelections`: the executor never reads that member, and the plan derivation
+ * it calls cannot see it either. The dormant channel still ends upstream of
+ * every decision made here.
  */
 function asDirectExecutionAnalysis(fn: AnalyzeDirectMediaFn): AnalyzeForExecutionFn {
   return async (url, signal) => ({
@@ -280,6 +384,9 @@ export class JobExecutor {
   private readonly downloadGenericSplit: DownloadGenericSplitFn;
   private readonly processLocally: LocalProcessingFn;
   private readonly mergeSplit: MergeSplitMediaFn;
+  private readonly acquireClearHls: AcquireClearHlsFn;
+  private readonly processClearHls: ProcessClearHlsFn;
+  private readonly derivePlanForExecution: DerivePlanForExecutionFn;
   private readonly availableWorkDirBytes: AvailableWorkDirBytesFn;
   private readonly genericLimits: GenericDownloadLimits;
 
@@ -325,6 +432,21 @@ export class JobExecutor {
         }));
     this.processLocally = deps.processLocally ?? convertMedia;
     this.mergeSplit = deps.mergeSplit ?? mergeSplitMedia;
+    // HLS-6: the two clear-HLS seams default to the `worker/hls` orchestration
+    // module, which owns the HLS-2/HLS-3/HLS-4 composition and maps their
+    // private failure vocabularies onto the existing public error codes.
+    this.acquireClearHls =
+      deps.acquireClearHls ??
+      ((plan, workDir, ctx) =>
+        acquireSelectedClearHlsTs({
+          plan,
+          workDir,
+          signal: ctx.signal,
+          ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
+        }));
+    this.processClearHls = deps.processClearHls ?? ((opts) => processAcquiredClearHlsTs(opts));
+    // HLS-6 §24: the ordinary Product planner, and nothing else, by default.
+    this.derivePlanForExecution = deps.derivePlanForExecution ?? deriveExecutionPlan;
     this.availableWorkDirBytes = deps.availableWorkDirBytes ?? availableBytesOnWorkDirFilesystem;
     this.genericLimits = deps.genericLimits ?? {
       maxFileSizeBytes: config.maxFileSize,
@@ -475,7 +597,7 @@ export class JobExecutor {
     // plan from trusted, runtime-validated metadata before any state advances.
     // On the generic path this also pins the single upstream source, so nothing
     // is left to be chosen later.
-    const plan = deriveExecutionPlan(analysis, job.formatId);
+    const plan = this.derivePlanForExecution(analysis, job.formatId);
 
     // §8: the strategy persisted here is EVIDENCE of what this execution
     // selected. It is never a browser field, never an input, and never a raw
@@ -515,7 +637,9 @@ export class JobExecutor {
     const producedPath =
       acquired.kind === "split"
         ? await this.executeSplitPlan(acquired.plan, acquired.sources, workDir, signal)
-        : await this.executePlan(acquired.plan, acquired.original, workDir, signal);
+        : acquired.kind === "clear-hls"
+          ? await this.executeClearHlsPlan(acquired.plan, acquired.source, workDir, signal)
+          : await this.executePlan(acquired.plan, acquired.original, workDir, signal);
 
     const validOut = await validateLocalOutput(workDir, producedPath);
 
@@ -566,12 +690,14 @@ export class JobExecutor {
    *   direct                      -> `downloadOriginal`
    *   generic keep/extract-*      -> `downloadGeneric`       (one source)
    *   generic `merge-split`       -> `downloadGenericSplit`  (two sources)
+   *   generic `clear-hls-remux`   -> `acquireClearHls`       (HLS-6)
    *
-   * The two generic seams are typed on complementary plan variants, so a pair
-   * cannot reach the single-source seam and a single source cannot reach the
-   * split one. Every seam runs while the durable status is `downloading`, and
-   * every result is checked here, at the module boundary, before processing
-   * may see it.
+   * The three generic seams are typed on MUTUALLY EXCLUSIVE plan partitions, so
+   * a pair cannot reach the single-source seam, a single source cannot reach the
+   * split one, and an HLS plan cannot reach either yt-dlp seam — nor they the
+   * HLS one. Every seam runs while the durable status is `downloading`, and
+   * every result is checked here, at the module boundary, before processing may
+   * see it.
    */
   private async acquire(
     url: string,
@@ -596,6 +722,38 @@ export class JobExecutor {
     }
 
     const generic = plan.generic;
+
+    // ── HLS-6: one clear-HLS rendition ──────────────────────────────────────
+    //
+    // Checked FIRST, and by equality rather than by exclusion, so this branch
+    // cannot be lost to a later edit of the conditions below it. The plan's own
+    // media playlist is the only location contacted: the job's stored page URL
+    // is deliberately not passed, because nothing on this path re-extracts.
+    //
+    // The progress gate is the executor's own, exactly as on the split path.
+    // HLS-3 already proves no callback can arrive after it returns — that is
+    // its commit-point invariant and it is relied on, not replaced — but this
+    // seam is injectable, so the executor states the guarantee for ANY
+    // implementation rather than inheriting it from one. Without it a late
+    // callback would lose the `downloading` CAS and abort a job that had
+    // already succeeded.
+    if (generic.operation === "clear-hls-remux") {
+      const report = this.makeProgressReporter(jobId);
+      let acquisitionLive = true;
+      let source: ClearHlsAcquiredTs;
+      try {
+        source = await this.acquireClearHls(generic, workDir, {
+          signal,
+          onProgress: (update) => {
+            if (acquisitionLive) report(update);
+          },
+        });
+      } finally {
+        acquisitionLive = false;
+      }
+      return { kind: "clear-hls", plan: generic, source: assertAcquiredClearHlsTs(source) };
+    }
+
     if (generic.operation !== "merge-split") {
       const original = await this.downloadGeneric(url, workDir, generic, {
         limits: this.genericLimits,
@@ -731,6 +889,51 @@ export class JobExecutor {
       throw new AppError("PROCESSING_FAILED");
     }
     return produced;
+  }
+
+  /**
+   * HLS-6: executes a `clear-hls-remux` plan — HLS-4's explicit ffprobe, fixed
+   * stream-copy remux and output validation, over the EXACT artifact HLS-3
+   * committed. Reached only after `beginProcessing()` committed, exactly like
+   * the one-input and two-input paths.
+   *
+   * Every argument is bound here and nowhere else: the acquired artifact
+   * verbatim (never a path rebuilt from a user value, and never re-analyzed in
+   * between), this job's server-owned workDir, the same application-owned
+   * processing timeout the other two paths use, and ONE normal product ceiling
+   * for the delivered artifact.
+   *
+   * `convertMedia` and `mergeSplitMedia` are unreachable from here: neither is
+   * named on this path, and the plan type could not be handed to either.
+   */
+  private async executeClearHlsPlan(
+    plan: ClearHlsExecutionPlan,
+    source: ClearHlsAcquiredTs,
+    workDir: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const produced = await this.processClearHls({
+      source,
+      workDir,
+      timeoutMs: config.downloadTimeoutMs,
+      maxOutputBytes: this.genericLimits.maxFileSizeBytes,
+      signal,
+    });
+
+    // The delivered artifact must be the remux's OWN output. Read through
+    // `unknown` rather than trusted by type: this is a module boundary, and an
+    // injected or alternate implementation handing the MPEG-TS aggregate back
+    // as if it had been processed is exactly the failure this refuses.
+    const container: unknown = (produced as { container?: unknown } | null)?.container;
+    if (container !== plan.targetContainer) throw new AppError("PROCESSING_FAILED");
+
+    const filePath: unknown = (produced as { filePath?: unknown } | null)?.filePath;
+    if (typeof filePath !== "string" || filePath.length === 0) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    if (filePath === source.filePath) throw new AppError("PROCESSING_FAILED");
+    if (!filePath.endsWith(`.${plan.targetContainer}`)) throw new AppError("PROCESSING_FAILED");
+    return filePath;
   }
 
   /**
@@ -893,6 +1096,38 @@ function isSplitMergeTarget(value: string): value is SplitMergeTarget {
 function assertSingleOriginal(raw: OriginalDownloadResult): OriginalDownloadResult {
   const filePath: unknown = (raw as { filePath?: unknown } | null)?.filePath;
   if (typeof filePath !== "string" || filePath.length === 0) {
+    throw new AppError("PROCESSING_FAILED");
+  }
+  return raw;
+}
+
+/**
+ * HLS-6: the executor's own proof that clear-HLS acquisition handed back what
+ * an MPEG-TS aggregate must be.
+ *
+ * HLS-3 already guarantees every property below, and HLS-4 re-validates the
+ * same artifact far more strictly before it goes anywhere near a subprocess.
+ * This is neither of those: it is the module boundary, where an injected or
+ * alternate implementation is not trusted merely because the production one is
+ * correct.
+ *
+ * The SAME OBJECT is returned, never a rebuilt copy. HLS-4's independent
+ * validation is defence in depth precisely because it re-reads what acquisition
+ * committed; handing it a reconstruction here would quietly remove that.
+ */
+function assertAcquiredClearHlsTs(raw: ClearHlsAcquiredTs): ClearHlsAcquiredTs {
+  const candidate = raw as { filePath?: unknown; segmentType?: unknown; fileSize?: unknown } | null;
+  if (typeof candidate !== "object" || candidate === null) {
+    throw new AppError("PROCESSING_FAILED");
+  }
+  // An MPEG-TS aggregate, stated as such. Anything else must never be allowed
+  // to continue as if it were one.
+  if (candidate.segmentType !== "mpegts") throw new AppError("PROCESSING_FAILED");
+  if (typeof candidate.filePath !== "string" || candidate.filePath.length === 0) {
+    throw new AppError("PROCESSING_FAILED");
+  }
+  const fileSize = candidate.fileSize;
+  if (typeof fileSize !== "number" || !Number.isSafeInteger(fileSize) || fileSize <= 0) {
     throw new AppError("PROCESSING_FAILED");
   }
   return raw;
