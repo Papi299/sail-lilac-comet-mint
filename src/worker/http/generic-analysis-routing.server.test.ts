@@ -276,6 +276,7 @@ describe("routing: YTDLP_ENABLED=true (§53)", () => {
             },
           },
         },
+        hlsSelections: {},
       }),
     });
 

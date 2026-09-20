@@ -148,7 +148,7 @@ async function runPolicy(
     analyzeGeneric: async () => {
       counters.generic += 1;
       opts.onTrace?.("generic");
-      return { video: genericMeta(), selections: SELECTIONS };
+      return { video: genericMeta(), selections: SELECTIONS, hlsSelections: {} };
     },
   });
 
