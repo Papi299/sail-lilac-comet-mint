@@ -177,15 +177,47 @@ one AAC stream of the fixture's duration. Compressed packet identity between
 MPEG-TS and MP4 is deliberately **not** claimed: Annex-B → AVCC framing may
 change in a container stream copy.
 
-### The hostname privacy rule
+### Privacy placement
 
-The Product legitimately echoes the page the user submitted — `webpageUrl` is
-that URL, `source` its hostname, and the durable row keeps both because the job
-re-analyzes its own URL. That echo is ordinary Product metadata, not HLS
-provenance. Every OTHER host:port/path use of the fixture hostname is a
-failure, and every marker, the raw upstream id, `m3u8`, `sig=`, fragment names,
-`playlistUrl`, `hlsSelections` and `clear-hls-remux` are refused on the public
-and durable surfaces regardless.
+There is one fixture hostname, and the Product legitimately echoes the page the
+user submitted: the browser-safe analysis carries it as `webpageUrl` and its
+hostname as `source`, and the durable row keeps `url` and `source` because the
+job re-analyzes its own URL. Those echoes are ordinary Product metadata, not
+HLS acquisition provenance, so they are admitted — but only as **exact
+field/value pairs**, validated structurally by field path
+(`validateStructuredPrivacy`, `validateDurablePrivacy`):
+
+| Surface | Admitted, exactly | Everything else |
+| :--- | :--- | :--- |
+| browser-safe analysis | `webpageUrl` = the submitted page URL; `source` = the fixture hostname | the hostname in any other field or key fails |
+| `sourceQuality` | nothing | the hostname fails anywhere |
+| `worker_jobs` rows (each of the 3 expected jobs, and only those) | `url` = the submitted page URL; `source` = the fixture hostname | the hostname in any other column fails |
+| every other table | nothing | the hostname fails anywhere |
+| job views | `source` = the fixture hostname (the view has no `url` field) | the hostname in any other field fails |
+| upload filename, quality, mime, object key, content disposition, content type | nothing | the hostname fails anywhere |
+| acceptance trace, sanitized fixture and transport ledgers | nothing | the hostname fails anywhere |
+| the evidence record itself | nothing | the builder refuses the hostname and any URL |
+
+An admitted field must be present and hold exactly its value: a page URL with
+any added query, fragment, path or suffix, another port or path, or a hostname
+with any suffix, prefix or letter-case change fails. Hostnames are matched in
+any letter case. There is no "bare hostname anywhere" or "page URL prefix"
+allowance.
+
+Every structured surface, admitted fields included, is also scanned for the
+HLS acquisition needles (`HLS08_PRIVACY_NEEDLES`): every private marker, the
+raw upstream format id, `m3u8`, `sig=`, the master and media-playlist routes,
+the key name, fragment names, `playlistUrl`, `hlsSelections` and
+`clear-hls-remux`. Findings carry the surface, a sanitized field path and a
+label — never a scanned value.
+
+**Raw SQLite bytes are different.** They have no fields, and a SQLite file
+legitimately stores the submitted page URL and `source` (possibly more than
+once, in free pages or the WAL). The raw database, WAL and shared-memory files
+are therefore scanned for the HLS acquisition needles **only**
+(`scanRawPrivacyNeedles`); no claim is made that the page URL or hostname is
+absent from them. The structured rows above are the authority on where the
+hostname is stored.
 
 ---
 
@@ -239,7 +271,15 @@ stopping it again afterwards is the operator's step.
 
 ## Evidence
 
-Schema `hls08-deterministic-full-path-01` (`lib/hls-evidence.mjs`). There is no
+Schema `hls08-deterministic-full-path-02` (`lib/hls-evidence.mjs`).
+
+| Schema | Meaning |
+| :--- | :--- |
+| `-01` | **Historical, not accepted for HLS-8 closure.** The first record, from PR #78 head `da4f63d9…`. Its hostname/page-echo placement check was too permissive: it admitted any hostname occurrence not followed by `:` or `/` (so `<host>.evil`, `<host>X`, `<host>?x=1`, or the bare hostname in any unrelated field) and any occurrence followed by the page route (so `<page>?x=1`, `<page>#x`, `<page>/extra`). |
+| `-02` | Field-aware privacy placement, as described above. The single durable privacy check of `-01` is split into exact-echo, rows, views and raw-bytes checks, and the public exact echo is its own check. |
+
+`-01` records are never rewritten or re-read under `-02`; the `-02` validator
+refuses them on the schema. There is no
 partial PASS: every name in `HLS08_MANDATORY_CHECKS` must be recorded exactly
 once and pass, and every other recorded check must pass. The builder is an
 allowlist, refuses raw-material keys (`stderr`, `stdout`, `argv`,

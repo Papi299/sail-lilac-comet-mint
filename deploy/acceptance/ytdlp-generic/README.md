@@ -201,8 +201,8 @@ deliberately does **not** prove.
 | `lib/hls-container.mjs` | — | Overlay Dockerfile and every `docker` argv; `--network none`, the one `--add-host`, the structural posture check. |
 | `lib/hls-fixture-url.mjs` | — | The acceptance hostname, route table, private markers, and the exact submitted-page validator. |
 | `lib/hls-safe-http-transport.mjs` | — | The acceptance DNS answer and loopback socket under the Product's real safe-HTTP policy. |
-| `lib/hls-observers.mjs` | — | Subprocess observer, remux-policy reader, privacy scanning. |
-| `lib/hls-evidence.mjs` | — | The `hls08-deterministic-full-path-01` record and its PASS gate. |
+| `lib/hls-observers.mjs` | — | Subprocess observer, remux-policy reader, field-aware privacy placement. |
+| `lib/hls-evidence.mjs` | — | The `hls08-deterministic-full-path-02` record and its PASS gate; `-01` records are historical and not accepted. |
 | `fixtures/hls-media.mjs` | — | The FFmpeg HLS fixture recipe, master, page and negative playlists. |
 | `fixtures/hls-server.mjs` | inside the acceptance container, loopback only | The closed-route fixture service with its sanitized ledger. |
 

@@ -13,6 +13,17 @@
 
 import { basename, dirname, isAbsolute } from "node:path";
 
+import {
+  HLS08_PRIVATE_MARKERS,
+  HLS08_PRIVATE_MARKER_PREFIX,
+  HLS08_RAW_FORMAT_NAME,
+  HLS_FRAGMENT_FAMILIES,
+  HLS_KEY_ROUTE,
+  HLS_MASTER_ROUTE,
+  HLS_MEDIA_ROUTE,
+  HLS_MEDIA_SIGNATURE_PARAMETER,
+} from "./hls-fixture-url.mjs";
+
 /** The spawn classes the ledger distinguishes. */
 export const SPAWN_KINDS = Object.freeze([
   "ytdlp-runtime-probe",
@@ -199,60 +210,209 @@ export async function withProcessObserver(setProcessRunnerTestHooks, observer, f
   }
 }
 
-// ── Privacy scanning ───────────────────────────────────────────────────────
+// ── Privacy placement ──────────────────────────────────────────────────────
+//
+// Two different questions, answered by two different tools.
+//
+// WHERE may the fixture hostname appear? Only a structured value can answer
+// that, because only a structured value has fields. The Product legitimately
+// echoes the page the user submitted: the browser-safe analysis carries it as
+// `webpageUrl` and its hostname as `source`, and the durable row keeps `url`
+// and `source` because the job re-analyzes its own URL. Those are ordinary
+// Product echoes, not HLS acquisition provenance. `validateStructuredPrivacy`
+// admits EXACTLY those field/value pairs — each named by its path and required
+// to hold its exact value — and refuses the hostname in every other field and
+// key. There is no "bare hostname anywhere" or "page URL prefix" allowance.
+//
+// Is any HLS acquisition provenance present? That is a needle question, and it
+// can be asked of any text — including raw SQLite bytes, which are NOT
+// field-delimited and legitimately contain the page URL and `source`.
+// `scanRawPrivacyNeedles` makes no hostname claim at all; the structured rows
+// are the authority on where the hostname is stored.
 
 /**
- * Where one surface mentions the fixture hostname in a way that is NOT the
- * Product's ordinary echo of the submitted page.
- *
- * The Product legitimately echoes the page the user submitted: `webpageUrl`
- * is that URL, `source` is its hostname, and the durable row keeps both (the
- * job must re-analyze its own URL). That echo is ordinary Product metadata,
- * not HLS provenance. Every OTHER hostname occurrence that begins a
- * host:port/path reference — a media playlist, a fragment, a master — is a
- * leak. So an occurrence is admitted only when it is immediately followed by
- * exactly `:<port><page route>` (the page URL), or is not followed by `:` or
- * `/` at all (a bare hostname, i.e. the `source` echo).
- *
- * What FOLLOWS an admitted page echo is deliberately not inspected: raw SQLite
- * records store column values back to back, so the byte after the page URL is
- * the next column's data. The page route is not a prefix of any HLS route, and
- * every private marker, the raw upstream id and the playlist extension are
- * scanned for independently, so nothing HLS-private can hide behind the echo.
- *
- * Returns the number of unadmitted occurrences; 0 means clean.
+ * HLS acquisition provenance, by label. Findings report the LABEL, never the
+ * needle. Every one is refused on every scanned surface and admitted nowhere.
+ * Needles match exactly as the harness authored them.
  */
-export function unadmittedHostnameOccurrences(text, { hostname, port, pageRoute }) {
-  if (typeof text !== "string" || text.length === 0) return 0;
-  const pageTail = `:${port}${pageRoute}`;
-  let bad = 0;
-  let from = 0;
-  for (;;) {
-    const at = text.indexOf(hostname, from);
-    if (at < 0) break;
-    const rest = text.slice(at + hostname.length);
-    const pageEcho = rest.startsWith(pageTail);
-    const bare = !rest.startsWith(":") && !rest.startsWith("/");
-    if (!pageEcho && !bare) bad += 1;
-    from = at + hostname.length;
+export const HLS08_PRIVACY_NEEDLES = Object.freeze({
+  "private-marker-prefix": HLS08_PRIVATE_MARKER_PREFIX,
+  "browser-marker": HLS08_PRIVATE_MARKERS.browser,
+  "execution-marker": HLS08_PRIVATE_MARKERS.execution,
+  "encrypted-marker": HLS08_PRIVATE_MARKERS.encrypted,
+  "fragment-marker": HLS08_PRIVATE_MARKERS["fragment-failure"],
+  "no-ffmpeg-marker": HLS08_PRIVATE_MARKERS["no-ffmpeg"],
+  "raw-hls-format-name": HLS08_RAW_FORMAT_NAME,
+  "playlist-extension": "m3u8",
+  "signature-parameter": `${HLS_MEDIA_SIGNATURE_PARAMETER}=`,
+  "master-playlist-route": HLS_MASTER_ROUTE.replace(/\.m3u8$/, ""),
+  "media-playlist-route": HLS_MEDIA_ROUTE.replace(/\.m3u8$/, ""),
+  "key-name": HLS_KEY_ROUTE.split("/").pop().replace(/\.bin$/, ""),
+  // `seg-` is also the tail of the failure family's `fail-seg-`.
+  "fragment-name": HLS_FRAGMENT_FAMILIES.positive,
+  "playlistUrl-field": "playlistUrl",
+  "hlsSelections-field": "hlsSelections",
+  "clear-hls-operation": "clear-hls-remux",
+});
+
+/** An admitted field that is absent, not a string, or not its exact value. */
+export const HLS08_ADMISSION_FINDING = "admitted-field-not-the-exact-echo";
+/** The fixture hostname in any field or key other than an exact admitted echo. */
+export const HLS08_HOSTNAME_FINDING = "fixture-hostname-outside-an-admitted-field";
+
+const PLAIN_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+
+function needleLabels(text, needles) {
+  const labels = [];
+  for (const [label, needle] of Object.entries(needles)) {
+    if (typeof needle !== "string" || needle.length === 0) throw new TypeError(`empty privacy needle: ${label}`);
+    if (text.includes(needle)) labels.push(label);
   }
-  return bad;
+  return labels;
+}
+
+/** Hostnames are case-insensitive, so the hostname is found in any letter case. */
+function containsHostname(text, hostname) {
+  return text.toLowerCase().includes(hostname.toLowerCase());
+}
+
+/** A key as it may appear in a finding: only a plain identifier that carries no needle. */
+function safeSegment(key, needles, hostname) {
+  return PLAIN_KEY.test(key) && needleLabels(key, needles).length === 0 && !containsHostname(key, hostname)
+    ? key
+    : "<key>";
 }
 
 /**
- * Scans named surfaces for private needles and unadmitted hostname use.
- * Returns the SURFACE NAMES and needle LABELS that failed — never the needles.
+ * Field-aware privacy validation of ONE structured surface. Pure.
+ *
+ * `admitted` maps a field path (`webpageUrl`, `source`, `presets[0].label`) to
+ * the exact string that field must hold. Each admitted path must be present
+ * and hold exactly that value, or the surface fails with
+ * `HLS08_ADMISSION_FINDING`. An admitted field holding its exact value is the
+ * ONLY place the fixture hostname may appear: the hostname in any other string
+ * value or object key, in any letter case, fails with `HLS08_HOSTNAME_FINDING`.
+ * Every string value and key — admitted or not — is also scanned for every
+ * needle.
+ *
+ * Returns `{ surface, field, finding }` records: the surface name, a sanitized
+ * field path and a label. A scanned value never leaves this function.
  */
-export function scanPrivacySurfaces(surfaces, { needles, hostname, port, pageRoute }) {
+export function validateStructuredPrivacy(surface, value, { needles, hostname, admitted = {} }) {
+  if (typeof hostname !== "string" || hostname.length === 0) throw new TypeError("a fixture hostname is required");
+  const admittedPaths = new Map(Object.entries(admitted));
+  for (const [path, expected] of admittedPaths) {
+    if (typeof expected !== "string" || expected.length === 0) throw new TypeError(`admitted field ${path} needs an exact value`);
+  }
   const findings = [];
-  for (const [surface, text] of Object.entries(surfaces)) {
-    const value = typeof text === "string" ? text : String(text ?? "");
-    for (const [label, needle] of Object.entries(needles)) {
-      if (value.includes(needle)) findings.push({ surface, needle: label });
+  const exact = new Set();
+  const seen = new WeakSet();
+  const scanText = (text, field, admittedValue) => {
+    for (const label of needleLabels(text, needles)) findings.push({ surface, field, finding: label });
+    if (admittedValue !== undefined && text === admittedValue) {
+      exact.add(field);
+      return;
     }
-    if (unadmittedHostnameOccurrences(value, { hostname, port, pageRoute }) > 0) {
-      findings.push({ surface, needle: "fixture-hostname-outside-the-page-echo" });
+    if (containsHostname(text, hostname)) findings.push({ surface, field, finding: HLS08_HOSTNAME_FINDING });
+  };
+  const walk = (node, path) => {
+    const field = path === "" ? "<root>" : path;
+    if (typeof node === "string") {
+      scanText(node, field, admittedPaths.get(path));
+      return;
     }
+    if (node instanceof Uint8Array) {
+      scanText(Buffer.from(node).toString("latin1"), field, undefined);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    if (seen.has(node)) {
+      findings.push({ surface, field, finding: "cyclic-value" });
+      return;
+    }
+    seen.add(node);
+    if (Array.isArray(node)) {
+      node.forEach((item, i) => walk(item, `${path}[${i}]`));
+      return;
+    }
+    for (const key of Object.keys(node)) {
+      const segment = safeSegment(key, needles, hostname);
+      const childPath = path === "" ? segment : `${path}.${segment}`;
+      // A key is never an admitted echo.
+      scanText(key, childPath, undefined);
+      walk(node[key], childPath);
+    }
+  };
+  walk(value, "");
+  for (const path of admittedPaths.keys()) {
+    if (!exact.has(path)) findings.push({ surface, field: path, finding: HLS08_ADMISSION_FINDING });
   }
   return findings;
+}
+
+/**
+ * Needle-only scan of text that has no fields: raw SQLite database bytes. Pure.
+ *
+ * It answers only "is HLS acquisition provenance present?" and makes NO claim
+ * about the fixture hostname. A SQLite file legitimately stores the submitted
+ * page URL and `source`, possibly more than once (free pages, the WAL), and
+ * its bytes cannot be attributed to a column. The structured rows are the
+ * authority on where the hostname is stored — see `validateDurablePrivacy`.
+ */
+export function scanRawPrivacyNeedles(surface, bytes, { needles }) {
+  const text = typeof bytes === "string" ? bytes : Buffer.from(bytes).toString("latin1");
+  return needleLabels(text, needles).map((finding) => ({ surface, field: null, finding }));
+}
+
+/**
+ * Field-aware validation of the durable state. Pure.
+ *
+ * @param {object} input
+ * @param {Record<string, object[]>} input.tables every table of the database, by name, as rows
+ * @param {Array<object|null>} input.views the Product's job view of each expected job
+ * @param {string[]} input.expectedJobIds the jobs this run created
+ *
+ * `worker_jobs` must hold exactly the expected jobs, and each row admits only
+ * `url` = the exact submitted page URL and `source` = the exact fixture
+ * hostname. Each job view admits only `source` = the exact fixture hostname
+ * (the view has no `url` field). Every other table admits nothing.
+ */
+export function validateDurablePrivacy({ tables, views, expectedJobIds, pageUrl, hostname, needles }) {
+  const echo = [];
+  const rows = [];
+  const viewFindings = [];
+  const split = (findings, into) => {
+    for (const f of findings) (f.finding === HLS08_ADMISSION_FINDING ? echo : into).push(f);
+  };
+  const jobRows = tables.worker_jobs ?? [];
+  const rowIds = jobRows.map((r) => r.job_id).sort();
+  const expected = [...expectedJobIds].sort();
+  const jobRowsAreTheExpectedJobs =
+    expected.length > 0 && rowIds.length === expected.length && rowIds.every((id, i) => id === expected[i]);
+  for (const [table, tableRows] of Object.entries(tables)) {
+    const name = safeSegment(table, needles, hostname);
+    const admitted = table === "worker_jobs" ? { url: pageUrl, source: hostname } : {};
+    tableRows.forEach((row, i) => {
+      split(validateStructuredPrivacy(`${name}[${i}]`, row, { needles, hostname, admitted }), rows);
+    });
+  }
+  const viewsAreTheExpectedJobs =
+    views.length === expected.length && views.every((v, i) => v !== null && typeof v === "object" && v.jobId === expectedJobIds[i]);
+  views.forEach((view, i) => {
+    split(validateStructuredPrivacy(`job view ${i}`, view, { needles, hostname, admitted: { source: hostname } }), viewFindings);
+  });
+  return { jobRowsAreTheExpectedJobs, viewsAreTheExpectedJobs, echo, rows, views: viewFindings };
+}
+
+/** Splits one surface's findings into exact-echo failures and everything else. */
+export function partitionPrivacyFindings(findings) {
+  return {
+    echo: findings.filter((f) => f.finding === HLS08_ADMISSION_FINDING),
+    other: findings.filter((f) => f.finding !== HLS08_ADMISSION_FINDING),
+  };
+}
+
+/** `surface:field:finding` — labels only, safe for a check detail. */
+export function describePrivacyFindings(findings) {
+  return findings.map((f) => (f.field === null ? `${f.surface}:${f.finding}` : `${f.surface}:${f.field}:${f.finding}`)).join(",");
 }

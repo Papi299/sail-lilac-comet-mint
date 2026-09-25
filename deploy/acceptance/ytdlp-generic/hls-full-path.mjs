@@ -116,12 +116,9 @@ import {
 } from "./fixtures/hls-media.mjs";
 import { createHlsFixtureService } from "./fixtures/hls-server.mjs";
 import {
-  HLS08_PRIVATE_MARKERS,
   HLS08_RAW_FORMAT_ID,
-  HLS08_RAW_FORMAT_NAME,
   HLS_FIXTURE_HOSTNAME,
   HLS_FIXTURE_LOOPBACK,
-  HLS_PAGE_ROUTE,
   HLS_SYNTHETIC_PUBLIC_ADDRESS,
   classifyHlsFixturePath,
   createHlsPageUrlValidator,
@@ -135,14 +132,21 @@ import {
   withHlsSafeHttpTransport,
 } from "./lib/hls-safe-http-transport.mjs";
 import {
+  HLS08_ADMISSION_FINDING,
+  HLS08_HOSTNAME_FINDING,
+  HLS08_PRIVACY_NEEDLES,
   HLS_AGGREGATE_FILE_NAME,
   HLS_OUTPUT_FILE_NAME,
   HLS_OUTPUT_PARTIAL_FILE_NAME,
   classifyProductSpawn,
   createProcessObserver,
+  describePrivacyFindings,
   evaluateHlsRemuxArgv,
   inputOperand,
-  scanPrivacySurfaces,
+  partitionPrivacyFindings,
+  scanRawPrivacyNeedles,
+  validateDurablePrivacy,
+  validateStructuredPrivacy,
   withProcessObserver,
 } from "./lib/hls-observers.mjs";
 import { HLS08_ACCEPTED_BASE, assertNonDeployableTag } from "./lib/hls-container.mjs";
@@ -1185,29 +1189,33 @@ async function main(argv) {
     };
 
     // ── public privacy ──────────────────────────────────────────────────────
-    const needles = {
-      "browser-marker": HLS08_PRIVATE_MARKERS.browser,
-      "execution-marker": HLS08_PRIVATE_MARKERS.execution,
-      "encrypted-marker": HLS08_PRIVATE_MARKERS.encrypted,
-      "fragment-marker": HLS08_PRIVATE_MARKERS["fragment-failure"],
-      "no-ffmpeg-marker": HLS08_PRIVATE_MARKERS["no-ffmpeg"],
-      "raw-hls-format-name": HLS08_RAW_FORMAT_NAME,
-      "playlist-extension": "m3u8",
-      "signature-parameter": "sig=",
-      "fragment-name": "seg-",
-      "playlistUrl-field": "playlistUrl",
-      "hlsSelections-field": "hlsSelections",
-      "clear-hls-operation": "clear-hls-remux",
-    };
-    const scanOpts = { needles, hostname: HLS_FIXTURE_HOSTNAME, port, pageRoute: HLS_PAGE_ROUTE };
-    const publicFindings = scanPrivacySurfaces({ "browser-safe analysis": JSON.stringify(publicMeta) }, scanOpts);
+    // Field-aware: `webpageUrl` and `source` are the only admitted echoes, each
+    // required to hold its exact value; the hostname anywhere else fails.
+    const needles = HLS08_PRIVACY_NEEDLES;
+    const privacyOpts = { needles, hostname: HLS_FIXTURE_HOSTNAME };
+    const publicPrivacy = partitionPrivacyFindings(
+      validateStructuredPrivacy("browser-safe analysis", publicMeta, {
+        ...privacyOpts,
+        admitted: { webpageUrl: pageUrl, source: HLS_FIXTURE_HOSTNAME },
+      }),
+    );
+    checks.record(
+      "privacy/public-page-echo-is-exact",
+      publicPrivacy.echo.length === 0,
+      describePrivacyFindings(publicPrivacy.echo),
+    );
     checks.record(
       "privacy/public-analysis-carries-no-hls-provenance",
-      publicFindings.length === 0,
-      publicFindings.map((f) => `${f.surface}:${f.needle}`).join(","),
+      publicPrivacy.other.length === 0,
+      describePrivacyFindings(publicPrivacy.other),
     );
-    const sqFindings = scanPrivacySurfaces({ sourceQuality: JSON.stringify(quality) }, scanOpts);
-    checks.record("privacy/source-quality-carries-no-hls-provenance", sqFindings.length === 0 && quality !== null);
+    // sourceQuality needs no echo: the hostname is refused there entirely.
+    const sqFindings = validateStructuredPrivacy("sourceQuality", quality, privacyOpts);
+    checks.record(
+      "privacy/source-quality-carries-no-hls-provenance",
+      sqFindings.length === 0 && quality !== null,
+      describePrivacyFindings(sqFindings),
+    );
 
     // ── fresh execution analysis ────────────────────────────────────────────
     checks.record("executor/only-the-fresh-analysis-seam-injected", sameList(job.depsKeys, ["analyzeForExecution"]));
@@ -1746,69 +1754,112 @@ async function main(argv) {
     for (const name of (await readdir(dbDir)).sort()) {
       if (name.startsWith("worker.sqlite")) rawDbBytes.push((await readFile(join(dbDir, name))).toString("latin1"));
     }
-    const allRows = db.prepare("SELECT * FROM worker_jobs").all();
-    const views = [positive.job, encrypted, fragment].map((r) => store.getJob(r.jobId));
-    const durableFindings = scanPrivacySurfaces(
-      {
-        "raw sqlite bytes": rawDbBytes.join("\n"),
-        "durable rows": JSON.stringify(allRows),
-        "job views": JSON.stringify(views),
-      },
-      scanOpts,
+    // Structured durable state is the authority on WHERE the hostname is
+    // stored: every table, row by row, field by field. `worker_jobs` admits
+    // only `url` and `source`, each exact; job views admit only `source`.
+    const tableNames = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+      .all()
+      .map((r) => r.name);
+    const tables = {};
+    for (const name of tableNames) {
+      tables[name] = db.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all();
+    }
+    const expectedJobIds = [positive.job, encrypted, fragment].map((r) => r.jobId);
+    const views = expectedJobIds.map((jobId) => store.getJob(jobId));
+    const durable = validateDurablePrivacy({
+      tables, views, expectedJobIds, pageUrl, hostname: HLS_FIXTURE_HOSTNAME, needles,
+    });
+    checks.record(
+      "privacy/durable-page-echo-is-exact",
+      durable.jobRowsAreTheExpectedJobs && durable.viewsAreTheExpectedJobs && durable.echo.length === 0,
+      describePrivacyFindings(durable.echo),
     );
     checks.record(
-      "privacy/durable-state-carries-no-hls-provenance",
-      durableFindings.length === 0 && rawDbBytes.length >= 1 && allRows.length === 3,
-      durableFindings.map((f) => `${f.surface}:${f.needle}`).join(","),
+      "privacy/durable-rows-carry-no-hls-provenance",
+      durable.rows.length === 0 && (tables.worker_jobs ?? []).length === expectedJobIds.length,
+      describePrivacyFindings(durable.rows),
     );
-    const uploadFindings = scanPrivacySurfaces(
+    checks.record(
+      "privacy/job-views-carry-no-hls-provenance",
+      durable.views.length === 0 && durable.viewsAreTheExpectedJobs,
+      describePrivacyFindings(durable.views),
+    );
+    // Raw bytes have no fields and legitimately hold the page URL and
+    // `source`, so they are scanned for HLS acquisition provenance only.
+    const rawFindings = scanRawPrivacyNeedles("raw sqlite bytes", rawDbBytes.join("\n"), { needles });
+    checks.record(
+      "privacy/raw-sqlite-carries-no-hls-provenance",
+      rawFindings.length === 0 && rawDbBytes.length >= 1,
+      describePrivacyFindings(rawFindings),
+    );
+    // Upload and trace surfaces need no echo: the hostname is refused entirely.
+    const uploadFindings = validateStructuredPrivacy(
+      "upload",
       {
-        filename: String(view?.filename ?? ""),
-        quality: String(view?.quality ?? ""),
-        mime: String(view?.mime ?? ""),
-        "object key": String(object?.objectKey ?? ""),
-        "content disposition": String(object?.contentDisposition ?? ""),
-        "content type": String(object?.contentType ?? ""),
+        filename: view?.filename ?? null,
+        quality: view?.quality ?? null,
+        mime: view?.mime ?? null,
+        objectKey: object?.objectKey ?? null,
+        contentDisposition: object?.contentDisposition ?? null,
+        contentType: object?.contentType ?? null,
       },
-      scanOpts,
+      privacyOpts,
     );
     checks.record(
       "privacy/upload-surfaces-carry-no-hls-provenance",
       uploadFindings.length === 0 && object !== null,
-      uploadFindings.map((f) => `${f.surface}:${f.needle}`).join(","),
+      describePrivacyFindings(uploadFindings),
     );
     // The trace and the sanitized request ledgers. The plan and discovery
     // blocks are NOT scanned with these needles: they legitimately name the
     // plan operation and the upstream protocol, and the evidence builder scans
     // them — with the whole record — for markers, ids, hostnames and URLs.
-    const traceFindings = scanPrivacySurfaces(
-      {
-        "acceptance trace": JSON.stringify(trace),
-        "fixture ledger": JSON.stringify(out.fixtureRequests),
-      },
-      scanOpts,
-    );
+    const traceFindings = [
+      ...validateStructuredPrivacy("acceptance trace", trace, privacyOpts),
+      ...validateStructuredPrivacy("fixture ledger", out.fixtureRequests, privacyOpts),
+    ];
     checks.record(
       "privacy/trace-carries-no-hls-provenance",
       traceFindings.length === 0,
-      traceFindings.map((f) => `${f.surface}:${f.needle}`).join(","),
+      describePrivacyFindings(traceFindings),
     );
     out.privacy = {
       privateValuesPresentOnlyIn: ["the in-memory execution analysis", "the in-memory execution plan", "the HLS-2/HLS-3 requests they became"],
-      scannedSurfaces: [
-        "browser-safe analysis", "sourceQuality", "raw sqlite bytes", "durable rows", "job views",
-        "filename", "quality", "mime", "object key", "content disposition", "content type",
-        "acceptance trace", "fixture ledger", "this evidence record (by the builder)",
+      hostnamePlacement: {
+        admittedEchoes: [
+          "browser-safe analysis webpageUrl = the exact submitted page URL",
+          "browser-safe analysis source = the exact fixture hostname",
+          "worker_jobs url = the exact submitted page URL, for each expected job",
+          "worker_jobs source = the exact fixture hostname, for each expected job",
+          "job view source = the exact fixture hostname, for each expected job",
+        ],
+        elsewhere: "the fixture hostname in any other structured field or key, in any letter case, fails",
+        hostnameFreeSurfaces: [
+          "sourceQuality", "every non-worker_jobs table", "upload filename, quality, mime, object key, content disposition and content type",
+          "acceptance trace", "fixture ledger", "this evidence record (by the builder)",
+        ],
+        rawSqlite:
+          "no hostname claim: raw bytes have no fields and legitimately hold the submitted page URL and source; they are scanned for HLS acquisition provenance only, and the structured rows prove where the hostname is stored",
+      },
+      structuredSurfaces: [
+        "browser-safe analysis", "sourceQuality", "every table row", "job views", "upload", "acceptance trace", "fixture ledger",
       ],
-      needleClasses: Object.keys(needles).concat(["fixture-hostname-outside-the-page-echo"]),
-      hostnameRule:
-        "the Product echoes the submitted page (webpageUrl, source, durable url/source); every OTHER host:port/path use of the fixture hostname fails",
-      publicFindings: publicFindings.length + sqFindings.length,
-      durableFindings: durableFindings.length,
+      unstructuredSurfaces: ["raw sqlite bytes (database, WAL and shared-memory files)"],
+      tablesScanned: tableNames.length,
+      needleClasses: Object.keys(needles),
+      findingClasses: [HLS08_ADMISSION_FINDING, HLS08_HOSTNAME_FINDING],
+      publicFindings: publicPrivacy.echo.length + publicPrivacy.other.length + sqFindings.length,
+      durableFindings: durable.echo.length + durable.rows.length + durable.views.length,
+      rawSqliteFindings: rawFindings.length,
       uploadFindings: uploadFindings.length,
       traceFindings: traceFindings.length,
       passed:
-        publicFindings.length + sqFindings.length + durableFindings.length + uploadFindings.length + traceFindings.length === 0,
+        publicPrivacy.echo.length + publicPrivacy.other.length + sqFindings.length === 0 &&
+        durable.echo.length + durable.rows.length + durable.views.length === 0 &&
+        durable.jobRowsAreTheExpectedJobs && durable.viewsAreTheExpectedJobs &&
+        rawFindings.length === 0 && rawDbBytes.length >= 1 &&
+        uploadFindings.length + traceFindings.length === 0,
     };
 
     // ════════════════════════════ CLEANUP ═════════════════════════════════

@@ -23,11 +23,23 @@ import {
 /**
  * The schema identifier. Bump it when the record's meaning changes.
  *
- *   -01  the first HLS-08 record: one positive clear-HLS full path plus the
- *        three bounded negatives (encrypted playlist, fragment failure,
- *        FFmpeg unavailable at analysis).
+ *   -01  HISTORICAL. The first HLS-08 record (PR #78 head da4f63d9…): one
+ *        positive clear-HLS full path plus the three bounded negatives
+ *        (encrypted playlist, fragment failure, FFmpeg unavailable at
+ *        analysis). NOT accepted for HLS-8 closure: its hostname/page-echo
+ *        placement validation was too permissive — it admitted any hostname
+ *        occurrence not followed by `:` or `/` (so `<host>.evil`, `<host>X`,
+ *        `<host>?x=1`, or the bare host in any unrelated field) and any page
+ *        URL prefix (so `<page>?x=1`, `<page>#x`, `<page>/extra`).
+ *   -02  Field-aware privacy placement. The fixture hostname is admitted only
+ *        as exact field/value pairs — public `webpageUrl`/`source`, durable
+ *        `url`/`source` of each expected job, job-view `source` — and refused
+ *        in every other structured field and key; the hostname-free surfaces
+ *        refuse it entirely; raw SQLite bytes are scanned for HLS acquisition
+ *        provenance only. The single durable privacy check of -01 is split
+ *        into exact-echo, rows, views and raw-bytes checks.
  */
-export const HLS08_EVIDENCE_SCHEMA = "hls08-deterministic-full-path-01";
+export const HLS08_EVIDENCE_SCHEMA = "hls08-deterministic-full-path-02";
 
 /**
  * Keys that must never appear anywhere in a record, on top of the shared list.
@@ -139,6 +151,7 @@ export const HLS08_MANDATORY_CHECKS = Object.freeze([
   "public/source-quality-deliverable-360",
   "public/no-unsupported-protocol-withholding",
   // public privacy
+  "privacy/public-page-echo-is-exact",
   "privacy/public-analysis-carries-no-hls-provenance",
   "privacy/source-quality-carries-no-hls-provenance",
   // fresh execution analysis
@@ -224,7 +237,10 @@ export const HLS08_MANDATORY_CHECKS = Object.freeze([
   "fixture/no-unexpected-route",
   "transport/no-refused-request",
   // durable privacy
-  "privacy/durable-state-carries-no-hls-provenance",
+  "privacy/durable-page-echo-is-exact",
+  "privacy/durable-rows-carry-no-hls-provenance",
+  "privacy/job-views-carry-no-hls-provenance",
+  "privacy/raw-sqlite-carries-no-hls-provenance",
   "privacy/upload-surfaces-carry-no-hls-provenance",
   "privacy/trace-carries-no-hls-provenance",
   // cleanup and hooks

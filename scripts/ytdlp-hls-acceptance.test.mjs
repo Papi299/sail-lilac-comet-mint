@@ -15,9 +15,10 @@ import { after, afterEach, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import http from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { AppError } from "../src/lib/errors.ts";
 import {
@@ -29,14 +30,18 @@ import {
   HLS08_PRIVATE_MARKER_PREFIX,
   HLS08_RAW_FORMAT_ID,
   HLS08_RAW_FORMAT_NAME,
+  HLS08_VARIANTS,
   HLS_FIXTURE_HOSTNAME,
   HLS_FIXTURE_LOOPBACK,
+  HLS_FRAGMENT_FAMILIES,
+  HLS_KEY_ROUTE,
   HLS_MASTER_ROUTE,
   HLS_MEDIA_ROUTE,
   HLS_PAGE_ROUTE,
   HLS_SYNTHETIC_PUBLIC_ADDRESS,
   classifyHlsFixturePath,
   createHlsPageUrlValidator,
+  hlsFixtureOrigin,
   hlsPageUrl,
   mediaPlaylistUri,
   nearbyPageUrlAlternatives,
@@ -84,9 +89,14 @@ import {
   classifyProductSpawn,
   createProcessObserver,
   evaluateHlsRemuxArgv,
+  HLS08_ADMISSION_FINDING,
+  HLS08_HOSTNAME_FINDING,
+  HLS08_PRIVACY_NEEDLES,
+  describePrivacyFindings,
   inputOperand,
-  scanPrivacySurfaces,
-  unadmittedHostnameOccurrences,
+  scanRawPrivacyNeedles,
+  validateDurablePrivacy,
+  validateStructuredPrivacy,
   withProcessObserver,
 } from "../deploy/acceptance/ytdlp-generic/lib/hls-observers.mjs";
 import {
@@ -620,27 +630,354 @@ describe("hls process observer and remux policy", () => {
   });
 });
 
-// ── privacy scanning ───────────────────────────────────────────────────────
+// ── privacy placement ──────────────────────────────────────────────────────
 
-describe("hls privacy scanning", () => {
-  const opts = { hostname: HLS_FIXTURE_HOSTNAME, port: 40123, pageRoute: HLS_PAGE_ROUTE };
-  const page = hlsPageUrl(40123);
+describe("hls privacy placement", () => {
+  const PORT = 40123;
+  const H = HLS_FIXTURE_HOSTNAME;
+  const page = hlsPageUrl(PORT);
+  const origin = hlsFixtureOrigin(PORT);
+  const mediaUrl = `${origin}/hls08/${mediaPlaylistUri("execution")}`;
+  const fragmentUrl = `${origin}/hls08/${HLS_FRAGMENT_FAMILIES.positive}1.ts`;
+  const opts = { needles: HLS08_PRIVACY_NEEDLES, hostname: H };
+  const publicAdmitted = { webpageUrl: page, source: H };
+  const JOB_IDS = ["a".repeat(32), "b".repeat(32), "c".repeat(32)];
 
-  it("admits the Product's echo of the submitted page, and nothing else on the host", () => {
-    assert.equal(unadmittedHostnameOccurrences(JSON.stringify({ webpageUrl: page, source: HLS_FIXTURE_HOSTNAME }), opts), 0);
-    // raw SQLite stores column values back to back
-    assert.equal(unadmittedHostnameOccurrences(`${page}preset:best${HLS_FIXTURE_HOSTNAME}yt-dlp`, opts), 0);
-    assert.equal(unadmittedHostnameOccurrences(`http://${HLS_FIXTURE_HOSTNAME}:40123${HLS_MEDIA_ROUTE}?sig=x`, opts), 1);
-    assert.equal(unadmittedHostnameOccurrences(`http://${HLS_FIXTURE_HOSTNAME}:40124${HLS_PAGE_ROUTE}`, opts), 1);
-    assert.equal(unadmittedHostnameOccurrences(`http://${HLS_FIXTURE_HOSTNAME}/hls08/seg-0.ts`, opts), 1);
+  /** A browser-safe analysis shaped like the Product's for the fixture. */
+  const publicMeta = () => ({
+    title: "HLS-08 deterministic fixture",
+    thumbnail: null,
+    duration: 6.0,
+    source: H,
+    extractor: "yt-dlp",
+    webpageUrl: page,
+    formats: [],
+    presets: [
+      { id: "preset:best", formatId: "preset:best", label: "Best", container: "mp4", hasVideo: true, hasAudio: true, fileSize: null },
+      { id: "preset:360", formatId: "preset:360", label: "360p", container: "mp4", hasVideo: true, hasAudio: true, fileSize: null },
+    ],
+    capabilities: { mp3: false, merge: false },
+    sourceQuality: { observedMaxHeight: 360, deliverableMaxHeight: 360, withheld: [] },
+  });
+  const publicFindings = (meta) => validateStructuredPrivacy("public", meta, { ...opts, admitted: publicAdmitted });
+  const labels = (findings) => findings.map((f) => `${f.field}:${f.finding}`).sort();
+
+  /** A durable row shaped like `worker_jobs` for one job, after analysis. */
+  const jobRow = (jobId, over = {}) => ({
+    job_id: jobId, url: page, format_id: "preset:best", principal_id: "private-access-user", status: "ready",
+    progress: 100, stage_label: null, downloaded_bytes: null, total_bytes: null, speed: null, eta: null,
+    error_code: null, safe_error_message: null, filename: "HLS-08 deterministic fixture.mp4", file_size: 600157,
+    mime: "video/mp4", quality: "360p", container: "mp4", title: "HLS-08 deterministic fixture", thumbnail: null,
+    source: H, extractor: "yt-dlp", created_at_ms: 1, updated_at_ms: 2, expires_at_ms: 3,
+    object_key: `jobs/private-access-user/${jobId}/x.mp4`, started_at_ms: 1, finished_at_ms: 2, ...over,
+  });
+  const jobView = (jobId, over = {}) => ({
+    jobId, status: "ready", filename: "HLS-08 deterministic fixture.mp4", title: "HLS-08 deterministic fixture",
+    thumbnail: null, source: H, extractor: "yt-dlp", objectKey: `jobs/private-access-user/${jobId}/x.mp4`, ...over,
+  });
+  const durableInput = ({ rows, views, extraTables = {} } = {}) => ({
+    tables: {
+      split06_status_audit: [{ seq: 1, job_id: JOB_IDS[0], from_status: null, to_status: "queued", at_ms: 1 }],
+      worker_jobs: rows ?? JOB_IDS.map((id) => jobRow(id)),
+      ...extraTables,
+    },
+    views: views ?? JOB_IDS.map((id) => jobView(id)),
+    expectedJobIds: JOB_IDS,
+    pageUrl: page,
+    hostname: H,
+    needles: HLS08_PRIVACY_NEEDLES,
   });
 
-  it("reports surface names and needle labels, never the needle", () => {
-    const findings = scanPrivacySurfaces(
-      { clean: JSON.stringify({ webpageUrl: page }), dirty: `x ${HLS08_PRIVATE_MARKERS.execution} y` },
-      { ...opts, needles: { "execution-marker": HLS08_PRIVATE_MARKERS.execution } },
+  it("admits exactly webpageUrl = the page URL and source = the hostname on the public analysis", () => {
+    assert.deepEqual(publicFindings(publicMeta()), []);
+  });
+
+  it("refuses every false admission of the -01 scanner in source and webpageUrl", () => {
+    const badSources = [`${H}.evil`, `${H}X`, `${H}?x=1`, `${H}.`, H.toUpperCase(), `x${H}`];
+    for (const source of badSources) {
+      assert.deepEqual(
+        labels(publicFindings({ ...publicMeta(), source })),
+        [`source:${HLS08_ADMISSION_FINDING}`, `source:${HLS08_HOSTNAME_FINDING}`],
+        source,
+      );
+    }
+    const badPages = [
+      `${page}?x=1`, `${page}#fragment`, `${page}/extra`, `${page}.evil`,
+      hlsPageUrl(PORT + 1), `${origin}/hls08/other.html`, `https://${H}:${PORT}${HLS_PAGE_ROUTE}`,
+    ];
+    for (const webpageUrl of badPages) {
+      assert.deepEqual(
+        labels(publicFindings({ ...publicMeta(), webpageUrl })),
+        [`webpageUrl:${HLS08_ADMISSION_FINDING}`, `webpageUrl:${HLS08_HOSTNAME_FINDING}`],
+        webpageUrl,
+      );
+    }
+    // The HLS acquisition URLs fail as an echo AND carry provenance needles.
+    const media = labels(publicFindings({ ...publicMeta(), webpageUrl: mediaUrl }));
+    for (const want of ["admitted-field-not-the-exact-echo", "fixture-hostname-outside-an-admitted-field",
+      "media-playlist-route", "playlist-extension", "signature-parameter", "execution-marker", "private-marker-prefix"]) {
+      assert.ok(media.includes(`webpageUrl:${want}`), want);
+    }
+    const fragment = labels(publicFindings({ ...publicMeta(), webpageUrl: fragmentUrl }));
+    assert.ok(fragment.includes(`webpageUrl:${HLS08_ADMISSION_FINDING}`));
+    assert.ok(fragment.includes("webpageUrl:fragment-name"));
+  });
+
+  it("refuses the exact hostname, or the exact page URL, in any unrelated field or key", () => {
+    const cases = [
+      [(m) => ({ ...m, title: H }), "title"],
+      [(m) => ({ ...m, title: page }), "title"],
+      [(m) => ({ ...m, title: `Watch on ${H}` }), "title"],
+      [(m) => ({ ...m, thumbnail: page }), "thumbnail"],
+      [(m) => ({ ...m, presets: [{ ...m.presets[0], label: H }, m.presets[1]] }), "presets[0].label"],
+      [(m) => ({ ...m, sourceQuality: { ...m.sourceQuality, note: H } }), "sourceQuality.note"],
+      [(m) => ({ ...m, formats: [{ url: page }] }), "formats[0].url"],
+      [(m) => ({ ...m, capabilities: { ...m.capabilities, [H]: true } }), "capabilities.<key>"],
+      // the -01 scanner admitted these as "bare" or "page-prefixed" anywhere
+      [(m) => ({ ...m, title: `${H}.evil` }), "title"],
+      [(m) => ({ ...m, title: `${H}X` }), "title"],
+      [(m) => ({ ...m, title: `${H}?x=1` }), "title"],
+      [(m) => ({ ...m, title: `${page}?x=1` }), "title"],
+      [(m) => ({ ...m, title: `${page}#fragment` }), "title"],
+      [(m) => ({ ...m, title: `${page}/extra` }), "title"],
+      [(m) => ({ ...m, title: `${page}.evil` }), "title"],
+      [(m) => ({ ...m, title: H.toUpperCase() }), "title"],
+    ];
+    for (const [mutate, field] of cases) {
+      const findings = publicFindings(mutate(publicMeta()));
+      assert.deepEqual(
+        findings.filter((f) => f.finding === HLS08_HOSTNAME_FINDING).map((f) => f.field),
+        [field],
+        field,
+      );
+      assert.equal(findings.filter((f) => f.finding === HLS08_ADMISSION_FINDING).length, 0, field);
+    }
+  });
+
+  it("requires each admitted echo to be present, a string, and exact", () => {
+    const noPage = publicMeta();
+    delete noPage.webpageUrl;
+    assert.deepEqual(labels(publicFindings(noPage)), [`webpageUrl:${HLS08_ADMISSION_FINDING}`]);
+    assert.deepEqual(labels(publicFindings({ ...publicMeta(), source: null })), [`source:${HLS08_ADMISSION_FINDING}`]);
+    assert.deepEqual(labels(publicFindings({ ...publicMeta(), source: [H] })), [
+      `source:${HLS08_ADMISSION_FINDING}`, `source[0]:${HLS08_HOSTNAME_FINDING}`,
+    ]);
+    // an admission names ONE path: the same field nested elsewhere is not admitted
+    assert.deepEqual(
+      labels(publicFindings({ ...publicMeta(), sourceQuality: { source: H } })),
+      [`sourceQuality.source:${HLS08_HOSTNAME_FINDING}`],
     );
-    assert.deepEqual(findings, [{ surface: "dirty", needle: "execution-marker" }]);
+    assert.throws(() => validateStructuredPrivacy("x", {}, { ...opts, admitted: { source: "" } }), TypeError);
+    assert.throws(() => validateStructuredPrivacy("x", {}, { needles: HLS08_PRIVACY_NEEDLES, hostname: "" }), TypeError);
+  });
+
+  it("refuses every HLS acquisition needle in any value or key, admitted fields included", () => {
+    const provenance = [
+      HLS08_RAW_FORMAT_ID, mediaUrl, fragmentUrl, `fail-seg-2.ts`, "playlistUrl", "hlsSelections", "clear-hls-remux",
+      `${HLS_MASTER_ROUTE}`, `${origin}${HLS_KEY_ROUTE}`, ...HLS08_VARIANTS.map((v) => mediaPlaylistUri(v)),
+      ...Object.values(HLS08_PRIVATE_MARKERS),
+    ];
+    for (const value of provenance) {
+      assert.notEqual(validateStructuredPrivacy("s", { title: value }, opts).length, 0, value);
+      assert.notEqual(validateStructuredPrivacy("s", { [value]: 1 }, opts).length, 0, value);
+      assert.notEqual(scanRawPrivacyNeedles("raw", `\u0000${value}\u0000`, opts).length, 0, value);
+    }
+    for (const [label, needle] of Object.entries(HLS08_PRIVACY_NEEDLES)) {
+      const found = validateStructuredPrivacy("s", { title: `a${needle}b` }, opts).map((f) => f.finding);
+      assert.ok(found.includes(label), label);
+    }
+    // an exact echo exempts a field from the hostname rule only, never from needles
+    assert.ok(
+      validateStructuredPrivacy("s", { webpageUrl: `${page}` }, { ...opts, needles: { "page-route": HLS_PAGE_ROUTE }, admitted: { webpageUrl: page } })
+        .some((f) => f.finding === "page-route"),
+    );
+    // and none of the needles matches the legitimate echoes themselves
+    assert.deepEqual(scanRawPrivacyNeedles("raw", `${page}\u0000${H}`, opts), []);
+  });
+
+  it("reports surface, sanitized field path and label — never a scanned value", () => {
+    const findings = validateStructuredPrivacy(
+      "public",
+      { ...publicMeta(), [HLS08_PRIVATE_MARKERS.execution]: { [H]: mediaUrl }, hlsSelections: { x: 1 } },
+      { ...opts, admitted: publicAdmitted },
+    );
+    assert.ok(findings.length > 0);
+    assert.ok(findings.every((f) => f.surface === "public"));
+    const serialized = JSON.stringify(findings) + describePrivacyFindings(findings);
+    for (const secret of [H, page, mediaUrl, HLS08_PRIVATE_MARKERS.execution, "://", "sig="]) {
+      assert.equal(serialized.includes(secret), false, secret);
+    }
+    assert.ok(findings.some((f) => f.field === "<key>.<key>" && f.finding === "media-playlist-route"));
+    assert.ok(findings.some((f) => f.field === "<key>" && f.finding === "hlsSelections-field"));
+  });
+
+  it("refuses the hostname entirely on sourceQuality, upload and trace surfaces", () => {
+    const quality = publicMeta().sourceQuality;
+    assert.deepEqual(validateStructuredPrivacy("sourceQuality", quality, opts), []);
+    assert.deepEqual(labels(validateStructuredPrivacy("sourceQuality", { ...quality, origin: H }, opts)), [`origin:${HLS08_HOSTNAME_FINDING}`]);
+    const upload = {
+      filename: "HLS-08 deterministic fixture.mp4", quality: "360p", mime: "video/mp4",
+      objectKey: `jobs/private-access-user/${JOB_IDS[0]}/x.mp4`,
+      contentDisposition: 'attachment; filename="HLS-08 deterministic fixture.mp4"', contentType: "video/mp4",
+    };
+    assert.deepEqual(validateStructuredPrivacy("upload", upload, opts), []);
+    for (const field of Object.keys(upload)) {
+      for (const leak of [H, page, `${H}.evil`]) {
+        assert.deepEqual(
+          labels(validateStructuredPrivacy("upload", { ...upload, [field]: `${upload[field]} ${leak}` }, opts)),
+          [`${field}:${HLS08_HOSTNAME_FINDING}`],
+          `${field} ${leak}`,
+        );
+      }
+    }
+    const trace = [{ event: "job-created", status: "queued" }];
+    assert.deepEqual(validateStructuredPrivacy("acceptance trace", trace, opts), []);
+    assert.deepEqual(
+      labels(validateStructuredPrivacy("acceptance trace", [...trace, { event: H, status: null }], opts)),
+      [`[1].event:${HLS08_HOSTNAME_FINDING}`],
+    );
+  });
+
+  it("admits exactly durable url/source per expected job and view source, and nothing else", () => {
+    const clean = validateDurablePrivacy(durableInput());
+    assert.deepEqual(clean, { jobRowsAreTheExpectedJobs: true, viewsAreTheExpectedJobs: true, echo: [], rows: [], views: [] });
+
+    const withRow = (i, over) => durableInput({ rows: JOB_IDS.map((id, j) => jobRow(id, j === i ? over : {})) });
+    for (const url of [`${page}?x=1`, `${page}#fragment`, `${page}/extra`, `${page}.evil`, hlsPageUrl(PORT + 1), mediaUrl]) {
+      const r = validateDurablePrivacy(withRow(1, { url }));
+      assert.deepEqual(r.echo.map((f) => `${f.surface}:${f.field}`), ["worker_jobs[1]:url"], url);
+      assert.ok(r.rows.some((f) => f.field === "url" && f.finding === HLS08_HOSTNAME_FINDING), url);
+    }
+    for (const source of [`${H}.evil`, `${H}X`, `${H}?x=1`, null]) {
+      const r = validateDurablePrivacy(withRow(2, { source }));
+      assert.deepEqual(r.echo.map((f) => `${f.surface}:${f.field}`), ["worker_jobs[2]:source"], String(source));
+    }
+    for (const field of ["title", "filename", "stage_label", "safe_error_message", "quality", "thumbnail"]) {
+      for (const leak of [H, page]) {
+        const r = validateDurablePrivacy(withRow(0, { [field]: leak }));
+        assert.deepEqual(r.echo, [], field);
+        assert.deepEqual(r.rows.map((f) => `${f.surface}:${f.field}:${f.finding}`), [`worker_jobs[0]:${field}:${HLS08_HOSTNAME_FINDING}`], field);
+      }
+    }
+    // job views admit `source` only — the view has no url field
+    const views = JOB_IDS.map((id) => jobView(id));
+    views[1] = { ...views[1], title: H };
+    views[2] = { ...views[2], url: page };
+    const v = validateDurablePrivacy(durableInput({ views }));
+    assert.deepEqual(v.views.map((f) => `${f.surface}:${f.field}`), ["job view 1:title", "job view 2:url"]);
+    const badViewSource = JOB_IDS.map((id, i) => jobView(id, i === 0 ? { source: `${H}.evil` } : {}));
+    assert.deepEqual(validateDurablePrivacy(durableInput({ views: badViewSource })).echo.map((f) => `${f.surface}:${f.field}`), ["job view 0:source"]);
+    // every other table admits nothing
+    const audit = validateDurablePrivacy(durableInput({ extraTables: { worker_idempotency_records: [{ idempotency_key: H }] } }));
+    assert.deepEqual(audit.rows.map((f) => `${f.surface}:${f.field}`), ["worker_idempotency_records[0]:idempotency_key"]);
+    // the rows must be exactly the expected jobs
+    assert.equal(validateDurablePrivacy(durableInput({ rows: JOB_IDS.slice(0, 2).map((id) => jobRow(id)) })).jobRowsAreTheExpectedJobs, false);
+    assert.equal(validateDurablePrivacy(durableInput({ rows: [...JOB_IDS, "d".repeat(32)].map((id) => jobRow(id)) })).jobRowsAreTheExpectedJobs, false);
+    assert.equal(validateDurablePrivacy(durableInput({ views: [...views.slice(0, 2), null] })).viewsAreTheExpectedJobs, false);
+  });
+
+  describe("against a real Product SQLite database", () => {
+    let dir;
+    let productDb;
+    before(async () => {
+      await import("./register-ts-aliases.mjs");
+      const [database, migrations, jobStore] = await Promise.all([
+        import("../src/worker/state/database.server.ts"),
+        import("../src/worker/state/migrations.server.ts"),
+        import("../src/worker/state/sqlite-job-store.server.ts"),
+      ]);
+      productDb = { ...database, ...migrations, ...jobStore };
+      dir = await mkdtemp(join(tmpdir(), "hls08-privacy-db-"));
+    });
+    after(async () => {
+      if (dir) await rm(dir, { recursive: true, force: true });
+    });
+
+    const rawBytes = async (path) => {
+      const parts = [];
+      for (const name of (await readdir(dirname(path))).sort()) {
+        if (name.startsWith(basename(path))) parts.push((await readFile(join(dirname(path), name))).toString("latin1"));
+      }
+      return parts.join("\n");
+    };
+    const tablesOf = (db) => {
+      const out = {};
+      for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()) {
+        out[name] = db.prepare(`SELECT * FROM "${name}"`).all();
+      }
+      return out;
+    };
+
+    it("admits the stored page/source echo in raw bytes, and refuses HLS provenance there", async () => {
+      const path = join(dir, "worker.sqlite");
+      const db = productDb.openWorkerDatabase({ path });
+      try {
+        productDb.applyMigrations(db);
+        const store = new productDb.SQLiteJobStore({ db });
+        const created = store.createJob({ url: page, formatId: "preset:best", principalId: "private-access-user" }, randomUUID());
+        assert.equal(created.type, "created");
+        const jobId = created.job.jobId;
+        assert.equal(store.claimNextQueuedJob()?.jobId, jobId);
+        assert.equal(
+          store.completeAnalysis(jobId, { title: "HLS-08 deterministic fixture", thumbnail: null, source: H, extractor: "yt-dlp" }).type,
+          "updated",
+        );
+
+        // The legitimate echoes really are in the raw bytes...
+        const clean = await rawBytes(path);
+        assert.ok(clean.includes(page) && clean.includes(H));
+        // ...and the needle scan does not mistake them for provenance.
+        assert.deepEqual(scanRawPrivacyNeedles("raw sqlite bytes", clean, opts), []);
+        // The structured rows prove WHERE the hostname is stored.
+        const view = store.getJob(jobId);
+        assert.equal(view.source, H);
+        const durable = validateDurablePrivacy({
+          tables: tablesOf(db), views: [view], expectedJobIds: [jobId], pageUrl: page, hostname: H, needles: HLS08_PRIVACY_NEEDLES,
+        });
+        assert.deepEqual(durable, { jobRowsAreTheExpectedJobs: true, viewsAreTheExpectedJobs: true, echo: [], rows: [], views: [] });
+
+        // A media-playlist signature stored anywhere is caught in the raw bytes.
+        db.prepare("UPDATE worker_jobs SET stage_label = ? WHERE job_id = ?").run(`fetching ${mediaUrl}`, jobId);
+        const leaked = scanRawPrivacyNeedles("raw sqlite bytes", await rawBytes(path), opts).map((f) => f.finding);
+        for (const want of ["private-marker-prefix", "execution-marker", "playlist-extension", "signature-parameter", "media-playlist-route"]) {
+          assert.ok(leaked.includes(want), want);
+        }
+        // and the structured row names the field.
+        const rows = validateDurablePrivacy({
+          tables: tablesOf(db), views: [view], expectedJobIds: [jobId], pageUrl: page, hostname: H, needles: HLS08_PRIVACY_NEEDLES,
+        }).rows;
+        assert.ok(rows.some((f) => f.surface === "worker_jobs[0]" && f.field === "stage_label" && f.finding === HLS08_HOSTNAME_FINDING));
+      } finally {
+        db.close();
+      }
+    });
+
+    it("an HLS private marker alone, with no hostname, still fails the raw scan", async () => {
+      const path = join(dir, "marker.sqlite");
+      const db = productDb.openWorkerDatabase({ path });
+      try {
+        productDb.applyMigrations(db);
+        const store = new productDb.SQLiteJobStore({ db });
+        const created = store.createJob({ url: page, formatId: "preset:best", principalId: "private-access-user" }, randomUUID());
+        store.claimNextQueuedJob();
+        store.completeAnalysis(created.job.jobId, { title: HLS08_PRIVATE_MARKERS.browser, thumbnail: null, source: H, extractor: "yt-dlp" });
+        const found = scanRawPrivacyNeedles("raw sqlite bytes", await rawBytes(path), opts).map((f) => f.finding);
+        assert.deepEqual(found.sort(), ["browser-marker", "private-marker-prefix"]);
+      } finally {
+        db.close();
+      }
+    });
+  });
+
+  it("the admitted field names are the Product's own", async () => {
+    await import("./register-ts-aliases.mjs");
+    const contracts = await import("../src/shared/worker/contracts.ts");
+    const shapeOf = (schema) => schema.shape ?? schema.innerType?.().shape ?? schema._def?.schema?.shape;
+    const meta = shapeOf(contracts.VideoMetadataSchema);
+    assert.ok(meta.webpageUrl && meta.source);
+    const view = shapeOf(contracts.WorkerJobViewSchema);
+    assert.ok(view.source);
+    assert.equal(Object.hasOwn(view, "url"), false);
   });
 });
 
@@ -799,7 +1136,7 @@ describe("hls evidence record", () => {
   it("a PASS carrying every mandatory check builds, with the fixed schema, substitutions and non-claims", () => {
     const record = buildHlsEvidence(evidenceInput());
     assert.equal(record.schema, HLS08_EVIDENCE_SCHEMA);
-    assert.equal(record.schema, "hls08-deterministic-full-path-01");
+    assert.equal(record.schema, "hls08-deterministic-full-path-02");
     assert.equal(record.image.deployable, false);
     assert.equal(record.network.mode, "none");
     assert.match(record.substitutions.submittedUrlValidator, /NOT Production SSRF/);
