@@ -59,7 +59,10 @@ import {
   HLS08_ACCEPTED_BASE,
   HLS08_CONTAINER_REPORT_DIR,
   HLS08_FIXTURE_HOST_MAPPING,
+  HLS08_ORCHESTRATOR,
   HLS08_OVERLAY_COPIED_PATHS,
+  HLS_ACCEPTANCE_MODES,
+  HLS_ACCEPTANCE_MODE_FLAG,
   assertNonDeployableTag,
   hlsAcceptanceRunArgs,
   hlsOverlayBuildArgs,
@@ -67,6 +70,26 @@ import {
   hlsOverlayImageTag,
   hlsRunPostureViolations,
 } from "../deploy/acceptance/ytdlp-generic/lib/hls-container.mjs";
+import {
+  HLS_MODE_EVIDENCE_SCHEMAS,
+  acceptanceIdentityChecks,
+  buildAcceptanceEvidence,
+  imageRemovalFact,
+  parseHlsAcceptanceArgv,
+  renderAcceptanceEvidence,
+} from "../deploy/acceptance/ytdlp-generic/lib/hls-acceptance-mode.mjs";
+import {
+  HLS09_MANDATORY_CHECKS,
+  HLS09_NON_CLAIMS,
+  HLS09_RELEASE_EVIDENCE_SCHEMA,
+  HLS09_RELEASE_IDENTITY_CHECKS,
+  buildHlsReleaseEvidence,
+  validateHlsReleaseChildRecord,
+} from "../deploy/acceptance/ytdlp-generic/lib/hls-release-evidence.mjs";
+import {
+  candidateImageTag,
+  releaseHlsAcceptanceRunArgs,
+} from "../deploy/acceptance/ytdlp-generic/lib/release-container.mjs";
 import { OVERLAY_COPIED_PATHS } from "../deploy/acceptance/ytdlp-generic/lib/split-container.mjs";
 import {
   OVERLAY_RUNTIME_COMPATIBILITY_FILES,
@@ -76,6 +99,8 @@ import {
   HLS08_EVIDENCE_SCHEMA,
   HLS08_FORBIDDEN_EVIDENCE_SUBSTRINGS,
   HLS08_MANDATORY_CHECKS,
+  HLS08_OVERLAY_IDENTITY_CHECKS,
+  HLS_BEHAVIORAL_MANDATORY_CHECKS,
   buildHlsEvidence,
   findForbiddenSubstring,
   renderHlsEvidence,
@@ -1398,5 +1423,332 @@ describe("hls host driver", () => {
     const world = fakeWorld(repoState(), { evidenceText: passText() });
     await runHlsAcceptance({ ...opts(), keepImage: true }, { ...world.deps, scratchRoot: scratch });
     assert.ok(!world.docker().some((a) => a[0] === "image" && a[1] === "rm"));
+  });
+});
+
+// ── HLS-09: the explicit acceptance-mode boundary ──────────────────────────
+
+const RELEASE_IMAGE_ID = `sha256:${"c".repeat(64)}`;
+const RELEASE_TAG = candidateImageTag(HEAD);
+const RELEASE_HARNESS = "/var/tmp/hls09-harness/deploy/acceptance/ytdlp-generic";
+
+/** The orchestrator's own argv: everything after `<image> --import … <orchestrator>`. */
+function orchestratorArgv(dockerArgv, imageId) {
+  const tail = dockerArgv.slice(dockerArgv.indexOf(imageId) + 1);
+  assert.deepEqual(tail.slice(0, 4), ["--import", "./scripts/register-ts-aliases.mjs", "--experimental-strip-types", HLS08_ORCHESTRATOR]);
+  return tail.slice(4);
+}
+
+function overlayDockerArgv() {
+  return hlsAcceptanceRunArgs({
+    imageId: OVERLAY_ID, image: hlsOverlayImageTag(HEAD), reportDir: REPORT, evidenceName: "hls08-x.json",
+    provenance: {
+      commit: HEAD, tree: TREE, acceptedBaseSourceCommit: BASE_SOURCE, contextClean: true,
+      overlayRuntimeCompatibilityVerified: true, baseImage: BASE_IMAGE, baseDigest: BASE_DIGEST,
+    },
+  });
+}
+
+function releaseDockerArgv() {
+  return releaseHlsAcceptanceRunArgs({
+    imageId: RELEASE_IMAGE_ID, harnessDir: RELEASE_HARNESS, reportDir: "/var/tmp/hls09",
+    mediaWorkspaceDir: "/var/tmp/hls09-media", evidenceName: "hls09-x.json",
+    sourceCommit: HEAD, sourceTree: TREE, candidateTag: RELEASE_TAG,
+  });
+}
+
+const OVERLAY_OPTS = Object.freeze({
+  mode: "overlay", evidence: "/report/hls08-x.json", sourceCommit: HEAD, sourceTree: TREE, sourceContextClean: true,
+  acceptedBaseSource: BASE_SOURCE, baseImage: BASE_IMAGE, baseDigest: BASE_DIGEST,
+  overlayImage: hlsOverlayImageTag(HEAD), overlayImageId: OVERLAY_ID, overlayRuntimeCompatible: true,
+});
+
+const RELEASE_OPTS = Object.freeze({
+  mode: "release-image", evidence: "/report/hls09-x.json", sourceCommit: HEAD, sourceTree: TREE, sourceContextClean: true,
+  candidateTag: RELEASE_TAG, candidateImageId: RELEASE_IMAGE_ID, runImageId: RELEASE_IMAGE_ID,
+});
+
+describe("hls acceptance modes (the explicit boundary)", () => {
+  it("names exactly two modes, and each mode's schema", () => {
+    assert.deepEqual({ ...HLS_ACCEPTANCE_MODES }, { overlay: "overlay", releaseImage: "release-image" });
+    assert.equal(HLS_ACCEPTANCE_MODE_FLAG, "--acceptance-mode");
+    assert.deepEqual({ ...HLS_MODE_EVIDENCE_SCHEMAS }, {
+      overlay: "hls08-deterministic-full-path-02",
+      "release-image": "hls09-release-image-full-path-01",
+    });
+  });
+
+  it("the HLS-08 overlay invocation names overlay mode explicitly, and parses to exactly HLS-08's identity", () => {
+    const argv = orchestratorArgv(overlayDockerArgv(), OVERLAY_ID);
+    assert.deepEqual(argv.slice(0, 2), ["--acceptance-mode", "overlay"]);
+    assert.equal(argv.filter((a) => a === "--acceptance-mode").length, 1);
+    assert.deepEqual(parseHlsAcceptanceArgv(argv), { ...OVERLAY_OPTS, evidence: `${HLS08_CONTAINER_REPORT_DIR}/hls08-x.json` });
+  });
+
+  it("the HLS-09 release invocation parses to exactly the parent's release identity, and nothing historical", () => {
+    const parsed = parseHlsAcceptanceArgv(orchestratorArgv(releaseDockerArgv(), RELEASE_IMAGE_ID));
+    assert.deepEqual(parsed, { ...RELEASE_OPTS, evidence: "/report/hls09-x.json" });
+    for (const key of ["acceptedBaseSource", "baseImage", "baseDigest", "overlayImage", "overlayImageId", "overlayRuntimeCompatible"]) {
+      assert.ok(!Object.hasOwn(parsed, key), `${key} is not a release-mode field`);
+    }
+  });
+
+  it("the mode is required, given once, known, and never inferred from the identity flags", () => {
+    const overlay = orchestratorArgv(overlayDockerArgv(), OVERLAY_ID);
+    const noMode = overlay.slice(2);
+    assert.throws(() => parseHlsAcceptanceArgv(noMode), /--acceptance-mode is required/);
+    const release = orchestratorArgv(releaseDockerArgv(), RELEASE_IMAGE_ID);
+    assert.throws(() => parseHlsAcceptanceArgv(release.slice(2)), /--acceptance-mode is required/,
+      "release identity flags alone never select release mode");
+    assert.throws(() => parseHlsAcceptanceArgv(["--acceptance-mode", "hls09", ...noMode]), /unknown --acceptance-mode/);
+    assert.throws(() => parseHlsAcceptanceArgv(["--acceptance-mode", "overlay", ...overlay]), /may be given only once/);
+    assert.throws(() => parseHlsAcceptanceArgv([...overlay, "--source-commit", HEAD]), /may be given only once/);
+    assert.throws(() => parseHlsAcceptanceArgv([...overlay, "--family", "mp4"]), /unknown argument: --family/);
+  });
+
+  it("mixed identity fails closed in both directions, for every flag of the other mode", () => {
+    const overlay = orchestratorArgv(overlayDockerArgv(), OVERLAY_ID);
+    for (const extra of [["--candidate-tag", RELEASE_TAG], ["--candidate-image-id", RELEASE_IMAGE_ID], ["--run-image-id", RELEASE_IMAGE_ID]]) {
+      assert.throws(() => parseHlsAcceptanceArgv([...overlay, ...extra]), /mixed acceptance identity: .* belongs to release-image mode/, extra[0]);
+    }
+    const release = orchestratorArgv(releaseDockerArgv(), RELEASE_IMAGE_ID);
+    for (const extra of [
+      ["--accepted-base-source", BASE_SOURCE], ["--base-image", BASE_IMAGE], ["--base-digest", BASE_DIGEST],
+      ["--overlay-image", hlsOverlayImageTag(HEAD)], ["--overlay-image-id", OVERLAY_ID], ["--overlay-runtime-compatible"],
+    ]) {
+      assert.throws(() => parseHlsAcceptanceArgv([...release, ...extra]), /mixed acceptance identity: .* belongs to overlay mode/, extra[0]);
+    }
+  });
+
+  it("each mode requires its own complete identity", () => {
+    const release = orchestratorArgv(releaseDockerArgv(), RELEASE_IMAGE_ID);
+    const drop = (argv, flag, withValue = true) => {
+      const copy = [...argv];
+      copy.splice(copy.indexOf(flag), withValue ? 2 : 1);
+      return copy;
+    };
+    const swap = (argv, flag, value) => argv.map((x, i) => (argv[i - 1] === flag ? value : x));
+    for (const flag of ["--candidate-tag", "--candidate-image-id", "--run-image-id"]) {
+      assert.throws(() => parseHlsAcceptanceArgv(drop(release, flag)), new RegExp(`${flag} is required`));
+    }
+    assert.throws(() => parseHlsAcceptanceArgv(drop(release, "--evidence")), /--evidence <path> is required/);
+    assert.throws(() => parseHlsAcceptanceArgv(drop(release, "--source-context-clean", false)), /not verified clean/);
+    assert.throws(() => parseHlsAcceptanceArgv(swap(release, "--source-commit", HEAD.slice(0, 12))), /--source-commit must be the full/);
+    assert.throws(() => parseHlsAcceptanceArgv(swap(release, "--source-tree", TREE.toUpperCase())), /--source-tree must be the full/);
+    const overlay = orchestratorArgv(overlayDockerArgv(), OVERLAY_ID);
+    assert.throws(() => parseHlsAcceptanceArgv(drop(overlay, "--overlay-runtime-compatible", false)), /runtime-compatible/);
+    assert.throws(() => parseHlsAcceptanceArgv(swap(overlay, "--accepted-base-source", "593f47df")), /--accepted-base-source must be the full/);
+    assert.throws(() => parseHlsAcceptanceArgv(drop(overlay, "--overlay-image-id")), /--overlay-image-id is required/);
+  });
+});
+
+describe("hls acceptance identity checks", () => {
+  const names = (entries) => entries.map((e) => e.name);
+  const byName = (entries) => Object.fromEntries(entries.map((e) => [e.name, e.ok]));
+
+  it("overlay mode records exactly HLS-08's four identity checks, unchanged", () => {
+    const entries = acceptanceIdentityChecks(OVERLAY_OPTS, { networkInterfaceNames: ["lo", "eth0"] });
+    assert.deepEqual(names(entries), [...HLS08_OVERLAY_IDENTITY_CHECKS]);
+    assert.deepEqual(HLS08_MANDATORY_CHECKS.slice(0, 4), [...HLS08_OVERLAY_IDENTITY_CHECKS]);
+    assert.ok(entries.every((e) => e.ok === true && e.detail === null));
+    const bad = byName(acceptanceIdentityChecks({ ...OVERLAY_OPTS, baseDigest: RELEASE_IMAGE_ID, overlayImageId: RELEASE_IMAGE_ID }));
+    assert.equal(bad["image/accepted-base-digest-is-the-recorded-runtime"], false);
+    assert.equal(bad["image/overlay-is-non-deployable"], false);
+  });
+
+  it("release mode records the release identity and NO historical-base or overlay assertion", () => {
+    const entries = acceptanceIdentityChecks(RELEASE_OPTS, { networkInterfaceNames: ["lo"] });
+    assert.deepEqual(names(entries), [...HLS09_RELEASE_IDENTITY_CHECKS]);
+    assert.ok(entries.every((e) => e.ok === true), JSON.stringify(entries));
+    for (const overlayCheck of HLS08_OVERLAY_IDENTITY_CHECKS) {
+      assert.ok(!names(entries).includes(overlayCheck));
+      assert.ok(!HLS09_MANDATORY_CHECKS.includes(overlayCheck), `${overlayCheck} is not required in release mode`);
+    }
+    assert.equal(entries.find((e) => e.name === "release/network-namespace-is-loopback-only").detail, "lo");
+  });
+
+  it("each release identity check fails on its own fault", () => {
+    const failing = (opts, interfaces = ["lo"]) =>
+      acceptanceIdentityChecks({ ...RELEASE_OPTS, ...opts }, { networkInterfaceNames: interfaces }).filter((e) => !e.ok).map((e) => e.name);
+    assert.deepEqual(failing({ sourceCommit: HEAD.slice(0, 12) }), ["release/source-identity-present", "release/candidate-label-is-non-production"]);
+    assert.deepEqual(failing({ sourceTree: null }), ["release/source-identity-present"]);
+    assert.deepEqual(failing({ sourceContextClean: false }), ["release/source-context-clean"]);
+    assert.deepEqual(failing({ candidateImageId: "sha256:abc", runImageId: "sha256:abc" }), [
+      "release/candidate-image-id-valid", "release/run-subject-is-candidate-image-id",
+    ]);
+    assert.deepEqual(failing({ runImageId: OVERLAY_ID }), ["release/run-subject-is-candidate-image-id"]);
+    assert.deepEqual(failing({ runImageId: RELEASE_TAG }), ["release/run-subject-is-candidate-image-id"]);
+    for (const label of ["videofetch-worker:latest", "videofetch-worker:rc-0123456789ab-cccccccccccc", candidateImageTag(TREE), hlsOverlayImageTag(HEAD)]) {
+      assert.deepEqual(failing({ candidateTag: label }), ["release/candidate-label-is-non-production"], label);
+    }
+    for (const interfaces of [["lo", "eth0"], ["eth0"], [], null]) {
+      assert.deepEqual(failing({}, interfaces), ["release/network-namespace-is-loopback-only"], String(JSON.stringify(interfaces)));
+    }
+    assert.throws(() => acceptanceIdentityChecks({ ...RELEASE_OPTS, mode: "both" }), /unknown acceptance mode/);
+  });
+});
+
+describe("hls release-image evidence (hls09-release-image-full-path-01)", () => {
+  /** The behavioral blocks alone — what the orchestrator measures in either mode. */
+  function behavioral(checks) {
+    const { source: _source, image: _image, ...rest } = evidenceInput(checks ? { checks } : {});
+    return rest;
+  }
+  const releasePassing = () => HLS09_MANDATORY_CHECKS.map((name) => ({ name, ok: true, detail: null }));
+  const observed = { networkInterfaceNames: ["lo"] };
+
+  /** Every key anywhere in a document. */
+  function allKeys(value, out = new Set()) {
+    if (Array.isArray(value)) value.forEach((v) => allKeys(v, out));
+    else if (value && typeof value === "object") {
+      for (const [k, v] of Object.entries(value)) {
+        out.add(k);
+        allKeys(v, out);
+      }
+    }
+    return out;
+  }
+
+  it("overlay mode still produces HLS-08 -02, byte-identical to the HLS-08 builder", () => {
+    const viaMode = buildAcceptanceEvidence(OVERLAY_OPTS, behavioral());
+    const direct = buildHlsEvidence(evidenceInput({
+      source: {
+        commit: HEAD, tree: TREE, contextClean: true, acceptedBaseSourceCommit: BASE_SOURCE,
+        overlayRuntimeCompatibilityVerified: true,
+      },
+      image: {
+        acceptedBaseImage: BASE_IMAGE, acceptedBaseDigest: BASE_DIGEST,
+        overlayImage: hlsOverlayImageTag(HEAD), overlayImageId: OVERLAY_ID,
+      },
+    }));
+    assert.equal(viaMode.schema, "hls08-deterministic-full-path-02");
+    assert.equal(renderAcceptanceEvidence(OVERLAY_OPTS, viaMode), renderHlsEvidence(direct));
+    assert.deepEqual(imageRemovalFact(OVERLAY_OPTS), { overlayRemovedBy: "run-hls-acceptance.mjs unless --keep-image" });
+  });
+
+  it("release mode produces HLS-09 -01 with release identity and no historical-base or overlay field", () => {
+    const record = buildAcceptanceEvidence(RELEASE_OPTS, behavioral(releasePassing()), observed);
+    assert.equal(record.schema, HLS09_RELEASE_EVIDENCE_SCHEMA);
+    assert.equal(record.schema, "hls09-release-image-full-path-01");
+    assert.equal(record.verdict, "PASS");
+    assert.deepEqual(record.source.commit, HEAD);
+    assert.equal(record.source.contextClean, true);
+    assert.equal(record.image.candidateTag, RELEASE_TAG);
+    assert.equal(record.image.imageId, RELEASE_IMAGE_ID);
+    assert.equal(record.image.runSubject, RELEASE_IMAGE_ID);
+    assert.equal(record.image.deployable, false);
+    assert.equal(record.network.mode, "none");
+    assert.deepEqual(record.network.observedInterfaceNames, ["lo"]);
+    const keys = allKeys(record);
+    for (const key of ["acceptedBaseImage", "acceptedBaseDigest", "acceptedBaseSourceCommit", "overlayImage", "overlayImageId", "overlayRuntimeCompatibilityVerified", "runtimeCompatibilityFiles"]) {
+      assert.ok(!keys.has(key), `${key} must not appear in a release record`);
+    }
+    assert.deepEqual(record.nonClaims, [...HLS09_NON_CLAIMS]);
+    assert.ok(record.nonClaims.some((c) => /Production egress\/nftables is NOT re-proven/.test(c)));
+    assert.ok(record.nonClaims.some((c) => /Production DNS is NOT re-proven/.test(c)));
+    assert.ok(record.nonClaims.some((c) => /Cloudflare Tunnel\/Access, Vercel, Cloudflare R2 or R2 credential broker/.test(c)));
+    assert.ok(record.nonClaims.some((c) => /public HLS source compatibility/.test(c)));
+    assert.ok(record.nonClaims.some((c) => /no Production startup of this candidate/.test(c)));
+    assert.match(record.substitutions.safeHttpTransport, /NOT Production DNS, address-pinning or egress/);
+    assert.deepEqual(imageRemovalFact(RELEASE_OPTS), { candidateRemovedBy: "run-release-image-acceptance.mjs unless --keep-image" });
+    assert.deepEqual(
+      validateHlsReleaseChildRecord(JSON.parse(renderAcceptanceEvidence(RELEASE_OPTS, record)), {
+        sourceCommit: HEAD, sourceTree: TREE, candidateTag: RELEASE_TAG, candidateImageId: RELEASE_IMAGE_ID,
+      }),
+      [],
+    );
+  });
+
+  it("a release PASS does not require the historical accepted-base identity, and the overlay ledger cannot earn it", () => {
+    assert.equal(HLS09_MANDATORY_CHECKS.length, HLS09_RELEASE_IDENTITY_CHECKS.length + HLS_BEHAVIORAL_MANDATORY_CHECKS.length);
+    assert.deepEqual(HLS09_MANDATORY_CHECKS.slice(HLS09_RELEASE_IDENTITY_CHECKS.length), [...HLS_BEHAVIORAL_MANDATORY_CHECKS]);
+    assert.equal(buildAcceptanceEvidence(RELEASE_OPTS, behavioral(releasePassing()), observed).verdict, "PASS");
+    // HLS-08's complete PASS ledger lacks the release identity: no release PASS.
+    assert.throws(
+      () => buildAcceptanceEvidence(RELEASE_OPTS, behavioral(passingChecks()), observed),
+      /refusing to emit a PASS hls09-release-image-full-path-01 record: release\/source-identity-present: recorded 0 times/,
+    );
+  });
+
+  it("a release PASS still requires every behavioral check and every release identity check, exactly once", () => {
+    for (const name of HLS09_MANDATORY_CHECKS) {
+      const dropped = releasePassing().filter((c) => c.name !== name);
+      assert.throws(() => buildHlsReleaseEvidenceFor(dropped), /refusing to emit a PASS/, `absent ${name}`);
+      const failed = releasePassing().map((c) => (c.name === name ? { ...c, ok: false } : c));
+      assert.throws(() => buildHlsReleaseEvidenceFor(failed), /refusing to emit a PASS/, `failed ${name}`);
+    }
+    const duplicated = [...releasePassing(), releasePassing()[10]];
+    assert.throws(() => buildHlsReleaseEvidenceFor(duplicated), /recorded 2 times/);
+    const extraFailed = [...releasePassing(), { name: "extra/x", ok: false, detail: null }];
+    assert.throws(() => buildHlsReleaseEvidenceFor(extraFailed), /extra\/x: failed/);
+    // A FAIL is still emittable, so a release failure is reportable.
+    assert.equal(buildHlsReleaseEvidenceFor(releasePassing().slice(1), "FAIL").verdict, "FAIL");
+    assert.throws(() => buildHlsReleaseEvidenceFor(releasePassing(), "MAYBE"), /PASS, FAIL or BLOCKED/);
+
+    function buildHlsReleaseEvidenceFor(checks, verdict = "PASS") {
+      return buildAcceptanceEvidence(RELEASE_OPTS, { ...behavioral(checks), verdict }, observed);
+    }
+  });
+
+  it("records the run subject the parent handed over, never a copy of the candidate id", () => {
+    const opts = { ...RELEASE_OPTS, runImageId: OVERLAY_ID };
+    const checks = acceptanceIdentityChecks(opts, observed);
+    assert.equal(checks.find((c) => c.name === "release/run-subject-is-candidate-image-id").ok, false);
+    const record = buildAcceptanceEvidence(opts, { ...behavioral([...checks, ...releasePassing().slice(6)]), verdict: "FAIL" }, observed);
+    assert.equal(record.image.imageId, RELEASE_IMAGE_ID);
+    assert.equal(record.image.runSubject, OVERLAY_ID, "a mismatch must be visible in the record, never papered over");
+    assert.ok(
+      validateHlsReleaseChildRecord(record, {
+        sourceCommit: HEAD, sourceTree: TREE, candidateTag: RELEASE_TAG, candidateImageId: RELEASE_IMAGE_ID,
+      }).includes("run image id is not the parent's candidate id"),
+    );
+  });
+
+  it("the PASS gate names exactly the unmet release check, once", () => {
+    const failed = releasePassing().map((c) => (c.name === "release/source-context-clean" ? { ...c, ok: false } : c));
+    assert.deepEqual(unmetPassConditions(failed, HLS09_MANDATORY_CHECKS), ["release/source-context-clean: failed"]);
+    assert.deepEqual(unmetPassConditions(releasePassing(), HLS09_MANDATORY_CHECKS), []);
+    // The default ledger is still HLS-08's.
+    assert.deepEqual(unmetPassConditions(passingChecks()), []);
+  });
+
+  it("a release record refuses unverified source identity, PASS or FAIL", () => {
+    for (const verdict of ["PASS", "FAIL"]) {
+      for (const opts of [
+        { sourceCommit: HEAD.slice(0, 12) }, { sourceTree: "x" }, { sourceContextClean: false },
+      ]) {
+        assert.throws(
+          () => buildAcceptanceEvidence({ ...RELEASE_OPTS, ...opts }, { ...behavioral(releasePassing()), verdict }, observed),
+          /without parent-verified release source identity/,
+          `${verdict} ${JSON.stringify(opts)}`,
+        );
+      }
+    }
+  });
+
+  it("release record privacy stays fail-closed: the same leaks, keys and placements as HLS-08 -02", () => {
+    const leaks = [
+      HLS08_PRIVATE_MARKERS.execution, HLS08_PRIVATE_MARKERS.browser, HLS08_RAW_FORMAT_ID, HLS_FIXTURE_HOSTNAME,
+      "http://anything.example/x", "sig=abc",
+      "/tmp/videofetch/jobs/x/hls-source.ts", "media.m3u8",
+    ];
+    const build = (extra) => buildHlsReleaseEvidence({
+      ...behavioral(releasePassing()),
+      source: { commit: HEAD, tree: TREE, contextClean: true },
+      image: { candidateTag: RELEASE_TAG, imageId: RELEASE_IMAGE_ID, runSubject: RELEASE_IMAGE_ID },
+      network: { fixtureBind: HLS_FIXTURE_LOOPBACK, fixturePort: 40123, observedInterfaceNames: ["lo"] },
+      ...extra,
+    });
+    assert.equal(build({}).verdict, "PASS");
+    for (const leak of leaks) {
+      assert.throws(() => build({ hls2: { note: leak } }), /private HLS material/, leak);
+      assert.throws(() => build({ fixture: { deep: [{ x: leak }] } }), /private HLS material/, leak);
+      assert.throws(() => build({ image: { candidateTag: leak, imageId: RELEASE_IMAGE_ID, runSubject: RELEASE_IMAGE_ID } }), /private HLS material/, leak);
+    }
+    for (const key of ["stderr", "stdout", "argv", "playlistUrl", "fragmentUrl", "cookie", "authorization", "secret", "credential", "token", "url", "headers"]) {
+      assert.throws(() => build({ hls3: { [key]: 1 } }), /containing a/, key);
+    }
+    // A leak is refused even in a FAIL record: privacy is not a PASS-only gate.
+    assert.throws(() => build({ verdict: "FAIL", hls2: { note: HLS_FIXTURE_HOSTNAME } }), /private HLS material/);
   });
 });

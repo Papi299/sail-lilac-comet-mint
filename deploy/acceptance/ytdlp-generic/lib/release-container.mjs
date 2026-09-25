@@ -30,6 +30,16 @@
 // below refuses every path that would substitute product source or runtime, and
 // `assertNoForbiddenMounts` is applied to every argv this module produces. The
 // harness is the observer; everything observed is the image's own.
+//
+// Import-free apart from the HLS-08 container model's constants (itself
+// import-free), so the driver runs on the VM's Node 18.
+
+import {
+  HLS08_FIXTURE_HOST_MAPPING,
+  HLS08_ORCHESTRATOR,
+  HLS_ACCEPTANCE_MODES,
+  HLS_ACCEPTANCE_MODE_FLAG,
+} from "./hls-container.mjs";
 
 /** The one repository name a SPLIT-07 candidate may use. */
 export const CANDIDATE_IMAGE_REPOSITORY = "videofetch-worker";
@@ -155,6 +165,15 @@ export const HARNESS_SCRATCH_TMPFS =
 export const RELEASE_RUN_ENVIRONMENT = Object.freeze([`TMPDIR=${HARNESS_SCRATCH_TARGET}`]);
 
 /**
+ * Host paths the Production stack owns: its disk-backed media workspace, its
+ * durable Worker state and its configuration. A candidate's Product media
+ * workspace must never be, be inside, or contain any of them — acceptance
+ * scratch is task-owned and wiped between children, and Production's is not
+ * this harness's to touch.
+ */
+export const PRODUCTION_HOST_PATHS = Object.freeze(["/srv/videofetch", "/var/lib/videofetch", "/etc/videofetch"]);
+
+/**
  * The `--mount` operand binding a host-supplied Product media workspace at
  * `/tmp/videofetch`, in exactly the Production unit's `type=bind` form.
  *
@@ -175,6 +194,11 @@ export function productMediaWorkspaceMount(hostDirectory) {
       "the Product media workspace must be a clean absolute directory: not /, no relative " +
         "segment, and no comma, quote or control character",
     );
+  }
+  for (const production of PRODUCTION_HOST_PATHS) {
+    if (hostPathsOverlap(hostDirectory, production)) {
+      throw new Error(`the Product media workspace must not overlap the Production host path ${production}`);
+    }
   }
   return `type=bind,source=${hostDirectory},target=${PRODUCT_MEDIA_TARGET}`;
 }
@@ -382,10 +406,19 @@ export function imageIdArgs(reference) {
  * to Docker, so "every candidate container ran the immutable image" is measured
  * from what was executed rather than asserted from what was intended.
  */
+//
+// `--add-host` joined the grammar with HLS-09: the clear-HLS release child needs
+// its ONE acceptance-only name mapping. It is admitted as a one-value option and
+// nothing broader. An `--option=value` spelling is admitted only for an option
+// this grammar already knows (`--cap-drop=ALL` is the one the module emits), so
+// `--privileged=true` or `--network=host` cannot slip past as "some option with
+// an equals sign".
 const RUN_OPTIONS_WITH_VALUE = new Set([
   "--network", "--security-opt", "--tmpfs", "-e", "--env", "-v", "--volume", "--mount", "-w", "--entrypoint",
+  "--add-host",
 ]);
 const RUN_FLAGS = new Set(["--rm", "--read-only"]);
+const RUN_OPTIONS_EQUALS_FORM = new Set([...RUN_OPTIONS_WITH_VALUE, "--cap-drop"]);
 
 export function dockerRunSubject(args) {
   if (!Array.isArray(args) || args[0] !== "run") throw new Error("not a docker run argv");
@@ -395,7 +428,9 @@ export function dockerRunSubject(args) {
       i += 1;
       continue;
     }
-    if (RUN_FLAGS.has(arg) || /^--[a-z][a-z-]*=/.test(arg)) continue;
+    if (RUN_FLAGS.has(arg)) continue;
+    const equals = /^(--[a-z][a-z-]*)=/.exec(arg);
+    if (equals && RUN_OPTIONS_EQUALS_FORM.has(equals[1])) continue;
     if (arg.startsWith("-")) throw new Error(`unrecognized docker run option: ${arg}`);
     return arg;
   }
@@ -548,6 +583,222 @@ export function releaseAcceptanceRunArgs({
     "--evidence",
     `${containerReportDir}/${evidenceName}`,
   ]);
+}
+
+/**
+ * The HLS-09 clear-HLS release child `docker run` argv, against the RELEASE
+ * image.
+ *
+ * Deliberately its own builder rather than a branch of
+ * `releaseAcceptanceRunArgs`, whose contract stays "one SPLIT-06 family".
+ * The container shape is the SPLIT-06 release run's — `--network none`,
+ * `--cap-drop=ALL`, `no-new-privileges`, `--read-only`, the Product media
+ * workspace bound at `/tmp/videofetch` in Production's exact `--mount
+ * type=bind` form, the harness scratch tmpfs with `TMPDIR` pointing at it, the
+ * harness read-only at its repository-relative path, the report directory —
+ * plus exactly ONE addition: the acceptance-only `--add-host` mapping the
+ * pinned yt-dlp subprocess resolves the HLS fixture through, as HLS-08 uses.
+ *
+ * The orchestrator runs in `release-image` mode. The identity it records is
+ * placed here from the PARENT's observations: the verified release source
+ * commit/tree and its clean-context assertion, the build tag as a label, and
+ * the immutable id — which is also this container's run subject, so the child
+ * is told exactly the id Docker is told to execute.
+ */
+export function releaseHlsAcceptanceRunArgs({
+  imageId,
+  harnessDir,
+  reportDir,
+  mediaWorkspaceDir,
+  evidenceName,
+  sourceCommit,
+  sourceTree,
+  candidateTag,
+  containerReportDir = REPORT_MOUNT_TARGET,
+}) {
+  assertImmutableImageId(imageId);
+  requireAbsoluteHostPath("the harness directory", harnessDir);
+  requireAbsoluteHostPath("the report directory", reportDir);
+  const productMediaMount = productMediaWorkspaceMount(mediaWorkspaceDir);
+  if (hostPathsOverlap(mediaWorkspaceDir, reportDir)) {
+    throw new Error("the Product media workspace must not overlap the report directory");
+  }
+  if (hostPathsOverlap(mediaWorkspaceDir, harnessDir)) {
+    throw new Error("the Product media workspace must not overlap the harness directory");
+  }
+  if (typeof evidenceName !== "string" || !/^[A-Za-z0-9._-]+$/.test(evidenceName)) {
+    throw new Error("the evidence filename must be a plain basename");
+  }
+  for (const [label, value] of [["source commit", sourceCommit], ["source tree", sourceTree]]) {
+    if (typeof value !== "string" || !/^[0-9a-f]{40}$/.test(value)) {
+      throw new Error(`the release ${label} must be a full 40-hex SHA`);
+    }
+  }
+  assertCandidateReference(candidateTag);
+  return assertNoForbiddenMounts([
+    "run",
+    "--rm",
+    ...RELEASE_HARDENING_ARGS,
+    "--read-only",
+    // The ONE acceptance-only name mapping, for the pinned yt-dlp subprocess.
+    "--add-host",
+    HLS08_FIXTURE_HOST_MAPPING,
+    // The product's writable media surface, bound exactly as Production binds
+    // its disk-backed workspace. `--mount`, never `-v`: a missing source fails.
+    "--mount",
+    productMediaMount,
+    // The harness's own scratch, disjoint from every product path.
+    "--tmpfs",
+    HARNESS_SCRATCH_TMPFS,
+    ...RELEASE_RUN_ENVIRONMENT.flatMap((entry) => ["-e", entry]),
+    "-v",
+    `${harnessDir}:${HARNESS_MOUNT_TARGET}:ro`,
+    "-v",
+    `${reportDir}:${containerReportDir}`,
+    "-w",
+    "/app",
+    "--entrypoint",
+    "/usr/local/bin/node",
+    imageId,
+    "--import",
+    "./scripts/register-ts-aliases.mjs",
+    "--experimental-strip-types",
+    HLS08_ORCHESTRATOR,
+    HLS_ACCEPTANCE_MODE_FLAG,
+    HLS_ACCEPTANCE_MODES.releaseImage,
+    "--evidence",
+    `${containerReportDir}/${evidenceName}`,
+    "--source-commit",
+    sourceCommit,
+    "--source-tree",
+    sourceTree,
+    "--source-context-clean",
+    "--candidate-tag",
+    candidateTag,
+    "--candidate-image-id",
+    imageId,
+    "--run-image-id",
+    imageId,
+  ]);
+}
+
+/**
+ * The docker-run options the HLS-09 release child may carry, with whether each
+ * takes a value. Anything else — `--privileged`, `--user`, `--env-file`,
+ * `--env`, `--cap-add`, `--pull`, `-p`, … — is a violation by construction.
+ */
+const RELEASE_HLS_RUN_OPTIONS = Object.freeze({
+  "--rm": false,
+  "--read-only": false,
+  "--network": true,
+  "--cap-drop": true,
+  "--security-opt": true,
+  "--add-host": true,
+  "--mount": true,
+  "--tmpfs": true,
+  "-e": true,
+  "-v": true,
+  "-w": true,
+  "--entrypoint": true,
+});
+
+/** Anything naming a socket, a credential store or a Production path. */
+const RELEASE_HLS_FORBIDDEN_NAMES =
+  /docker\.sock|containerd\.sock|videofetch-r2-broker|worker\.env|\/etc\/videofetch|\/var\/lib\/videofetch|\/srv\/videofetch|cloudflared|\.aws|\.config\/gcloud|\.ssh|\.vercel/;
+
+/**
+ * The HLS-09 release child's run posture, re-derived STRUCTURALLY from an argv.
+ * Pure; returns the violations (empty when the argv is exactly the model). The
+ * driver applies it to the argv it is about to execute, and the self-tests to
+ * mutated argv.
+ *
+ * Docker options are parsed left to right until the first positional token,
+ * which is the image and must be the immutable id; the orchestrator after it
+ * must run in `release-image` mode.
+ */
+export function releaseHlsRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }) {
+  const argv = Array.isArray(args) ? args.map(String) : [];
+  const violations = [];
+  if (argv[0] !== "run") violations.push("not a docker run");
+
+  const options = [];
+  let i = 1;
+  while (i < argv.length && argv[i].startsWith("-")) {
+    const raw = argv[i];
+    const eq = raw.indexOf("=");
+    const name = eq > 0 ? raw.slice(0, eq) : raw;
+    if (!Object.hasOwn(RELEASE_HLS_RUN_OPTIONS, name)) {
+      violations.push(`option outside the model: ${name}`);
+      i += 1;
+      continue;
+    }
+    if (RELEASE_HLS_RUN_OPTIONS[name]) {
+      if (eq > 0) {
+        options.push([name, raw.slice(eq + 1)]);
+        i += 1;
+      } else {
+        options.push([name, argv[i + 1]]);
+        i += 2;
+      }
+    } else {
+      options.push([name, null]);
+      i += 1;
+    }
+  }
+  const image = argv[i];
+  if (typeof image !== "string" || !IMAGE_ID_PATTERN.test(image)) {
+    violations.push("the run must name the immutable candidate image id");
+  }
+
+  const values = (name) => options.filter(([n]) => n === name).map(([, v]) => v);
+  const exactlyOnce = (name, expected, message) => {
+    const found = values(name);
+    if (found.length !== 1 || found[0] !== expected) violations.push(message);
+  };
+  let expectedMediaMount = null;
+  try {
+    expectedMediaMount = productMediaWorkspaceMount(mediaWorkspaceDir);
+  } catch (error) {
+    violations.push(`the Product media workspace is not admissible: ${error.message}`);
+  }
+  if (values("--rm").length !== 1) violations.push("--rm missing");
+  if (values("--read-only").length !== 1) violations.push("--read-only missing");
+  exactlyOnce("--network", "none", "--network none missing or overridden");
+  exactlyOnce("--add-host", HLS08_FIXTURE_HOST_MAPPING, "exactly one --add-host with the fixture mapping is required");
+  exactlyOnce("--cap-drop", "ALL", "--cap-drop=ALL missing or overridden");
+  exactlyOnce("--security-opt", "no-new-privileges", "no-new-privileges missing or overridden");
+  exactlyOnce("--mount", expectedMediaMount, "exactly one Product media workspace bind at /tmp/videofetch is required");
+  exactlyOnce("--tmpfs", HARNESS_SCRATCH_TMPFS, "exactly one harness scratch tmpfs is allowed");
+  exactlyOnce("-e", RELEASE_RUN_ENVIRONMENT[0], "exactly one environment entry, TMPDIR at the harness scratch, is allowed");
+  exactlyOnce("-w", "/app", "the working directory must be /app");
+  exactlyOnce("--entrypoint", "/usr/local/bin/node", "the entrypoint must be the image's node");
+  const binds = values("-v");
+  const expectedBinds = [`${harnessDir}:${HARNESS_MOUNT_TARGET}:ro`, `${reportDir}:${REPORT_MOUNT_TARGET}`];
+  if (binds.length !== expectedBinds.length || !expectedBinds.every((bind) => binds.filter((b) => b === bind).length === 1)) {
+    violations.push("exactly one read-only harness mount and one report mount are allowed");
+  }
+
+  const tail = argv.slice(i + 1);
+  if (tail.filter((arg) => arg === HLS08_ORCHESTRATOR).length !== 1) {
+    violations.push("the clear-HLS orchestrator must run exactly once");
+  }
+  const modeAt = tail.indexOf(HLS_ACCEPTANCE_MODE_FLAG);
+  if (
+    tail.filter((arg) => arg === HLS_ACCEPTANCE_MODE_FLAG).length !== 1 ||
+    tail[modeAt + 1] !== HLS_ACCEPTANCE_MODES.releaseImage
+  ) {
+    violations.push("the orchestrator must run in release-image mode");
+  }
+
+  if (argv.some((arg) => RELEASE_HLS_FORBIDDEN_NAMES.test(arg))) {
+    violations.push("a socket, credential or Production path is named");
+  }
+  try {
+    assertNoForbiddenMounts(argv);
+  } catch (error) {
+    violations.push(error.message);
+  }
+  return violations;
 }
 
 /** `docker image rm` for the temporary candidate. Never `latest`, by construction. */

@@ -18,6 +18,13 @@ browser-safe analysis -> ordinary HLS-backed public preset
 It is the clear-HLS counterpart of SPLIT-06. It is **not** HLS-9 (release-image
 qualification) and **not** HLS-10 (promotion or real-source acceptance).
 
+The orchestrator `hls-full-path.mjs` is shared with HLS-09. It takes a required,
+explicit `--acceptance-mode`; HLS-08 is `overlay` mode, and `run-hls-acceptance.mjs`
+passes it. The mode changes only identity and the record: overlay mode still
+emits `hls08-deterministic-full-path-02` with exactly the mandatory checks and
+PASS meaning described here. `release-image` mode is HLS-09's, launched by the
+SPLIT-07 release-image gate — see [`HLS-09.md`](HLS-09.md).
+
 ---
 
 ## What one PASS proves
@@ -113,7 +120,8 @@ Worker's side stays real, and its HEAD measures the persisted file.
   rollback tag; removed after the run unless `--keep-image`.
 - `docker run --rm --pull never --network none
   --add-host hls-fixture.example.invalid:127.0.0.1 -v <report>:/report -w /app`
-  by the overlay's **immutable id**. The only bind mount is the report
+  by the overlay's **immutable id**, running the orchestrator with
+  `--acceptance-mode overlay`. The only bind mount is the report
   directory: no Docker socket, broker socket, `worker.env`, credential,
   Production SQLite or Production workspace. `hlsRunPostureViolations()` parses
   the argv structurally and the driver refuses to run on any violation.
@@ -165,6 +173,7 @@ that one, and the BROWSER playlist never to be requested by anyone.
 | the HLS-3 aggregate's bytes | hashed at HLS-4's first media spawn, before that spawn is delegated |
 | the remux policy | `evaluateHlsRemuxArgv()` over the argv actually spawned; booleans only |
 | the produced MP4 vs the uploaded object | digest of the upload stream's own file at `put` start vs the writer's digest |
+| workspace free bytes (diagnostic only) | harness `statfs` of the Product temp directory's filesystem — the one the job's work directory lives on, never `TMPDIR`; the Product's own `statfs` preflight is authoritative |
 
 Evidence carries sanitized facts only — kinds, labels, ordinals, booleans,
 counts, digests — never a URL, a marker, a raw id, argv or a temporary path.

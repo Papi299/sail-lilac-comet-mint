@@ -100,15 +100,24 @@ export const HLS08_NON_CLAIMS = Object.freeze([
 ]);
 
 /**
- * Every check a PASS requires, by name. A PASS record must carry each one,
- * exactly once, passed. Additional recorded checks must pass too.
+ * The OVERLAY identity checks: source provenance, the accepted historical
+ * base, and the overlay built on it. They are what makes a record HLS-08
+ * overlay evidence, and the only checks HLS-09's release-image child replaces
+ * (`lib/hls-release-evidence.mjs`).
  */
-export const HLS08_MANDATORY_CHECKS = Object.freeze([
-  // source provenance, base identity, overlay identity
+export const HLS08_OVERLAY_IDENTITY_CHECKS = Object.freeze([
   "provenance/driver-verified-source",
   "image/accepted-base-digest-is-the-recorded-runtime",
   "image/accepted-base-source-is-the-recorded-runtime",
   "image/overlay-is-non-deployable",
+]);
+
+/**
+ * The BEHAVIORAL checks: the clear-HLS chain itself, from the toolchain to the
+ * three negatives. Shared, unchanged, by every mode that runs the chain — an
+ * overlay (HLS-08) and a release image (HLS-09) must both earn every one.
+ */
+export const HLS_BEHAVIORAL_MANDATORY_CHECKS = Object.freeze([
   // toolchain
   "preflight/node-runtime-family",
   "preflight/ytdlp-available",
@@ -275,20 +284,30 @@ export const HLS08_MANDATORY_CHECKS = Object.freeze([
 ]);
 
 /**
+ * Every check an HLS-08 PASS requires, by name. A PASS record must carry each
+ * one, exactly once, passed. Additional recorded checks must pass too.
+ */
+export const HLS08_MANDATORY_CHECKS = Object.freeze([
+  ...HLS08_OVERLAY_IDENTITY_CHECKS,
+  ...HLS_BEHAVIORAL_MANDATORY_CHECKS,
+]);
+
+/**
  * The PASS conditions over a check list. Pure; returns the unmet reasons.
  * No partial PASS: every mandatory check present exactly once and passed, and
- * every other recorded check passed too.
+ * every other recorded check passed too. `mandatory` defaults to HLS-08's list;
+ * HLS-09's release child passes its own.
  */
-export function unmetPassConditions(checks) {
+export function unmetPassConditions(checks, mandatory = HLS08_MANDATORY_CHECKS) {
   const list = Array.isArray(checks) ? checks : [];
   const unmet = [];
-  for (const name of HLS08_MANDATORY_CHECKS) {
+  for (const name of mandatory) {
     const found = list.filter((c) => c?.name === name);
     if (found.length !== 1) unmet.push(`${name}: recorded ${found.length} times`);
     else if (found[0].ok !== true) unmet.push(`${name}: failed`);
   }
   for (const check of list) {
-    if (check?.ok !== true && !HLS08_MANDATORY_CHECKS.includes(check?.name)) {
+    if (check?.ok !== true && !mandatory.includes(check?.name)) {
       unmet.push(`${String(check?.name)}: failed`);
     }
   }
@@ -429,7 +448,7 @@ function verifiedSource(source) {
 }
 
 /** The dotted path of the first forbidden key, or null. Case-insensitive. */
-function findForbiddenKey(value, path = "$", depth = 0) {
+export function findForbiddenKey(value, path = "$", depth = 0) {
   if (depth > 12) return null;
   if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i += 1) {

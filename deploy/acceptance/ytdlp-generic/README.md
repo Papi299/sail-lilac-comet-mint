@@ -169,17 +169,19 @@ not an overlay. It does the following, and deploys nothing and never touches
 - checks the image's configuration, hardening and pinned runtime from inside it;
 - runs both offline policy verifiers against it;
 - runs the unchanged SPLIT-06 full path against it for **mp4 and webm**;
-- creates its record exclusively.
+- (since `-03`) runs the HLS-09 clear-HLS release child against it — the
+  HLS-08 full path and negatives in `release-image` mode;
+- creates its record exclusively, and reads it back.
 
-See [`SPLIT-07.md`](SPLIT-07.md).
+See [`SPLIT-07.md`](SPLIT-07.md) and, for the clear-HLS child, [`HLS-09.md`](HLS-09.md).
 
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
-| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, writes the `split07-release-image-candidate-02` record (`-01` records are historical). Requires `--media-workspace`: an existing, EMPTY, uid-1000-writable directory on disk, never the report directory — admitted before any Docker command and cleared after each family. |
+| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice and the clear-HLS child once, writes the `split07-release-image-candidate-03` record (`-02` is valid split-stream-only qualification and does not qualify clear HLS; `-01` is historical). Requires `--media-workspace`: an existing, EMPTY, uid-1000-writable directory on disk, never the report directory or a Production path — admitted before any Docker command and cleared after each child. |
 | `lib/release-provenance.mjs` | — | The clean-worktree gate for the release context and the harness, and the `/app` source manifest from Git objects. |
-| `lib/release-container.mjs` | — | Every `docker` argv: non-deployable tags, immutable-id run subjects, hardening, the Product media workspace bound in Production's exact `--mount type=bind` form (the 2 GiB tmpfs is retired, `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`), the forbidden-mount guard. |
+| `lib/release-container.mjs` | — | Every `docker` argv: non-deployable tags, immutable-id run subjects, hardening, the Product media workspace bound in Production's exact `--mount type=bind` form (the 2 GiB tmpfs is retired, `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`), the forbidden-mount guard, and the clear-HLS child's argv and structural posture check. |
 | `lib/release-image-probe.mjs` | inside the candidate, at `/verify` | Import-free observer: manifest, forbidden tools, env names, runtime identity. |
-| `lib/release-evidence.mjs` | — | The parent record, SPLIT-06 child validation and re-hashing, and the PASS gate. |
+| `lib/release-evidence.mjs` | — | The parent record, SPLIT-06 and clear-HLS child validation and re-hashing, the PASS gate, and the read-back validator. |
 
 Self-tests: `scripts/ytdlp-release-image-acceptance.test.mjs` — no Docker, no
 network.
@@ -197,8 +199,10 @@ deliberately does **not** prove.
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
 | `run-hls-acceptance.mjs` | where Docker is | Provenance, pinned accepted base, non-deployable overlay, isolated run, evidence read-back. |
-| `hls-full-path.mjs` | inside the acceptance container | The deterministic clear-HLS orchestrator. |
-| `lib/hls-container.mjs` | — | Overlay Dockerfile and every `docker` argv; `--network none`, the one `--add-host`, the structural posture check. |
+| `hls-full-path.mjs` | inside the acceptance container | The deterministic clear-HLS orchestrator, in an explicit `--acceptance-mode`: `overlay` (HLS-08) or `release-image` (HLS-09, launched by SPLIT-07). |
+| `lib/hls-acceptance-mode.mjs` | — | The explicit mode boundary: argv parsing (mixed identity fails closed), per-mode identity checks, per-mode record. |
+| `lib/hls-release-evidence.mjs` | — | The HLS-09 `hls09-release-image-full-path-01` release-child record, its PASS and privacy gates, and the parent-side validator. See [`HLS-09.md`](HLS-09.md). |
+| `lib/hls-container.mjs` | — | Overlay Dockerfile and every `docker` argv; `--network none`, the one `--add-host`, the structural posture check; the acceptance-mode names. |
 | `lib/hls-fixture-url.mjs` | — | The acceptance hostname, route table, private markers, and the exact submitted-page validator. |
 | `lib/hls-safe-http-transport.mjs` | — | The acceptance DNS answer and loopback socket under the Product's real safe-HTTP policy. |
 | `lib/hls-observers.mjs` | — | Subprocess observer, remux-policy reader, field-aware privacy placement. |

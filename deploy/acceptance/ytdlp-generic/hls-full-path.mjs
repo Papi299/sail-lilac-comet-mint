@@ -37,21 +37,37 @@
 //
 // Production SSRF/address pinning, Production DNS, Production egress/nftables,
 // Cloudflare, Vercel, R2 and its broker, the Production network namespace,
-// the watchdog, public-site or real-CDN compatibility, and release-image
-// qualification (HLS-9) or promotion (HLS-10).
+// the watchdog, public-site or real-CDN compatibility, and promotion (HLS-10).
+//
+// ── Two explicit acceptance modes, one behavioral run ──────────────────────
+//
+// `--acceptance-mode` is required (`lib/hls-acceptance-mode.mjs`):
+//
+//   overlay        HLS-08. The candidate source overlaid on the accepted
+//                  historical runtime; emits `hls08-deterministic-full-path-02`.
+//   release-image  HLS-09. The ACTUAL `Dockerfile.worker` release candidate,
+//                  launched by the SPLIT-07 parent; emits
+//                  `hls09-release-image-full-path-01`.
+//
+// Only identity and the record differ. Everything this file measures, and
+// every behavioral check, is the same code in both modes.
 //
 // ── Where it runs ──────────────────────────────────────────────────────────
 //
 // INSIDE the acceptance container, as the image's non-root `node` user, with
-// `--network none` and exactly one `--add-host` mapping. `lib/hls-container.mjs`
-// builds that invocation and `run-hls-acceptance.mjs` launches it.
+// `--network none` and exactly one `--add-host` mapping. Overlay mode:
+// `lib/hls-container.mjs` builds that invocation and `run-hls-acceptance.mjs`
+// launches it. Release-image mode: `lib/release-container.mjs` builds it — with
+// a read-only root, the Product media workspace bound at `/tmp/videofetch` and
+// harness scratch on its own tmpfs via `TMPDIR` — and
+// `run-release-image-acceptance.mjs` launches it.
 
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import http from "node:http";
 import { readFileSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, statfs, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -149,11 +165,17 @@ import {
   validateStructuredPrivacy,
   withProcessObserver,
 } from "./lib/hls-observers.mjs";
-import { HLS08_ACCEPTED_BASE, assertNonDeployableTag } from "./lib/hls-container.mjs";
-import { buildHlsEvidence, renderHlsEvidence } from "./lib/hls-evidence.mjs";
+import { HLS08_ACCEPTED_BASE } from "./lib/hls-container.mjs";
+import {
+  acceptanceIdentityChecks,
+  acceptanceLabel,
+  buildAcceptanceEvidence,
+  imageRemovalFact,
+  parseHlsAcceptanceArgv,
+  renderAcceptanceEvidence,
+} from "./lib/hls-acceptance-mode.mjs";
 import { createLocalObjectStoreWriter } from "./lib/local-object-writer.mjs";
 import { createRunnerLedger, installStatusAudit, readStatusTrace } from "./lib/split-observers.mjs";
-import { isFullGitSha } from "./lib/split-provenance.mjs";
 
 // ── Bounds ─────────────────────────────────────────────────────────────────
 
@@ -286,6 +308,8 @@ async function preflight(checks) {
 
   const runtime = await probeYtdlpRuntime();
   checks.require("preflight/ytdlp-available", runtime.available === true, runtime.reason ?? null);
+  // A version pin, not a base-image assertion: the harness's yt-dlp pin is the
+  // same `2026.08.19` in both modes (and in SPLIT-07's EXPECTED_YTDLP_RUNTIME).
   checks.require(
     "preflight/ytdlp-exact-pin",
     runtime.version === YTDLP_RUNTIME.expectedVersion && runtime.version === HLS08_ACCEPTED_BASE.ytdlpVersion,
@@ -683,8 +707,11 @@ async function runJob(ctx, { caseLabel, masterVariant }) {
       execution.masterVariantAtAnalysis = service.masterVariant();
       execution.facts = inspectExecutionAnalysis(result, port);
       // Diagnostic only: the Product's own statfs preflight is authoritative.
+      // Measured on the Product's temp directory — the filesystem the job's
+      // workDir lives on — never on `TMPDIR`, which in release-image mode is
+      // the harness scratch tmpfs rather than the Product media workspace.
       try {
-        const fs = await statfs(tmpdir());
+        const fs = await statfs(config.tempDirectory);
         execution.freeBytesBeforeAcquisition = Number(fs.bavail) * Number(fs.bsize);
       } catch {
         execution.freeBytesBeforeAcquisition = null;
@@ -832,50 +859,12 @@ function sanitizeFixtureRequest(entry) {
 
 // ── 8. CLI ─────────────────────────────────────────────────────────────────
 
-function parseArgv(argv) {
-  const out = {
-    evidence: null, sourceCommit: null, sourceTree: null, acceptedBaseSource: null,
-    sourceContextClean: false, overlayRuntimeCompatible: false,
-    baseImage: null, baseDigest: null, overlayImage: null, overlayImageId: null,
-  };
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    const value = argv[i + 1];
-    const take = (key) => {
-      if (value === undefined) throw new Error(`${arg} requires a value`);
-      out[key] = value;
-      i += 1;
-    };
-    switch (arg) {
-      case "--evidence": take("evidence"); break;
-      case "--source-commit": take("sourceCommit"); break;
-      case "--source-tree": take("sourceTree"); break;
-      case "--accepted-base-source": take("acceptedBaseSource"); break;
-      case "--source-context-clean": out.sourceContextClean = true; break;
-      case "--overlay-runtime-compatible": out.overlayRuntimeCompatible = true; break;
-      case "--base-image": take("baseImage"); break;
-      case "--base-digest": take("baseDigest"); break;
-      case "--overlay-image": take("overlayImage"); break;
-      case "--overlay-image-id": take("overlayImageId"); break;
-      default: throw new Error(`unknown argument: ${arg}`);
-    }
-  }
-  if (!out.evidence) throw new Error("--evidence <path> is required");
-  for (const [flag, key] of [
-    ["--source-commit", "sourceCommit"],
-    ["--source-tree", "sourceTree"],
-    ["--accepted-base-source", "acceptedBaseSource"],
-  ]) {
-    if (!isFullGitSha(out[key])) throw new Error(`${flag} must be the full 40-hex value the driver observed`);
-  }
-  if (!out.sourceContextClean || !out.overlayRuntimeCompatible) {
-    throw new Error("the build context was not verified clean and runtime-compatible by run-hls-acceptance.mjs");
-  }
-  for (const key of ["baseImage", "baseDigest", "overlayImage", "overlayImageId"]) {
-    if (!out[key]) throw new Error(`--${key.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)} is required`);
-  }
-  return out;
-}
+/**
+ * `--acceptance-mode overlay|release-image` plus that mode's identity flags.
+ * The mode is explicit and mixed identity fails closed; see
+ * `lib/hls-acceptance-mode.mjs`.
+ */
+const parseArgv = parseHlsAcceptanceArgv;
 
 async function admitEvidencePath(path) {
   if (await pathExists(path)) throw new Error("refusing to replace an existing evidence artifact");
@@ -910,26 +899,14 @@ async function main(argv) {
   const note = (event, status) => trace.push({ event, status: status ?? null });
 
   // ── Recorded provenance and image identity (observed by the driver) ────
-  checks.record(
-    "provenance/driver-verified-source",
-    isFullGitSha(opts.sourceCommit) && isFullGitSha(opts.sourceTree) && opts.sourceContextClean && opts.overlayRuntimeCompatible,
-  );
-  checks.record(
-    "image/accepted-base-digest-is-the-recorded-runtime",
-    opts.baseDigest === HLS08_ACCEPTED_BASE.imageDigest,
-  );
-  checks.record(
-    "image/accepted-base-source-is-the-recorded-runtime",
-    opts.acceptedBaseSource === HLS08_ACCEPTED_BASE.sourceCommit,
-  );
-  let overlayNonDeployable = false;
-  try {
-    assertNonDeployableTag(opts.overlayImage);
-    overlayNonDeployable = /^sha256:[0-9a-f]{64}$/.test(opts.overlayImageId) && opts.overlayImageId !== opts.baseDigest;
-  } catch {
-    overlayNonDeployable = false;
+  //
+  // The mode's identity checks: HLS-08's overlay/historical-base checks, or
+  // HLS-09's release-candidate checks. The release child also observes its
+  // own network namespace, so "offline" is measured rather than asserted.
+  const identityObservations = { networkInterfaceNames: Object.keys(networkInterfaces()) };
+  for (const entry of acceptanceIdentityChecks(opts, identityObservations)) {
+    checks.record(entry.name, entry.ok, entry.detail);
   }
-  checks.record("image/overlay-is-non-deployable", overlayNonDeployable);
 
   try {
     out.toolchain = await preflight(checks);
@@ -1335,7 +1312,7 @@ async function main(argv) {
       footprint: exec?.workspaceFootprint ?? null,
       requiredBytes: exec?.workspaceRequiredBytes ?? null,
       observedFreeBytes: job.execution.freeBytesBeforeAcquisition,
-      observedBy: "harness statfs of the container temp filesystem after execution analysis (diagnostic only)",
+      observedBy: "harness statfs of the Product temp directory's filesystem after execution analysis (diagnostic only)",
       authority: "JobExecutor's own statfs preflight (availableWorkDirBytes NOT injected)",
     };
 
@@ -1905,7 +1882,7 @@ async function main(argv) {
       safeHttpHooksCleared: true,
       processRunnerHooksCleared: true,
       containerRemovedBy: "--rm",
-      overlayRemovedBy: "run-hls-acceptance.mjs unless --keep-image",
+      ...imageRemovalFact(opts),
     };
 
     if (blocked.length > 0) verdict = "BLOCKED";
@@ -1931,23 +1908,11 @@ async function main(argv) {
     await rm(sinkRoot, { recursive: true, force: true }).catch(() => {});
   }
 
-  const record = buildHlsEvidence({
+  // The mode adds only its identity (source/image) to the behavioral blocks.
+  const record = buildAcceptanceEvidence(opts, {
     verdict,
     startedAt,
     finishedAt: new Date().toISOString(),
-    source: {
-      commit: opts.sourceCommit,
-      tree: opts.sourceTree,
-      contextClean: opts.sourceContextClean,
-      acceptedBaseSourceCommit: opts.acceptedBaseSource,
-      overlayRuntimeCompatibilityVerified: opts.overlayRuntimeCompatible,
-    },
-    image: {
-      acceptedBaseImage: opts.baseImage,
-      acceptedBaseDigest: opts.baseDigest,
-      overlayImage: opts.overlayImage,
-      overlayImageId: opts.overlayImageId,
-    },
     network: { fixtureBind: HLS_FIXTURE_LOOPBACK, fixturePort: out.port },
     toolchain: out.toolchain,
     invariants: out.invariants,
@@ -1978,12 +1943,12 @@ async function main(argv) {
       blockedReasons: blocked,
     },
     checks: checks.all(),
-  });
+  }, identityObservations);
 
-  await writeFile(opts.evidence, renderHlsEvidence(record), { flag: "wx" });
+  await writeFile(opts.evidence, renderAcceptanceEvidence(opts, record), { flag: "wx" });
 
   const failed = checks.failed();
-  process.stdout.write(`${verdict} hls08 checks=${checks.all().length} failed=${failed.length}\n`);
+  process.stdout.write(`${verdict} ${acceptanceLabel(opts)} checks=${checks.all().length} failed=${failed.length}\n`);
   for (const f of failed) process.stdout.write(`  FAIL ${f.name}${f.detail ? ` :: ${f.detail}` : ""}\n`);
   for (const b of blocked) process.stdout.write(`  BLOCKED ${b}\n`);
   process.exitCode = verdict === "PASS" ? 0 : 1;

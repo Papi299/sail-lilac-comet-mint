@@ -51,13 +51,23 @@ import {
   policyVerifierRunArgs,
   probeRunArgs,
   PRODUCT_MEDIA_TARGET,
+  PRODUCTION_HOST_PATHS,
   productMediaWorkspaceMount,
   RELEASE_DOCKERFILE,
   RELEASE_RUN_ENVIRONMENT,
   releaseAcceptanceRunArgs,
   releaseBuildArgs,
+  releaseHlsAcceptanceRunArgs,
+  releaseHlsRunPostureViolations,
+  REPORT_MOUNT_TARGET,
   VERIFY_MOUNT_TARGET,
 } from "../deploy/acceptance/ytdlp-generic/lib/release-container.mjs";
+import { HLS08_FIXTURE_HOST_MAPPING } from "../deploy/acceptance/ytdlp-generic/lib/hls-container.mjs";
+import {
+  buildHlsReleaseEvidence,
+  HLS09_MANDATORY_CHECKS,
+  HLS09_RELEASE_EVIDENCE_SCHEMA,
+} from "../deploy/acceptance/ytdlp-generic/lib/hls-release-evidence.mjs";
 import {
   buildExpectedSourceManifest,
   compareSourceManifests,
@@ -80,14 +90,20 @@ import {
   EXPECTED_IMAGE_CONFIG,
   EXPECTED_YTDLP_RUNTIME,
   FORBIDDEN_IMAGE_ENVIRONMENT_NAMES,
+  HARNESS_VERIFICATION_POINTS,
+  HISTORICAL_SPLIT07_SCHEMAS,
+  HLS_CANDIDATE_RUN_PURPOSE,
   ReleaseEvidenceError,
   REQUIRED_CANDIDATE_RUN_PURPOSES,
   REQUIRED_CHILD_SCHEMA,
+  REQUIRED_HLS_CHILD_SCHEMA,
   REQUIRED_PASS_CHECKS,
   REQUIRED_SPLIT_FAMILIES,
   renderReleaseEvidence,
   SPLIT07_EVIDENCE_SCHEMA,
   validateChildRecord,
+  validateHlsChildRecord,
+  validateReleaseParentRecord,
 } from "../deploy/acceptance/ytdlp-generic/lib/release-evidence.mjs";
 import {
   parseArgv,
@@ -113,7 +129,10 @@ const TAG = `${CANDIDATE_IMAGE_REPOSITORY}:split07-${SOURCE.slice(0, 12)}-local-
 const PARENT = `${REPORT}/split07-release-image-1700000000000.json`;
 const STATUS_TRACKED = "status --porcelain=v1 --untracked-files=all --ignored=no --ignore-submodules=none";
 const STATUS_IGNORED = "status --porcelain=v1 --untracked-files=all --ignored=matching --ignore-submodules=none";
-const HARNESS_POINTS = ["before-docker", "after-build", "before-split06-mp4", "before-split06-webm", "after-children"];
+const HARNESS_POINTS = [
+  "before-docker", "after-build", "before-split06-mp4", "before-split06-webm", "before-hls09-clear-hls", "after-children",
+];
+const HARNESS_DIR = `${HARNESS}/deploy/acceptance/ytdlp-generic`;
 
 /** The application files the fake commit carries, plus the broker it removes. */
 const SOURCE_FILES = {
@@ -223,18 +242,56 @@ function passingChild(family, overrides = {}, flags = null) {
 }
 
 /**
+ * A PASS clear-HLS release child, built by the REAL HLS-09 builder (so its
+ * privacy and PASS gates apply) and shaped as the real orchestrator shapes it
+ * in `release-image` mode: it records the identity flags it was GIVEN. It
+ * cannot introspect Docker either, which is why the parent re-binds them.
+ *
+ * `overrides` are applied AFTER the builder, by deep merge, to model a child
+ * that is broken or hostile in exactly one respect.
+ */
+function passingHlsChild(flags = null, overrides = {}) {
+  const f = flags ?? {
+    sourceCommit: SOURCE, sourceTree: TREE, sourceContextClean: true,
+    candidateTag: TAG, candidateImageId: IMAGE_ID, runImageId: IMAGE_ID,
+  };
+  const record = buildHlsReleaseEvidence({
+    verdict: "PASS",
+    startedAt: "2026-09-26T00:00:00.000Z",
+    finishedAt: "2026-09-26T00:01:30.000Z",
+    source: { commit: f.sourceCommit, tree: f.sourceTree, contextClean: f.sourceContextClean },
+    image: { candidateTag: f.candidateTag, imageId: f.candidateImageId, runSubject: f.runImageId },
+    network: { fixtureBind: "127.0.0.1", fixturePort: 40123, observedInterfaceNames: ["lo"] },
+    toolchain: { node: "v22.23.2" }, invariants: {}, fixture: {}, fixtureToolUse: {},
+    discovery: { protocol: "m3u8_native" }, publicAnalysis: {}, executionAnalysis: {}, freshProvenance: {},
+    plan: { operation: "clear-hls-remux" }, workspace: {}, hls2: {}, hls3: {}, aggregate: {}, lifecycle: {},
+    productMediaToolUse: {}, remux: {}, output: {}, upload: { objectKey: "videofetch/jobs/x/y.mp4" }, ready: {},
+    fixtureRequests: {}, privacy: {}, cleanup: {}, negativeCases: {}, openNotes: {},
+    checks: HLS09_MANDATORY_CHECKS.map((name) => ({ name, ok: true, detail: null })),
+  });
+  return deepMerge(record, overrides);
+}
+
+/** A child record's exact on-disk bytes. */
+function recordBytes(record) {
+  return Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+}
+
+/**
  * One internally consistent fake run, and the knobs that break exactly one
  * thing about it.
  *
  * `spec` fields:
  *   git / harnessGit        overrides for individual release-context / harness git answers
- *   harnessChange           { after: "start"|"build"|"split06:mp4"|"split06:webm", kind }
+ *   harnessChange           { after: "start"|"build"|"split06:mp4"|"split06:webm"|"hls09:clear-hls", kind }
  *                           makes the harness stop verifying from that event on
  *   imageConfig / configOverrides / probes   what image A (the inspected one) reports
  *   imageBProbes            what image B reports, if it is ever executed
  *   retargetTagAfterInspect the candidate tag points at B once it has been inspected
  *   inspectId               the id the tag inspect reports, to test the id grammar
  *   children                per-family child record overrides (or `null` to omit the file)
+ *   hls                     clear-HLS child overrides (or `null` to omit the file,
+ *                           or `{ raw: "<bytes>" }` for unparseable bytes)
  *   verifiers               per-verifier exit code
  *   production / productionAfter             Production observations
  *   files                   [path, bytes] entries already on the fake filesystem
@@ -483,6 +540,26 @@ function createWorld(spec = {}) {
       const name = evidenceArg.slice(evidenceArg.lastIndexOf("/") + 1);
       const reportMount = args.find((arg) => String(arg).endsWith(":/report"));
       const hostReport = reportMount ? String(reportMount).slice(0, -":/report".length) : REPORT;
+      if (flagValue(args, "--acceptance-mode") === "release-image") {
+        // The clear-HLS child: echoes the identity flags it was given.
+        const hls = Object.prototype.hasOwnProperty.call(spec, "hls") ? spec.hls : {};
+        if (hls !== null) {
+          const flags = {
+            sourceCommit: flagValue(args, "--source-commit"),
+            sourceTree: flagValue(args, "--source-tree"),
+            sourceContextClean: args.includes("--source-context-clean"),
+            candidateTag: flagValue(args, "--candidate-tag"),
+            candidateImageId: flagValue(args, "--candidate-image-id"),
+            runImageId: flagValue(args, "--run-image-id"),
+          };
+          files.set(
+            `${hostReport}/${name}`,
+            typeof hls.raw === "string" ? Buffer.from(hls.raw, "utf8") : recordBytes(passingHlsChild(flags, hls)),
+          );
+        }
+        events.add(HLS_CANDIDATE_RUN_PURPOSE);
+        return ok("", spec.hlsExit ?? 0);
+      }
       const override = Object.prototype.hasOwnProperty.call(childSpec, family) ? childSpec[family] : {};
       if (override !== null) {
         const flags = {
@@ -684,6 +761,15 @@ function evidenceInput(overrides = {}) {
         evidenceFile: `split06-${family}.json`, sourceCommit: SOURCE, sourceTree: TREE,
         ranImage: IMAGE_ID, ranImageId: IMAGE_ID, networkMode: "none", reason: null,
       })),
+    },
+    hlsAcceptance: {
+      executed: true,
+      child: {
+        schema: REQUIRED_HLS_CHILD_SCHEMA, verdict: "PASS", ok: true, sha256: sha256("clear-hls"), bytes: 100,
+        checkCount: HLS09_MANDATORY_CHECKS.length, failedCheckCount: 0, evidenceFile: "hls09-clear-hls.json",
+        sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG, candidateImageId: IMAGE_ID, runImageId: IMAGE_ID,
+        networkMode: "none", reason: null,
+      },
     },
     production: { latestTag: "videofetch-worker:latest", retaggedLatest: false },
     checks: REQUIRED_PASS_CHECKS.map((name) => ({ name, ok: true, detail: null })),
@@ -1400,9 +1486,11 @@ describe("SPLIT-07 evidence builder", () => {
   });
 
   it("names a NEW schema, and never reuses or bumps SPLIT-06's", () => {
-    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-02");
+    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-03");
     assert.equal(REQUIRED_CHILD_SCHEMA, "split06-deterministic-full-path-04");
+    assert.equal(REQUIRED_HLS_CHILD_SCHEMA, "hls09-release-image-full-path-01");
     assert.notEqual(SPLIT07_EVIDENCE_SCHEMA, REQUIRED_CHILD_SCHEMA);
+    assert.notEqual(REQUIRED_HLS_CHILD_SCHEMA, "hls08-deterministic-full-path-02", "HLS-08 overlay evidence is not a release child");
   });
 
   it("keeps a FAIL record emittable, so a failure is reportable", () => {
@@ -2142,9 +2230,21 @@ describe("SPLIT-07 harness provenance (driver)", () => {
     assert.equal(world.writeCalls.length, 0, "no parent evidence may be written");
   });
 
-  it("refuses the record when the harness changes while the last child runs", async () => {
+  it("refuses the record when the harness changes between webm and the clear-HLS child, before HLS runs", async () => {
+    const { result, error, world } = await drive({ harnessChange: { after: "split06:webm", kind: "modified" } });
+    assert.equal(result, null);
+    assert.match(String(error?.message), /\(before-hls09-clear-hls\)/);
+    assert.equal(
+      world.dockerCalls.filter((c) => c.args.includes("--acceptance-mode")).length,
+      0,
+      "the clear-HLS child must never run on a changed harness",
+    );
+    assert.equal(world.writeCalls.length, 0, "no parent evidence may be written");
+  });
+
+  it("refuses the record when the harness changes while the last child — clear-HLS — runs", async () => {
     for (const kind of ["modified", "staged", "ignored", "hidden", "moved"]) {
-      const { result, error, world } = await drive({ harnessChange: { after: "split06:webm", kind } });
+      const { result, error, world } = await drive({ harnessChange: { after: HLS_CANDIDATE_RUN_PURPOSE, kind } });
       assert.equal(result, null, `${kind} must be refused`);
       assert.match(String(error?.message), /\(after-children\)/);
       assert.equal(world.writeCalls.length, 0, "no parent evidence may be written");
@@ -2191,7 +2291,7 @@ describe("SPLIT-07 parent evidence is created exclusively", () => {
   it("A1: with the pre-flight blind, the exclusive create itself refuses and leaves the file untouched", async () => {
     const { result, error, world } = await drive({ files: [[PARENT, PRIOR]] }, {}, { readdir: async () => [] });
     assert.equal(result, null);
-    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-02 verdict/);
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-03 verdict/);
     assert.ok(world.files.get(PARENT).equals(PRIOR), "the existing bytes must be unchanged");
     assert.deepEqual(world.writeCalls.map((call) => call.options), [{ encoding: "utf8", flag: "wx" }]);
   });
@@ -2202,7 +2302,7 @@ describe("SPLIT-07 parent evidence is created exclusively", () => {
     const lines = [];
     const { result, error, world } = await drive({ competitorAtWrite: competitor }, {}, { log: (line) => lines.push(line) });
     assert.equal(result, null, "a lost race returns no result, and so no PASS");
-    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-02 verdict/);
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-03 verdict/);
     assert.match(String(error?.message), /has NOT been modified/);
     assert.equal(world.files.get(PARENT).toString("utf8"), competitor, "the competing record must be byte-identical");
     assert.deepEqual(
@@ -2281,8 +2381,540 @@ describe("SPLIT-07 -02 evidence gates", () => {
     assert.equal(record.harness.commitIsReleaseSource, true);
   });
 
-  it("treats -01 as historical: the builder emits only -02", () => {
-    assert.equal(buildReleaseEvidence(evidenceInput()).schema, "split07-release-image-candidate-02");
-    assert.notEqual(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-01");
+  it("treats -01 and -02 as historical: the builder emits only -03", () => {
+    assert.equal(buildReleaseEvidence(evidenceInput()).schema, "split07-release-image-candidate-03");
+    assert.deepEqual([...HISTORICAL_SPLIT07_SCHEMAS], [
+      "split07-release-image-candidate-01",
+      "split07-release-image-candidate-02",
+    ]);
+    assert.ok(!HISTORICAL_SPLIT07_SCHEMAS.includes(SPLIT07_EVIDENCE_SCHEMA));
+  });
+});
+
+// ── 9. The -03 clear-HLS release child ──────────────────────────────────────
+
+describe("SPLIT-07 -03 clear-HLS release child invocation (container model)", () => {
+  const hlsArgs = (overrides = {}) =>
+    releaseHlsAcceptanceRunArgs({
+      imageId: IMAGE_ID, harnessDir: HARNESS_DIR, reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE,
+      evidenceName: "hls09-clear-hls-1.json", sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG,
+      ...overrides,
+    });
+  const posture = (args) =>
+    releaseHlsRunPostureViolations(args, { reportDir: REPORT, harnessDir: HARNESS_DIR, mediaWorkspaceDir: MEDIA_WORKSPACE });
+  const values = (args, flag) => args.flatMap((arg, i) => (arg === flag ? [args[i + 1]] : []));
+  const imageAt = (args) => args.indexOf(IMAGE_ID);
+
+  it("has exactly the model posture: offline, one --add-host, hardened, one of each mount, by immutable id", () => {
+    const args = hlsArgs();
+    assert.deepEqual(posture(args), []);
+    assert.equal(dockerRunSubject(args), IMAGE_ID);
+    assert.deepEqual(values(args, "--network"), ["none"]);
+    assert.deepEqual(values(args, "--add-host"), [HLS08_FIXTURE_HOST_MAPPING]);
+    assert.equal(HLS08_FIXTURE_HOST_MAPPING, "hls-fixture.example.invalid:127.0.0.1");
+    assert.equal(args.filter((arg) => arg === "--cap-drop=ALL").length, 1);
+    assert.deepEqual(values(args, "--security-opt"), ["no-new-privileges"]);
+    assert.equal(args.filter((arg) => arg === "--read-only").length, 1);
+    assert.equal(args.filter((arg) => arg === "--rm").length, 1);
+    assert.deepEqual(values(args, "--mount"), [`type=bind,source=${MEDIA_WORKSPACE},target=/tmp/videofetch`]);
+    assert.deepEqual(values(args, "--tmpfs"), [HARNESS_SCRATCH_TMPFS], "the only tmpfs is the harness scratch");
+    assert.deepEqual(values(args, "-e"), [...RELEASE_RUN_ENVIRONMENT]);
+    assert.deepEqual(values(args, "-v"), [`${HARNESS_DIR}:${HARNESS_MOUNT_TARGET}:ro`, `${REPORT}:${REPORT_MOUNT_TARGET}`]);
+    assert.deepEqual(mountTargets(args), [PRODUCT_MEDIA_TARGET, HARNESS_SCRATCH_TARGET, HARNESS_MOUNT_TARGET, "/report"]);
+    assert.equal(args.filter((arg) => arg === TAG).length, 1, "the tag appears only as the child's label argument");
+    assert.equal(args[args.indexOf(TAG) - 1], "--candidate-tag");
+    assert.ok(!mountTargets(args).includes("/tmp"), "/tmp itself stays read-only");
+  });
+
+  it("runs the orchestrator in release-image mode with exactly the parent's identity, and no overlay identity", () => {
+    const tail = hlsArgs().slice(imageAt(hlsArgs()) + 1);
+    assert.deepEqual(tail.slice(0, 5), [
+      "--import", "./scripts/register-ts-aliases.mjs", "--experimental-strip-types",
+      "deploy/acceptance/ytdlp-generic/hls-full-path.mjs", "--acceptance-mode",
+    ]);
+    assert.equal(tail[5], "release-image");
+    const flag = (name) => tail[tail.indexOf(name) + 1];
+    assert.equal(flag("--source-commit"), SOURCE);
+    assert.equal(flag("--source-tree"), TREE);
+    assert.ok(tail.includes("--source-context-clean"));
+    assert.equal(flag("--candidate-tag"), TAG);
+    assert.equal(flag("--candidate-image-id"), IMAGE_ID);
+    assert.equal(flag("--run-image-id"), IMAGE_ID, "the child is told exactly the id Docker is told to run");
+    assert.equal(flag("--evidence"), "/report/hls09-clear-hls-1.json");
+    for (const overlayFlag of ["--accepted-base-source", "--overlay-runtime-compatible", "--base-image", "--base-digest", "--overlay-image", "--overlay-image-id"]) {
+      assert.ok(!tail.includes(overlayFlag), `${overlayFlag} must not reach a release child`);
+    }
+  });
+
+  it("refuses a tag, latest or an abbreviated id as the run subject, and a deployable or foreign label", () => {
+    for (const bad of [TAG, "videofetch-worker:latest", "sha256:ea08b43366ee", IMAGE_ID.slice("sha256:".length)]) {
+      assert.throws(() => hlsArgs({ imageId: bad }), /not an immutable image ID/, bad);
+    }
+    for (const label of ["videofetch-worker:latest", "videofetch-worker:rc-593f47dfffe7-5925515fb002", "other:split07-7400a51b578d-local-test"]) {
+      assert.throws(() => hlsArgs({ candidateTag: label }), /refusing/, label);
+    }
+    assert.throws(() => hlsArgs({ sourceCommit: SOURCE.slice(0, 12) }), /full 40-hex/);
+    assert.throws(() => hlsArgs({ sourceTree: TREE.toUpperCase() }), /full 40-hex/);
+    assert.throws(() => hlsArgs({ evidenceName: "../escape.json" }), /plain basename/);
+  });
+
+  it("refuses the Production media workspace, and a workspace overlapping the report or the harness", () => {
+    assert.deepEqual([...PRODUCTION_HOST_PATHS], ["/srv/videofetch", "/var/lib/videofetch", "/etc/videofetch"]);
+    for (const production of ["/srv/videofetch/media/workspace", "/srv/videofetch", "/srv", "/var/lib/videofetch/jobs", "/etc/videofetch"]) {
+      assert.throws(() => hlsArgs({ mediaWorkspaceDir: production }), /Production host path/, production);
+      assert.throws(() => productMediaWorkspaceMount(production), /Production host path/, production);
+    }
+    assert.throws(() => hlsArgs({ mediaWorkspaceDir: REPORT }), /report directory/);
+    assert.throws(() => hlsArgs({ mediaWorkspaceDir: `${HARNESS_DIR}/media` }), /harness directory/);
+    assert.doesNotThrow(() => hlsArgs({ mediaWorkspaceDir: "/var/tmp/hls09-media" }));
+  });
+
+  // §39 — every mutation of the posture is caught, with no Docker at all.
+  it("catches each removal, substitution and dangerous addition in the argv", () => {
+    const without = (flag, withValue = true) => {
+      const args = hlsArgs();
+      args.splice(args.indexOf(flag), withValue ? 2 : 1);
+      return args;
+    };
+    const replaced = (from, to) => hlsArgs().map((arg) => (arg === from ? to : arg));
+    const inject = (...extra) => {
+      const args = hlsArgs();
+      args.splice(imageAt(args), 0, ...extra);
+      return args;
+    };
+    const cases = {
+      "missing --network none": without("--network"),
+      "network host": replaced("none", "host"),
+      "an extra --network host": inject("--network", "host"),
+      "missing --add-host": without("--add-host"),
+      "wrong --add-host target": replaced(HLS08_FIXTURE_HOST_MAPPING, "hls-fixture.example.invalid:10.0.0.1"),
+      "wrong --add-host name": replaced(HLS08_FIXTURE_HOST_MAPPING, "example.com:127.0.0.1"),
+      "second --add-host": inject("--add-host", "example.com:127.0.0.1"),
+      "mutable tag as the run subject": replaced(IMAGE_ID, TAG),
+      "missing --read-only": without("--read-only", false),
+      "missing --cap-drop": without("--cap-drop=ALL", false),
+      "missing no-new-privileges": without("--security-opt"),
+      "missing --rm": without("--rm", false),
+      "missing Product media workspace": without("--mount"),
+      "Product media tmpfs instead of the bind": (() => {
+        const args = without("--mount");
+        args.splice(imageAt(args), 0, "--tmpfs", "/tmp/videofetch:rw,size=9g,uid=1000,gid=1000");
+        return args;
+      })(),
+      "harness mount over /app/src": replaced(`${HARNESS_DIR}:${HARNESS_MOUNT_TARGET}:ro`, `${HARNESS_DIR}:/app/src:ro`),
+      "harness mount made writable": replaced(`${HARNESS_DIR}:${HARNESS_MOUNT_TARGET}:ro`, `${HARNESS_DIR}:${HARNESS_MOUNT_TARGET}`),
+      "missing report mount": replaced(`${REPORT}:${REPORT_MOUNT_TARGET}`, `${REPORT}:/elsewhere`),
+      "docker socket": inject("-v", "/var/run/docker.sock:/var/run/docker.sock"),
+      "broker socket": inject("-v", "/run/videofetch-r2-broker:/run/b"),
+      "worker.env": inject("--env-file", "/etc/videofetch/worker.env"),
+      "secret env": inject("-e", "R2_BROKER_PARENT_SECRET_ACCESS_KEY=x"),
+      "credential env (long form)": inject("--env", "WORKER_CONTROL_SECRET=x"),
+      privileged: inject("--privileged"),
+      "privileged (equals form)": inject("--privileged=true"),
+      "user override": inject("--user", "0"),
+      "capability added": inject("--cap-add", "NET_ADMIN"),
+      "Production media workspace": replaced(
+        `type=bind,source=${MEDIA_WORKSPACE},target=/tmp/videofetch`,
+        "type=bind,source=/srv/videofetch/media/workspace,target=/tmp/videofetch",
+      ),
+      "overlay mode": replaced("release-image", "overlay"),
+      "no mode": (() => {
+        const args = hlsArgs();
+        args.splice(args.indexOf("--acceptance-mode"), 2);
+        return args;
+      })(),
+      "an extra tmpfs beside the bind": inject("--tmpfs", "/var/cache:rw,size=1m"),
+      "no harness scratch tmpfs": without("--tmpfs"),
+    };
+    for (const [label, args] of Object.entries(cases)) {
+      assert.ok(posture(args).length > 0, `${label} must be a posture violation`);
+    }
+  });
+
+  it("refuses a Production or credential path as the report or harness directory, even when the argv is self-consistent", () => {
+    for (const [reportDir, harnessDir] of [
+      ["/var/lib/videofetch/report", HARNESS_DIR],
+      ["/var/tmp/.ssh/report", HARNESS_DIR],
+      [REPORT, "/etc/videofetch/harness/deploy/acceptance/ytdlp-generic"],
+    ]) {
+      const args = hlsArgs({ reportDir, harnessDir });
+      const violations = releaseHlsRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir: MEDIA_WORKSPACE });
+      assert.deepEqual(violations, ["a socket, credential or Production path is named"], `${reportDir} ${harnessDir}`);
+    }
+  });
+
+  it("admits --add-host into the closed run-subject grammar, and still refuses unrecognized options", () => {
+    assert.equal(dockerRunSubject(["run", "--rm", "--add-host", HLS08_FIXTURE_HOST_MAPPING, IMAGE_ID, "x"]), IMAGE_ID);
+    assert.equal(dockerRunSubject(["run", `--add-host=${HLS08_FIXTURE_HOST_MAPPING}`, IMAGE_ID]), IMAGE_ID);
+    for (const unknown of ["--privileged", "--privileged=true", "--user", "--pull", "--env-file", "--cap-add", "-p", "--pid=host", "--userns=host"]) {
+      assert.throws(
+        () => dockerRunSubject(["run", unknown, IMAGE_ID]),
+        /unrecognized docker run option/,
+        `${unknown} must stay outside the grammar`,
+      );
+    }
+  });
+});
+
+describe("SPLIT-07 -03 clear-HLS child record validation", () => {
+  const expected = { sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG, candidateImageId: IMAGE_ID };
+  const validate = (record) => validateHlsChildRecord({ bytes: recordBytes(record), expected });
+
+  it("accepts a real HLS-09 PASS naming exactly this source and image, and reports its exact byte digest", () => {
+    const bytes = recordBytes(passingHlsChild());
+    const child = validateHlsChildRecord({ bytes, expected });
+    assert.equal(child.ok, true, String(child.reason));
+    assert.equal(child.schema, HLS09_RELEASE_EVIDENCE_SCHEMA);
+    assert.equal(child.verdict, "PASS");
+    assert.equal(child.sha256, createHash("sha256").update(bytes).digest("hex"));
+    assert.equal(child.checkCount, HLS09_MANDATORY_CHECKS.length);
+    assert.equal(child.failedCheckCount, 0);
+    assert.deepEqual(
+      [child.sourceCommit, child.sourceTree, child.candidateTag, child.candidateImageId, child.runImageId, child.networkMode],
+      [SOURCE, TREE, TAG, IMAGE_ID, IMAGE_ID, "none"],
+    );
+  });
+
+  it("rejects each way a child can fail to be this run's clear-HLS PASS", () => {
+    const failedCheck = passingHlsChild();
+    failedCheck.checks[40] = { ...failedCheck.checks[40], ok: false };
+    const missingCheck = passingHlsChild();
+    missingCheck.checks = missingCheck.checks.filter((check) => check.name !== "hls3/each-fragment-requested-exactly-once");
+    const cases = [
+      ["HLS-08 overlay schema", passingHlsChild(null, { schema: "hls08-deterministic-full-path-02" }), /schema is/],
+      ["a future schema", passingHlsChild(null, { schema: "hls09-release-image-full-path-02" }), /schema is/],
+      ["verdict FAIL", passingHlsChild(null, { verdict: "FAIL" }), /verdict is FAIL/],
+      ["one failed check", failedCheck, /1 of \d+ checks did not pass/],
+      ["a missing mandatory check", missingCheck, /mandatory checks absent/],
+      ["no checks", passingHlsChild(null, { checks: [] }), /no checks/],
+      ["another source commit", passingHlsChild(null, { source: { commit: "d".repeat(40) } }), /source commit/],
+      ["another source tree", passingHlsChild(null, { source: { tree: "e".repeat(40) } }), /source tree/],
+      ["another candidate image", passingHlsChild(null, { image: { imageId: IMAGE_B } }), /candidate image id/],
+      ["another run image", passingHlsChild(null, { image: { runSubject: IMAGE_B } }), /run image id/],
+      ["another label", passingHlsChild(null, { image: { candidateTag: "videofetch-worker:split07-000000000000-local-test" } }), /candidate label/],
+      ["a deployable claim", passingHlsChild(null, { image: { deployable: true } }), /non-deployable/],
+      ["a network", passingHlsChild(null, { network: { mode: "bridge" } }), /network mode/],
+      ["the fixture hostname", passingHlsChild(null, { hls2: { note: "hls-fixture.example.invalid" } }), /private HLS material/],
+      ["a URL", passingHlsChild(null, { plan: { note: "http://x.example/y" } }), /private HLS material/],
+      ["a raw-material key", passingHlsChild(null, { hls3: { playlistUrl: "x" } }), /forbidden raw-material key/],
+    ];
+    for (const [label, record, reason] of cases) {
+      const child = validate(record);
+      assert.equal(child.ok, false, `${label} must be rejected`);
+      assert.match(String(child.reason), reason, label);
+    }
+    const unparseable = validateHlsChildRecord({ bytes: Buffer.from("{not json", "utf8"), expected });
+    assert.equal(unparseable.ok, false);
+    assert.match(unparseable.reason, /not parseable JSON/);
+    assert.throws(() => validateHlsChildRecord({ bytes: JSON.stringify(passingHlsChild()), expected }), /exact bytes/);
+  });
+
+  it("echoes only grammar-checked values, so a hostile child cannot write into the parent", () => {
+    const hostile = passingHlsChild(null, {
+      schema: "http://x.example/?sig=1",
+      source: { commit: "hls-fixture.example.invalid" },
+      image: { candidateTag: "https://x.example", imageId: "/tmp/x", runSubject: "sha256:short" },
+      network: { mode: "none; http://x" },
+    });
+    const child = validate(hostile);
+    assert.equal(child.ok, false);
+    assert.deepEqual(
+      [child.schema, child.sourceCommit, child.candidateTag, child.candidateImageId, child.runImageId, child.networkMode],
+      [null, null, null, null, null, null],
+    );
+  });
+});
+
+describe("SPLIT-07 -03 evidence gates", () => {
+  it("emits a -03 PASS with mp4 + webm + the clear-HLS child", () => {
+    const record = buildReleaseEvidence(evidenceInput());
+    assert.equal(record.schema, "split07-release-image-candidate-03");
+    assert.equal(record.verdict, "PASS");
+    assert.equal(record.hlsAcceptance.requiredChildSchema, "hls09-release-image-full-path-01");
+    assert.equal(record.hlsAcceptance.executed, true);
+    assert.equal(record.hlsAcceptance.child.candidateImageId, IMAGE_ID);
+    assert.equal(record.hlsAcceptance.child.runImageId, IMAGE_ID);
+    assert.equal(record.splitAcceptance.children.length, 2, "HLS is not a SPLIT-06 family");
+    assert.ok(!record.splitAcceptance.children.some((child) => child.family === "hls" || child.schema === REQUIRED_HLS_CHILD_SCHEMA));
+    assert.deepEqual(record.harness.verificationPoints, [...HARNESS_VERIFICATION_POINTS]);
+    assert.deepEqual([...HARNESS_VERIFICATION_POINTS], HARNESS_POINTS);
+  });
+
+  it("names every clear-HLS binding among the checks a PASS requires", () => {
+    assert.deepEqual(REQUIRED_PASS_CHECKS.filter((name) => name.startsWith("hls/")), [
+      "hls/clear-hls-child-executed",
+      "hls/clear-hls-child-passed",
+      "hls/child-names-the-release-source",
+      "hls/child-ran-in-the-candidate-image",
+      "hls/child-evidence-unchanged-before-assembly",
+    ]);
+  });
+
+  it("requires the HLS run purpose in the candidate ledger: nine runs, every one by the immutable id", () => {
+    assert.deepEqual([...REQUIRED_CANDIDATE_RUN_PURPOSES], [
+      "probe:manifest", "probe:tools", "probe:env", "probe:runtime",
+      "verifier:verify-selector.py", "verifier:verify-download-policy.py",
+      "split06:mp4", "split06:webm", "hls09:clear-hls",
+    ]);
+    const missing = evidenceInput();
+    missing.image.candidateRuns = missing.image.candidateRuns.filter((entry) => entry.purpose !== HLS_CANDIDATE_RUN_PURPOSE);
+    assert.throws(() => buildReleaseEvidence(missing), /did not all execute the immutable image ID/);
+    const byTag = evidenceInput();
+    byTag.image.candidateRuns = byTag.image.candidateRuns.map((entry) =>
+      (entry.purpose === HLS_CANDIDATE_RUN_PURPOSE ? { ...entry, subject: TAG } : entry));
+    assert.throws(() => buildReleaseEvidence(byTag), /did not all execute the immutable image ID/);
+  });
+
+  // §40 — each HLS mutation refuses PASS.
+  it("refuses a PASS for each way the clear-HLS child can fall short", () => {
+    const child = (overrides) => ({ hlsAcceptance: { child: overrides } });
+    const cases = [
+      ["HLS child missing", { hlsAcceptance: { executed: false, child: null } }, /without an executed HLS-09 clear-HLS child/],
+      ["HLS child absent entirely", null, /without an executed HLS-09 clear-HLS child/],
+      ["HLS schema wrong", child({ schema: "hls08-deterministic-full-path-02" }), /clear-HLS child is hls08-deterministic-full-path-02/],
+      ["HLS verdict FAIL", child({ verdict: "FAIL", ok: false }), /clear-HLS child did not pass/],
+      ["HLS not ok", child({ ok: false }), /clear-HLS child did not pass/],
+      ["one HLS check failed", child({ failedCheckCount: 1 }), /clear-HLS child did not pass/],
+      ["no HLS checks", child({ checkCount: 0 }), /clear-HLS child did not pass/],
+      ["no HLS digest", child({ sha256: null }), /clear-HLS child has no content digest/],
+      ["HLS source commit wrong", child({ sourceCommit: "d".repeat(40) }), /clear-HLS child names another source/],
+      ["HLS source tree wrong", child({ sourceTree: "e".repeat(40) }), /clear-HLS child names another source/],
+      ["HLS candidate image id wrong", child({ candidateImageId: IMAGE_B }), /clear-HLS child names another image/],
+      ["HLS run image id wrong", child({ runImageId: IMAGE_B }), /clear-HLS child names another image/],
+      ["HLS network not none", child({ networkMode: "bridge" }), /clear-HLS child was not offline/],
+    ];
+    for (const [label, overrides, reason] of cases) {
+      const input = evidenceInput(overrides ?? {});
+      if (overrides === null) delete input.hlsAcceptance;
+      assert.throws(() => buildReleaseEvidence(input), reason, label);
+      // The same record is still emittable as a FAIL, so the failure is reportable.
+      const failed = { ...input, verdict: "FAIL" };
+      assert.equal(buildReleaseEvidence(failed).verdict, "FAIL", label);
+    }
+  });
+
+  it("refuses ANY record whose harness was not re-verified before the clear-HLS child and after it", () => {
+    for (const points of [
+      ["before-docker", "after-build", "before-split06-mp4", "before-split06-webm", "after-children"],
+      ["before-docker", "after-build", "before-split06-mp4", "before-split06-webm", "before-hls09-clear-hls"],
+      ["before-docker", "after-build", "before-split06-mp4", "before-hls09-clear-hls", "before-split06-webm", "after-children"],
+    ]) {
+      for (const verdict of ["PASS", "FAIL"]) {
+        const input = evidenceInput({ verdict });
+        input.harness.verificationPoints = points;
+        assert.throws(() => buildReleaseEvidence(input), /without driver-verified harness provenance/, JSON.stringify(points));
+      }
+    }
+  });
+
+  it("reads a -03 record back, and never silently reads a historical -02 or -01 record as -03", () => {
+    const current = JSON.parse(renderReleaseEvidence(buildReleaseEvidence(evidenceInput())));
+    assert.deepEqual(validateReleaseParentRecord(current, { sourceCommit: SOURCE, imageId: IMAGE_ID }), []);
+    for (const schema of HISTORICAL_SPLIT07_SCHEMAS) {
+      // A historical record, even with a green ledger and an HLS block pasted
+      // in, is named historical — never read under -03 rules as a PASS.
+      const problems = validateReleaseParentRecord({ ...current, schema }, { sourceCommit: SOURCE, imageId: IMAGE_ID });
+      assert.equal(problems.length, 1, schema);
+      assert.match(problems[0], /historical schema.*does not qualify clear HLS/, schema);
+    }
+    // A -02-shaped record relabelled -03: no HLS child, so no -03 PASS.
+    const relabelled = JSON.parse(JSON.stringify(current));
+    delete relabelled.hlsAcceptance;
+    relabelled.checks = relabelled.checks.filter((check) => !check.name.startsWith("hls/"));
+    relabelled.image.candidateRuns = relabelled.image.candidateRuns.filter((entry) => entry.purpose !== HLS_CANDIDATE_RUN_PURPOSE);
+    assert.ok(validateReleaseParentRecord(relabelled).some((problem) => /missing required checks/.test(problem)));
+    assert.ok(validateReleaseParentRecord({ ...current, schema: "split07-release-image-candidate-04" }).length > 0);
+    assert.ok(validateReleaseParentRecord(current, { sourceCommit: "f".repeat(40) }).includes("source commit mismatch"));
+    assert.ok(validateReleaseParentRecord(current, { imageId: IMAGE_B }).includes("image id mismatch"));
+    assert.ok(validateReleaseParentRecord({ ...current, harness: { ...current.harness, verifiedAfterRun: false } }).length > 0);
+    assert.ok(validateReleaseParentRecord(null).length > 0);
+  });
+});
+
+describe("SPLIT-07 -03 driver: the clear-HLS child", () => {
+  const hlsCalls = (world) => world.dockerCalls.filter((call) => call.args.includes("--acceptance-mode"));
+
+  it("runs mp4, webm, then clear-HLS — all by the immutable id — and PASSes with a bound -03 record", async () => {
+    const { result, error, world } = await drive();
+    assert.equal(error, null, error ? String(error.message) : undefined);
+    assert.equal(result.verdict, "PASS");
+    assert.equal(result.record.schema, "split07-release-image-candidate-03");
+    const childOrder = world.dockerCalls
+      .filter((call) => call.args[0] === "run" && (call.args.includes("--family") || call.args.includes("--acceptance-mode")))
+      .map((call) => (call.args.includes("--family") ? call.args[call.args.indexOf("--family") + 1] : "clear-hls"));
+    assert.deepEqual(childOrder, ["mp4", "webm", "clear-hls"]);
+    const [hlsCall] = hlsCalls(world);
+    assert.equal(dockerRunSubject(hlsCall.args), IMAGE_ID);
+    assert.deepEqual(
+      releaseHlsRunPostureViolations(hlsCall.args, { reportDir: REPORT, harnessDir: HARNESS_DIR, mediaWorkspaceDir: MEDIA_WORKSPACE }),
+      [],
+    );
+    assert.equal(world.executed.length, 9);
+    assert.ok(world.executed.every((id) => id === IMAGE_ID));
+    const hls = result.record.hlsAcceptance;
+    assert.equal(hls.executed, true);
+    assert.equal(hls.child.schema, HLS09_RELEASE_EVIDENCE_SCHEMA);
+    assert.equal(hls.child.verdict, "PASS");
+    assert.deepEqual([hls.child.candidateImageId, hls.child.runImageId, hls.child.candidateTag], [IMAGE_ID, IMAGE_ID, TAG]);
+    const childBytes = world.files.get(`${REPORT}/${hls.child.evidenceFile}`);
+    assert.equal(hls.child.sha256, createHash("sha256").update(childBytes).digest("hex"));
+    for (const name of REQUIRED_PASS_CHECKS.filter((check) => check.startsWith("hls/"))) {
+      assert.equal(result.checks.find((c) => c.name === name)?.ok, true, name);
+    }
+    // The parent's own digest is the digest of the bytes on disk.
+    assert.equal(result.evidenceSha256, createHash("sha256").update(world.files.get(PARENT)).digest("hex"));
+    // The parent never embeds the child document.
+    assert.ok(!JSON.stringify(result.record).includes("hls-fixture.example.invalid"));
+    assert.equal(result.record.hlsAcceptance.child.checks, undefined);
+  });
+
+  for (const [label, hls, check, reason] of [
+    ["the HLS child record is missing", null, "hls/clear-hls-child-passed", /unreadable/],
+    ["the HLS child bytes are unparseable", { raw: "{not json" }, "hls/clear-hls-child-passed", /not parseable JSON/],
+    ["the HLS child is of the wrong schema", { schema: "hls08-deterministic-full-path-02" }, "hls/clear-hls-child-passed", /schema is/],
+    ["the HLS child verdict is FAIL", { verdict: "FAIL" }, "hls/clear-hls-child-passed", /verdict is FAIL/],
+    ["the HLS child names another source commit", { source: { commit: "d".repeat(40) } }, "hls/child-names-the-release-source", null],
+    ["the HLS child names another source tree", { source: { tree: "e".repeat(40) } }, "hls/child-names-the-release-source", null],
+    ["the HLS child names another candidate image", { image: { imageId: IMAGE_B } }, "hls/child-ran-in-the-candidate-image", null],
+    ["the HLS child names another run image", { image: { runSubject: IMAGE_B } }, "hls/child-ran-in-the-candidate-image", null],
+    ["the HLS child ran with a network", { network: { mode: "bridge" } }, "hls/child-ran-in-the-candidate-image", null],
+    [
+      "the HLS child names another build label",
+      { image: { candidateTag: "videofetch-worker:split07-000000000000-local-test" } },
+      "hls/child-ran-in-the-candidate-image",
+      null,
+    ],
+  ]) {
+    it(`FAILs — never PASSes — when ${label}`, async () => {
+      const { result, error } = await drive({ hls });
+      assert.equal(error, null, error ? String(error.message) : undefined);
+      assert.equal(result.verdict, "FAIL");
+      assert.equal(result.record.verdict, "FAIL", "a failed clear-HLS child yields a FAIL parent record");
+      const failed = result.checks.find((c) => c.name === check);
+      assert.equal(failed.ok, false, check);
+      if (reason) assert.match(String(failed.detail), reason);
+      assert.equal(result.checks.find((c) => c.name === "hls/clear-hls-child-passed").ok, false);
+    });
+  }
+
+  it("FAILs when one HLS check failed", async () => {
+    const checks = HLS09_MANDATORY_CHECKS.map((name) => ({ name, ok: name !== "negative-fragment/fragment-3-never", detail: null }));
+    const { result } = await drive({ hls: { checks } });
+    assert.equal(result.verdict, "FAIL");
+    assert.match(result.checks.find((c) => c.name === "hls/clear-hls-child-passed").detail, /1 of \d+ checks did not pass/);
+  });
+
+  it("refuses the record when the HLS child's bytes change before the parent is assembled", async () => {
+    const world = createWorld();
+    const reads = new Map();
+    const deps = {
+      ...world.deps,
+      readFile: async (path) => {
+        const key = String(path);
+        const bytes = await world.deps.readFile(path);
+        if (!/\/hls09-clear-hls-/.test(key)) return bytes;
+        reads.set(key, (reads.get(key) ?? 0) + 1);
+        return reads.get(key) === 1 ? bytes : Buffer.concat([bytes, Buffer.from(" ", "utf8")]);
+      },
+    };
+    await assert.rejects(runReleaseImageAcceptance(world.options, deps), /clear-HLS child evidence changed after it was observed/);
+    assert.equal(world.writeCalls.length, 0, "no parent record may be written");
+    assert.ok(world.dockerCalls.some((call) => call.args.join(" ") === `image rm ${world.tag}`), "the candidate is still removed");
+  });
+
+  it("refuses to run the clear-HLS child when its evidence path already exists", async () => {
+    const taken = `${REPORT}/hls09-clear-hls-1700000000000.json`;
+    const { result, error, world } = await drive({ files: [[taken, recordBytes(passingHlsChild())]] });
+    assert.equal(result, null);
+    assert.match(String(error?.message), /refusing to replace an existing evidence artifact/);
+    assert.equal(hlsCalls(world).length, 0, "a pre-existing record is never adopted as this run's child");
+    assert.equal(world.writeCalls.length, 0);
+  });
+
+  it("refuses to run a SPLIT-06 child when its evidence path already exists", async () => {
+    const taken = `${REPORT}/split06-webm-1700000000000.json`;
+    const { result, error, world } = await drive({ files: [[taken, Buffer.from("{}\n", "utf8")]] });
+    assert.equal(result, null);
+    assert.match(String(error?.message), /refusing to replace an existing evidence artifact/);
+    assert.equal(world.dockerCalls.filter((call) => call.args.includes("webm")).length, 0);
+  });
+
+  it("clears the Product workspace after the clear-HLS child too, and never runs it on residue", async () => {
+    const world = createWorld();
+    const entries = new Set();
+    const log = [];
+    const deps = {
+      ...world.deps,
+      run: async (command, args, options) => {
+        const answer = await world.deps.run(command, args, options);
+        if (args[0] === "run" && (args.includes("--family") || args.includes("--acceptance-mode"))) {
+          log.push(args.includes("--family") ? `run:${args[args.indexOf("--family") + 1]}` : "run:clear-hls");
+          entries.add("jobs");
+        }
+        return answer;
+      },
+      listMediaWorkspace: async () => [...entries],
+      removeMediaWorkspaceEntry: async (directory, name) => {
+        log.push(`remove:${name}`);
+        entries.delete(name);
+      },
+    };
+    const result = await runReleaseImageAcceptance(world.options, deps);
+    assert.equal(result.verdict, "PASS");
+    assert.deepEqual(log, ["run:mp4", "remove:jobs", "run:webm", "remove:jobs", "run:clear-hls", "remove:jobs"]);
+    assert.equal(entries.size, 0);
+
+    const stuck = createWorld();
+    await assert.rejects(
+      runReleaseImageAcceptance(stuck.options, {
+        ...stuck.deps,
+        listMediaWorkspace: async () =>
+          stuck.dockerCalls.some((call) => call.args.includes("webm")) ? ["jobs"] : [],
+        removeMediaWorkspaceEntry: async () => {},
+      }),
+      /is not empty \(split06-webm\)/,
+    );
+    assert.equal(stuck.dockerCalls.filter((call) => call.args.includes("--acceptance-mode")).length, 0);
+  });
+
+  it("re-admits the Product workspace immediately before the clear-HLS child, and never runs it on residue", async () => {
+    const world = createWorld();
+    let listings = 0;
+    const deps = {
+      ...world.deps,
+      // Empty everywhere except the one admission right before the HLS child:
+      // before-docker, before-mp4, clear-mp4 (list+admit), before-webm,
+      // clear-webm (list+admit), then before-hls09 is the 8th listing.
+      listMediaWorkspace: async () => {
+        listings += 1;
+        return listings === 8 ? ["stray"] : [];
+      },
+    };
+    await assert.rejects(runReleaseImageAcceptance(world.options, deps), /is not empty \(before-hls09-clear-hls\)/);
+    assert.equal(world.dockerCalls.filter((call) => call.args.includes("--acceptance-mode")).length, 0);
+    assert.equal(world.writeCalls.length, 0);
+  });
+
+  it("refuses to launch a clear-HLS child whose argv violates the posture model", async () => {
+    // A report directory under a credential path: the builder places it
+    // faithfully; the structural posture check refuses it before Docker runs.
+    const report = "/var/tmp/.ssh/split07";
+    const { result, error, world } = await drive({}, { report });
+    assert.equal(result, null);
+    assert.match(String(error?.message), /refusing a clear-HLS child with posture violations: a socket, credential or Production path is named/);
+    assert.equal(world.dockerCalls.filter((call) => call.args.includes("--acceptance-mode")).length, 0);
+    assert.ok(world.dockerCalls.some((call) => call.args.join(" ") === `image rm ${world.tag}`), "the candidate is still removed");
+  });
+
+  it("refuses to claim a verdict when the record on disk does not read back as written", async () => {
+    const world = createWorld();
+    const deps = {
+      ...world.deps,
+      readFile: async (path) =>
+        String(path) === PARENT
+          ? Buffer.from(String(world.files.get(PARENT)).replace(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-02"), "utf8")
+          : world.deps.readFile(path),
+    };
+    await assert.rejects(runReleaseImageAcceptance(world.options, deps), /did not read back as written/);
   });
 });
