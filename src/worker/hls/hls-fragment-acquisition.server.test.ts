@@ -2085,28 +2085,29 @@ function productionSourceFiles(): string[] {
   return out;
 }
 
-describe("clear-HLS acquisition: dormant, and inside its boundary", () => {
+describe("clear-HLS acquisition: inside its boundary", () => {
   const source = readFileSync(MODULE_PATH, "utf8");
   /** The module with its prose removed, so a mention is not mistaken for a call. */
   const code = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
   it("strips prose without destroying the module under test", () => {
     assert.ok(code.includes("export async function acquireClearHlsTs"));
-    assert.equal(code.includes("Dormancy"), false, "comments should be gone");
+    assert.ok(source.includes("Reachability"), "the prose is really there...");
+    assert.equal(code.includes("Reachability"), false, "...and comments should be gone");
   });
 
-  it("leaves HLS unadvertised: both protocol policies are still exactly http and https", () => {
+  it("never widens yt-dlp's protocol policies: both are still exactly http and https", () => {
     assert.deepEqual([...YTDLP_V1_NATIVE_PROTOCOLS], ["http", "https"]);
     assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https"]);
   });
 
-  it("is reachable from no production module outside the dormant HLS directory", () => {
+  it("is named by no production module outside the HLS directory", () => {
     for (const file of productionSourceFiles()) {
       if (dirname(file) === HLS_DIR) continue;
       assert.equal(
         readFileSync(file, "utf8").includes("hls-fragment-acquisition"),
         false,
-        `${relative(ROOT, file)} must not import the dormant HLS acquisition`,
+        `${relative(ROOT, file)} must not import the HLS acquisition directly`,
       );
     }
   });

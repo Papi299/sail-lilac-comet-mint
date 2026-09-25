@@ -16,6 +16,7 @@ import {
   YTDLP_ANALYSIS_PATH,
   YTDLP_V1_NATIVE_PROTOCOLS,
   buildYtdlpAnalysisEnvironment,
+  analyzeGenericFormats,
   analyzeGenericMedia,
   analyzeGenericMediaInternal,
   assertGenericPresetBuild,
@@ -30,6 +31,7 @@ import {
   type GenericAnalysisLimits,
 } from "./ytdlp-analysis.server.ts";
 import { buildYtdlpEnvironment } from "../runtime/ytdlp-runtime.server.ts";
+import type { ClearHlsMediaPlaylistSelection } from "../hls/hls-source-selection.ts";
 import {
   buildGenericFormatSelector,
   splitTargetContainer,
@@ -73,7 +75,7 @@ function splitPair(value: GenericPresetSource | undefined): GenericSplitSourceSe
 function selectionMembers(value: GenericPresetSource): GenericSourceSelection[] {
   return value.kind === "single" ? [value.source] : [value.pair.video, value.pair.audio];
 }
-import { WorkerAnalyzeSuccessSchema } from "../../shared/worker/contracts.ts";
+import { WorkerAnalyzeSuccessSchema, type WorkerQualityPreset } from "../../shared/worker/contracts.ts";
 import {
   YTDLP_PROBE_TIMEOUT_MS,
   YTDLP_RUNTIME,
@@ -4072,5 +4074,161 @@ describe("GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001", () => {
       (orphan.selections as Record<string, GenericPresetSource>)["preset:720"] = clone(orphan.selections["preset:best"]!);
       expectFail(() => assertGenericPresetBuild(orphan, ctx([unknownProgressive()])), "orphan selection");
     });
+  });
+});
+
+// ── HLS-7: the analyzer's own assertion holds every preset to ONE owner ─────
+
+describe("HLS-7: assertGenericPresetBuild enforces one owner per advertised preset", () => {
+  const MAX = LIMITS.maxFileSizeBytes;
+  const URL_2160 = "https://media.example.invalid/hls/2160/media.m3u8?sig=VERY_PRIVATE_HLS_TOKEN";
+  const FORMATS: Array<Record<string, unknown>> = [
+    {
+      format_id: "hls-2160",
+      ext: "mp4",
+      protocol: "m3u8_native",
+      height: 2160,
+      vcodec: "avc1.640033",
+      acodec: "mp4a.40.2",
+      video_ext: "mp4",
+      audio_ext: "none",
+      url: URL_2160,
+    },
+    {
+      format_id: "mux",
+      ext: "mp4",
+      protocol: "https",
+      height: 720,
+      vcodec: "avc1.64001F",
+      acodec: "mp4a.40.2",
+      video_ext: "mp4",
+      audio_ext: "none",
+      filesize: 5_000_000,
+    },
+  ];
+
+  /** A REAL composed build, and a mutable copy of it to tamper with. */
+  const composed = () => {
+    const { build, hlsSelections, candidates } = analyzeGenericFormats(FORMATS as never, {
+      ffmpegAvailable: true,
+      maxFileSizeBytes: MAX,
+    });
+    return {
+      build: {
+        presets: JSON.parse(JSON.stringify(build.presets)) as WorkerQualityPreset[],
+        selections: JSON.parse(JSON.stringify(build.selections)) as Record<string, GenericPresetSource>,
+        // Entries stay the SAME frozen selections analysis produced.
+        hlsSelections: { ...hlsSelections } as Record<string, ClearHlsMediaPlaylistSelection>,
+      },
+      ctx: { candidates, ffmpegAvailable: true, maxFileSizeBytes: MAX },
+    };
+  };
+  const expectFail = (fn: () => void, label: string) =>
+    assert.throws(fn, (e: unknown) => e instanceof AppError && e.code === "EXTRACTION_FAILED", label);
+  const preset = (b: ReturnType<typeof composed>["build"], id: string) => b.presets.find((p) => p.id === id)!;
+
+  it("accepts the real composed build (positive control)", () => {
+    const { build, ctx } = composed();
+    assert.deepEqual(build.presets.map((p) => p.id), [
+      "preset:best",
+      "preset:2160",
+      "preset:720",
+      "preset:audio",
+      "preset:mp3",
+    ]);
+    assert.deepEqual(Object.keys(build.hlsSelections), ["preset:best", "preset:2160"]);
+    assert.doesNotThrow(() => assertGenericPresetBuild(build, ctx));
+    // …and exactly the pre-HLS-7 contract when no HLS map is given at all.
+    const progressiveOnly = buildGenericPresets(selectCandidates([FORMATS[1]!], LIMITS), {
+      ffmpegAvailable: true,
+      maxFileSizeBytes: MAX,
+    });
+    assert.doesNotThrow(() => assertGenericPresetBuild(progressiveOnly, ctx));
+  });
+
+  it("an HLS-owned preset without Worker FFmpeg", () => {
+    const { build, ctx } = composed();
+    expectFail(() => assertGenericPresetBuild(build, { ...ctx, ffmpegAvailable: false }), "no FFmpeg");
+  });
+
+  it("BOTH maps owning one preset, and NEITHER", () => {
+    const both = composed();
+    both.build.selections["preset:2160"] = both.build.selections["preset:720"]!;
+    expectFail(() => assertGenericPresetBuild(both.build, both.ctx), "dual ownership");
+
+    const neither = composed();
+    delete neither.build.hlsSelections["preset:2160"];
+    expectFail(() => assertGenericPresetBuild(neither.build, neither.ctx), "no owner");
+  });
+
+  it("an HLS key nothing advertises", () => {
+    const { build, ctx } = composed();
+    build.hlsSelections["preset:480"] = build.hlsSelections["preset:2160"]!;
+    expectFail(() => assertGenericPresetBuild(build, ctx), "orphan HLS key");
+  });
+
+  it("an HLS-owned AUDIO product", () => {
+    const { build, ctx } = composed();
+    build.hlsSelections["preset:audio"] = build.hlsSelections["preset:2160"]!;
+    delete build.selections["preset:audio"];
+    expectFail(() => assertGenericPresetBuild(build, ctx), "HLS audio product");
+  });
+
+  it("an HLS-owned preset that does not state exactly the HLS public facts", () => {
+    for (const [field, value] of [
+      ["videoCodec", "h264"],
+      ["audioCodec", "aac"],
+      ["fps", 30],
+      ["fileSize", 1],
+      ["container", "webm"],
+      ["hasAudio", false],
+    ] as const) {
+      const { build, ctx } = composed();
+      (preset(build, "preset:2160") as Record<string, unknown>)[field] = value;
+      expectFail(() => assertGenericPresetBuild(build, ctx), field);
+    }
+  });
+
+  it("a PROGRESSIVE preset that states the HLS public facts", () => {
+    // Its private source still proves audio, so every progressive check passes;
+    // only the family cross-invariant the planner relies on can catch this.
+    const { build, ctx } = composed();
+    Object.assign(preset(build, "preset:720"), {
+      fileSize: null,
+      videoCodec: null,
+      audioCodec: null,
+      fps: null,
+    });
+    expectFail(() => assertGenericPresetBuild(build, ctx), "progressive preset with HLS facts");
+  });
+
+  it("an HLS selection that is not frozen, or not canonical", () => {
+    const unfrozen = composed();
+    unfrozen.build.hlsSelections["preset:2160"] = { playlistUrl: URL_2160, height: 2160 };
+    expectFail(() => assertGenericPresetBuild(unfrozen.build, unfrozen.ctx), "unfrozen");
+
+    const padded = composed();
+    padded.build.hlsSelections["preset:2160"] = Object.freeze({ playlistUrl: ` ${URL_2160}`, height: 2160 });
+    expectFail(() => assertGenericPresetBuild(padded.build, padded.ctx), "non-canonical URL");
+  });
+
+  it("a preset:best from a different family or rendition than the tallest rung", () => {
+    const otherRendition = composed();
+    otherRendition.build.hlsSelections["preset:best"] = Object.freeze({
+      playlistUrl: "https://media.example.invalid/hls/other/media.m3u8",
+      height: 2160,
+    });
+    expectFail(() => assertGenericPresetBuild(otherRendition.build, otherRendition.ctx), "best ≠ rung");
+
+    const otherFamily = composed();
+    delete otherFamily.build.hlsSelections["preset:best"];
+    otherFamily.build.selections["preset:best"] = otherFamily.build.selections["preset:720"]!;
+    Object.assign(preset(otherFamily.build, "preset:best"), {
+      ...preset(otherFamily.build, "preset:720"),
+      id: "preset:best",
+      formatId: "preset:best",
+      label: "Best available",
+    });
+    expectFail(() => assertGenericPresetBuild(otherFamily.build, otherFamily.ctx), "best progressive under an HLS 2160");
   });
 });

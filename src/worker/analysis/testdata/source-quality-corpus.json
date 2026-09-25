@@ -84,7 +84,8 @@
      "vcodec": "avc1.640028",
      "acodec": "mp4a.40.2",
      "video_ext": "mp4",
-     "audio_ext": "none"
+     "audio_ext": "none",
+     "url": "https://media.example.invalid/hls/1080/media.m3u8?sig=CORPUS_PRIVATE_HLS_TOKEN"
     },
     {
      "format_id": "hls-2160",
@@ -96,7 +97,8 @@
      "vcodec": "avc1.640028",
      "acodec": "mp4a.40.2",
      "video_ext": "mp4",
-     "audio_ext": "none"
+     "audio_ext": "none",
+     "url": "https://media.example.invalid/hls/2160/media.m3u8?sig=CORPUS_PRIVATE_HLS_TOKEN"
     },
     {
      "format_id": "hls-audio-en",
@@ -105,7 +107,8 @@
      "vcodec": "none",
      "acodec": "mp4a.40.2",
      "video_ext": "none",
-     "audio_ext": "mp4"
+     "audio_ext": "mp4",
+     "url": "https://media.example.invalid/hls/audio-en/media.m3u8?sig=CORPUS_PRIVATE_HLS_TOKEN"
     }
    ]
   }

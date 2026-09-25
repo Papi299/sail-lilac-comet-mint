@@ -63,6 +63,10 @@ export function isSafeFormatId(value: unknown): value is SafeFormatId {
  * decides at DOWNLOAD time, from manifest bytes analysis never fetched, whether
  * to delegate to `FFmpegFD` — which would run local media work while the
  * durable job still says `downloading`.
+ *
+ * This list governs the yt-dlp downloader ONLY. Clear HLS became deliverable
+ * in HLS-7 without widening it: that path never hands yt-dlp a download, so
+ * nothing about it belongs here.
  */
 export const GENERIC_SOURCE_PROTOCOLS = Object.freeze(["http", "https"] as const);
 

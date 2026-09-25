@@ -9,6 +9,7 @@ import {
 import {
   CLEAR_HLS_V1_MAX_PLAYLIST_URL_BYTES,
   acceptClearHlsPlaylistUrl,
+  hasClearHlsPublicPresetFacts,
   type ClearHlsMediaPlaylistSelections,
 } from "../hls/hls-source-selection.ts";
 import {
@@ -665,10 +666,10 @@ export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
    * VideoFetch-owned is the acquisition itself, and that is what `operation`
    * says: no yt-dlp subprocess runs on this path.
    *
-   * NOT REACHABLE FROM ORDINARY PRODUCT DERIVATION. `deriveExecutionPlan()`
-   * never reads `hlsSelections` and never calls `deriveClearHlsExecutionPlan()`,
-   * so nothing a browser can ask for produces this variant. HLS-7 owns that
-   * activation decision.
+   * REACHABLE FROM ORDINARY PRODUCT DERIVATION since HLS-7, and only one way:
+   * `deriveExecutionPlan()` produces it for a requested preset that the FRESH
+   * analysis's `hlsSelections` — and nothing else — owns. It is never a
+   * fallback from a progressive refusal, nor the reverse.
    *
    * `source.playlistUrl` is SENSITIVE Worker-private data — routinely a signed,
    * expiring location. It lives in this in-memory plan and in the HLS-2 request
@@ -924,11 +925,11 @@ function buildGenericSplitCandidate(
 /**
  * HLS-6 §8: derives the clear-HLS execution plan for ONE requested video preset.
  *
- * Deliberately a SEPARATE entry point from `deriveGenericExecutionPlan()`, and
- * deliberately NOT called by `deriveExecutionPlan()`. That separation IS the
- * HLS-6 dormancy invariant: the machinery below is executable, and the ordinary
- * Product planner still has no way to reach it. HLS-7 is the reviewed change
- * that wires it in.
+ * Deliberately a SEPARATE entry point from `deriveGenericExecutionPlan()`. Since
+ * HLS-7, `deriveExecutionPlan()` calls it for exactly one case — the requested
+ * preset is owned by `hlsSelections` alone, and its public facts agree — after
+ * checking that the preset is advertised. It is never tried because the
+ * progressive derivation refused, and never the other way round.
  *
  * The steps, in order:
  *
@@ -1029,6 +1030,57 @@ export function executionPlanRequiresProcessing(plan: ExecutionPlan): boolean {
     : plan.generic.operation !== "keep-original";
 }
 
+/** The two private families a generic preset can be owned by. */
+type GenericPresetOwner = "progressive" | "clear-hls";
+
+/** Does this private map say ANYTHING about `id`? Never invokes an accessor. */
+function claims(map: unknown, id: string): boolean {
+  return typeof map === "object" && map !== null && id in map;
+}
+
+/**
+ * HLS-7: which family owns ONE requested generic preset, read — never decided —
+ * off the FRESH analysis.
+ *
+ * Analysis made the family decision once, for this source, and encoded it as
+ * WHICH private map holds the key. This reads that encoding and checks it:
+ *
+ *   1. exactly one map claims the id. Neither and both are both
+ *      `FORMAT_UNAVAILABLE` — "both" is a malformed analysis, and resolving it
+ *      here by precedence would be the third family decision analysis exists to
+ *      prevent;
+ *   2. the preset is ADVERTISED, with `id === formatId`;
+ *   3. its public facts agree with the family that claims it. A clear-HLS preset
+ *      states exactly `CLEAR_HLS_PUBLIC_PRESET_FACTS`, and a progressive one
+ *      never does (the analyzer asserts both). A disagreement means the private
+ *      map and the preset the browser was shown describe different things, so
+ *      it is refused rather than fulfilled by whichever map happened to hold
+ *      the key.
+ *
+ * Each step can only REFUSE. Nothing here substitutes one family for another,
+ * and nothing is retried with the other family after a refusal.
+ */
+function genericPresetOwner(
+  analysis: {
+    readonly video: WorkerVideoMetadata;
+    readonly selections: GenericSourceSelections;
+    readonly hlsSelections: ClearHlsMediaPlaylistSelections;
+  },
+  requestedFormatId: string,
+): GenericPresetOwner {
+  const progressive = claims(analysis.selections, requestedFormatId);
+  const hls = claims(analysis.hlsSelections, requestedFormatId);
+  if (progressive === hls) throw new AppError("FORMAT_UNAVAILABLE");
+
+  const preset = analysis.video.presets.find(
+    (p) => p.id === requestedFormatId && p.formatId === requestedFormatId,
+  );
+  if (!preset) throw new AppError("FORMAT_UNAVAILABLE");
+  if (hasClearHlsPublicPresetFacts(preset) !== hls) throw new AppError("FORMAT_UNAVAILABLE");
+
+  return hls ? "clear-hls" : "progressive";
+}
+
 /**
  * §35: derives the execution plan for whichever strategy the Worker selected.
  *
@@ -1036,30 +1088,31 @@ export function executionPlanRequiresProcessing(plan: ExecutionPlan): boolean {
  * and never from the durable `extractor` column, which records what a previous
  * attempt chose rather than what this one should (§42).
  *
- * ─── HLS-6 DORMANCY GATE ────────────────────────────────────────────────────
+ * ─── HLS-7: THE PRODUCT ACTIVATION POINT ────────────────────────────────────
  *
- * This function derives ONLY the currently advertised Product capabilities:
- * direct, progressive generic, and split. It does not read `hlsSelections`, it
- * does not call `deriveClearHlsExecutionPlan()`, and it has no HLS fallback of
- * any kind — not when progressive selection is absent, not for an HLS-only
- * document, and not for a hand-written durable row.
+ * This is the ONE place the ordinary Product planner reaches clear HLS. For
+ * `yt-dlp` it reads which private map owns the requested preset
+ * (`genericPresetOwner`) and dispatches to that family's already-reviewed
+ * derivation, and to nothing else:
  *
- * The parameter type is the enforcement, not the comment: `analysis` declares
- * `strategy`, `video` and `selections` and NOTHING else, so an
- * `ExecutionAnalysis` is accepted while its `hlsSelections` member is simply
- * not visible here. An HLS-only document therefore fails the ordinary
- * `meta.presets` / `selections` lookup below and yields `FORMAT_UNAVAILABLE`,
- * and a mixed document is fulfilled from the progressive source that is
- * actually advertised.
+ *   progressive/split owner   `deriveGenericExecutionPlan()`, unchanged;
+ *   clear-HLS owner           `deriveClearHlsExecutionPlan()`, unchanged;
+ *   neither, or both          `FORMAT_UNAVAILABLE`.
  *
- * HLS-6 assembles execution machinery but does not activate it. HLS-7 is the
- * single reviewed change that consumes `hlsSelections` here.
+ * There is no try-one-then-the-other. A progressive refusal is final, an HLS
+ * refusal is final, and a preset whose owner the fresh analysis cannot name is
+ * unavailable — the site may have changed since the browser chose it, and the
+ * answer to that has always been `FORMAT_UNAVAILABLE`, never a substitution.
+ *
+ * `hlsSelections` is a REQUIRED input, so every caller states the HLS half of
+ * the fresh analysis, if only as `{}`. The direct strategy never reads it.
  */
 export function deriveExecutionPlan(
   analysis: {
     readonly strategy: "direct" | "yt-dlp";
     readonly video: WorkerVideoMetadata;
     readonly selections: GenericSourceSelections;
+    readonly hlsSelections: ClearHlsMediaPlaylistSelections;
   },
   requestedFormatId: string,
 ): ExecutionPlan {
@@ -1076,6 +1129,18 @@ export function deriveExecutionPlan(
       strategy: "direct",
       direct: deriveDirectExecutionPlan(analysis.video, requestedFormatId),
     };
+  }
+
+  if (genericPresetOwner(analysis, requestedFormatId) === "clear-hls") {
+    const hls = deriveClearHlsExecutionPlan(analysis.hlsSelections, requestedFormatId);
+    // §10-equivalent: the container the browser was shown is the container
+    // this plan delivers. The facts check above already pinned it to mp4; this
+    // restates the invariant against the plan itself.
+    const shown = analysis.video.presets.find((p) => p.id === requestedFormatId);
+    if (!shown || hls.targetContainer !== shown.container) {
+      throw new AppError("FORMAT_UNAVAILABLE");
+    }
+    return { strategy: "yt-dlp", generic: hls };
   }
   return {
     strategy: "yt-dlp",

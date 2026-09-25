@@ -22,11 +22,13 @@ import { Buffer } from "node:buffer";
  * HLS-2 must resolve it against the FINAL validated response URL — the URL
  * after redirects — and resolving here against anything else would be wrong.
  *
- * ─── Dormancy ───────────────────────────────────────────────────────────────
+ * ─── Reachability ───────────────────────────────────────────────────────────
  *
- * Nothing in Production calls this module. HLS remains unadvertised and
- * unselectable: the analyzer's protocol policy is unchanged, so `m3u8_native`
- * is still withheld as `unsupported_protocol`. This is foundation only.
+ * Source-activated by HLS-7: an advertised clear-HLS video preset now reaches
+ * this module through the ordinary execution planner and the one HLS
+ * orchestration seam the JobExecutor calls. The analyzer's yt-dlp protocol
+ * policy is unchanged — `m3u8_native` is never a yt-dlp download — and
+ * activation in source is not a deployment or an acceptance of any kind.
  *
  * ─── The governing rule ─────────────────────────────────────────────────────
  *

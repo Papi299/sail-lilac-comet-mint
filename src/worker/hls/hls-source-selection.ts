@@ -23,11 +23,11 @@ import { validatePublicHttpUrl } from "@/lib/validation/url";
  *
  * ─── What this module is NOT ────────────────────────────────────────────────
  *
- *   - It is not a capability. A key in the map does NOT mean the preset is
- *     advertised: HLS stays withheld publicly as `unsupported_protocol` until
- *     HLS-7, and the progressive candidate evaluator still refuses every HLS
- *     format. The private half is future execution provenance; the public half
- *     remains current Product truth, and they are allowed to disagree.
+ *   - It is not a capability decision. A placement on the shadow ladder does
+ *     NOT by itself mean the preset is advertised: analysis composes the
+ *     placements with the mature progressive/split ladder, and a rung the
+ *     progressive family already fulfils stays progressive (HLS-7). The
+ *     progressive candidate evaluator still refuses every HLS format.
  *   - It is not a safety proof. Static screening here bounds and shapes a
  *     string; it says nothing about whether the host resolves publicly NOW.
  *     HLS-2 remains the authoritative request-time boundary — DNS, private
@@ -61,13 +61,16 @@ import { validatePublicHttpUrl } from "@/lib/validation/url";
  * existing durable-execution model (analysis runs at execution time, never
  * reusing the browser's earlier result), and HLS-5 only depends on it.
  *
- * ─── Dormancy ───────────────────────────────────────────────────────────────
+ * ─── Activation ─────────────────────────────────────────────────────────────
  *
- * HLS-6 consumes this. Today nothing does: no execution plan names it, the
- * JobExecutor does not read it, and HLS-2/3/4 are not called from Product
- * execution. This module is the ONE member of `src/worker/hls/` that Product
- * analysis may name, precisely because it is the dormant channel's source end
- * and holds no execution capability whatsoever.
+ * HLS-7 activated this channel at the source level. Analysis places admitted
+ * candidates here, keeps only the rungs the final Product result gives to
+ * clear HLS, and advertises those as ordinary video presets; the ordinary
+ * execution planner then derives a clear-HLS plan from the FRESH analysis's
+ * map. This module still holds no execution capability whatsoever — no
+ * request, no transport, no processing — which is why Product analysis and
+ * the planner may name it. Source activation is not deployment: nothing here
+ * states that the capability is running anywhere.
  */
 
 // ── Bounds ───────────────────────────────────────────────────────────────────
@@ -291,11 +294,30 @@ function firstInUpstreamOrder(
 }
 
 /**
- * Places accepted HLS candidates on the application's video ladder.
+ * Application-owned VIDEO preset id → the ACCEPTED candidate placed there
+ * (HLS-7).
  *
- * This is NOT yet Product ranking. It gives HLS-6 exactly ONE private location
- * per would-be rung, so that phase never has to re-read yt-dlp output or
- * re-decide which rendition a rung meant.
+ * The placement keeps the candidate WHOLE, upstream `index` included, because
+ * the rendition inventory must be able to say exactly which raw rendition won
+ * a rung. The minimal `ClearHlsMediaPlaylistSelection` deliberately cannot say
+ * that, and matching a URL/height pair back to a raw row would be ambiguous
+ * whenever an extractor lists two equivalent rows.
+ *
+ * PRIVATE and transient, like everything else here: a placement lives inside
+ * one analysis pass and is projected down (`projectClearHlsPlacements`) before
+ * anything leaves it. The index is never execution provenance, never public,
+ * and never persisted.
+ */
+export type ClearHlsShadowPlacements = Readonly<Record<string, ClearHlsShadowCandidate>>;
+
+/**
+ * Places accepted HLS candidates on the application's video ladder, keeping
+ * each winner's upstream position (HLS-7).
+ *
+ * This is NOT Product ranking. It gives analysis exactly ONE candidate per
+ * would-be rung, so that nothing downstream has to re-read yt-dlp output or
+ * re-decide which rendition a rung meant. Whether a placed rung is actually
+ * given to clear HLS is analysis's composition decision, not this function's.
  *
  * The rules, and why they are this small:
  *
@@ -322,17 +344,20 @@ function firstInUpstreamOrder(
  * A rung whose id is outside the closed vocabulary is SKIPPED rather than
  * emitted or thrown on. Fail-closed is the rule for this whole channel: a
  * missing shadow candidate is the defined outcome, and an unrecognised key
- * must never reach a map that HLS-6 will index by preset id.
+ * must never reach a map that execution will index by preset id.
  *
- * Both the map and every selection in it are frozen, so no later caller can
- * rewrite a URL that admission already approved.
+ * The map and every placed candidate are frozen copies, so no later caller can
+ * rewrite a URL that admission already approved, or move a winner's index.
  */
-export function buildClearHlsMediaPlaylistSelections(
+export function placeClearHlsShadowCandidates(
   candidates: readonly ClearHlsShadowCandidate[],
   rungs: readonly ClearHlsShadowRung[],
-): ClearHlsMediaPlaylistSelections {
-  const out: Record<string, ClearHlsMediaPlaylistSelection> = {};
+): ClearHlsShadowPlacements {
+  const out: Record<string, ClearHlsShadowCandidate> = {};
   if (candidates.length === 0) return Object.freeze(out);
+
+  const place = (c: ClearHlsShadowCandidate): ClearHlsShadowCandidate =>
+    Object.freeze({ playlistUrl: c.playlistUrl, height: c.height, index: c.index });
 
   const atOrAbove = (floor: number) =>
     candidates.filter((c) => c.height !== null && c.height >= floor);
@@ -343,7 +368,7 @@ export function buildClearHlsMediaPlaylistSelections(
     ? firstInUpstreamOrder(atOrAbove(topRung.minHeight))
     : firstInUpstreamOrder(candidates);
   if (best !== null && CLEAR_HLS_SHADOW_PRESET_ID_PATTERN.test(CLEAR_HLS_SHADOW_BEST_PRESET_ID)) {
-    out[CLEAR_HLS_SHADOW_BEST_PRESET_ID] = toSelection(best);
+    out[CLEAR_HLS_SHADOW_BEST_PRESET_ID] = place(best);
   }
 
   for (const rung of rungs) {
@@ -355,8 +380,104 @@ export function buildClearHlsMediaPlaylistSelections(
       return !rungs.some((r) => r.minHeight > rung.minHeight && height >= r.minHeight);
     });
     const winner = firstInUpstreamOrder(inRung);
-    if (winner !== null) out[rung.id] = toSelection(winner);
+    if (winner !== null) out[rung.id] = place(winner);
   }
 
   return Object.freeze(out);
+}
+
+/**
+ * Projects placements down to the minimal private selection map — the ONLY
+ * shape that leaves analysis (HLS-7).
+ *
+ * `index` is dropped here and nowhere later: what execution receives is exactly
+ * `playlistUrl` + `height`, frozen, keyed by the closed video vocabulary. A key
+ * outside that vocabulary is skipped, fail-closed, exactly as placement does.
+ */
+export function projectClearHlsPlacements(
+  placements: Readonly<Record<string, ClearHlsShadowCandidate>>,
+): ClearHlsMediaPlaylistSelections {
+  const out: Record<string, ClearHlsMediaPlaylistSelection> = {};
+  for (const [id, candidate] of Object.entries(placements)) {
+    if (!CLEAR_HLS_SHADOW_PRESET_ID_PATTERN.test(id)) continue;
+    out[id] = toSelection(candidate);
+  }
+  return Object.freeze(out);
+}
+
+/**
+ * The WHOLE shadow ladder as minimal selections: every rung placement can
+ * fill, whether or not the Product result gives it to clear HLS.
+ *
+ * This is the HLS-5 contract, kept as a projection of the placement above so
+ * the two can never disagree about which rendition a rung means. Product
+ * analysis does not advertise from it directly: since HLS-7 it projects only
+ * the rungs its composition actually gives to clear HLS.
+ */
+export function buildClearHlsMediaPlaylistSelections(
+  candidates: readonly ClearHlsShadowCandidate[],
+  rungs: readonly ClearHlsShadowRung[],
+): ClearHlsMediaPlaylistSelections {
+  return projectClearHlsPlacements(placeClearHlsShadowCandidates(candidates, rungs));
+}
+
+// ── The public preset an HLS-owned rung advertises (HLS-7) ───────────────────
+
+/**
+ * The facts every clear-HLS-owned public preset states, and the only ones.
+ *
+ * Stated ONCE so that analysis (which advertises) and the execution planner
+ * (which verifies before acquiring anything) read the same contract:
+ *
+ *   container   `mp4`: HLS v1's only deliverable is the MP4 its fixed
+ *               stream-copy remux produces;
+ *   video/audio both `true`: admission requires established video AND proven
+ *               audio, and the approved local shape is exactly one of each;
+ *   fileSize    `null`: upstream size metadata is not the size authority for
+ *               an HLS rendition — the aggregate actual-byte bound is;
+ *   codecs/fps  `null`: the private selection deliberately retains no codec or
+ *               frame-rate identity, and it is not widened merely to decorate
+ *               browser metadata.
+ *
+ * Nothing here identifies HLS to the browser. It is an ordinary preset whose
+ * unknown fields are unknown. The combination — PROVEN audio with NO audio
+ * codec named — is never produced by the progressive family, whose proven
+ * audio always carries the codec that proved it; the analyzer asserts that,
+ * which is what lets the planner cross-check a preset's family against the
+ * private map that claims it.
+ */
+export const CLEAR_HLS_PUBLIC_PRESET_FACTS = Object.freeze({
+  container: "mp4",
+  fileSize: null,
+  hasVideo: true,
+  hasAudio: true,
+  videoCodec: null,
+  audioCodec: null,
+  fps: null,
+} as const);
+
+/**
+ * Does this public preset state EXACTLY the clear-HLS facts above?
+ *
+ * Structural rather than typed on the public contract, so this vocabulary
+ * module keeps importing nothing but its two pure helpers.
+ */
+export function hasClearHlsPublicPresetFacts(preset: {
+  readonly container: string;
+  readonly fileSize: number | null;
+  readonly hasVideo: boolean;
+  readonly hasAudio: boolean;
+  readonly videoCodec: string | null;
+  readonly audioCodec: string | null;
+  readonly fps: number | null;
+}): boolean {
+  return (
+    preset.container === CLEAR_HLS_PUBLIC_PRESET_FACTS.container &&
+    preset.fileSize === CLEAR_HLS_PUBLIC_PRESET_FACTS.fileSize &&
+    preset.hasVideo === CLEAR_HLS_PUBLIC_PRESET_FACTS.hasVideo &&
+    preset.hasAudio === CLEAR_HLS_PUBLIC_PRESET_FACTS.hasAudio &&
+    preset.videoCodec === CLEAR_HLS_PUBLIC_PRESET_FACTS.videoCodec &&
+    preset.audioCodec === CLEAR_HLS_PUBLIC_PRESET_FACTS.audioCodec &&
+    preset.fps === CLEAR_HLS_PUBLIC_PRESET_FACTS.fps
+  );
 }

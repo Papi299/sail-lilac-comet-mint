@@ -51,13 +51,14 @@ import {
  * separate modules, with the artifact as the only thing crossing between them,
  * is what makes that boundary structural rather than a convention.
  *
- * ─── Dormancy ───────────────────────────────────────────────────────────────
+ * ─── Reachability ───────────────────────────────────────────────────────────
  *
- * Nothing in Production calls this module. HLS remains unadvertised and
- * unselectable: the analyzer's protocol policy is untouched, so `m3u8_native`
- * is still withheld as `unsupported_protocol`, there is no HLS preset, no
- * JobExecutor path and no upload integration. This is foundation only, and
- * implementing the source foundation is NOT a Product capability.
+ * Source-activated by HLS-7: an advertised clear-HLS video preset now reaches
+ * this module through the ordinary execution planner and the one HLS
+ * orchestration seam the JobExecutor calls — strictly after
+ * `beginProcessing()` commits. The analyzer's yt-dlp protocol policy is
+ * unchanged, and activation in source is not a deployment or an acceptance of
+ * any kind.
  */
 
 // ── The processed artifact ───────────────────────────────────────────────────
@@ -156,18 +157,16 @@ export const HLS_V1_MP4_STREAM_SHAPE = Object.freeze({
  * `merge-split` already have, which is why `STARTUP_WORKSPACE_FOOTPRINT` is
  * already sufficient for it.
  *
- * It is stated HERE rather than in `workspaceFootprintForPlan()` on purpose.
- * That switch is exhaustive over the operations a Product execution plan can
- * actually carry, and HLS has no such operation: inventing one so the switch
- * could return 2 would put a non-executable operation into a closed Product
- * vocabulary purely to satisfy an arithmetic lookup. HLS-6/HLS-7 will decide
- * how a real HLS plan joins that policy. Until then the requirement lives with
- * the primitive that has it, and the arithmetic stays single-sourced in
+ * It was first stated HERE, by HLS-4, because `workspaceFootprintForPlan()` is
+ * exhaustive over the operations a Product execution plan can carry and HLS
+ * then had none. HLS-6 gave that switch `clear-hls-remux`, and its footprint is
+ * pinned equal to this constant, so the requirement still lives with the
+ * primitive that has it and the arithmetic stays single-sourced in
  * `requiredWorkspaceBytes()`.
  *
  * The type annotation is load-bearing: it is a compile error for this to drift
  * outside the closed `WorkspaceFootprint` union the capacity policy accepts.
- * The import is type-only, so no runtime edge is created from the dormant HLS
+ * The import is type-only, so no runtime edge is created from the HLS
  * foundation into `worker/execution`.
  */
 export const HLS_V1_PROCESSING_WORKSPACE_FOOTPRINT: WorkspaceFootprint = 2;

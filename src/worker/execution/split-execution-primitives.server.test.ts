@@ -102,8 +102,8 @@ function splitAnalysis(target: SplitTarget): ExecutionAnalysis {
         pair: { video: member("video"), audio: member("audio") },
       }),
     },
-    // HLS-5: no execution path reads this map, so every fixture here states
-    // it empty. These suites are dormancy witnesses for that.
+    // No preset here is owned by clear HLS, so the HLS half of the fresh
+    // analysis is empty — which the ordinary planner reads since HLS-7.
     hlsSelections: {},
   };
 }

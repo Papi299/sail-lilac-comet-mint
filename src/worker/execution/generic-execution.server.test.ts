@@ -120,8 +120,9 @@ function genericAnalysis(
   presets: PresetSpec[],
   selections: GenericSourceSelections,
 ): ExecutionAnalysis {
-  // HLS-5: the executor never reads this map, so every generic fixture here
-  // states it empty. `generic-execution` is a dormancy witness for that.
+  // Every preset here is progressive-owned, so the HLS half of the fresh
+  // analysis is empty. Since HLS-7 the ordinary planner reads it; the
+  // executor itself still never does.
   return { strategy: "yt-dlp", video: genericMeta(presets), selections, hlsSelections: {} };
 }
 
@@ -1441,13 +1442,14 @@ describe("generic job: unknown-audio progressive video (GENERIC-UNKNOWN-AUDIO-VI
   });
 
   /**
-   * HLS-5: the same real traversal, with a clear-HLS rendition present.
+   * HLS-5 + HLS-7: the same real traversal, with a clear-HLS rendition present.
    *
-   * The analyzer now builds a private media-playlist selection for it, so this
-   * is the end-to-end proof that the selection goes NOWHERE — not into the
-   * durable row, not into an object key, not into the delivered metadata, not
-   * into the acquisition argv — while the progressive job is unaffected and
-   * still reaches `ready`.
+   * Since HLS-7 that rendition backs its OWN presets (`preset:1080` and, being
+   * tallest, `preset:best`). This job asks for the progressive `preset:360`,
+   * so this is the end-to-end proof that the HLS selection goes NOWHERE on a
+   * progressive job — not into the durable row, not into an object key, not
+   * into the delivered metadata, not into the acquisition argv — and that the
+   * progressive rung it never touched still reaches `ready`.
    */
   it("HLS-5: a private HLS playlist URL reaches no durable row, object key or argv", async () => {
     const TOKEN = "VERY_PRIVATE_HLS_TOKEN";
@@ -1468,15 +1470,24 @@ describe("generic job: unknown-audio progressive video (GENERIC-UNKNOWN-AUDIO-VI
     const counters = { ffmpeg: 0, merge: 0, split: 0, direct: 0 };
     const { writer, bodies } = recordingWriter();
 
+    const analyze = realAnalysis(doc(undefined, [hlsRendition]))!;
+    // HLS-7: the rendition really is live in the same analysis — it owns its
+    // own rung and, being tallest, `preset:best` — while `preset:360` stays
+    // progressive.
+    const analysis = await analyze("https://example.invalid/watch/abc");
+    assert.deepEqual(Object.keys(analysis.hlsSelections), ["preset:best", "preset:1080"]);
+    assert.equal(analysis.selections["preset:360"]?.kind, "single");
+    assert.equal("preset:360" in analysis.hlsSelections, false);
+
     const deps: JobExecutorDeps = {
-      analyzeForExecution: realAnalysis(doc(undefined, [hlsRendition])),
+      analyzeForExecution: analyze,
       genericLimits: DOWNLOAD_LIMITS,
       downloadGeneric: realAcquisition(record, "write-silent-mp4"),
       ...forbiddenSeams(counters),
     };
     await new JobExecutor(h.store, writer, () => Date.now(), new Map(), deps).execute(job);
 
-    // The progressive job is entirely unaffected by the dormant HLS rendition.
+    // The progressive job is entirely unaffected by the HLS rendition.
     const final = h.store.getJob(job.jobId);
     assert.equal(final?.status, "ready", `got ${final?.status}/${final?.errorCode}`);
     assert.equal(record.argvs.length, 1, "still exactly one progressive acquisition");

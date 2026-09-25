@@ -189,15 +189,16 @@ export type ProcessClearHlsFn = (opts: {
  * HLS-6 §24: the execution plan derivation, as an INTERNAL seam.
  *
  * Production is always `deriveExecutionPlan`, and `runtime.server.ts` never
- * supplies an alternative — a structural test pins that. The seam exists only
- * so HLS-6's dormant branch can be exercised end to end: the ordinary planner
- * cannot produce a `clear-hls-remux` plan by design, so without it the HLS
- * lifecycle would be untestable until HLS-7 activated it, which is exactly the
- * wrong order to review these changes in.
+ * supplies an alternative — a structural test pins that. Since HLS-7 the
+ * ordinary planner itself produces a `clear-hls-remux` plan for a preset the
+ * fresh analysis gives to clear HLS, so HLS execution no longer depends on this
+ * seam at all. It remains only so focused lifecycle tests can drive the HLS
+ * branch in isolation — failure, cancellation and shutdown — from a hand-built
+ * plan.
  *
  * It is NOT a feature flag. It cannot be set by a user, a request, the
  * environment or configuration; it changes no default behaviour; and injecting
- * one does not activate HLS for anything else.
+ * one activates nothing the ordinary planner does not already reach.
  */
 export type DerivePlanForExecutionFn = typeof deriveExecutionPlan;
 
@@ -328,10 +329,10 @@ export type JobExecutorDeps = {
  * Both private maps are empty literals. Direct media is one already-known file
  * location, so it has no rendition ladder and no HLS shadow channel.
  *
- * HLS-6 gave the executor an HLS branch, but it did NOT give it a way to reach
- * `hlsSelections`: the executor never reads that member, and the plan derivation
- * it calls cannot see it either. The dormant channel still ends upstream of
- * every decision made here.
+ * The executor itself still never reads `hlsSelections`. It hands the whole
+ * fresh analysis to plan derivation, which — since HLS-7 — reads which private
+ * map owns the requested preset. Every family decision stays upstream of the
+ * executor; it only routes the plan it is given.
  */
 function asDirectExecutionAnalysis(fn: AnalyzeDirectMediaFn): AnalyzeForExecutionFn {
   return async (url, signal) => ({

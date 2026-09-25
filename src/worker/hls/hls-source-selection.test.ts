@@ -391,7 +391,8 @@ describe("clear-HLS selection vocabulary: the module is inert", () => {
 
   it("strips prose without destroying the module under test", () => {
     assert.ok(code.includes("export function acceptClearHlsPlaylistUrl"));
-    assert.equal(code.includes("Dormancy"), false, "comments should be gone");
+    assert.ok(source.includes("Activation"), "the prose is really there...");
+    assert.equal(code.includes("Activation"), false, "...and comments should be gone");
   });
 
   it("names no network, DNS, filesystem, process or runtime facility", () => {

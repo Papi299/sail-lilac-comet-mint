@@ -44,10 +44,11 @@ import type { WorkerErrorCode } from "@/shared/worker/errors";
  *
  *   - It is not a plan derivation. It receives an already-derived plan and
  *     never chooses a rendition, a rung or a fallback.
- *   - It is not a capability. Nothing here is reachable from ordinary Product
- *     plan derivation: `deriveExecutionPlan()` cannot produce a
- *     `clear-hls-remux` plan, so no browser request can arrive at these
- *     functions. HLS-7 owns that activation decision.
+ *   - It is not a capability decision. Since HLS-7 the ordinary planner,
+ *     `deriveExecutionPlan()`, produces a `clear-hls-remux` plan for a preset
+ *     the fresh analysis gave to clear HLS, and that plan arrives here. Which
+ *     presets exist, and which family owns each, is decided upstream of this
+ *     module and never revisited in it.
  *   - It is not a second transport or a second processing path. It adds no
  *     request of its own, no header, no cookie, no referer and no retry policy.
  *     Every byte still moves through HLS-2/HLS-3's fixed safe-HTTP profile, and

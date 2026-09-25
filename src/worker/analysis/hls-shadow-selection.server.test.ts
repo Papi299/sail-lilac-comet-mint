@@ -12,7 +12,10 @@ import {
 } from "../../shared/worker/contracts.ts";
 import { GENERIC_SOURCE_PROTOCOLS } from "../execution/generic-source.ts";
 import { deriveExecutionPlan } from "../execution/format-plan.ts";
-import { CLEAR_HLS_SHADOW_PRESET_ID_PATTERN } from "../hls/hls-source-selection.ts";
+import {
+  CLEAR_HLS_SHADOW_PRESET_ID_PATTERN,
+  hasClearHlsPublicPresetFacts,
+} from "../hls/hls-source-selection.ts";
 import { YTDLP_RUNTIME, type YtdlpRuntimeStatus } from "../runtime/ytdlp-runtime.server.ts";
 import {
   YTDLP_V1_NATIVE_PROTOCOLS,
@@ -24,19 +27,21 @@ import {
 import { analyzeForExecution } from "./media-analyzer.server.ts";
 
 /**
- * HLS-5: the PRIVATE clear-HLS media-playlist selection channel.
+ * HLS-5 + HLS-7: the PRIVATE clear-HLS media-playlist channel, and its
+ * activation as an ordinary Product video capability.
  *
- * Two things are proved here, and they are deliberately in tension:
+ * HLS-5 proved the exact per-rendition playlist URL reaches Worker-private
+ * execution-analysis memory on an application-owned rung, and nothing else.
+ * HLS-7 composes those placements with the mature progressive/split ladder:
  *
- *   1. the exact per-rendition playlist URL now reaches Worker-private
- *      execution-analysis memory, on an application-owned preset rung;
- *   2. absolutely nothing else changes. HLS is still not advertised, still not
- *      downloadable, still withheld publicly as `unsupported_protocol`, and the
- *      progressive path's public and private outputs are untouched.
+ *   1. HLS may FILL a rung the progressive family leaves empty, never displace
+ *      one it fulfils, and owns `preset:best` only when its rung is tallest;
+ *   2. every advertised preset is owned by EXACTLY ONE private map;
+ *   3. HLS takes part only with Worker FFmpeg, and never as an audio product;
+ *   4. the URL stays Worker-private, and both yt-dlp protocol lists stay
+ *      exactly http/https — yt-dlp never acquires HLS.
  *
- * The private half is future execution provenance for HLS-6. The public half
- * remains current Product truth. Both are asserted, together, on the same
- * documents.
+ * Public and private halves are asserted together, on the same documents.
  */
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -227,8 +232,12 @@ describe("HLS-5 admission: the narrow initial HLS shape", () => {
 
   for (const [label, format] of REFUSED) {
     it(`refuses ${label}`, () => {
-      const { hlsSelections } = analyzeFormats(infoWith([format]));
+      const { build, hlsSelections } = analyzeFormats(infoWith([format]));
       assert.deepEqual(hlsSelections, {}, `${label} must not be shadow-selected`);
+      // HLS-7: and therefore never an HLS-backed public preset either. (The
+      // http/https rows above are ordinary progressive sources, so this is a
+      // statement about ownership, not about an empty ladder.)
+      assert.equal(build.presets.some(hasClearHlsPublicPresetFacts), false, `${label}: no HLS preset`);
     });
   }
 
@@ -372,11 +381,13 @@ describe("HLS-5 privacy: the playlist URL is Worker-private", () => {
     assert.ok(JSON.stringify(internal.hlsSelections).includes(TOKEN));
   });
 
-  it("EXISTS in the strategy-aware execution analysis", async () => {
+  /** The strategy-aware execution analysis, with the router's FFmpeg answer. */
+  const executionAnalysis = (ffmpegAvailable: boolean) => {
     const stdout = JSON.stringify(HLS_ONLY());
-    const execution = await analyzeForExecution(SAFE_URL, {
+    return analyzeForExecution(SAFE_URL, {
       ytdlpEnabled: true,
       limits: LIMITS,
+      ffmpegAvailable,
       analyzeDirect: async () => {
         throw new AppError("EXTRACTOR_UNAVAILABLE");
       },
@@ -389,8 +400,20 @@ describe("HLS-5 privacy: the playlist URL is Worker-private", () => {
           validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
         }),
     });
+  };
+
+  it("EXISTS in the strategy-aware execution analysis", async () => {
+    const execution = await executionAnalysis(true);
     assert.equal(execution.strategy, "yt-dlp");
     assert.equal(execution.hlsSelections["preset:1080"]?.playlistUrl, hlsUrl("1080"));
+  });
+
+  it("does NOT exist when the router reports no Worker FFmpeg (HLS-7)", async () => {
+    // Every HLS job ends in a local remux, so without FFmpeg clear HLS takes no
+    // part: nothing is advertised and no private location is retained.
+    const execution = await executionAnalysis(false);
+    assert.deepEqual(execution.hlsSelections, {});
+    assert.deepEqual(execution.video.presets, []);
   });
 
   it("does NOT exist in the public metadata of the same analysis", async () => {
@@ -418,22 +441,32 @@ describe("HLS-5 privacy: the playlist URL is Worker-private", () => {
     assert.equal(JSON.stringify(reparsed).includes(TOKEN), false);
   });
 
-  it("does NOT reach the execution PLAN, which cannot express HLS", async () => {
+  it("reaches ONLY the plan of the preset clear HLS owns (HLS-7)", async () => {
     const internal = await analyzeInternal(infoWith([hlsFormat(), progressiveFormat()]));
-    // The planner takes `{strategy, video, selections}` and has no HLS arm at
-    // all: there is nothing for the private map to flow into.
-    const plan = deriveExecutionPlan(
-      { strategy: "yt-dlp", video: internal.video, selections: internal.selections },
-      "preset:720",
+    const analysis = { strategy: "yt-dlp" as const, ...internal };
+
+    // A progressive-owned preset: its plan carries no HLS provenance at all.
+    const progressive = deriveExecutionPlan(analysis, "preset:720");
+    assert.equal(JSON.stringify(progressive).includes(TOKEN), false);
+    assert.equal(JSON.stringify(progressive).includes("m3u8"), false);
+
+    // The HLS-owned preset: its Worker-private, in-memory plan is the one place
+    // the exact location may go, because HLS-2 is about to request it.
+    const hls = deriveExecutionPlan(analysis, "preset:1080");
+    assert.equal(hls.strategy === "yt-dlp" ? hls.generic.operation : null, "clear-hls-remux");
+    assert.equal(
+      hls.strategy === "yt-dlp" && hls.generic.operation === "clear-hls-remux"
+        ? hls.generic.source.playlistUrl
+        : null,
+      hlsUrl("1080"),
     );
-    assert.equal(JSON.stringify(plan).includes(TOKEN), false);
-    assert.equal(JSON.stringify(plan).includes("m3u8"), false);
   });
 
   it("does NOT appear in an error when the whole document is unusable", async () => {
-    // Every rendition is HLS, so nothing is advertised. The failure must be a
-    // canonical code, and must not describe the private URL it declined.
-    const err = await analyzeInternal(infoWith([hlsFormat({ height: null })]))
+    // Every rendition is HLS and Worker FFmpeg is unavailable, so nothing is
+    // advertised. Any failure must be a canonical code, and must not describe
+    // the private URL it declined.
+    const err = await analyzeInternal(infoWith([hlsFormat({ height: null })]), { ffmpegAvailable: false })
       .then(() => null, (e: unknown) => e);
     // A document with no advertisable preset still analyses successfully today;
     // if that ever becomes a failure, it must still be token-free.
@@ -441,6 +474,38 @@ describe("HLS-5 privacy: the playlist URL is Worker-private", () => {
       assert.equal(JSON.stringify(err, Object.getOwnPropertyNames(err)).includes(TOKEN), false);
       assert.equal(String((err as Error).message ?? "").includes(TOKEN), false);
     }
+  });
+
+  it("does NOT reach the public Worker analyze response of an HLS-DOMINANT source (HLS-7)", async () => {
+    const info = infoWith([
+      hlsFormat({ format_id: "hls-2160", height: 2160, url: hlsUrl("2160") }),
+      hlsFormat({ format_id: "hls-1080", height: 1080, url: hlsUrl("1080") }),
+      progressiveFormat(),
+    ]);
+    const video = await analyzePublic(info);
+    // The browser really is offered HLS-backed ordinary presets...
+    assert.deepEqual(
+      video.presets.filter(hasClearHlsPublicPresetFacts).map((p) => p.id),
+      ["preset:best", "preset:2160", "preset:1080"],
+    );
+    // ...and the serialized public response names nothing that says so.
+    const body = JSON.stringify(WorkerAnalyzeSuccessSchema.parse({ success: true, video }));
+    for (const forbidden of [
+      TOKEN,
+      "playlistUrl",
+      "hlsSelections",
+      "clear-hls-remux",
+      "m3u8_native",
+      "m3u8",
+      "hls-2160",
+      "hls-1080",
+      "media.example.invalid",
+    ]) {
+      assert.equal(body.includes(forbidden), false, `the public body names ${forbidden}`);
+    }
+    // The private analysis of the same document still holds the exact URL.
+    const internal = await analyzeInternal(info);
+    assert.equal(internal.hlsSelections["preset:2160"]?.playlistUrl, hlsUrl("2160"));
   });
 
   it("is not derivable from the progressive private selections", async () => {
@@ -471,106 +536,257 @@ describe("HLS-5 privacy: the playlist URL is Worker-private", () => {
   });
 });
 
-// ── Public equivalence: nothing about Product behaviour moved (§15, §16) ─────
+// ── HLS-7 activation: one final ladder, one owner per preset (§7–§14) ───────
 
-describe("HLS-5 public equivalence: HLS is still not a capability", () => {
-  /** The same document, with and without every HLS rendition removed. */
-  function pair(): { withHls: Record<string, unknown>; withoutHls: Record<string, unknown> } {
-    return {
-      withHls: infoWith([
-        hlsFormat({ format_id: "hls-2160", height: 2160, url: hlsUrl("2160") }),
-        hlsFormat({ format_id: "hls-1080", height: 1080, url: hlsUrl("1080") }),
-        progressiveFormat(),
-      ]),
-      withoutHls: infoWith([progressiveFormat()]),
-    };
-  }
+describe("HLS-7 activation: clear HLS composes with the progressive ladder", () => {
+  /** The exact public preset an HLS-owned rung advertises. */
+  const hlsPreset = (id: string, label: string, resolution: string | null) => ({
+    id,
+    label,
+    resolution,
+    container: "mp4",
+    fileSize: null,
+    hasVideo: true,
+    hasAudio: true,
+    formatId: id,
+    videoCodec: null,
+    audioCodec: null,
+    fps: null,
+  });
+  const ids = (video: WorkerVideoMetadata) => video.presets.map((p) => p.id);
+  const operationOf = (analysis: Parameters<typeof deriveExecutionPlan>[0], id: string) => {
+    const plan = deriveExecutionPlan(analysis, id);
+    return plan.strategy === "yt-dlp" ? plan.generic.operation : plan.direct.operation;
+  };
+  const asAnalysis = (internal: Awaited<ReturnType<typeof analyzeInternal>>) => ({
+    strategy: "yt-dlp" as const,
+    ...internal,
+  });
 
   it("leaves both protocol policies exactly http and https", () => {
     assert.deepEqual([...YTDLP_V1_NATIVE_PROTOCOLS], ["http", "https"]);
     assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https"]);
   });
 
-  it("still refuses every HLS rendition as protocol-unsupported", () => {
+  it("never makes an HLS rendition a yt-dlp acquisition candidate", () => {
     const { candidates } = analyzeFormats(infoWith([hlsFormat()]));
-    assert.deepEqual(candidates, [], "HLS is not an acquisition candidate");
+    assert.deepEqual(candidates, [], "HLS is acquired by VideoFetch, never by yt-dlp");
   });
 
-  it("still reports HLS publicly as unsupported_protocol", async () => {
-    const video = await analyzePublic(infoWith([hlsFormat()]));
-    assert.deepEqual(withheldReasons(video), ["unsupported_protocol"]);
-    assert.equal(video.sourceQuality?.observedMaxHeight, 1080);
-    assert.equal(video.sourceQuality?.deliverableMaxHeight, null);
-    assert.deepEqual(video.presets, [], "no HLS-derived public preset exists");
-    assert.deepEqual(video.formats, []);
-    assert.deepEqual(video.capabilities, { mp3: false, merge: false });
-  });
-
-  it("creates no public preset for an HLS-ONLY source, while selecting privately", async () => {
+  // ── A. HLS-only, FFmpeg available ──────────────────────────────────────────
+  it("A: an HLS-ONLY source advertises ordinary HLS-owned video presets", async () => {
     const internal = await analyzeInternal(infoWith([hlsFormat()]));
-    // Private: a full shadow ladder entry exists.
-    assert.equal(internal.hlsSelections["preset:1080"]?.playlistUrl, hlsUrl("1080"));
-    // Public: nothing at all. This is the deliberate contradiction of HLS-5.
+
+    assert.deepEqual(internal.video.presets, [
+      hlsPreset("preset:best", "Best available", "1080p"),
+      hlsPreset("preset:1080", "1080p", "1080p"),
+    ]);
+    assert.deepEqual(internal.video.formats, []);
+    assert.deepEqual(internal.video.capabilities, { mp3: false, merge: false });
+
+    // Ownership: HLS alone, and the SAME rendition behind best and its rung.
+    assert.deepEqual(internal.selections, {});
+    assert.deepEqual(internal.hlsSelections, {
+      "preset:best": { playlistUrl: hlsUrl("1080"), height: 1080 },
+      "preset:1080": { playlistUrl: hlsUrl("1080"), height: 1080 },
+    });
+
+    // The ORDINARY planner — nothing injected — reaches clear HLS.
+    for (const id of ["preset:best", "preset:1080"]) {
+      assert.equal(operationOf(asAnalysis(internal), id), "clear-hls-remux", id);
+    }
+
+    // And the inventory calls the rendition deliverable.
+    assert.deepEqual(internal.video.sourceQuality, {
+      observedMaxHeight: 1080,
+      deliverableMaxHeight: 1080,
+      withheld: [],
+      protectedUnenumerated: false,
+      maybeProtectedObserved: false,
+    });
+  });
+
+  // ── B. HLS-only, FFmpeg unavailable ────────────────────────────────────────
+  it("B: WITHOUT Worker FFmpeg an HLS-only source advertises nothing", async () => {
+    const internal = await analyzeInternal(infoWith([hlsFormat()]), { ffmpegAvailable: false });
     assert.deepEqual(internal.video.presets, []);
     assert.deepEqual(internal.selections, {});
+    assert.deepEqual(internal.hlsSelections, {});
     assert.deepEqual(withheldReasons(internal.video), ["unsupported_protocol"]);
-  });
-
-  it("keeps public metadata IDENTICAL whether or not HLS renditions are present", async () => {
-    const { withHls, withoutHls } = pair();
-    const a = await analyzePublic(withHls);
-    const b = await analyzePublic(withoutHls);
-
-    // Everything the browser can act on is untouched by the HLS rows.
-    assert.deepEqual(a.presets, b.presets);
-    assert.deepEqual(a.formats, b.formats);
-    assert.deepEqual(a.capabilities, b.capabilities);
-    assert.equal(a.sourceQuality?.deliverableMaxHeight, b.sourceQuality?.deliverableMaxHeight);
-
-    // sourceQuality's OBSERVED half legitimately differs — it always described
-    // the HLS rows, before HLS-5 and after. What must not change is that they
-    // are still WITHHELD, and for the same reason.
-    assert.equal(a.sourceQuality?.observedMaxHeight, 2160);
-    assert.equal(b.sourceQuality?.observedMaxHeight, 720);
-    assert.deepEqual(withheldReasons(a), ["unsupported_protocol"]);
-    assert.deepEqual(withheldReasons(b), []);
-  });
-
-  it("does not let a TALLER HLS rendition displace the progressive preset:best", async () => {
-    const internal = await analyzeInternal(pair().withHls);
-    const best = internal.video.presets.find((p) => p.id === "preset:best");
-    assert.ok(best, "the progressive source still backs preset:best");
-    assert.equal(best.resolution, "720p", "a 2160 HLS rendition does not take it");
-
-    // The private progressive selection is the progressive source, unchanged.
-    const selection = internal.selections["preset:best"];
-    assert.equal(selection?.kind, "single");
-    assert.equal(
-      selection?.kind === "single" ? selection.source.formatId : null,
-      "http-720",
+    assert.equal(internal.video.sourceQuality?.deliverableMaxHeight, null);
+    assert.throws(
+      () => deriveExecutionPlan(asAnalysis(internal), "preset:1080"),
+      (e: unknown) => e instanceof AppError && e.code === "FORMAT_UNAVAILABLE",
     );
-    assert.equal(
-      selection?.kind === "single" ? selection.source.protocol : null,
-      "https",
-    );
-
-    // …while the SHADOW `preset:best` is the 2160 HLS rendition. Two maps, two
-    // meanings: advertised-and-acquirable versus if-HLS-were-downloadable.
-    assert.equal(internal.hlsSelections["preset:best"]?.playlistUrl, hlsUrl("2160"));
   });
 
-  it("leaves the private progressive selections byte-identical", async () => {
-    const { withHls, withoutHls } = pair();
-    const a = await analyzeInternal(withHls);
-    const b = await analyzeInternal(withoutHls);
+  it("B: WITHOUT Worker FFmpeg a mixed source is exactly its progressive result", async () => {
+    const withHls = infoWith([
+      hlsFormat({ format_id: "hls-2160", height: 2160, url: hlsUrl("2160") }),
+      progressiveFormat(),
+    ]);
+    const a = await analyzeInternal(withHls, { ffmpegAvailable: false });
+    const b = await analyzeInternal(infoWith([progressiveFormat()]), { ffmpegAvailable: false });
+    assert.deepEqual(a.video.presets, b.video.presets);
+    assert.deepEqual(a.video.capabilities, b.video.capabilities);
     assert.deepEqual(a.selections, b.selections);
-    assert.equal(JSON.stringify(a.selections).includes("m3u8"), false);
+    assert.deepEqual(a.hlsSelections, {});
+    assert.deepEqual(withheldReasons(a.video), ["unsupported_protocol"]);
   });
 
-  it("reports the same public result for a progressive-only document either way", async () => {
-    // The HLS pass is additive: with no HLS rows present, removing it would
-    // change nothing. Proved by the shadow map being empty and the whole
-    // public document parsing unchanged.
+  // ── C. Higher HLS + lower progressive ──────────────────────────────────────
+  it("C: progressive 720 + HLS 2160 — HLS fills 2160 and takes best", async () => {
+    const internal = await analyzeInternal(
+      infoWith([hlsFormat({ format_id: "hls-2160", height: 2160, url: hlsUrl("2160") }), progressiveFormat()]),
+    );
+    const progressiveOnly = await analyzeInternal(infoWith([progressiveFormat()]));
+    const progressivePreset = (id: string) => progressiveOnly.video.presets.find((p) => p.id === id);
+
+    assert.deepEqual(internal.video.presets, [
+      hlsPreset("preset:best", "Best available", "2160p"),
+      hlsPreset("preset:2160", "2160p / 4K", "2160p"),
+      progressivePreset("preset:720"),
+      progressivePreset("preset:audio"),
+      progressivePreset("preset:mp3"),
+    ]);
+    // The progressive half is the progressive-only result minus `preset:best`.
+    const { "preset:best": _displaced, ...progressiveRest } = progressiveOnly.selections;
+    assert.deepEqual(internal.selections, progressiveRest);
+    assert.deepEqual(Object.keys(internal.hlsSelections), ["preset:best", "preset:2160"]);
+    assert.equal(internal.hlsSelections["preset:best"]?.playlistUrl, hlsUrl("2160"));
+
+    assert.equal(operationOf(asAnalysis(internal), "preset:720"), "keep-original");
+    assert.equal(operationOf(asAnalysis(internal), "preset:best"), "clear-hls-remux");
+    assert.equal(operationOf(asAnalysis(internal), "preset:2160"), "clear-hls-remux");
+
+    assert.equal(internal.video.sourceQuality?.deliverableMaxHeight, 2160);
+    assert.equal(internal.video.sourceQuality?.observedMaxHeight, 2160);
+    assert.deepEqual(withheldReasons(internal.video), []);
+    // `merge` is the SPLIT merge; an HLS remux never sets it.
+    assert.deepEqual(internal.video.capabilities, { mp3: true, merge: false });
+  });
+
+  // ── D. Same-rung tie ───────────────────────────────────────────────────────
+  it("D: progressive 1080 + HLS 1080 — progressive keeps the rung and best", async () => {
+    const progressive1080 = progressiveFormat({ format_id: "http-1080", height: 1080 });
+    const internal = await analyzeInternal(infoWith([hlsFormat(), progressive1080]));
+    const progressiveOnly = await analyzeInternal(infoWith([progressive1080]));
+
+    assert.deepEqual(internal.video.presets, progressiveOnly.video.presets);
+    assert.deepEqual(internal.selections, progressiveOnly.selections);
+    assert.deepEqual(internal.hlsSelections, {}, "HLS does not displace a mature fulfilment");
+    assert.equal(operationOf(asAnalysis(internal), "preset:1080"), "keep-original");
+    assert.equal(operationOf(asAnalysis(internal), "preset:best"), "keep-original");
+    // The HLS rendition was eligible and lost its rung: not_selected.
+    assert.deepEqual(internal.video.sourceQuality?.withheld, [
+      { reason: "not_selected", count: 1, maxObservedHeight: 1080 },
+    ]);
+  });
+
+  // ── E. Higher progressive + lower HLS ──────────────────────────────────────
+  it("E: progressive 2160 + HLS 1080 — best stays progressive, HLS fills 1080", async () => {
+    const progressive2160 = progressiveFormat({ format_id: "http-2160", height: 2160 });
+    const internal = await analyzeInternal(infoWith([hlsFormat(), progressive2160]));
+    const progressiveOnly = await analyzeInternal(infoWith([progressive2160]));
+
+    assert.deepEqual(ids(internal.video), [
+      "preset:best",
+      "preset:2160",
+      "preset:1080",
+      "preset:audio",
+      "preset:mp3",
+    ]);
+    const best = internal.video.presets.find((p) => p.id === "preset:best");
+    assert.deepEqual(best, progressiveOnly.video.presets.find((p) => p.id === "preset:best"));
+    assert.equal(best?.resolution, "2160p");
+    assert.deepEqual(internal.selections, progressiveOnly.selections);
+    assert.deepEqual(Object.keys(internal.hlsSelections), ["preset:1080"]);
+    assert.deepEqual(
+      internal.video.presets.find((p) => p.id === "preset:1080"),
+      hlsPreset("preset:1080", "1080p", "1080p"),
+    );
+    assert.equal(operationOf(asAnalysis(internal), "preset:best"), "keep-original");
+    assert.equal(operationOf(asAnalysis(internal), "preset:1080"), "clear-hls-remux");
+  });
+
+  // ── F. Unknown height ──────────────────────────────────────────────────────
+  it("F: with no named rung, a progressive unknown-height best wins", async () => {
+    const internal = await analyzeInternal(
+      infoWith([hlsFormat({ height: null }), progressiveFormat({ height: null })]),
+    );
+    const best = internal.video.presets.find((p) => p.id === "preset:best");
+    assert.equal(best?.resolution, null);
+    assert.equal(internal.selections["preset:best"]?.kind, "single");
+    assert.deepEqual(internal.hlsSelections, {});
+    assert.deepEqual(internal.video.sourceQuality?.withheld, [
+      { reason: "not_selected", count: 1, maxObservedHeight: null },
+    ]);
+  });
+
+  it("F: with no named rung and no progressive best, HLS may back best alone", async () => {
+    const internal = await analyzeInternal(infoWith([hlsFormat({ height: null })]));
+    assert.deepEqual(internal.video.presets, [hlsPreset("preset:best", "Best available", null)]);
+    assert.deepEqual(internal.hlsSelections, {
+      "preset:best": { playlistUrl: hlsUrl("1080"), height: null },
+    });
+    assert.equal(operationOf(asAnalysis(internal), "preset:best"), "clear-hls-remux");
+  });
+
+  it("F: a named HLS rung outranks an unknown-height progressive best", async () => {
+    const internal = await analyzeInternal(
+      infoWith([hlsFormat({ height: 720, url: hlsUrl("720") }), progressiveFormat({ height: null })]),
+    );
+    assert.deepEqual(internal.video.presets.slice(0, 2), [
+      hlsPreset("preset:best", "Best available", "720p"),
+      hlsPreset("preset:720", "720p", "720p"),
+    ]);
+    assert.equal(internal.selections["preset:best"], undefined);
+    // The displaced progressive rendition is still eligible: not_selected.
+    assert.deepEqual(internal.video.sourceQuality?.withheld, [
+      { reason: "not_selected", count: 1, maxObservedHeight: null },
+    ]);
+  });
+
+  // ── K. Audio products ──────────────────────────────────────────────────────
+  it("K: clear HLS never creates or owns preset:audio or preset:mp3", async () => {
+    const hlsOnly = await analyzeInternal(infoWith([hlsFormat()]));
+    assert.equal(hlsOnly.video.presets.some((p) => !p.hasVideo), false);
+
+    const audioOnly = {
+      format_id: "http-audio",
+      ext: "m4a",
+      vcodec: "none",
+      acodec: "mp4a.40.2",
+      video_ext: "none",
+      protocol: "https",
+    };
+    const mixed = await analyzeInternal(infoWith([hlsFormat(), audioOnly]));
+    assert.deepEqual(ids(mixed.video), ["preset:best", "preset:1080", "preset:audio", "preset:mp3"]);
+    for (const id of ["preset:audio", "preset:mp3"]) {
+      assert.equal(mixed.hlsSelections[id], undefined, `${id} is never HLS-owned`);
+      const value = mixed.selections[id];
+      assert.equal(value?.kind === "single" ? value.source.formatId : null, "http-audio", id);
+    }
+  });
+
+  // ── The progressive family's own tier choice is kept ───────────────────────
+  it("keeps an unknown-audio progressive ladder, and lets HLS fill above it", async () => {
+    // The progressive family chose its unknown-audio fallback tier on its own
+    // candidates, before composition. HLS-7's precedence is literal: a rung the
+    // progressive family fulfils stays progressive, whatever tier backs it.
+    const unknownAudio = progressiveFormat({ format_id: "http-360", height: 360, acodec: null });
+    const internal = await analyzeInternal(infoWith([hlsFormat(), unknownAudio]));
+    assert.deepEqual(ids(internal.video), ["preset:best", "preset:1080", "preset:360"]);
+    assert.equal(internal.video.presets.find((p) => p.id === "preset:best")?.hasAudio, true);
+    assert.equal(internal.video.presets.find((p) => p.id === "preset:360")?.hasAudio, false);
+    assert.deepEqual(Object.keys(internal.hlsSelections), ["preset:best", "preset:1080"]);
+    const value = internal.selections["preset:360"];
+    assert.equal(value?.kind === "single" ? value.source.audioConstraint : null, "unknown");
+  });
+
+  it("reports the same result for a progressive-only document either way", async () => {
+    // The HLS pass is additive: with no HLS rows present, composition returns
+    // the construction untouched.
     const info = infoWith([progressiveFormat()]);
     const { hlsSelections } = analyzeFormats(info);
     assert.deepEqual(hlsSelections, {});
@@ -581,26 +797,43 @@ describe("HLS-5 public equivalence: HLS is still not a capability", () => {
     );
     assert.deepEqual(withheldReasons(video), []);
   });
+
+  it("makes the two private maps disjoint, and together exhaustive", async () => {
+    for (const info of [
+      infoWith([hlsFormat()]),
+      infoWith([hlsFormat({ format_id: "hls-2160", height: 2160, url: hlsUrl("2160") }), progressiveFormat()]),
+      infoWith([hlsFormat(), progressiveFormat({ format_id: "http-2160", height: 2160 })]),
+      infoWith([hlsFormat(), progressiveFormat({ format_id: "http-1080", height: 1080 })]),
+    ]) {
+      const internal = await analyzeInternal(info);
+      for (const preset of internal.video.presets) {
+        const progressive = preset.id in internal.selections;
+        const hls = preset.id in internal.hlsSelections;
+        assert.equal(progressive !== hls, true, `${preset.id} has exactly one owner`);
+        assert.equal(hasClearHlsPublicPresetFacts(preset), hls, `${preset.id}: facts agree with owner`);
+      }
+      for (const id of [...Object.keys(internal.selections), ...Object.keys(internal.hlsSelections)]) {
+        assert.ok(internal.video.presets.some((p) => p.id === id), `${id} is advertised`);
+      }
+    }
+  });
 });
 
-// ── Structural dormancy (§10, §25) ───────────────────────────────────────────
+// ── Structure: who may read the channel (§10, §25; HLS-7 §17, §27) ─────────
 
-describe("HLS-5 dormancy: the channel exists and nothing consumes it", () => {
+describe("HLS-5/HLS-7 structure: analysis produces the channel, the planner alone reads it", () => {
   const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
 
   /**
-   * HLS-6 NARROWED THE NEXT TWO CASES, and the narrowing is exact.
+   * HLS-7 REPLACED THE DORMANCY PIN BELOW, deliberately.
    *
-   * HLS-5 could assert the crudest possible thing — that the planner and the
-   * executor did not contain the substring "hls" at all — because neither had
-   * any HLS concept. HLS-6 gives both one: the planner gains a `clear-hls-remux`
-   * plan and its own SEPARATE derivation entry point, and the executor gains a
-   * routing branch behind one orchestration seam.
-   *
-   * What must still hold, and is what these cases now pin, is the thing that
-   * actually keeps HLS dormant: the ORDINARY planner never sees the shadow map,
-   * and the executor has no way to reach it either. HLS-7 is the reviewed change
-   * that connects them.
+   * HLS-5 asserted that nothing read the shadow map; HLS-6 narrowed that to
+   * "the ORDINARY planner never sees it", pinned by its parameter type. HLS-7 is
+   * the reviewed change that connects them, so that pin is now its opposite:
+   * the ordinary planner REQUIRES the map, reads which family owns the request,
+   * and dispatches — with no try/catch, so neither family is ever a fallback
+   * for the other. The progressive derivation it dispatches to stays HLS-blind,
+   * and the executor still reads nothing of the map itself.
    */
 
   /** The body of a top-level function, by brace matching from its signature. */
@@ -620,28 +853,56 @@ describe("HLS-5 dormancy: the channel exists and nothing consumes it", () => {
     assert.fail(`${signature} has no balanced body`);
   };
 
-  it("is not read by the ORDINARY execution planner", () => {
+  /** The executable body of a function: brace-matched from `opener`, comments removed. */
+  const bodyAfter = (source: string, signature: string, opener: string): string => {
+    const start = source.indexOf(signature);
+    assert.notEqual(start, -1, `${signature} must exist`);
+    const open = source.indexOf(opener, start) + opener.length - 1;
+    assert.equal(source[open], "{", `${signature} must open its body with ${opener}`);
+    let depth = 0;
+    for (let i = open; i < source.length; i += 1) {
+      if (source[i] === "{") depth += 1;
+      else if (source[i] === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          return source
+            .slice(open, i + 1)
+            .replace(/\/\*[\s\S]*?\*\//g, " ")
+            .replace(/(^|[^:])\/\/.*$/gm, "$1");
+        }
+      }
+    }
+    assert.fail(`${signature} has no balanced body`);
+  };
+
+  it("HLS-7: the ordinary planner REQUIRES the map, reads ownership, and never falls back", () => {
     const source = read("src/worker/execution/format-plan.ts");
 
-    // The dormant machinery exists…
-    assert.ok(
-      source.includes("export function deriveClearHlsExecutionPlan"),
-      "HLS-6 added a SEPARATE derivation entry point",
-    );
+    // The parameter type now declares the HLS half as REQUIRED, so every caller
+    // states it — the direct path and progressive fixtures as `{}`.
+    const params = functionBody(source, "export function deriveExecutionPlan(");
+    assert.ok(params.includes("readonly hlsSelections: ClearHlsMediaPlaylistSelections;"));
+    assert.equal(params.includes("hlsSelections?"), false, "never optional");
 
-    // …and the ordinary planner cannot reach it. Its whole body — including its
-    // parameter list, which is what makes `hlsSelections` invisible to it — is
-    // free of every HLS name.
-    const ordinary = functionBody(source, "export function deriveExecutionPlan(");
-    for (const forbidden of ["hlsSelections", "ClearHls", "clear-hls"]) {
-      assert.equal(
-        ordinary.includes(forbidden),
-        false,
-        `deriveExecutionPlan must not name ${forbidden}`,
-      );
+    const planner = bodyAfter(source, "export function deriveExecutionPlan(", "): ExecutionPlan {");
+    for (const required of [
+      "genericPresetOwner(",
+      "analysis.hlsSelections",
+      "deriveClearHlsExecutionPlan(",
+      "deriveGenericExecutionPlan(",
+    ]) {
+      assert.ok(planner.includes(required), `deriveExecutionPlan must name ${required}`);
     }
+    // No try/catch anywhere in it: a refusal from one family is final, and is
+    // never retried as the other.
+    assert.equal(/\btry\b|\bcatch\b/.test(planner), false, "no hidden substitution");
 
-    // Nor may the ordinary GENERIC derivation it delegates to.
+    // The ownership reader READS; it derives nothing and can only refuse.
+    const owner = bodyAfter(source, "function genericPresetOwner(", "): GenericPresetOwner {");
+    assert.equal(/derive\w*ExecutionPlan\s*\(/.test(owner), false);
+    assert.equal(/\btry\b|\bcatch\b/.test(owner), false);
+
+    // The ordinary GENERIC derivation it dispatches to stays HLS-blind.
     const generic = functionBody(source, "export function deriveGenericExecutionPlan(");
     for (const forbidden of ["hlsSelections", "ClearHls", "clear-hls"]) {
       assert.equal(
