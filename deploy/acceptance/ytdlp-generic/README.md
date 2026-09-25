@@ -184,6 +184,30 @@ See [`SPLIT-07.md`](SPLIT-07.md).
 Self-tests: `scripts/ytdlp-release-image-acceptance.test.mjs` — no Docker, no
 network.
 
+### HLS-08 — the deterministic clear-HLS full-path harness
+
+A **separate acceptance stage** in the SPLIT-06 mould, additive and changing
+none of the above: offline, `--network none`, no tunnel, no control plane, no
+R2, no live source. It proves the activated clear-HLS chain (analysis → HLS
+preset → fresh execution analysis → `clear-hls-remux` plan → HLS-2 → HLS-3 →
+HLS-4 → upload → `ready`) against the exact accepted media runtime, plus three
+bounded negatives. See [`HLS-08.md`](HLS-08.md) — including what it
+deliberately does **not** prove.
+
+| File | Runs on | Purpose |
+| :--- | :--- | :--- |
+| `run-hls-acceptance.mjs` | where Docker is | Provenance, pinned accepted base, non-deployable overlay, isolated run, evidence read-back. |
+| `hls-full-path.mjs` | inside the acceptance container | The deterministic clear-HLS orchestrator. |
+| `lib/hls-container.mjs` | — | Overlay Dockerfile and every `docker` argv; `--network none`, the one `--add-host`, the structural posture check. |
+| `lib/hls-fixture-url.mjs` | — | The acceptance hostname, route table, private markers, and the exact submitted-page validator. |
+| `lib/hls-safe-http-transport.mjs` | — | The acceptance DNS answer and loopback socket under the Product's real safe-HTTP policy. |
+| `lib/hls-observers.mjs` | — | Subprocess observer, remux-policy reader, field-aware privacy placement. |
+| `lib/hls-evidence.mjs` | — | The `hls08-deterministic-full-path-02` record and its PASS gate; `-01` records are historical and not accepted. |
+| `fixtures/hls-media.mjs` | — | The FFmpeg HLS fixture recipe, master, page and negative playlists. |
+| `fixtures/hls-server.mjs` | inside the acceptance container, loopback only | The closed-route fixture service with its sanitized ledger. |
+
+Self-tests: `scripts/ytdlp-hls-acceptance.test.mjs` — no Docker, no network.
+
 Tests: `scripts/ytdlp-acceptance.test.mjs` and `scripts/ytdlp-fixture.test.mjs`,
 both run by `npm test`. They drive the real evaluators with fakes and the real
 fixture over loopback; **no test performs a live run, and none needs the
