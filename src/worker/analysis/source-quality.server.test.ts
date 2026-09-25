@@ -40,6 +40,11 @@ import { analyzeDirectMedia } from "../execution/direct-media.server.ts";
  * field), private selections, derived execution plans and the yt-dlp selectors
  * those plans produce. A change to any of them fails here, whatever the
  * inventory says.
+ *
+ * HLS-7 is a deliberate delivery change, and it is carved out rather than
+ * regenerated: `HLS_ACTIVATED` names the ONE scenario whose clear-HLS rows are
+ * now delivered, and for it the golden record still pins everything the
+ * progressive family owns (see `testdata/README.md`).
  */
 
 const TESTDATA = join(import.meta.dirname, "testdata");
@@ -111,10 +116,15 @@ type Expected = {
  */
 const EXPECTED: Record<string, Expected> = {
   "case01-deliverable-progressive-ladder": { observed: 2160, deliverable: 2160, withheld: [] },
+  // HLS-7: both admitted clear-HLS rows now back HLS-owned presets, so nothing
+  // is withheld. Before HLS-7 this read deliverable 720 with the two HLS rows
+  // withheld as `unsupported_protocol` (still the outcome without FFmpeg — see
+  // the HLS-7 describe below). The audio-only HLS row is not a video rendition
+  // and was never observed.
   "case02-clear-hls-above-progressive": {
     observed: 2160,
-    deliverable: 720,
-    withheld: [["unsupported_protocol", 2, 2160]],
+    deliverable: 2160,
+    withheld: [],
   },
   "case03-segmented-dash-above-progressive": {
     observed: 2160,
@@ -258,6 +268,21 @@ function expectedSummary(name: string): SourceQuality {
   };
 }
 
+/**
+ * HLS-7 carve-out: scenarios whose ADMITTED clear-HLS rows are now delivered,
+ * and the exact preset ids clear HLS owns in each. Everything else those
+ * scenarios produce is still compared with the golden record; every scenario
+ * NOT listed here must still match it in full.
+ */
+const HLS_ACTIVATED: Record<string, readonly string[]> = {
+  "case02-clear-hls-above-progressive": ["preset:best", "preset:2160", "preset:1080"],
+};
+
+/** A golden-shaped record with the HLS-owned ids removed. */
+function withoutIds<T>(record: Record<string, T> | undefined, ids: ReadonlySet<string>): Record<string, T> {
+  return Object.fromEntries(Object.entries(record ?? {}).filter(([id]) => !ids.has(id)));
+}
+
 describe("P1 rendition inventory: the corpus", () => {
   it("the corpus and the golden record describe the same scenarios", () => {
     const names = CORPUS.map((s) => s.name);
@@ -265,6 +290,7 @@ describe("P1 rendition inventory: the corpus", () => {
     assert.deepEqual(names.slice().sort(), Object.keys(GOLDEN).sort());
     assert.deepEqual(names.slice().sort(), Object.keys(EXPECTED).sort());
     assert.ok(names.length >= 25, "the corpus must keep its breadth");
+    for (const name of Object.keys(HLS_ACTIVATED)) assert.ok(names.includes(name), name);
   });
 
   for (const scenario of CORPUS) {
@@ -273,11 +299,23 @@ describe("P1 rendition inventory: the corpus", () => {
         const golden = GOLDEN[scenario.name]!;
         assert.equal(golden.ok, true, "every corpus scenario analyzed successfully before P1");
 
-        const { video, selections } = await analyzeScenario(scenario);
+        const { video, selections, hlsSelections } = await analyzeScenario(scenario);
         const { sourceQuality, ...identity } = video;
         assert.ok(sourceQuality, "the new field exists...");
-        assert.deepEqual(identity, golden.video, "...and nothing else moved");
-        assert.deepEqual(JSON.parse(JSON.stringify(selections)), golden.selections);
+
+        // HLS-7: the ids clear HLS owns in this scenario, and nothing else.
+        const hlsIds = new Set(HLS_ACTIVATED[scenario.name] ?? []);
+        assert.deepEqual(Object.keys(hlsSelections).sort(), [...hlsIds].sort(), "exactly the carved-out ids");
+        const progressivePresets = (presets: readonly { id: string }[]) =>
+          presets.filter((p) => !hlsIds.has(p.id));
+        const goldenVideo = golden.video as { presets: { id: string }[] };
+
+        assert.deepEqual(
+          { ...identity, presets: progressivePresets(identity.presets) },
+          { ...goldenVideo, presets: progressivePresets(goldenVideo.presets) },
+          "...and nothing else moved",
+        );
+        assert.deepEqual(JSON.parse(JSON.stringify(selections)), withoutIds(golden.selections, hlsIds));
 
         // The same presets must still derive the same plans and the same
         // yt-dlp selectors: identity of the metadata is not identity of
@@ -285,13 +323,21 @@ describe("P1 rendition inventory: the corpus", () => {
         const plans: Record<string, unknown> = {};
         const selectors: Record<string, string[]> = {};
         for (const preset of video.presets) {
-          plans[preset.id] = deriveExecutionPlan({ strategy: "yt-dlp", video, selections }, preset.id);
+          const plan = deriveExecutionPlan({ strategy: "yt-dlp", video, selections, hlsSelections }, preset.id);
+          if (hlsIds.has(preset.id)) {
+            // HLS-owned: VideoFetch's own acquisition, so there is no yt-dlp
+            // selector to compare — and none may exist.
+            assert.equal(plan.strategy === "yt-dlp" ? plan.generic.operation : null, "clear-hls-remux");
+            assert.equal(selections[preset.id], undefined);
+            continue;
+          }
+          plans[preset.id] = plan;
           const value = selections[preset.id]!;
           const members = value.kind === "single" ? [value.source] : [value.pair.video, value.pair.audio];
           selectors[preset.id] = members.map(buildGenericFormatSelector);
         }
-        assert.deepEqual(JSON.parse(JSON.stringify(plans)), golden.plans);
-        assert.deepEqual(selectors, golden.selectors);
+        assert.deepEqual(JSON.parse(JSON.stringify(plans)), withoutIds(golden.plans, hlsIds));
+        assert.deepEqual(selectors, withoutIds(golden.selectors, hlsIds));
       });
 
       it("reports exactly the expected source quality", async () => {
@@ -300,8 +346,17 @@ describe("P1 rendition inventory: the corpus", () => {
       });
 
       it("the summary is self-consistent, bounded, and free of upstream data", async () => {
-        const { video, selections } = await analyzeScenario(scenario);
+        const { video, selections, hlsSelections } = await analyzeScenario(scenario);
         const quality = sourceQualityOf(video);
+
+        // HLS-7: no private playlist location reaches the public body.
+        const publicBody = JSON.stringify(WorkerAnalyzeSuccessSchema.parse({ success: true, video }));
+        for (const forbidden of ["CORPUS_PRIVATE_HLS_TOKEN", "media.example.invalid", "m3u8", "playlistUrl"]) {
+          assert.equal(publicBody.includes(forbidden), false, forbidden);
+        }
+        for (const selection of Object.values(hlsSelections)) {
+          assert.equal(publicBody.includes(selection.playlistUrl), false);
+        }
 
         // The contract's own refinements, applied to the emitted value.
         assert.deepEqual(SourceQualitySchema.parse(quality), quality);
@@ -351,9 +406,12 @@ describe("P1 rendition inventory: the corpus", () => {
   }
 });
 
-describe("P1 rendition inventory: HLS and segmented DASH stay inventory-only", () => {
+describe("P1 rendition inventory: segmented DASH and non-admitted HLS stay inventory-only", () => {
+  // case02 left this list in HLS-7: its clear-HLS rows are admitted and now
+  // delivered (see the HLS-7 describe below). What remains are manifests clear
+  // HLS v1 does not take — segmented DASH, an HLS row with no playlist URL and a
+  // hostile height, and X-shaped HLS video with no proven audio.
   const manifestScenarios = [
-    "case02-clear-hls-above-progressive",
     "case03-segmented-dash-above-progressive",
     "case18-hostile-height-not-a-fact",
     "x-synthetic-x-progressive-unknown-audio-ffmpeg",
@@ -362,7 +420,8 @@ describe("P1 rendition inventory: HLS and segmented DASH stay inventory-only", (
   for (const name of manifestScenarios) {
     it(`${name}: manifest renditions are counted but never executable`, async () => {
       const scenario = CORPUS.find((s) => s.name === name)!;
-      const { video, selections } = await analyzeScenario(scenario);
+      const { video, selections, hlsSelections } = await analyzeScenario(scenario);
+      assert.deepEqual(hlsSelections, {}, "no clear-HLS ownership either");
 
       // Which upstream ids belong to a manifest protocol, per the document.
       const formats = (documentOf(scenario).formats ?? []) as Array<Record<string, unknown>>;
@@ -388,9 +447,8 @@ describe("P1 rendition inventory: HLS and segmented DASH stay inventory-only", (
 
       // Every preset is still derivable; none of them acquires a manifest.
       for (const preset of video.presets) {
-        assert.doesNotThrow(() =>
-          deriveExecutionPlan({ strategy: "yt-dlp", video, selections }, preset.id),
-        );
+        const plan = deriveExecutionPlan({ strategy: "yt-dlp", video, selections, hlsSelections }, preset.id);
+        assert.notEqual(plan.strategy === "yt-dlp" ? plan.generic.operation : null, "clear-hls-remux");
       }
 
       // And the renditions did reach the inventory.
@@ -410,7 +468,9 @@ describe("P1 rendition inventory: HLS and segmented DASH stay inventory-only", (
     ).length;
   }
 
-  it("an HLS-only document yields no presets at all, exactly as before", async () => {
+  it("an HLS-only document whose rows carry no playlist URL yields no presets, exactly as before", async () => {
+    // Without a `url`, no row passes clear-HLS admission, so HLS-7 has nothing
+    // to activate and the document reads exactly as it did before it.
     const document = {
       _type: "video",
       title: "HLS only",
@@ -438,6 +498,126 @@ describe("P1 rendition inventory: HLS and segmented DASH stay inventory-only", (
       protectedUnenumerated: false,
       maybeProtectedObserved: false,
     });
+  });
+});
+
+describe("HLS-7 rendition inventory: admitted clear HLS is deliverable, and only it", () => {
+  const case02 = () => CORPUS.find((s) => s.name === "case02-clear-hls-above-progressive")!;
+  const HLS_URL = (tag: string) =>
+    `https://media.example.invalid/hls/${tag}/media.m3u8?sig=CORPUS_PRIVATE_HLS_TOKEN`;
+  const run = (document: Record<string, unknown>, ffmpegAvailable = true) =>
+    analyzeGenericMediaInternal(SAFE_URL, {
+      limits: { analysisTimeoutSeconds: 45, maxVideoDurationSeconds: 7200, maxFileSizeBytes: 4 * 1024 ** 3 },
+      ffmpegAvailable,
+      runner: async () => ({ code: 0, stdout: JSON.stringify(document), stderr: "" }),
+      probeRuntime: async () => ({ available: true, version: "2026.08.19", reason: "ok" as const }),
+      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+    });
+  const hlsRow = (id: string, height: number, over: Record<string, unknown> = {}) => ({
+    format_id: id, ext: "mp4", protocol: "m3u8_native", height, vcodec: "avc1.640028",
+    acodec: "mp4a.40.2", video_ext: "mp4", audio_ext: "none", url: HLS_URL(id), ...over,
+  });
+  const progressiveRow = (id: string, height: number) => ({
+    format_id: id, ext: "mp4", protocol: "https", height, vcodec: "avc1.640028",
+    acodec: "mp4a.40.2", video_ext: "mp4", audio_ext: "none", filesize: 1024,
+  });
+  const doc = (formats: Array<Record<string, unknown>>) => ({
+    _type: "video", title: "HLS-7 inventory", duration: 60, formats,
+  });
+
+  it("case02: the taller HLS rungs are delivered, the progressive 720 is untouched", async () => {
+    const { video, selections, hlsSelections } = await analyzeScenario(case02());
+    const hls = (id: string, label: string, resolution: string) => ({
+      id, label, resolution, container: "mp4", fileSize: null, hasVideo: true, hasAudio: true,
+      formatId: id, videoCodec: null, audioCodec: null, fps: null,
+    });
+    const golden = GOLDEN["case02-clear-hls-above-progressive"]!.video as { presets: Array<{ id: string }> };
+    const goldenPreset = (id: string) => golden.presets.find((p) => p.id === id);
+
+    assert.deepEqual(video.presets, [
+      hls("preset:best", "Best available", "2160p"),
+      hls("preset:2160", "2160p / 4K", "2160p"),
+      hls("preset:1080", "1080p", "1080p"),
+      goldenPreset("preset:720"),
+      goldenPreset("preset:audio"),
+      goldenPreset("preset:mp3"),
+    ]);
+    // Private ownership: disjoint, and the SAME 2160 rendition behind best.
+    assert.deepEqual(Object.keys(selections).sort(), ["preset:720", "preset:audio", "preset:mp3"]);
+    assert.deepEqual(hlsSelections, {
+      "preset:best": { playlistUrl: HLS_URL("2160"), height: 2160 },
+      "preset:2160": { playlistUrl: HLS_URL("2160"), height: 2160 },
+      "preset:1080": { playlistUrl: HLS_URL("1080"), height: 1080 },
+    });
+    // The audio-only HLS row carries a URL too, and is still no product.
+    assert.equal(JSON.stringify(hlsSelections).includes("audio-en"), false);
+    // `merge` still means the split merge; an HLS remux never sets it.
+    assert.deepEqual(video.capabilities, { mp3: true, merge: false });
+    assert.deepEqual(sourceQualityOf(video), expectedSummary("case02-clear-hls-above-progressive"));
+  });
+
+  it("case02 WITHOUT Worker FFmpeg: exactly the pre-HLS-7 withheld result", async () => {
+    const { video, selections, hlsSelections } = await run(documentOf(case02()), false);
+    assert.deepEqual(hlsSelections, {});
+    assert.deepEqual(video.presets.map((p) => p.id), ["preset:best", "preset:720"]);
+    assert.equal(Object.values(selections).every((v) => v.kind === "single" && v.source.formatId === "p720"), true);
+    assert.deepEqual(sourceQualityOf(video), {
+      observedMaxHeight: 2160,
+      deliverableMaxHeight: 720,
+      withheld: [{ reason: "unsupported_protocol", count: 2, maxObservedHeight: 2160 }],
+      protectedUnenumerated: false,
+      maybeProtectedObserved: false,
+    });
+  });
+
+  it("counts a rendition behind both preset:best and its rung ONCE", () => {
+    const { inventory } = analyzeGenericFormats(documentOf(case02()).formats as never, {
+      ffmpegAvailable: true,
+      maxFileSizeBytes: 4 * 1024 ** 3,
+    });
+    assert.deepEqual(
+      inventory.renditions.map((r) => [r.observed.height, r.observed.protocol, r.disposition]),
+      [
+        [720, "progressive", "deliverable"],
+        [1080, "hls", "deliverable"],
+        [2160, "hls", "deliverable"],
+      ],
+    );
+  });
+
+  it("an HLS rendition that loses its rung to progressive is not_selected", async () => {
+    const { video, hlsSelections } = await run(doc([progressiveRow("p1080", 1080), hlsRow("h1080", 1080)]));
+    assert.deepEqual(hlsSelections, {}, "progressive keeps the equal rung");
+    assert.deepEqual(sourceQualityOf(video).withheld, [
+      { reason: "not_selected", count: 1, maxObservedHeight: 1080 },
+    ]);
+    assert.equal(sourceQualityOf(video).deliverableMaxHeight, 1080);
+  });
+
+  it("an HLS rendition that loses its rung to an EARLIER HLS rendition is not_selected", async () => {
+    const { video, hlsSelections } = await run(doc([hlsRow("first", 1080), hlsRow("second", 1080)]));
+    assert.equal(hlsSelections["preset:1080"]?.playlistUrl, HLS_URL("first"));
+    assert.deepEqual(sourceQualityOf(video).withheld, [
+      { reason: "not_selected", count: 1, maxObservedHeight: 1080 },
+    ]);
+  });
+
+  it("segmented DASH stays unsupported_protocol even carrying a URL, with FFmpeg", async () => {
+    const dash = hlsRow("dash-2160", 2160, { protocol: "http_dash_segments", url: "https://media.example.invalid/dash/a.mpd" });
+    const { video, selections, hlsSelections } = await run(doc([progressiveRow("p720", 720), dash]));
+    assert.deepEqual(hlsSelections, {});
+    assert.equal(JSON.stringify(selections).includes("dash-2160"), false);
+    assert.deepEqual(sourceQualityOf(video).withheld, [
+      { reason: "unsupported_protocol", count: 1, maxObservedHeight: 2160 },
+    ]);
+  });
+
+  it("an `m3u8` (not `m3u8_native`) rendition stays unsupported_protocol", async () => {
+    const { video, hlsSelections } = await run(doc([progressiveRow("p720", 720), hlsRow("m3u8-2160", 2160, { protocol: "m3u8" })]));
+    assert.deepEqual(hlsSelections, {});
+    assert.deepEqual(sourceQualityOf(video).withheld, [
+      { reason: "unsupported_protocol", count: 1, maxObservedHeight: 2160 },
+    ]);
   });
 });
 
@@ -724,7 +904,7 @@ describe("P1 rendition inventory: what counts as an observed video rendition", (
 
   it("every advertised video preset is backed by a rendition marked deliverable", async () => {
     for (const scenario of CORPUS) {
-      const { video, selections } = await analyzeScenario(scenario);
+      const { video, selections, hlsSelections } = await analyzeScenario(scenario);
       const { inventory } = analyzeGenericFormats(
         (documentOf(scenario).formats ?? []) as never,
         {
@@ -734,8 +914,13 @@ describe("P1 rendition inventory: what counts as an observed video rendition", (
       );
       const deliverable = inventory.renditions.filter((r) => r.disposition === "deliverable");
       const videoPresets = video.presets.filter((p) => p.hasVideo);
+      // HLS-7: an HLS-owned preset names its rendition by playlist location.
+      // The corpus gives every admitted HLS row a distinct URL, so distinct
+      // locations are distinct renditions here.
       const videoSources = new Set(
         videoPresets.map((p) => {
+          const hls = hlsSelections[p.id];
+          if (hls) return `hls:${hls.playlistUrl}`;
           const value = selections[p.id]!;
           return value.kind === "single" ? value.source.formatId : value.pair.video.formatId;
         }),

@@ -5,11 +5,12 @@ import type {
 } from "../../shared/worker/contracts.ts";
 import type { GenericSourceSelections } from "../execution/generic-source.ts";
 /**
- * TYPE-ONLY, deliberately. HLS-5's private selection map has to be NAMED in
- * `ExecutionAnalysis`, but this router must acquire no runtime dependency on
- * the dormant HLS directory: the edge disappears entirely at build time, so
- * nothing here can call into HLS, and the direct path's empty map is an
- * ordinary literal rather than an imported constant.
+ * TYPE-ONLY, deliberately. The private clear-HLS selection map has to be NAMED
+ * in `ExecutionAnalysis`, but this router must acquire no runtime dependency on
+ * the HLS directory: it routes strategies and makes no family decision, so the
+ * edge disappears entirely at build time, nothing here can call into HLS, and
+ * the direct path's empty map is an ordinary literal rather than an imported
+ * constant.
  */
 import type { ClearHlsMediaPlaylistSelections } from "../hls/hls-source-selection.ts";
 import { analyzeDirectMedia } from "../execution/direct-media.server.ts";
@@ -275,16 +276,17 @@ export async function analyzeMedia(
  * browser, be logged, or appear in an error message (§9).
  *
  * `hlsSelections` (HLS-5) is the second private map and is populated only on
- * the generic path too. It carries the exact clear-HLS media-playlist URL for
- * one rendition per would-be video rung, which is SENSITIVE — signed query
- * parameters and expiring tokens — and is subject to every restriction above
- * plus one more: it may not be PERSISTED or reused across attempts. The URL
- * belongs to THIS fresh analysis. A restart or retry must obtain a new one.
+ * the generic path too. It carries the exact clear-HLS media-playlist URL
+ * behind each advertised preset the generic analysis gave to clear HLS, which
+ * is SENSITIVE — signed query parameters and expiring tokens — and is subject
+ * to every restriction above plus one more: it may not be PERSISTED or reused
+ * across attempts. The URL belongs to THIS fresh analysis. A restart or retry
+ * must obtain a new one.
  *
- * It is a shadow channel. A key in it is not a capability: HLS is not
- * downloadable, no execution plan can express it, and the public rendition
- * inventory still reports HLS as `unsupported_protocol`. HLS-6 is what begins
- * to consume it.
+ * Since HLS-7 the two maps are DISJOINT and together own every advertised
+ * generic preset exactly once. Which one holds a requested id is the family
+ * decision analysis already made; `deriveExecutionPlan()` reads it and makes
+ * none of its own.
  */
 export type ExecutionAnalysis = {
   readonly strategy: WorkerExtractorStrategy;

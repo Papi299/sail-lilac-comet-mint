@@ -667,7 +667,7 @@ describe("strategy-aware plan wrapper (§19)", () => {
     });
 
     const plan = deriveExecutionPlan(
-      { strategy: "direct", video: meta, selections: {} },
+      { strategy: "direct", video: meta, selections: {}, hlsSelections: {} },
       "direct-original",
     );
     assert.equal(plan.strategy, "direct");
@@ -682,7 +682,7 @@ describe("strategy-aware plan wrapper (§19)", () => {
     assert.throws(
       () =>
         deriveExecutionPlan(
-          { strategy: "direct", video: {} as never, selections: {} },
+          { strategy: "direct", video: {} as never, selections: {}, hlsSelections: {} },
           "bv+ba",
         ),
       (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
@@ -791,6 +791,7 @@ describe("generic SPLIT execution plan (SPLIT-01)", () => {
         strategy: "yt-dlp",
         video: meta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
         selections: { "preset:1080": splitSource() },
+        hlsSelections: {},
       },
       "preset:1080",
     );

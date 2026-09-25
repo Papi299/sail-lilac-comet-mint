@@ -41,11 +41,13 @@ import {
  * how much of the failed fragment had already been appended, and v1 discards
  * the whole partial artifact instead of carrying rollback semantics.
  *
- * ─── Dormancy ───────────────────────────────────────────────────────────────
+ * ─── Reachability ───────────────────────────────────────────────────────────
  *
- * Nothing in Production calls this module. HLS remains unadvertised and
- * unselectable: the analyzer's protocol policy is unchanged, so `m3u8_native`
- * is still withheld as `unsupported_protocol`. This is foundation only.
+ * Source-activated by HLS-7: an advertised clear-HLS video preset now reaches
+ * this module through the ordinary execution planner and the one HLS
+ * orchestration seam the JobExecutor calls. The analyzer's yt-dlp protocol
+ * policy is unchanged — `m3u8_native` is never a yt-dlp download — and
+ * activation in source is not a deployment or an acceptance of any kind.
  *
  * ─── The byte path ──────────────────────────────────────────────────────────
  *

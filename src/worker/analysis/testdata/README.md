@@ -164,3 +164,24 @@ rather than a claim: `source-quality.server.test.ts` re-derives all four for
 every scenario and compares. **Regenerating it is never part of an inventory
 change.** A diff here means presets, selections, plans or selectors moved, which
 is a deliberate product change belonging to its own task.
+
+### The HLS-7 carve-out — the golden record is NOT regenerated
+
+`HLS-7-CLEAR-HLS-PRODUCT-ACTIVATION-001` is exactly such a deliberate product
+change, and it is confined to ONE scenario:
+
+- `case02-clear-hls-above-progressive` now gives its two clear-HLS video rows a
+  synthetic media-playlist `url` (`media.example.invalid`, sentinel
+  `CORPUS_PRIVATE_HLS_TOKEN`), and its audio-only HLS row one too. Before that
+  the rows had no `url`, so HLS admission could never accept them and the
+  scenario could not show activation. Its golden entry is still historically
+  true for the amended document: the analyzer that generated it (`d3a967b7`)
+  did not parse `url` at all.
+- The test lists case02 as HLS-activated and compares only its PROGRESSIVE half
+  with the golden record — every preset, selection, plan and selector whose id
+  clear HLS does not now own must be byte-identical. The HLS-owned ids
+  (`preset:best`, `preset:2160`, `preset:1080`) are asserted separately against
+  the HLS-7 contract.
+- Every other scenario, including `case03-segmented-dash-above-progressive`
+  and the HLS rows in `case18` and the synthetic X case (no `url`, or no proven
+  audio), must still match the golden record in full.

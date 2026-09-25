@@ -17,6 +17,7 @@ import {
 import type { DurableWorkerJob, WorkerJobStore } from "@/worker/state/job-store";
 import type { ObjectStoreWriter, ObjectStorePutInput } from "@/worker/storage/writer.ts";
 import type { ExecutionAnalysis } from "../analysis/media-analyzer.server.ts";
+import { analyzeGenericMediaInternal } from "../analysis/ytdlp-analysis.server.ts";
 import type { ClearHlsAcquiredTs } from "../hls/hls-execution.server.ts";
 import { AGGREGATE_FILE_NAME } from "../hls/hls-fragment-acquisition.server.ts";
 import { HLS_OUTPUT_FILE_NAME } from "../hls/hls-processing.server.ts";
@@ -25,7 +26,7 @@ import { deriveClearHlsExecutionPlan } from "./format-plan.ts";
 import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
 
 /**
- * HLS-6: the DORMANT clear-HLS job lifecycle, end to end.
+ * HLS-6 + HLS-7: the clear-HLS job lifecycle, end to end.
  *
  * Everything is a fake — a fake analyzer, fake HLS primitives, a fake object
  * store, a real SQLite store and a real temp filesystem. No network, no DNS, no
@@ -35,15 +36,19 @@ import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
  * the exact instant HLS-2 runs, at the exact instant HLS-3 runs, and at the
  * exact instant HLS-4 would be invoked.
  *
- * ─── Why an injected plan derivation ────────────────────────────────────────
+ * ─── Two ways to reach the branch ───────────────────────────────────────────
  *
- * Ordinary `deriveExecutionPlan()` cannot produce a `clear-hls-remux` plan —
- * that is the HLS-6 dormancy invariant, pinned in
- * `hls-execution-plan.test.ts`. So the only way to exercise the branch before
- * HLS-7 activates it is the internal `derivePlanForExecution` seam, which these
- * cases use to call `deriveClearHlsExecutionPlan()` explicitly. The seam is not
- * user-controlled, not read from the environment or configuration, and the
- * Production runtime never supplies one — also pinned there.
+ * Section I is the HLS-7 activation proof: the REAL generic analyzer over a
+ * canned document, and the ORDINARY `deriveExecutionPlan()` — nothing injected
+ * — reach the HLS branch and a `ready` job.
+ *
+ * Sections A–G keep the HLS-6 matrix, which drives the branch in isolation
+ * through the internal `derivePlanForExecution` seam, calling
+ * `deriveClearHlsExecutionPlan()` explicitly on a hand-built analysis. That is
+ * still the cleanest way to aim a failure, a cancellation or a shutdown at one
+ * precise stage. The seam is not user-controlled, not read from the environment
+ * or configuration, and the Production runtime never supplies one — pinned in
+ * `hls-execution-plan.test.ts`.
  */
 
 const VERY_PRIVATE_HLS_TOKEN = "VERY_PRIVATE_HLS_TOKEN";
@@ -52,10 +57,11 @@ const PAGE_URL = "https://example.invalid/watch/abc";
 const MP4_BYTES = "REMUXED-MP4-BYTES";
 
 /**
- * An HLS-ONLY analysis: no progressive preset is advertised, and the private
- * shadow map carries the rung. This is the document HLS-7 will eventually
- * serve, and it is deliberately the fixture here so nothing can pass by
- * accidentally selecting a progressive source.
+ * A hand-built HLS-ONLY analysis for the injected-derivation matrix: no
+ * progressive preset, and the private map carries the rung. It advertises
+ * NOTHING publicly, so the ordinary planner refuses it (section H) — which is
+ * exactly why sections A–G derive their plan explicitly. Nothing can pass here
+ * by accidentally selecting a progressive source.
  */
 function hlsOnlyAnalysis(
   hlsSelections: ClearHlsMediaPlaylistSelections = Object.freeze({
@@ -86,8 +92,8 @@ function meta(): WorkerVideoMetadata {
 
 /**
  * The HLS-6 test seam: derive the clear-HLS plan explicitly from the fresh
- * analysis's private map, exactly as HLS-7 eventually will from inside the
- * ordinary planner.
+ * analysis's private map — the same derivation the ordinary planner has
+ * dispatched to since HLS-7, minus its ownership and advertising checks.
  */
 const deriveHlsPlan: NonNullable<JobExecutorDeps["derivePlanForExecution"]> = (
   analysis,
@@ -1034,11 +1040,15 @@ describe("HLS-6 privacy: the playlist URL reaches no durable or outward surface"
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// H. THE PRODUCTION DEFAULT (§24, §25)
+// H. THE PRODUCTION DEFAULT: an UNADVERTISED HLS selection is no capability
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("HLS-6 dormancy at runtime: the default executor cannot run an HLS job", () => {
-  it("refuses the very same job when no derivation is injected", async () => {
+describe("HLS-7 production default: the ordinary planner never runs an unadvertised HLS selection", () => {
+  it("refuses a private HLS selection that the fresh analysis does not advertise", async () => {
+    // Before HLS-7 this proved the default planner could not reach HLS at all.
+    // Since HLS-7 it can — for an ADVERTISED preset (section I). This same
+    // fixture advertises nothing, so a private selection alone must still
+    // produce no plan, no request and no job output.
     const job = claimJob(h.store, "preset:1080");
     let acquisitions = 0;
     const deps = hlsDeps({
@@ -1047,16 +1057,249 @@ describe("HLS-6 dormancy at runtime: the default executor cannot run an HLS job"
         return writeAggregate(workDir);
       },
     });
-    // The ONLY difference from the success case above.
+    // The ONLY difference from the injected success case in section A.
     delete deps.derivePlanForExecution;
 
     const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), deps);
     await executor.execute(job);
 
-    assert.equal(acquisitions, 0, "the default planner cannot produce an HLS plan");
+    assert.equal(acquisitions, 0, "no playlist request for an unadvertised rung");
     const final = h.raw.getJob(job.jobId);
     assert.equal(final?.status, "failed");
     assert.equal(final?.errorCode, "FORMAT_UNAVAILABLE");
     assert.equal(h.puts.length, 0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// I. HLS-7 ACTIVATION: the REAL analyzer + the ORDINARY planner (§19, §28, §31)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A real `-J` document: one admitted clear-HLS rendition, nothing progressive. */
+const HLS_ONLY_DOCUMENT = JSON.stringify({
+  _type: "video",
+  title: "An HLS Clip",
+  duration: 120,
+  live_status: "not_live",
+  formats: [
+    {
+      format_id: "synthetic-hls-1080",
+      ext: "mp4",
+      video_ext: "mp4",
+      audio_ext: "none",
+      height: 1080,
+      width: 1920,
+      fps: 30,
+      protocol: "m3u8_native",
+      vcodec: "avc1.640028",
+      acodec: "mp4a.40.2",
+      url: PLAYLIST_URL,
+    },
+  ],
+});
+
+/** The executor's analysis seam: the REAL generic analyzer, only yt-dlp canned. */
+function realHlsAnalysis(ffmpegAvailable = true): NonNullable<JobExecutorDeps["analyzeForExecution"]> {
+  return async (url, signal) => {
+    const { video, selections, hlsSelections } = await analyzeGenericMediaInternal(url, {
+      limits: { analysisTimeoutSeconds: 45, maxVideoDurationSeconds: 7200, maxFileSizeBytes: 4 * 1024 ** 3 },
+      ffmpegAvailable,
+      runner: async () => ({ code: 0, stdout: HLS_ONLY_DOCUMENT, stderr: "" }),
+      probeRuntime: async () => ({ available: true, version: "2026.08.19", reason: "ok" as const }),
+      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+      ...(signal ? { signal } : {}),
+    });
+    return { strategy: "yt-dlp", video, selections, hlsSelections };
+  };
+}
+
+/** `hlsDeps()` with the REAL analyzer and NO injected plan derivation. */
+function ordinaryDeps(over: Partial<JobExecutorDeps> = {}): JobExecutorDeps {
+  const deps = hlsDeps({ analyzeForExecution: realHlsAnalysis(), ...over });
+  delete deps.derivePlanForExecution;
+  assert.equal("derivePlanForExecution" in deps, false, "the Production default planner");
+  return deps;
+}
+
+describe("HLS-7 activation: an ordinary HLS job reaches ready through the ORDINARY planner", () => {
+  it("analyzes, acquires while downloading, remuxes while processing, uploads, and is ready", async () => {
+    const job = claimJob(h.store, "preset:1080");
+    const observed: string[] = [];
+    const at = (label: string) =>
+      observed.push(`${label}:${h.raw.getJob(job.jobId)?.status ?? "missing"}`);
+    let seenPlan: unknown;
+
+    const executor = new JobExecutor(
+      h.store,
+      h.writer,
+      () => Date.now(),
+      new Map(),
+      ordinaryDeps({
+        acquireClearHls: async (plan, workDir) => {
+          seenPlan = plan;
+          at("hls-acquisition");
+          return writeAggregate(workDir);
+        },
+        processClearHls: async ({ workDir }) => {
+          at("hls-processing");
+          return writeOutput(workDir);
+        },
+      }),
+    );
+    const originalPut = h.writer.put.bind(h.writer);
+    h.writer.put = async (input) => {
+      at("upload");
+      return originalPut(input);
+    };
+    await executor.execute(job);
+
+    assert.deepEqual(observed, [
+      "hls-acquisition:downloading",
+      "hls-processing:processing",
+      "upload:uploading",
+    ]);
+    // The plan the ORDINARY planner derived from the fresh real analysis.
+    assert.deepEqual(seenPlan, {
+      strategy: "yt-dlp",
+      operation: "clear-hls-remux",
+      requestedFormatId: "preset:1080",
+      source: { playlistUrl: PLAYLIST_URL, height: 1080 },
+      targetContainer: "mp4",
+    });
+    const final = h.raw.getJob(job.jobId);
+    assert.equal(final?.status, "ready");
+    assert.equal(final?.extractor, "yt-dlp", "the durable strategy vocabulary gains no HLS member");
+    assert.equal(h.puts.length, 1);
+    assert.equal(h.puts[0]!.contentType, "video/mp4");
+    assert.equal(h.puts[0]!.contentLength, MP4_BYTES.length);
+    assert.ok(h.calls.indexOf("beginProcessing") < h.calls.indexOf("beginUploading"));
+  });
+
+  it("serves preset:best from the same rendition", async () => {
+    const job = claimJob(h.store, "preset:best");
+    let seenUrl = "";
+    const executor = new JobExecutor(
+      h.store,
+      h.writer,
+      () => Date.now(),
+      new Map(),
+      ordinaryDeps({
+        acquireClearHls: async (plan, workDir) => {
+          seenUrl = plan.source.playlistUrl;
+          return writeAggregate(workDir);
+        },
+      }),
+    );
+    await executor.execute(job);
+    assert.equal(h.raw.getJob(job.jobId)?.status, "ready");
+    assert.equal(seenUrl, PLAYLIST_URL);
+  });
+
+  it("refuses preset:audio and preset:mp3 — clear HLS has no audio product", async () => {
+    for (const formatId of ["preset:audio", "preset:mp3"] as const) {
+      const local = makeHarness();
+      try {
+        const job = claimJob(local.store, formatId);
+        let acquisitions = 0;
+        const executor = new JobExecutor(
+          local.store,
+          local.writer,
+          () => Date.now(),
+          new Map(),
+          ordinaryDeps({
+            acquireClearHls: async (_plan, workDir) => {
+              acquisitions += 1;
+              return writeAggregate(workDir);
+            },
+          }),
+        );
+        await executor.execute(job);
+        assert.equal(acquisitions, 0, formatId);
+        assert.equal(local.raw.getJob(job.jobId)?.errorCode, "FORMAT_UNAVAILABLE", formatId);
+      } finally {
+        local.cleanup();
+      }
+    }
+  });
+
+  it("refuses the job when the FRESH analysis has no Worker FFmpeg — no substitution", async () => {
+    // The browser may have been offered the preset earlier. The job's own
+    // analysis is authoritative, and without FFmpeg it advertises nothing.
+    const job = claimJob(h.store, "preset:1080");
+    let acquisitions = 0;
+    const executor = new JobExecutor(
+      h.store,
+      h.writer,
+      () => Date.now(),
+      new Map(),
+      ordinaryDeps({
+        analyzeForExecution: realHlsAnalysis(false),
+        acquireClearHls: async (_plan, workDir) => {
+          acquisitions += 1;
+          return writeAggregate(workDir);
+        },
+      }),
+    );
+    await executor.execute(job);
+    assert.equal(acquisitions, 0);
+    assert.equal(h.raw.getJob(job.jobId)?.errorCode, "FORMAT_UNAVAILABLE");
+    assert.equal(h.puts.length, 0);
+  });
+
+  it("persists NO playlist URL, token, plan operation or raw format id — anywhere durable", async () => {
+    const job = claimJob(h.store, "preset:1080");
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), ordinaryDeps());
+    await executor.execute(job);
+
+    const view = h.raw.getJob(job.jobId);
+    assert.equal(view?.status, "ready");
+    // The raw durable store, byte for byte, plus every outward surface.
+    const database = fs.readFileSync(path.join(h.tempDir, "test.sqlite")).toString("binary");
+    const surfaces = [
+      database,
+      JSON.stringify(view),
+      JSON.stringify(h.puts),
+      h.puts[0]!.objectKey,
+      h.puts[0]!.contentDisposition ?? "",
+    ];
+    for (const surface of surfaces) {
+      for (const forbidden of [
+        VERY_PRIVATE_HLS_TOKEN,
+        PLAYLIST_URL,
+        "media.example.invalid",
+        "m3u8",
+        "clear-hls-remux",
+        "synthetic-hls-1080",
+        "playlistUrl",
+      ]) {
+        assert.equal(surface.includes(forbidden), false, `a durable surface names ${forbidden}`);
+      }
+    }
+    // Positive control: the scan really reads the durable row it guards.
+    assert.ok(database.includes(job.jobId));
+  });
+
+  it("persists NO private provenance on a FAILED ordinary HLS job either", async () => {
+    const job = claimJob(h.store, "preset:1080");
+    const executor = new JobExecutor(
+      h.store,
+      h.writer,
+      () => Date.now(),
+      new Map(),
+      ordinaryDeps({
+        acquireClearHls: async () => {
+          throw new AppError("NETWORK_ERROR");
+        },
+      }),
+    );
+    await executor.execute(job);
+
+    const view = h.raw.getJob(job.jobId);
+    assert.equal(view?.status, "failed");
+    assert.equal(view?.errorCode, "NETWORK_ERROR");
+    const serialized = `${JSON.stringify(view)}\n${fs.readFileSync(path.join(h.tempDir, "test.sqlite")).toString("binary")}`;
+    for (const forbidden of [VERY_PRIVATE_HLS_TOKEN, "media.example.invalid", "m3u8", "synthetic-hls-1080"]) {
+      assert.equal(serialized.includes(forbidden), false, forbidden);
+    }
   });
 });

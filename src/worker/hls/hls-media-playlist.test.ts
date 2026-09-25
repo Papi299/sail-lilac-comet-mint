@@ -789,11 +789,11 @@ describe("clear-HLS playlist parser: the module is inert", () => {
   });
 
   it("is reachable from no production module", () => {
-    // HLS stays dormant: the parser exists, and nothing in the shipping graph
-    // can call it. Its importers are its dormant siblings in `src/worker/hls/`
-    // (HLS-2 onwards), so the rule is held by that directory as a SET: no
-    // production module outside it may name ANY module in it. The later atomic
-    // activation task is what changes this.
+    // The parser is named only by its siblings in `src/worker/hls/` (HLS-2
+    // onwards), so the rule is held by that directory as a SET: no production
+    // module outside it may name ANY module in it. HLS-7 activated clear HLS
+    // WITHOUT widening this graph: the planner reaches HLS execution by
+    // producing a plan, not by importing a primitive.
     //
     // TWO narrow exceptions, and no others.
     //
@@ -813,9 +813,9 @@ describe("clear-HLS playlist parser: the module is inert", () => {
     //
     // Both allowlists are EXACT, in both directions: only these files may name
     // these stems, and these files may name NOTHING else from this directory.
-    // Reachability from the executor is expected after HLS-6 — dormancy is now
-    // held at plan derivation, which `hls-shadow-selection.server.test.ts` pins
-    // — but the graph must still narrow to exactly these edges.
+    // Reachability from the executor is expected since HLS-6, and from ordinary
+    // plan derivation since HLS-7 (pinned in `hls-execution-plan.test.ts`) —
+    // but the graph must still narrow to exactly these edges.
     const hlsDir = dirname(MODULE_PATH);
     const dormantModules = readdirSync(hlsDir)
       .filter((name) => /\.ts$/.test(name) && !/\.test\.ts$/.test(name))

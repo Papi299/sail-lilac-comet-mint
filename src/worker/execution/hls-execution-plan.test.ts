@@ -16,7 +16,11 @@ import {
   type ClearHlsMediaPlaylistSelections,
 } from "../hls/hls-source-selection.ts";
 import { YTDLP_V1_NATIVE_PROTOCOLS } from "../analysis/ytdlp-analysis.server.ts";
-import { GENERIC_SOURCE_PROTOCOLS, type GenericSourceSelections } from "./generic-source.ts";
+import {
+  GENERIC_SOURCE_PROTOCOLS,
+  GenericPresetSourceSchema,
+  type GenericSourceSelections,
+} from "./generic-source.ts";
 import {
   CLEAR_HLS_TARGET_CONTAINER,
   ClearHlsVideoPresetIdSchema,
@@ -36,8 +40,8 @@ import type { downloadGenericOriginal } from "./ytdlp-download.server.ts";
 import { VideoMetadataSchema, type WorkerVideoMetadata } from "@/shared/worker/contracts";
 
 /**
- * HLS-6: the clear-HLS EXECUTION PLAN — representation, derivation, and the
- * dormancy that must survive both.
+ * HLS-6 + HLS-7: the clear-HLS EXECUTION PLAN — representation, derivation,
+ * and (since HLS-7) the one point where the ordinary Product planner reaches it.
  *
  * Everything here is pure. No network, no filesystem, no subprocess, no store.
  * The lifecycle cases live in `hls-job-execution.server.test.ts`, and the
@@ -536,12 +540,19 @@ describe("HLS-6 workspace: an HLS plan costs two ceilings", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// F. DORMANCY: the ordinary planner stays HLS-blind (§9, §25)
+// F. HLS-7 ACTIVATION: the ordinary planner reads ONE owner (§17)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function genericMeta(
-  presets: { id: string; container: string; hasVideo: boolean; hasAudio?: boolean }[],
-): WorkerVideoMetadata {
+type PresetShape = {
+  id: string;
+  container: string;
+  hasVideo: boolean;
+  hasAudio?: boolean;
+  videoCodec?: string | null;
+  audioCodec?: string | null;
+};
+
+function genericMeta(presets: PresetShape[]): WorkerVideoMetadata {
   return VideoMetadataSchema.parse({
     title: "A Clip",
     thumbnail: null,
@@ -559,93 +570,211 @@ function genericMeta(
       hasVideo: p.hasVideo,
       hasAudio: p.hasAudio ?? true,
       formatId: p.id,
-      videoCodec: p.hasVideo ? "h264" : null,
-      audioCodec: "aac",
+      videoCodec: p.videoCodec === undefined ? (p.hasVideo ? "h264" : null) : p.videoCodec,
+      audioCodec: p.audioCodec === undefined ? "aac" : p.audioCodec,
       fps: null,
     })),
     capabilities: { mp3: true, merge: false },
   });
 }
 
-const progressiveSelections: GenericSourceSelections = {
-  "preset:1080": {
-    kind: "single",
-    source: {
-      formatId: "137",
-      protocol: "https",
-      container: "mp4",
-      hasVideo: true,
-      hasAudio: true,
-      videoConstraint: "codec-present",
-      audioConstraint: "codec-present",
-      fileSize: null,
-    },
-  },
-};
+/** A progressive preset: proven audio NAMES the codec that proved it. */
+const progressive = (id: string): PresetShape => ({ id, container: "mp4", hasVideo: true });
 
-describe("HLS-6 dormancy: ordinary derivation cannot reach HLS", () => {
-  it("HLS-ONLY analysis still fails, although the shadow rung exists", () => {
-    // The document HLS-7 will eventually serve: nothing progressive is
-    // advertised, and the private HLS map has exactly the requested rung.
+/** A clear-HLS preset: exactly the HLS-7 public facts, codecs unknown. */
+const hlsPublic = (id: string): PresetShape => ({
+  id,
+  container: "mp4",
+  hasVideo: true,
+  hasAudio: true,
+  videoCodec: null,
+  audioCodec: null,
+});
+
+const progressiveSource = GenericPresetSourceSchema.parse({
+  kind: "single",
+  source: {
+    formatId: "137",
+    protocol: "https",
+    container: "mp4",
+    hasVideo: true,
+    hasAudio: true,
+    videoConstraint: "codec-present",
+    audioConstraint: "codec-present",
+    fileSize: null,
+  },
+});
+
+const progressiveSelections: GenericSourceSelections = { "preset:1080": progressiveSource };
+
+const operationOf = (plan: ReturnType<typeof deriveExecutionPlan>) =>
+  plan.strategy === "yt-dlp" ? plan.generic.operation : null;
+
+describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-owned preset", () => {
+  it("A: an HLS-ONLY analysis derives clear-hls-remux — nothing injected", () => {
     const analysis = {
       strategy: "yt-dlp" as const,
-      video: genericMeta([]),
+      video: genericMeta([hlsPublic("preset:best"), hlsPublic("preset:1080")]),
       selections: {},
-      hlsSelections: shadow({ "preset:1080": selection() }),
+      hlsSelections: shadow({ "preset:best": selection(), "preset:1080": selection() }),
     };
-    assert.ok(analysis.hlsSelections["preset:1080"], "the shadow rung is genuinely present");
-    // …and the dormant derivation WOULD produce a plan for it.
-    assert.equal(
-      deriveClearHlsExecutionPlan(analysis.hlsSelections, "preset:1080").operation,
-      "clear-hls-remux",
-    );
-    // The ordinary planner still refuses.
-    expectFormatUnavailable(
-      () => deriveExecutionPlan(analysis, "preset:1080"),
-      "HLS-only must stay unavailable until HLS-7",
-    );
+    for (const id of ["preset:best", "preset:1080"] as const) {
+      const plan = deriveExecutionPlan(analysis, id);
+      assert.deepEqual(plan, {
+        strategy: "yt-dlp",
+        generic: {
+          strategy: "yt-dlp",
+          operation: "clear-hls-remux",
+          requestedFormatId: id,
+          source: { playlistUrl: PLAYLIST_URL, height: 1080 },
+          targetContainer: "mp4",
+        },
+      });
+      // The SAME plan the reviewed HLS-6 derivation builds, frozen as it was.
+      assert.deepEqual(plan.strategy === "yt-dlp" ? plan.generic : null, deriveClearHlsExecutionPlan(analysis.hlsSelections, id));
+      assert.ok(plan.strategy === "yt-dlp" && Object.isFrozen(plan.generic));
+      assert.equal(executionPlanRequiresProcessing(plan), true);
+      assert.equal(executionPlanTargetContainer(plan), "mp4");
+    }
   });
 
-  it("MIXED analysis stays on the progressive source, whatever HLS offers", () => {
+  it("MIXED: each preset is derived from the ONE family that owns it", () => {
     const analysis = {
       strategy: "yt-dlp" as const,
-      video: genericMeta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
+      video: genericMeta([hlsPublic("preset:best"), hlsPublic("preset:2160"), progressive("preset:1080")]),
       selections: progressiveSelections,
-      // A taller, more tempting HLS rendition on the same rung.
       hlsSelections: shadow({
-        "preset:1080": selection("https://media.example.invalid/hls/2160.m3u8", 2160),
         "preset:best": selection("https://media.example.invalid/hls/2160.m3u8", 2160),
+        "preset:2160": selection("https://media.example.invalid/hls/2160.m3u8", 2160),
       }),
     };
-
-    const plan = deriveExecutionPlan(analysis, "preset:1080");
-    assert.equal(plan.strategy, "yt-dlp");
-    assert.equal(plan.strategy === "yt-dlp" ? plan.generic.operation : null, "keep-original");
-    assert.notEqual(
-      plan.strategy === "yt-dlp" ? plan.generic.operation : null,
-      "clear-hls-remux",
-    );
-    assert.equal(
-      JSON.stringify(plan).includes(VERY_PRIVATE_HLS_TOKEN),
-      false,
-      "no HLS provenance reaches an ordinary plan",
-    );
+    const progressivePlan = deriveExecutionPlan(analysis, "preset:1080");
+    assert.equal(operationOf(progressivePlan), "keep-original");
+    assert.equal(JSON.stringify(progressivePlan).includes("m3u8"), false, "no HLS provenance in it");
+    assert.equal(operationOf(deriveExecutionPlan(analysis, "preset:best")), "clear-hls-remux");
+    assert.equal(operationOf(deriveExecutionPlan(analysis, "preset:2160")), "clear-hls-remux");
   });
 
-  it("does not fall back to HLS when the progressive selection is missing", () => {
+  // ── G. No hidden fallback — progressive ownership ──────────────────────────
+  it("G: a progressive preset whose progressive owner is gone does NOT fall back to HLS", () => {
+    // The advertised preset is progressive: it names its codecs. Its progressive
+    // selection is gone — the exact shape a mid-flight site change produces —
+    // and an HLS entry for the same id is sitting right there.
     const analysis = {
       strategy: "yt-dlp" as const,
-      // The preset is ADVERTISED but its private selection is gone — the exact
-      // shape a mid-flight site change produces, and the most tempting moment
-      // to substitute.
-      video: genericMeta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
+      video: genericMeta([progressive("preset:1080")]),
       selections: {},
       hlsSelections: shadow({ "preset:1080": selection() }),
     };
+    assert.equal(
+      operationOf({ strategy: "yt-dlp", generic: deriveClearHlsExecutionPlan(analysis.hlsSelections, "preset:1080") }),
+      "clear-hls-remux",
+      "the HLS entry would genuinely produce a plan",
+    );
     expectFormatUnavailable(() => deriveExecutionPlan(analysis, "preset:1080"), "no HLS fallback");
+
+    // The final-analysis shape of the same story: progressive won the rung, so
+    // the HLS map never held it. Neither map owns it now.
+    expectFormatUnavailable(
+      () => deriveExecutionPlan({ ...analysis, hlsSelections: shadow({}) }, "preset:1080"),
+      "no owner at all",
+    );
   });
 
-  it("refuses a hand-crafted durable row naming an HLS-only rung", () => {
+  // ── H. No hidden fallback — HLS ownership ──────────────────────────────────
+  it("H: an HLS preset whose HLS owner is gone does NOT fall back to progressive", () => {
+    // The advertised preset is clear-HLS shaped. Its HLS selection is gone, and
+    // a perfectly valid progressive source is available for the same id.
+    const sameId = {
+      strategy: "yt-dlp" as const,
+      video: genericMeta([hlsPublic("preset:1080")]),
+      selections: progressiveSelections,
+      hlsSelections: shadow({}),
+    };
+    expectFormatUnavailable(() => deriveExecutionPlan(sameId, "preset:1080"), "no progressive fallback");
+
+    // …and with progressive sources only at OTHER rungs: still no substitution.
+    const otherRungs = {
+      strategy: "yt-dlp" as const,
+      video: genericMeta([hlsPublic("preset:2160"), progressive("preset:1080")]),
+      selections: progressiveSelections,
+      hlsSelections: shadow({}),
+    };
+    expectFormatUnavailable(() => deriveExecutionPlan(otherRungs, "preset:2160"), "no other rung");
+    assert.equal(operationOf(deriveExecutionPlan(otherRungs, "preset:1080")), "keep-original");
+  });
+
+  it("H: an HLS preset whose HLS selection is malformed is refused, not substituted", () => {
+    for (const [label, value] of [
+      ["unfrozen", { playlistUrl: PLAYLIST_URL, height: 1080 }],
+      ["a bad URL", Object.freeze({ playlistUrl: "ftp://media.example.invalid/m.m3u8", height: 1080 })],
+    ] as const) {
+      const analysis = {
+        strategy: "yt-dlp" as const,
+        video: genericMeta([hlsPublic("preset:2160"), progressive("preset:1080")]),
+        selections: progressiveSelections,
+        hlsSelections: { "preset:2160": value as ClearHlsMediaPlaylistSelection },
+      };
+      expectFormatUnavailable(() => deriveExecutionPlan(analysis, "preset:2160"), label);
+    }
+  });
+
+  // ── I. Ambiguous dual ownership ────────────────────────────────────────────
+  it("I: BOTH maps claiming one id is refused, whichever family the preset looks like", () => {
+    for (const shape of [progressive("preset:1080"), hlsPublic("preset:1080")]) {
+      const analysis = {
+        strategy: "yt-dlp" as const,
+        video: genericMeta([shape]),
+        selections: progressiveSelections,
+        hlsSelections: shadow({ "preset:1080": selection() }),
+      };
+      expectFormatUnavailable(() => deriveExecutionPlan(analysis, "preset:1080"), JSON.stringify(shape));
+    }
+  });
+
+  it("I: an INHERITED or accessor claim still counts, and no accessor is invoked", () => {
+    // Any statement a map makes about the id is a claim for the ambiguity rule.
+    const inherited = Object.create({ "preset:1080": selection() }) as ClearHlsMediaPlaylistSelections;
+    expectFormatUnavailable(
+      () =>
+        deriveExecutionPlan(
+          {
+            strategy: "yt-dlp",
+            video: genericMeta([progressive("preset:1080")]),
+            selections: progressiveSelections,
+            hlsSelections: inherited,
+          },
+          "preset:1080",
+        ),
+      "an inherited HLS claim beside a progressive one",
+    );
+
+    let reads = 0;
+    const accessor = Object.defineProperty({}, "preset:1080", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return selection();
+      },
+    }) as ClearHlsMediaPlaylistSelections;
+    expectFormatUnavailable(
+      () =>
+        deriveExecutionPlan(
+          {
+            strategy: "yt-dlp",
+            video: genericMeta([hlsPublic("preset:1080")]),
+            selections: {},
+            hlsSelections: accessor,
+          },
+          "preset:1080",
+        ),
+      "an accessor HLS entry",
+    );
+    assert.equal(reads, 0, "ownership is read without running a getter");
+  });
+
+  // ── Advertising is still required ─────────────────────────────────────────
+  it("refuses an HLS-owned rung that the fresh analysis does not advertise", () => {
     const analysis = {
       strategy: "yt-dlp" as const,
       video: genericMeta([]),
@@ -660,7 +789,40 @@ describe("HLS-6 dormancy: ordinary derivation cannot reach HLS", () => {
     }
   });
 
-  it("is unaffected by the shadow map on the DIRECT path", () => {
+  it("refuses an advertised preset whose formatId is not its id", () => {
+    const video = genericMeta([hlsPublic("preset:1080")]);
+    const tampered = VideoMetadataSchema.parse({
+      ...video,
+      presets: video.presets.map((p) => ({ ...p, formatId: "preset:720" })),
+    });
+    expectFormatUnavailable(
+      () =>
+        deriveExecutionPlan(
+          { strategy: "yt-dlp", video: tampered, selections: {}, hlsSelections: shadow({ "preset:1080": selection() }) },
+          "preset:1080",
+        ),
+      "formatId mismatch",
+    );
+  });
+
+  // ── K. Audio products ──────────────────────────────────────────────────────
+  it("K: clear HLS can never fulfil preset:audio, preset:mp3 or direct-original", () => {
+    for (const id of ["preset:audio", "preset:mp3", "direct-original"] as const) {
+      const analysis = {
+        strategy: "yt-dlp" as const,
+        // Advertised, in whatever shape the malformed analysis claims.
+        video: genericMeta([
+          id === "direct-original" ? hlsPublic("preset:1080") : { id, container: "m4a", hasVideo: false },
+        ]),
+        selections: {},
+        hlsSelections: { [id]: selection() } as ClearHlsMediaPlaylistSelections,
+      };
+      expectFormatUnavailable(() => deriveExecutionPlan(analysis, id), id);
+    }
+  });
+
+  // ── J. The direct path ────────────────────────────────────────────────────
+  it("J: is unaffected by HLS-shaped private data on the DIRECT path", () => {
     const analysis = {
       strategy: "direct" as const,
       video: VideoMetadataSchema.parse({
@@ -690,16 +852,17 @@ describe("HLS-6 dormancy: ordinary derivation cannot reach HLS", () => {
         capabilities: { mp3: false, merge: false },
       }),
       selections: {},
-      hlsSelections: shadow({ "preset:1080": selection() }),
+      hlsSelections: shadow({ "preset:1080": selection(), "direct-original": selection() }),
     };
     const plan = deriveExecutionPlan(analysis, "direct-original");
     assert.equal(plan.strategy, "direct");
     assert.equal(JSON.stringify(plan).includes(VERY_PRIVATE_HLS_TOKEN), false);
+    expectFormatUnavailable(() => deriveExecutionPlan(analysis, "preset:1080"), "direct has no HLS arm");
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// G. STRUCTURAL PRODUCTION DORMANCY (§25) AND THE HLS-7 BARRIER (§44)
+// G. STRUCTURAL BOUNDARIES (§25) AND THE HLS-7 ACTIVATION POINT (§27)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Every non-test TypeScript file under `src/`. */
@@ -718,14 +881,17 @@ function productionSourceFiles(): string[] {
 
 const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
 
-describe("HLS-6 structural dormancy: the machinery exists and stays unadvertised", () => {
+describe("HLS-7 structure: activated at ONE point, and nowhere else", () => {
   it("leaves both protocol policies exactly http and https", () => {
     assert.deepEqual([...YTDLP_V1_NATIVE_PROTOCOLS], ["http", "https"]);
     assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https"]);
   });
 
-  it("keeps HLS publicly withheld as unsupported_protocol", () => {
+  it("keeps the public withheld vocabulary unchanged — segmented DASH still lands on unsupported_protocol", () => {
     assert.ok((SOURCE_QUALITY_WITHHELD_REASONS as readonly string[]).includes("unsupported_protocol"));
+    for (const reason of SOURCE_QUALITY_WITHHELD_REASONS) {
+      assert.equal(/hls|m3u8|playlist/i.test(reason), false, `${reason}: no HLS-specific reason`);
+    }
   });
 
   it("adds no public HLS preset or requested-format id", () => {
@@ -795,39 +961,69 @@ describe("HLS-6 structural dormancy: the machinery exists and stays unadvertised
   });
 
   /**
-   * §44: THE HLS-7 ACTIVATION BARRIER.
+   * THE HLS-7 STRUCTURAL BOUNDARY — the former HLS-6 §44 activation barrier.
    *
-   * HLS-6 assembles execution machinery but does not activate it. The normal
-   * Product planner must not consume `hlsSelections` until HLS-7.
-   *
-   * This case is DESIGNED TO FAIL when someone implements HLS-7. That is its
-   * purpose: activation must be an explicit, reviewed edit to this gate, not
-   * something that happens because a planner quietly grew a branch.
+   * HLS-6 pinned "no production module calls `deriveClearHlsExecutionPlan()` or
+   * reads `analysis.hlsSelections`", and was designed to fail when HLS-7 landed.
+   * HLS-7 is that reviewed edit. What it pins now is the SHAPE of activation:
+   * exactly one production call site, inside the ordinary planner; exactly one
+   * reader of the fresh analysis's HLS map; the executor reaching HLS only
+   * through that planner by default; and no other production module holding
+   * HLS private provenance at all.
    */
-  it("HLS-6 assembles execution machinery but does not activate it", () => {
+  it("activates clear HLS in deriveExecutionPlan and NOWHERE else", () => {
+    const rel = (file: string) => relative(ROOT, file).split("\\").join("/");
+    const code = (file: string) =>
+      readFileSync(file, "utf8").replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/.*$/gm, "$1");
     const planner = read("src/worker/execution/format-plan.ts");
 
     // The machinery exists…
     assert.ok(planner.includes("export function deriveClearHlsExecutionPlan"));
     assert.ok(planner.includes('operation: z.literal("clear-hls-remux")'));
 
-    // …and no production module CALLS it. The declaring module is excluded, and
-    // its own declaration would not match anyway: a call site is not preceded
-    // by `function`.
-    const declaringModule = join(ROOT, "src/worker/execution/format-plan.ts");
-    const callers = productionSourceFiles()
-      .filter((file) => file !== declaringModule)
-      .filter((file) => /(?<!function\s)\bderiveClearHlsExecutionPlan\s*\(/.test(readFileSync(file, "utf8")));
-    assert.deepEqual(
-      callers.map((file) => relative(ROOT, file).split("\\").join("/")),
-      [],
-      "HLS-7 is what may call the clear-HLS planner from production code; until then nothing may",
-    );
+    // …and exactly ONE production call site names it — inside the ordinary
+    // planner. A declaration is not a call: it is preceded by `function`.
+    // Deliberately NOT a global regex: `.test()` on one would carry `lastIndex`
+    // from file to file and silently skip matches.
+    const CALL = /(?<!function\s)\bderiveClearHlsExecutionPlan\s*\(/;
+    const callers = productionSourceFiles().filter((file) => CALL.test(code(file)));
+    assert.deepEqual(callers.map(rel), ["src/worker/execution/format-plan.ts"]);
+    const plannerCode = code(join(ROOT, "src/worker/execution/format-plan.ts"));
+    assert.equal([...plannerCode.matchAll(new RegExp(CALL.source, "g"))].length, 1, "one call site");
+    // `deriveExecutionPlan` is the module's last function, so a call site after
+    // its signature is inside it.
+    const start = plannerCode.indexOf("export function deriveExecutionPlan(");
+    assert.ok(start !== -1 && plannerCode.search(CALL) > start, "the call site is inside deriveExecutionPlan");
+    assert.equal(plannerCode.slice(start + 1).includes("export function"), false, "…and it is the last one");
 
-    // And no production module may read the shadow map for a decision.
-    const readers = productionSourceFiles().filter((file) =>
-      readFileSync(file, "utf8").includes("analysis.hlsSelections"),
-    );
-    assert.deepEqual(readers, [], "the normal planner must not consume hlsSelections until HLS-7");
+    // Exactly ONE reader of the fresh analysis's HLS map for a decision.
+    const readers = productionSourceFiles().filter((file) => code(file).includes("analysis.hlsSelections"));
+    assert.deepEqual(readers.map(rel), ["src/worker/execution/format-plan.ts"]);
+
+    // No unrelated production module holds HLS private provenance at all: the
+    // map is produced by analysis, carried by the router, stated empty by the
+    // executor's direct adapter, and consumed by the planner.
+    const holders = productionSourceFiles()
+      .filter((file) => !rel(file).startsWith("src/worker/hls/"))
+      .filter((file) => code(file).includes("hlsSelections"));
+    assert.deepEqual(holders.map(rel).sort(), [
+      "src/worker/analysis/media-analyzer.server.ts",
+      "src/worker/analysis/ytdlp-analysis.server.ts",
+      "src/worker/execution/format-plan.ts",
+      "src/worker/execution/job-executor.server.ts",
+    ]);
+    const executor = code(join(ROOT, "src/worker/execution/job-executor.server.ts"));
+    assert.equal([...executor.matchAll(/hlsSelections/g)].length, 1, "the executor only states it empty");
+    assert.ok(executor.includes("hlsSelections: {}"));
+    const urlHolders = productionSourceFiles()
+      .filter((file) => !rel(file).startsWith("src/worker/hls/"))
+      .filter((file) => code(file).includes("playlistUrl"));
+    assert.deepEqual(urlHolders.map(rel).sort(), [
+      "src/worker/analysis/ytdlp-analysis.server.ts",
+      "src/worker/execution/format-plan.ts",
+    ]);
+
+    // The JobExecutor reaches HLS through the ORDINARY planner by default.
+    assert.ok(executor.includes("deps.derivePlanForExecution ?? deriveExecutionPlan"));
   });
 });

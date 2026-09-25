@@ -29,7 +29,7 @@ import { runProcess } from "@/services/processing/process-runner.server";
  * never carried forward — it is normalized into one of these values or
  * rejected outright. See `FFPROBE_FORMAT_TOKENS` for why that matters.
  *
- * `mpegts` was added by HLS-4 so the dormant clear-HLS processing primitive can
+ * `mpegts` was added by HLS-4 so the clear-HLS processing primitive can
  * validate the raw MPEG-TS artifact HLS-3 acquires before remuxing it. Adding a
  * family here widens exactly one thing — which explicit demuxer this probe is
  * able to select — and nothing else:
@@ -39,7 +39,9 @@ import { runProcess } from "@/services/processing/process-runner.server";
  *     can ask for an MPEG-TS probe;
  *   - `hasExactStreamShape()` compares the family for EQUALITY, so a file that
  *     normalizes to `mpegts` can never satisfy an ISO-BMFF or WebM expectation;
- *   - nothing in Product execution reaches the HLS foundation at all.
+ *   - since HLS-7 Product execution reaches it for an HLS-owned preset, and
+ *     only through the HLS processing primitive, strictly after
+ *     `beginProcessing()` — never from the split, convert or extract paths.
  */
 export const LOCAL_MEDIA_FAMILIES = ["iso-bmff", "webm", "mpegts"] as const;
 export type LocalMediaFamily = (typeof LOCAL_MEDIA_FAMILIES)[number];

@@ -33,11 +33,17 @@ import {
   type GenericVideoConstraint,
 } from "../execution/generic-source.ts";
 import {
+  CLEAR_HLS_PUBLIC_PRESET_FACTS,
+  CLEAR_HLS_SHADOW_BEST_PRESET_ID,
+  CLEAR_HLS_SHADOW_PRESET_ID_PATTERN,
   acceptClearHlsPlaylistUrl,
-  buildClearHlsMediaPlaylistSelections,
+  hasClearHlsPublicPresetFacts,
   isClearHlsShadowProtocol,
+  placeClearHlsShadowCandidates,
+  projectClearHlsPlacements,
   type ClearHlsMediaPlaylistSelections,
   type ClearHlsShadowCandidate,
+  type ClearHlsShadowPlacements,
 } from "../hls/hls-source-selection.ts";
 import {
   YTDLP_PROBE_TIMEOUT_MS,
@@ -155,9 +161,16 @@ export const YTDLP_ANALYSIS_MIN_TIMEOUT_MS = 1_000;
  * analysis time, and advertising it would risk local FFmpeg work running while
  * a future durable job still reports `downloading`.
  *
- * This is the fail-closed reading of the recorded acquisition boundary. It can
- * be widened later by a phase that proves the manifest is native — with
- * evidence, not optimism.
+ * This is the fail-closed reading of the recorded acquisition boundary, and it
+ * describes ONE thing: what the generic yt-dlp DOWNLOADER may acquire. It is
+ * not the list of protocols the Product can deliver. Clear HLS (HLS-7) is
+ * delivered WITHOUT widening it: yt-dlp only analyzes such a rendition, and
+ * VideoFetch's own playlist preflight, fragment transport and post-
+ * `beginProcessing()` remux acquire and process it (see
+ * `clearHlsShadowCandidate` and `composeGenericVideoOwnership`). Adding an HLS
+ * or DASH spelling here would hand that acquisition back to yt-dlp, whose
+ * `HlsFD` can delegate to `FFmpegFD` during `downloading` — the exact boundary
+ * this list exists to hold.
  */
 export const YTDLP_V1_NATIVE_PROTOCOLS = Object.freeze(["http", "https"] as const);
 
@@ -1470,9 +1483,15 @@ export function buildGenericPresets(
  * reads: which candidates back an advertised VIDEO preset, and the fulfilment
  * plan (tier and split shortfalls) the presets were built from. It is the one
  * construction; nothing here is re-derived for the inventory.
+ *
+ * `videoBacking` names, per progressive VIDEO preset id, the candidate behind
+ * it (a pair's video half). HLS-7 needs it because the FINAL result may give
+ * `preset:best` to clear HLS, and the inventory must then read deliverability
+ * off the presets that survived rather than off every preset constructed.
  */
 type GenericPresetConstruction = GenericPresetBuild & {
   readonly advertisedVideo: ReadonlySet<Candidate>;
+  readonly videoBacking: ReadonlyMap<string, Candidate>;
   readonly videoPlan: VideoFulfillmentPlan;
 };
 
@@ -1501,13 +1520,14 @@ function constructGenericPresets(
   // PRIVATE: the video half of every fulfilment an advertised video preset
   // names. Recorded in the same step as the selection, like it.
   const advertisedVideo = new Set<Candidate>();
+  const videoBacking = new Map<string, Candidate>();
 
   const videoPreset = (
     id: string,
     label: string,
     resolution: string | null,
     f: VideoFulfillment,
-  ): WorkerQualityPreset => ((selections[id] = f.source), advertisedVideo.add(f.video), {
+  ): WorkerQualityPreset => ((selections[id] = f.source), advertisedVideo.add(f.video), videoBacking.set(id, f.video), {
     id,
     label,
     resolution,
@@ -1633,7 +1653,7 @@ function constructGenericPresets(
     }
   }
 
-  return { presets, selections, advertisedVideo, videoPlan };
+  return { presets, selections, advertisedVideo, videoBacking, videoPlan };
 }
 
 /**
@@ -1665,10 +1685,28 @@ function constructGenericPresets(
  * The unknown-audio tier is additionally asserted to be a FALLBACK: it may not
  * coexist with a proven-backed video preset, and it may not be used at all when
  * the candidate set has a proven video fulfilment to offer
- * (GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001).
+ * (GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001). That rule governs the
+ * PROGRESSIVE family's own tier choice, which is made before clear HLS is
+ * composed in, and is checked over progressive-owned presets exactly as before.
+ *
+ * ─── Ownership (HLS-7) ──────────────────────────────────────────────────────
+ *
+ * With `hlsSelections`, every advertised preset must be owned by EXACTLY ONE
+ * private map — `selections` or `hlsSelections`, never both and never neither —
+ * and neither map may hold a key nothing advertises. A clear-HLS-owned preset
+ * must be a VIDEO-ladder id, must state exactly `CLEAR_HLS_PUBLIC_PRESET_FACTS`,
+ * must sit behind a retained playlist URL the static policy still returns
+ * unchanged, and may exist only when Worker FFmpeg is available, because every
+ * HLS job ends in a local remux. A progressive-owned preset must NOT state those
+ * facts: that asymmetry is what lets the planner cross-check a preset's family
+ * against the map that claims it. And `preset:best` must belong to the same
+ * family, and for HLS the same rendition, as the tallest named rung on offer.
+ *
+ * Omitting `hlsSelections` means "no HLS-owned preset", which is exactly the
+ * pre-HLS-7 contract.
  */
 export function assertGenericPresetBuild(
-  build: GenericPresetBuild,
+  build: GenericPresetBuild & { readonly hlsSelections?: ClearHlsMediaPlaylistSelections },
   context: {
     readonly candidates: readonly Candidate[];
     readonly ffmpegAvailable: boolean;
@@ -1676,20 +1714,25 @@ export function assertGenericPresetBuild(
   },
 ): void {
   const { presets, selections } = build;
+  const hlsSelections = build.hlsSelections ?? {};
   const fail = (): never => {
     throw new AppError("EXTRACTION_FAILED");
   };
+  const owns = (map: object, id: string) => Object.prototype.hasOwnProperty.call(map, id);
 
   if (presets.length > YTDLP_ANALYSIS_MAX_PRESETS) fail();
   for (const preset of presets) {
     if (!GENERIC_PRESET_ID_PATTERN.test(preset.id)) fail();
     if (preset.formatId !== preset.id) fail();
-    // Every advertised preset must be acquirable. A preset without a private
-    // selection could only fail later, after the user had chosen it.
-    if (!selections[preset.id]) fail();
+    // Every advertised preset must be acquirable, by exactly ONE family. A
+    // preset without a private owner could only fail later, after the user had
+    // chosen it; a preset with two would leave execution a choice to make.
+    const progressive = owns(selections, preset.id) && Boolean(selections[preset.id]);
+    const hls = owns(hlsSelections, preset.id);
+    if (progressive === hls) fail();
   }
   // ...and nothing may be selectable that was never advertised.
-  for (const id of Object.keys(selections)) {
+  for (const id of [...Object.keys(selections), ...Object.keys(hlsSelections)]) {
     if (!presets.some((p) => p.id === id)) fail();
   }
 
@@ -1697,6 +1740,22 @@ export function assertGenericPresetBuild(
   let unknownAudioVideoPresets = 0;
 
   for (const preset of presets) {
+    // ── CLEAR-HLS (HLS-7) ─────────────────────────────────────────────────────
+    if (owns(hlsSelections, preset.id)) {
+      if (!CLEAR_HLS_SHADOW_PRESET_ID_PATTERN.test(preset.id)) fail();
+      if (!hasClearHlsPublicPresetFacts(preset)) fail();
+      if (!context.ffmpegAvailable) fail();
+      const selection = hlsSelections[preset.id];
+      if (selection === undefined || !Object.isFrozen(selection)) fail();
+      if (acceptClearHlsPlaylistUrl(selection!.playlistUrl) !== selection!.playlistUrl) fail();
+      continue;
+    }
+
+    // A progressive preset never states the clear-HLS facts. Unreachable from
+    // construction — proven audio always carries the codec that proved it —
+    // and asserted because the planner relies on it.
+    if (hasClearHlsPublicPresetFacts(preset)) fail();
+
     const value = selections[preset.id]!;
     const audioProduct = preset.id === "preset:audio" || preset.id === "preset:mp3";
 
@@ -1782,6 +1841,20 @@ export function assertGenericPresetBuild(
     if (provenVideoPresets > 0) fail();
     if (buildProvenVideoFulfillments(context.candidates, context).length > 0) fail();
   }
+
+  // `preset:best` is never a different family — or, for clear HLS, a different
+  // rendition — from the tallest named rung on offer (HLS-7). For a
+  // progressive-only result this holds trivially: everything is progressive.
+  const topRung = RESOLUTION_STEPS.find((step) => presets.some((p) => p.id === step.id));
+  if (topRung && presets.some((p) => p.id === CLEAR_HLS_SHADOW_BEST_PRESET_ID)) {
+    const bestIsHls = owns(hlsSelections, CLEAR_HLS_SHADOW_BEST_PRESET_ID);
+    if (bestIsHls !== owns(hlsSelections, topRung.id)) fail();
+    if (bestIsHls) {
+      const best = hlsSelections[CLEAR_HLS_SHADOW_BEST_PRESET_ID]!;
+      const rung = hlsSelections[topRung.id]!;
+      if (best.playlistUrl !== rung.playlistUrl || best.height !== rung.height) fail();
+    }
+  }
 }
 
 // ── Rendition inventory (GENERIC-SOURCE-RENDITION-INVENTORY-001) ─────────────
@@ -1850,14 +1923,21 @@ export type ObservedVideoRendition = {
  * the public reason it maps to (`withheldReasonFor`).
  *
  *   deliverable          an advertised VIDEO preset is fulfilled by it — alone,
- *                        or as the video half of a pair;
- *   CandidateRejection   the first eligibility gate that refused it;
+ *                        as the video half of a pair, or (HLS-7) as the admitted
+ *                        clear-HLS rendition behind an HLS-owned preset;
+ *   CandidateRejection   the first eligibility gate that refused it. An HLS
+ *                        row is `protocol-unsupported` here whenever clear HLS
+ *                        does not take part: it failed an HLS admission gate,
+ *                        or Worker FFmpeg is unavailable for this analysis;
  *   SplitShortfall       a proven-video-only candidate that did not pair;
  *   no-audio             ditto, and the result has no proven audio-only
  *                        candidate at all;
  *   fallback-suppressed  an unknown-audio candidate the proven tier displaced;
  *   not-selected         in the advertised tier, but another rendition won its
- *                        rung, or it has no height while others do;
+ *                        rung, or it has no height while others do. Since
+ *                        HLS-7 this includes an admitted clear-HLS rendition
+ *                        whose rung a progressive fulfilment kept, or that
+ *                        lost its rung to an earlier HLS rendition;
  *   unclassified         none of the above. Unreachable for an observed
  *                        rendition; kept so the mapping stays total.
  */
@@ -1971,17 +2051,30 @@ function observeVideoRendition(raw: RawFormat, index: number): ObservedVideoRend
 }
 
 /**
- * Reads one observed rendition's outcome off the REAL evaluation and the REAL
- * construction. Nothing here re-decides eligibility, pairing or tiering.
+ * Reads one observed rendition's outcome off the REAL evaluation, the REAL
+ * construction and the REAL final ownership. Nothing here re-decides
+ * eligibility, pairing, tiering or which family owns a rung.
+ *
+ * Clear HLS is read FIRST, and by upstream index: an admitted HLS rendition is
+ * refused by the progressive evaluator on protocol, so its evaluation says
+ * nothing about what the final result did with it. The index is the exact raw
+ * row HLS placement chose, so a duplicated URL/height pair cannot be confused
+ * with the row that actually won, and a rendition behind both `preset:best`
+ * and its named rung is still one observed rendition.
  */
 function dispositionOf(
+  index: number,
   evaluation: FormatEvaluation,
   construction: GenericPresetConstruction,
+  ownership: GenericVideoOwnership,
   hasProvenAudioOnly: boolean,
 ): RenditionDisposition {
+  if (ownership.hlsParticipates && ownership.admittedHlsIndexes.has(index)) {
+    return ownership.deliverableHlsIndexes.has(index) ? "deliverable" : "not-selected";
+  }
   if (!evaluation.ok) return evaluation.rejection;
   const c = evaluation.candidate;
-  if (construction.advertisedVideo.has(c)) return "deliverable";
+  if (ownership.advertisedVideo.has(c)) return "deliverable";
 
   if (isSplitVideoCandidate(c)) {
     const shortfall = construction.videoPlan.shortfalls.get(c);
@@ -2035,18 +2128,19 @@ function withheldReasonFor(cause: WithheldCause): SourceQualityWithheldReason {
   }
 }
 
-// ── Clear-HLS shadow admission (HLS-5) ───────────────────────────────────────
+// ── Clear-HLS admission (HLS-5) ──────────────────────────────────────────────
 
 /**
- * Judges ONE raw format for the PRIVATE clear-HLS v1 shadow channel.
+ * Judges ONE raw format for the clear-HLS v1 channel.
  *
- * This runs entirely beside the progressive path and changes nothing about it.
- * An HLS format is still refused by `evaluateRawFormat` as
- * `protocol-unsupported` and still reaches the public source-quality summary
- * as `unsupported_protocol`. The apparent contradiction is the point of HLS-5:
- * a private shadow selection may exist while the public capability still says
- * HLS is not downloadable, because the private half is future execution
- * provenance and the public half is current Product truth.
+ * This runs entirely beside the progressive path and changes nothing about its
+ * eligibility. An HLS format is still refused by `evaluateRawFormat` as
+ * `protocol-unsupported`, so yt-dlp is never asked to acquire it. What HLS-7
+ * changed is what happens to a candidate admitted HERE: when Worker FFmpeg is
+ * available, `composeGenericVideoOwnership` may give it a rung the progressive
+ * family does not fulfil, and it is then an ordinary advertised video preset
+ * acquired by VideoFetch itself. A row that fails any gate below, or any HLS
+ * row while FFmpeg is unavailable, is still reported as `unsupported_protocol`.
  *
  * The gates, in order, and every one of them conservative:
  *
@@ -2088,8 +2182,13 @@ function withheldReasonFor(cause: WithheldCause): SourceQualityWithheldReason {
  *
  * Any failed gate returns `null`, meaning simply "there is no HLS shadow
  * candidate here". It is never an analysis failure: ordinary metadata for this
- * document stays available regardless of how bad one dormant rendition's
- * private provenance is.
+ * document stays available regardless of how bad one HLS rendition's private
+ * provenance is.
+ *
+ * No gate here fetches anything. Admission is a METADATA screen, and an
+ * advertised HLS preset is not a promise that a later manifest still passes:
+ * the fresh execution analysis re-derives the URL, and HLS-2's preflight —
+ * during `downloading` — is the authoritative semantic check, fail-closed.
  */
 function clearHlsShadowCandidate(
   raw: RawFormat,
@@ -2114,17 +2213,209 @@ function clearHlsShadowCandidate(
   return { playlistUrl, height: observed.height, index };
 }
 
+// ── Family ownership: progressive/split + clear HLS (HLS-7) ──────────────────
+
 /**
- * The generic eligibility → construction → inventory pass for ONE document.
+ * The FINAL video ladder after the two acquisition families are composed, and
+ * the private facts the inventory reads off it.
  *
- * Pure, and exactly what `analyzeGenericMediaInternal` runs: the presets and
- * selections are those `buildGenericPresets` would produce from the same
- * formats, and the inventory is read off that same construction.
+ *   presets / selections / hlsSelections
+ *                          what analysis returns. The two private maps are
+ *                          DISJOINT: every advertised preset is in exactly one.
+ *   advertisedVideo        progressive candidates (a pair's video half) behind
+ *                          a FINAL progressive-owned video preset.
+ *   hlsParticipates        clear HLS took part in this result at all — exactly
+ *                          "Worker FFmpeg is available".
+ *   admittedHlsIndexes     upstream index of every row HLS admission accepted.
+ *   deliverableHlsIndexes  upstream index of every row behind a FINAL HLS-owned
+ *                          preset. Each index is one raw rendition, however
+ *                          many presets it backs.
  *
- * `hlsSelections` is the HLS-5 PRIVATE shadow channel, computed in the same
- * pass and touching nothing above: it is not consulted by eligibility, by
- * preset construction, or by the inventory, and none of those is consulted by
- * it. Removing it would leave every other value here bit-for-bit identical.
+ * PRIVATE and transient. No index leaves analysis.
+ */
+type GenericVideoOwnership = {
+  readonly presets: WorkerQualityPreset[];
+  readonly selections: GenericSourceSelections;
+  readonly hlsSelections: ClearHlsMediaPlaylistSelections;
+  readonly advertisedVideo: ReadonlySet<Candidate>;
+  readonly hlsParticipates: boolean;
+  readonly admittedHlsIndexes: ReadonlySet<number>;
+  readonly deliverableHlsIndexes: ReadonlySet<number>;
+};
+
+/** The public preset a clear-HLS-owned rung advertises. No field is upstream data. */
+function clearHlsPublicPreset(
+  id: string,
+  label: string,
+  resolution: string | null,
+): WorkerQualityPreset {
+  return {
+    id,
+    label,
+    resolution,
+    container: CLEAR_HLS_PUBLIC_PRESET_FACTS.container,
+    fileSize: CLEAR_HLS_PUBLIC_PRESET_FACTS.fileSize,
+    hasVideo: CLEAR_HLS_PUBLIC_PRESET_FACTS.hasVideo,
+    hasAudio: CLEAR_HLS_PUBLIC_PRESET_FACTS.hasAudio,
+    // `id === formatId`, both application-owned — exactly as for every other
+    // generic preset. No playlist URL or upstream identity fills any field.
+    formatId: id,
+    videoCodec: CLEAR_HLS_PUBLIC_PRESET_FACTS.videoCodec,
+    audioCodec: CLEAR_HLS_PUBLIC_PRESET_FACTS.audioCodec,
+    fps: CLEAR_HLS_PUBLIC_PRESET_FACTS.fps,
+  };
+}
+
+/**
+ * Composes the mature progressive/split ladder with clear-HLS placements into
+ * ONE final ladder, deciding once — here, during THIS source's analysis — which
+ * family owns every advertised video preset (HLS-7).
+ *
+ * The rules, and nothing else:
+ *
+ *   FFMPEG       clear HLS takes part only when Worker FFmpeg is available,
+ *                because every HLS job ends in a local remux after
+ *                `beginProcessing()`. Without it the progressive result is
+ *                returned exactly as constructed, and `hlsSelections` is empty.
+ *
+ *   NAMED RUNG   for each rung of the application's closed ladder:
+ *                  1. a progressive/split fulfilment for that exact rung wins;
+ *                  2. otherwise an HLS placement on that rung fills it;
+ *                  3. otherwise the rung is absent.
+ *                HLS fills gaps and never displaces a progressive rung. The
+ *                progressive family keeps its own whole-result tier choice
+ *                (including the unknown-audio fallback), made before this runs.
+ *
+ *   BEST         `preset:best` belongs to whichever family owns the TALLEST
+ *                final named rung, and is backed by that very rung's
+ *                fulfilment — so progressive keeps it at an equal rung, and a
+ *                taller HLS rung takes it. With no named rung at all, the
+ *                progressive unknown-height `preset:best` wins when present,
+ *                and otherwise an HLS unknown-height placement may back it.
+ *
+ * The ladder is the ranking vocabulary. No upstream format id, codec, bitrate
+ * or size is compared across families, and no decision is left to execution:
+ * the planner reads ownership off the two maps and never chooses a family.
+ *
+ * A progressive-only document (no admitted HLS candidate) returns the
+ * construction's own presets and selections, so its output is byte-for-byte
+ * what it was before HLS-7.
+ */
+function composeGenericVideoOwnership(
+  construction: GenericPresetConstruction,
+  placements: ClearHlsShadowPlacements,
+  admittedHlsIndexes: ReadonlySet<number>,
+  opts: { readonly ffmpegAvailable: boolean },
+): GenericVideoOwnership {
+  const progressiveOnly: GenericVideoOwnership = {
+    presets: construction.presets,
+    selections: construction.selections,
+    hlsSelections: Object.freeze({}),
+    advertisedVideo: construction.advertisedVideo,
+    hlsParticipates: opts.ffmpegAvailable,
+    admittedHlsIndexes,
+    deliverableHlsIndexes: new Set<number>(),
+  };
+  if (!opts.ffmpegAvailable || Object.keys(placements).length === 0) return progressiveOnly;
+
+  const progressive = new Map(construction.presets.map((p) => [p.id, p] as const));
+  type Owned =
+    | { readonly owner: "progressive"; readonly preset: WorkerQualityPreset }
+    | { readonly owner: "clear-hls"; readonly preset: WorkerQualityPreset; readonly placed: ClearHlsShadowCandidate };
+
+  // Named rungs, tallest first: progressive wins its own rung; HLS fills a gap.
+  const rungs: Owned[] = [];
+  let tallest: { readonly step: (typeof RESOLUTION_STEPS)[number]; readonly owned: Owned } | null = null;
+  for (const step of RESOLUTION_STEPS) {
+    const own = progressive.get(step.id);
+    const placed = placements[step.id];
+    const owned: Owned | null = own
+      ? { owner: "progressive", preset: own }
+      : placed
+        ? { owner: "clear-hls", preset: clearHlsPublicPreset(step.id, step.label, step.resolution), placed }
+        : null;
+    if (owned === null) continue;
+    rungs.push(owned);
+    tallest ??= { step, owned };
+  }
+
+  // `preset:best`: the tallest final rung's family and fulfilment.
+  let best: Owned | null = null;
+  const progressiveBest = progressive.get(CLEAR_HLS_SHADOW_BEST_PRESET_ID);
+  if (tallest !== null) {
+    if (tallest.owned.owner === "progressive") {
+      best = progressiveBest ? { owner: "progressive", preset: progressiveBest } : null;
+    } else {
+      best = {
+        owner: "clear-hls",
+        preset: clearHlsPublicPreset(CLEAR_HLS_SHADOW_BEST_PRESET_ID, "Best available", tallest.step.resolution),
+        placed: tallest.owned.placed,
+      };
+    }
+  } else if (progressiveBest) {
+    best = { owner: "progressive", preset: progressiveBest };
+  } else {
+    const placed = placements[CLEAR_HLS_SHADOW_BEST_PRESET_ID];
+    best = placed
+      ? {
+          owner: "clear-hls",
+          preset: clearHlsPublicPreset(CLEAR_HLS_SHADOW_BEST_PRESET_ID, "Best available", null),
+          placed,
+        }
+      : null;
+  }
+
+  const video = best === null ? rungs : [best, ...rungs];
+  // Audio products are the progressive family's, untouched: clear HLS has no
+  // audio product, and is never an extraction source.
+  const audio = construction.presets.filter((p) => !p.hasVideo);
+
+  const progressiveIds = new Set(video.filter((o) => o.owner === "progressive").map((o) => o.preset.id));
+  for (const p of audio) progressiveIds.add(p.id);
+
+  // The FINAL private maps, disjoint by construction. Progressive keeps the
+  // construction's own insertion order, so an unchanged ladder is unchanged.
+  const selections: Record<string, GenericPresetSource> = {};
+  for (const [id, value] of Object.entries(construction.selections)) {
+    if (progressiveIds.has(id)) selections[id] = value;
+  }
+  const hlsOwned: Record<string, ClearHlsShadowCandidate> = {};
+  for (const o of video) if (o.owner === "clear-hls") hlsOwned[o.preset.id] = o.placed;
+
+  const advertisedVideo = new Set<Candidate>();
+  for (const o of video) {
+    if (o.owner !== "progressive") continue;
+    const backing = construction.videoBacking.get(o.preset.id);
+    if (backing) advertisedVideo.add(backing);
+  }
+
+  return {
+    presets: [...video.map((o) => o.preset), ...audio],
+    selections,
+    hlsSelections: projectClearHlsPlacements(hlsOwned),
+    advertisedVideo,
+    hlsParticipates: true,
+    admittedHlsIndexes,
+    deliverableHlsIndexes: new Set(Object.values(hlsOwned).map((c) => c.index)),
+  };
+}
+
+/**
+ * The generic eligibility → construction → ownership → inventory pass for ONE
+ * document.
+ *
+ * Pure, and exactly what `analyzeGenericMediaInternal` runs. Progressive
+ * eligibility and construction are exactly what `selectCandidates` +
+ * `buildGenericPresets` produce; clear-HLS admission runs beside them and never
+ * feeds them; `composeGenericVideoOwnership` then decides, once, which family
+ * owns each advertised video preset; and the inventory reads every rendition's
+ * outcome off that FINAL result.
+ *
+ * `build.selections` and `hlsSelections` are the two PRIVATE maps, disjoint:
+ * together they own every advertised preset exactly once. `hlsSelections`
+ * carries only the rungs the final result gives to clear HLS — not every rung
+ * HLS could have filled. For a document with no admitted HLS candidate every
+ * value here is bit-for-bit what it was before HLS-7.
  */
 export function analyzeGenericFormats(
   formats: readonly RawFormat[],
@@ -2145,31 +2436,40 @@ export function analyzeGenericFormats(
   const construction = constructGenericPresets(candidates, opts);
   const hasProvenAudioOnly = candidates.some(isSplitAudioCandidate);
 
-  const renditions: InventoriedRendition[] = [];
   const hlsCandidates: ClearHlsShadowCandidate[] = [];
   formats.forEach((raw, index) => {
     const hls = clearHlsShadowCandidate(raw, index, opts);
     if (hls !== null) hlsCandidates.push(hls);
+  });
 
+  // The SAME rung boundaries the public video presets are built from, passed
+  // rather than restated, so the two ladders cannot drift apart.
+  const ownership = composeGenericVideoOwnership(
+    construction,
+    placeClearHlsShadowCandidates(hlsCandidates, RESOLUTION_STEPS),
+    new Set(hlsCandidates.map((c) => c.index)),
+    opts,
+  );
+
+  const renditions: InventoriedRendition[] = [];
+  formats.forEach((raw, index) => {
     const observed = observeVideoRendition(raw, index);
     if (observed === null) return;
     renditions.push({
       observed,
-      disposition: dispositionOf(evaluations[index]!, construction, hasProvenAudioOnly),
+      disposition: dispositionOf(index, evaluations[index]!, construction, ownership, hasProvenAudioOnly),
     });
   });
 
   return {
     candidates,
-    build: { presets: construction.presets, selections: construction.selections },
+    build: { presets: ownership.presets, selections: ownership.selections },
     inventory: {
       renditions,
       protectedUnenumerated: opts.protectionSignal === true,
       maybeProtectedObserved: formats.some((raw) => raw.has_drm === "maybe"),
     },
-    // The SAME rung boundaries the public video presets are built from, passed
-    // rather than restated, so the two ladders cannot drift apart.
-    hlsSelections: buildClearHlsMediaPlaylistSelections(hlsCandidates, RESOLUTION_STEPS),
+    hlsSelections: ownership.hlsSelections,
   };
 }
 
@@ -2178,9 +2478,9 @@ export function analyzeGenericFormats(
  *
  *   observedMaxHeight     the tallest observed rendition, whatever its outcome;
  *   deliverableMaxHeight  the tallest rendition behind an advertised VIDEO
- *                         preset, by its OWN height — an 848×384 source behind
- *                         `preset:360` counts as 384, not 360. Audio presets
- *                         never count;
+ *                         preset of either family, by its OWN height — an
+ *                         848×384 source behind `preset:360` counts as 384,
+ *                         not 360. Audio presets never count;
  *   withheld              one entry per reason present, in vocabulary order.
  *
  * Every observed rendition is either deliverable or withheld, so the observed
@@ -2338,15 +2638,16 @@ export type GenericAnalysisDeps = {
  * The EXECUTION-side analysis result (§9).
  *
  * `video` is exactly what the browser may see. `selections` is the private
- * half: one validated source descriptor per advertised preset, each carrying
- * the raw upstream `format_id` the Worker approved.
+ * progressive/split half: one validated source descriptor per preset that
+ * family owns, each carrying the raw upstream `format_id` the Worker approved.
  *
- * `hlsSelections` (HLS-5) is a SECOND, separate private channel: the exact
- * media-playlist URL of one clear-HLS rendition per would-be video rung. It is
- * deliberately not merged into `selections`, because a key there means "this
- * preset is advertised and acquirable now", while a key here means only "if
- * HLS were downloadable, this is where that rung would come from". HLS is not
- * downloadable, so the two maps must not be confusable.
+ * `hlsSelections` (HLS-5, activated by HLS-7) is the SECOND private map: the
+ * exact media-playlist URL behind each preset the final result gives to clear
+ * HLS. The two maps are DISJOINT and together own every advertised preset
+ * exactly once, so the key's location IS the family decision — the planner
+ * reads it and never makes one of its own. They stay separate types because
+ * they name different things: a yt-dlp-selectable source versus a playlist
+ * VideoFetch fetches itself.
  *
  * This type is returned by `analyzeGenericMediaInternal` and by nothing else.
  * Neither private map may cross Worker HTTP, enter `WorkerVideoMetadata`, enter
@@ -2500,9 +2801,10 @@ export async function analyzeGenericMediaInternal(
   }
 
   const ffmpegAvailable = deps.ffmpegAvailable ?? false;
-  // Eligibility, preset construction and the rendition inventory, in one pass:
-  // the presets and selections are exactly what `selectCandidates` +
-  // `buildGenericPresets` produce, and the inventory only reads that result.
+  // Eligibility, preset construction, family ownership and the rendition
+  // inventory, in one pass: progressive presets and selections are exactly what
+  // `selectCandidates` + `buildGenericPresets` produce, clear HLS only fills
+  // rungs they leave empty, and the inventory reads the final result.
   const { candidates, build, inventory, hlsSelections } = analyzeGenericFormats(info.formats ?? [], {
     ffmpegAvailable,
     // The per-format size gate, and the PAIR-level combined-size budget
@@ -2512,11 +2814,12 @@ export async function analyzeGenericMediaInternal(
   });
   const { presets, selections } = build;
 
-  // Structural and shape-aware audio assertions on this module's OWN output,
-  // including the fallback-only rule for the unknown-audio video tier. Any
-  // violation is one canonical EXTRACTION_FAILED; see `assertGenericPresetBuild`.
+  // Structural, ownership and shape-aware audio assertions on this module's OWN
+  // output, including the fallback-only rule for the unknown-audio video tier.
+  // Any violation is one canonical EXTRACTION_FAILED; see
+  // `assertGenericPresetBuild`.
   assertGenericPresetBuild(
-    { presets, selections },
+    { presets, selections, hlsSelections },
     { candidates, ffmpegAvailable, maxFileSizeBytes: deps.limits.maxFileSizeBytes },
   );
 
@@ -2555,7 +2858,9 @@ export async function analyzeGenericMediaInternal(
       // Derived from the FINAL selection map, so it can never claim a capability
       // the user cannot actually choose, and can never stay false while a
       // split-backed preset is on offer. A merely POSSIBLE but unselected pair
-      // sets nothing.
+      // sets nothing. That map holds only progressive/split-owned presets, so a
+      // clear-HLS preset never sets it either: its local FFmpeg work is a
+      // single-input remux, not the split merge this flag has always meant.
       //
       // The `ffmpegAvailable` conjunction is redundant at runtime — split
       // construction is already gated on it, and the loop above re-asserts that
