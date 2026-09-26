@@ -196,10 +196,12 @@ export const BYTELIMIT_EVIDENCE_URL_ENV = "VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_
  * origin, so the grammar is exactly that and nothing wider:
  *
  *   - present and a non-empty string;
- *   - no whitespace or control character ANYWHERE. The WHATWG parser silently
- *     strips leading and trailing C0 controls and spaces, so a value pasted out
- *     of the manifest with its line ending still attached would otherwise be
- *     admitted as a different string from the one supplied;
+ *   - no whitespace or control character ANYWHERE, by Unicode's own classes —
+ *     see `EVIDENCE_URL_FORBIDDEN_CHARACTER`. The WHATWG parser silently strips
+ *     leading and trailing C0 controls and spaces, removes ASCII tab and
+ *     newline wherever they occur, and percent-encodes other non-ASCII
+ *     characters in a path, query or fragment, so a value carrying any of them
+ *     would otherwise be admitted as a different string from the one supplied;
  *   - an absolute URL that parses;
  *   - scheme exactly `https:`;
  *   - no userinfo: the fixture holds no credential and must never be sent one.
@@ -207,6 +209,30 @@ export const BYTELIMIT_EVIDENCE_URL_ENV = "VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_
  * A refusal never echoes the value. It is not a secret, but the harness prints
  * no raw URL (§13), and naming the rule that failed is all the operator needs.
  */
+/**
+ * The characters the evidence-endpoint rule refuses ANYWHERE in the value.
+ *
+ * Exactly the union of two Unicode classes, matched per code point (`u` flag):
+ *
+ *   White_Space  the binary property: ASCII TAB..CR and SPACE, plus U+0085,
+ *                U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029, U+202F,
+ *                U+205F and U+3000
+ *   Cc           General_Category "Control": C0 U+0000..U+001F, DEL U+007F
+ *                and C1 U+0080..U+009F
+ *
+ * The first revision tested an ASCII-only class (U+0000..U+0020 and U+007F),
+ * which honoured the documented "no whitespace or control character anywhere"
+ * rule for ASCII only: NO-BREAK SPACE, NEXT LINE, the line and paragraph
+ * separators and IDEOGRAPHIC SPACE passed it, and the WHATWG parser then
+ * percent-encoded them into an admitted URL. Unicode property escapes are
+ * ES2018 and available on every Node this harness runs under (the VM host's
+ * Node 18 and the Worker image's Node 22).
+ *
+ * "Control" deliberately means Cc. Format characters (Cf, e.g. U+200B, U+FEFF)
+ * are neither White_Space nor Cc, and are not claimed by this rule.
+ */
+const EVIDENCE_URL_FORBIDDEN_CHARACTER = /[\p{White_Space}\p{Cc}]/u;
+
 export function parseByteLimitEvidenceUrl(raw) {
   if (raw === undefined || raw === null || raw === "") {
     return {
@@ -217,8 +243,7 @@ export function parseByteLimitEvidenceUrl(raw) {
         "without it would create a real Production job whose evidence it could never obtain",
     };
   }
-  // eslint-disable-next-line no-control-regex -- refusing control characters is this check's purpose
-  if (typeof raw !== "string" || /[\u0000-\u0020\u007f]/.test(raw)) {
+  if (typeof raw !== "string" || EVIDENCE_URL_FORBIDDEN_CHARACTER.test(raw)) {
     return {
       ok: false,
       reason:

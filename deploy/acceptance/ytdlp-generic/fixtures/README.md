@@ -363,9 +363,11 @@ then verifies the bytes actually served.
 
 The Product's absolute acquisition timeout is **600 s** and is unchanged. A real
 threshold proof therefore requires transferring more than the deployed effective
-limit within that deadline — for the 4 GiB default, sustained throughput of
-roughly 7.2 MiB/s end to end, before the Worker's own poll interval and the
-tunnel are accounted for. If the threshold is not reached in time, the harness
+limit within that deadline. For the 4 GiB default that means sustained
+throughput of roughly **6.83 MiB/s (7.16 MB/s) end to end** (4,096 MiB / 600 s),
+before the Worker's own poll interval, protocol overhead and the tunnel are
+accounted for. That is a **planning figure only**, not an exact required rate
+and not acceptance evidence. If the threshold is not reached in time, the harness
 must report **TIMEOUT/BLOCKED honestly**; a run that timed out short of the
 threshold is not byte-guard acceptance, and the `bytesServed >
 effectiveMaxFileSizeBytes` requirement will refuse it as invalid fixture

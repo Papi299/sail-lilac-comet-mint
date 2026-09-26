@@ -1237,7 +1237,9 @@ submits anything**. See "The capacity preflight" below.
 too (`YTDLP-CURRENT-LIMIT-4GIB-ACCEPTANCE-HARNESS-HARDENING-001`). Without it
 the case can never attribute the transfer it causes, so it is refused where the
 case's other inputs are. The value must be one absolute `https:` URL, with no
-whitespace or control characters anywhere and no userinfo. A missing or malformed
+whitespace or control characters anywhere and no userinfo. "Whitespace" and
+"control" here mean Unicode's own classes, `White_Space` and `Cc`, not just
+ASCII. A missing or malformed
 value is a **usage error before the producer runs**, which means before the
 analysis request, before any job and before any fixture request. The CLI reads it
 **once**, carries it on the case context as `byteLimitEvidenceUrl`, and the
@@ -1352,9 +1354,21 @@ as invalid fixture evidence.
 
 **Throughput, and reporting it honestly.** The Product's absolute acquisition
 timeout is **600 s** and is unchanged by this correction. Crossing 4 GiB inside
-that deadline requires roughly 7.2 MiB/s sustained end to end. If the threshold
-is not reached, the run must be reported as **TIMEOUT/BLOCKED** — not as a pass,
-and not as a smaller-than-intended threshold proof.
+that deadline needs roughly **6.83 MiB/s (7.16 MB/s) sustained end to end**,
+which is 4,096 MiB / 600 s.
+
+This is a **planning figure only**. It is not an exact required rate, and it is
+not acceptance evidence:
+
+- protocol and tunnel overhead are not included;
+- queueing, job-time analysis and the harness's own observation window are
+  separate matters (see
+  [a poll timeout is not proven](#a-poll-timeout-is-blocked--not-proven));
+- the Product's byte watcher observes on its own 150 ms cadence.
+
+If the threshold is not reached, the run must be reported as
+**TIMEOUT/BLOCKED** — not as a pass, and not as a smaller-than-intended
+threshold proof.
 
 The `--byte-limit-bytes` override in `server.mjs` is **not** how the default is
 made sufficient (it already is). It remains bounded to small automated fixture

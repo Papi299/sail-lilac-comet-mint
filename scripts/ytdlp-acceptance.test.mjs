@@ -5009,6 +5009,74 @@ describe("byte-limit causal binding", () => {
     assert.match(run.out, /running case 'byte-limit'/);
     assert.ok(world.calls.commands.some((c) => c.includes(MAX_FILE_SIZE_PROBE_ARGV.join(" "))));
   });
+
+  it("41y. the whitespace/control rule is Unicode-wide, not ASCII-only", async () => {
+    // …-REVIEW-CORRECTION-001. The first revision refused only U+0000..U+0020
+    // and U+007F. Every character below passed that check, and the WHATWG
+    // parser then percent-encoded it into an ADMITTED URL, so the documented
+    // "no whitespace or control character anywhere" rule held for ASCII only.
+    //
+    // Built from code points rather than escapes, so the file carries no
+    // invisible characters and each case is named by what it is.
+    const U = (cp) => String.fromCodePoint(cp);
+    const characters = [
+      [0x0080, "U+0080 PADDING CHARACTER (Cc, C1)"],
+      [0x0085, "U+0085 NEXT LINE (Cc, C1, and White_Space)"],
+      [0x009f, "U+009F APPLICATION PROGRAM COMMAND (Cc, C1)"],
+      [0x00a0, "U+00A0 NO-BREAK SPACE"],
+      [0x1680, "U+1680 OGHAM SPACE MARK"],
+      [0x2000, "U+2000 EN QUAD"],
+      [0x200a, "U+200A HAIR SPACE"],
+      [0x2028, "U+2028 LINE SEPARATOR"],
+      [0x2029, "U+2029 PARAGRAPH SEPARATOR"],
+      [0x202f, "U+202F NARROW NO-BREAK SPACE"],
+      [0x205f, "U+205F MEDIUM MATHEMATICAL SPACE"],
+      [0x3000, "U+3000 IDEOGRAPHIC SPACE"],
+    ];
+    const positions = [
+      ["trailing, as a pasted value's tail", (c) => `https://media.invalid/byte-evidence${c}`],
+      ["inside the path", (c) => `https://media.invalid/byte${c}evidence`],
+      ["in the query", (c) => `https://media.invalid/byte-evidence?x=${c}`],
+      ["in the fragment", (c) => `https://media.invalid/byte-evidence#${c}`],
+    ];
+    for (const [cp, name] of characters) {
+      for (const [where, place] of positions) {
+        const raw = place(U(cp));
+        const label = `${name}, ${where}`;
+        // The discriminator: WHATWG ACCEPTS this value as an https: URL, so
+        // the explicit rule is the only thing that can refuse it.
+        assert.equal(new URL(raw).protocol, "https:", `${label}: WHATWG admits it`);
+        const parsed = parseByteLimitEvidenceUrl(raw);
+        assert.equal(parsed.ok, false, label);
+        assert.match(parsed.reason, /VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL/, label);
+        assert.match(parsed.reason, /no whitespace or control/, label);
+        assert.ok(!parsed.reason.includes("media.invalid"), `${label}: the value is never echoed`);
+      }
+    }
+
+    // Positive controls, unchanged: the rule refuses characters, not URLs.
+    for (const raw of [
+      "https://media.invalid/byte-evidence",
+      "HTTPS://media.invalid/byte-evidence",
+      "https://random-words-here.trycloudflare.com/byte-evidence",
+    ]) {
+      assert.deepEqual(parseByteLimitEvidenceUrl(raw), { ok: true, url: raw });
+    }
+
+    // And through the CLI: refused at admission, before the producer runs,
+    // which is the same boundary 41v proves for the ASCII cases.
+    for (const cp of [0x00a0, 0x0085, 0x2028, 0x2029, 0x3000]) {
+      const run = await runByteLimit(
+        {},
+        { VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL: `https://media.invalid/byte-evidence${U(cp)}` },
+      );
+      const label = `U+${cp.toString(16).toUpperCase().padStart(4, "0")}`;
+      assert.equal(run.code, 3, `${label}: ${run.out} | ${run.err}`);
+      assert.match(run.err, /usage error: case 'byte-limit'/, label);
+      assert.doesNotMatch(run.err, /media\.invalid/, `${label}: the value is never echoed`);
+      assertRefusedBeforeProducer(run);
+    }
+  });
 });
 
 /**
