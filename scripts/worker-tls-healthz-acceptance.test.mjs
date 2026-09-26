@@ -16,6 +16,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { lstat, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -27,14 +29,16 @@ import {
   assertTlsVerificationEnabled,
   buildAccessHeaders,
   evaluateHealthzResponse,
+  readBoundedBody,
   resolveHealthzTarget,
   runTlsHealthzAcceptance,
   TLS_HEALTHZ_EXPECTED_STATUS,
+  TLS_HEALTHZ_MAX_BODY_BYTES,
   TLS_HEALTHZ_OUTCOMES,
   TLS_HEALTHZ_PATH,
   TLS_HEALTHZ_SCHEMA_VERSION,
 } from "../deploy/acceptance/worker-health/lib/tls-healthz.mjs";
-import { main, parseArgs } from "../deploy/acceptance/worker-health/tls-healthz-acceptance.mjs";
+import { createEvidenceFile, main, parseArgs } from "../deploy/acceptance/worker-health/tls-healthz-acceptance.mjs";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -45,19 +49,70 @@ const FAKE_SECRET = "FAKE-ACCESS-CLIENT-SECRET-0000000000000000000000";
 /** A hostname that exists only in this file. Never resolved: the transport is fake. */
 const FAKE_ORIGIN = "https://worker.invalid-test-host.example";
 
-/** Builds a fake transport that records what it was called with. */
-function fakeTransport({ status = 200, body = JSON.stringify({ status: "ok" }), throws = null } = {}) {
+/**
+ * Builds a fake transport that records what it was called with.
+ *
+ * It answers with a REAL platform `Response`, so the acceptance reads the body
+ * through the same ReadableStream path it uses against the network — not
+ * through a convenience method a fake happens to provide.
+ */
+function fakeTransport({ status = 200, body = JSON.stringify({ status: "ok" }), throws = null, respond = null } = {}) {
   const calls = [];
   const impl = async (url, init) => {
     calls.push({ url, init });
     if (throws) throw throws;
-    return {
-      status,
-      text: async () => body,
-    };
+    if (respond) return respond(url, init);
+    return new Response(body, { status });
   };
   impl.calls = calls;
   return impl;
+}
+
+/**
+ * A streaming body that would yield `totalChunks` × `chunkBytes` if allowed to,
+ * and counts exactly how much of it was actually pulled.
+ *
+ * highWaterMark 0: the stream produces a chunk ONLY when a read is pending, so
+ * `pulls` is exactly the number of chunks the consumer asked for — no
+ * read-ahead can hide an over-read.
+ */
+function meteredStream({ totalChunks, chunkBytes, first = null }) {
+  const meter = { pulls: 0, bytesProduced: 0, cancelled: false };
+  let produced = 0;
+  const stream = new ReadableStream(
+    {
+      pull(controller) {
+        meter.pulls += 1;
+        if (produced >= totalChunks) {
+          controller.close();
+          return;
+        }
+        const chunk =
+          produced === 0 && first !== null ? first : new Uint8Array(chunkBytes).fill(0x20);
+        produced += 1;
+        meter.bytesProduced += chunk.byteLength;
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        meter.cancelled = true;
+      },
+    },
+    new CountQueuingStrategy({ highWaterMark: 0 }),
+  );
+  return { stream, meter };
+}
+
+/** A Response whose buffering conveniences THROW, so only the stream is usable. */
+function streamOnlyResponse(stream, status = 200) {
+  const response = new Response(stream, { status });
+  for (const method of ["text", "json", "arrayBuffer", "blob", "formData", "bytes"]) {
+    Object.defineProperty(response, method, {
+      value: () => {
+        throw new Error(`the acceptance must not call response.${method}() — it buffers the whole body`);
+      },
+    });
+  }
+  return response;
 }
 
 describe("TLS healthz target contract", () => {
@@ -307,7 +362,12 @@ describe("certificate verification cannot be disabled", () => {
     assert.equal(result.pass, false);
     assert.equal(result.outcome, TLS_HEALTHZ_OUTCOMES.TLS_VERIFICATION_DISABLED);
     assert.equal(transport.calls.length, 0, "nothing is dialled with verification off");
-    assert.equal(result.evidence.tlsVerification, "enabled");
+    // REVIEW-CORRECTION-001, finding 2. The first revision asserted "enabled"
+    // HERE — evidence contradicting the very outcome it recorded.
+    assert.equal(result.evidence.tlsVerification, "disabled-refused");
+    assert.notEqual(result.evidence.tlsVerification, "enabled");
+    assert.equal(result.evidence.requestAttempted, false);
+    assert.equal(result.evidence.httpsUsed, null);
   });
 
   it("runs normally when verification is untouched or explicitly on", () => {
@@ -422,8 +482,14 @@ describe("the evidence record is deliberately narrow", () => {
   it("records the non-secret facts the operator needs", async () => {
     const evidence = await record();
     assert.equal(evidence.schemaVersion, TLS_HEALTHZ_SCHEMA_VERSION);
+    assert.equal(evidence.schemaVersion, "worker-tls-healthz-02");
+    assert.equal(evidence.requestAttempted, true);
     assert.equal(evidence.httpsUsed, true);
-    assert.equal(evidence.requestedPath, TLS_HEALTHZ_PATH);
+    assert.equal(evidence.tlsVerification, "enabled");
+    assert.equal(evidence.responseReceived, true);
+    assert.equal(evidence.bodyWithinLimit, true);
+    assert.equal(evidence.healthPath, TLS_HEALTHZ_PATH);
+    assert.equal(evidence.accessCredentialPresence, "both");
     assert.equal(evidence.accessCredentialPairSupplied, true);
     assert.equal(evidence.httpStatus, 200);
     assert.equal(evidence.healthyBodyMatched, true);
@@ -466,9 +532,9 @@ describe("the evidence record is deliberately narrow", () => {
 
   it("records Access header NAMES only, never values", async () => {
     const evidence = await record();
-    assert.deepEqual(evidence.accessHeaderNames.sort(), [ACCESS_ID_HEADER, ACCESS_SECRET_HEADER].sort());
+    assert.deepEqual(evidence.accessHeaderNamesSent.sort(), [ACCESS_ID_HEADER, ACCESS_SECRET_HEADER].sort());
     assert.equal(evidence.unexpectedHeaderCount, 0);
-    for (const name of evidence.accessHeaderNames) {
+    for (const name of evidence.accessHeaderNamesSent) {
       assert.ok(!name.includes(FAKE_ID));
       assert.ok(!name.includes(FAKE_SECRET));
     }
@@ -614,6 +680,378 @@ describe("the acceptance CLI", () => {
         .filter((line) => !/^\s*#/.test(line))
         .join("\n");
       assert.doesNotMatch(executable, /tls-healthz/, `${unit} must not invoke the acceptance`);
+    }
+  });
+});
+
+describe("evidence records only what actually happened (REVIEW-CORRECTION-001)", () => {
+  const run = (options) =>
+    runTlsHealthzAcceptance({
+      origin: FAKE_ORIGIN,
+      accessClientId: FAKE_ID,
+      accessClientSecret: FAKE_SECRET,
+      fetchImpl: fakeTransport(),
+      ...options,
+    });
+
+  it("PASS: request attempted, HTTPS used, verification enabled", async () => {
+    const { evidence } = await run();
+    assert.equal(evidence.verdict, "PASS");
+    assert.equal(evidence.requestAttempted, true);
+    assert.equal(evidence.httpsUsed, true);
+    assert.equal(evidence.tlsVerification, "enabled");
+    assert.equal(evidence.targetAccepted, true);
+    assert.equal(evidence.suppliedScheme, "https:");
+    assert.equal(evidence.httpStatus, 200);
+    assert.equal(evidence.redirectObserved, false);
+    assert.equal(evidence.healthyBodyMatched, true);
+  });
+
+  it("transport or certificate failure: attempted over verified HTTPS, then FAIL", async () => {
+    const certificateError = Object.assign(new Error("unable to verify the first certificate"), { name: "TypeError" });
+    const { evidence } = await run({ fetchImpl: fakeTransport({ throws: certificateError }) });
+    assert.equal(evidence.verdict, "FAIL");
+    assert.equal(evidence.outcome, TLS_HEALTHZ_OUTCOMES.TRANSPORT_FAILED);
+    assert.equal(evidence.requestAttempted, true);
+    assert.equal(evidence.httpsUsed, true);
+    assert.equal(evidence.tlsVerification, "enabled");
+    assert.equal(evidence.responseReceived, false);
+    assert.equal(evidence.httpStatus, null, "no status was observed");
+    assert.equal(evidence.redirectObserved, null, "no response, so no redirect judgement");
+    assert.equal(evidence.healthyBodyMatched, null);
+  });
+
+  it("NODE_TLS_REJECT_UNAUTHORIZED=0: no request, and verification recorded as disabled", async () => {
+    const { evidence } = await run({ env: { NODE_TLS_REJECT_UNAUTHORIZED: "0" } });
+    assert.equal(evidence.outcome, TLS_HEALTHZ_OUTCOMES.TLS_VERIFICATION_DISABLED);
+    assert.equal(evidence.tlsVerification, "disabled-refused");
+    assert.equal(evidence.requestAttempted, false);
+    assert.equal(evidence.httpsUsed, null);
+    // The run stopped before the target was even evaluated.
+    assert.equal(evidence.targetAccepted, null);
+    assert.equal(evidence.responseReceived, false);
+    // What the operator supplied is still a true fact; nothing was SENT.
+    assert.equal(evidence.accessCredentialPresence, "both");
+    assert.deepEqual(evidence.accessHeaderNamesSent, []);
+  });
+
+  it("http:// target refused: no request, and HTTPS is NOT claimed", async () => {
+    const { evidence } = await run({ origin: "http://worker.invalid-test-host.example" });
+    assert.equal(evidence.outcome, TLS_HEALTHZ_OUTCOMES.TARGET_REFUSED);
+    assert.equal(evidence.requestAttempted, false);
+    assert.notEqual(evidence.httpsUsed, true);
+    assert.equal(evidence.httpsUsed, null);
+    assert.equal(evidence.tlsVerification, "not-attempted");
+    assert.equal(evidence.targetAccepted, false);
+    assert.equal(evidence.suppliedScheme, "http:", "the reason for refusal is recorded");
+  });
+
+  it("an unrecognized scheme is reported as 'other', never rendered", async () => {
+    const { evidence } = await run({ origin: "gopher-secret-thing://worker.invalid-test-host.example" });
+    assert.equal(evidence.suppliedScheme, "other");
+  });
+
+  it("incomplete credentials: no request, presence recorded as incomplete", async () => {
+    const { evidence } = await run({ accessClientSecret: undefined });
+    assert.equal(evidence.outcome, TLS_HEALTHZ_OUTCOMES.CREDENTIALS_INCOMPLETE);
+    assert.equal(evidence.accessCredentialPresence, "incomplete");
+    assert.equal(evidence.accessCredentialPairSupplied, false);
+    assert.equal(evidence.requestAttempted, false);
+    assert.equal(evidence.httpsUsed, null);
+    assert.equal(evidence.tlsVerification, "not-attempted");
+    assert.equal(evidence.targetAccepted, true, "the target itself was fine");
+    assert.deepEqual(evidence.accessHeaderNamesSent, []);
+  });
+
+  it("redirect and non-200: status measured, body never judged", async () => {
+    for (const [status, outcome, redirected] of [
+      [302, TLS_HEALTHZ_OUTCOMES.REDIRECTED, true],
+      [503, TLS_HEALTHZ_OUTCOMES.BAD_STATUS, false],
+    ]) {
+      const { evidence } = await run({ fetchImpl: fakeTransport({ status, body: '{"status":"ok"}' }) });
+      assert.equal(evidence.outcome, outcome);
+      assert.equal(evidence.responseReceived, true);
+      assert.equal(evidence.httpStatus, status);
+      assert.equal(evidence.redirectObserved, redirected);
+      assert.equal(evidence.bodyWithinLimit, null, "the body was not read");
+      assert.equal(evidence.healthyBodyMatched, null, "a healthy-looking body behind a 3xx/5xx is not judged");
+    }
+  });
+
+  it("NO refusal path ever records HTTPS or enabled verification", async () => {
+    const refusals = [
+      await run({ env: { NODE_TLS_REJECT_UNAUTHORIZED: "0" } }),
+      await run({ origin: "http://worker.invalid-test-host.example" }),
+      await run({ origin: `${FAKE_ORIGIN}?q=1` }),
+      await run({ origin: "not a url" }),
+      await run({ accessClientSecret: undefined }),
+      await run({ accessClientId: undefined }),
+    ];
+    for (const { evidence } of refusals) {
+      assert.equal(evidence.requestAttempted, false, evidence.outcome);
+      assert.notEqual(evidence.httpsUsed, true, `${evidence.outcome} must not claim HTTPS`);
+      assert.notEqual(evidence.tlsVerification, "enabled", `${evidence.outcome} must not claim verification`);
+      assert.equal(evidence.responseReceived, false);
+      assert.equal(evidence.httpStatus, null);
+      assert.equal(evidence.verdict, "FAIL");
+    }
+  });
+});
+
+describe("the body limit is enforced WHILE streaming (REVIEW-CORRECTION-001)", () => {
+  const CHUNK = 1024;
+  const TOTAL = 4096; // 4 MiB available if the reader never stopped
+
+  it("cuts an oversized body off at the limit instead of buffering it", async () => {
+    const { stream, meter } = meteredStream({ totalChunks: TOTAL, chunkBytes: CHUNK });
+    const result = await runTlsHealthzAcceptance({
+      origin: FAKE_ORIGIN,
+      fetchImpl: fakeTransport({ respond: () => streamOnlyResponse(stream) }),
+    });
+
+    assert.equal(result.outcome, TLS_HEALTHZ_OUTCOMES.BODY_TOO_LARGE);
+    assert.equal(result.evidence.bodyWithinLimit, false);
+    assert.equal(result.evidence.healthyBodyMatched, null);
+    assert.equal(meter.cancelled, true, "the stream was cancelled once the cap was crossed");
+
+    // The cap is 4 KiB: exactly the chunks up to and including the one that
+    // crossed it were pulled — never the 4 MiB that was on offer.
+    const expectedPulls = Math.floor(TLS_HEALTHZ_MAX_BODY_BYTES / CHUNK) + 1;
+    assert.equal(meter.pulls, expectedPulls, `pulled ${meter.pulls} chunks`);
+    assert.ok(meter.bytesProduced <= TLS_HEALTHZ_MAX_BODY_BYTES + CHUNK);
+    assert.ok(meter.bytesProduced < TOTAL * CHUNK / 100, "far less than the full body was produced");
+  });
+
+  it("stops on a single chunk that alone exceeds the limit", async () => {
+    const huge = new Uint8Array(1024 * 1024).fill(0x20);
+    const { stream, meter } = meteredStream({ totalChunks: 50, chunkBytes: CHUNK, first: huge });
+    const body = await readBoundedBody(streamOnlyResponse(stream), TLS_HEALTHZ_MAX_BODY_BYTES);
+    assert.equal(body.tooLarge, true);
+    assert.equal(body.text, undefined, "nothing is returned for an oversized body");
+    assert.equal(meter.pulls, 1);
+    assert.equal(meter.cancelled, true);
+  });
+
+  it("never calls a buffering convenience (text/json/arrayBuffer/blob)", async () => {
+    // streamOnlyResponse makes every one of those THROW; a regression back to
+    // `await response.text()` fails here as a transport failure, not a pass.
+    const encoded = new TextEncoder().encode('{"status":"ok"}');
+    const { stream } = meteredStream({ totalChunks: 1, chunkBytes: 0, first: encoded });
+    const result = await runTlsHealthzAcceptance({
+      origin: FAKE_ORIGIN,
+      fetchImpl: fakeTransport({ respond: () => streamOnlyResponse(stream) }),
+    });
+    assert.equal(result.outcome, TLS_HEALTHZ_OUTCOMES.HEALTHY, result.detail);
+  });
+
+  it("reassembles a healthy body split across many small chunks", async () => {
+    const parts = ['{"sta', 'tus":', '"o', 'k"', "}"].map((t) => new TextEncoder().encode(t));
+    let i = 0;
+    const stream = new ReadableStream({
+      pull(controller) {
+        if (i < parts.length) controller.enqueue(parts[i++]);
+        else controller.close();
+      },
+    });
+    const result = await runTlsHealthzAcceptance({
+      origin: FAKE_ORIGIN,
+      fetchImpl: fakeTransport({ respond: () => streamOnlyResponse(stream) }),
+    });
+    assert.equal(result.outcome, TLS_HEALTHZ_OUTCOMES.HEALTHY);
+  });
+
+  it("accepts a body of exactly the limit and refuses one byte more", async () => {
+    const pad = (n) => {
+      const base = '{"status":"ok","pad":""}';
+      return `{"status":"ok","pad":"${"x".repeat(n - base.length)}"}`;
+    };
+    const exact = await runTlsHealthzAcceptance({
+      origin: FAKE_ORIGIN,
+      fetchImpl: fakeTransport({ body: pad(TLS_HEALTHZ_MAX_BODY_BYTES) }),
+    });
+    assert.equal(exact.outcome, TLS_HEALTHZ_OUTCOMES.HEALTHY);
+
+    const over = await runTlsHealthzAcceptance({
+      origin: FAKE_ORIGIN,
+      fetchImpl: fakeTransport({ body: pad(TLS_HEALTHZ_MAX_BODY_BYTES + 1) }),
+    });
+    assert.equal(over.outcome, TLS_HEALTHZ_OUTCOMES.BODY_TOO_LARGE);
+  });
+
+  it("does not read a non-200 body at all", async () => {
+    const { stream, meter } = meteredStream({ totalChunks: TOTAL, chunkBytes: CHUNK });
+    const result = await runTlsHealthzAcceptance({
+      origin: FAKE_ORIGIN,
+      fetchImpl: fakeTransport({ respond: () => streamOnlyResponse(stream, 503) }),
+    });
+    assert.equal(result.outcome, TLS_HEALTHZ_OUTCOMES.BAD_STATUS);
+    assert.equal(meter.pulls, 0, "no chunk was requested");
+    assert.equal(meter.cancelled, true, "the body was released");
+  });
+
+  it("applies the request's deadline to a body that stalls", async () => {
+    // One byte, then silence forever. Only the shared AbortSignal can end this.
+    let sent = false;
+    const stalled = new ReadableStream({
+      pull(controller) {
+        if (!sent) {
+          sent = true;
+          controller.enqueue(new TextEncoder().encode("{"));
+          return;
+        }
+        return new Promise(() => {});
+      },
+    });
+    // Raced against a bounded watchdog, so a regression that stops honouring the
+    // deadline FAILS this test promptly instead of hanging the whole suite. The
+    // watchdog timer also holds the event loop open, which AbortSignal.timeout
+    // does not do on its own.
+    let watchdog;
+    const hung = new Promise((resolve) => {
+      watchdog = setTimeout(() => resolve("HUNG"), 3_000);
+    });
+    try {
+      const started = Date.now();
+      const result = await Promise.race([
+        runTlsHealthzAcceptance({
+          origin: FAKE_ORIGIN,
+          timeoutMs: 150,
+          fetchImpl: fakeTransport({ respond: () => streamOnlyResponse(stalled) }),
+        }),
+        hung,
+      ]);
+      assert.notEqual(result, "HUNG", "a stalled body must be ended by the request deadline");
+      assert.equal(result.outcome, TLS_HEALTHZ_OUTCOMES.TRANSPORT_FAILED);
+      assert.match(result.detail, /TimeoutError|AbortError/);
+      assert.equal(result.evidence.responseReceived, true);
+      assert.equal(result.evidence.bodyWithinLimit, null, "a timed-out body is not a judged body");
+      assert.ok(Date.now() - started < 3_000);
+    } finally {
+      clearTimeout(watchdog);
+    }
+  });
+});
+
+describe("the evidence file is created new, exactly 0600, and never overwritten (REVIEW-CORRECTION-001)", () => {
+  async function sandbox() {
+    return mkdtemp(join(tmpdir(), "vf-tls-evidence-"));
+  }
+  const quiet = () => ({ log: () => {}, errorLog: () => {} });
+
+  it("creates a NEW file with mode exactly 0600 containing the record", async () => {
+    const dir = await sandbox();
+    try {
+      const path = join(dir, "evidence.json");
+      const code = await main(["--origin", FAKE_ORIGIN, "--evidence", path], {
+        env: {},
+        fetchImpl: fakeTransport(),
+        ...quiet(),
+      });
+      assert.equal(code, 0);
+      assert.equal((await stat(path)).mode & 0o777, 0o600);
+      const record = JSON.parse(await readFile(path, "utf8"));
+      assert.equal(record.verdict, "PASS");
+      assert.equal(record.schemaVersion, "worker-tls-healthz-02");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("is exactly 0600 even under a umask that would strip the owner's write bit", async () => {
+    const dir = await sandbox();
+    const previous = process.umask(0o277);
+    try {
+      const path = join(dir, "evidence.json");
+      const handle = await createEvidenceFile(path);
+      await handle.close();
+      assert.equal((await stat(path)).mode & 0o777, 0o600);
+    } finally {
+      process.umask(previous);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("REFUSES an existing file, leaves it untouched, and requests nothing", async () => {
+    const dir = await sandbox();
+    try {
+      const path = join(dir, "evidence.json");
+      const original = "PRE-EXISTING EVIDENCE — must survive\n";
+      await writeFile(path, original, { mode: 0o644 });
+      const transport = fakeTransport();
+      const errors = [];
+      const code = await main(["--origin", FAKE_ORIGIN, "--evidence", path], {
+        env: {},
+        fetchImpl: transport,
+        log: () => {},
+        errorLog: (m) => errors.push(String(m)),
+      });
+      assert.equal(code, 2);
+      assert.equal(await readFile(path, "utf8"), original, "the existing file is unchanged");
+      assert.equal((await stat(path)).mode & 0o777, 0o644, "and so are its permissions");
+      assert.equal(transport.calls.length, 0, "nothing was requested");
+      assert.match(errors.join("\n"), /already exists; refusing to overwrite/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("REFUSES a symlink and never writes through it to the target", async () => {
+    const dir = await sandbox();
+    try {
+      const target = join(dir, "victim.txt");
+      const link = join(dir, "evidence.json");
+      await writeFile(target, "VICTIM CONTENT\n");
+      await symlink(target, link);
+      const transport = fakeTransport();
+      const code = await main(["--origin", FAKE_ORIGIN, "--evidence", link], {
+        env: {},
+        fetchImpl: transport,
+        ...quiet(),
+      });
+      assert.equal(code, 2);
+      assert.equal(await readFile(target, "utf8"), "VICTIM CONTENT\n");
+      assert.ok((await lstat(link)).isSymbolicLink(), "the link itself is untouched");
+      assert.equal(await readlink(link), target);
+      assert.equal(transport.calls.length, 0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("REFUSES a dangling symlink rather than creating its target", async () => {
+    const dir = await sandbox();
+    try {
+      const target = join(dir, "would-be-created.txt");
+      const link = join(dir, "evidence.json");
+      await symlink(target, link);
+      const code = await main(["--origin", FAKE_ORIGIN, "--evidence", link], {
+        env: {},
+        fetchImpl: fakeTransport(),
+        ...quiet(),
+      });
+      assert.equal(code, 2);
+      await assert.rejects(stat(target), { code: "ENOENT" }, "the symlink target was not created");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes the evidence of a FAILED run too", async () => {
+    const dir = await sandbox();
+    try {
+      const path = join(dir, "evidence.json");
+      const code = await main(["--origin", "http://worker.invalid-test-host.example", "--evidence", path], {
+        env: {},
+        fetchImpl: fakeTransport(),
+        ...quiet(),
+      });
+      assert.equal(code, 1);
+      const record = JSON.parse(await readFile(path, "utf8"));
+      assert.equal(record.verdict, "FAIL");
+      assert.equal(record.requestAttempted, false);
+      assert.equal((await stat(path)).mode & 0o777, 0o600);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

@@ -30,7 +30,16 @@ The tool makes **exactly one** outbound request and requires all of:
   followed (`redirect: "manual"`), because following it is how an Access login
   page or a zone redirect becomes a false PASS;
 - HTTP `200`;
-- a JSON object body whose `status` is exactly `"ok"`.
+- a JSON object body whose `status` is exactly `"ok"`, read within **4096
+  bytes**.
+
+The body limit is enforced **while the body streams**. Each chunk is checked
+before it is kept. The first chunk that would cross the limit is dropped, and
+the stream is cancelled so no more bytes are read from the connection. The
+result is `body-too-large`. At most 4096 bytes of body are ever held.
+`Content-Length` is never trusted. A non-200 body is cancelled unread. The
+request's single deadline also covers the body, so a stalled body is a
+`transport-failed` result, never a truncated pass.
 
 ### The origin normalization contract
 
@@ -72,14 +81,14 @@ evidence record, a log, a PR or this document.
 # operator's own secret store. Never typed inline.
 node deploy/acceptance/worker-health/tls-healthz-acceptance.mjs \
   --origin https://<worker-host> \
-  --evidence ./tls-healthz-evidence.json
+  --evidence ./tls-healthz-evidence-<UTC timestamp>.json
 ```
 
 | Exit | Meaning |
 | :--- | :--- |
 | `0` | PASS |
-| `1` | FAIL — including a refused target, an incomplete credential pair, a redirect, a TLS failure |
-| `2` | usage error, or the evidence file could not be written |
+| `1` | FAIL — including a refused target, an incomplete credential pair, a redirect, a TLS failure, an oversized body |
+| `2` | usage error; the evidence path already exists or cannot be created (**nothing is requested**); or the record could not be written |
 
 The Worker must be **running** for a PASS. The `videofetch` VM is on-demand:
 starting it, and the Worker, for this measurement is part of the separately
@@ -87,20 +96,65 @@ authorized run, not something this tool does.
 
 ## Evidence
 
-Schema `worker-tls-healthz-01`. Built from an **allowlist**, so nothing can
-arrive by being spread in from a response, a header bag or an error object.
+Schema **`worker-tls-healthz-02`**. The record is built from an **allowlist**,
+so nothing can get in by being copied over from a response, a header bag or an
+error object.
 
-| Recorded | Never recorded |
+`-01` is retired and must not be used. It recorded `httpsUsed: true` and
+`tlsVerification: "enabled"` on every run. That included runs refused before
+any request, and the run refused precisely *because* verification was
+disabled. No accepted evidence was ever produced under `-01`.
+
+**Each fact is recorded only once the run reaches the stage that measures
+it.** `null` means *not measured*: the run stopped earlier. It never stands in
+for `false`.
+
+| Stage | Fields |
 | :--- | :--- |
-| task, schema version, UTC start/finish | the Worker hostname — recorded as `"<withheld>"` |
-| `httpsUsed`, `tlsVerification` | the Access Client Id or Client Secret |
-| `requestedPath` (`/v1/healthz`) | any header **value** |
-| `accessCredentialPairSupplied` (yes/no) | cookies, signed URLs, response bodies |
-| Access header **names** only | Worker HMAC keys, R2 credentials, Cloudflare identifiers |
-| `httpStatus`, `redirectObserved`, `healthyBodyMatched` | the observed health state when it is wrong |
-| `workerHmacEmitted: false`, outcome, `PASS`/`FAIL` | transport error messages (they can carry the hostname) |
+| Always | `task`, `schemaVersion`, `startedAt`/`finishedAt` (UTC), `tlsOrigin: "<withheld>"`, `healthPath`, `accessCredentialPresence` (`both` / `neither` / `incomplete`: what was supplied), `workerHmacEmitted: false`, `outcome`, `verdict` |
+| Target validation | `targetAccepted` (`null` if never evaluated), `suppliedScheme` (`https:`, `http:`, …, or `other`) |
+| Request | `requestAttempted`, `httpsUsed` (`null` unless a request was attempted), `tlsVerification`, `accessHeaderNamesSent` (names only, and only once actually sent) |
+| Response | `responseReceived`, `httpStatus`, `redirectObserved`, `bodyWithinLimit`, `healthyBodyMatched` |
 
-The evidence file is written mode `0600`.
+The `tlsVerification` field takes three values:
+
+| Value | Meaning |
+| :--- | :--- |
+| `enabled` | A request was attempted with ordinary certificate validation. |
+| `disabled-refused` | `NODE_TLS_REJECT_UNAUTHORIZED=0` was present, so the run was refused and nothing was requested. |
+| `not-attempted` | The run stopped before any request for another reason. |
+
+| Situation | `requestAttempted` | `httpsUsed` | `tlsVerification` |
+| :--- | :--- | :--- | :--- |
+| PASS | `true` | `true` | `enabled` |
+| transport or certificate failure | `true` | `true` | `enabled` |
+| `NODE_TLS_REJECT_UNAUTHORIZED=0` | `false` | `null` | `disabled-refused` |
+| `http://` target refused | `false` | `null` | `not-attempted` |
+| incomplete Access pair | `false` | `null` | `not-attempted` |
+
+**Never recorded:**
+
+- the Worker hostname;
+- the Access Client Id or Client Secret;
+- any header **value**;
+- cookies, signed URLs or response bodies;
+- Worker HMAC keys, R2 credentials or Cloudflare identifiers;
+- the observed health state when it is wrong;
+- transport error messages, which can carry the hostname.
+
+### The evidence file
+
+`--evidence <path>` must name a path that **does not exist yet**:
+
+- The file is created **before the request**, with `O_CREAT | O_EXCL`, then
+  `fchmod` to exactly **`0600`** whatever the umask. The path is reserved for
+  the whole run, and an unusable path stops the run before anything is dialled.
+- An existing path is **refused and left untouched**, and the tool exits `2`
+  without requesting anything. This covers a regular file, and a symlink whether
+  or not its target exists. A symlink is never followed, so its target can never
+  be overwritten.
+- The record of a FAIL is written too. The same record is always printed to
+  stdout as well.
 
 ## Validation
 

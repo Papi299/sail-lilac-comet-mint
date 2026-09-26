@@ -23,8 +23,12 @@
 //
 // There is also no `--insecure`, no `--no-verify` and no certificate override of
 // any kind, and the tool refuses to run under NODE_TLS_REJECT_UNAUTHORIZED=0.
+//
+// `--evidence <path>` must name a path that does NOT exist yet. It is created
+// before the request, exclusively and with mode exactly 0600; an existing file
+// or symlink is refused and left untouched.
 
-import { writeFile } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -94,6 +98,33 @@ export function parseArgs(argv) {
   return { origin, evidencePath, timeoutMs };
 }
 
+/**
+ * Creates the evidence file as a NEW file with mode exactly 0600.
+ *
+ * REVIEW-CORRECTION-001. `writeFile(path, …, { mode: 0o600 })` applies the mode
+ * only when it CREATES the file: an existing file keeps its old permissions and
+ * is silently overwritten, so the documented "0600" was not a guarantee.
+ *
+ *   `wx`   O_CREAT | O_EXCL. An existing path — regular file, directory, or a
+ *          symlink, dangling or not — fails with EEXIST. A symlink is never
+ *          followed, so its target can never be clobbered.
+ *   chmod  on the open descriptor, so the mode is exactly 0600 whatever the
+ *          process umask (a umask only ever REMOVES bits from the create mode).
+ *
+ * Called BEFORE the request, so an unusable evidence path stops the run before
+ * anything is dialled, and the path is reserved for the whole run.
+ */
+export async function createEvidenceFile(path) {
+  const handle = await open(path, "wx", 0o600);
+  try {
+    await handle.chmod(0o600);
+  } catch (err) {
+    await handle.close().catch(() => {});
+    throw err;
+  }
+  return handle;
+}
+
 export async function main(argv, { env = process.env, log = console.log, errorLog = console.error, fetchImpl = fetch } = {}) {
   const args = parseArgs(argv);
   if (args.help) {
@@ -106,31 +137,49 @@ export async function main(argv, { env = process.env, log = console.log, errorLo
     return 2;
   }
 
-  const result = await runTlsHealthzAcceptance({
-    origin: args.origin,
-    accessClientId: env[ACCESS_ID_ENV],
-    accessClientSecret: env[ACCESS_SECRET_ENV],
-    env,
-    fetchImpl,
-    timeoutMs: args.timeoutMs,
-  });
-
-  // The record is printed as well as optionally written, so a run whose evidence
-  // path is unwritable still leaves a reviewable result. It contains no
-  // credential, no header value, no body and no hostname.
-  log(JSON.stringify(result.evidence, null, 2));
-
+  let evidenceFile = null;
   if (args.evidencePath) {
     try {
-      await writeFile(args.evidencePath, `${JSON.stringify(result.evidence, null, 2)}\n`, {
-        encoding: "utf8",
-        mode: 0o600,
-      });
-      log(`tls-healthz-acceptance: evidence written to ${args.evidencePath}`);
+      evidenceFile = await createEvidenceFile(args.evidencePath);
     } catch (err) {
-      errorLog(`tls-healthz-acceptance: could not write evidence (${err?.code ?? "error"})`);
+      errorLog(
+        err?.code === "EEXIST"
+          ? "tls-healthz-acceptance: the evidence path already exists; refusing to overwrite it" +
+              " (choose a new path). Nothing was requested."
+          : `tls-healthz-acceptance: could not create the evidence file (${err?.code ?? "error"}).` +
+              " Nothing was requested.",
+      );
       return 2;
     }
+  }
+
+  let result;
+  try {
+    result = await runTlsHealthzAcceptance({
+      origin: args.origin,
+      accessClientId: env[ACCESS_ID_ENV],
+      accessClientSecret: env[ACCESS_SECRET_ENV],
+      env,
+      fetchImpl,
+      timeoutMs: args.timeoutMs,
+    });
+
+    // The record is printed as well as written, so a run whose evidence write
+    // fails still leaves a reviewable result. It contains no credential, no
+    // header value, no body and no hostname.
+    log(JSON.stringify(result.evidence, null, 2));
+
+    if (evidenceFile) {
+      try {
+        await evidenceFile.writeFile(`${JSON.stringify(result.evidence, null, 2)}\n`, "utf8");
+        log(`tls-healthz-acceptance: evidence written to ${args.evidencePath} (mode 0600)`);
+      } catch (err) {
+        errorLog(`tls-healthz-acceptance: could not write evidence (${err?.code ?? "error"})`);
+        return 2;
+      }
+    }
+  } finally {
+    await evidenceFile?.close().catch(() => {});
   }
 
   if (result.pass) {
