@@ -9,14 +9,18 @@ made by the Product Owner, because it determines persistent-volume semantics,
 TLS termination, external egress enforcement, network-namespace ownership and
 R2 placement/jurisdiction.
 
-**Status — current as of 2026-09-26, recorded by
-`HLS-10-PRODUCTION-ACCEPTANCE-DOCS-CLOSURE-001`** (documentation only; it
-re-measured nothing itself). The previous record was
-`HLS-PRE-HLS10-DOCS-STATE-RECONCILIATION-001` (earlier on 2026-09-26). The Worker
+**Status — current as of 2026-09-27, recorded by
+`WORKER-LIVENESS-STATIC-USER-CORRECTION-001`** and its evidence reconciliation.
+It re-measured nothing on the VM. It records the operator-held evidence of
+`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-LIVE-ACCEPTANCE-001`, plus one read-only
+provider observation of Vercel Production. The previous records were
+`HLS-10-PRODUCTION-ACCEPTANCE-DOCS-CLOSURE-001` and, before it,
+`HLS-PRE-HLS10-DOCS-STATE-RECONCILIATION-001` (both 2026-09-26). The Worker
 image and rollback rows are the accepted operator-measured HLS-10 Production
-state (§4j). The Vercel deployment rows were last observed on 2026-09-19; HLS-10
-exercised the unchanged control plane through its Production alias but did not
-re-measure the deployment identity.
+state (§4j). The Vercel Production row was re-observed from provider metadata
+on 2026-09-27. HLS-10 (2026-09-26 16:05Z) exercised the control plane, then
+unchanged, through its Production alias but did not re-measure the deployment
+identity.
 
 - Phase 9 and Phase 10 are complete and accepted. Generic yt-dlp extraction is
   enabled in Production, and the execution plane runs on demand.
@@ -38,6 +42,15 @@ re-measure the deployment identity.
   `sha256:e5b1144c…`, to `videofetch-worker:latest` and accepted it end to end on
   a real public HLS source. The immediate Worker rollback is the pre-HLS image
   `sha256:5925515f…`. See §4j.
+- **Worker health, 2026-09-26.** `GET /v1/healthz` through the real TLS
+  endpoint was accepted in Production. The external liveness probe is **not**
+  deployed: its first live deployment failed at the systemd state query and
+  was rolled back. A static-account correction is in source, and live
+  re-acceptance is pending. See §8 and §10.
+- **Vercel Production was redeployed on 2026-09-26 at 20:10Z.** The new
+  deployment, `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd`, is a provider-recorded
+  redeploy of the P2 deployment `dpl_BcefWQ…`. It was not Git-attested and has
+  no acceptance record of its own; see the Vercel row and §11h.
 
 The Phase-10 rows below were recorded on 2026-09-10 by
 `POST-PHASE-10-STATE-OF-RECORD-RECONCILIATION-001`. The Worker-runtime,
@@ -67,8 +80,9 @@ records are in §11 and §11a–§11h.
 | Worker runtime source | `f0b47bd567dd978374bfec1a01e6d9768c747160`, tree `2b1099bb146a88f4a4e70bdd3065fba100ef5f7f` (PR #79 merge) — the qualified source of the image promoted 2026-09-26 by `HLS-10-PRODUCTION-PROMOTION-REAL-SOURCE-ACCEPTANCE-001`. The image was **not** built from later `main`: at promotion `main` was `1524cdc4a8f1347431481e7fc4c2772aabe7ac60` (tree `481e4eac86357fb1bc0d1e4e19d498331e21f3fe`), four documentation-only commits ahead, with no runtime-code drift. It superseded P1's `593f47df…` (2026-09-18). Before that came the unknown-audio promotion's `8b59cdff…` (2026-09-18), the 4 GiB rollout's `2e6c0cf9…` (2026-09-17) and SPLIT-08E's `6ce4ce2b…` (2026-09-13) | commit and drift GitHub-verifiable; image↔source identity operator-measured — §4j, §11h |
 | Worker image | `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a` as `videofetch-worker:latest`, also retained as `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c`; pinned yt-dlp `2026.08.19`, unchanged. Observed as `latest` and as the running Worker throughout the HLS-10 acceptance epoch (container `0bfaf6810dc233819ac3281903fc750c66fb5a969ed6725c5408521399dbbf83`, NRestarts 0). It contains clear-HLS v1 | operator-measured — §4j |
 | Previous Worker image — rollback asset | **Immediate:** `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e`, retained as `videofetch-worker:rc-593f47dfffe7-5925515fb002` (source `593f47df…`, the P1 image: pre-HLS, sends `sourceQuality`; Production 2026-09-18 → 2026-09-26). **Deeper:** `sha256:d6aa8b404d015e72bb216f364b900271521d44f66bae672bd012d4239fc52b0e`, retained as `videofetch-worker:rc-8b59cdffbfe5-d6aa8b404d01` (source `8b59cdff…`, the unknown-audio image, without `sourceQuality`), then `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0`, retained as `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799` (source `2e6c0cf9…`, the 4 GiB rollout image), then `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b`, retained as `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (source `6ce4ce2b…`, the SPLIT-08E image, 500 MiB default). Rollback is an image retag onto the same disk-backed unit and workspace | operator-measured — §9, §11h |
-| Vercel Production | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478`, deployed 2026-09-19 for P2. **Immediate rollback:** `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` (from `593f47df…`, P1's Vercel-first step), which accepts `sourceQuality`, so it needs no Worker rollback. **Deeper:** `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` (from `397f238b…`) predates `sourceQuality`: roll the Worker back **before** using it (§9) | source by chain of custody — **not** Vercel Git-attested; deployment and alias state provider-observable (§11h) |
+| Vercel Production | `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd` — target `production`, `source: redeploy`, created 2026-09-26T20:10:31.374Z, READY 2026-09-26T20:11:07.464Z, and holding the Production aliases when observed on 2026-09-27. Vercel records it as a redeploy of `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq` (`meta.originalDeploymentId`), the P2 deployment of 2026-09-19 from `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478` by chain of custody; the redeploy carries that CLI-recorded commit over. It has no acceptance record of its own. **Rollback:** `dpl_BcefWQ…` (the redeploy's original); **immediate code rollback** `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` (from `593f47df…`, P1's Vercel-first step), which accepts `sourceQuality`, so it needs no Worker rollback. **Deeper:** `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` (from `397f238b…`) predates `sourceQuality`: roll the Worker back **before** using it (§9). Vercel applies environment changes only to new deployments, so each older deployment keeps the values it was created with (§9) | *provider-observed* deployment metadata (read-only, 2026-09-27) — establishes deployment identity and state, **not** a Git-attested source commit (§11h) |
 | Execution plane | **on demand**; the idle state is **Stopped** | §3c, §11h |
+| Worker health (§10) | `GET /v1/healthz` through the TLS endpoint: **ACCEPTED 2026-09-26**. External liveness probe: **OPEN** — first live deployment failed and was rolled back; static-account correction in source, live re-acceptance pending | operator-measured — §8, §10, §11 |
 | Product media workspace | **4 GiB delivered-media limit (4,294,967,296 bytes) LIVE** on the bounded 10 GiB disk-backed ext4 workspace bound at `/tmp/videofetch` — no Product media tmpfs. `MAX_FILE_SIZE` is absent, so the image default applies. `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, rollout Phases 1A–1E complete, Production accepted 2026-09-17 | contract repository/source-verifiable; deployment operator-measured — §2a, §11h |
 
 Precisely:
@@ -3303,8 +3317,10 @@ it passed (see *HLS-10* above).
 
 - `genericPresetOwner()` / `id in map` — non-blocking defense-in-depth debt
   (§11).
-- The external liveness probe and `GET /v1/healthz` through the TLS endpoint —
-  still unchecked in §10; HLS-10 did not measure them.
+- The external liveness probe — still unchecked in §10; HLS-10 did not
+  measure it. Its first live deployment (2026-09-26, after HLS-10) failed and
+  was rolled back (§8). `GET /v1/healthz` through the TLS endpoint, which
+  HLS-10 did not measure either, has since been accepted (§10).
 
 ---
 
@@ -3947,9 +3963,12 @@ deliberately **not** implemented in application code.
 
 ### The external liveness probe — source implementation
 
-*`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001` — **implemented in
-source, not deployed, live acceptance pending.** Nothing below has been
-installed on the VM; §10 stays open until it is, and is accepted there.*
+*`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`, runtime identity
+corrected by `WORKER-LIVENESS-STATIC-USER-CORRECTION-001` — **implemented in
+source, not deployed, live re-acceptance pending.** The first live deployment
+(2026-09-26) failed and was rolled back; see "First live deployment" below.
+Nothing is installed on the VM, and §10 stays open until the corrected
+artefacts are installed and accepted there.*
 
 The probe owner in the table above now has a reviewed source implementation:
 `deploy/bin/vf-worker-liveness-probe`, run by
@@ -3961,8 +3980,9 @@ The probe owner in the table above now has a reviewed source implementation:
 | :--- | :--- |
 | Runs outside the media namespace | VM host namespace; no `nsenter`, no `docker exec`, no container runtime at all; `RestrictNamespaces=yes` |
 | Probes loopback only | `http://127.0.0.1:<VIDEOFETCH_WORKER_PORT>/v1/healthz` — host and path are constants, only the port is configuration |
-| One port declaration | `VIDEOFETCH_WORKER_PORT` in `/etc/videofetch/media-egress.env` — the file the namespace holder's port also comes from — is the authoritative source. `/etc/videofetch` is root `0700` and stays so, so the probe's DynamicUser never opens it. **PID 1 reads the file as root** (`EnvironmentFile=-…`, the holder's own mechanism and parser), pins the variable so it cannot come from the manager environment, and passes only that value to the unprivileged process; no copy, no second setting |
-| No new host package | the pinned host Node the broker already requires; no curl, no wget. The DynamicUser's ability to traverse `/opt/videofetch` is **not** recorded in the repository and is an install-time check (`deploy/README.md`) |
+| One port declaration | `VIDEOFETCH_WORKER_PORT` in `/etc/videofetch/media-egress.env` — the file the namespace holder's port also comes from — is the authoritative source. `/etc/videofetch` is root `0700` and stays so, so the probe's unprivileged account never opens it. **PID 1 reads the file as root** (`EnvironmentFile=-…`, the holder's own mechanism and parser), pins the variable so it cannot come from the manager environment, and passes only that value to the unprivileged process; no copy, no second setting |
+| No new host package | the pinned host Node the broker already requires; no curl, no wget. Traversal of `/opt/videofetch` is an install-time check run as the probe's own account (`deploy/README.md` step 6c). On 2026-09-26 the path measured `755 root:root` at every component, and a `DynamicUser` ran Node `v22.23.2` (*operator-measured*) |
+| Runtime identity | a dedicated static system account, `User=`/`Group=videofetch-liveness`: its own group only (no `docker`, no `videofetch-broker`, no `SupplementaryGroups=`), `nologin`, no home, no sudo, no capability. **Not** `DynamicUser=`, which was measured unable to make the systemd query on the Production VM (below). The operator provisions it before the timer is enabled (`deploy/README.md` step 6a) |
 | One verdict per run | every exit, including configuration faults, signals and unexpected shell errors, emits exactly one `OUTCOME=` line |
 | On-demand preserved | a stopped VM produces no ticks and `Persistent=false` forbids catch-up; an `inactive` Worker is `idle` with **no request made**; a `failed` Worker is always a failure |
 | Observer, not supervisor | read-only `systemctl show`/`is-failed` only; no activating dependency on the Worker; `StartLimitIntervalSec=0` so failures cannot silence it |
@@ -3975,7 +3995,61 @@ records `OUTCOME=unhealthy` and its own unit enters `failed` — but nothing
 restarts it on that basis. Adding such an action would be a separate, reviewed
 decision; it is out of scope here and deliberately absent.
 
-### TLS `/v1/healthz` acceptance tooling — source only
+### First live deployment — FAILED and rolled back (2026-09-26)
+
+`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-LIVE-ACCEPTANCE-001`, from `main`
+`394fe60cdcdc04feaa9b65b664734bf29eb80564` (the PR #83 merge). Evidence SHA-256
+`867f6eca937e0fa004ce8e3ce5924ee07aa2d78b5444dd919b2cbdfb0c5448da` (held by
+the operator, not in the repository) — *operator-measured failed-deployment
+evidence*. It proves the failure and the rollback; it does **not** prove
+liveness acceptance.
+
+| Stage | Result |
+| :--- | :--- |
+| Baseline | VM initially **Stopped**; Worker image `sha256:e5b1144c…`; no liveness artefact present |
+| `DynamicUser` Node prerequisite | **PASS** — Node `v22.23.2` |
+| Installation | all four PR #83 artefacts installed **byte-identical** to source |
+| `systemd-analyze verify` | clean after installation |
+| Timer | enabled, `active`/`waiting`, `Persistent=no`; the service stayed `static` |
+| First timer-triggered probe (19:41:49Z) | exactly one `OUTCOME=state-unavailable`, exit `2`; no health request was made |
+| Liveness stages: active and healthy, idle, idle timer tick, restore | **not reached** — every invocation stopped at the systemd state query |
+| Worker | never stopped or restarted: same main PID and container, `NRestarts=0` |
+| Rollback (19:43:47Z–19:43:48Z) | timer disabled, four artefacts removed, units `not-found`, no failed unit, every pre-existing unit unchanged |
+| End state | VM returned to **Stopped** |
+
+**Root cause, as measured.** The probe's read-only `systemctl show` failed with
+`Transport endpoint is not connected`, and the failure was isolated to the
+`DynamicUser` identity:
+- a `DynamicUser` with no other hardening failed the same way;
+- the full sandbox minus each of 11 hardening directives, one at a time, failed
+  the same way;
+- a static unprivileged identity (`nobody`) made the same query successfully;
+- the kernel recorded no seccomp denial.
+
+**Bounded conclusion.** On the current Production Lima VM, whose classic
+`dbus-daemon` is 1.14.10 (systemd 255), the `DynamicUser` service identity
+could not complete the read-only systemd query; a stable static unprivileged
+identity could. That is not a claim about `DynamicUser` or D-Bus in general,
+and the mechanism inside the bus daemon that rejects the transient identity
+was not isolated.
+
+**Correction — source only.** `WORKER-LIVENESS-STATIC-USER-CORRECTION-001`
+runs the unit as a dedicated static account, `videofetch-liveness`
+(`deploy/README.md`, "Runtime identity"). Everything else in the table above is
+unchanged:
+- the hardening set, with `RemoveIPC=yes`, which `DynamicUser=` implied, now
+  stated explicitly;
+- PID 1's delivery of the port;
+- `/etc/videofetch` at `0700 root:root`;
+- the loopback-only request and the observer-only behaviour;
+- the timer.
+
+The corrected unit has **not** been installed. A new live acceptance must first
+prove, as `videofetch-liveness` and before the timer is enabled, that the
+account can run the pinned Node and make the probe's exact systemd query
+(`deploy/README.md` step 6c).
+
+### TLS `/v1/healthz` acceptance — CLOSED / PASS (2026-09-26)
 
 `deploy/acceptance/worker-health/tls-healthz-acceptance.mjs` is the tool for the
 second open health item: `GET /v1/healthz` through the **real external HTTPS
@@ -3989,8 +4063,28 @@ sent, because `/v1/healthz` is unauthenticated at the application layer. Its
 evidence record (`worker-tls-healthz-02`) records each fact only once the run
 reaches the stage that measures it, and it withholds the hostname and every
 credential value. The record is written to a new file created exclusively
-with mode `0600` before the request. **It has not been run against
-Production.** See `deploy/acceptance/worker-health/README.md`.
+with mode `0600` before the request. See
+`deploy/acceptance/worker-health/README.md`.
+
+**Accepted in Production on 2026-09-26** by
+`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-LIVE-ACCEPTANCE-001`, in one run of this
+tool from `main` `394fe60c…`.
+- **Path.** From the operator's Mac over the real external path: public HTTPS →
+  Cloudflare Access (Service Auth) → named tunnel → VM loopback ingress →
+  Worker.
+- **Result.** Schema `worker-tls-healthz-02`, verdict `PASS`, outcome
+  `healthy`, HTTP `200`. `requestAttempted` and `httpsUsed` are `true`,
+  `tlsVerification` is `"enabled"`, and `redirectObserved` is `false`. The body
+  was within the limit and matched the healthy shape.
+- **Credentials.** The Access pair was present (`both`) and both Service Auth
+  header names were sent. `workerHmacEmitted` is `false`.
+- **Evidence.** SHA-256
+  `5745ece713e824585d9d21c67214b4c140d7a58e91aa4251a4323a4f0ae03f35` —
+  **accepted operator-measured Production evidence, not CI**. The record's
+  `task` field is the harness constant
+  (`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`).
+- **Privacy.** The record withholds the hostname. Neither it nor this document
+  holds the origin, an Access value or anything derived from one.
 
 Do not "fix" an unhealthy-looking container by punching a hole in the egress
 policy. A Worker that cannot be probed from outside its namespace is a
@@ -4076,14 +4170,27 @@ promotion. Analysis stops sending `sourceQuality`, and nothing else changes:
 - presets, selections, execution plans and selectors are identical across the
   28-scenario identity corpus (*operator-measured*, candidate acceptance);
 - the accepted X/Twitter job delivered the same bytes on both images (§11h);
-- current Vercel `dpl_BcefWQ…` and its immediate rollback `dpl_AFFCLwLi…` both
-  accept a Worker that omits the field. P1's Vercel-first step proved it for
+- the P2 deployment `dpl_BcefWQ…` and the immediate rollback `dpl_AFFCLwLi…`
+  both accept a Worker that omits the field. P1's Vercel-first step proved it for
   `dpl_AFFCLwLi…` against this exact image. `dpl_BcefWQ…` carries the same shared
   contract: PR #64 changed no file under `src/shared`, `src/web`,
-  `src/lib/security` or `src/routes/api` (*repository-verifiable*).
+  `src/lib/security` or `src/routes/api` (*repository-verifiable*). The current
+  Production deployment, `dpl_BJYRG7…`, is a provider-recorded redeploy of
+  `dpl_BcefWQ…`.
 
-**Vercel rollback ordering.** Vercel Production is `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`
-(P2, 2026-09-19). There are two Vercel rollback layers, and they are NOT alike:
+**Vercel rollback ordering.** Vercel Production is `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd`.
+Vercel records it as a redeploy (2026-09-26 20:10Z) of the P2 deployment
+`dpl_BcefWQBrtw7bJuubiQrTr9h38cvq` (2026-09-19); *provider-observed*, not
+Git-attested.
+
+- **Environment.** Vercel applies environment changes only to new deployments,
+  so every older deployment below keeps the environment it was created with.
+  Before relying on one, confirm that its Cloudflare Access Service Auth pair
+  is still accepted.
+- **Stepping back to `dpl_BcefWQ…` itself** returns to the redeploy's
+  original.
+
+Beyond that there are two code rollback layers, and they are NOT alike:
 
 - **Immediate — `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`**, P1's control plane. It
   already accepts the optional `sourceQuality`, so P2 rolls back on Vercel alone
@@ -4298,22 +4405,50 @@ authorization.
       *Left open by the 2026-09-10 reconciliation.* No automated external probe
       is recorded as configured; successful manual health requests are not
       one.
-      - *Still open.* A source implementation now exists —
-        `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`, §8, §11 —
-        with executor-local deterministic validation only. It is **not
-        installed or enabled on the VM**, and no deployed probe has been
-        observed. This box closes only after the artefacts are installed under
-        separate authorization and accepted there.
-- [ ] `GET /v1/healthz` returns 200 through the TLS endpoint.
-      *Left open by the 2026-09-10 reconciliation.* The TLS endpoint is proven
-      to reach the Worker's authenticated routes (§11c, §11h), but no accepted
-      record measures `/v1/healthz` itself through it.
-      - *Still open.* Acceptance **tooling** now exists
-        (`deploy/acceptance/worker-health/`, same task id), with
-        executor-local deterministic validation only. **It has not been run
-        against the real endpoint**, so there is still no accepted
-        measurement. This box closes only after a separately authorized live
-        run passes.
+      - *Source.* `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`
+        (PR #83; §8, §11), with executor-local deterministic validation only.
+      - *First live deployment, 2026-09-26 — FAILED and rolled back.*
+        - **What passed.** `…-LIVE-ACCEPTANCE-001` installed the PR #83
+          artefacts byte-identically. The prerequisites and
+          `systemd-analyze verify` passed.
+        - **What failed.** The first timer-triggered probe returned
+          `OUTCOME=state-unavailable` at the systemd state query.
+        - **Diagnosis.** The `DynamicUser` identity on the VM's classic D-Bus.
+          A static unprivileged identity succeeded in the diagnostic.
+        - **Outcome.** The deployment was rolled back, and no liveness
+          acceptance stage completed.
+        - **Evidence.** SHA-256
+          `867f6eca937e0fa004ce8e3ce5924ee07aa2d78b5444dd919b2cbdfb0c5448da` —
+          *operator-measured failed-deployment evidence*. It proves the
+          failure and the rollback, not acceptance (§8).
+      - *Still open.* `WORKER-LIVENESS-STATIC-USER-CORRECTION-001` implements
+        the static-account correction in source only.
+        - **To close this box**, the corrected artefacts must be installed
+          under separate authorization and accepted there.
+        - **Before the timer is enabled**, the account's Node and
+          systemd-query checks must pass.
+- [x] **`GET /v1/healthz` returns 200 through the TLS endpoint.**
+      *Left open by the 2026-09-10 reconciliation; closed 2026-09-26.*
+      - Before: the TLS endpoint was proven to reach the Worker's authenticated
+        routes (§11c, §11h), but no accepted record measured `/v1/healthz`
+        itself through it. `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`
+        then added the acceptance tooling (`deploy/acceptance/worker-health/`).
+      - Now measured. On 2026-09-26, `…-LIVE-ACCEPTANCE-001` ran that tool from
+        the operator's Mac through the real external path: public HTTPS →
+        Cloudflare Access → named tunnel → VM loopback → Worker.
+        - **Result.** Schema `worker-tls-healthz-02`, **PASS**, HTTP `200`,
+          healthy body matched.
+        - **Transport.** TLS verification enabled; no redirect.
+        - **Credentials.** Access Service Auth used, with both header names
+          sent; no Worker HMAC.
+        - **Evidence.** SHA-256
+          `5745ece713e824585d9d21c67214b4c140d7a58e91aa4251a4323a4f0ae03f35` —
+          **accepted operator-measured Production evidence, not CI** (§8).
+      - No hostname, origin or Access value is recorded here or in the
+        evidence.
+      - The measurement accepts the ingress as it was when the run executed.
+        Vercel is not on that path, so the Vercel Production redeploy earlier
+        in the same window (§11) neither weakens nor is described by it.
 - [x] **Phase-9 safe-egress acceptance suite executed from inside the deployed
       boundary.** Executed 2026-08-30 and ACCEPTED. See §11a.
 
@@ -4360,7 +4495,9 @@ authorization.
 | `CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001` | **CLOSED — runtime absence verified (PASS)** | A dedicated measurement on 2026-09-26 of the live Production Worker, not of the retained HLS candidate. It used the committed names-only observer `makeSystemObservers().environmentNames()` against `videofetch-worker`, from `main` `77732cfe…`. `CLOUDFLARE_ACCESS_CLIENT_ID`, `CLOUDFLARE_ACCESS_CLIENT_SECRET` and `VIDEOFETCH_ACCESS_SECRET` are absent, and so are their case-insensitive variants. The expected control names `WORKER_CONTROL_KEY_ID`, `WORKER_CONTROL_SECRET` and `R2_BROKER_SOCKET_PATH` are present. One stable runtime epoch covered the measurement: image `sha256:5925515f…`, container `cd6e46d0…`, 0 restarts. No secret value, value hash or value length was fetched. Evidence: SHA-256 `702d6a350a08f263a19ac6aa3445ee7a8cd0fe2238fe0d7c213baac6a17f8971` (operator-held). *Accepted operator-measured runtime evidence, not CI.* No HLS step closed it. It was a pre-promotion prerequisite, so HLS-10 had to repeat the check after promotion. HLS-10 did, immediately after the promotion and at the end, on the promoted Worker epoch, and it passed (§4j). The §10 checklist item is closed. See §4j. |
 | `HLS-10-PRODUCTION-PROMOTION-REAL-SOURCE-ACCEPTANCE-001` (executed as `…-RETRY-001`) | **CLOSED / PASS / PRODUCTION ACCEPTED** | 2026-09-26: the qualified HLS-9B image `sha256:e5b1144c…` (source `f0b47bd5…`, not rebuilt; `main` `1524cdc4…` was docs-only ahead, with no runtime-code drift) was retagged by immutable id as `videofetch-worker:latest` at 16:05:26.998Z, and only `videofetch-worker.service` was restarted. Candidate epoch: container `0bfaf6810dc2…`, StartedAt 16:05:27.747Z, NRestarts 0, stable to the end. The post-promotion names-only credential-custody check passed twice on that epoch. The direct regression passed (2,848,208 bytes, equal to the job size and the expected digest). On an operator-approved public HLS test master, the previous image advertised 0 presets (5 HLS renditions withheld, `unsupported_protocol`), and the promoted image advertised `preset:best` plus five named rungs; `preset:144` went through all six durable states, directly observed, with 0 yt-dlp, `ffmpeg` or `ffprobe` processes across 35 downloading samples. A `303` presigned R2 GET delivered 20,049,865 bytes, equal to the Product `fileSize` (SHA-256 `91cd6fc0…`, `video/mp4` from the object's `Content-Type`), and an offline ffprobe found one H.264 and one AAC stream, 634.634 s. No rollback; no Vercel, Cloudflare, R2, systemd or `worker.env` change; the VM ended Stopped. Evidence `/var/tmp/hls10/hls10-production-acceptance.txt`, SHA-256 `83b0e2374eb29effe54190bdbb55890e9252f8583c2334e9ca6d7e648b1dcf2e` (*accepted operator-measured*, not CI). A first attempt stopped before starting the VM and changed nothing. See §4j. |
 | `genericPresetOwner()` / `id in map` | **OPEN — non-blocking defense-in-depth debt** | `genericPresetOwner()` (`src/worker/execution/format-plan.ts`, since HLS-7) decides which private selection map claims a requested preset with `id in map`, and `in` also sees inherited keys. An inherited progressive entry alone would therefore count as an executable owner. Analysis builds ordinary maps, so no current Product path produces one. A future hardening may move ownership to own-property semantics. Not changed here. |
-| `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001` | **IMPLEMENTED IN SOURCE / NOT DEPLOYED / LIVE ACCEPTANCE PENDING** | Source foundation for the two open §10 health items; **neither is closed by it**. *(1) External liveness probe:* `deploy/bin/vf-worker-liveness-probe` + `vf-worker-health-request.mjs`, run by `videofetch-worker-liveness.service` on `videofetch-worker-liveness.timer`. It runs in the VM host namespace, outside `videofetch-media-netns` and the container (no `nsenter`, no `docker`), and probes only `http://127.0.0.1:<VIDEOFETCH_WORKER_PORT>/v1/healthz`. The authoritative port source is `media-egress.env`, but the probe's DynamicUser never opens the root-only `0700` `/etc/videofetch`: PID 1 reads the file as root through `EnvironmentFile=` and passes only the value. The request runs on the pinned host Node the broker already requires, so no new host package is added. Every run emits exactly one `OUTCOME=` line. On-demand semantics: a stopped VM produces no ticks and `Persistent=false` forbids catch-up; an `inactive` Worker is `idle` with no request; a `failed` Worker is a failure, never idle. It is an observer only: read-only `systemctl` verbs, no activating dependency on the Worker, `StartLimitIntervalSec=0`, and **no restart action** — restart-on-unhealthy remains unimplemented (§8). *(2) TLS `/v1/healthz` acceptance tooling:* `deploy/acceptance/worker-health/` — HTTPS only, exact path, ordinary certificate validation, no redirect, 200 + `{"status":"ok"}`, Access Service Auth pair from the environment both-or-neither, no Worker HMAC. The 4096-byte body limit is enforced while streaming. Evidence schema `worker-tls-healthz-02` records only measured facts (`-01` is retired; it never produced accepted evidence) and withholds the hostname and every credential value, in a new `0600` file that is never overwritten. **Not run against Production.** *Validation:* executor-local deterministic tests only (`src/worker/runtime/worker-liveness-deployment-policy.test.ts`, `scripts/worker-tls-healthz-acceptance.test.mjs`) — not GitHub CI. *Unchanged:* `Dockerfile.worker` (still no `HEALTHCHECK`, no curl/wget), Worker capabilities, the media namespace, the safe-egress policy, every bind, every credential scope and all Cloudflare configuration. *Review correction (`…-REVIEW-CORRECTION-001`), still source only:* (a) port delivery through PID 1 `EnvironmentFile=`, because the first revision's DynamicUser could not traverse the root-only `/etc/videofetch`; (b) exactly one `OUTCOME=` on every exit; (c) evidence stage semantics; (d) the body cap enforced while streaming; (e) exclusive `0600` evidence creation. *Remaining gates:* installing and accepting the probe on the VM — including the DynamicUser `/opt/videofetch` traversal check and `systemd-analyze verify`, neither available to the executor — and a live TLS run, each under its own authorization. |
+| `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001` | **IMPLEMENTED IN SOURCE (PR #83). TLS portion: CLOSED / PASS / PRODUCTION ACCEPTED. Liveness portion: OPEN — first live attempt failed and rolled back** | Source foundation for the two §10 health items; the source alone closed **neither**. *(1) External liveness probe:* `deploy/bin/vf-worker-liveness-probe` + `vf-worker-health-request.mjs`, run by `videofetch-worker-liveness.service` on `videofetch-worker-liveness.timer`. It runs in the VM host namespace, outside `videofetch-media-netns` and the container (no `nsenter`, no `docker`), and probes only `http://127.0.0.1:<VIDEOFETCH_WORKER_PORT>/v1/healthz`. The authoritative port source is `media-egress.env`, but the probe's DynamicUser never opens the root-only `0700` `/etc/videofetch`: PID 1 reads the file as root through `EnvironmentFile=` and passes only the value. The request runs on the pinned host Node the broker already requires, so no new host package is added. Every run emits exactly one `OUTCOME=` line. On-demand semantics: a stopped VM produces no ticks and `Persistent=false` forbids catch-up; an `inactive` Worker is `idle` with no request; a `failed` Worker is a failure, never idle. It is an observer only: read-only `systemctl` verbs, no activating dependency on the Worker, `StartLimitIntervalSec=0`, and **no restart action** — restart-on-unhealthy remains unimplemented (§8). *(2) TLS `/v1/healthz` acceptance tooling:* `deploy/acceptance/worker-health/` — HTTPS only, exact path, ordinary certificate validation, no redirect, 200 + `{"status":"ok"}`, Access Service Auth pair from the environment both-or-neither, no Worker HMAC. The 4096-byte body limit is enforced while streaming. Evidence schema `worker-tls-healthz-02` records only measured facts (`-01` is retired; it never produced accepted evidence) and withholds the hostname and every credential value, in a new `0600` file that is never overwritten. **Not run against Production.** *Validation:* executor-local deterministic tests only (`src/worker/runtime/worker-liveness-deployment-policy.test.ts`, `scripts/worker-tls-healthz-acceptance.test.mjs`) — not GitHub CI. *Unchanged:* `Dockerfile.worker` (still no `HEALTHCHECK`, no curl/wget), Worker capabilities, the media namespace, the safe-egress policy, every bind, every credential scope and all Cloudflare configuration. *Review correction (`…-REVIEW-CORRECTION-001`), still source only:* (a) port delivery through PID 1 `EnvironmentFile=`, because the first revision's DynamicUser could not traverse the root-only `/etc/videofetch`; (b) exactly one `OUTCOME=` on every exit; (c) evidence stage semantics; (d) the body cap enforced while streaming; (e) exclusive `0600` evidence creation. *Remaining gates, as first recorded:* installing and accepting the probe on the VM — including the DynamicUser `/opt/videofetch` traversal check and `systemd-analyze verify`, neither available to the executor — and a live TLS run, each under its own authorization. *Live outcome (2026-09-26, `…-LIVE-ACCEPTANCE-001`, next row):* the TLS run PASSED and closed the TLS §10 box. The probe's first deployment failed at the systemd state query under `DynamicUser=` and was rolled back, so the liveness box stays open. *Remaining gate:* live acceptance of the static-account correction (`WORKER-LIVENESS-STATIC-USER-CORRECTION-001`, below), under its own authorization. |
+| `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-LIVE-ACCEPTANCE-001` | **PARTIAL — TLS PASS / LIVENESS FAILED AND ROLLED BACK** | 2026-09-26, from `main` `394fe60c…`. The VM was initially Stopped and was returned to Stopped. *TLS:* PASS — schema `worker-tls-healthz-02`, HTTP `200`, healthy body matched, TLS verification enabled, no redirect, Access Service Auth used, no Worker HMAC — over public HTTPS → Cloudflare Access → named tunnel → VM loopback → Worker. Evidence `5745ece713e824585d9d21c67214b4c140d7a58e91aa4251a4323a4f0ae03f35`, *accepted operator-measured Production evidence, not CI*; it closes the TLS §10 box. *Liveness:* the PR #83 artefacts were installed byte-identically. The `DynamicUser` Node prerequisite (`v22.23.2`) and `systemd-analyze verify` passed, and the timer was enabled (`Persistent=no`, service `static`). The first timer-triggered probe returned exactly one `OUTCOME=state-unavailable`. On this VM (classic `dbus-daemon` 1.14.10) the `DynamicUser` identity could not complete the read-only systemd query; a static unprivileged identity could. No liveness stage was reached, the Worker was never stopped or restarted, and the deployment was fully rolled back. Evidence `867f6eca937e0fa004ce8e3ce5924ee07aa2d78b5444dd919b2cbdfb0c5448da`, *operator-measured failed-deployment evidence*: it proves the failure and the rollback, not acceptance. *What changed — three scopes, not one claim:* (a) **the liveness deployment actions** changed only the four task-owned VM artefacts and the timer's enablement and unit state; all of it was rolled back, and they did not touch the Worker image, the safe-egress policy, R2 or any Worker credential. (b) **The TLS acceptance harness** made one read-only HTTPS `GET /v1/healthz`. It mutated nothing in Cloudflare, Vercel or R2, rotated no credential and used no Worker HMAC material; the task's own automation made only read-only Vercel API calls (environment metadata, and one read of `WORKER_BASE_URL` by id). (c) **The provider state around the acceptance did change:** Vercel records a new Production deployment, `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd`. It is `source: redeploy` of `dpl_BcefWQ…`, created 2026-09-26T20:10:31.374Z and READY at 20:11:07.464Z, which is after the credential-intake step began (19:38Z) and before the TLS run (20:14:25Z). It was made outside the task's automation (*provider-observed*, read-only, 2026-09-27). Whether the Cloudflare Access Service Auth credential changed in that window is not established by the recorded evidence and is not claimed either way. The TLS PASS accepts the ingress as it was when the run executed; Vercel is not on the path it measures. See §8, §10, §11h. |
+| `WORKER-LIVENESS-STATIC-USER-CORRECTION-001` | **IMPLEMENTED IN SOURCE / LIVE RE-ACCEPTANCE PENDING** | Replaces `DynamicUser=yes` in `videofetch-worker-liveness.service` with the dedicated static system account `User=videofetch-liveness` / `Group=videofetch-liveness`. The account has its own group only (no `docker`, no `videofetch-broker`, no `SupplementaryGroups=`), `nologin`, no home, no sudo and no capability. `RemoveIPC=yes`, which `DynamicUser=` implied, is now explicit. Unchanged: every other hardening directive, PID 1's `EnvironmentFile=` port delivery, `/etc/videofetch` `0700 root:root`, the probe's logic and the timer. `deploy/README.md` step 6 now provisions the account idempotently before the unit is installed. Before the timer is enabled, it then checks, as that account, the pinned Node (`v22.23.2`) and the probe's exact read-only systemd query, followed by one on-demand run. The policy suite fails if `DynamicUser=` returns or the identity changes, and it pins that ordering in the docs. No repository test emulates the VM's D-Bus. *Validation:* executor-local only, not GitHub CI. Nothing is installed. The liveness §10 box stays open until a new live acceptance passes. |
 
 ---
 
@@ -6780,10 +6917,11 @@ its Production alias.*
 | Source-vs-downloadable quality UI | `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001` — **live in Production since 2026-09-19** (Vercel only; browser presentation of `sourceQuality`; the Worker did not change) |
 | Clear-HLS v1 | **DEPLOYED / PRODUCTION ACCEPTED since 2026-09-26 (HLS-10).** Deliberately narrow: `m3u8_native` discovery only, a clear VOD MPEG-TS media playlist, one rendition with proven video and audio, VideoFetch-owned acquisition, and a Worker stream-copy remux after `beginProcessing()`. Every HLS rendition outside that path still appears only in `sourceQuality`, as withheld, and never as a download (§4j) |
 | Segmented DASH | **not implemented** — such renditions appear only in `sourceQuality`, as withheld, and never as a download |
-| Control plane | Vercel Production `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from `main` `02b3f15f…` (2026-09-19, P2) — chain of custody, **not** Git-attested. Immediate rollback `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` (`593f47df…`) accepts `sourceQuality`: no Worker rollback needed. Deeper rollback `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` (`397f238b…`) predates `sourceQuality`: roll the Worker back first (§9) |
+| Control plane | Vercel Production `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd`, a provider-recorded redeploy (2026-09-26 20:10Z, `source: redeploy`) of the P2 deployment `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, which was from `main` `02b3f15f…` (2026-09-19) by chain of custody. Neither is Git-attested. Each older deployment keeps its own creation-time environment (§9). Immediate code rollback `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` (`593f47df…`) accepts `sourceQuality`: no Worker rollback needed. Deeper rollback `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` (`397f238b…`) predates `sourceQuality`: roll the Worker back first (§9) |
 | Vercel project safe-state | `8a85a0e1…` — byte-identical across the SPLIT-08E promotion; not re-measured since, and not by this record |
 | Execution plane | the on-demand `videofetch` Lima VM — idle state **Stopped** |
-| Latest control-plane deployment | 2026-09-19 06:57Z — P2 quality UI, `dpl_BcefWQ…`; evidence `7fce201ed8fa4ba844b2730ec2fe7dc04ae97def0168d627134e684a9471e5f1` |
+| Latest control-plane deployment | 2026-09-26 20:10:31Z — `dpl_BJYRG7…`, a Production **redeploy** of `dpl_BcefWQ…`, READY at 20:11:07Z. It is *provider-observed* (read-only, 2026-09-27) and has no acceptance record. It was made outside the automation of `…-LIVE-ACCEPTANCE-001`, during that task's credential-intake window (§11) |
+| Previous control-plane deployment | 2026-09-19 06:57Z — P2 quality UI, `dpl_BcefWQ…`; evidence `7fce201ed8fa4ba844b2730ec2fe7dc04ae97def0168d627134e684a9471e5f1` |
 | Latest promotion | 2026-09-26 16:05Z — HLS-10, clear-HLS v1; evidence `83b0e2374eb29effe54190bdbb55890e9252f8583c2334e9ca6d7e648b1dcf2e` |
 | Previous promotion | 2026-09-18 21:00Z — P1 rendition inventory, on the retry; evidence `f143de781e4a28e004af4f12479d6fd82c6e633b4a2d9eb112e111b1db13ba2d` |
 | Rolled-back attempt | 2026-09-18 20:30Z — P1 first attempt, ROLLED_BACK on a false-negative gate; evidence `2a95f80619b800e9652999c31575856c9733abd47d579ad8e871bd0626ce804e` |

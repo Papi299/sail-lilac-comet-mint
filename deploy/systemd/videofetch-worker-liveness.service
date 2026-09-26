@@ -1,5 +1,6 @@
 # External Worker liveness probe — one bounded observation.
-# (WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001)
+# (WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001; runtime identity
+# corrected by WORKER-LIVENESS-STATIC-USER-CORRECTION-001)
 #
 # Started by videofetch-worker-liveness.timer and by nothing else. It runs in
 # the VM's ORDINARY host namespace: it does not join videofetch-media-netns, it
@@ -61,11 +62,11 @@ ExecStart=/usr/local/sbin/vf-worker-liveness-probe
 # `-p 127.0.0.1:${VIDEOFETCH_WORKER_PORT}:...` flag.
 #
 # /etc/videofetch is root-owned mode 0700 because it also holds broker
-# credentials, and the DynamicUser below CANNOT traverse it. That is correct
-# and is not weakened here. Instead PID 1 reads this file AS ROOT, before any
-# privilege is dropped, and passes the value to the unprivileged process in its
-# environment. Nothing is copied to disk and no second setting exists; the probe
-# itself never opens anything under /etc/videofetch.
+# credentials, and the unprivileged account below CANNOT traverse it. That is
+# correct and is not weakened here. Instead PID 1 reads this file AS ROOT,
+# before any privilege is dropped, and passes the value to the unprivileged
+# process in its environment. Nothing is copied to disk and no second setting
+# exists; the probe itself never opens anything under /etc/videofetch.
 #
 # Environment= FIRST pins the variable to empty, and EnvironmentFile= overrides
 # it. The value is therefore the file's or nothing — it can never be inherited
@@ -84,29 +85,58 @@ UnsetEnvironment=VIDEOFETCH_MEDIA_DNS_FLAGS
 # The probe needs to execute the pinned host Node, read its own two installed
 # files under /usr/local, ask systemd for a unit's state over D-Bus, and open a
 # loopback TCP connection. It reads no configuration file itself — PID 1 hands
-# it the port, see above. It needs no account, no capability and no write
-# access anywhere, and this is what makes "the probe cannot mutate the
+# it the port, see above. It needs no capability, no group membership and no
+# write access anywhere, and this is what makes "the probe cannot mutate the
 # boundary" a property of the sandbox rather than a promise in a comment.
 #
-# DEPLOYMENT PRECONDITION: the DynamicUser must be able to TRAVERSE and execute
-# /opt/videofetch/node/bin/node. The broker proves a fixed non-root system user
-# can; the repository does not record /opt/videofetch's mode, so it does not
-# prove an arbitrary UID can. If it cannot, the probe says so precisely —
-# OUTCOME=config-invalid reason=node-unavailable — rather than reporting an
-# unhealthy Worker. deploy/README.md lists the install-time check.
+# ── Identity: a dedicated STATIC system account ────────────────────────────
 #
-# DynamicUser: a transient unprivileged identity, so the probe introduces no
-# provisioned user, group or home directory to the deployment.
-DynamicUser=yes
+# videofetch-liveness is a system account provisioned BEFORE this unit is
+# installed (deploy/README.md, install order step 6). It is non-login
+# (/usr/sbin/nologin), has no home directory, has its own primary group and NO
+# supplementary group — in particular neither docker nor videofetch-broker —
+# and has no sudo rule. It exists for this observer alone. It owns no file and
+# this unit gives it no writable path: it is an identity, not storage.
+#
+# WHY NOT DynamicUser=yes — MEASURED, NOT PREFERENCE. The first revision of
+# this unit ran as a transient DynamicUser. On the Production Lima VM (systemd
+# 255, classic dbus-daemon 1.14.10) its first live timer tick on 2026-09-26
+# reported OUTCOME=state-unavailable: the read-only `systemctl show` the probe
+# makes failed with "Transport endpoint is not connected". A DynamicUser with
+# every other hardening directive removed failed the same way, as did the full
+# sandbox minus each directive in turn; a static unprivileged identity made the
+# same query successfully. That finding is scoped to that VM and runtime — it
+# is not a claim about DynamicUser or D-Bus in general — but it is why this
+# unit runs as a stable, statically provisioned account, and why reverting to
+# DynamicUser= is a regression that worker-liveness-deployment-policy.test.ts
+# fails on.
+#
+# Not root, not nobody, not the broker's account, not the VM's login user.
+# `nobody` was diagnostic evidence that a static identity works; it is not an
+# identity to share with everything else that falls back to it.
+#
+# DEPLOYMENT PRECONDITIONS, checked AS THIS ACCOUNT before the timer is enabled
+# (deploy/README.md): it can execute /opt/videofetch/node/bin/node and observes
+# v22.23.2, and it can read videofetch-worker.service's LoadState, ActiveState
+# and SubState from systemd. If Node is not reachable anyway, the probe says so
+# precisely — OUTCOME=config-invalid reason=node-unavailable — rather than
+# reporting an unhealthy Worker. If the account does not exist, systemd refuses
+# to start this unit (status=217/USER) before the probe runs at all.
+User=videofetch-liveness
+Group=videofetch-liveness
 
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 
+# DynamicUser= implied this; with a static account it is stated instead. Any
+# System V or POSIX IPC object the account created is removed when the probe
+# stops. The account is dedicated to this unit, so no other unit is affected.
+RemoveIPC=yes
+
 # The whole filesystem is read-only to this unit. The ONLY writable location is
 # its own PrivateTmp — a per-invocation /tmp that no other unit shares and that
-# is discarded when the probe exits (DynamicUser= implies it regardless). The
-# probe writes nothing there either.
+# is discarded when the probe exits. The probe writes nothing there either.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
@@ -158,6 +188,15 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 #   Credentials      It holds and needs none. media-egress.env contains no
 #                    secret by its own contract, and nothing else from
 #                    /etc/videofetch is delivered to this unit.
-#   Root execution   There is no User=root and no PermissionsStartOnly-style
-#                    escape: only PID 1's EnvironmentFile= read is privileged.
+#   Root execution   The account is videofetch-liveness, never root, and there
+#                    is no PermissionsStartOnly-style escape: only PID 1's
+#                    EnvironmentFile= read is privileged.
+#   DynamicUser=     See "Identity" above. What it used to imply is stated
+#                    explicitly: ProtectSystem=strict, ProtectHome=,
+#                    PrivateTmp=, NoNewPrivileges=, RestrictSUIDSGID=,
+#                    RemoveIPC=.
+#   Supplementary    No SupplementaryGroups=: not docker, not
+#   groups           videofetch-broker, nothing.
+#   State or home    No StateDirectory=, RuntimeDirectory=, CacheDirectory=,
+#                    LogsDirectory= or home directory: the probe is stateless.
 #   Requires=        See the [Unit] note: nothing here may activate the Worker.

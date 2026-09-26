@@ -2,10 +2,17 @@
 
 `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`
 
-**Source tooling only. Nothing here has been run against Production.** This
-directory holds the tool for a *later, separately authorized* operator run. Its
-existence does not close the runbook §10 item "`GET /v1/healthz` returns 200
-through the TLS endpoint"; only an accepted live measurement does.
+**Run against Production and accepted on 2026-09-26.**
+- **The run.** `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-LIVE-ACCEPTANCE-001` ran
+  this tool once, from `main` `394fe60c…`, through the real external path, and
+  it passed: schema `worker-tls-healthz-02`, HTTP `200`.
+- **Evidence.** SHA-256
+  `5745ece713e824585d9d21c67214b4c140d7a58e91aa4251a4323a4f0ae03f35`, held by
+  the operator — accepted operator-measured Production evidence, not CI.
+- **What it closed.** That accepted measurement closed the runbook §10 item
+  "`GET /v1/healthz` returns 200 through the TLS endpoint" (runbook §8, §10).
+  The tool's existence alone never did.
+- **Further runs.** Each is its own, separately authorized operator action.
 
 ## What it proves, and what it does not
 

@@ -31,8 +31,8 @@
 # The authoritative declaration is VIDEOFETCH_WORKER_PORT in
 # /etc/videofetch/media-egress.env, the same file the namespace holder
 # publishes the port from. But /etc/videofetch is root-owned mode 0700 — it
-# also holds broker credentials — and this probe runs as an unprivileged
-# DynamicUser that cannot traverse it, by design.
+# also holds broker credentials — and this probe runs as the unprivileged
+# static account videofetch-liveness, which cannot traverse it, by design.
 #
 # So the probe does not read that file at all. videofetch-worker-liveness.service
 # declares `EnvironmentFile=-/etc/videofetch/media-egress.env`: PID 1 reads it
@@ -227,8 +227,8 @@ esac
 # curl or wget, which the Worker image is forbidden to contain and which this
 # task must not install on the host either.
 #
-# Both checks run AS THE PROBE'S OWN IDENTITY, so a path the DynamicUser cannot
-# traverse is reported here, precisely, rather than as an unhealthy Worker.
+# Both checks run AS THE PROBE'S OWN IDENTITY, so a path the probe's account
+# cannot traverse is reported here, precisely, rather than as an unhealthy Worker.
 if [ ! -x "$NODE" ]; then
   echo "$VF_PROG: pinned host Node '$NODE' is missing or not executable by this identity" >&2
   echo "$VF_PROG: see deploy/README.md install order step 0" >&2

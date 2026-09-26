@@ -390,25 +390,34 @@ operation.
 
 ## External Worker liveness
 
-`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`
+`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`; runtime identity
+corrected by `WORKER-LIVENESS-STATIC-USER-CORRECTION-001`
 
-**Source only. Not installed, not enabled, not live-accepted.** The runbook §10
-item for an external liveness probe stays open until these artefacts are
-installed on the VM under separate authorization and accepted there.
+**Not installed, not enabled, not live-accepted.**
+- **The first live deployment failed.** It ran on 2026-09-26
+  (`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-LIVE-ACCEPTANCE-001`) with the probe as
+  a `DynamicUser`. Its first timer tick could not query systemd, so it was
+  rolled back, and nothing from it remains on the VM.
+- **The correction is in source only.** The unit now runs as a dedicated static
+  account; see
+  [Runtime identity](#runtime-identity-a-dedicated-static-account).
+- **The runbook §10 item stays open.** It closes only once the corrected
+  artefacts are installed on the VM under separate authorization and accepted
+  there.
 
 ```
 videofetch-worker-liveness.timer        every 5 min of VM UPTIME; Persistent=false
   │
   ▼
-videofetch-worker-liveness.service      oneshot, DynamicUser, no capabilities,
-  │                                     RestrictNamespaces=yes
+videofetch-worker-liveness.service      oneshot, static account videofetch-liveness,
+  │                                     no capabilities, RestrictNamespaces=yes
   │  PID 1, as root: EnvironmentFile=-/etc/videofetch/media-egress.env
   │                  -> VIDEOFETCH_WORKER_PORT in the probe's environment
   ▼
 vf-worker-liveness-probe                VM HOST namespace — outside the media netns,
   │                                     outside the container, no nsenter, no docker
   │  systemctl show / is-failed         read-only; never start/stop/restart
-  │  never opens /etc/videofetch        (root 0700; the DynamicUser cannot traverse it)
+  │  never opens /etc/videofetch        (root 0700; the probe's account cannot traverse it)
   ▼
 http://127.0.0.1:<VIDEOFETCH_WORKER_PORT>/v1/healthz
                                         the SAME loopback ingress cloudflared uses
@@ -437,8 +446,9 @@ traverses the denied path.
 `videofetch-media-netns.service` publishes its port from this same file.
 
 **How the probe receives it.** `/etc/videofetch` is root-owned mode `0700`,
-because it also holds broker credentials. The probe's `DynamicUser` cannot
-traverse it, and that is correct, so nothing here changes the directory.
+because it also holds broker credentials. The probe's account cannot traverse
+it, and that is correct, so nothing here changes the directory or grants the
+account access to it.
 Instead:
 
 ```
@@ -465,17 +475,51 @@ UnsetEnvironment=VIDEOFETCH_MEDIA_DNS_FLAGS         # the probe gets exactly one
 `/opt/videofetch/node/bin/node`. That is [install order](#install-order)
 step 0, which the broker already requires. No curl, no wget, no apt step.
 
-**Install-time check: the DynamicUser must be able to run that Node.**
-- **Why it is needed.** The broker proves that a *fixed* non-root system user
-  can. The repository does not record the mode of `/opt/videofetch`, so it
-  does not prove an arbitrary UID can traverse it.
-- **What happens if it cannot.** The probe reports
-  `OUTCOME=config-invalid reason=node-unavailable`, never "unhealthy".
-- **How to check.** Run this before relying on the timer:
+### Runtime identity: a dedicated static account
 
-  ```
-  systemd-run --wait --pipe -p DynamicUser=yes /opt/videofetch/node/bin/node -v   # v22.23.2
-  ```
+The probe runs as `videofetch-liveness`, a system account that exists for this
+observer alone.
+
+| Property | Value |
+| :--- | :--- |
+| Account | `videofetch-liveness`, a system account (`useradd --system`) |
+| Groups | its own primary group `videofetch-liveness` and **no** supplementary group — not `docker`, not `videofetch-broker` |
+| Login | none: shell `/usr/sbin/nologin`, locked password, no sudo rule |
+| Home | none: `/nonexistent`, never created |
+| Privilege | no capability, `NoNewPrivileges=yes`, and every other protection of the unit unchanged |
+| Writable paths | none: no `StateDirectory=`, `RuntimeDirectory=`, `CacheDirectory=`, `LogsDirectory=` or home; only the per-run `PrivateTmp`, which the probe does not use |
+
+It is **not** root, **not** `nobody`, **not** the broker's account and **not**
+the VM's login user. `nobody` was the diagnostic proof that a static identity
+works; it is not the Production identity, because everything else that falls
+back to `nobody` shares it.
+
+**Why a static account and not `DynamicUser=yes`: measured, not preferred.**
+- **What happened.** The first live deployment ran the probe as a
+  `DynamicUser`. On the Production Lima VM (systemd 255, classic `dbus-daemon`
+  1.14.10), its first timer tick reported `OUTCOME=state-unavailable`: the
+  probe's read-only `systemctl show` failed with `Transport endpoint is not
+  connected`.
+- **What was isolated.** A `DynamicUser` with every other hardening directive
+  removed failed the same way, and so did the full sandbox minus each
+  directive in turn. A static unprivileged identity made the same query
+  successfully.
+- **Scope.** On the current Production VM, the transient `DynamicUser`
+  identity could not complete this query and a stable static one could. That
+  is not a claim about `DynamicUser` or D-Bus in general.
+- **What the account is for.** It owns no file and no state. It exists only so
+  that the probe has a stable, statically provisioned identity for the
+  system-bus query.
+
+The two install-time checks run **as this account**: it can execute the pinned
+Node, and it can make the probe's exact read-only systemd query. They are
+[install order](#install-order) step 6c and must pass before the timer is
+enabled.
+
+**Missing account.** If the account does not exist, systemd refuses to start
+the unit (`status=217/USER`) before the probe runs. There is no `OUTCOME=` line
+in that case; the unit's own failed result is the record. Provision the account
+first (step 6a).
 
 ### On-demand execution is idle, not an outage
 
@@ -489,7 +533,8 @@ step 0, which the broker already requires. No curl, no wget, no apt step.
 | Worker `failed` | `OUTCOME=failed-unit` — **never** reported as idle | `1` |
 | Worker `ActiveState` not understood | `OUTCOME=unknown-state` | `1` |
 | Worker unit not loaded | `OUTCOME=not-installed` | `2` |
-| systemd could not be queried | `OUTCOME=state-unavailable` | `2` |
+| systemd could not be queried | `OUTCOME=state-unavailable` — what the `DynamicUser` identity produced on the Production VM | `2` |
+| service account missing | systemd refuses to start the unit (`status=217/USER`); the probe never runs, so there is **no** `OUTCOME=` line | — |
 | port unavailable or malformed; validator, host Node or request module unavailable | `OUTCOME=config-invalid reason=…` | `2` |
 | unknown argument | `OUTCOME=usage-error` | `2` |
 | terminated by a signal | `OUTCOME=interrupted` | `2` |
@@ -715,8 +760,42 @@ The order is not a convenience — it is the fail-closed boundary.
    but the reviewed bounded workspace and empties that workspace first.
 
 6. **Install the external liveness probe — only under separate authorization.**
-   *Not performed by `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`,
-   which is source only.*
+   *Not performed by `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001` or
+   `WORKER-LIVENESS-STATIC-USER-CORRECTION-001`, which are source only. The one
+   live attempt so far (`…-LIVE-ACCEPTANCE-001`, 2026-09-26) used the earlier
+   `DynamicUser` unit and was rolled back.*
+
+   It needs steps 0 (pinned host Node) and 4 (`vf-egress-lib.sh` and
+   `media-egress.env`), plus the account created in 6a. PID 1 reads
+   `media-egress.env` for it; `/etc/videofetch` stays `0700`, and the account
+   is never given access to it. Enabling the timer starts no other unit, and the
+   probe can be installed while the Worker is stopped: that is reported as idle.
+
+   **6a. Create the account — once.** Each command does nothing if the name
+   already exists, so re-running this step never creates a second identity:
+
+   ```
+   getent group videofetch-liveness >/dev/null || groupadd --system videofetch-liveness
+   getent passwd videofetch-liveness >/dev/null || \
+     useradd --system --gid videofetch-liveness --no-create-home \
+             --home-dir /nonexistent --shell /usr/sbin/nologin videofetch-liveness
+   ```
+
+   Then check what exists. If the account was already there, this step did not
+   create it, so confirm it matches rather than trusting the name:
+
+   ```
+   id -Gn videofetch-liveness           # exactly: videofetch-liveness
+   getent passwd videofetch-liveness    # ends :/nonexistent:/usr/sbin/nologin
+   passwd --status videofetch-liveness  # second field: L (locked)
+   sudo -l -U videofetch-liveness       # not allowed to run sudo
+   ```
+
+   Never add it to `docker`, `videofetch-broker` or any other group, and never
+   give it a sudo rule. Neither the probe nor its unit creates accounts:
+   provisioning happens in this operator step only.
+
+   **6b. Install and verify the artefacts.** The timer is still not enabled:
 
    ```
    install -m 0644 deploy/bin/vf-worker-health-request.mjs /usr/local/lib/videofetch/
@@ -724,18 +803,70 @@ The order is not a convenience — it is the fail-closed boundary.
    install -m 0644 deploy/systemd/videofetch-worker-liveness.service /etc/systemd/system/
    install -m 0644 deploy/systemd/videofetch-worker-liveness.timer   /etc/systemd/system/
    systemctl daemon-reload
+   systemd-analyze verify /etc/systemd/system/videofetch-worker-liveness.service \
+                          /etc/systemd/system/videofetch-worker-liveness.timer
+   ```
 
-   # Enable the TIMER only. The service has no [Install] section on purpose.
+   **6c. Prove the account works, before the timer.** Both checks run through
+   the service manager under the exact `User=`/`Group=` the unit declares. Both
+   are read-only, and neither makes the health request:
+
+   ```
+   systemd-run --wait --pipe \
+     -p User=videofetch-liveness -p Group=videofetch-liveness \
+     /opt/videofetch/node/bin/node -v          # must print v22.23.2
+
+   systemd-run --wait --pipe \
+     -p User=videofetch-liveness -p Group=videofetch-liveness \
+     /usr/bin/systemctl show --property=LoadState --property=ActiveState \
+     --property=SubState videofetch-worker.service
+   ```
+
+   - **The Node check** must print `v22.23.2`. A failure means the account
+     cannot traverse `/opt/videofetch`, which the probe would report as
+     `OUTCOME=config-invalid reason=node-unavailable`, never "unhealthy". Do
+     not fix it by `chmod`-ing broad directories.
+   - **The systemd query** must exit `0` and print `LoadState=loaded` plus the
+     Worker's current `ActiveState`/`SubState`. It starts, stops and changes
+     nothing.
+   - **`Transport endpoint is not connected`** is the failure the first live
+     deployment hit. Stop, do not enable the timer, and roll back (below).
+
+   Then run the real unit once, on demand, which exercises its full sandbox:
+
+   ```
+   systemctl start videofetch-worker-liveness.service
+   journalctl -u videofetch-worker-liveness.service -n 5 --no-pager
+   ```
+
+   Expect exactly one `OUTCOME=` line: `healthy` with the Worker running, or
+   `idle` with it stopped. `OUTCOME=state-unavailable` means the account
+   cannot query systemd. Stop, do not enable the timer, and roll back
+   (below).
+
+   **6d. Enable the TIMER only.** The service has no `[Install]` section on
+   purpose:
+
+   ```
    systemctl enable --now videofetch-worker-liveness.timer
    ```
 
-   It needs steps 0 (pinned host Node) and 4 (`vf-egress-lib.sh` and
-   `media-egress.env`), and nothing else. PID 1 reads `media-egress.env` for it;
-   `/etc/videofetch` stays `0700`. Enabling it starts no other unit, and it can
-   be installed while the Worker is stopped: that is reported as idle.
+   **Rollback.** Remove the four artefacts. Leave `/etc/videofetch`, the Worker
+   and every other unit alone:
 
-   Before relying on it, run the DynamicUser Node check above, then
-   `systemd-analyze verify` on both liveness units.
+   ```
+   systemctl disable --now videofetch-worker-liveness.timer
+   systemctl stop videofetch-worker-liveness.service
+   systemctl reset-failed videofetch-worker-liveness.service
+   rm -f /etc/systemd/system/videofetch-worker-liveness.service \
+         /etc/systemd/system/videofetch-worker-liveness.timer \
+         /usr/local/sbin/vf-worker-liveness-probe \
+         /usr/local/lib/videofetch/vf-worker-health-request.mjs
+   systemctl daemon-reload
+   ```
+
+   The account holds nothing and may stay. A later install reuses it, after
+   re-running 6a's checks.
 
 ---
 
@@ -905,7 +1036,12 @@ systemctl show videofetch-worker-liveness.service -p Requires -p Wants -p BindsT
 
 # /etc/videofetch is still root-only; the probe gets the port from PID 1.
 stat -c '%a %U:%G' /etc/videofetch                                           # 700 root:root
-systemctl show videofetch-worker-liveness.service -p EnvironmentFiles -p DynamicUser
+systemctl show videofetch-worker-liveness.service -p EnvironmentFiles
+
+# It runs as the dedicated static account, which belongs to no other group.
+systemctl show videofetch-worker-liveness.service -p User -p Group -p DynamicUser
+#   User=videofetch-liveness  Group=videofetch-liveness  DynamicUser=no
+id -Gn videofetch-liveness                                                    # videofetch-liveness
 
 # One observation, on demand. With the Worker stopped this prints OUTCOME=idle.
 systemctl start videofetch-worker-liveness.service
