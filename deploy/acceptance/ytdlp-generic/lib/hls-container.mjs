@@ -53,6 +53,23 @@ export const HLS08_CONTAINER_REPORT_DIR = "/report";
 /** The in-image orchestrator the run executes. */
 export const HLS08_ORCHESTRATOR = "deploy/acceptance/ytdlp-generic/hls-full-path.mjs";
 
+/**
+ * The orchestrator's explicit acceptance MODE. Every invocation names exactly
+ * one, and the orchestrator never infers it from which identity flags happen
+ * to be present (`lib/hls-acceptance-mode.mjs`):
+ *
+ *   overlay        HLS-08: the candidate source overlaid on the accepted
+ *                  historical runtime; emits `hls08-deterministic-full-path-02`.
+ *   release-image  HLS-09: the real `Dockerfile.worker` release candidate,
+ *                  launched by the SPLIT-07 parent; emits
+ *                  `hls09-release-image-full-path-01`.
+ */
+export const HLS_ACCEPTANCE_MODE_FLAG = "--acceptance-mode";
+export const HLS_ACCEPTANCE_MODES = Object.freeze({
+  overlay: "overlay",
+  releaseImage: "release-image",
+});
+
 const FULL_SHA = /^[0-9a-f]{40}$/;
 const IMAGE_ID = /^sha256:[0-9a-f]{64}$/;
 
@@ -169,6 +186,8 @@ export function hlsAcceptanceRunArgs({ imageId, reportDir, evidenceName, provena
     "./scripts/register-ts-aliases.mjs",
     "--experimental-strip-types",
     HLS08_ORCHESTRATOR,
+    HLS_ACCEPTANCE_MODE_FLAG,
+    HLS_ACCEPTANCE_MODES.overlay,
     "--evidence",
     `${HLS08_CONTAINER_REPORT_DIR}/${evidenceName}`,
     "--source-commit",

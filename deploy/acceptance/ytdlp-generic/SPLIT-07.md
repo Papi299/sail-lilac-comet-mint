@@ -11,17 +11,20 @@ SPLIT-07 answers one question SPLIT-06 cannot:
 > one exact, clean Git commit, contain exactly that commit's application source,
 > carry the hardened configuration and pinned media runtime the deployment
 > contract relies on, and execute the full split-stream chain — mp4 **and**
-> webm — deterministically?
+> webm — and (since `-03`) the activated clear-HLS chain, deterministically?
 
 ```
 release source   (clean Git worktree, exact commit + tree)
 acceptance harness (clean Git worktree, exact commit + tree, verified throughout)
   → actual Dockerfile.worker image (immutable image id = every container's run subject)
   → image identity / configuration / runtime / hardening
-  → SPLIT-06 mp4 PASS   (split06-deterministic-full-path-04, validated, hashed)
-  → SPLIT-06 webm PASS  (split06-deterministic-full-path-04, validated, hashed)
-  → SPLIT-07 PASS       (split07-release-image-candidate-02, created exclusively)
+  → SPLIT-06 mp4 PASS    (split06-deterministic-full-path-04, validated, hashed)
+  → SPLIT-06 webm PASS   (split06-deterministic-full-path-04, validated, hashed)
+  → HLS-09 clear-HLS PASS (hls09-release-image-full-path-01, validated, hashed)
+  → SPLIT-07 PASS        (split07-release-image-candidate-03, created exclusively, read back)
 ```
+
+The clear-HLS child is HLS-09's; its own contract is in [`HLS-09.md`](HLS-09.md).
 
 ---
 
@@ -59,8 +62,8 @@ actual built image rather than asserted from the Dockerfile text:
 | :--- | :--- |
 | **Source** | The build context was a real Git worktree root at the exact expected commit and tree, with nothing modified, staged, untracked, ignored, or hidden by assume-unchanged/skip-worktree — **before** Docker ran and **again after** the build read it. |
 | **Recipe** | The image was built by `Dockerfile.worker` from that context, with no build arg, no secret and no host network. Its committed blob and SHA-256 are recorded. |
-| **Harness** | The executable acceptance harness — driver, SPLIT-06 orchestrator, Python verifiers, image probe, evidence evaluator — was a real Git worktree root at the operator's explicit `--harness-source`/`--harness-tree`, clean in the same ways as the release context, **before any Docker command and at every checkpoint through the end of both children**; and the executing driver file is that checkout's own. |
-| **Run subject** | Every candidate container — four probes, two verifiers, two SPLIT-06 children — executed the image's immutable `sha256:` id, as parsed from the argv Docker received. None executed the mutable tag. |
+| **Harness** | The executable acceptance harness — driver, SPLIT-06 and clear-HLS orchestrators, Python verifiers, image probe, evidence evaluators — was a real Git worktree root at the operator's explicit `--harness-source`/`--harness-tree`, clean in the same ways as the release context, **before any Docker command and at every checkpoint through the end of all three children**; and the executing driver file is that checkout's own. |
+| **Run subject** | Every candidate container — four probes, two verifiers, two SPLIT-06 children and the clear-HLS child — executed the image's immutable `sha256:` id, as parsed from the argv Docker received. None executed the mutable tag. |
 | **Source → image** | Every regular file the recipe places in `/app` (`package.json`, `package-lock.json`, the alias loader and hooks, all of `src/**`) is present in the image with byte-identical content; no unexplained file is present; `src/broker/**` is absent and its removal is accounted for; the acceptance harness is not baked in. |
 | **Configuration** | Linux; architecture recorded and compared with the accepted Worker's; `WorkingDir=/app`; runtime user `node`; `CMD` is exactly the standalone Worker entry point, and `ENTRYPOINT` is at most the base image's inherited `docker-entrypoint.sh` exec shim — observed root-owned, unwritable, at its real path, digest recorded; only `8080/tcp` exposed; no `HEALTHCHECK`; no image-declared volume; the expected non-secret defaults present. |
 | **Environment** | No `YTDLP_ENABLED`, no retired `YTDLP_NETWORK_ISOLATED`/`YTDLP_PATH`, and no Worker HMAC, Cloudflare Access, R2 broker-parent, legacy R2 writer or Vercel signer name — checked in the image config **and** inside a running container. |
@@ -69,6 +72,7 @@ actual built image rather than asserted from the Dockerfile text:
 | **Media tools** | `ffmpeg` and `ffprobe` are present and executable by the runtime user; Node, Python, ffmpeg and ffprobe versions are recorded exactly. |
 | **Offline policy** | `verify-selector.py` and `verify-download-policy.py` (which pins PR #54's `--no-quiet` contract) exit 0 against the image's own artifact. |
 | **Full path** | The unchanged SPLIT-06 harness PASSes for **mp4 and webm**, executing the candidate image's own `/app/src`, dependency graph, alias loader, Node, Python, yt-dlp, FFmpeg and ffprobe. |
+| **Clear HLS** (since `-03`) | The HLS-08 clear-HLS positive full path and its three bounded negatives PASS in the orchestrator's `release-image` mode (`hls09-release-image-full-path-01`), executed by the same image's own runtime, naming this release source and this immutable id, offline. |
 | **No disturbance** | `videofetch-worker:latest`'s image id, and the running Worker container's image id, start time and restart count, are identical before and after the run. |
 
 ### The inherited ENTRYPOINT
@@ -95,6 +99,10 @@ the real build corrected. The fake now mirrors the real base.
 - **Cloudflare, the R2 broker, Vercel, or live YouTube compatibility.** Those
   have their own stages. The SPLIT-06 children substitute a local object writer
   and an exact-fixture URL validator exactly as `SPLIT-06.md` documents.
+- **Production safe-egress, DNS or address pinning for HLS, or real public HLS
+  sources.** The clear-HLS child keeps HLS-08's substitution — the real Product
+  safe-HTTP policy with an acceptance synthetic public DNS answer and a loopback
+  socket — and a real release image as the subject does not widen that claim.
 - **Reproducibility of the build.** Two builds of one commit may differ in
   Debian package revisions or npm tarball timing. SPLIT-07 characterizes **one
   built image by its immutable id**; it does not claim that any other build of
@@ -128,10 +136,10 @@ following one silently would make two different things look identical.
 ### Harness provenance (since `-02`)
 
 The release context is not the only executable input. The harness checkout
-supplies the driver, `split-full-path.mjs`, both Python verifiers, the image
-probe and the evidence evaluator, and it is mounted into the candidate, so a
-locally modified harness could change what is measured or what counts as PASS.
-Recording its `HEAD` — all `-01` did — is not provenance.
+supplies the driver, `split-full-path.mjs`, `hls-full-path.mjs`, both Python
+verifiers, the image probe and the evidence evaluators, and it is mounted into
+the candidate, so a locally modified harness could change what is measured or
+what counts as PASS. Recording its `HEAD` — all `-01` did — is not provenance.
 
 `verifyHarnessProvenance` applies the release context's gate to `--harness`,
 against **explicit** `--harness-source`/`--harness-tree` expectations that are
@@ -149,11 +157,13 @@ Run the driver **from** the harness checkout.
 
 The harness is consumed throughout the run, so it is re-verified at every
 checkpoint: `before-docker`, `after-build`, `before-split06-mp4`,
-`before-split06-webm` and `after-children`. The last one comes after both
-children have executed and before the parent record is assembled. A harness
-that changes at any point makes the run's own measurements untrustworthy, so the
-driver **refuses the record outright**. That means no parent record, PASS or
-FAIL, and the refusal says which checkpoint failed.
+`before-split06-webm`, `before-hls09-clear-hls` (since `-03`) and
+`after-children`. The last one comes after **all three** children have executed
+and before the parent record is assembled; since `-03` the record must list
+exactly that sequence. A harness that changes at any point makes the run's own
+measurements untrustworthy, so the driver **refuses the record outright**. That
+means no parent record, PASS or FAIL, and the refusal says which checkpoint
+failed.
 
 The topology is recorded as **observed**, not assumed:
 - `harness.worktreeIsReleaseContext` says whether the two checkouts are one path.
@@ -175,8 +185,15 @@ even though the daemon itself would run all three.
 Configuration and id come from one `docker image inspect`, so they describe one
 image. The driver records the run subject of every candidate container from
 the very argv it hands Docker, parsed by a closed-grammar `dockerRunSubject`.
-It then checks that all eight required containers ran the id: the four probes
-(manifest, tools, env, runtime), the two verifiers, and SPLIT-06 mp4 and webm.
+It then checks that all nine required containers ran the id: the four probes
+(manifest, tools, env, runtime), the two verifiers, SPLIT-06 mp4 and webm, and
+(since `-03`) the clear-HLS child, purpose `hls09:clear-hls`.
+
+The grammar is closed: it understands exactly the options the container model
+emits, now including `--add-host` as a one-value option for the clear-HLS
+child, and refuses anything else. An `--option=value` spelling is understood
+only for an option the grammar already knows, so `--privileged=true` cannot
+pass as "some option with an equals sign".
 
 The tag keeps its other jobs — `docker build -t`, human diagnostics and cleanup —
 and keeps every restriction on it. Cleanup removes the tag only while it still
@@ -204,12 +221,18 @@ are the other writable surfaces, below):
 | Mount | Target | Why there |
 | :--- | :--- | :--- |
 | `deploy/acceptance/ytdlp-generic` | `/verify` (ro) | The Python verifiers and the image probe import nothing from `/app`, so they sit outside the application tree entirely. |
-| `deploy/acceptance/ytdlp-generic` | `/app/deploy/acceptance/ytdlp-generic` (ro) | SPLIT-06 only. `split-full-path.mjs` imports the product via `../../../src/...`; at its repository-relative position those imports resolve to the **image's** `/app/src`. It is a leaf directory the release image does not contain, so it shadows nothing. |
-| the report directory | `/report` (rw) | SPLIT-06 only. The one writable bind: where the child writes its own record. |
+| `deploy/acceptance/ytdlp-generic` | `/app/deploy/acceptance/ytdlp-generic` (ro) | The children only. `split-full-path.mjs` and `hls-full-path.mjs` import the product via `../../../src/...`; at their repository-relative position those imports resolve to the **image's** `/app/src`. It is a leaf directory the release image does not contain, so it shadows nothing. |
+| the report directory | `/report` (rw) | The children only. Where each child writes its own record. |
+
+The clear-HLS child uses exactly this layout, plus one non-mount addition: the
+acceptance-only `--add-host hls-fixture.example.invalid:127.0.0.1` mapping the
+pinned yt-dlp subprocess resolves the HLS fixture through, as HLS-08 does. Its
+posture is re-derived structurally before launch (`releaseHlsRunPostureViolations`;
+see `HLS-09.md`).
 
 ### The writable surfaces mirror Production
 
-Besides the report directory, the SPLIT-06 runs get two writable surfaces, and
+Besides the report directory, the children get two writable surfaces, and
 `/tmp` itself stays read-only:
 
 | Target | Mount | Whose |
@@ -236,13 +259,16 @@ What the driver enforces (`run-release-image-acceptance.mjs`,
   be inside or around, `--context`, `--harness` or `--report`. The comparison is
   component-aware, so `/var/tmp/split07-media` beside `/var/tmp/split07` is
   allowed.
+- **Never a Production host path.** It must not be, or be inside or around,
+  `/srv/videofetch` (Production's own media workspace), `/var/lib/videofetch` or
+  `/etc/videofetch`.
 - **An existing, real, empty directory.** A symlink or non-directory is
   refused. Emptiness is checked before any Docker command and again before each
-  family.
-- **Cleared between families.** After each family the driver removes what the
-  child left — normally the executor's empty `jobs/` root — and re-proves the
+  child — mp4, webm and clear-HLS.
+- **Cleared between children.** After each child the driver removes what it
+  left — normally the executor's empty `jobs/` root — and re-proves the
   directory empty. A workspace it cannot clear stops the run instead of letting
-  one family's residue stand in for the next.
+  one child's residue stand in for the next.
 - **A bind, never a copy of the source or a tmpfs.** It is always bound with
   `--mount`, never `-v`, so a missing source fails instead of being created. The
   finished argv still passes the forbidden-mount guard, so the workspace
@@ -334,16 +360,18 @@ fixtures, the checks, what PASS requires — is unchanged; only the caller is ne
 
 ## What `--network none` proves, and what it does not
 
-Every candidate container — probes, verifiers and both SPLIT-06 runs — gets
-`--network none`, `--read-only`, `--cap-drop=ALL` and
+Every candidate container — probes, verifiers, both SPLIT-06 runs and the
+clear-HLS run — gets `--network none`, `--read-only`, `--cap-drop=ALL` and
 `--security-opt no-new-privileges`, and never `--privileged`, `--cap-add`, a host
 network or the Docker socket.
 
 `--network none` **proves** the run is offline and deterministic: the container
-has a loopback interface and nothing else, the SPLIT-06 fixture binds
+has a loopback interface and nothing else, the SPLIT-06 and HLS fixtures bind
 `127.0.0.1` inside that namespace, and no DNS, public address, proxy or host
 service is reachable. A PASS therefore cannot depend on anything the machine
-happened to be able to reach.
+happened to be able to reach. The clear-HLS child's one `--add-host` entry only
+names the loopback fixture; it adds no route. That child also records the
+interfaces it observes and requires loopback only.
 
 It proves **nothing** about the Production egress namespace. That boundary is an
 external, host-owned nftables policy the Worker can neither read nor alter, and
@@ -362,28 +390,51 @@ They are the only two container combinations the SPLIT-05 pairing table admits
 muxers and ffprobe stream-shape rules in the rebuilt FFmpeg. A real rebuild can
 change a Debian FFmpeg revision, and a change that breaks one family need not
 break the other. One family passing is not release-image acceptance: the
-record refuses to emit a PASS unless both children are present, validated and
+record refuses to emit a PASS unless both SPLIT-06 children are present, validated and
 passing, and the executed-family list is exactly `mp4` and `webm`.
+
+## Why the clear-HLS child must pass too (since `-03`)
+
+HLS-7 activated clear HLS, so a release image the Worker would run carries a
+second media acquisition path that SPLIT-06 never touches: Product-owned
+playlist and fragment acquisition (HLS-2/HLS-3) and an MPEG-TS → MP4 stream-copy
+remux through the rebuilt FFmpeg and ffprobe (HLS-4). HLS-08 proved that chain
+against an overlay of the accepted historical runtime — deliberately not against
+a release build. A `-03` PASS therefore also requires the HLS-09 clear-HLS child
+(`HLS-09.md`) to PASS on the same immutable image. It is **not** a SPLIT-06
+family: it is recorded in its own `hlsAcceptance` block, and `splitAcceptance`
+still holds exactly mp4 and webm.
+
+Child order is fixed and tested: characterization → mp4 → clear workspace →
+webm → clear workspace → clear-HLS → clear workspace → final harness
+verification → child re-hashing → parent.
 
 ## The evidence
 
-**Schema: `split07-release-image-candidate-02`.** SPLIT-07 has its own
+**Schema: `split07-release-image-candidate-03`.** SPLIT-07 has its own
 identifier, because its record claims something strictly larger and different
 in kind than a SPLIT-06 one. Bump it when the record's **meaning** changes;
 never rewrite an older record.
 
-| Schema | What a PASS claims |
-| :--- | :--- |
-| `-01` | The release source was verified. The image was built by the real recipe and characterized. Both children passed. The harness `HEAD` was **recorded but not verified**. Candidates ran **by tag**. The parent was written after a directory check, not exclusively. |
-| `-02` | Everything in `-01`. **Plus:** the executable harness was provenance-bound against explicit expectations and unchanged through the whole run. Every candidate container executed the immutable image id. The record was created exclusively. |
+| Schema | Status | What a PASS claims |
+| :--- | :--- | :--- |
+| `-01` | historical | The release source was verified. The image was built by the real recipe and characterized. Both children passed. The harness `HEAD` was **recorded but not verified**. Candidates ran **by tag**. The parent was written after a directory check, not exclusively. It lacks the current harness and immutable-run-subject guarantees. |
+| `-02` | valid split-stream release qualification | Everything in `-01`. **Plus:** the executable harness was provenance-bound against explicit expectations and unchanged through the whole run. Every candidate container executed the immutable image id. The record was created exclusively. Requires mp4 + webm; does **not** qualify clear HLS. |
+| `-03` | current, HLS-aware | Everything in `-02`. **Plus:** a validated, byte-hashed HLS-09 clear-HLS child (`hls09-release-image-full-path-01`) PASS, on the same immutable image id, naming the same release source, offline; the harness re-verified before that child and after it; `hls09:clear-hls` in the candidate run ledger; the parent read back after it was written. mp4 + webm + clear-HLS. |
 
 `-01` records are **historical**. They are never rewritten, never re-read under
-`-02` rules, and never sufficient to authorize SPLIT-07B. They stay useful as
-debugging history. SPLIT-06 children remain `split06-deterministic-full-path-04`:
-nothing about what a SPLIT-06 PASS means changed.
+later rules, and never sufficient to authorize SPLIT-07B. They stay useful as
+debugging history. `-02` records remain **valid** for exactly what they proved
+— split-stream release qualification, mp4 + webm — and are not invalid
+globally; they are simply insufficient for clear-HLS release qualification
+(HLS-9). A `-02` record is never rewritten as `-03`, and
+`validateReleaseParentRecord` names a `-01`/`-02` record as historical rather
+than reading it under `-03` rules. SPLIT-06 children remain
+`split06-deterministic-full-path-04`: nothing about what a SPLIT-06 PASS means
+changed.
 
-The parent record owns the top level. Each SPLIT-06 child owns its own record,
-which SPLIT-07 never flattens or rewrites. For each child the driver:
+The parent record owns the top level. Each child owns its own record, which
+SPLIT-07 never flattens, embeds or rewrites. For each SPLIT-06 child the driver:
 
 1. reads the **exact bytes** from the report directory;
 2. requires the exact schema `split06-deterministic-full-path-04`, the exact
@@ -395,17 +446,42 @@ which SPLIT-07 never flattens or rewrites. For each child the driver:
 5. records schema, verdict, digest, byte count, check counts, source identity
    and the image it ran in.
 
+For the clear-HLS child (since `-03`) the driver refuses an evidence path that
+already exists before launching it (as it now does for every child: a stale
+record is never adopted), and a dedicated validator (`validateHlsChildRecord`)
+reads the **exact bytes** and requires: parseable JSON; schema exactly
+`hls09-release-image-full-path-01`; verdict `PASS`; every HLS-09 mandatory check
+present and every check passing; source commit **and** tree equal to the
+release source; candidate image id **and** run image id equal to the parent's
+candidate id; the parent's build label; `network.mode` `none`; non-deployable;
+and no private HLS material. It hashes those bytes, and re-reads and re-hashes
+them immediately before assembling the parent. The parent's `hlsAcceptance`
+block records `requiredChildSchema`, `executed`, and the child's schema,
+verdict, `ok`, SHA-256, byte and check counts, file name, source commit and
+tree, candidate label, candidate and run image ids, network mode and reason —
+only grammar-checked values, never the child document.
+
 A PASS parent is refused unless **all** of the following hold:
 - every check in `REQUIRED_PASS_CHECKS` is present **and** passing, and no other
-  check failed;
-- both children passed as above;
+  check failed — including `hls/clear-hls-child-executed`,
+  `hls/clear-hls-child-passed`, `hls/child-names-the-release-source`,
+  `hls/child-ran-in-the-candidate-image` and
+  `hls/child-evidence-unchanged-before-assembly`;
+- both SPLIT-06 children passed as above;
+- the clear-HLS child executed and passed as above — missing, failed, of
+  another schema, naming another image or another source: **no PASS**;
 - the image id is a full immutable id, and every required candidate container
-  ran it;
+  — all nine — ran it;
 - the candidate tag is not deployable.
 
 A FAIL record is still written, so an image failure is always reportable. A
-record whose harness was not verified before **and** after the run is not
-written at all, PASS or FAIL.
+record whose harness was not verified at every checkpoint is not written at
+all, PASS or FAIL.
+
+After the exclusive write the driver reads the record **back**: the bytes on
+disk must be the bytes written, and the record must validate under the current
+schema's rules for this source and image. Otherwise it refuses to claim a
+verdict. It prints the parent's SHA-256.
 
 The record is assembled from an allowlist and swept for forbidden keys. It
 contains no raw stdout/stderr, no argv, no URL, no upstream format id, no
@@ -442,7 +518,9 @@ sudo install -d -m 2775 -o 1000 -g 1000 /var/tmp/split07
 
 # 4. The Product media workspace: an EXISTING, EMPTY directory on disk (never a
 #    tmpfs), writable by uid 1000 and clearable by the operator, outside the
-#    context, the harness and the report directory.
+#    context, the harness and the report directory, and never a Production path.
+#    The clear-HLS child's Product preflight needs 8,589,934,592 bytes available
+#    on its filesystem under the default 4 GiB limit; check it first (`df -B1`).
 sudo install -d -m 2770 -o 1000 -g 1000 /var/tmp/split07-media
 
 # 5. The run — the driver runs FROM the harness checkout it names.
@@ -475,8 +553,10 @@ Exit status:
 - `2` — a refusal before a verdict could be recorded: a missing or invalid
   argument, release-context or harness provenance, the driver binding, a Product
   media workspace that is missing, not empty or could not be cleared, an invalid
-  image id, the build, a harness that changed mid-run, or an occupied or lost
-  evidence path.
+  image id, the build, a harness that changed mid-run, a child evidence path
+  that already existed, a clear-HLS child argv outside the posture model, a
+  child record whose bytes changed before assembly, or an occupied, lost or
+  unreadable-back evidence path.
 
 ## Temporary pre-merge validation vs. the retained candidate
 
@@ -491,19 +571,27 @@ Exit status:
 
 SPLIT-07A never produces the deployable candidate. Its image exists only to
 prove this harness against the real recipe, and is removed at the end of the
-run unless `--keep-image` holds it for diagnosis. Only a `-02` record can
+run unless `--keep-image` holds it for diagnosis. Only a `-02` record could
 support SPLIT-07B; the earlier `-01` SPLIT-07A PASS records do not.
+
+HLS-9 repeats that split with the `-03` gate — **HLS-9A** proves the HLS-aware
+gate from an unmerged harness against a real build of the already merged
+`main`, with a temporary, removed candidate; **HLS-9B**, later and separately
+authorized, runs the same `-03` gate with merged `main` as both context and
+harness and retains the exact accepted immutable candidate. Only a `-03` PASS
+can support HLS-9B; a `-02` PASS proves nothing about clear HLS. See
+[`HLS-09.md`](HLS-09.md).
 
 ## Cleanup expectations
 
 | Artifact | After a run |
 | :--- | :--- |
 | the candidate image | removed unless `--keep-image` |
-| probe, verifier and SPLIT-06 containers | removed (`--rm`) |
-| SPLIT-06 media in the Product media workspace | removed by the driver after each family, which re-proves the directory empty |
+| probe, verifier, SPLIT-06 and clear-HLS containers | removed (`--rm`) |
+| child media in the Product media workspace | removed by the driver after each child, which re-proves the directory empty |
 | the `--media-workspace` directory itself | **kept**, empty; the operator removes it |
-| SPLIT-06 fixtures, temporary database and object sink | gone with the containers' harness scratch tmpfs |
-| the two SPLIT-06 child records | **kept**, in the report directory |
+| child fixtures, temporary databases and object sinks | gone with the containers' harness scratch tmpfs |
+| the two SPLIT-06 child records and the clear-HLS child record | **kept**, in the report directory |
 | the SPLIT-07 parent record | **kept**, in the report directory |
 | `videofetch-worker:latest`, the running Worker | untouched, and measured as such |
 
@@ -513,11 +601,12 @@ support SPLIT-07B; the earlier `-01` SPLIT-07A PASS records do not.
 
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
-| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, writes the parent record. Admits the required `--media-workspace` empty and clears it after each family. |
+| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice and the clear-HLS child once, writes and reads back the parent record. Admits the required `--media-workspace` empty and clears it after each child. |
 | `lib/release-provenance.mjs` | — | The shared clean-worktree gate, applied to the release context and to the harness; the release-input identities; the `/app` source manifest from Git objects. |
-| `lib/release-container.mjs` | — | Every `docker` argv. Non-deployable tags for build and cleanup; the immutable-id grammar for every run subject; `dockerRunSubject`; the real Dockerfile; the hardening flags; the Product media workspace `--mount type=bind` and the harness scratch tmpfs; the forbidden-mount guard. |
+| `lib/release-container.mjs` | — | Every `docker` argv. Non-deployable tags for build and cleanup; the immutable-id grammar for every run subject; `dockerRunSubject`'s closed grammar (with `--add-host`); the real Dockerfile; the hardening flags; the Product media workspace `--mount type=bind` (never a Production host path) and the harness scratch tmpfs; the forbidden-mount guard; `releaseHlsAcceptanceRunArgs` and its structural posture check. |
 | `lib/release-image-probe.mjs` | inside the candidate, at `/verify` | Import-free observer: `/app` manifest, forbidden tools, env names, runtime identity. Observes; never judges. |
-| `lib/release-evidence.mjs` | — | The `split07-release-image-candidate-02` record, child validation and re-verification, the verified-harness gate, and the PASS gate (including the immutable-run-subject ledger). |
+| `lib/release-evidence.mjs` | — | The `split07-release-image-candidate-03` record, SPLIT-06 and clear-HLS child validation and re-verification, the verified-harness gate, the PASS gate (including the immutable-run-subject ledger), and the read-back validator. |
+| `hls-full-path.mjs`, `lib/hls-acceptance-mode.mjs`, `lib/hls-release-evidence.mjs` | inside the candidate / — | The clear-HLS child in `release-image` mode and its `hls09-release-image-full-path-01` record — see `HLS-09.md`. |
 | `lib/provenance.mjs` | — | Shared with the Phase-10D harness; SPLIT-07 uses only its `writeEvidenceExclusive`, the `wx` exclusive-create writer. |
 | `scripts/ytdlp-release-image-acceptance.test.mjs` | `npm test` | Harness self-tests against a scripted Git/Docker fake. No Docker, no network. |
 

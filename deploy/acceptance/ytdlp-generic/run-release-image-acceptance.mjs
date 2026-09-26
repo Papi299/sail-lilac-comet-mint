@@ -2,8 +2,19 @@
 //
 // The SPLIT-07 host driver: verify a clean release source, build the ACTUAL
 // `Dockerfile.worker` image, characterize it, and run the existing SPLIT-06
-// deterministic full path against it — mp4 AND webm — before emitting one
-// release-image candidate record.
+// deterministic full path against it — mp4 AND webm — and (since -03) the
+// HLS-09 clear-HLS release child, before emitting one release-image candidate
+// record. Every child runs the same immutable candidate image id.
+//
+// ── Child order (deterministic) ────────────────────────────────────────────
+//
+//   characterization → SPLIT-06 mp4 → clear workspace → SPLIT-06 webm
+//   → clear workspace → HLS-09 clear-HLS → clear workspace → parent
+//
+// Before each child the harness is re-verified and the Product media workspace
+// must be empty; after each child the workspace is cleared and re-proven empty.
+// After the last child the harness is verified once more, then every child
+// record is re-read and re-hashed, and only then is the parent assembled.
 //
 // Runs wherever Docker is; on this project that is inside the Lima VM, not on
 // the Mac. Deliberately plain ESM with no repository imports beyond the pure
@@ -62,6 +73,7 @@
 // run rather than contaminating the next family.
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -83,6 +95,8 @@ import {
   productMediaWorkspaceMount,
   releaseAcceptanceRunArgs,
   releaseBuildArgs,
+  releaseHlsAcceptanceRunArgs,
+  releaseHlsRunPostureViolations,
 } from "./lib/release-container.mjs";
 import {
   buildExpectedSourceManifest,
@@ -98,16 +112,20 @@ import {
   ALLOWED_IMAGE_ENTRYPOINTS,
   assertChildUnchanged,
   buildReleaseEvidence,
+  emptyHlsChildObservation,
   ENTRYPOINT_SHIM_PATH,
   EXPECTED_IMAGE_CONFIG,
   EXPECTED_IMAGE_ENVIRONMENT_NAMES,
   EXPECTED_YTDLP_RUNTIME,
   FORBIDDEN_IMAGE_ENVIRONMENT_NAMES,
+  HLS_CANDIDATE_RUN_PURPOSE,
   REQUIRED_CANDIDATE_RUN_PURPOSES,
   REQUIRED_SPLIT_FAMILIES,
   renderReleaseEvidence,
   SPLIT07_EVIDENCE_SCHEMA,
   validateChildRecord,
+  validateHlsChildRecord,
+  validateReleaseParentRecord,
 } from "./lib/release-evidence.mjs";
 // The repository's accepted exclusive-create writer (Phase-10D §5): `wx`, and a
 // lost race is a refusal — never "adopt the winner", never truncate.
@@ -402,6 +420,7 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
   let verdict = "BLOCKED";
   let record = null;
   let imageId = null;
+  let evidenceSha256 = null;
 
   try {
     // 2b. The context must STILL be exactly what was verified, now that the
@@ -643,6 +662,9 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       await verifyHarnessAt(`before-split06-${family}`);
       await admitMediaWorkspace(`before-split06-${family}`);
       const evidenceName = `split06-${family}-${now()}.json`;
+      // A child path that already exists would be READ BACK as this run's
+      // child. Refused before the child runs, never adopted.
+      await admitEvidencePath(join(opts.report, evidenceName), deps);
       const args = releaseAcceptanceRunArgs({
         imageId: runSubject, family, harnessDir, reportDir: opts.report,
         mediaWorkspaceDir: opts.mediaWorkspace, evidenceName,
@@ -684,6 +706,59 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       await clearMediaWorkspace(`split06-${family}`);
     }
 
+    // ── 6b. The HLS-09 clear-HLS release child (since -03) ─────────────────
+    //
+    // The accepted HLS-08 behavioral chain — real analysis, real pinned yt-dlp
+    // discovery, the ordinary planner, HLS-2/3/4, the upload lifecycle, `ready`
+    // and the three bounded negatives — executed by THIS image's own `/app/src`,
+    // runtime and media tools, in the orchestrator's explicit `release-image`
+    // mode. Same hardening as the SPLIT-06 children plus the one acceptance
+    // `--add-host`; the posture is re-derived from the argv before it runs.
+    // The child records the identity this driver observed; the binding checks
+    // below tie that record to this driver's own run subject.
+    await verifyHarnessAt("before-hls09-clear-hls");
+    await admitMediaWorkspace("before-hls09-clear-hls");
+    const hlsEvidenceName = `hls09-clear-hls-${now()}.json`;
+    await admitEvidencePath(join(opts.report, hlsEvidenceName), deps);
+    const hlsArgs = releaseHlsAcceptanceRunArgs({
+      imageId: runSubject,
+      harnessDir,
+      reportDir: opts.report,
+      mediaWorkspaceDir: opts.mediaWorkspace,
+      evidenceName: hlsEvidenceName,
+      sourceCommit: provenance.source,
+      sourceTree: provenance.tree,
+      candidateTag: image,
+    });
+    const hlsViolations = releaseHlsRunPostureViolations(hlsArgs, {
+      reportDir: opts.report,
+      harnessDir,
+      mediaWorkspaceDir: opts.mediaWorkspace,
+    });
+    if (hlsViolations.length > 0) {
+      throw new Error(`refusing a clear-HLS child with posture violations: ${hlsViolations.join("; ")}`);
+    }
+    log(`[split07] HLS-09 clear-HLS against the release candidate\n`);
+    const hlsResult = await runCandidate(HLS_CANDIDATE_RUN_PURPOSE, hlsArgs);
+    let hlsChild;
+    try {
+      hlsChild = validateHlsChildRecord({
+        bytes: await readFileBytes(join(opts.report, hlsEvidenceName)),
+        expected: {
+          sourceCommit: provenance.source,
+          sourceTree: provenance.tree,
+          candidateTag: image,
+          candidateImageId: imageId,
+        },
+      });
+    } catch {
+      hlsChild = emptyHlsChildObservation("the clear-HLS child record is unreadable");
+    }
+    hlsChild = { ...hlsChild, path: hlsEvidenceName, exitCode: hlsResult.code };
+    log(`[split07] HLS-09 clear-HLS: ${hlsChild.verdict ?? "UNREADABLE"} ` +
+      `${hlsChild.checkCount} checks sha256=${hlsChild.sha256 ?? "n/a"}\n`);
+    await clearMediaWorkspace("hls09-clear-hls");
+
     // The children are re-read and re-hashed here, so the digests the parent
     // records describe bytes that were still identical at assembly time.
     const children = [];
@@ -697,8 +772,17 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       }
       children.push(child);
     }
+    let hlsChildReverified = false;
+    if (hlsChild.sha256 !== null) {
+      assertChildUnchanged({
+        family: "clear-HLS",
+        expectedSha256: hlsChild.sha256,
+        bytes: await readFileBytes(join(opts.report, hlsChild.path)),
+      });
+      hlsChildReverified = true;
+    }
 
-    // The harness must STILL be exactly what was verified, now that both
+    // The harness must STILL be exactly what was verified, now that all three
     // children have consumed it. A harness modified at any point in the run
     // makes the run's own measurements untrustworthy, so the record is refused
     // outright rather than emitted as a FAIL.
@@ -745,6 +829,33 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
           );
         }),
       imageId,
+    );
+
+    // The clear-HLS child (since -03): it ran, its record is a validated HLS-09
+    // PASS, it names this release source, and the image it names is the one
+    // this driver told Docker to execute for it — as candidate image AND run
+    // subject, under this run's build label, offline.
+    const hlsRun = candidateRuns.find((entry) => entry.purpose === HLS_CANDIDATE_RUN_PURPOSE);
+    checks.record("hls/clear-hls-child-executed", hlsRun !== undefined, HLS_CANDIDATE_RUN_PURPOSE);
+    checks.record("hls/clear-hls-child-passed", hlsChild.ok === true, hlsChild.reason);
+    checks.record(
+      "hls/child-names-the-release-source",
+      hlsChild.sourceCommit === provenance.source && hlsChild.sourceTree === provenance.tree,
+      `${String(hlsChild.sourceCommit)} ${String(hlsChild.sourceTree)}`,
+    );
+    checks.record(
+      "hls/child-ran-in-the-candidate-image",
+      hlsRun?.subject === imageId &&
+        hlsChild.candidateImageId === imageId &&
+        hlsChild.runImageId === imageId &&
+        hlsChild.candidateTag === image &&
+        hlsChild.networkMode === "none",
+      imageId,
+    );
+    checks.record(
+      "hls/child-evidence-unchanged-before-assembly",
+      hlsChildReverified,
+      hlsChild.sha256 ?? "no bytes to re-verify",
     );
 
     // ── 7. Production identity, AFTER ──────────────────────────────────────
@@ -873,6 +984,26 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
           reason: child.reason,
         })),
       },
+      hlsAcceptance: {
+        executed: hlsRun !== undefined,
+        child: {
+          schema: hlsChild.schema,
+          verdict: hlsChild.verdict,
+          ok: hlsChild.ok,
+          sha256: hlsChild.sha256,
+          bytes: hlsChild.bytes,
+          checkCount: hlsChild.checkCount,
+          failedCheckCount: hlsChild.failedCheckCount,
+          evidenceFile: hlsChild.path,
+          sourceCommit: hlsChild.sourceCommit,
+          sourceTree: hlsChild.sourceTree,
+          candidateTag: hlsChild.candidateTag,
+          candidateImageId: hlsChild.candidateImageId,
+          runImageId: hlsChild.runImageId,
+          networkMode: hlsChild.networkMode,
+          reason: hlsChild.reason,
+        },
+      },
       production: {
         latestTag: PRODUCTION_TAG,
         latestImageIdBefore: productionBefore.latestImageId,
@@ -894,7 +1025,8 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
     // exclusive (`wx`) create either makes this file or fails, so a record that
     // appeared after the pre-flight is refused rather than truncated, and a lost
     // race is never "adopt the winner" — the other file is not this run's.
-    const written = await writeEvidenceExclusive(evidencePath, renderReleaseEvidence(record), {
+    const rendered = renderReleaseEvidence(record);
+    const written = await writeEvidenceExclusive(evidencePath, rendered, {
       writeFile: deps.writeFile,
     });
     if (!written.ok) {
@@ -902,10 +1034,32 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       verdict = "BLOCKED";
       throw new Error(`refusing to claim a ${SPLIT07_EVIDENCE_SCHEMA} verdict: ${written.reason}`);
     }
+    // Read the record BACK, as a reviewer would: the exact bytes written, and a
+    // valid record under the CURRENT schema's rules for this source and image.
+    const writtenBytes = await readFileBytes(evidencePath);
+    let readBack = null;
+    try {
+      readBack = JSON.parse(writtenBytes.toString("utf8"));
+    } catch {
+      readBack = null;
+    }
+    const readBackProblems = writtenBytes.toString("utf8") !== rendered
+      ? ["the bytes on disk are not the bytes written"]
+      : validateReleaseParentRecord(readBack, { sourceCommit: provenance.source, imageId });
+    if (readBackProblems.length > 0) {
+      record = null;
+      verdict = "BLOCKED";
+      throw new Error(
+        `refusing to claim a ${SPLIT07_EVIDENCE_SCHEMA} verdict: the record at ${evidencePath} did not read back ` +
+          `as written (${readBackProblems.join("; ")}); do not rely on it`,
+      );
+    }
+    evidenceSha256 = createHash("sha256").update(writtenBytes).digest("hex");
     // Every failed check is named on the operator's console: a FAIL whose cause
     // is visible only inside the record is a FAIL that gets misdiagnosed.
     for (const name of checks.failed) log(`[split07]   FAIL ${name}\n`);
     log(`[split07] ${SPLIT07_EVIDENCE_SCHEMA} ${verdict}: ${evidencePath}\n`);
+    log(`[split07] parent sha256 ${evidenceSha256}\n`);
   } finally {
     // The candidate exists only to execute SPLIT-07A — and is removed even
     // when the run above was refused, unless it is being held for diagnosis.
@@ -928,7 +1082,7 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
     }
   }
 
-  return { code: verdict === "PASS" ? 0 : 1, verdict, image, evidencePath, record, checks: checks.entries };
+  return { code: verdict === "PASS" ? 0 : 1, verdict, image, evidencePath, evidenceSha256, record, checks: checks.entries };
 }
 
 /** A probe run, parsed. Its stdout is one JSON document and nothing else. */
