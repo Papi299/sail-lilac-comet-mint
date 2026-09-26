@@ -103,7 +103,7 @@ Safe for transmission to Vercel. When ready, it contains:
 | | |
 | :--- | :--- |
 | Source | `main` `593f47dfffe79f166d40af6575c6130668e56af0` (PR #63 merge) |
-| Production Worker | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest` |
+| Production Worker (P1 rollout) | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest`, from 2026-09-18 21:00Z. Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`, which still sends the field, and now the immediate Worker rollback (deployment runbook §4j, §9) |
 | Vercel (P1 rollout) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from the same source. Superseded on 2026-09-19 by the P2 deployment below, and now the immediate Vercel rollback |
 
 It was recorded here as "IMPLEMENTED IN SOURCE — NOT DEPLOYED" until then; that
@@ -142,7 +142,8 @@ only describes that outcome:
 - HLS renditions that analysis does not admit to the narrow clear-HLS v1 path
   appear in it as withheld (`unsupported_protocol`) and remain non-executable —
   as does every HLS rendition when the Worker has no FFmpeg;
-- since HLS-7, in **source only** (not yet deployed; deployment runbook §4j), an
+- since HLS-7 in source, and in the Production Worker since HLS-10 (2026-09-26;
+  deployment runbook §4j), an
   admitted clear-HLS v1 rendition can independently back an ordinary advertised
   video preset through the Worker's private HLS selection path. The field then
   counts it as deliverable, or withholds it as `not_selected` when another
@@ -155,7 +156,9 @@ application-owned preset (`preset:best`, `preset:1080`, `preset:720`, …); ther
 is no HLS-specific format id, field or error code. Such a preset states
 `container: "mp4"`, `hasVideo: true`, `hasAudio: true` and `null` for
 `fileSize`, `videoCodec`, `audioCodec` and `fps`. `preset:audio` and
-`preset:mp3` are never HLS-backed.
+`preset:mp3` are never HLS-backed. HLS-10 observed exactly this public shape in
+Production on a real public source (`preset:best` and five named rungs), and the
+unchanged Vercel control plane accepted it (deployment runbook §4j).
 
 **Deployment order — VERCEL FIRST.** `VideoMetadataSchema` is strict, so a
 control plane that predates this field REJECTS a Worker response that carries it
@@ -204,7 +207,7 @@ PRODUCTION ACCEPTED (2026-09-19).**
 | Source | `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478` (PR #64 merge), tree `44abfe6e90c0d9ce5bd9eae8af6140e3f39e7ff9` |
 | Production Vercel | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from that source by chain of custody (the project has no Git integration, so Vercel does not attest the commit) |
 | Immediate Vercel rollback | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` — needs no Worker rollback (above) |
-| Production Worker | unchanged by P2: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`) |
+| Production Worker at P2 | unchanged by P2: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`). Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c…` (deployment runbook §4j); P2 itself did not change |
 
 It was recorded here as "IMPLEMENTED IN SOURCE / NOT DEPLOYED" until then; that
 state is now history. The deployment and acceptance record is in the deployment
@@ -255,10 +258,10 @@ deployed source by deterministic render tests, not on a live third-party source.
 
 P2 changes presentation only. At P2, HLS and segmented DASH were not implemented
 and were inventory-only. Segmented DASH still is. Clear-HLS v1 was later
-implemented in source (HLS-7) and qualified in a retained release candidate, but
-it is **not deployed** — the Production Worker still runs the pre-HLS image
-(deployment runbook §4j) — and every HLS rendition outside that narrow path
-remains inventory-only. `observedMaxHeight` is still not a claim about a
+implemented in source (HLS-7), qualified in a retained release candidate (HLS-9B)
+and, on 2026-09-26, **deployed to the Production Worker and accepted** by HLS-10
+on a real public source (deployment runbook §4j). Every HLS rendition outside that
+narrow path remains inventory-only. `observedMaxHeight` is still not a claim about a
 provider's absolute maximum, and protected renditions are still not
 downloadable.
 
