@@ -393,17 +393,30 @@ operation.
 `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`; runtime identity
 corrected by `WORKER-LIVENESS-STATIC-USER-CORRECTION-001`
 
-**Not installed, not enabled, not live-accepted.**
+**Installed and live-accepted in Production on 2026-09-26.**
 - **The first live deployment failed.** It ran on 2026-09-26
   (`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-LIVE-ACCEPTANCE-001`) with the probe as
   a `DynamicUser`. Its first timer tick could not query systemd, so it was
-  rolled back, and nothing from it remains on the VM.
-- **The correction is in source only.** The unit now runs as a dedicated static
+  rolled back, and nothing from that attempt was left on the VM.
+- **PR #84 corrected the identity.** The unit now runs as a dedicated static
   account; see
   [Runtime identity](#runtime-identity-a-dedicated-static-account).
-- **The runbook §10 item stays open.** It closes only once the corrected
-  artefacts are installed on the VM under separate authorization and accepted
-  there.
+- **The static-account deployment was then accepted live.**
+  `WORKER-LIVENESS-STATIC-USER-LIVE-REACCEPTANCE-001` installed the four
+  artefacts from `main` `db20d910…` by [install order](#install-order) step 6,
+  and every stage passed:
+  - as the account, Node `v22.23.2` and the probe's exact systemd query;
+  - one on-demand run `healthy`;
+  - with the Worker deliberately stopped, one manual run and one naturally
+    scheduled timer tick both `idle`, and the timer started nothing;
+  - `healthy` again once the Worker was restored.
+
+  The record is in the runbook (§8, §10). Its evidence is operator-held, not CI.
+- **What stays on the VM.** The `videofetch-liveness` account, the four
+  artefacts and the enabled `videofetch-worker-liveness.timer`. The service
+  itself stays `static` and runs only on timer ticks. The VM stays on demand:
+  while it is stopped the timer does not run, and `Persistent=false` replays no
+  missed tick at the next boot.
 
 ```
 videofetch-worker-liveness.timer        every 5 min of VM UPTIME; Persistent=false
@@ -510,6 +523,10 @@ back to `nobody` shares it.
 - **What the account is for.** It owns no file and no state. It exists only so
   that the probe has a stable, statically provisioned identity for the
   system-bus query.
+- **Proven live.** On the same Production VM, the static account then made
+  that exact query successfully (`LoadState=loaded`), with no
+  `Transport endpoint is not connected`, and the full deployment was accepted
+  (runbook §8).
 
 The two install-time checks run **as this account**: it can execute the pinned
 Node, and it can make the probe's exact read-only systemd query. They are
@@ -760,10 +777,15 @@ The order is not a convenience — it is the fail-closed boundary.
    but the reviewed bounded workspace and empties that workspace first.
 
 6. **Install the external liveness probe — only under separate authorization.**
-   *Not performed by `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001` or
-   `WORKER-LIVENESS-STATIC-USER-CORRECTION-001`, which are source only. The one
-   live attempt so far (`…-LIVE-ACCEPTANCE-001`, 2026-09-26) used the earlier
-   `DynamicUser` unit and was rolled back.*
+   *This is the accepted deployment procedure.
+   `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001` and
+   `WORKER-LIVENESS-STATIC-USER-CORRECTION-001` are source only and installed
+   nothing. Two live deployments followed on 2026-09-26. The first
+   (`…-LIVE-ACCEPTANCE-001`) used the earlier `DynamicUser` unit and was rolled
+   back. The second (`WORKER-LIVENESS-STATIC-USER-LIVE-REACCEPTANCE-001`)
+   followed 6a–6d below and was accepted. Its result persists: the account,
+   the artefacts and the enabled timer survive VM stops, so this is a one-time
+   install, not a per-boot step.*
 
    It needs steps 0 (pinned host Node) and 4 (`vf-egress-lib.sh` and
    `media-egress.env`), plus the account created in 6a. PID 1 reads
