@@ -17,7 +17,8 @@ import {
 
 /**
  * Static and behavioural policy guard for the EXTERNAL Worker liveness probe
- * (WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001).
+ * (WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001; runtime identity
+ * corrected by WORKER-LIVENESS-STATIC-USER-CORRECTION-001).
  *
  * Two halves, in the style of the safe-egress suite:
  *
@@ -56,6 +57,10 @@ const WORKER_UNIT = join(SYSTEMD, "videofetch-worker.service");
 const NETNS_UNIT = join(SYSTEMD, "videofetch-media-netns.service");
 const EGRESS_ENV_TEMPLATE = join(SYSTEMD, "media-egress.env.example");
 const DOCKERFILE = join(REPO_ROOT, "Dockerfile.worker");
+const DEPLOY_README = join(DEPLOY, "README.md");
+
+/** The dedicated static service account the probe runs as. */
+const LIVENESS_ACCOUNT = "videofetch-liveness";
 
 /** Strips comments and joins line continuations into logical directives. */
 function parseUnit(source: string): string[] {
@@ -95,6 +100,47 @@ function values(directives: string[], key: string): string[] {
 /** Every whitespace-separated token of every value of a directive. */
 function tokens(directives: string[], key: string): string[] {
   return values(directives, key).flatMap((v) => v.split(/\s+/).filter(Boolean));
+}
+
+/**
+ * The probe's identity contract, as a function so it can be applied both to
+ * the shipped unit and to deliberately regressed copies of it. Returns every
+ * violation; an empty list means the unit complies.
+ */
+function staticIdentityViolations(directives: string[]): string[] {
+  const violations: string[] = [];
+  const dynamic = values(directives, "DynamicUser");
+  if (dynamic.length > 0) {
+    violations.push(
+      `DynamicUser=${dynamic.join(",")} is set — on the Production VM that identity could not query systemd`,
+    );
+  }
+  const users = values(directives, "User");
+  const groups = values(directives, "Group");
+  const supplementary = tokens(directives, "SupplementaryGroups");
+  if (users.length !== 1 || users[0] !== LIVENESS_ACCOUNT) {
+    violations.push(`User= must be exactly ${LIVENESS_ACCOUNT}, got [${users.join(", ")}]`);
+  }
+  if (groups.length !== 1 || groups[0] !== LIVENESS_ACCOUNT) {
+    violations.push(`Group= must be exactly ${LIVENESS_ACCOUNT}, got [${groups.join(", ")}]`);
+  }
+  if (values(directives, "SupplementaryGroups").length > 0) {
+    violations.push(`SupplementaryGroups= must not be set, got [${supplementary.join(", ")}]`);
+  }
+  for (const forbidden of ["root", "0", "nobody", "65534", "nogroup", "videofetch-broker", "docker"]) {
+    if ([...users, ...groups, ...supplementary].includes(forbidden)) {
+      violations.push(`${forbidden} must never be part of the probe's identity`);
+    }
+  }
+  return violations;
+}
+
+/** Joins backslash continuations, so a wrapped shell command is matched as one line. */
+function logicalCommands(markdown: string): string[] {
+  return markdown
+    .replace(/\\\n\s*/g, " ")
+    .split("\n")
+    .map((line) => line.trim());
 }
 
 describe("external Worker liveness probe — source contract", () => {
@@ -155,8 +201,8 @@ describe("external Worker liveness probe — source contract", () => {
 
   it("NEVER traverses the root-only /etc/videofetch directory itself", () => {
     // REVIEW-CORRECTION-001, finding 1. /etc/videofetch is root-owned 0700 — it
-    // also holds broker credentials — and the probe runs as a DynamicUser that
-    // cannot traverse it. The first revision read media-egress.env directly
+    // also holds broker credentials — and the probe runs as an unprivileged
+    // account that cannot traverse it. The first revision read media-egress.env directly
     // through vf_config_load, which could never have worked when deployed.
     // Operator diagnostics may NAME the file so a fault is actionable. Only a
     // pure quoted-string `echo` to stdout/stderr is exempt; an echo that
@@ -387,7 +433,6 @@ describe("liveness probe deployment wiring", () => {
     assert.equal(values(serviceDirectives, "AmbientCapabilities")[0], "");
     assert.equal(values(serviceDirectives, "NoNewPrivileges")[0], "yes");
     assert.equal(values(serviceDirectives, "RestrictNamespaces")[0], "yes");
-    assert.equal(values(serviceDirectives, "DynamicUser")[0], "yes");
     for (const forbidden of [/NET_ADMIN/, /SYS_ADMIN/, /--privileged/, /docker\.sock/]) {
       assert.doesNotMatch(serviceExec, forbidden);
     }
@@ -472,11 +517,11 @@ describe("liveness probe deployment wiring", () => {
     assert.deepEqual(probeFiles, holderFiles, "the probe reads exactly the holder's file");
   });
 
-  it("lets PID 1, not the DynamicUser, read the root-only configuration", () => {
+  it("lets PID 1, not the probe's account, read the root-only configuration", () => {
     // REVIEW-CORRECTION-001, finding 1. /etc/videofetch stays 0700. PID 1 reads
     // the file as root before dropping privilege; the unprivileged process only
-    // ever sees the resulting environment value.
-    assert.equal(values(serviceDirectives, "DynamicUser")[0], "yes");
+    // ever sees the resulting environment value. The static-account correction
+    // changes WHO the process is, not how its configuration reaches it.
     assert.deepEqual(
       values(serviceDirectives, "EnvironmentFile"),
       ["-/etc/videofetch/media-egress.env"],
@@ -496,8 +541,11 @@ describe("liveness probe deployment wiring", () => {
     for (const key of ["ReadOnlyPaths", "ReadWritePaths", "BindPaths", "BindReadOnlyPaths", "LoadCredential", "LoadCredentialEncrypted", "SetCredential", "ImportCredential"]) {
       assert.deepEqual(values(serviceDirectives, key), [], `${key}= must not be used`);
     }
-    // Not root, by any route.
-    for (const key of ["User", "Group", "SupplementaryGroups", "PermissionsStartOnly"]) {
+    // Not root, by any route: the process is the dedicated static account (see
+    // the identity suite) and nothing grants it more.
+    assert.deepEqual(values(serviceDirectives, "User"), [LIVENESS_ACCOUNT]);
+    assert.deepEqual(values(serviceDirectives, "Group"), [LIVENESS_ACCOUNT]);
+    for (const key of ["SupplementaryGroups", "PermissionsStartOnly"]) {
       assert.deepEqual(values(serviceDirectives, key), [], `${key}= must not be set`);
     }
     assert.doesNotMatch(serviceExec, /ExecStart[A-Za-z]*=\s*[+!]/, "no privileged ExecStart prefix");
@@ -516,6 +564,220 @@ describe("liveness probe deployment wiring", () => {
         assert.doesNotMatch(exec, forbidden, `the liveness units must not touch ${forbidden}`);
       }
     }
+  });
+});
+
+describe("liveness probe runtime identity — a dedicated static account", () => {
+  // WORKER-LIVENESS-STATIC-USER-CORRECTION-001.
+  //
+  // The first live deployment (2026-09-26) ran this unit as DynamicUser=yes. On
+  // the Production Lima VM — systemd 255, classic dbus-daemon 1.14.10 — its
+  // first timer tick reported OUTCOME=state-unavailable: the read-only
+  // `systemctl show` failed with "Transport endpoint is not connected". A
+  // DynamicUser with the other hardening removed failed the same way, and a
+  // static unprivileged identity made the same query successfully. The
+  // deployment was rolled back.
+  //
+  // No repository test can emulate that VM's D-Bus, and none of these pretends
+  // to. What they CAN do is make the measured prerequisite — a stable,
+  // statically provisioned identity — a structural property of the unit, so a
+  // revert to DynamicUser= fails here instead of on the VM. The live proof that
+  // the account can make the query is an install-time check in
+  // deploy/README.md, and it must pass before the timer is enabled.
+  let service: string;
+  let serviceDirectives: string[];
+  let serviceExec: string;
+
+  before(async () => {
+    service = await readFile(LIVENESS_SERVICE, "utf8");
+    serviceDirectives = parseUnit(service);
+    serviceExec = executableLines(service);
+  });
+
+  it("runs as the dedicated static account, with its own group and no other", () => {
+    assert.deepEqual(staticIdentityViolations(serviceDirectives), []);
+    assert.deepEqual(values(serviceDirectives, "User"), [LIVENESS_ACCOUNT]);
+    assert.deepEqual(values(serviceDirectives, "Group"), [LIVENESS_ACCOUNT]);
+    assert.deepEqual(values(serviceDirectives, "SupplementaryGroups"), []);
+  });
+
+  it("is NOT a transient DynamicUser, the identity that could not query systemd on the Production VM", () => {
+    assert.deepEqual(
+      values(serviceDirectives, "DynamicUser"),
+      [],
+      "DynamicUser= must be absent: on the Production VM a DynamicUser could not complete " +
+        "the read-only systemd query this probe depends on (OUTCOME=state-unavailable)",
+    );
+  });
+
+  it("rejects a regression back to DynamicUser=yes, and every other wrong identity", () => {
+    // Deliberately regressed copies of the SHIPPED unit. Every one must be
+    // caught; a contract that accepted any of them would be one in name only.
+    const identity = `User=${LIVENESS_ACCOUNT}\nGroup=${LIVENESS_ACCOUNT}\n`;
+    assert.ok(service.includes(identity), "the shipped unit declares its identity as one block");
+    const mutants: Array<[string, string]> = [
+      ["the PR #83 identity (DynamicUser=yes, no User=/Group=)", service.replace(identity, "DynamicUser=yes\n")],
+      ["DynamicUser=yes alongside the static account", service.replace(identity, `${identity}DynamicUser=yes\n`)],
+      ["no User=/Group= at all, which systemd runs as root", service.replace(identity, "")],
+      ["User=root", service.replace(identity, `User=root\nGroup=${LIVENESS_ACCOUNT}\n`)],
+      ["User=nobody", service.replace(identity, "User=nobody\nGroup=nogroup\n")],
+      ["the broker's account", service.replace(identity, "User=videofetch-broker\nGroup=videofetch-broker\n")],
+      ["the broker's group", service.replace(identity, `User=${LIVENESS_ACCOUNT}\nGroup=videofetch-broker\n`)],
+      ["docker membership", service.replace(identity, `${identity}SupplementaryGroups=docker\n`)],
+      ["broker-group membership", service.replace(identity, `${identity}SupplementaryGroups=videofetch-broker\n`)],
+    ];
+    for (const [name, mutant] of mutants) {
+      assert.notEqual(mutant, service, `${name}: the mutation must actually change the unit`);
+      assert.ok(
+        staticIdentityViolations(parseUnit(mutant)).length > 0,
+        `${name} must be rejected by the identity contract`,
+      );
+    }
+  });
+
+  it("keeps every protection the DynamicUser revision had, now stated explicitly", () => {
+    // DynamicUser= implied ProtectSystem=strict, ProtectHome=read-only,
+    // PrivateTmp=, NoNewPrivileges=, RestrictSUIDSGID= and RemoveIPC=. Each is
+    // declared here, so moving to a static account weakened nothing.
+    const required: Array<[string, string]> = [
+      ["NoNewPrivileges", "yes"],
+      ["CapabilityBoundingSet", ""],
+      ["AmbientCapabilities", ""],
+      ["ProtectSystem", "strict"],
+      ["ProtectHome", "yes"],
+      ["PrivateTmp", "yes"],
+      ["PrivateDevices", "yes"],
+      ["ProtectKernelTunables", "yes"],
+      ["ProtectKernelModules", "yes"],
+      ["ProtectKernelLogs", "yes"],
+      ["ProtectControlGroups", "yes"],
+      ["ProtectClock", "yes"],
+      ["ProtectHostname", "yes"],
+      ["ProtectProc", "invisible"],
+      ["LockPersonality", "yes"],
+      ["RestrictRealtime", "yes"],
+      ["RestrictSUIDSGID", "yes"],
+      ["RestrictNamespaces", "yes"],
+      ["SystemCallArchitectures", "native"],
+      ["RemoveIPC", "yes"],
+      ["RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6"],
+    ];
+    for (const [key, value] of required) {
+      assert.deepEqual(values(serviceDirectives, key), [value], `${key}=${value} is required, exactly once`);
+    }
+    // Host loopback must stay reachable, so there is still no PrivateNetwork=.
+    assert.deepEqual(values(serviceDirectives, "PrivateNetwork"), []);
+  });
+
+  it("brings no state, home directory or writable path with the account", () => {
+    for (const key of [
+      "StateDirectory",
+      "RuntimeDirectory",
+      "CacheDirectory",
+      "LogsDirectory",
+      "ConfigurationDirectory",
+      "ReadWritePaths",
+      "BindPaths",
+      "WorkingDirectory",
+    ]) {
+      assert.deepEqual(values(serviceDirectives, key), [], `${key}= must not be set`);
+    }
+  });
+
+  it("adds no credential and no configuration beyond the one delivered port", () => {
+    assert.deepEqual(values(serviceDirectives, "Environment"), ["VIDEOFETCH_WORKER_PORT="]);
+    assert.deepEqual(values(serviceDirectives, "EnvironmentFile"), ["-/etc/videofetch/media-egress.env"]);
+    for (const key of [
+      "LoadCredential",
+      "LoadCredentialEncrypted",
+      "SetCredential",
+      "SetCredentialEncrypted",
+      "ImportCredential",
+      "PassEnvironment",
+    ]) {
+      assert.deepEqual(values(serviceDirectives, key), [], `${key}= must not be set`);
+    }
+    for (const forbidden of [/r2-broker\.env/, /worker\.env/, /broker-gid\.env/, /secret/i, /token/i]) {
+      assert.doesNotMatch(serviceExec, forbidden, `the probe unit must not reference ${forbidden}`);
+    }
+  });
+});
+
+describe("the liveness install procedure provisions and verifies the account BEFORE the timer", () => {
+  // The unit cannot create its own account, and must not: systemd would refuse
+  // to start it (status=217/USER), and a unit that provisions users is a
+  // privileged unit. So the ordering lives in the operator procedure, and this
+  // suite pins it.
+  let commands: string[];
+  let enableAt: number;
+
+  const firstIndex = (pattern: RegExp) => commands.findIndex((line) => pattern.test(line));
+
+  before(async () => {
+    commands = logicalCommands(await readFile(DEPLOY_README, "utf8"));
+    enableAt = firstIndex(/^systemctl enable --now videofetch-worker-liveness\.timer\b/);
+  });
+
+  it("enables the timer somewhere, so the ordering checks below are not vacuous", () => {
+    assert.ok(enableAt >= 0, "deploy/README.md must enable videofetch-worker-liveness.timer");
+  });
+
+  it("creates the group and the account idempotently, before enabling the timer", () => {
+    const group = firstIndex(
+      /^getent group videofetch-liveness\b.*\|\|\s*groupadd --system videofetch-liveness$/,
+    );
+    const user = firstIndex(/^getent passwd videofetch-liveness\b.*\|\|\s*useradd --system\b.*\bvideofetch-liveness$/);
+    assert.ok(group >= 0 && group < enableAt, "the group is created, once, before the timer is enabled");
+    assert.ok(user >= 0 && user < enableAt, "the account is created, once, before the timer is enabled");
+
+    const useradd = commands[user]!;
+    for (const required of ["--no-create-home", "--home-dir /nonexistent", "--shell /usr/sbin/nologin", "--gid videofetch-liveness"]) {
+      assert.ok(useradd.includes(required), `useradd must pass ${required}`);
+    }
+    // Its own group and nothing else: no docker, no broker group.
+    assert.doesNotMatch(useradd, /\s(-G|--groups|-aG|--append)\b/);
+  });
+
+  it("verifies the account's groups before enabling the timer", () => {
+    const check = firstIndex(/^id -Gn videofetch-liveness\b/);
+    assert.ok(check >= 0 && check < enableAt, "`id -Gn videofetch-liveness` is checked first");
+  });
+
+  it("proves AS THE SERVICE ACCOUNT that it can run the pinned Node, after creating it and before the timer", () => {
+    const user = firstIndex(/^getent passwd videofetch-liveness\b/);
+    const node = firstIndex(
+      /^systemd-run\b.*-p User=videofetch-liveness\b.*-p Group=videofetch-liveness\b.*\/opt\/videofetch\/node\/bin\/node -v\b/,
+    );
+    assert.ok(node > user && node < enableAt, "the Node check runs as videofetch-liveness, between 6a and 6d");
+  });
+
+  it("proves AS THE SERVICE ACCOUNT that it can make the exact systemd query, before the timer", () => {
+    // The live failure was precisely this query. It must be exercised as the
+    // real identity, read-only, before anything depends on it.
+    const user = firstIndex(/^getent passwd videofetch-liveness\b/);
+    const query = firstIndex(
+      /^systemd-run\b.*-p User=videofetch-liveness\b.*-p Group=videofetch-liveness\b.*systemctl show\b.*--property=LoadState\b.*--property=ActiveState\b.*--property=SubState\b.*\bvideofetch-worker\.service\b/,
+    );
+    assert.ok(query > user && query < enableAt, "the systemd query runs as videofetch-liveness, between 6a and 6d");
+    assert.doesNotMatch(commands[query]!, /\b(start|stop|restart|reload|kill)\b/, "the check is read-only");
+
+    // Then one on-demand run of the real unit, under its full sandbox, still
+    // before the timer exists.
+    const onDemand = firstIndex(/^systemctl start videofetch-worker-liveness\.service$/);
+    assert.ok(onDemand > query && onDemand < enableAt, "one on-demand run precedes enabling the timer");
+  });
+
+  it("no longer prescribes a DynamicUser check, and never adds the account to another group", () => {
+    assert.deepEqual(
+      commands.filter((line) => /^systemd-run\b.*DynamicUser=yes/.test(line)),
+      [],
+      "the DynamicUser prerequisite is obsolete: it is not the identity the unit runs as",
+    );
+    assert.deepEqual(
+      commands.filter((line) => /^(usermod|gpasswd|adduser)\b.*videofetch-liveness/.test(line)),
+      [],
+      "videofetch-liveness is never added to docker, the broker group or any other group",
+    );
   });
 });
 
@@ -972,8 +1234,8 @@ exit 0
 
   it("works WITHOUT any access to the root-only configuration directory", async () => {
     // REVIEW-CORRECTION-001, finding 1, behaviourally. VF_CONFIG_FILE points
-    // into a directory this process cannot traverse — the DynamicUser's view of
-    // /etc/videofetch — and the probe still succeeds on the delivered value.
+    // into a directory this process cannot traverse — the probe account's view
+    // of /etc/videofetch — and the probe still succeeds on the delivered value.
     await listen((req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok" }));
