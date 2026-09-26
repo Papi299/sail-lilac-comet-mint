@@ -104,7 +104,7 @@ Safe for transmission to Vercel. When ready, it contains:
 | :--- | :--- |
 | Source | `main` `593f47dfffe79f166d40af6575c6130668e56af0` (PR #63 merge) |
 | Production Worker (P1 rollout) | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest`, from 2026-09-18 21:00Z. Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`, which still sends the field, and now the immediate Worker rollback (deployment runbook §4j, §9) |
-| Vercel (P1 rollout) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from the same source. Superseded on 2026-09-19 by the P2 deployment below, and now the immediate Vercel rollback |
+| Vercel (P1 rollout) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from the same source. Superseded on 2026-09-19 by the P2 deployment below. Retained as the first code-rollback layer behind the current redeploy and the original P2 deployment (below; deployment runbook §9) |
 
 It was recorded here as "IMPLEMENTED IN SOURCE — NOT DEPLOYED" until then; that
 state is now history. The rollout record is in the deployment runbook (§11h).
@@ -183,21 +183,44 @@ All three steps were performed on 2026-09-18, in that order:
 After that, a live Production analysis returned `sourceQuality` through Vercel,
 and the strict schema accepted it.
 
-**The ordering constraint still holds for rollback, and Vercel now has two
-rollback layers.** Vercel Production is the P2 deployment
-`dpl_BcefWQBrtw7bJuubiQrTr9h38cvq` (below).
+**The ordering constraint still holds for rollback.**
 
-- Its immediate rollback, `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, already accepts
-  the optional field, so P2 can be rolled back on Vercel alone, with the Worker
-  left in place.
-- The deeper rollback, `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`, predates the field.
-  While the live Worker sends it, that deployment would reject every generic
-  analysis, so roll the Worker back first.
+**Current Production.** Vercel Production is `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd`,
+observed read-only from the provider on 2026-09-27.
+- **Deployment.** Target `production`, `source: redeploy`, created
+  2026-09-26T20:10:31.374Z, READY at 20:11:07.464Z.
+- **Origin.** Vercel records it as a redeploy of the P2 deployment
+  `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq` (`meta.originalDeploymentId`). It carries
+  the P2 source's CLI-recorded commit `02b3f15f…`.
+- **What that establishes.** This is provider metadata and chain-of-custody
+  context, **not** a Git attestation. It changes the deployment identity, not
+  the accepted P2 API contract.
 
-A Worker rollback on its own is safe: `dpl_BcefWQ…` and `dpl_AFFCLwLi…` both
-accept a Worker that omits the field. The field is optional in the shared
-contract, which P2 did not change, and P1's Vercel-first step measured it for
-`dpl_AFFCLwLi…`.
+**Rollback layers**, as in the deployment runbook §9 (operational detail there
+and in §11h):
+
+1. **The redeploy's original, `dpl_BcefWQ…`.** It is the P2 deployment itself,
+   so its contract is the accepted P2 one.
+2. **First code rollback, `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` (P1).** It already
+   accepts the optional field, so the control plane can roll back on Vercel
+   alone, with the Worker left in place.
+3. **Deeper rollback, `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`.** It predates the
+   field. While the live Worker sends it, that deployment would reject every
+   generic analysis, so roll the Worker back first.
+
+**Environment of older deployments.** Vercel applies environment changes only
+to new deployments, so each older deployment keeps the environment it was
+created with.
+- **Before rolling back** to one, confirm that its Cloudflare Access Service
+  Auth configuration is still usable.
+- **Not recorded here:** which credential version any older deployment holds.
+
+**A Worker rollback on its own is safe.** `dpl_BcefWQ…` and `dpl_AFFCLwLi…`
+both accept a Worker that omits the field.
+- **Why.** The field is optional in the shared contract, which P2 did not
+  change, and P1's Vercel-first step measured it for `dpl_AFFCLwLi…`.
+- **The current redeploy.** `dpl_BJYRG7…` is a provider-recorded redeploy of
+  `dpl_BcefWQ…`.
 
 **Browser presentation — `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001`, DEPLOYED /
 PRODUCTION ACCEPTED (2026-09-19).**
@@ -205,8 +228,8 @@ PRODUCTION ACCEPTED (2026-09-19).**
 | | |
 | :--- | :--- |
 | Source | `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478` (PR #64 merge), tree `44abfe6e90c0d9ce5bd9eae8af6140e3f39e7ff9` |
-| Production Vercel | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from that source by chain of custody (the project has no Git integration, so Vercel does not attest the commit) |
-| Immediate Vercel rollback | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` — needs no Worker rollback (above) |
+| P2 accepted Production deployment | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from that source by chain of custody (the project has no Git integration, so Vercel does not attest the commit); accepted in Production on 2026-09-19. Current Production is the later provider-observed redeploy of it, `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd` (above) |
+| Immediate Vercel rollback at P2 | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` — needs no Worker rollback. Now the first code-rollback layer (above) |
 | Production Worker at P2 | unchanged by P2: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`). Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c…` (deployment runbook §4j); P2 itself did not change |
 
 It was recorded here as "IMPLEMENTED IN SOURCE / NOT DEPLOYED" until then; that
