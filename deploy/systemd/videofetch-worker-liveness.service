@@ -53,13 +53,47 @@ TimeoutStartSec=30
 
 ExecStart=/usr/local/sbin/vf-worker-liveness-probe
 
+# ── Configuration: the ONE port declaration, delivered by PID 1 ─────────────
+#
+# The authoritative source is VIDEOFETCH_WORKER_PORT in
+# /etc/videofetch/media-egress.env — the same file, read by the same systemd
+# parser, that videofetch-media-netns.service expands into its
+# `-p 127.0.0.1:${VIDEOFETCH_WORKER_PORT}:...` flag.
+#
+# /etc/videofetch is root-owned mode 0700 because it also holds broker
+# credentials, and the DynamicUser below CANNOT traverse it. That is correct
+# and is not weakened here. Instead PID 1 reads this file AS ROOT, before any
+# privilege is dropped, and passes the value to the unprivileged process in its
+# environment. Nothing is copied to disk and no second setting exists; the probe
+# itself never opens anything under /etc/videofetch.
+#
+# Environment= FIRST pins the variable to empty, and EnvironmentFile= overrides
+# it. The value is therefore the file's or nothing — it can never be inherited
+# from the service manager's own environment. The `-` makes a missing file
+# non-fatal to systemd, so the probe runs and reports it as
+# OUTCOME=config-invalid instead of the unit failing silently before ExecStart.
+#
+# UnsetEnvironment= removes the resolver declaration the same file carries. It is
+# not secret, but the probe consumes exactly one value and is given exactly one.
+Environment=VIDEOFETCH_WORKER_PORT=
+EnvironmentFile=-/etc/videofetch/media-egress.env
+UnsetEnvironment=VIDEOFETCH_MEDIA_DNS_FLAGS
+
 # ── Privilege: none ────────────────────────────────────────────────────────
 #
-# The probe needs to read one world-readable configuration file, ask systemd for
-# a unit's state, and open a loopback TCP connection. It needs no account, no
-# capability and no write access anywhere, and this is what makes "the probe
-# cannot mutate the boundary" a property of the sandbox rather than a promise in
-# a comment.
+# The probe needs to execute the pinned host Node, read its own two installed
+# files under /usr/local, ask systemd for a unit's state over D-Bus, and open a
+# loopback TCP connection. It reads no configuration file itself — PID 1 hands
+# it the port, see above. It needs no account, no capability and no write
+# access anywhere, and this is what makes "the probe cannot mutate the
+# boundary" a property of the sandbox rather than a promise in a comment.
+#
+# DEPLOYMENT PRECONDITION: the DynamicUser must be able to TRAVERSE and execute
+# /opt/videofetch/node/bin/node. The broker proves a fixed non-root system user
+# can; the repository does not record /opt/videofetch's mode, so it does not
+# prove an arbitrary UID can. If it cannot, the probe says so precisely —
+# OUTCOME=config-invalid reason=node-unavailable — rather than reporting an
+# unhealthy Worker. deploy/README.md lists the install-time check.
 #
 # DynamicUser: a transient unprivileged identity, so the probe introduces no
 # provisioned user, group or home directory to the deployment.
@@ -69,6 +103,10 @@ NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 
+# The whole filesystem is read-only to this unit. The ONLY writable location is
+# its own PrivateTmp — a per-invocation /tmp that no other unit shares and that
+# is discarded when the probe exits (DynamicUser= implies it regardless). The
+# probe writes nothing there either.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
@@ -117,9 +155,9 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 #
 #   [Install]        This unit is NOT enabled. Only the timer is, so the probe
 #                    has exactly one trigger and never runs at boot on its own.
-#   EnvironmentFile  It holds and needs no secret. The one value it reads —
-#                    VIDEOFETCH_WORKER_PORT — comes from
-#                    /etc/videofetch/media-egress.env, parsed by the shared
-#                    vf-egress-lib.sh reader, so there is no second
-#                    authoritative Worker-port setting.
+#   Credentials      It holds and needs none. media-egress.env contains no
+#                    secret by its own contract, and nothing else from
+#                    /etc/videofetch is delivered to this unit.
+#   Root execution   There is no User=root and no PermissionsStartOnly-style
+#                    escape: only PID 1's EnvironmentFile= read is privileged.
 #   Requires=        See the [Unit] note: nothing here may activate the Worker.

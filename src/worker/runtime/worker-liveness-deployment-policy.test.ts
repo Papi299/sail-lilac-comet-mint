@@ -144,13 +144,54 @@ describe("external Worker liveness probe — source contract", () => {
     assert.doesNotMatch(probeExec, /\blocalhost\b/);
   });
 
-  it("takes the port from the ONE authoritative deployment declaration", () => {
-    // Read through the shared library, exactly as systemd and the safe-egress
-    // helpers read it. A second parser would be a second authoritative port.
-    assert.match(probeExec, /VF_EGRESS_LIB/, "the shared config reader is sourced");
-    assert.match(probeExec, /vf_config_load/, "the shared loader is called");
-    assert.match(probeExec, /VIDEOFETCH_WORKER_PORT/, "the declared port is used");
+  it("consumes the declared port from its environment and validates it fail-closed", () => {
+    // PID 1 delivers VIDEOFETCH_WORKER_PORT from media-egress.env (see the
+    // wiring suite). The probe validates it with the SAME rule that gates the
+    // namespace holder, sourced from the shared library.
+    assert.match(probeExec, /\$\{VIDEOFETCH_WORKER_PORT-\}/, "the delivered port is used");
+    assert.match(probeExec, /VF_EGRESS_LIB/, "the shared validator is sourced");
     assert.match(probeExec, /vf_validate_port/, "and it is validated fail-closed");
+  });
+
+  it("NEVER traverses the root-only /etc/videofetch directory itself", () => {
+    // REVIEW-CORRECTION-001, finding 1. /etc/videofetch is root-owned 0700 — it
+    // also holds broker credentials — and the probe runs as a DynamicUser that
+    // cannot traverse it. The first revision read media-egress.env directly
+    // through vf_config_load, which could never have worked when deployed.
+    // Operator diagnostics may NAME the file so a fault is actionable. Only a
+    // pure quoted-string `echo` to stdout/stderr is exempt; an echo that
+    // redirects into a path is still an access and is still checked.
+    const diagnostic = /^\s*echo\s+"[^"]*"\s*(>&2)?\s*$/;
+    const accessing = probeExec
+      .split("\n")
+      .filter((line) => !diagnostic.test(line))
+      .join("\n");
+    for (const forbidden of [
+      /\/etc\/videofetch/,
+      /\bvf_config_load\b/,
+      /\bvf_config_read\b/,
+      /\bVF_CONFIG_FILE\b/,
+      /media-egress\.env/,
+      /\bvf_die\b/,
+    ]) {
+      assert.doesNotMatch(accessing, forbidden, `the probe must not use ${forbidden}`);
+    }
+  });
+
+  it("routes EVERY exit through one OUTCOME record, with a backstop for the rest", () => {
+    // REVIEW-CORRECTION-001: the first revision promised one OUTCOME line on
+    // every path while calling a shared helper that could exit without one.
+    assert.match(probeExec, /trap vf_on_exit EXIT/, "an EXIT backstop is installed");
+    assert.match(probeExec, /OUTCOME=internal-error/, "and reports unexpected exits");
+    // Every literal `exit` lives inside verdict() or the backstop.
+    const exits = probeExec
+      .split("\n")
+      .filter((line) => /(^|[\s;])exit(\s|$)/.test(line));
+    assert.deepEqual(
+      exits.map((line) => line.trim()),
+      ['exit "$code"', "exit 2"],
+      "no exit may bypass verdict() and the EXIT backstop",
+    );
   });
 
   it("introduces no second Worker-port setting, and hard-codes no port", () => {
@@ -416,14 +457,57 @@ describe("liveness probe deployment wiring", () => {
     }
   });
 
-  it("reads the port from the SAME configuration that publishes the Worker", async () => {
+  it("gets the port from the SAME file, by the SAME parser, that publishes the Worker", async () => {
     const template = await readFile(EGRESS_ENV_TEMPLATE, "utf8");
     assert.match(template, /^VIDEOFETCH_WORKER_PORT=/m, "the declaration lives here");
-    // The holder publishes ${VIDEOFETCH_WORKER_PORT} from this same file, and the
-    // probe reads it through vf-egress-lib.sh. One value, two consumers.
-    assert.match(netnsUnitExec, /EnvironmentFile=\/etc\/videofetch\/media-egress\.env/);
-    const probeSource = await readFile(PROBE_SCRIPT, "utf8");
-    assert.match(executableLines(probeSource), /vf_config_load/);
+
+    // The holder expands ${VIDEOFETCH_WORKER_PORT} from its EnvironmentFile=, and
+    // the probe unit names the identical file. One file, one systemd parser, two
+    // consumers — there is no second port setting and no copy of the value.
+    const netnsDirectives = parseUnit(await readFile(NETNS_UNIT, "utf8"));
+    const strip = (v: string) => v.replace(/^-/, "");
+    const holderFiles = values(netnsDirectives, "EnvironmentFile").map(strip);
+    const probeFiles = values(serviceDirectives, "EnvironmentFile").map(strip);
+    assert.deepEqual(holderFiles, ["/etc/videofetch/media-egress.env"]);
+    assert.deepEqual(probeFiles, holderFiles, "the probe reads exactly the holder's file");
+  });
+
+  it("lets PID 1, not the DynamicUser, read the root-only configuration", () => {
+    // REVIEW-CORRECTION-001, finding 1. /etc/videofetch stays 0700. PID 1 reads
+    // the file as root before dropping privilege; the unprivileged process only
+    // ever sees the resulting environment value.
+    assert.equal(values(serviceDirectives, "DynamicUser")[0], "yes");
+    assert.deepEqual(
+      values(serviceDirectives, "EnvironmentFile"),
+      ["-/etc/videofetch/media-egress.env"],
+      "the manager reads it; a missing file reaches the probe as an empty value",
+    );
+    // Pinned FIRST, so the value is the file's or nothing — never inherited
+    // from the service manager's own environment block.
+    assert.ok(
+      values(serviceDirectives, "Environment").includes("VIDEOFETCH_WORKER_PORT="),
+      "VIDEOFETCH_WORKER_PORT is pinned empty before the file overrides it",
+    );
+    // The probe consumes one value and is handed one.
+    assert.ok(tokens(serviceDirectives, "UnsetEnvironment").includes("VIDEOFETCH_MEDIA_DNS_FLAGS"));
+
+    // Nothing makes /etc/videofetch reachable to the process, and nothing else
+    // from it is delivered.
+    for (const key of ["ReadOnlyPaths", "ReadWritePaths", "BindPaths", "BindReadOnlyPaths", "LoadCredential", "LoadCredentialEncrypted", "SetCredential", "ImportCredential"]) {
+      assert.deepEqual(values(serviceDirectives, key), [], `${key}= must not be used`);
+    }
+    // Not root, by any route.
+    for (const key of ["User", "Group", "SupplementaryGroups", "PermissionsStartOnly"]) {
+      assert.deepEqual(values(serviceDirectives, key), [], `${key}= must not be set`);
+    }
+    assert.doesNotMatch(serviceExec, /ExecStart[A-Za-z]*=\s*[+!]/, "no privileged ExecStart prefix");
+  });
+
+  it("grants no writable path of any kind", () => {
+    for (const key of ["StateDirectory", "RuntimeDirectory", "CacheDirectory", "LogsDirectory", "ConfigurationDirectory", "ReadWritePaths"]) {
+      assert.deepEqual(values(serviceDirectives, key), [], `${key}= must not be set`);
+    }
+    assert.equal(values(serviceDirectives, "ProtectSystem")[0], "strict");
   });
 
   it("does not touch the safe-egress policy or its configuration", () => {
@@ -499,12 +583,15 @@ describe("liveness probe behaviour", () => {
 
   const setIsFailed = (value: string) => writeFile(join(sandbox, "is-failed"), `${value}\n`);
 
-  /** Points the probe's configuration at `port`. */
-  const setConfiguredPort = (value: number | string) =>
-    writeFile(
-      join(sandbox, "media-egress.env"),
-      `VIDEOFETCH_WORKER_PORT=${value}\nVIDEOFETCH_MEDIA_DNS_FLAGS="--dns 10.11.12.13"\n`,
-    );
+  /**
+   * The port PID 1 would deliver. In the deployed unit it arrives through
+   * EnvironmentFile=; here it is placed in the child's environment directly,
+   * which is exactly what the probe observes either way.
+   */
+  let configuredPort: string | undefined = "1";
+  const setConfiguredPort = async (value: number | string) => {
+    configuredPort = String(value);
+  };
 
   /**
    * ASYNC on purpose, exactly as the DNS readiness suite is.
@@ -517,18 +604,30 @@ describe("liveness probe behaviour", () => {
    */
   function runProbe(
     extra: NodeJS.ProcessEnv = {},
-  ): Promise<{ status: number | null; stdout: string; stderr: string; outcome: string }> {
+    { args = [], signalAfterMs }: { args?: string[]; signalAfterMs?: number } = {},
+  ): Promise<{ status: number | null; stdout: string; stderr: string; outcome: string; outcomeCount: number }> {
+    const childEnv: NodeJS.ProcessEnv = { ...env };
+    if (configuredPort !== undefined) childEnv.VIDEOFETCH_WORKER_PORT = configuredPort;
+    for (const [key, value] of Object.entries(extra)) {
+      if (value === undefined) delete childEnv[key];
+      else childEnv[key] = value;
+    }
     return new Promise((resolve) => {
-      const child = spawn("bash", [PROBE_SCRIPT], { env: { ...env, ...extra } });
+      const child = spawn("bash", [PROBE_SCRIPT, ...args], { env: childEnv });
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (d) => (stdout += d));
       child.stderr.on("data", (d) => (stderr += d));
       const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+      const signalTimer =
+        signalAfterMs === undefined ? null : setTimeout(() => child.kill("SIGTERM"), signalAfterMs);
       child.on("close", (status) => {
         clearTimeout(timer);
-        const outcome = /OUTCOME=(\S+)/.exec(`${stdout}${stderr}`)?.[1] ?? "";
-        resolve({ status, stdout, stderr, outcome });
+        if (signalTimer) clearTimeout(signalTimer);
+        const all = `${stdout}${stderr}`;
+        const outcome = /OUTCOME=(\S+)/.exec(all)?.[1] ?? "";
+        const outcomeCount = (all.match(/OUTCOME=/g) ?? []).length;
+        resolve({ status, stdout, stderr, outcome, outcomeCount });
       });
     });
   }
@@ -603,6 +702,9 @@ if [ "$1" = "is-failed" ]; then cat "$VT/is-failed" 2>/dev/null || echo inactive
 echo "systemctl $*" >> "$VT/mutations.log"
 exit 0
 `,
+      // `systemctl show` exits 0 even for a missing unit, so a nonzero exit is
+      // systemd itself being unreachable — e.g. D-Bus denied by a sandbox.
+      "systemctl-broken": `#!/bin/bash\nexit 1\n`,
       // Present on PATH purely so a test can prove they are never called.
       docker: `#!/bin/bash\necho "docker $*" >> "$VT/mutations.log"\nexit 0\n`,
       nsenter: `#!/bin/bash\necho "nsenter $*" >> "$VT/mutations.log"\nexit 0\n`,
@@ -620,12 +722,23 @@ exit 0
     await setIsFailed("active");
     await setConfiguredPort(1);
 
+    const rootOnly = join(sandbox, "etc-videofetch");
+    await mkdir(rootOnly);
+    await writeFile(
+      join(rootOnly, "media-egress.env"),
+      'VIDEOFETCH_WORKER_PORT=9\nVIDEOFETCH_MEDIA_DNS_FLAGS="--dns 10.11.12.13"\n',
+    );
+    await chmod(rootOnly, 0o000);
+
     env = {
       ...process.env,
       VT: sandbox,
       PATH: `${bin}:${process.env.PATH ?? ""}`,
       VF_EGRESS_LIB: EGRESS_LIB,
-      VF_CONFIG_FILE: join(sandbox, "media-egress.env"),
+      // A stand-in for the root-only /etc/videofetch: a directory this process
+      // cannot traverse, holding a perfectly valid media-egress.env. If the probe
+      // ever regressed to reading the file itself, every run would die here.
+      VF_CONFIG_FILE: join(sandbox, "etc-videofetch", "media-egress.env"),
       VF_SYSTEMCTL: join(bin, "systemctl"),
       // The pinned host Node does not exist on this machine; the test's own
       // interpreter stands in for it. This is exactly the seam the safe-egress
@@ -638,6 +751,7 @@ exit 0
 
   after(async () => {
     await closeServer();
+    await chmod(join(sandbox, "etc-videofetch"), 0o700).catch(() => {});
     await rm(sandbox, { recursive: true, force: true });
   });
 
@@ -854,6 +968,124 @@ exit 0
     });
     assert.equal(result.status, 2);
     assert.match(result.stderr, /unknown argument/);
+  });
+
+  it("works WITHOUT any access to the root-only configuration directory", async () => {
+    // REVIEW-CORRECTION-001, finding 1, behaviourally. VF_CONFIG_FILE points
+    // into a directory this process cannot traverse — the DynamicUser's view of
+    // /etc/videofetch — and the probe still succeeds on the delivered value.
+    await listen((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
+    });
+    await setUnitState({ LoadState: "loaded", ActiveState: "active", SubState: "running" });
+    await setIsFailed("active");
+
+    const run = await runProbe();
+    assert.equal(run.status, 0, `${run.stdout}${run.stderr}`);
+    assert.equal(run.outcome, "healthy");
+  });
+
+  it("does NOT fall back to reading the file when the delivered value is absent", async () => {
+    // A readable media-egress.env with a valid port is offered through the
+    // library's own seam. If the probe consulted it, this would not be a
+    // config fault — so a port-unavailable verdict proves it never looked.
+    const readable = join(sandbox, "readable-media-egress.env");
+    await writeFile(readable, `VIDEOFETCH_WORKER_PORT=${port || 8080}\n`);
+    await setUnitState({ LoadState: "loaded", ActiveState: "active", SubState: "running" });
+
+    const run = await runProbe({ VIDEOFETCH_WORKER_PORT: undefined, VF_CONFIG_FILE: readable });
+    assert.equal(run.status, 2);
+    assert.equal(run.outcome, "config-invalid");
+    assert.match(run.stdout, /reason=port-unavailable/);
+  });
+
+  it("emits EXACTLY ONE OUTCOME line on every expected path", async () => {
+    // REVIEW-CORRECTION-001: the first revision could exit from inside the
+    // shared config loader with no OUTCOME line at all.
+    const cases: Array<{
+      name: string;
+      setup: () => Promise<void>;
+      extra?: NodeJS.ProcessEnv;
+      args?: string[];
+      outcome: string;
+      status: number;
+    }> = [];
+
+    const healthy = async () => {
+      await listen((req, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+      });
+    };
+    const unit = (active: string, failed = "inactive", load = "loaded") => async () => {
+      await healthy();
+      await setUnitState({ LoadState: load, ActiveState: active, SubState: active });
+      await setIsFailed(failed);
+    };
+
+    cases.push(
+      { name: "configuration unavailable (unset)", setup: unit("active", "active"), extra: { VIDEOFETCH_WORKER_PORT: undefined }, outcome: "config-invalid", status: 2 },
+      { name: "port missing (empty)", setup: unit("active", "active"), extra: { VIDEOFETCH_WORKER_PORT: "" }, outcome: "config-invalid", status: 2 },
+      { name: "malformed port", setup: unit("active", "active"), extra: { VIDEOFETCH_WORKER_PORT: "80 80" }, outcome: "config-invalid", status: 2 },
+      { name: "out-of-range port", setup: unit("active", "active"), extra: { VIDEOFETCH_WORKER_PORT: "70000" }, outcome: "config-invalid", status: 2 },
+      { name: "shared validator unavailable", setup: unit("active", "active"), extra: { VF_EGRESS_LIB: join(sandbox, "no-such-lib.sh") }, outcome: "config-invalid", status: 2 },
+      { name: "host Node missing", setup: unit("active", "active"), extra: { VF_NODE: join(sandbox, "no-such-node") }, outcome: "config-invalid", status: 2 },
+      { name: "request module missing", setup: unit("active", "active"), extra: { VF_WORKER_HEALTH_REQUEST: join(sandbox, "no-such.mjs") }, outcome: "config-invalid", status: 2 },
+      { name: "systemd unreachable", setup: unit("active", "active"), extra: { VF_SYSTEMCTL: join(sandbox, "bin", "systemctl-broken") }, outcome: "state-unavailable", status: 2 },
+      { name: "Worker unit not installed", setup: unit("inactive", "inactive", "not-found"), outcome: "not-installed", status: 2 },
+      { name: "Worker failed", setup: unit("failed", "failed"), outcome: "failed-unit", status: 1 },
+      { name: "unknown Worker state", setup: unit("banana"), outcome: "unknown-state", status: 1 },
+      { name: "idle", setup: unit("inactive"), outcome: "idle", status: 0 },
+      { name: "transient", setup: unit("activating"), outcome: "transient", status: 0 },
+      { name: "healthy", setup: unit("active", "active"), outcome: "healthy", status: 0 },
+      {
+        name: "unhealthy request",
+        setup: async () => {
+          await listen((req, res) => {
+            res.writeHead(503, { "Content-Type": "application/json" });
+            res.end("{}");
+          });
+          await setUnitState({ LoadState: "loaded", ActiveState: "active", SubState: "running" });
+          await setIsFailed("active");
+        },
+        outcome: "unhealthy",
+        status: 1,
+      },
+      { name: "usage error", setup: unit("active", "active"), args: ["--restart-worker"], outcome: "usage-error", status: 2 },
+    );
+
+    for (const c of cases) {
+      await c.setup();
+      const run = await runProbe(c.extra ?? {}, { args: c.args ?? [] });
+      assert.equal(run.outcomeCount, 1, `${c.name}: exactly one OUTCOME line, got ${run.outcomeCount}:\n${run.stdout}${run.stderr}`);
+      assert.equal(run.outcome, c.outcome, `${c.name}: outcome`);
+      assert.equal(run.status, c.status, `${c.name}: exit status`);
+    }
+  });
+
+  it("reports an UNEXPECTED exit as exactly one internal-error, never as success", async () => {
+    // A library that exits while being sourced stands in for any path that
+    // escapes verdict(): an unbound variable, a helper that calls exit, a bug.
+    const exiting = join(sandbox, "exiting-lib.sh");
+    await writeFile(exiting, "exit 0\n");
+    await setUnitState({ LoadState: "loaded", ActiveState: "active", SubState: "running" });
+
+    const run = await runProbe({ VF_EGRESS_LIB: exiting });
+    assert.equal(run.outcomeCount, 1, `${run.stdout}${run.stderr}`);
+    assert.equal(run.outcome, "internal-error");
+    assert.equal(run.status, 2, "an escaped exit 0 must not read as healthy or idle");
+  });
+
+  it("reports termination by signal as exactly one interrupted outcome", async () => {
+    await listenSilently();
+    await setUnitState({ LoadState: "loaded", ActiveState: "active", SubState: "running" });
+    await setIsFailed("active");
+
+    const run = await runProbe({ VF_LIVENESS_TIMEOUT_MS: "1500" }, { signalAfterMs: 300 });
+    assert.equal(run.outcomeCount, 1, `${run.stdout}${run.stderr}`);
+    assert.equal(run.outcome, "interrupted");
+    assert.equal(run.status, 2);
   });
 
   it("NEVER starts, stops or restarts anything, and never invokes docker or nsenter", async () => {
