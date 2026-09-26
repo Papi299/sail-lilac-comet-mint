@@ -52,6 +52,11 @@
 //                                     Stage-B byte-limit case; gates it out
 //                                     when the fixture could not cross the
 //                                     deployed limit)
+//   VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL
+//                                     the controlled fixture's https:
+//                                     byte-evidence endpoint (required by the
+//                                     Stage-B byte-limit case, and admitted
+//                                     before anything is submitted)
 //   VF_CONTROL_KEY_ID / VF_CONTROL_SECRET / VF_WORKER_ORIGIN
 //                                     for the Worker's own cancel route
 
@@ -81,11 +86,13 @@ import {
   ytdlpIdentified,
 } from "./lib/download-window.mjs";
 import {
+  BYTELIMIT_EVIDENCE_URL_ENV,
   BYTELIMIT_MAX_BYTES_ENV,
   CASE_PRODUCERS,
   GENERIC_EXPECTED_DIGEST_ENV,
   buildCaseRecord,
   caseNames,
+  parseByteLimitEvidenceUrl,
   parseByteLimitFixtureMaxBytes,
   parseGenericExpectedDigest,
   describeFeatureState,
@@ -619,6 +626,10 @@ async function runStageBCase(ctx, caseName) {
   // Likewise for the controlled byte-limit fixture's ADVERTISED ceiling, which
   // the operator takes from the fixture manifest's own `byteLimitMaxBytes`.
   const byteLimitMax = parseByteLimitFixtureMaxBytes(env[BYTELIMIT_MAX_BYTES_ENV]);
+  // And the fixture's own evidence endpoint (…-HARNESS-HARDENING-001): read ONCE
+  // here, validated, and carried. The transfer probe used to read it from the
+  // environment only after a real job had run.
+  const byteLimitEvidence = parseByteLimitEvidenceUrl(env[BYTELIMIT_EVIDENCE_URL_ENV]);
   const caseCtx = {
     ...ctx,
     genericUrl: env.VIDEOFETCH_ACCEPT_GENERIC_URL ?? null,
@@ -632,6 +643,9 @@ async function runStageBCase(ctx, caseName) {
     // context and never re-reads the environment, so the ceiling the capacity
     // preflight gates on is provably the one this command admitted.
     byteLimitFixtureMaxBytes: byteLimitMax.ok ? byteLimitMax.bytes : null,
+    // Admitted ONCE, here, and carried. The producer hands this exact value to
+    // the transfer probe, which never consults the environment.
+    byteLimitEvidenceUrl: byteLimitEvidence.ok ? byteLimitEvidence.url : null,
     egressRedirectUrl: env.VIDEOFETCH_ACCEPT_EGRESS_REDIRECT_URL ?? null,
     cloudflaredUnit: readOption(argv, "--cloudflared-unit") ?? "vf-cloudflared",
     sleep: ctx.deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
@@ -689,6 +703,17 @@ async function runStageBCase(ctx, caseName) {
   // claim about the byte threshold.
   if ((producer.needs ?? []).includes("byteLimitFixtureMaxBytes") && !byteLimitMax.ok) {
     errorLog(`usage error: case '${caseName}' — ${byteLimitMax.reason}`);
+    return EXIT.USAGE;
+  }
+
+  // ── The controlled fixture's evidence endpoint, refused precisely ───────
+  //
+  // Same placement, same reason. Without this endpoint the case can never
+  // attribute the transfer it causes, so a missing or malformed value must stop
+  // it here — not after analysis, job creation and a full acquisition, which is
+  // where the transfer probe used to discover it.
+  if ((producer.needs ?? []).includes("byteLimitEvidenceUrl") && !byteLimitEvidence.ok) {
+    errorLog(`usage error: case '${caseName}' — ${byteLimitEvidence.reason}`);
     return EXIT.USAGE;
   }
 
@@ -1313,14 +1338,22 @@ function makeCatalogComparator() {
  * `vf_case` correlation id, the fixture associates the media request it serves
  * with that id, and this probe requests and re-checks that exact id — so the
  * evidence is causally bound to this case's transfer or it is BLOCKED.
+ *
+ * ── The endpoint is an ADMITTED input, not an environment read ─────────────
+ *
+ * …-HARNESS-HARDENING-001. This probe used to read
+ * `VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL` from the environment when it was
+ * called — which is after analysis, job creation and the whole acquisition — so
+ * a missing value was discovered only once real Production work had run. The
+ * CLI now admits it before the producer starts, and the producer passes that
+ * admitted value here. The environment is not consulted at all.
  */
 function makeMediaTransferProbe(ctx) {
-  return async (caseId) =>
+  return async (caseId, endpoint) =>
     observe("actual media transfer semantics", async () => {
-      const endpoint = ctx.env.VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL;
-      if (!endpoint) {
+      if (typeof endpoint !== "string" || endpoint.length === 0) {
         throw new Error(
-          "no fixture evidence endpoint was supplied (VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL); " +
+          `no admitted fixture evidence endpoint was supplied (${BYTELIMIT_EVIDENCE_URL_ENV}); ` +
             "the transfer semantics of the actual media GET cannot be established",
         );
       }
