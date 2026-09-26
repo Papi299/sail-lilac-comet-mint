@@ -1,0 +1,163 @@
+# External Worker liveness probe — one bounded observation.
+# (WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001)
+#
+# Started by videofetch-worker-liveness.timer and by nothing else. It runs in
+# the VM's ORDINARY host namespace: it does not join videofetch-media-netns, it
+# does not enter the Worker container, and it invokes neither `nsenter` nor
+# `docker`. It reaches the Worker over the loopback ingress
+# videofetch-media-netns.service publishes — the same path cloudflared uses — so
+# it never touches the destinations the safe-egress policy exists to deny.
+#
+# IT IS AN OBSERVER, NOT A SUPERVISOR
+#
+# It never starts, stops, restarts or reloads the Worker, cloudflared, Docker or
+# anything else, and it never modifies firewall, namespace or container state.
+# Restart-on-failure is systemd's job through videofetch-worker.service's own
+# Restart= and BindsTo= semantics, which this unit deliberately does not touch.
+#
+# IT MUST NOT PULL THE WORKER UP
+#
+# There is deliberately NO Requires=, Wants=, BindsTo=, Requisite= or PartOf= on
+# videofetch-worker.service anywhere in this unit. `After=` is ordering only and
+# activates nothing, so a probe tick on an intentionally idle VM observes the
+# idle state instead of creating work. An intentionally stopped Worker is a
+# normal Product state, not an outage.
+
+[Unit]
+Description=VideoFetch external Worker liveness probe (observer only; never starts or restarts the Worker)
+Documentation=file:/opt/videofetch/docs/architecture/worker-deployment-runbook.md
+
+# Ordering ONLY — no activation dependency. If the Worker happens to be queued
+# in the same transaction, the probe runs after it; if the Worker is not queued,
+# this changes nothing and starts nothing.
+After=videofetch-worker.service
+
+# A transient failed health check must never make the probe permanently inert.
+# systemd's default start-rate limiting would, after a few consecutive failures,
+# refuse to start this unit at all ("start request repeated too quickly") and
+# the deployment would silently stop being observed — the one failure mode an
+# observability mechanism cannot have. Rate limiting is therefore off: the timer
+# governs the cadence, and the probe stays useful across repeated failures.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+
+# It probes, it reports, it exits. A failing probe is NOT retried here: the next
+# timer tick is the retry, so a Worker that is down cannot be hammered.
+Restart=no
+
+# Generously larger than the probe's own bounded HTTP deadline, so a hung unit
+# is still killed but an ordinary slow answer is not misreported as a hang.
+TimeoutStartSec=30
+
+ExecStart=/usr/local/sbin/vf-worker-liveness-probe
+
+# ── Configuration: the ONE port declaration, delivered by PID 1 ─────────────
+#
+# The authoritative source is VIDEOFETCH_WORKER_PORT in
+# /etc/videofetch/media-egress.env — the same file, read by the same systemd
+# parser, that videofetch-media-netns.service expands into its
+# `-p 127.0.0.1:${VIDEOFETCH_WORKER_PORT}:...` flag.
+#
+# /etc/videofetch is root-owned mode 0700 because it also holds broker
+# credentials, and the DynamicUser below CANNOT traverse it. That is correct
+# and is not weakened here. Instead PID 1 reads this file AS ROOT, before any
+# privilege is dropped, and passes the value to the unprivileged process in its
+# environment. Nothing is copied to disk and no second setting exists; the probe
+# itself never opens anything under /etc/videofetch.
+#
+# Environment= FIRST pins the variable to empty, and EnvironmentFile= overrides
+# it. The value is therefore the file's or nothing — it can never be inherited
+# from the service manager's own environment. The `-` makes a missing file
+# non-fatal to systemd, so the probe runs and reports it as
+# OUTCOME=config-invalid instead of the unit failing silently before ExecStart.
+#
+# UnsetEnvironment= removes the resolver declaration the same file carries. It is
+# not secret, but the probe consumes exactly one value and is given exactly one.
+Environment=VIDEOFETCH_WORKER_PORT=
+EnvironmentFile=-/etc/videofetch/media-egress.env
+UnsetEnvironment=VIDEOFETCH_MEDIA_DNS_FLAGS
+
+# ── Privilege: none ────────────────────────────────────────────────────────
+#
+# The probe needs to execute the pinned host Node, read its own two installed
+# files under /usr/local, ask systemd for a unit's state over D-Bus, and open a
+# loopback TCP connection. It reads no configuration file itself — PID 1 hands
+# it the port, see above. It needs no account, no capability and no write
+# access anywhere, and this is what makes "the probe cannot mutate the
+# boundary" a property of the sandbox rather than a promise in a comment.
+#
+# DEPLOYMENT PRECONDITION: the DynamicUser must be able to TRAVERSE and execute
+# /opt/videofetch/node/bin/node. The broker proves a fixed non-root system user
+# can; the repository does not record /opt/videofetch's mode, so it does not
+# prove an arbitrary UID can. If it cannot, the probe says so precisely —
+# OUTCOME=config-invalid reason=node-unavailable — rather than reporting an
+# unhealthy Worker. deploy/README.md lists the install-time check.
+#
+# DynamicUser: a transient unprivileged identity, so the probe introduces no
+# provisioned user, group or home directory to the deployment.
+DynamicUser=yes
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# The whole filesystem is read-only to this unit. The ONLY writable location is
+# its own PrivateTmp — a per-invocation /tmp that no other unit shares and that
+# is discarded when the probe exits (DynamicUser= implies it regardless). The
+# probe writes nothing there either.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+# The same system-call filter as videofetch-r2-broker.service, which runs this
+# SAME pinned Node binary on this SAME host and is Production-accepted under it.
+# Deliberately not tightened beyond that proven set: a filter that kills Node at
+# startup would make every tick report the Worker unhealthy, and a liveness
+# probe that always fails is indistinguishable from one that is not there.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+
+# MemoryDenyWriteExecute is deliberately NOT set. V8's JIT needs to make pages it
+# has written executable, which that option forbids, so Node would fail to run.
+# The broker omits it for the same reason.
+
+# RestrictNamespaces makes the "outside the media namespace" claim structural:
+# this process cannot create or enter a namespace even if a future edit tried to.
+RestrictNamespaces=yes
+
+# AF_UNIX reaches systemd for the unit-state query; AF_INET/AF_INET6 reach the
+# loopback ingress. Nothing else — and note PrivateNetwork is deliberately NOT
+# set, because an isolated network namespace would give this unit its OWN empty
+# loopback and the probe would measure nothing at all.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# The probe is stateless on purpose: no counter, no spool, no history — which is
+# why it needs no StateDirectory, no RuntimeDirectory and no writable path at
+# all. Time the VM spent powered off can therefore never be replayed as
+# accumulated liveness failures. The timer's Persistent=false is the other half
+# of that guarantee.
+
+# ── Deliberately absent ────────────────────────────────────────────────────
+#
+#   [Install]        This unit is NOT enabled. Only the timer is, so the probe
+#                    has exactly one trigger and never runs at boot on its own.
+#   Credentials      It holds and needs none. media-egress.env contains no
+#                    secret by its own contract, and nothing else from
+#                    /etc/videofetch is delivered to this unit.
+#   Root execution   There is no User=root and no PermissionsStartOnly-style
+#                    escape: only PID 1's EnvironmentFile= read is privileged.
+#   Requires=        See the [Unit] note: nothing here may activate the Worker.

@@ -1,0 +1,258 @@
+#!/bin/bash
+# External Worker liveness probe — host/deployment layer.
+# (WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001)
+#
+# WHERE THIS RUNS, AND WHY IT IS HERE AND NOT IN THE IMAGE
+#
+# In the VM's ORDINARY host namespace: outside videofetch-media-netns, outside
+# the Worker container, and with no nsenter and no `docker exec` anywhere in
+# this file. It reaches the Worker exactly the way cloudflared does — over the
+# loopback ingress videofetch-media-netns.service publishes on
+# 127.0.0.1:${VIDEOFETCH_WORKER_PORT} — so it never traverses the denied path.
+#
+# The reason is architectural, not stylistic. The safe-egress policy denies
+# loopback and private destinations FROM INSIDE the media namespace, including
+# the Worker's own listener address. An in-container probe could only pass by
+# punching a hole in that policy or weakening its deny set, so Dockerfile.worker
+# ships no HEALTHCHECK and no curl/wget, and the probe lives out here instead.
+# See docs/architecture/worker-deployment-runbook.md §8.
+#
+# THIS IS AN OBSERVER. IT NEVER REPAIRS.
+#
+# It does not start, stop, restart or reload the Worker, cloudflared, Docker or
+# the VM; it does not touch firewall, namespace or Docker state; it holds no
+# credential and needs no capability. Restart-on-failure remains systemd's job
+# through the Worker unit's own `Restart=`/`BindsTo=` semantics, which are
+# deliberately separate from this file. The only systemctl verbs used here are
+# read-only (`show`, `is-failed`), and neither activates a unit.
+#
+# WHERE THE PORT COMES FROM — AND WHY THIS FILE NEVER OPENS /etc/videofetch
+#
+# The authoritative declaration is VIDEOFETCH_WORKER_PORT in
+# /etc/videofetch/media-egress.env, the same file the namespace holder
+# publishes the port from. But /etc/videofetch is root-owned mode 0700 — it
+# also holds broker credentials — and this probe runs as an unprivileged
+# DynamicUser that cannot traverse it, by design.
+#
+# So the probe does not read that file at all. videofetch-worker-liveness.service
+# declares `EnvironmentFile=-/etc/videofetch/media-egress.env`: PID 1 reads it
+# AS ROOT, before dropping privilege, with the very same parser that expands
+# `${VIDEOFETCH_WORKER_PORT}` in the holder's `-p 127.0.0.1:...` flag, and hands
+# the process the resulting value in its environment. There is no copy on disk,
+# no second setting, and the directory's mode is not weakened. This file only
+# validates the value it is given.
+#
+# ON-DEMAND EXECUTION IS A PRODUCT PROPERTY, NOT AN OUTAGE
+#
+# The videofetch VM is not required to run 24/7, and an intentionally inactive
+# Worker on a running VM is idle, not unhealthy:
+#
+#   Worker inactive               -> intentional idle; NO request is made (exit 0)
+#   Worker activating/stopping    -> bounded transient; NO request is made (exit 0)
+#   Worker active and healthy     -> healthy (exit 0)
+#   Worker active and not healthy -> a real fault (exit 1)
+#   Worker failed                 -> a real fault, never disguised as idle (exit 1)
+#   Worker unit not loaded        -> a deployment fault (exit 2)
+#   configuration / tooling fault -> a deployment fault (exit 2)
+#
+# It is also STATELESS. It keeps no counter, no history and no spool file, so
+# time the VM spent powered off cannot be replayed as accumulated failures. The
+# timer's `Persistent=false` is the other half of that guarantee.
+#
+# EXACTLY ONE OUTCOME LINE, ON EVERY PATH
+#
+# Every exit — success, failure, configuration fault, even an unexpected shell
+# error or a termination signal — produces exactly one `OUTCOME=<value>` line.
+# Known paths go through verdict(); anything else is caught by the EXIT trap and
+# reported as OUTCOME=internal-error. This file deliberately does NOT call the
+# shared library's vf_config_load/vf_die, which exit on their own without one.
+#
+# Usage:  vf-worker-liveness-probe [--quiet]
+#
+# Exit codes:
+#   0  healthy, or a bounded not-applicable state (idle / transient)
+#   1  FAILURE: the Worker unit failed, or it is active and not healthy
+#   2  configuration or deployment fault
+
+set -uo pipefail
+VF_PROG=vf-worker-liveness-probe
+
+# ── The single exit path ───────────────────────────────────────────────────
+VF_VERDICT_EMITTED=0
+
+verdict() {
+  local outcome="$1" code="$2" detail="${3-}"
+  if [ "$VF_VERDICT_EMITTED" -eq 0 ]; then
+    VF_VERDICT_EMITTED=1
+    if [ -n "$detail" ]; then
+      echo "$VF_PROG: OUTCOME=$outcome $detail"
+    else
+      echo "$VF_PROG: OUTCOME=$outcome"
+    fi
+  fi
+  exit "$code"
+}
+
+# The backstop. Any exit that did not come through verdict() — an unbound
+# variable under `set -u`, a sourced file that exits, a missing builtin — still
+# leaves exactly one machine-readable line, and is never reported as success.
+vf_on_exit() {
+  local rc=$?
+  if [ "$VF_VERDICT_EMITTED" -eq 0 ]; then
+    VF_VERDICT_EMITTED=1
+    echo "$VF_PROG: OUTCOME=internal-error rc=$rc"
+    exit 2
+  fi
+}
+trap vf_on_exit EXIT
+trap 'verdict interrupted 2 "reason=signal"' TERM INT HUP
+
+QUIET=0
+case "${1-}" in
+  '') ;;
+  --quiet) QUIET=1 ;;
+  *)
+    echo "$VF_PROG: unknown argument '$1' (usage: $VF_PROG [--quiet])" >&2
+    verdict usage-error 2 "reason=unknown-argument"
+    ;;
+esac
+
+say() { [ "$QUIET" -eq 1 ] || echo "$VF_PROG: $*"; }
+
+# Test seams, in the style the safe-egress helpers already use. Overriding one
+# grants no authority: everything reached through them is read-only inspection
+# or a loopback HTTP GET.
+LIB="${VF_EGRESS_LIB:-/usr/local/lib/videofetch/vf-egress-lib.sh}"
+WORKER_UNIT="${VF_WORKER_UNIT:-videofetch-worker.service}"
+SYSTEMCTL="${VF_SYSTEMCTL:-systemctl}"
+NODE="${VF_NODE:-/opt/videofetch/node/bin/node}"
+HEALTH_REQUEST="${VF_WORKER_HEALTH_REQUEST:-/usr/local/lib/videofetch/vf-worker-health-request.mjs}"
+TIMEOUT_MS="${VF_LIVENESS_TIMEOUT_MS:-3000}"
+
+# ── Port validation: the SAME rule that gates the namespace holder ──────────
+#
+# The shared library is sourced for vf_validate_port only, so the probe accepts
+# exactly the ports vf-egress-config-check accepts before the holder publishes
+# one. Sourcing it performs no action; its configuration readers are not called.
+if [ ! -r "$LIB" ]; then
+  echo "$VF_PROG: shared library '$LIB' is missing or unreadable" >&2
+  verdict config-invalid 2 "reason=egress-lib-unavailable"
+fi
+# shellcheck source=vf-egress-lib.sh
+. "$LIB"
+
+PORT="${VIDEOFETCH_WORKER_PORT-}"
+if [ -z "$PORT" ]; then
+  echo "$VF_PROG: VIDEOFETCH_WORKER_PORT was not provided." >&2
+  echo "$VF_PROG: systemd supplies it from /etc/videofetch/media-egress.env via" >&2
+  echo "$VF_PROG: EnvironmentFile=; that file is missing or does not declare it." >&2
+  echo "$VF_PROG: Run the probe through videofetch-worker-liveness.service." >&2
+  verdict config-invalid 2 "reason=port-unavailable"
+fi
+if ! vf_validate_port "$PORT"; then
+  echo "$VF_PROG: VIDEOFETCH_WORKER_PORT is not a port in 1-65535; there is no default" >&2
+  verdict config-invalid 2 "reason=bad-port"
+fi
+
+# ── Worker unit state ──────────────────────────────────────────────────────
+#
+# `systemctl show` is read-only and does NOT activate the unit, which is what
+# makes it safe to run from a timer that must never pull the Worker up. It exits
+# 0 even for a unit that does not exist (LoadState=not-found), so a NONZERO exit
+# means systemd itself could not be asked — reported as such, never mistaken for
+# a missing unit. The output is parsed as KEY=VALUE rather than requested with
+# `--value`, so the result cannot depend on the order properties are printed in.
+if ! SHOW="$("$SYSTEMCTL" show --property=LoadState --property=ActiveState --property=SubState "$WORKER_UNIT" 2>/dev/null)"; then
+  echo "$VF_PROG: could not query systemd for $WORKER_UNIT state" >&2
+  verdict state-unavailable 2 "unit=$WORKER_UNIT"
+fi
+
+prop() {
+  printf '%s\n' "$SHOW" | while IFS= read -r line; do
+    case "$line" in
+      "$1="*) printf '%s\n' "${line#"$1"=}" ;;
+    esac
+  done | tail -n 1
+}
+
+LOAD_STATE="$(prop LoadState)"
+ACTIVE_STATE="$(prop ActiveState)"
+SUB_STATE="$(prop SubState)"
+
+if [ "$LOAD_STATE" != "loaded" ]; then
+  # The timer only exists on a host where the Worker is deployed, so a unit that
+  # is not loaded is a deployment fault rather than an idle Product.
+  echo "$VF_PROG: $WORKER_UNIT LoadState='${LOAD_STATE:-unknown}' - the unit is not installed" >&2
+  verdict not-installed 2 "unit=$WORKER_UNIT load_state=${LOAD_STATE:-unknown}"
+fi
+
+# Asked explicitly as well as read from ActiveState: `is-failed` is the
+# documented predicate for "this unit is in a failed state", and a failed unit
+# must never be reported as intentional idle.
+FAILED="$("$SYSTEMCTL" is-failed "$WORKER_UNIT" 2>/dev/null || true)"
+if [ "$FAILED" = "failed" ] || [ "$ACTIVE_STATE" = "failed" ]; then
+  echo "$VF_PROG: $WORKER_UNIT has FAILED (SubState='${SUB_STATE:-unknown}')" >&2
+  verdict failed-unit 1 "unit=$WORKER_UNIT active_state=${ACTIVE_STATE:-unknown} sub_state=${SUB_STATE:-unknown}"
+fi
+
+case "$ACTIVE_STATE" in
+  active)
+    : # fall through to the real probe
+    ;;
+  inactive)
+    # THE ORDINARY IDLE CASE. The Product is not in use, the operator stopped
+    # the Worker, or the VM was brought up without it. No request is attempted,
+    # and this is a success: reporting it as a failure would make an
+    # intentionally idle deployment look like a continuous outage.
+    say "$WORKER_UNIT is inactive - intentional idle, no health request attempted"
+    verdict idle 0 "unit=$WORKER_UNIT active_state=inactive"
+    ;;
+  activating|deactivating|reloading)
+    # Bounded transient. Probing mid-start would report connection-refused for a
+    # Worker that is simply not listening yet, so the next tick decides instead.
+    say "$WORKER_UNIT is $ACTIVE_STATE - bounded transient, no health request attempted"
+    verdict transient 0 "unit=$WORKER_UNIT active_state=$ACTIVE_STATE"
+    ;;
+  *)
+    echo "$VF_PROG: $WORKER_UNIT ActiveState='${ACTIVE_STATE:-unknown}' is not a state this probe understands" >&2
+    verdict unknown-state 1 "unit=$WORKER_UNIT active_state=${ACTIVE_STATE:-unknown}"
+    ;;
+esac
+
+# ── Worker active: make the real loopback health request ───────────────────
+#
+# The request is delegated to the PINNED HOST NODE the deployment already
+# requires (install order step 0; the R2 broker cannot run without it). That is
+# deliberate: it adds no host package, and in particular it does not reach for
+# curl or wget, which the Worker image is forbidden to contain and which this
+# task must not install on the host either.
+#
+# Both checks run AS THE PROBE'S OWN IDENTITY, so a path the DynamicUser cannot
+# traverse is reported here, precisely, rather than as an unhealthy Worker.
+if [ ! -x "$NODE" ]; then
+  echo "$VF_PROG: pinned host Node '$NODE' is missing or not executable by this identity" >&2
+  echo "$VF_PROG: see deploy/README.md install order step 0" >&2
+  verdict config-invalid 2 "reason=node-unavailable"
+fi
+if [ ! -r "$HEALTH_REQUEST" ]; then
+  echo "$VF_PROG: health request module '$HEALTH_REQUEST' is missing or unreadable" >&2
+  verdict config-invalid 2 "reason=request-module-unavailable"
+fi
+
+# The host and the path are NOT arguments. 127.0.0.1 and /v1/healthz are fixed
+# inside the request module, so no caller and no configuration file can point
+# this probe at a LAN address, a public host or some other endpoint. Only the
+# port — the one value the deployment legitimately owns — is passed in.
+OUTPUT="$("$NODE" "$HEALTH_REQUEST" --port "$PORT" --timeout-ms "$TIMEOUT_MS" 2>&1)"
+STATUS=$?
+
+printf '%s\n' "$OUTPUT" | while IFS= read -r line; do
+  [ -n "$line" ] && say "$line"
+done
+
+if [ "$STATUS" -eq 0 ]; then
+  verdict healthy 0 "unit=$WORKER_UNIT port=$PORT path=/v1/healthz"
+fi
+
+echo "$VF_PROG: the Worker is active but did not satisfy the health contract" >&2
+verdict unhealthy 1 "unit=$WORKER_UNIT port=$PORT path=/v1/healthz"

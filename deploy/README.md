@@ -28,6 +28,12 @@ The Worker additionally requires its **bounded Product media workspace**
 capacity and filesystem-hardening precondition rather than a third security
 boundary. See [The Product media workspace](#the-product-media-workspace).
 
+An **external liveness probe** (`systemd/videofetch-worker-liveness.{service,timer}`,
+`bin/vf-worker-liveness-probe`) observes the Worker from the VM host, outside the
+media namespace. It is an observer, not a boundary and not a supervisor: the
+Worker neither requires it nor is started by it. See
+[External Worker liveness](#external-worker-liveness).
+
 ---
 
 ## The trusted R2 credential broker
@@ -382,6 +388,136 @@ operation.
 
 ---
 
+## External Worker liveness
+
+`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`
+
+**Source only. Not installed, not enabled, not live-accepted.** The runbook §10
+item for an external liveness probe stays open until these artefacts are
+installed on the VM under separate authorization and accepted there.
+
+```
+videofetch-worker-liveness.timer        every 5 min of VM UPTIME; Persistent=false
+  │
+  ▼
+videofetch-worker-liveness.service      oneshot, DynamicUser, no capabilities,
+  │                                     RestrictNamespaces=yes
+  │  PID 1, as root: EnvironmentFile=-/etc/videofetch/media-egress.env
+  │                  -> VIDEOFETCH_WORKER_PORT in the probe's environment
+  ▼
+vf-worker-liveness-probe                VM HOST namespace — outside the media netns,
+  │                                     outside the container, no nsenter, no docker
+  │  systemctl show / is-failed         read-only; never start/stop/restart
+  │  never opens /etc/videofetch        (root 0700; the DynamicUser cannot traverse it)
+  ▼
+http://127.0.0.1:<VIDEOFETCH_WORKER_PORT>/v1/healthz
+                                        the SAME loopback ingress cloudflared uses
+```
+
+| File | Role |
+| :--- | :--- |
+| `bin/vf-worker-liveness-probe` | Classifies the Worker unit's state and, only when it is active, probes it. |
+| `bin/vf-worker-health-request.mjs` | The bounded loopback GET, run by the pinned host Node. Host and path are constants; only the port is passed in. |
+| `systemd/videofetch-worker-liveness.service` | One observation. Not enabled; the timer is its only trigger. |
+| `systemd/videofetch-worker-liveness.timer` | The cadence. The only enabled liveness unit. |
+
+### Why it lives on the host
+
+The safe-egress policy denies loopback and private destinations from inside the
+media namespace, including the Worker's own listener. An in-container probe
+could only pass by weakening that policy, so `Dockerfile.worker` ships no
+`HEALTHCHECK` and no curl/wget. The probe reaches the Worker the way cloudflared
+does — over the loopback ingress the namespace holder publishes — and never
+traverses the denied path.
+
+### One port declaration, delivered without weakening `/etc/videofetch`
+
+**Authoritative source.** `VIDEOFETCH_WORKER_PORT` in
+`/etc/videofetch/media-egress.env` is the only Worker-port setting.
+`videofetch-media-netns.service` publishes its port from this same file.
+
+**How the probe receives it.** `/etc/videofetch` is root-owned mode `0700`,
+because it also holds broker credentials. The probe's `DynamicUser` cannot
+traverse it, and that is correct, so nothing here changes the directory.
+Instead:
+
+```
+Environment=VIDEOFETCH_WORKER_PORT=                 # pin: the file's value or nothing
+EnvironmentFile=-/etc/videofetch/media-egress.env   # read by PID 1, AS ROOT
+UnsetEnvironment=VIDEOFETCH_MEDIA_DNS_FLAGS         # the probe gets exactly one value
+```
+
+- **Who reads it.** PID 1 reads the file before dropping privilege, using the
+  same parser that expands `${VIDEOFETCH_WORKER_PORT}` in the holder's
+  `-p 127.0.0.1:…` flag. It passes only the resulting value to the unprivileged
+  process.
+- **No copy, no second setting.** Nothing is copied to disk and no second
+  setting exists. The value can never come from the service manager's own
+  environment.
+- **Missing file.** The `-` makes a missing file non-fatal to systemd, so the
+  probe runs and reports `OUTCOME=config-invalid reason=port-unavailable`
+  instead of the unit failing silently before `ExecStart`.
+- **Validation.** The probe validates the value with `vf_validate_port`, the
+  same rule `vf-egress-config-check` applies before the holder publishes a
+  port. The probe itself never opens anything under `/etc/videofetch`.
+
+**Runtime.** The HTTP request runs on the pinned host Node at
+`/opt/videofetch/node/bin/node`. That is [install order](#install-order)
+step 0, which the broker already requires. No curl, no wget, no apt step.
+
+**Install-time check: the DynamicUser must be able to run that Node.**
+- **Why it is needed.** The broker proves that a *fixed* non-root system user
+  can. The repository does not record the mode of `/opt/videofetch`, so it
+  does not prove an arbitrary UID can traverse it.
+- **What happens if it cannot.** The probe reports
+  `OUTCOME=config-invalid reason=node-unavailable`, never "unhealthy".
+- **How to check.** Run this before relying on the timer:
+
+  ```
+  systemd-run --wait --pipe -p DynamicUser=yes /opt/videofetch/node/bin/node -v   # v22.23.2
+  ```
+
+### On-demand execution is idle, not an outage
+
+| Situation | Probe behaviour | Exit |
+| :--- | :--- | :--- |
+| VM stopped | no tick at all; `Persistent=false`, so **no catch-up** after boot | — |
+| Worker `inactive` | `OUTCOME=idle`; **no request is made** | `0` |
+| Worker `activating` / `deactivating` / `reloading` | `OUTCOME=transient`; no request | `0` |
+| Worker `active`, healthy | `OUTCOME=healthy` | `0` |
+| Worker `active`, refused / timeout / non-200 / malformed / wrong state | `OUTCOME=unhealthy` | `1` |
+| Worker `failed` | `OUTCOME=failed-unit` — **never** reported as idle | `1` |
+| Worker `ActiveState` not understood | `OUTCOME=unknown-state` | `1` |
+| Worker unit not loaded | `OUTCOME=not-installed` | `2` |
+| systemd could not be queried | `OUTCOME=state-unavailable` | `2` |
+| port unavailable or malformed; validator, host Node or request module unavailable | `OUTCOME=config-invalid reason=…` | `2` |
+| unknown argument | `OUTCOME=usage-error` | `2` |
+| terminated by a signal | `OUTCOME=interrupted` | `2` |
+| any exit not covered above | `OUTCOME=internal-error` — never success | `2` |
+
+**Every run emits exactly one `OUTCOME=` line.** Known paths go through one
+exit function. An EXIT trap covers everything else: a shell error, or a
+sourced file that exits. The probe deliberately does not call the shared
+library's `vf_config_load`/`vf_die`, because those exit without an `OUTCOME=`
+line.
+
+The probe is stateless — no counter, no spool — so time spent powered off can
+never be replayed as accumulated failures.
+
+### What a failed probe does, and does not do
+
+A failed probe **records** `OUTCOME=…` in the journal and the service enters
+`failed`. That is all.
+
+It does **not** start, stop, restart or reload the Worker, cloudflared, Docker
+or the VM, and it does not touch firewall, namespace or Docker state.
+Restart-on-failure stays with `videofetch-worker.service`'s own `Restart=` and
+`BindsTo=`. The probe unit declares **no** `Requires=`/`Wants=`/`BindsTo=` on the
+Worker, so a tick can never pull an idle Worker up, and `StartLimitIntervalSec=0`
+keeps repeated failures from rate-limiting the probe into silence.
+
+---
+
 ## Install order
 
 The order is not a convenience — it is the fail-closed boundary.
@@ -578,6 +714,29 @@ The order is not a convenience — it is the fail-closed boundary.
    runs `vf-media-workspace-verify --wipe`, which refuses to start it on anything
    but the reviewed bounded workspace and empties that workspace first.
 
+6. **Install the external liveness probe — only under separate authorization.**
+   *Not performed by `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`,
+   which is source only.*
+
+   ```
+   install -m 0644 deploy/bin/vf-worker-health-request.mjs /usr/local/lib/videofetch/
+   install -m 0755 deploy/bin/vf-worker-liveness-probe     /usr/local/sbin/
+   install -m 0644 deploy/systemd/videofetch-worker-liveness.service /etc/systemd/system/
+   install -m 0644 deploy/systemd/videofetch-worker-liveness.timer   /etc/systemd/system/
+   systemctl daemon-reload
+
+   # Enable the TIMER only. The service has no [Install] section on purpose.
+   systemctl enable --now videofetch-worker-liveness.timer
+   ```
+
+   It needs steps 0 (pinned host Node) and 4 (`vf-egress-lib.sh` and
+   `media-egress.env`), and nothing else. PID 1 reads `media-egress.env` for it;
+   `/etc/videofetch` stays `0700`. Enabling it starts no other unit, and it can
+   be installed while the Worker is stopped: that is reported as idle.
+
+   Before relying on it, run the DynamicUser Node check above, then
+   `systemd-analyze verify` on both liveness units.
+
 ---
 
 ## Fail-closed dependency
@@ -732,6 +891,30 @@ systemctl is-active videofetch-worker.service                                 # 
 Do **not** "fix" a Worker that will not start by disabling the verifier,
 loosening a deny class or adding a private-range DNS exception. A Worker that
 cannot start is the boundary working.
+
+### External liveness
+
+```
+# The timer is the enabled unit, and it does not catch up after a stopped VM.
+systemctl is-enabled videofetch-worker-liveness.timer                         # enabled
+systemctl show videofetch-worker-liveness.timer -p Persistent                  # Persistent=no
+systemctl is-enabled videofetch-worker-liveness.service                       # static
+
+# The probe cannot pull the Worker up.
+systemctl show videofetch-worker-liveness.service -p Requires -p Wants -p BindsTo
+
+# /etc/videofetch is still root-only; the probe gets the port from PID 1.
+stat -c '%a %U:%G' /etc/videofetch                                           # 700 root:root
+systemctl show videofetch-worker-liveness.service -p EnvironmentFiles -p DynamicUser
+
+# One observation, on demand. With the Worker stopped this prints OUTCOME=idle.
+systemctl start videofetch-worker-liveness.service
+journalctl -u videofetch-worker-liveness.service -n 5 --no-pager
+```
+
+Do **not** "fix" a failing probe by pointing it at another address, adding a
+Docker `HEALTHCHECK`, or giving it a restart action. A failing probe is the
+observation working.
 
 ---
 

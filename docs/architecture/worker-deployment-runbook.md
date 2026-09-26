@@ -3945,6 +3945,53 @@ loopback address on the VM host, outside the media namespace — so it never
 traverses the denied path. This is a deployment-layer responsibility and is
 deliberately **not** implemented in application code.
 
+### The external liveness probe — source implementation
+
+*`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001` — **implemented in
+source, not deployed, live acceptance pending.** Nothing below has been
+installed on the VM; §10 stays open until it is, and is accepted there.*
+
+The probe owner in the table above now has a reviewed source implementation:
+`deploy/bin/vf-worker-liveness-probe`, run by
+`videofetch-worker-liveness.service` and scheduled by
+`videofetch-worker-liveness.timer`. Full operator detail is in
+`deploy/README.md` ("External Worker liveness").
+
+| Property | How it holds |
+| :--- | :--- |
+| Runs outside the media namespace | VM host namespace; no `nsenter`, no `docker exec`, no container runtime at all; `RestrictNamespaces=yes` |
+| Probes loopback only | `http://127.0.0.1:<VIDEOFETCH_WORKER_PORT>/v1/healthz` — host and path are constants, only the port is configuration |
+| One port declaration | `VIDEOFETCH_WORKER_PORT` in `/etc/videofetch/media-egress.env` — the file the namespace holder's port also comes from — is the authoritative source. `/etc/videofetch` is root `0700` and stays so, so the probe's DynamicUser never opens it. **PID 1 reads the file as root** (`EnvironmentFile=-…`, the holder's own mechanism and parser), pins the variable so it cannot come from the manager environment, and passes only that value to the unprivileged process; no copy, no second setting |
+| No new host package | the pinned host Node the broker already requires; no curl, no wget. The DynamicUser's ability to traverse `/opt/videofetch` is **not** recorded in the repository and is an install-time check (`deploy/README.md`) |
+| One verdict per run | every exit, including configuration faults, signals and unexpected shell errors, emits exactly one `OUTCOME=` line |
+| On-demand preserved | a stopped VM produces no ticks and `Persistent=false` forbids catch-up; an `inactive` Worker is `idle` with **no request made**; a `failed` Worker is always a failure |
+| Observer, not supervisor | read-only `systemctl show`/`is-failed` only; no activating dependency on the Worker; `StartLimitIntervalSec=0` so failures cannot silence it |
+
+**Restart-on-unhealthy is still NOT implemented, and this probe does not add
+it.** What exists is systemd's `Restart=on-failure` on
+`videofetch-worker.service`, which acts when the Worker *process* fails. A
+Worker that is running but answers unhealthily is now *observed* — the probe
+records `OUTCOME=unhealthy` and its own unit enters `failed` — but nothing
+restarts it on that basis. Adding such an action would be a separate, reviewed
+decision; it is out of scope here and deliberately absent.
+
+### TLS `/v1/healthz` acceptance tooling — source only
+
+`deploy/acceptance/worker-health/tls-healthz-acceptance.mjs` is the tool for the
+second open health item: `GET /v1/healthz` through the **real external HTTPS
+endpoint**, as opposed to the loopback path above. It requires `https:`, the
+exact path, ordinary certificate validation (no `--insecure`; refuses
+`NODE_TLS_REJECT_UNAUTHORIZED=0`), **no** redirect, HTTP 200 and
+`{"status":"ok"}` within a 4096-byte body limit enforced **while streaming**.
+When Cloudflare Access requires Service Auth, the pair is read from the
+environment — both or neither — and **no** VideoFetch Worker HMAC header is
+sent, because `/v1/healthz` is unauthenticated at the application layer. Its
+evidence record (`worker-tls-healthz-02`) records each fact only once the run
+reaches the stage that measures it, and it withholds the hostname and every
+credential value. The record is written to a new file created exclusively
+with mode `0600` before the request. **It has not been run against
+Production.** See `deploy/acceptance/worker-health/README.md`.
+
 Do not "fix" an unhealthy-looking container by punching a hole in the egress
 policy. A Worker that cannot be probed from outside its namespace is a
 deployment wiring problem, not a policy problem.
@@ -4251,10 +4298,22 @@ authorization.
       *Left open by the 2026-09-10 reconciliation.* No automated external probe
       is recorded as configured; successful manual health requests are not
       one.
+      - *Still open.* A source implementation now exists —
+        `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`, §8, §11 —
+        with executor-local deterministic validation only. It is **not
+        installed or enabled on the VM**, and no deployed probe has been
+        observed. This box closes only after the artefacts are installed under
+        separate authorization and accepted there.
 - [ ] `GET /v1/healthz` returns 200 through the TLS endpoint.
       *Left open by the 2026-09-10 reconciliation.* The TLS endpoint is proven
       to reach the Worker's authenticated routes (§11c, §11h), but no accepted
       record measures `/v1/healthz` itself through it.
+      - *Still open.* Acceptance **tooling** now exists
+        (`deploy/acceptance/worker-health/`, same task id), with
+        executor-local deterministic validation only. **It has not been run
+        against the real endpoint**, so there is still no accepted
+        measurement. This box closes only after a separately authorized live
+        run passes.
 - [x] **Phase-9 safe-egress acceptance suite executed from inside the deployed
       boundary.** Executed 2026-08-30 and ACCEPTED. See §11a.
 
@@ -4301,6 +4360,7 @@ authorization.
 | `CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001` | **CLOSED — runtime absence verified (PASS)** | A dedicated measurement on 2026-09-26 of the live Production Worker, not of the retained HLS candidate. It used the committed names-only observer `makeSystemObservers().environmentNames()` against `videofetch-worker`, from `main` `77732cfe…`. `CLOUDFLARE_ACCESS_CLIENT_ID`, `CLOUDFLARE_ACCESS_CLIENT_SECRET` and `VIDEOFETCH_ACCESS_SECRET` are absent, and so are their case-insensitive variants. The expected control names `WORKER_CONTROL_KEY_ID`, `WORKER_CONTROL_SECRET` and `R2_BROKER_SOCKET_PATH` are present. One stable runtime epoch covered the measurement: image `sha256:5925515f…`, container `cd6e46d0…`, 0 restarts. No secret value, value hash or value length was fetched. Evidence: SHA-256 `702d6a350a08f263a19ac6aa3445ee7a8cd0fe2238fe0d7c213baac6a17f8971` (operator-held). *Accepted operator-measured runtime evidence, not CI.* No HLS step closed it. It was a pre-promotion prerequisite, so HLS-10 had to repeat the check after promotion. HLS-10 did, immediately after the promotion and at the end, on the promoted Worker epoch, and it passed (§4j). The §10 checklist item is closed. See §4j. |
 | `HLS-10-PRODUCTION-PROMOTION-REAL-SOURCE-ACCEPTANCE-001` (executed as `…-RETRY-001`) | **CLOSED / PASS / PRODUCTION ACCEPTED** | 2026-09-26: the qualified HLS-9B image `sha256:e5b1144c…` (source `f0b47bd5…`, not rebuilt; `main` `1524cdc4…` was docs-only ahead, with no runtime-code drift) was retagged by immutable id as `videofetch-worker:latest` at 16:05:26.998Z, and only `videofetch-worker.service` was restarted. Candidate epoch: container `0bfaf6810dc2…`, StartedAt 16:05:27.747Z, NRestarts 0, stable to the end. The post-promotion names-only credential-custody check passed twice on that epoch. The direct regression passed (2,848,208 bytes, equal to the job size and the expected digest). On an operator-approved public HLS test master, the previous image advertised 0 presets (5 HLS renditions withheld, `unsupported_protocol`), and the promoted image advertised `preset:best` plus five named rungs; `preset:144` went through all six durable states, directly observed, with 0 yt-dlp, `ffmpeg` or `ffprobe` processes across 35 downloading samples. A `303` presigned R2 GET delivered 20,049,865 bytes, equal to the Product `fileSize` (SHA-256 `91cd6fc0…`, `video/mp4` from the object's `Content-Type`), and an offline ffprobe found one H.264 and one AAC stream, 634.634 s. No rollback; no Vercel, Cloudflare, R2, systemd or `worker.env` change; the VM ended Stopped. Evidence `/var/tmp/hls10/hls10-production-acceptance.txt`, SHA-256 `83b0e2374eb29effe54190bdbb55890e9252f8583c2334e9ca6d7e648b1dcf2e` (*accepted operator-measured*, not CI). A first attempt stopped before starting the VM and changed nothing. See §4j. |
 | `genericPresetOwner()` / `id in map` | **OPEN — non-blocking defense-in-depth debt** | `genericPresetOwner()` (`src/worker/execution/format-plan.ts`, since HLS-7) decides which private selection map claims a requested preset with `id in map`, and `in` also sees inherited keys. An inherited progressive entry alone would therefore count as an executable owner. Analysis builds ordinary maps, so no current Product path produces one. A future hardening may move ownership to own-property semantics. Not changed here. |
+| `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001` | **IMPLEMENTED IN SOURCE / NOT DEPLOYED / LIVE ACCEPTANCE PENDING** | Source foundation for the two open §10 health items; **neither is closed by it**. *(1) External liveness probe:* `deploy/bin/vf-worker-liveness-probe` + `vf-worker-health-request.mjs`, run by `videofetch-worker-liveness.service` on `videofetch-worker-liveness.timer`. It runs in the VM host namespace, outside `videofetch-media-netns` and the container (no `nsenter`, no `docker`), and probes only `http://127.0.0.1:<VIDEOFETCH_WORKER_PORT>/v1/healthz`. The authoritative port source is `media-egress.env`, but the probe's DynamicUser never opens the root-only `0700` `/etc/videofetch`: PID 1 reads the file as root through `EnvironmentFile=` and passes only the value. The request runs on the pinned host Node the broker already requires, so no new host package is added. Every run emits exactly one `OUTCOME=` line. On-demand semantics: a stopped VM produces no ticks and `Persistent=false` forbids catch-up; an `inactive` Worker is `idle` with no request; a `failed` Worker is a failure, never idle. It is an observer only: read-only `systemctl` verbs, no activating dependency on the Worker, `StartLimitIntervalSec=0`, and **no restart action** — restart-on-unhealthy remains unimplemented (§8). *(2) TLS `/v1/healthz` acceptance tooling:* `deploy/acceptance/worker-health/` — HTTPS only, exact path, ordinary certificate validation, no redirect, 200 + `{"status":"ok"}`, Access Service Auth pair from the environment both-or-neither, no Worker HMAC. The 4096-byte body limit is enforced while streaming. Evidence schema `worker-tls-healthz-02` records only measured facts (`-01` is retired; it never produced accepted evidence) and withholds the hostname and every credential value, in a new `0600` file that is never overwritten. **Not run against Production.** *Validation:* executor-local deterministic tests only (`src/worker/runtime/worker-liveness-deployment-policy.test.ts`, `scripts/worker-tls-healthz-acceptance.test.mjs`) — not GitHub CI. *Unchanged:* `Dockerfile.worker` (still no `HEALTHCHECK`, no curl/wget), Worker capabilities, the media namespace, the safe-egress policy, every bind, every credential scope and all Cloudflare configuration. *Review correction (`…-REVIEW-CORRECTION-001`), still source only:* (a) port delivery through PID 1 `EnvironmentFile=`, because the first revision's DynamicUser could not traverse the root-only `/etc/videofetch`; (b) exactly one `OUTCOME=` on every exit; (c) evidence stage semantics; (d) the body cap enforced while streaming; (e) exclusive `0600` evidence creation. *Remaining gates:* installing and accepting the probe on the VM — including the DynamicUser `/opt/videofetch` traversal check and `systemd-analyze verify`, neither available to the executor — and a live TLS run, each under its own authorization. |
 
 ---
 
