@@ -402,11 +402,13 @@ videofetch-worker-liveness.timer        every 5 min of VM UPTIME; Persistent=fal
   ▼
 videofetch-worker-liveness.service      oneshot, DynamicUser, no capabilities,
   │                                     RestrictNamespaces=yes
+  │  PID 1, as root: EnvironmentFile=-/etc/videofetch/media-egress.env
+  │                  -> VIDEOFETCH_WORKER_PORT in the probe's environment
   ▼
 vf-worker-liveness-probe                VM HOST namespace — outside the media netns,
   │                                     outside the container, no nsenter, no docker
   │  systemctl show / is-failed         read-only; never start/stop/restart
-  │  VIDEOFETCH_WORKER_PORT             from media-egress.env via vf-egress-lib.sh
+  │  never opens /etc/videofetch        (root 0700; the DynamicUser cannot traverse it)
   ▼
 http://127.0.0.1:<VIDEOFETCH_WORKER_PORT>/v1/healthz
                                         the SAME loopback ingress cloudflared uses
@@ -428,15 +430,52 @@ could only pass by weakening that policy, so `Dockerfile.worker` ships no
 does — over the loopback ingress the namespace holder publishes — and never
 traverses the denied path.
 
-### One port declaration, no new host package
+### One port declaration, delivered without weakening `/etc/videofetch`
 
-- **Port.** `VIDEOFETCH_WORKER_PORT` in `/etc/videofetch/media-egress.env` is
-  the only Worker-port setting. The probe reads it through the same
-  `vf_config_read` the safe-egress helpers use, so it cannot drift from the port
-  `videofetch-media-netns.service` publishes.
-- **Runtime.** The HTTP request runs on the pinned host Node at
-  `/opt/videofetch/node/bin/node` — [install order](#install-order) step 0,
-  which the broker already requires. No curl, no wget, no apt step.
+**Authoritative source.** `VIDEOFETCH_WORKER_PORT` in
+`/etc/videofetch/media-egress.env` is the only Worker-port setting.
+`videofetch-media-netns.service` publishes its port from this same file.
+
+**How the probe receives it.** `/etc/videofetch` is root-owned mode `0700`,
+because it also holds broker credentials. The probe's `DynamicUser` cannot
+traverse it, and that is correct, so nothing here changes the directory.
+Instead:
+
+```
+Environment=VIDEOFETCH_WORKER_PORT=                 # pin: the file's value or nothing
+EnvironmentFile=-/etc/videofetch/media-egress.env   # read by PID 1, AS ROOT
+UnsetEnvironment=VIDEOFETCH_MEDIA_DNS_FLAGS         # the probe gets exactly one value
+```
+
+- **Who reads it.** PID 1 reads the file before dropping privilege, using the
+  same parser that expands `${VIDEOFETCH_WORKER_PORT}` in the holder's
+  `-p 127.0.0.1:…` flag. It passes only the resulting value to the unprivileged
+  process.
+- **No copy, no second setting.** Nothing is copied to disk and no second
+  setting exists. The value can never come from the service manager's own
+  environment.
+- **Missing file.** The `-` makes a missing file non-fatal to systemd, so the
+  probe runs and reports `OUTCOME=config-invalid reason=port-unavailable`
+  instead of the unit failing silently before `ExecStart`.
+- **Validation.** The probe validates the value with `vf_validate_port`, the
+  same rule `vf-egress-config-check` applies before the holder publishes a
+  port. The probe itself never opens anything under `/etc/videofetch`.
+
+**Runtime.** The HTTP request runs on the pinned host Node at
+`/opt/videofetch/node/bin/node`. That is [install order](#install-order)
+step 0, which the broker already requires. No curl, no wget, no apt step.
+
+**Install-time check: the DynamicUser must be able to run that Node.**
+- **Why it is needed.** The broker proves that a *fixed* non-root system user
+  can. The repository does not record the mode of `/opt/videofetch`, so it
+  does not prove an arbitrary UID can traverse it.
+- **What happens if it cannot.** The probe reports
+  `OUTCOME=config-invalid reason=node-unavailable`, never "unhealthy".
+- **How to check.** Run this before relying on the timer:
+
+  ```
+  systemd-run --wait --pipe -p DynamicUser=yes /opt/videofetch/node/bin/node -v   # v22.23.2
+  ```
 
 ### On-demand execution is idle, not an outage
 
@@ -448,7 +487,19 @@ traverses the denied path.
 | Worker `active`, healthy | `OUTCOME=healthy` | `0` |
 | Worker `active`, refused / timeout / non-200 / malformed / wrong state | `OUTCOME=unhealthy` | `1` |
 | Worker `failed` | `OUTCOME=failed-unit` — **never** reported as idle | `1` |
-| Worker unit not loaded; bad port; host Node missing | `OUTCOME=not-installed` / `config-invalid` | `2` |
+| Worker `ActiveState` not understood | `OUTCOME=unknown-state` | `1` |
+| Worker unit not loaded | `OUTCOME=not-installed` | `2` |
+| systemd could not be queried | `OUTCOME=state-unavailable` | `2` |
+| port unavailable or malformed; validator, host Node or request module unavailable | `OUTCOME=config-invalid reason=…` | `2` |
+| unknown argument | `OUTCOME=usage-error` | `2` |
+| terminated by a signal | `OUTCOME=interrupted` | `2` |
+| any exit not covered above | `OUTCOME=internal-error` — never success | `2` |
+
+**Every run emits exactly one `OUTCOME=` line.** Known paths go through one
+exit function. An EXIT trap covers everything else: a shell error, or a
+sourced file that exits. The probe deliberately does not call the shared
+library's `vf_config_load`/`vf_die`, because those exit without an `OUTCOME=`
+line.
 
 The probe is stateless — no counter, no spool — so time spent powered off can
 never be replayed as accumulated failures.
@@ -679,8 +730,12 @@ The order is not a convenience — it is the fail-closed boundary.
    ```
 
    It needs steps 0 (pinned host Node) and 4 (`vf-egress-lib.sh` and
-   `media-egress.env`), and nothing else. Enabling it starts no other unit, and
-   it can be installed while the Worker is stopped: that is reported as idle.
+   `media-egress.env`), and nothing else. PID 1 reads `media-egress.env` for it;
+   `/etc/videofetch` stays `0700`. Enabling it starts no other unit, and it can
+   be installed while the Worker is stopped: that is reported as idle.
+
+   Before relying on it, run the DynamicUser Node check above, then
+   `systemd-analyze verify` on both liveness units.
 
 ---
 
@@ -847,6 +902,10 @@ systemctl is-enabled videofetch-worker-liveness.service                       # 
 
 # The probe cannot pull the Worker up.
 systemctl show videofetch-worker-liveness.service -p Requires -p Wants -p BindsTo
+
+# /etc/videofetch is still root-only; the probe gets the port from PID 1.
+stat -c '%a %U:%G' /etc/videofetch                                           # 700 root:root
+systemctl show videofetch-worker-liveness.service -p EnvironmentFiles -p DynamicUser
 
 # One observation, on demand. With the Worker stopped this prints OUTCOME=idle.
 systemctl start videofetch-worker-liveness.service
