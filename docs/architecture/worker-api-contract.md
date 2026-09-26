@@ -132,9 +132,30 @@ lower rendition is never presented as the source maximum:
 - `maybeProtectedObserved` — a surviving rendition carried the upstream
   "maybe protected" marker. Delivery is unaffected by it.
 
-The field is INFORMATIONAL. Nothing selects, plans, or acquires from it; HLS and
-segmented-DASH renditions appear in it and remain non-executable. Direct
-analysis omits the field, which is why it is optional.
+The field is INFORMATIONAL. Nothing selects, plans, or acquires from it, and it
+never creates a download option. Which renditions are executable is decided
+elsewhere — by the analysis that builds the advertised presets — and the field
+only describes that outcome:
+
+- segmented-DASH renditions appear in it and remain inventory-only and
+  non-executable;
+- HLS renditions that analysis does not admit to the narrow clear-HLS v1 path
+  appear in it as withheld (`unsupported_protocol`) and remain non-executable —
+  as does every HLS rendition when the Worker has no FFmpeg;
+- since HLS-7, in **source only** (not yet deployed; deployment runbook §4j), an
+  admitted clear-HLS v1 rendition can independently back an ordinary advertised
+  video preset through the Worker's private HLS selection path. The field then
+  counts it as deliverable, or withholds it as `not_selected` when another
+  rendition won its rung. It reports that decision; it does not make it.
+
+Direct analysis omits the field, which is why it is optional.
+
+**No public contract change for clear HLS.** An HLS-backed preset is an ordinary
+application-owned preset (`preset:best`, `preset:1080`, `preset:720`, …); there
+is no HLS-specific format id, field or error code. Such a preset states
+`container: "mp4"`, `hasVideo: true`, `hasAudio: true` and `null` for
+`fileSize`, `videoCodec`, `audioCodec` and `fps`. `preset:audio` and
+`preset:mp3` are never HLS-backed.
 
 **Deployment order — VERCEL FIRST.** `VideoMetadataSchema` is strict, so a
 control plane that predates this field REJECTS a Worker response that carries it
@@ -215,7 +236,9 @@ stayed enabled and opened an empty Advanced list. Advanced lists the formats the
 analysis actually returns; it is not a browser for every format a source offers.
 
 **Accepted in Production** (*accepted operator-measured*; runbook §11h). On the
-authorized X/Twitter case, recorded only as `authorized-original-x-case`:
+authorized X/Twitter case, recorded only as `authorized-original-x-case`, at that
+2026-09-19 acceptance point — on the pre-HLS Production Worker image, before
+HLS-7 existed in source:
 
 - The live analysis returned `observedMaxHeight` 384 and `deliverableMaxHeight`
   384, with two `unsupported_protocol` renditions withheld at height 384.
@@ -230,9 +253,14 @@ authorized X/Twitter case, recorded only as `authorized-original-x-case`:
 The higher-quality notice and the unknown-resolution state were verified on the
 deployed source by deterministic render tests, not on a live third-party source.
 
-P2 changes presentation only. HLS and segmented DASH remain not implemented and
-inventory-only. `observedMaxHeight` is still not a claim about a provider's
-absolute maximum, and protected renditions are still not downloadable.
+P2 changes presentation only. At P2, HLS and segmented DASH were not implemented
+and were inventory-only. Segmented DASH still is. Clear-HLS v1 was later
+implemented in source (HLS-7) and qualified in a retained release candidate, but
+it is **not deployed** — the Production Worker still runs the pre-HLS image
+(deployment runbook §4j) — and every HLS rendition outside that narrow path
+remains inventory-only. `observedMaxHeight` is still not a claim about a
+provider's absolute maximum, and protected renditions are still not
+downloadable.
 
 ---
 
