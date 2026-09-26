@@ -1,0 +1,59 @@
+# Cadence for the external Worker liveness probe.
+# (WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001)
+#
+# This is the ONLY trigger for videofetch-worker-liveness.service, which is
+# deliberately not enabled itself.
+#
+# ON-DEMAND EXECUTION IS PRESERVED, AND THAT IS THE WHOLE POINT
+#
+# A timer runs only while the VM runs. A deliberately stopped `videofetch` VM
+# therefore produces NO probe ticks at all, and that is the intended Product idle
+# state — not an outage, and not something this timer should try to compensate
+# for later. `Persistent=false` is what makes that true: with `Persistent=true`
+# systemd would remember the missed elapsations and fire a catch-up run on the
+# next boot, which is exactly the "hours of accumulated liveness failures after a
+# weekend" behaviour the design forbids. It is stated explicitly rather than left
+# to the default, because the default is the thing that must not change.
+#
+# Nothing here creates a 24/7 requirement: no unit is kept running between ticks,
+# the probe holds nothing open, and an inactive Worker is reported as idle rather
+# than started.
+
+[Unit]
+Description=Periodic external Worker liveness probe (VM-uptime only; no catch-up after a stopped VM)
+Documentation=file:/opt/videofetch/docs/architecture/worker-deployment-runbook.md
+
+[Timer]
+Unit=videofetch-worker-liveness.service
+
+# Bounded, documented cadence.
+#
+#   OnBootSec        First tick a few minutes after boot, so the probe is not
+#                    racing the Worker's own start-up dependency chain (broker,
+#                    namespace, policy, watchdog, resolver, workspace mount).
+#   OnUnitActiveSec  Then every 5 minutes of VM UPTIME. Chosen against the
+#                    Worker's own 60s maintenance interval: frequent enough that
+#                    a dead Worker is visible in the journal within one tick,
+#                    infrequent enough to be nothing more than one loopback GET
+#                    every 300s on a laptop-hosted VM.
+OnBootSec=3min
+OnUnitActiveSec=5min
+
+# NO CATCH-UP. See the header. Time the VM spent powered off must never be
+# replayed as missed probe runs.
+Persistent=false
+
+# A 30s scheduling window lets systemd coalesce this wake-up with others, which
+# matters on a battery-powered host; liveness observability does not need
+# second-accuracy.
+AccuracySec=30s
+
+# Spreads the tick so the probe never lands in lockstep with another periodic
+# job that happens to share its cadence.
+RandomizedDelaySec=15s
+
+[Install]
+# The TIMER is the enabled unit. Enabling the service instead would make the
+# probe a boot-time one-shot with no cadence, and enabling both would run it
+# twice at boot for no benefit.
+WantedBy=timers.target
