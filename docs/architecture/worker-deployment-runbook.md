@@ -181,6 +181,12 @@ They are deliberately independent:
   > `CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` in §11 — **CLOSED**.
   > This remains a statement about the measured ingress path, not a property
   > this repository can re-derive from source.
+  >
+  > **Worker-side absence, measured and accepted.** A names-only runtime
+  > measurement of the running Production Worker found neither
+  > `CLOUDFLARE_ACCESS_CLIENT_*` name in its environment. See
+  > `CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001` in §11 —
+  > **CLOSED**, and §4j.
 - The Access credentials are **not part of the HMAC canonical request**. The
   signing input remains exactly `version | key id | method | canonical path |
   timestamp | request id | idempotency key | SHA-256(raw body)`. A logically
@@ -3057,12 +3063,85 @@ remains a separate step.
   so Production contains no clear-HLS code.
 - **No real public HLS source has been accepted** through an HLS-capable
   Production Worker.
+- **The credential-absence prerequisite is now satisfied.** A dedicated runtime
+  measurement of the current Production Worker closed it (below). That is a
+  **pre-promotion prerequisite, not acceptance of the candidate.** The same
+  names-only credential-custody check must be repeated after the retained
+  candidate becomes the running Worker, and before final HLS-10 Production
+  acceptance.
 - **HLS-10 needs its own authorization.**
 
-#### Carried forward — not closed by any HLS step
+#### Worker credential absence — CLOSED by a dedicated runtime measurement
 
-- `CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001` — unresolved
-  runtime evidence (§10, §11).
+*Recorded 2026-09-26 by
+`CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001-DOCS-CLOSURE`;
+documentation only. The evidence is accepted operator-measured runtime evidence,
+not GitHub CI.*
+
+`CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001` is **CLOSED /
+PASS**. No HLS step closed it. A later, dedicated measurement closed it, and it
+measured the **current Production Worker**, not the retained HLS candidate.
+
+- **Method.** It used the committed observer
+  `makeSystemObservers().environmentNames()` in
+  `deploy/acceptance/ytdlp-generic/lib/observers.mjs`, from an exact clean
+  checkout of `main` `77732cfe…`, against the running `videofetch-worker`
+  container. The probe emits environment variable **names only**. Nothing else
+  was retrieved:
+  - no `NAME=value` assignment;
+  - no secret value;
+  - no value hash;
+  - no value length.
+
+  `/etc/videofetch/worker.env`, `/proc/*/environ` and the systemd `Environment`
+  values were not read.
+- **Runtime binding.**
+  - Production `latest` and the running Worker image:
+    `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e`.
+  - Worker container:
+    `cd6e46d0dd23c83bad6afc6e21c101a3a175fce3d0fbee3603d3268585a70be9`.
+  - Restart count: 0.
+  - The same runtime epoch was observed before and after the measurement.
+
+| Name | In the Worker runtime environment |
+| :--- | :--- |
+| `CLOUDFLARE_ACCESS_CLIENT_ID` | absent |
+| `CLOUDFLARE_ACCESS_CLIENT_SECRET` | absent |
+| `VIDEOFETCH_ACCESS_SECRET` | absent |
+| case-insensitive variants of those three names | absent |
+| `WORKER_CONTROL_KEY_ID` — positive control | present |
+| `WORKER_CONTROL_SECRET` — positive control | present |
+| `R2_BROKER_SOCKET_PATH` — positive control | present |
+
+The positive controls establish that the names-only probe actually observed the
+Worker's runtime environment, not an empty or unrelated one. `WORKER_CONTROL_*`
+is expected: it is the separate Vercel → Worker HMAC credential plane (§1b).
+
+- **Supplementary.** The same observation found none of these R2 credential
+  names. This supplements the accepted R2 work (§5) and does not reopen it.
+  - `R2_BROKER_PARENT_ACCESS_KEY_ID`, `R2_BROKER_PARENT_SECRET_ACCESS_KEY`
+  - `R2_SIGNER_ACCESS_KEY_ID`, `R2_SIGNER_SECRET_ACCESS_KEY`
+  - `R2_WRITER_ACCESS_KEY_ID`, `R2_WRITER_SECRET_ACCESS_KEY`,
+    `R2_WRITER_SESSION_TOKEN`
+- **Evidence.** `/var/tmp/pre-hls10-security/cloudflare-access-worker-credential-absence.txt`,
+  mode `0444`, SHA-256
+  `702d6a350a08f263a19ac6aa3445ee7a8cd0fe2238fe0d7c213baac6a17f8971`. The file is
+  operator-held, outside the repository. It contains bounded booleans and
+  identities only: no credential value and no environment dump.
+- **An earlier attempt was discarded** before any evidence artifact was
+  accepted. The task-local artifact privacy heuristic had falsely classified one
+  of its own boolean key names as secret-bearing. The environment probe itself
+  was names-only. The heuristic was corrected and tested with positive and
+  negative controls, and the complete measurement was then repeated. Only the
+  second run is accepted.
+
+What this proves, and nothing more: the **currently deployed** Worker runtime
+does not contain the forbidden control-plane or private-access credential names.
+It establishes nothing about the retained candidate's runtime after a promotion;
+see *HLS-10 — NOT BEGUN* above.
+
+#### Carried forward — still open
+
 - `genericPresetOwner()` / `id in map` — non-blocking defense-in-depth debt
   (§11).
 
@@ -3965,14 +4044,20 @@ authorization.
       against the real Service Auth configuration, and Vercel Production reaches
       the Worker through Access (§11, §11c — *accepted provider observation /
       operator-measured*). No token value or identifier is recorded.
-- [ ] `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET` set on
-      **Vercel only** — both or neither — and never on the Worker.
-      *Left open by the 2026-09-10 reconciliation.* The Vercel half is
-      evidenced — Production authenticates to Access (§11c) — but no accepted
-      record measures their absence from the Worker: the Stage-A forbidden-name
-      audit does not cover these two names, and the §11 property that the
-      Worker never consumes them is a source property, not a deployment
-      measurement.
+- [x] **`CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET` set on
+      Vercel only — both or neither — and never on the Worker.**
+      *Left open by the 2026-09-10 reconciliation; closed 2026-09-26.*
+      - The Vercel half is evidenced: Production authenticates to Access
+        (§11c).
+      - The Worker half is now measured. A dedicated names-only runtime
+        measurement of the running Production Worker found both names absent,
+        and `VIDEOFETCH_ACCESS_SECRET` absent too. The expected HMAC control
+        names were present. See
+        `CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001` in §4j
+        and §11 — **CLOSED / PASS**, *accepted operator-measured*.
+      - Before that measurement, the Stage-A forbidden-name audit did not cover
+        these two names. The Worker's non-consumption of them was then a source
+        property only.
 - [x] **`CLOUDFLARE-ACCESS-ORIGIN-CREDENTIAL-STRIPPING-001` resolved and
       accepted.** Measured externally against the real Service Auth
       configuration. See §11.
@@ -4028,7 +4113,7 @@ authorization.
 | `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` | **OPEN / NON-PRODUCTION-BLOCKING** | Upstream bitrate-derived approximate sizes can materially overestimate the bytes actually delivered. Observed at the P2 acceptance (*accepted operator-measured*): for the authorized X/Twitter case the browser's estimated size was about 5.9 MB (preset `fileSize` 6,226,064 bytes), while the delivered object was 774,763 bytes (≈ 757 KiB). When the extractor declares no exact `filesize`, the Worker reports its `filesize_approx` (`src/worker/analysis/ytdlp-analysis.server.ts`, *repository-verifiable*). For this source that approximation derives from upstream nominal bitrate metadata, not from the real bitrate (*accepted operator-measured*, 2026-09-18 X/Twitter diagnostics). It is not a P2 defect: P2 only displays the size the Worker reports. Nothing is changed here. Later work may distinguish an exact size, an upstream approximate size, a bitrate-derived estimate and an unknown size. |
 | Clear-HLS v1 — HLS-1 … HLS-10 | **IMPLEMENTED IN SOURCE / QUALIFIED IN A RETAINED RELEASE CANDIDATE / NOT DEPLOYED — HLS-10 NOT BEGUN** | *Source (GitHub-verifiable):* HLS-7 (PR #77, `ff9d5c66…`) source-activated a narrow clear-HLS path. The rendition must be public, single-item, non-live and use exactly `m3u8_native`, with a clear VOD media playlist of MPEG-TS segments and video with proven audio. yt-dlp discovers it during metadata analysis only. VideoFetch owns the HLS-2 preflight and HLS-3 fragment acquisition, and the Worker performs the HLS-4 TS → MP4 stream copy only after `beginProcessing()`. yt-dlp's download allowlist is unchanged (`http`, `https`). HLS-8 (PR #78) and HLS-9A (PR #79, SPLIT-07 `-03`) merged the acceptance tooling; `main` is `f0b47bd5…`. *Candidate (accepted operator-measured):* HLS-9B qualified and retained `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c` → `sha256:e5b1144c…` (parent `-03` PASS 47/47; mp4 and webm 141/141; clear-HLS 146/146). HLS-8 `-02` is accepted and `-01` is historical and not accepted. *Not done:* no promotion, `latest` has not moved, the running Production Worker is still `sha256:5925515f…`, and no real public HLS source has been accepted. Full record: §4j. |
 | `HLS-PRE-HLS10-RETAINED-CANDIDATE-PACKAGE-DRIFT-AUDIT-001` | **COMPLETE — VERSION-ONLY DRIFT; accepted as non-blocking for HLS promotion preparation** | A read-only comparison of the retained candidate `sha256:e5b1144c…` with Production `sha256:5925515f…`; neither image was executed (*accepted operator-measured*). Both images have 300 installed packages: 298 are identical and 2 changed, with 0 Production-only and 0 candidate-only. The changes are `libssl3` and `openssl`, each `3.0.20-1~deb12u2` → `3.0.22-1~deb12u1`; both are upgrades under `dpkg --compare-versions`, with no downgrade. The CA bundle, `ffmpeg`, `ffprobe`, `python3.11`, Node and yt-dlp are byte-identical. Evidence `/var/tmp/hls09b/package-drift-audit.txt`, SHA-256 `138b7208…` (operator-held). The disposition is not Production acceptance, and HLS-10's real-network acceptance stays separate. See §4j. |
-| `CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001` | **OPEN — unresolved runtime evidence** | No accepted record measures that `CLOUDFLARE_ACCESS_CLIENT_ID` / `CLOUDFLARE_ACCESS_CLIENT_SECRET` are absent from the deployed Worker. Their non-consumption by Worker code is a source property; the §10 checklist item stays open. No HLS step closes it. |
+| `CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001` | **CLOSED — runtime absence verified (PASS)** | A dedicated measurement on 2026-09-26 of the live Production Worker, not of the retained HLS candidate. It used the committed names-only observer `makeSystemObservers().environmentNames()` against `videofetch-worker`, from `main` `77732cfe…`. `CLOUDFLARE_ACCESS_CLIENT_ID`, `CLOUDFLARE_ACCESS_CLIENT_SECRET` and `VIDEOFETCH_ACCESS_SECRET` are absent, and so are their case-insensitive variants. The expected control names `WORKER_CONTROL_KEY_ID`, `WORKER_CONTROL_SECRET` and `R2_BROKER_SOCKET_PATH` are present. One stable runtime epoch covered the measurement: image `sha256:5925515f…`, container `cd6e46d0…`, 0 restarts. No secret value, value hash or value length was fetched. Evidence: SHA-256 `702d6a350a08f263a19ac6aa3445ee7a8cd0fe2238fe0d7c213baac6a17f8971` (operator-held). *Accepted operator-measured runtime evidence, not CI.* No HLS step closed it. It is a pre-promotion prerequisite, so HLS-10 must repeat the check after promotion. The §10 checklist item is closed. See §4j. |
 | `genericPresetOwner()` / `id in map` | **OPEN — non-blocking defense-in-depth debt** | `genericPresetOwner()` (`src/worker/execution/format-plan.ts`, since HLS-7) decides which private selection map claims a requested preset with `id in map`, and `in` also sees inherited keys. An inherited progressive entry alone would therefore count as an executable owner. Analysis builds ordinary maps, so no current Product path produces one. A future hardening may move ownership to own-property semantics. Not changed here. |
 
 ---
