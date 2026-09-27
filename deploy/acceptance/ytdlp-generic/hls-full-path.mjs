@@ -1938,7 +1938,7 @@ async function main(argv) {
     cleanup: out.cleanup,
     negativeCases: out.negativeCases,
     openNotes: {
-      hls7GenericPresetOwnerNote: "HLS-7 defense-in-depth note (`id in map` ownership) remains OPEN and non-blocking; not addressed here",
+      hls7GenericPresetOwnerNote: "HLS-7 generic-preset ownership hardening (GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001) is outside this HLS full-path acceptance; this record makes no independent claim about that workstream's source, deployment or Production status",
       cloudflareAccessCredentialAbsence: "CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001 is NOT addressed or resolved by this run",
       blockedReasons: blocked,
     },
