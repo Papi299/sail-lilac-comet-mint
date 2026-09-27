@@ -303,6 +303,36 @@ narrow path remains inventory-only. `observedMaxHeight` is still not a claim abo
 provider's absolute maximum, and protected renditions are still not
 downloadable.
 
+**4. Preset `fileSize` for generic analysis (semantics only; no schema change)**
+
+`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, implemented in source. For generic yt-dlp analysis:
+
+- A non-null preset `fileSize` is a positive, **upstream-declared** source size
+  (yt-dlp's `filesize`).
+- It is not independently verified by VideoFetch, and it is not a promise of the
+  exact size of the delivered object.
+- For a split-merge preset, a non-null value is the sum of the two inputs'
+  declared sizes. That is input metadata, not the final merged object's size.
+- When a source reports only `filesize_approx`, or no size at all, `fileSize` is
+  `null`.
+- The Worker's private per-preset selection follows the same rule. Download
+  progress reads that selection as its `totalBytes`, so an estimate never becomes
+  a progress total either.
+
+`filesize_approx` remains a private, conservative analysis input. It still takes
+part in:
+
+- per-format and split-pair size-limit admission;
+- clear-HLS admission;
+- within-rung source ranking;
+- the `size_limit_exceeded` accounting in `sourceQuality`.
+
+A `null` size does not weaken byte enforcement: acquisition enforces actual
+bytes regardless of metadata. The public shape is unchanged
+(`fileSize: number | null`), so this needs no control-plane change and imposes no
+Vercel/Worker deployment order. Direct analysis is unaffected. Its `fileSize`
+remains the source's HEAD `Content-Length` when available.
+
 ---
 
 ## Job-Create Idempotency

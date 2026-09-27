@@ -283,6 +283,75 @@ function withoutIds<T>(record: Record<string, T> | undefined, ids: ReadonlySet<s
   return Object.fromEntries(Object.entries(record ?? {}).filter(([id]) => !ids.has(id)));
 }
 
+/**
+ * SOURCE-FILESIZE-ESTIMATE-DRIFT-001 carve-out: scenarios whose advertised
+ * sources carry ONLY an upstream `filesize_approx`, and the exact preset ids
+ * backed by one. The Worker no longer publishes an approximation as a preset
+ * `fileSize` or carries it in a private selection (where progress reads it),
+ * so for exactly these ids the golden's three size locations — the preset, its
+ * selection's source and its plan's source — are compared as `null`. Every
+ * other field of these scenarios, and every other scenario, is still compared
+ * with the golden record in full. The golden record is NOT regenerated.
+ */
+const ESTIMATE_ONLY_SIZE_SUPPRESSED: Record<string, readonly string[]> = {
+  "x-synthetic-x-progressive-unknown-audio-ffmpeg": ["preset:best", "preset:360", "preset:240"],
+  "x-synthetic-x-progressive-unknown-audio-no-ffmpeg": ["preset:best", "preset:360", "preset:240"],
+};
+
+type GoldenSource = { formatId: string; fileSize: number | null };
+type GoldenSingleSelection = { kind: string; source: GoldenSource };
+type GoldenGenericPlan = { generic: { source: GoldenSource } };
+
+/**
+ * The three golden size locations of one carved-out preset, each proven to
+ * hold the historical approximation-backed value: non-null, equal to that
+ * source row's `filesize_approx`, and from a row that declares no `filesize`.
+ */
+function historicalEstimateOnlySizes(scenario: Scenario, golden: GoldenEntry, id: string): number {
+  const preset = (golden.video as { presets: Array<{ id: string; fileSize: number | null }> }).presets.find(
+    (p) => p.id === id,
+  );
+  const selection = golden.selections?.[id] as GoldenSingleSelection | undefined;
+  const plan = golden.plans?.[id] as GoldenGenericPlan | undefined;
+  assert.ok(preset && selection && plan, `${scenario.name} ${id}: present in all three golden maps`);
+  assert.equal(selection.kind, "single", `${scenario.name} ${id}: carved sizes are single-source`);
+
+  const formats = (documentOf(scenario).formats ?? []) as Array<Record<string, unknown>>;
+  const row = formats.find((f) => f.format_id === selection.source.formatId);
+  assert.ok(row, `${scenario.name} ${id}: the golden source row exists in the fixture`);
+  assert.ok(!(typeof row.filesize === "number" && row.filesize > 0), `${scenario.name} ${id}: no declared size`);
+  const approx = row.filesize_approx;
+  assert.ok(typeof approx === "number" && approx > 0, `${scenario.name} ${id}: an approximation exists`);
+
+  for (const size of [preset.fileSize, selection.source.fileSize, plan.generic.source.fileSize]) {
+    assert.equal(size, approx, `${scenario.name} ${id}: the golden holds the historical approximation`);
+  }
+  return approx;
+}
+
+/**
+ * The golden record as SOURCE-FILESIZE-ESTIMATE-DRIFT-001 expects it: a deep
+ * copy with exactly the carved-out size locations set to `null`. Scenarios not
+ * listed come back unchanged.
+ */
+function withEstimateOnlySizesSuppressed(scenario: Scenario, golden: GoldenEntry): GoldenEntry {
+  const ids = ESTIMATE_ONLY_SIZE_SUPPRESSED[scenario.name];
+  if (!ids) return golden;
+  for (const id of ids) historicalEstimateOnlySizes(scenario, golden, id);
+
+  const copy = structuredClone(golden) as GoldenEntry & {
+    video: { presets: Array<{ id: string; fileSize: number | null }> };
+    selections: Record<string, GoldenSingleSelection>;
+    plans: Record<string, GoldenGenericPlan>;
+  };
+  for (const id of ids) {
+    copy.video.presets.find((p) => p.id === id)!.fileSize = null;
+    copy.selections[id]!.source.fileSize = null;
+    copy.plans[id]!.generic.source.fileSize = null;
+  }
+  return copy;
+}
+
 describe("P1 rendition inventory: the corpus", () => {
   it("the corpus and the golden record describe the same scenarios", () => {
     const names = CORPUS.map((s) => s.name);
@@ -291,12 +360,40 @@ describe("P1 rendition inventory: the corpus", () => {
     assert.deepEqual(names.slice().sort(), Object.keys(EXPECTED).sort());
     assert.ok(names.length >= 25, "the corpus must keep its breadth");
     for (const name of Object.keys(HLS_ACTIVATED)) assert.ok(names.includes(name), name);
+    for (const name of Object.keys(ESTIMATE_ONLY_SIZE_SUPPRESSED)) assert.ok(names.includes(name), name);
+  });
+
+  it("the size carve-out names EXACTLY the golden sizes that were approximation-only", () => {
+    // Not a generic "ignore fileSize": a golden size is carved out when, and
+    // only when, a member source row behind it declared no `filesize` but had
+    // a `filesize_approx`. Any other scenario's sizes stay fully compared.
+    for (const scenario of CORPUS) {
+      const golden = GOLDEN[scenario.name]!;
+      const formats = (documentOf(scenario).formats ?? []) as Array<Record<string, unknown>>;
+      const positive = (v: unknown) => typeof v === "number" && v > 0;
+      const approxOnly = new Set(
+        formats.filter((f) => !positive(f.filesize) && positive(f.filesize_approx)).map((f) => f.format_id),
+      );
+      const carved: string[] = [];
+      for (const [id, value] of Object.entries(golden.selections ?? {})) {
+        const v = value as { kind: string; source?: GoldenSource; pair?: { video: GoldenSource; audio: GoldenSource } };
+        const members = v.kind === "single" ? [v.source!] : [v.pair!.video, v.pair!.audio];
+        if (members.some((m) => m.fileSize !== null && approxOnly.has(m.formatId))) carved.push(id);
+      }
+      assert.deepEqual(
+        carved.sort(),
+        [...(ESTIMATE_ONLY_SIZE_SUPPRESSED[scenario.name] ?? [])].sort(),
+        scenario.name,
+      );
+    }
   });
 
   for (const scenario of CORPUS) {
     describe(scenario.name, () => {
       it("presets, selections, execution plans and selectors are IDENTICAL to pre-P1", async () => {
-        const golden = GOLDEN[scenario.name]!;
+        // SOURCE-FILESIZE-ESTIMATE-DRIFT-001: only the named approximation-only
+        // sizes are expected as `null`; the historical record itself is unchanged.
+        const golden = withEstimateOnlySizesSuppressed(scenario, GOLDEN[scenario.name]!);
         assert.equal(golden.ok, true, "every corpus scenario analyzed successfully before P1");
 
         const { video, selections, hlsSelections } = await analyzeScenario(scenario);

@@ -31,7 +31,11 @@ import {
   type GenericAnalysisLimits,
 } from "./ytdlp-analysis.server.ts";
 import { buildYtdlpEnvironment } from "../runtime/ytdlp-runtime.server.ts";
-import type { ClearHlsMediaPlaylistSelection } from "../hls/hls-source-selection.ts";
+import {
+  hasClearHlsPublicPresetFacts,
+  type ClearHlsMediaPlaylistSelection,
+} from "../hls/hls-source-selection.ts";
+import { deriveExecutionPlan } from "../execution/format-plan.ts";
 import {
   buildGenericFormatSelector,
   splitTargetContainer,
@@ -3610,46 +3614,72 @@ describe("SPLIT-05: the public/private boundary is unchanged (§35)", () => {
     assert.ok(Object.values(selections).some((v) => v.kind === "split"));
   });
 
-  it("§75: public metadata agrees with the SHAPE that produced it", async () => {
-    const { runner } = fakeRunner(
-      ok(JSON.stringify(singleVideoInfo({
-        formats: [
-          ...PAIRABLE,
-          { format_id: "mx", ext: "mp4", protocol: "https", height: 480, vcodec: "avc1.42001E", acodec: "mp4a.40.2", fps: 25, filesize: 1234 },
-        ],
-      }))),
-    );
-    const { video, selections } = await analyzeGenericMediaInternal(SAFE_URL, {
-      limits: { ...LIMITS, maxFileSizeBytes: MAX },
-      runner,
-      probeRuntime: async () => OK_RUNTIME,
-      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
-      ffmpegAvailable: true,
-    });
+  // SOURCE-FILESIZE-ESTIMATE-DRIFT-001 adds the approximation-only shape: the
+  // same rows, but every size is a `filesize_approx`. The public size must still
+  // equal the private one exactly — and both must be `null`.
+  const SIZE_SHAPES: ReadonlyArray<readonly [string, Array<Record<string, unknown>>]> = [
+    [
+      "declared",
+      [
+        ...PAIRABLE,
+        { format_id: "mx", ext: "mp4", protocol: "https", height: 480, vcodec: "avc1.42001E", acodec: "mp4a.40.2", fps: 25, filesize: 1234 },
+      ],
+    ],
+    [
+      "approximation-only",
+      [
+        { ...PAIRABLE[0]!, filesize_approx: 9_000_000 },
+        { ...PAIRABLE[1]!, filesize_approx: 500_000 },
+        { format_id: "mx", ext: "mp4", protocol: "https", height: 480, vcodec: "avc1.42001E", acodec: "mp4a.40.2", fps: 25, filesize_approx: 1234 },
+      ],
+    ],
+  ];
 
-    for (const preset of video.presets.filter((p) => p.hasVideo)) {
-      const value = selections[preset.id];
-      assert.ok(value);
-      if (value.kind === "single") {
-        assert.equal(preset.container, value.source.container, preset.id);
-        assert.equal(preset.fileSize, value.source.fileSize, preset.id);
-        continue;
+  for (const [shape, formats] of SIZE_SHAPES) {
+    it(`§75: public metadata agrees with the SHAPE that produced it (${shape} sizes)`, async () => {
+      const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats }))));
+      const { video, selections } = await analyzeGenericMediaInternal(SAFE_URL, {
+        limits: { ...LIMITS, maxFileSizeBytes: MAX },
+        runner,
+        probeRuntime: async () => OK_RUNTIME,
+        validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+        ffmpegAvailable: true,
+      });
+
+      const kinds = new Set<string>();
+      for (const preset of video.presets.filter((p) => p.hasVideo)) {
+        const value = selections[preset.id];
+        assert.ok(value);
+        kinds.add(value.kind);
+        if (value.kind === "single") {
+          assert.equal(preset.container, value.source.container, preset.id);
+          assert.equal(preset.fileSize, value.source.fileSize, preset.id);
+          if (shape === "approximation-only") assert.equal(value.source.fileSize, null, preset.id);
+          continue;
+        }
+        // Target from the closed table; codecs from the correct halves.
+        assert.equal(
+          preset.container,
+          splitTargetContainer(value.pair.video.container, value.pair.audio.container),
+          preset.id,
+        );
+        const known =
+          value.pair.video.fileSize !== null && value.pair.audio.fileSize !== null
+            ? value.pair.video.fileSize + value.pair.audio.fileSize
+            : null;
+        assert.equal(preset.fileSize, known, preset.id);
+        if (shape === "approximation-only") {
+          assert.equal(value.pair.video.fileSize, null, preset.id);
+          assert.equal(value.pair.audio.fileSize, null, preset.id);
+          assert.equal(preset.fileSize, null, preset.id);
+        }
+        assert.equal(value.pair.video.hasVideo, true, preset.id);
+        assert.equal(value.pair.audio.hasAudio, true, preset.id);
       }
-      // Target from the closed table; codecs from the correct halves.
-      assert.equal(
-        preset.container,
-        splitTargetContainer(value.pair.video.container, value.pair.audio.container),
-        preset.id,
-      );
-      const known =
-        value.pair.video.fileSize !== null && value.pair.audio.fileSize !== null
-          ? value.pair.video.fileSize + value.pair.audio.fileSize
-          : null;
-      assert.equal(preset.fileSize, known, preset.id);
-      assert.equal(value.pair.video.hasVideo, true, preset.id);
-      assert.equal(value.pair.audio.hasAudio, true, preset.id);
-    }
-  });
+      // Both shapes of fulfilment really are exercised.
+      assert.deepEqual([...kinds].sort(), ["single", "split"]);
+    });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3789,15 +3819,19 @@ describe("GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001", () => {
           ffmpegAvailable,
         });
         const common = { container: "mp4", hasVideo: true, hasAudio: false, videoCodec: null, audioCodec: null, fps: null };
+        // SOURCE-FILESIZE-ESTIMATE-DRIFT-001: both progressive rows carry only a
+        // `filesize_approx` (2,400,000 / 1,200,000), so no size is published —
+        // and none is carried privately, where progress would read it.
         assert.deepEqual(video.presets, [
-          { id: "preset:best", label: "Best available", resolution: "360p", fileSize: 2_400_000, formatId: "preset:best", ...common },
-          { id: "preset:360", label: "360p", resolution: "360p", fileSize: 2_400_000, formatId: "preset:360", ...common },
-          { id: "preset:240", label: "240p", resolution: "240p", fileSize: 1_200_000, formatId: "preset:240", ...common },
+          { id: "preset:best", label: "Best available", resolution: "360p", fileSize: null, formatId: "preset:best", ...common },
+          { id: "preset:360", label: "360p", resolution: "360p", fileSize: null, formatId: "preset:360", ...common },
+          { id: "preset:240", label: "240p", resolution: "240p", fileSize: null, formatId: "preset:240", ...common },
         ]);
         assert.deepEqual(video.capabilities, { mp3: false, merge: false });
         assert.equal(singleSource(selections["preset:best"]).formatId, "synthetic-prog-high");
         assert.equal(singleSource(selections["preset:360"]).formatId, "synthetic-prog-high");
         assert.equal(singleSource(selections["preset:240"]).formatId, "synthetic-prog-low");
+        for (const value of Object.values(selections)) assert.equal(singleSource(value).fileSize, null);
         assertUnknownVideoOnly(video.presets, selections, "synthetic X");
         for (const value of Object.values(selections)) {
           const selector = buildGenericFormatSelector(singleSource(value));
@@ -4230,5 +4264,281 @@ describe("HLS-7: assertGenericPresetBuild enforces one owner per advertised pres
       label: "Best available",
     });
     expectFail(() => assertGenericPresetBuild(otherFamily.build, otherFamily.ctx), "best progressive under an HLS 2160");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE-FILESIZE-ESTIMATE-DRIFT-001
+//
+// Two sizes, two jobs. The POLICY size (`limitSize`: declared, else
+// `filesize_approx`) keeps every conservative job an approximation always did —
+// per-format and pair admission, clear-HLS admission, within-rung ranking and
+// `size_limit_exceeded`. The DECLARED size (`fileSize`) is the only one that is
+// published, or carried in a private selection where download progress reads it
+// as its total. These tests pin both halves: presentation changed, selection
+// and safety did not.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("SOURCE-FILESIZE-ESTIMATE-DRIFT-001: declared vs approximate sizes", () => {
+  const MAX = 10_000_000;
+  const LIM = { maxFileSizeBytes: MAX };
+  const N = 3_000_000;
+
+  /** The REAL internal analyzer over a canned document, at a small ceiling. */
+  async function analyzeFormats(formats: Array<Record<string, unknown>>, ffmpegAvailable = true) {
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats }))));
+    return analyzeGenericMediaInternal(SAFE_URL, {
+      limits: { ...LIMITS, maxFileSizeBytes: MAX },
+      runner,
+      probeRuntime: async () => OK_RUNTIME,
+      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+      ffmpegAvailable,
+    });
+  }
+  type Analysis = Awaited<ReturnType<typeof analyzeFormats>>;
+
+  /** One muxed 1080p progressive MP4 row carrying only the given size fields. */
+  const muxed = (sizes: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+    format_id: "mux-1080",
+    ext: "mp4",
+    protocol: "https",
+    height: 1080,
+    vcodec: "avc1.640028",
+    acodec: "mp4a.40.2",
+    ...sizes,
+    ...extra,
+  });
+
+  /** `preset:best`'s public size and its private selection size, which must agree. */
+  function bestSizes(result: Analysis) {
+    const preset = result.video.presets.find((p) => p.id === "preset:best");
+    assert.ok(preset, "preset:best is advertised");
+    const source = singleSource(result.selections["preset:best"]);
+    assert.equal(preset.fileSize, source.fileSize, "public and private sizes agree");
+    return { publicSize: preset.fileSize, privateSize: source.fileSize, formatId: source.formatId };
+  }
+
+  describe("single source", () => {
+    it("declared only: eligible, published, and carried privately", async () => {
+      const [c] = selectCandidates([muxed({ filesize: N })], LIM);
+      assert.ok(c);
+      assert.equal(c.fileSize, N);
+      assert.equal(c.limitSize, N);
+      assert.deepEqual(bestSizes(await analyzeFormats([muxed({ filesize: N })])), {
+        publicSize: N,
+        privateSize: N,
+        formatId: "mux-1080",
+      });
+    });
+
+    it("approximation only, under the limit: still eligible, but no size is published or carried", async () => {
+      const [c] = selectCandidates([muxed({ filesize_approx: N })], LIM);
+      assert.ok(c, "an in-limit approximation does not cost the candidate its eligibility");
+      assert.equal(c.fileSize, null);
+      assert.equal(c.limitSize, N, "the approximation is still the policy size");
+      assert.deepEqual(bestSizes(await analyzeFormats([muxed({ filesize_approx: N })])), {
+        publicSize: null,
+        privateSize: null,
+        formatId: "mux-1080",
+      });
+    });
+
+    for (const [label, declared, approx] of [
+      ["declared below the approximation", N, 2 * N],
+      ["declared above the approximation", 2 * N, N],
+    ] as const) {
+      it(`both present, ${label}: the declared size wins everywhere`, async () => {
+        const [c] = selectCandidates([muxed({ filesize: declared, filesize_approx: approx })], LIM);
+        assert.ok(c);
+        assert.equal(c.fileSize, declared);
+        assert.equal(c.limitSize, declared, "declared-first policy precedence");
+        const sizes = bestSizes(await analyzeFormats([muxed({ filesize: declared, filesize_approx: approx })]));
+        assert.deepEqual(sizes, { publicSize: declared, privateSize: declared, formatId: "mux-1080" });
+      });
+    }
+
+    it("both present: admission reads the DECLARED size first, exactly as before", () => {
+      assert.equal(
+        selectCandidates([muxed({ filesize: N, filesize_approx: MAX + 1 })], LIM).length,
+        1,
+        "a declared size within the limit is not overridden by a larger approximation",
+      );
+      assert.equal(
+        selectCandidates([muxed({ filesize: MAX + 1, filesize_approx: N })], LIM).length,
+        0,
+        "a declared size over the limit is not rescued by a smaller approximation",
+      );
+    });
+
+    it("neither: eligible, with no size anywhere", async () => {
+      const [c] = selectCandidates([muxed({})], LIM);
+      assert.ok(c);
+      assert.equal(c.fileSize, null);
+      assert.equal(c.limitSize, null);
+      assert.deepEqual(bestSizes(await analyzeFormats([muxed({})])), {
+        publicSize: null,
+        privateSize: null,
+        formatId: "mux-1080",
+      });
+    });
+
+    for (const [label, sizes] of [
+      ["a declared", { filesize: MAX + 1 }],
+      ["an approximation-only", { filesize_approx: MAX + 1 }],
+    ] as const) {
+      it(`${label} size over the limit: still refused, and withheld as size_limit_exceeded`, async () => {
+        assert.equal(selectCandidates([muxed(sizes)], LIM).length, 0);
+
+        const deliverable = {
+          format_id: "mux-720", ext: "mp4", protocol: "https", height: 720,
+          vcodec: "avc1.64001F", acodec: "mp4a.40.2", filesize: N,
+        };
+        const { video, selections } = await analyzeFormats([muxed(sizes), deliverable]);
+        for (const value of Object.values(selections)) {
+          for (const member of selectionMembers(value)) assert.notEqual(member.formatId, "mux-1080");
+        }
+        assert.equal(singleSource(selections["preset:best"]).formatId, "mux-720");
+        assert.deepEqual(video.sourceQuality, {
+          observedMaxHeight: 1080,
+          deliverableMaxHeight: 720,
+          withheld: [{ reason: "size_limit_exceeded", count: 1, maxObservedHeight: 1080 }],
+          protectedUnenumerated: false,
+          maybeProtectedObserved: false,
+        });
+      });
+    }
+  });
+
+  it("ranking still reads approximations: the larger estimate wins its rung, and publishes nothing", async () => {
+    // Identical in every ranked respect except the approximation, with the
+    // LARGER estimate later in the list, so only the size tiebreak can pick it.
+    const result = await analyzeFormats([
+      muxed({ filesize_approx: N }, { format_id: "mux-small" }),
+      muxed({ filesize_approx: 2 * N }, { format_id: "mux-large" }),
+    ]);
+    assert.deepEqual(bestSizes(result), { publicSize: null, privateSize: null, formatId: "mux-large" });
+    const rung = singleSource(result.selections["preset:1080"]);
+    assert.equal(rung.formatId, "mux-large");
+    assert.equal(rung.fileSize, null);
+
+    // Control: with no sizes at all, upstream position decides instead.
+    const control = await analyzeFormats([
+      muxed({}, { format_id: "mux-small" }),
+      muxed({}, { format_id: "mux-large" }),
+    ]);
+    assert.equal(bestSizes(control).formatId, "mux-small");
+  });
+
+  describe("split pair", () => {
+    const videoOnly1080 = (sizes: Record<string, unknown>) => ({
+      format_id: "v", ext: "mp4", protocol: "https", height: 1080, vcodec: "avc1.640028", acodec: "none", ...sizes,
+    });
+    const audioOnlyM4a = (sizes: Record<string, unknown>) => ({
+      format_id: "a", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2", ...sizes,
+    });
+
+    /** The advertised pair's public size and member sizes, or `null` when no pair is advertised. */
+    function pairOutcome(result: Analysis) {
+      const value = result.selections["preset:best"];
+      if (!value || value.kind !== "split") return null;
+      const preset = result.video.presets.find((p) => p.id === "preset:best")!;
+      return { publicSize: preset.fileSize, members: [value.pair.video.fileSize, value.pair.audio.fileSize] };
+    }
+
+    const ADMITTED: ReadonlyArray<
+      readonly [string, Record<string, unknown>, Record<string, unknown>, number | null, [number | null, number | null]]
+    > = [
+      ["declared + declared", { filesize: 6_000_000 }, { filesize: 1_000_000 }, 7_000_000, [6_000_000, 1_000_000]],
+      ["declared + approximate", { filesize: 6_000_000 }, { filesize_approx: 1_000_000 }, null, [6_000_000, null]],
+      ["approximate + approximate", { filesize_approx: 6_000_000 }, { filesize_approx: 1_000_000 }, null, [null, null]],
+      ["declared + unknown", { filesize: 6_000_000 }, {}, null, [6_000_000, null]],
+    ];
+    for (const [label, v, a, publicSize, members] of ADMITTED) {
+      it(`${label}, within the limit: admitted; only a fully declared pair publishes a size`, async () => {
+        const outcome = pairOutcome(await analyzeFormats([videoOnly1080(v), audioOnlyM4a(a)]));
+        assert.deepEqual(outcome, { publicSize, members });
+      });
+    }
+
+    for (const [label, v, a] of [
+      ["declared + approximate", { filesize: 6_000_000 }, { filesize_approx: 5_000_000 }],
+      ["approximate + approximate", { filesize_approx: 6_000_000 }, { filesize_approx: 5_000_000 }],
+    ] as const) {
+      it(`${label}, over the COMBINED limit: not advertised, withheld as size_limit_exceeded`, async () => {
+        // Each half fits alone (6 MB, 5 MB ≤ 10 MB); together they do not, and
+        // the approximation takes part in that decision exactly as before.
+        const result = await analyzeFormats([videoOnly1080(v), audioOnlyM4a(a)]);
+        assert.equal(pairOutcome(result), null);
+        assert.equal(result.video.presets.some((p) => p.hasVideo), false);
+        assert.deepEqual(result.video.sourceQuality?.withheld, [
+          { reason: "size_limit_exceeded", count: 1, maxObservedHeight: 1080 },
+        ]);
+      });
+    }
+  });
+
+  describe("audio", () => {
+    const audioRow = (sizes: Record<string, unknown>) => ({
+      format_id: "a", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2", ...sizes,
+    });
+
+    for (const [label, sizes, expected] of [
+      ["declared", { filesize: N }, N],
+      ["approximation-only", { filesize_approx: N }, null],
+    ] as const) {
+      it(`an audio-only source with a ${label} size: preset:audio and its selection carry ${expected}`, async () => {
+        const { video, selections } = await analyzeFormats([audioRow(sizes)]);
+        const preset = video.presets.find((p) => p.id === "preset:audio");
+        assert.ok(preset);
+        assert.equal(preset.fileSize, expected);
+        assert.equal(singleSource(selections["preset:audio"]).fileSize, expected);
+      });
+    }
+
+    it("unchanged: extract-m4a and MP3 publish no size; the muxed SOURCE keeps its declared total", async () => {
+      const { video, selections } = await analyzeFormats([muxed({ filesize: N })]);
+      assert.equal(video.presets.find((p) => p.id === "preset:audio")?.fileSize, null);
+      assert.equal(video.presets.find((p) => p.id === "preset:mp3")?.fileSize, null);
+      // What progress reads while the muxed source downloads is that source's
+      // own declared size, exactly as before.
+      assert.equal(singleSource(selections["preset:audio"]).fileSize, N);
+      assert.equal(singleSource(selections["preset:mp3"]).fileSize, N);
+    });
+  });
+
+  it("an approximation-only progressive muxed MP4 preset is not mistaken for a clear-HLS one", async () => {
+    // As close to CLEAR_HLS_PUBLIC_PRESET_FACTS as a progressive preset can get:
+    // mp4, video and PROVEN audio, an unknown video codec, no fps — and now no
+    // size either. Only the proven audio codec tells it apart, and that is
+    // exactly what keeps it progressive.
+    const progressive = {
+      format_id: "prog-720", ext: "mp4", video_ext: "mp4", audio_ext: "none", protocol: "https",
+      height: 720, acodec: "mp4a.40.2", filesize_approx: N,
+    };
+    const hls = {
+      format_id: "hls-1080", ext: "mp4", video_ext: "mp4", audio_ext: "none", protocol: "m3u8_native",
+      height: 1080, vcodec: "avc1.640028", acodec: "mp4a.40.2",
+      url: "https://media.example.invalid/hls/1080/media.m3u8",
+    };
+    const result = await analyzeFormats([progressive, hls]);
+
+    const preset = result.video.presets.find((p) => p.id === "preset:720");
+    assert.ok(preset);
+    const { container, fileSize, hasVideo, hasAudio, videoCodec, audioCodec, fps } = preset;
+    assert.deepEqual(
+      { container, fileSize, hasVideo, hasAudio, videoCodec, audioCodec, fps },
+      { container: "mp4", fileSize: null, hasVideo: true, hasAudio: true, videoCodec: null, audioCodec: "aac", fps: null },
+    );
+    assert.equal(hasClearHlsPublicPresetFacts(preset), false);
+
+    // HLS really took part, and the progressive rung still has ONE progressive owner.
+    assert.equal(Object.hasOwn(result.hlsSelections, "preset:1080"), true);
+    assert.equal(Object.hasOwn(result.hlsSelections, "preset:720"), false);
+    assert.equal(singleSource(result.selections["preset:720"]).formatId, "prog-720");
+    const plan = deriveExecutionPlan(
+      { strategy: "yt-dlp", video: result.video, selections: result.selections, hlsSelections: result.hlsSelections },
+      "preset:720",
+    );
+    assert.equal(plan.strategy === "yt-dlp" ? plan.generic.operation : null, "keep-original");
   });
 });
