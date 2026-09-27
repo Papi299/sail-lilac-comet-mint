@@ -1194,9 +1194,12 @@ function pairWithinSizeLimit(video: Candidate, audio: Candidate, maxFileSizeByte
 }
 
 /**
- * The size an ADMITTED split preset advertises, and that its private members
- * carry into progress: the safe sum of both members' DECLARED sizes, else
- * `null` (§15; SOURCE-FILESIZE-ESTIMATE-DRIFT-001).
+ * The size an ADMITTED split preset advertises: the safe sum of both members'
+ * DECLARED sizes, else `null` (§15; SOURCE-FILESIZE-ESTIMATE-DRIFT-001).
+ *
+ * The private split selection does not carry this sum. It retains each
+ * member's individual declared `fileSize`, and download progress later
+ * recomputes the aggregate total from those members via `splitKnownTotal()`.
  *
  * `null` whenever either member's size is unknown OR only approximate — no
  * estimate is invented, and no approximation is summed into a claim. Even the
