@@ -1289,10 +1289,12 @@ clamped, so an ambiguous transfer stays `BLOCKED` instead of passing.
 > described here, and it is now **CLOSED** following the independently reviewed
 > implementation in PR #75.
 >
-> Closure means the acceptance **fixture/harness drift is corrected**. It does
-> **not** mean the current limit has been exercised live: nothing below has been
-> run against Production, and **no live 4 GiB threshold acceptance has been
-> performed.**
+> That closure meant the acceptance **fixture/harness drift was corrected**. It
+> did not by itself exercise the current limit live. That happened separately, on
+> 2026-09-27: `YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN` ran this
+> fixture against Production, and `limit.actual-byte-guard` passed. See
+> [the narrow current-limit claim](#the-narrow-current-limit-claim) for the
+> accepted result and its scope.
 
 ```
 reference limit (current Product default)   4,294,967,296   4 GiB
@@ -1308,10 +1310,17 @@ guarantee derived from 150 ms alone — how many bytes arrive within a polling
 interval depends on actual throughput and scheduling.
 
 The 256 MiB value is therefore a **bounded practical margin, not a proven
-throughput guarantee**. Its real adequacy will be established only by a future
-live current-limit acceptance run. If such a run reaches the fixture ceiling or
-the Product timeout before producing valid threshold evidence, it must report
-**BLOCKED/TIMEOUT** rather than treating the configured margin as proof.
+throughput guarantee**. The one live current-limit run so far (2026-09-27) went
+like this:
+
+- The Worker stopped the transfer at 4,309,106,033 bytes, which is 14,138,737
+  bytes past the 4 GiB limit and below the 4.25 GiB ceiling.
+- Its terminal `TOO_LARGE` was observed inside the harness window.
+
+That is one observation on one deployment and throughput profile, not a
+guarantee. Any run that reaches the fixture ceiling or the Product timeout
+before producing valid threshold evidence must still report **BLOCKED/TIMEOUT**
+rather than treating the configured margin as proof.
 
 The 4.25 GiB figure is a **ceiling, not an allocation** — the stream is one reused
 64 KiB block, nothing is proportional to the ceiling, and no automated
@@ -1435,7 +1444,7 @@ means "record written", not "passed". The check `limit.actual-byte-guard` is
 graded only by `--stage B --aggregate`, which also requires an authentic Stage A
 `PASS` for the same run, source SHA and image.
 
-A future current-limit acceptance scoped to Stage A plus this one case therefore
+A current-limit acceptance scoped to Stage A plus this one case therefore
 yields an aggregate whose **overall** Stage-B verdict is `BLOCKED` by
 construction: `success`, `cancellation`, `shutdown`, `safe-egress`,
 `direct-regression` and `kill-switch` were not rerun. That is expected, and no
@@ -1448,10 +1457,40 @@ limit.actual-byte-guard = PASS   (in a correctly sealed, Stage-A-authorized aggr
 It must **not** be reported as a Stage-B `PASS`, as a Phase-10D rerun, or as
 re-acceptance of the generic matrix.
 
-**No live current-limit acceptance has occurred.** This hardening is source and
-test only. It does not close the live gap, and it does not resolve the separate
-image-identity prerequisite: the harness binds `videofetch-worker:<expected-sha>`,
-and that tag must exist for the running image before a live run can begin.
+**Accepted live result — 2026-09-27,
+`YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN`** (runbook §11; *accepted
+operator-measured Production evidence, not CI*). It ran exactly the scoped shape
+above: a fresh Stage A (PASS 23 / FAIL 0 / BLOCKED 0 / NOT_EXERCISED 0) and
+exactly one `byte-limit` case. The case sealed these raw observations:
+
+```
+effectiveMaxFileSizeBytes   4,294,967,296   (measured from the deployed Worker; default)
+fixture ceiling             4,563,402,752   (admitted manifest value)
+bytesServed                 4,309,106,033   (14,138,737 bytes past the limit)
+mediaRequestCount           1
+contentLengthPresent        false           (chunked; declared length unknown)
+outcome                     TOO_LARGE       queued -> analyzing -> downloading -> failed
+beganProcessing / uploaded / workDirPresent   false / false / false
+```
+
+The terminal result was observed inside the harness window. The sealed case
+record has no `timedOut` field, but the hardened producer seals a record only
+after an explicit `timedOut === false`. The aggregate then graded the case:
+
+- the only accepted case was `byte-limit`;
+- **`limit.actual-byte-guard = PASS`**, with PASS 3 / FAIL 0 / BLOCKED 29 /
+  NOT_EXERCISED 1;
+- the overall verdict is **`BLOCKED`**, as expected, because the other cases
+  were not rerun.
+
+That is the only claim this run adds. It is **not** a Stage-B `PASS`, a
+Phase-10D rerun or a re-acceptance of any other case. The historical Phase-10D
+`byte-limit` record remains evidence for the 500 MiB deployment it measured.
+
+The image-identity prerequisite was met by a Docker source-SHA compatibility
+alias, `videofetch-worker:f0b47bd567dd978374bfec1a01e6d9768c747160` →
+`sha256:e5b1144c…`. The alias is **addressing only, not provenance**: the
+source→image relationship is the accepted HLS-9B/HLS-10 evidence.
 
 ### Cancellation and shutdown
 
