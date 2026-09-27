@@ -139,14 +139,17 @@ import {
   CONTAINER_INSTANCE_PATTERN,
   CASE_PRODUCERS,
   CASE_SCHEMA_VERSION,
+  BYTELIMIT_EVIDENCE_URL_ENV,
   BYTELIMIT_MAX_BYTES_ENV,
   GENERIC_EXPECTED_DIGEST_ENV,
   HARNESS_ID,
+  parseByteLimitEvidenceUrl,
   parseByteLimitFixtureMaxBytes,
   parseGenericExpectedDigest,
   runByteLimitCase,
   runSuccessCase,
 } from "../deploy/acceptance/ytdlp-generic/lib/cases.mjs";
+import { makeControlPlaneSession } from "../deploy/acceptance/ytdlp-generic/lib/control-plane.mjs";
 import {
   readDenyCounter,
   fingerprintChain,
@@ -4859,6 +4862,447 @@ describe("byte-limit causal binding", () => {
       assert.equal(calls.analyze, 0, String(byteLimitFixtureMaxBytes));
       assert.equal(calls.createJob, 0, String(byteLimitFixtureMaxBytes));
     }
+  });
+
+  // ── YTDLP-CURRENT-LIMIT-4GIB-ACCEPTANCE-HARNESS-HARDENING-001, defect A ──
+  //
+  // The fixture's evidence endpoint used to be read from the environment by
+  // the transfer probe — after analysis, job creation and the acquisition — so
+  // a missing value cost a real Production job before the case discovered it
+  // could never attribute its transfer. It is now an admitted input.
+
+  /**
+   * Asserts the case was refused at ADMISSION: the producer never started.
+   *
+   * Stronger than `assertNoByteLimitJob`, which it includes. The producer's
+   * first act is to measure the deployed `MAX_FILE_SIZE`, and the CLI prints
+   * `running case` immediately before calling it, so the absence of both is a
+   * direct observation that `producer.run()` was never entered. 41x is the
+   * positive control proving both markers DO appear when it is.
+   */
+  function assertRefusedBeforeProducer(run) {
+    assertNoByteLimitJob(run);
+    assert.doesNotMatch(run.out, /running case 'byte-limit'/, "the producer must not start");
+    assert.ok(
+      !run.world.calls.commands.some((c) => c.includes(MAX_FILE_SIZE_PROBE_ARGV.join(" "))),
+      "the producer's first measurement must not have run",
+    );
+    // No request of any kind reached the controlled fixture.
+    const fixtureRequests = run.world.calls.fetches.filter((c) => /byte-?(evidence|limit)|bytelimit/.test(c));
+    assert.deepEqual(fixtureRequests, [], `the fixture must not be contacted; saw ${fixtureRequests.join(", ")}`);
+    // Nothing but reads and the session login: no Production mutation.
+    const writes = run.world.calls.fetches.filter(
+      (c) => !c.startsWith("GET ") && c !== "POST /api/access/login",
+    );
+    assert.deepEqual(writes, [], `only reads may occur; saw ${writes.join(", ")}`);
+  }
+
+  it("41u. A MISSING evidence endpoint refuses the case before the producer runs", async () => {
+    for (const absent of [undefined, ""]) {
+      const run = await runByteLimit({}, { VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL: absent });
+      assert.equal(run.code, 3, `${JSON.stringify(absent)}: ${run.out}\n${run.err}`);
+      assert.match(run.err, /usage error: case 'byte-limit'/);
+      assert.match(run.err, /VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL is required/);
+      assertRefusedBeforeProducer(run);
+    }
+  });
+
+  it("41v. A MALFORMED evidence endpoint is refused before the producer runs", async () => {
+    for (const raw of [
+      "not a url",
+      "byte-evidence",
+      "/byte-evidence",
+      "//media.invalid/byte-evidence",
+      "http://media.invalid/byte-evidence",
+      "ftp://media.invalid/byte-evidence",
+      "file:///byte-evidence",
+      "javascript:alert(1)",
+      "https://",
+      "https://user:pw@media.invalid/byte-evidence",
+      "https://user@media.invalid/byte-evidence",
+      " https://media.invalid/byte-evidence",
+      "https://media.invalid/byte-evidence\n",
+      "https://media.invalid/byte evidence",
+    ]) {
+      const run = await runByteLimit({}, { VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL: raw });
+      assert.equal(run.code, 3, `${JSON.stringify(raw)}: ${run.out}\n${run.err}`);
+      assert.match(run.err, /usage error: case 'byte-limit'/, JSON.stringify(raw));
+      assert.match(run.err, /VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL/, JSON.stringify(raw));
+      assertRefusedBeforeProducer(run);
+    }
+  });
+
+  it("41w. the evidence-endpoint grammar admits only an absolute https: URL, verbatim", () => {
+    assert.equal(BYTELIMIT_EVIDENCE_URL_ENV, "VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL");
+    assert.ok(CASE_PRODUCERS["byte-limit"].needs.includes("byteLimitEvidenceUrl"));
+
+    for (const raw of [
+      "https://media.invalid/byte-evidence",
+      "https://random-words-here.trycloudflare.com/byte-evidence",
+      // The scheme is case-insensitive by URL grammar; the value is carried
+      // verbatim rather than normalized.
+      "HTTPS://media.invalid/byte-evidence",
+    ]) {
+      assert.deepEqual(parseByteLimitEvidenceUrl(raw), { ok: true, url: raw });
+    }
+
+    for (const raw of [
+      undefined, null, "", 42, {}, ["https://media.invalid/byte-evidence"],
+      "not a url", "/byte-evidence", "//media.invalid/byte-evidence",
+      "http://media.invalid/byte-evidence", "ftp://media.invalid/byte-evidence",
+      "file:///byte-evidence", "javascript:alert(1)", "https://",
+      "https://user:pw@media.invalid/byte-evidence", "https://user@media.invalid/byte-evidence",
+      // The realistic operator hazard, as in 41m: a value pasted with its line
+      // ending or padding still attached. The WHATWG parser would silently
+      // strip these, so they are refused before it ever sees them.
+      " https://media.invalid/byte-evidence", "https://media.invalid/byte-evidence\n",
+      "https://media.invalid/byte-evidence\r\n", "\thttps://media.invalid/byte-evidence",
+      "https://media.invalid/byte evidence", "https://media.invalid/\u0000byte-evidence",
+    ]) {
+      const parsed = parseByteLimitEvidenceUrl(raw);
+      assert.equal(parsed.ok, false, JSON.stringify(String(raw)));
+      assert.match(parsed.reason, /VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL/);
+      // A refusal names the rule, never the value.
+      assert.ok(!parsed.reason.includes("media.invalid"), JSON.stringify(String(raw)));
+    }
+  });
+
+  it("41x. the ADMITTED endpoint is the one queried, even if the environment changes afterwards", async () => {
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const env = byteLimitEnv({
+      VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL: "https://fixture-a.invalid/byte-evidence",
+    });
+    const requested = [];
+    let mutated = false;
+    const fetch = async (target, init = {}) => {
+      const url = new URL(String(target));
+      const method = init.method ?? "GET";
+      requested.push({ method, host: url.host, pathname: url.pathname, vfCase: url.searchParams.get("vf_case") });
+      if (method === "POST" && url.pathname === "/api/download") {
+        // Admission is long over and the case is running. A probe that still
+        // read the environment would now be sent somewhere else entirely.
+        env.VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL = "https://fixture-b.invalid/elsewhere";
+        mutated = true;
+      }
+      return world.fetch(target, init);
+    };
+    const run = await runCli(
+      ["--stage", "B", "--case", "byte-limit", ...LIVE_ARGS, "--evidence", "/tmp/bl.json"],
+      env,
+      { runReadOnly: world.runReadOnly, fetch, files: seedRun() },
+    );
+    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+    assert.ok(mutated, "the environment really did change mid-case");
+
+    const payload = JSON.parse(run.files.get("/tmp/bl.json")).payload.byteLimitCase;
+    const evidenceCalls = requested.filter((r) => r.pathname === "/byte-evidence");
+    assert.equal(evidenceCalls.length, 1);
+    assert.equal(evidenceCalls[0].host, "fixture-a.invalid", "the admitted origin is queried");
+    assert.equal(evidenceCalls[0].vfCase, payload.caseId, "for this case's own correlation id");
+    assert.ok(!requested.some((r) => r.host === "fixture-b.invalid"), "the later value is never read");
+
+    // Positive controls for 41u/41v: when admission succeeds, the producer's
+    // markers DO appear, so their absence there is not vacuous.
+    assert.match(run.out, /running case 'byte-limit'/);
+    assert.ok(world.calls.commands.some((c) => c.includes(MAX_FILE_SIZE_PROBE_ARGV.join(" "))));
+  });
+
+  it("41y. the whitespace/control rule is Unicode-wide, not ASCII-only", async () => {
+    // …-REVIEW-CORRECTION-001. The first revision refused only U+0000..U+0020
+    // and U+007F. Every character below passed that check, and the WHATWG
+    // parser then percent-encoded it into an ADMITTED URL, so the documented
+    // "no whitespace or control character anywhere" rule held for ASCII only.
+    //
+    // Built from code points rather than escapes, so the file carries no
+    // invisible characters and each case is named by what it is.
+    const U = (cp) => String.fromCodePoint(cp);
+    const characters = [
+      [0x0080, "U+0080 PADDING CHARACTER (Cc, C1)"],
+      [0x0085, "U+0085 NEXT LINE (Cc, C1, and White_Space)"],
+      [0x009f, "U+009F APPLICATION PROGRAM COMMAND (Cc, C1)"],
+      [0x00a0, "U+00A0 NO-BREAK SPACE"],
+      [0x1680, "U+1680 OGHAM SPACE MARK"],
+      [0x2000, "U+2000 EN QUAD"],
+      [0x200a, "U+200A HAIR SPACE"],
+      [0x2028, "U+2028 LINE SEPARATOR"],
+      [0x2029, "U+2029 PARAGRAPH SEPARATOR"],
+      [0x202f, "U+202F NARROW NO-BREAK SPACE"],
+      [0x205f, "U+205F MEDIUM MATHEMATICAL SPACE"],
+      [0x3000, "U+3000 IDEOGRAPHIC SPACE"],
+    ];
+    const positions = [
+      ["trailing, as a pasted value's tail", (c) => `https://media.invalid/byte-evidence${c}`],
+      ["inside the path", (c) => `https://media.invalid/byte${c}evidence`],
+      ["in the query", (c) => `https://media.invalid/byte-evidence?x=${c}`],
+      ["in the fragment", (c) => `https://media.invalid/byte-evidence#${c}`],
+    ];
+    for (const [cp, name] of characters) {
+      for (const [where, place] of positions) {
+        const raw = place(U(cp));
+        const label = `${name}, ${where}`;
+        // The discriminator: WHATWG ACCEPTS this value as an https: URL, so
+        // the explicit rule is the only thing that can refuse it.
+        assert.equal(new URL(raw).protocol, "https:", `${label}: WHATWG admits it`);
+        const parsed = parseByteLimitEvidenceUrl(raw);
+        assert.equal(parsed.ok, false, label);
+        assert.match(parsed.reason, /VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL/, label);
+        assert.match(parsed.reason, /no whitespace or control/, label);
+        assert.ok(!parsed.reason.includes("media.invalid"), `${label}: the value is never echoed`);
+      }
+    }
+
+    // Positive controls, unchanged: the rule refuses characters, not URLs.
+    for (const raw of [
+      "https://media.invalid/byte-evidence",
+      "HTTPS://media.invalid/byte-evidence",
+      "https://random-words-here.trycloudflare.com/byte-evidence",
+    ]) {
+      assert.deepEqual(parseByteLimitEvidenceUrl(raw), { ok: true, url: raw });
+    }
+
+    // And through the CLI: refused at admission, before the producer runs,
+    // which is the same boundary 41v proves for the ASCII cases.
+    for (const cp of [0x00a0, 0x0085, 0x2028, 0x2029, 0x3000]) {
+      const run = await runByteLimit(
+        {},
+        { VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL: `https://media.invalid/byte-evidence${U(cp)}` },
+      );
+      const label = `U+${cp.toString(16).toUpperCase().padStart(4, "0")}`;
+      assert.equal(run.code, 3, `${label}: ${run.out} | ${run.err}`);
+      assert.match(run.err, /usage error: case 'byte-limit'/, label);
+      assert.doesNotMatch(run.err, /media\.invalid/, `${label}: the value is never echoed`);
+      assertRefusedBeforeProducer(run);
+    }
+  });
+});
+
+/**
+ * Drives `runByteLimitCase` against a scripted poll result.
+ *
+ * Every collaborator is a counter or a fixed value, so "was fixture evidence
+ * requested" and "which endpoint was it requested from" are facts about calls.
+ * The defaults describe a genuine over-limit case whose TOO_LARGE terminal
+ * state WAS observed inside the poll window.
+ *
+ * Defaults apply only to keys the caller OMITS. Destructuring defaults would
+ * also replace an explicitly supplied `undefined`, silently turning the
+ * "absent value" cases of A2 and B4 back into the passing default.
+ */
+function makeByteLimitCaseCtx(options = {}) {
+  const pick = (key, fallback) => (Object.hasOwn(options, key) ? options[key] : fallback);
+  const timedOut = pick("timedOut", false);
+  const trace = pick("trace", ["queued", "analyzing", "downloading", "failed"]);
+  const final = pick("final", { status: "failed", errorCode: "TOO_LARGE" });
+  const byteLimitEvidenceUrl = pick("byteLimitEvidenceUrl", "https://fixture.invalid/byte-evidence");
+  const calls = { analyze: 0, createJob: 0, pollTrace: 0, mediaTransferEvidence: [], workDirPresent: 0 };
+  const ctx = {
+    byteLimitUrl: "https://fixture.invalid/generic/bytelimit",
+    byteLimitFixtureMaxBytes: 4_563_402_752,
+    byteLimitEvidenceUrl,
+    sleep: async () => {},
+    monotonicNow: (() => {
+      let tick = 0;
+      return () => (tick += 1);
+    })(),
+    sampler: { sample: async () => ({ rows: [] }) },
+    session: {
+      analyze: async () => {
+        calls.analyze += 1;
+        return { extractor: "yt-dlp", presets: APP_PRESETS };
+      },
+      createJob: async () => {
+        calls.createJob += 1;
+        return { jobId: BYTE_JOB_ID, status: "queued" };
+      },
+      pollTrace: async () => {
+        calls.pollTrace += 1;
+        return { trace, timeline: [], final, timedOut };
+      },
+    },
+    effectiveMaxFileSize: async () => ({
+      measured: true,
+      value: { bytes: 4_294_967_296, source: "default" },
+    }),
+    mediaTransferEvidence: async (caseId, endpoint) => {
+      calls.mediaTransferEvidence.push({ caseId, endpoint });
+      return {
+        measured: true,
+        value: {
+          caseId,
+          actualMediaRequestObserved: true,
+          mediaRequestCount: 1,
+          contentLengthPresent: false,
+          transferMode: "chunked",
+          bytesServed: OVER_DEFAULT_BYTES,
+          observedAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+    },
+    workDirPresent: async () => {
+      calls.workDirPresent += 1;
+      return { measured: true, value: false };
+    },
+  };
+  return { ctx, calls };
+}
+
+describe("current-limit byte-limit harness hardening (…-HARNESS-HARDENING-001)", () => {
+  // ── Defect A, at the producer ──────────────────────────────────────────
+
+  it("A1. the producer hands the ADMITTED context endpoint to the transfer probe", async () => {
+    const { ctx, calls } = makeByteLimitCaseCtx({
+      byteLimitEvidenceUrl: "https://admitted.invalid/byte-evidence",
+    });
+    const result = await runByteLimitCase(ctx);
+    assert.equal(calls.mediaTransferEvidence.length, 1);
+    assert.equal(calls.mediaTransferEvidence[0].endpoint, "https://admitted.invalid/byte-evidence");
+    assert.equal(calls.mediaTransferEvidence[0].caseId, result.byteLimitCase.caseId);
+  });
+
+  it("A2. a producer driven without an admitted endpoint cannot submit anything", async () => {
+    // Defence in depth, like 41t: the CLI refuses this as a usage error, but a
+    // producer called directly must not become able to run a job whose
+    // transfer it could never attribute.
+    for (const byteLimitEvidenceUrl of [
+      undefined, null, "", 42, "http://fixture.invalid/byte-evidence", "not a url",
+    ]) {
+      const { ctx, calls } = makeByteLimitCaseCtx({ byteLimitEvidenceUrl });
+      await assert.rejects(
+        () => runByteLimitCase(ctx),
+        /evidence endpoint was not admitted/,
+        String(byteLimitEvidenceUrl),
+      );
+      assert.equal(calls.analyze, 0, String(byteLimitEvidenceUrl));
+      assert.equal(calls.createJob, 0, String(byteLimitEvidenceUrl));
+      assert.equal(calls.mediaTransferEvidence.length, 0, String(byteLimitEvidenceUrl));
+    }
+  });
+
+  // ── Defect B: the poll window must have CLOSED on an observed terminal ──
+
+  it("B1. a TOO_LARGE terminal state observed before the poll deadline still yields the payload", async () => {
+    // The discriminator for B2-B4: identical inputs, `timedOut: false`.
+    const { ctx, calls } = makeByteLimitCaseCtx();
+    const result = await runByteLimitCase(ctx);
+    const payload = result.byteLimitCase;
+    assert.equal(payload.outcome, "TOO_LARGE");
+    assert.equal(payload.exceededLimit, true);
+    assert.equal(payload.beganProcessing, false);
+    assert.equal(payload.uploaded, false);
+    assert.deepEqual(payload.transitions, ["queued", "analyzing", "downloading", "failed"]);
+    assert.equal(calls.mediaTransferEvidence.length, 1);
+    assert.equal(calls.workDirPresent, 1);
+
+    const stageB = evaluateStageB(
+      passingStageBObservations({ byteLimitCase: measured(payload) }),
+      passingStageA(),
+    );
+    assert.equal(
+      stageB.checks.find((c) => c.id === "limit.actual-byte-guard").outcome,
+      OUTCOMES.PASS,
+    );
+  });
+
+  /** The shared assertions for every timed-out poll: BLOCKED, not a Product result. */
+  function assertBlockedTimeout(error, lastObserved) {
+    assert.match(error.message, /^BLOCKED \/ TIMEOUT — /);
+    assert.match(error.message, /within the acceptance observation window/);
+    assert.match(error.message, new RegExp(`last observed ${lastObserved};`));
+    assert.match(error.message, /LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN/);
+    // Never dressed up as a Product outcome.
+    assert.doesNotMatch(error.message, /TOO_LARGE/);
+    assert.doesNotMatch(error.message, /\bFAIL\b/);
+    assert.doesNotMatch(error.message, /\bPASS\b/);
+    return true;
+  }
+
+  it("B2. a poll that TIMED OUT while still downloading is BLOCKED / TIMEOUT", async () => {
+    const { ctx, calls } = makeByteLimitCaseCtx({
+      timedOut: true,
+      trace: ["queued", "analyzing", "downloading"],
+      final: { status: "downloading" },
+    });
+    await assert.rejects(() => runByteLimitCase(ctx), (error) => assertBlockedTimeout(error, "downloading"));
+    // The job really was created — this is an honest post-work refusal — but no
+    // part of the outcome is read from a window that never closed on a terminal.
+    assert.equal(calls.createJob, 1);
+    assert.equal(calls.mediaTransferEvidence.length, 0, "no fixture evidence is requested");
+    assert.equal(calls.workDirPresent, 0);
+  });
+
+  it("B3. a post-deadline TERMINAL-looking read cannot rescue a timed-out poll", async () => {
+    // `pollTrace` attaches one more status read AFTER its deadline as `final`.
+    // Even a perfect-looking `failed/TOO_LARGE` there is not an observation the
+    // trace witnessed, so it must not be believed.
+    const { ctx, calls } = makeByteLimitCaseCtx({
+      timedOut: true,
+      trace: ["queued", "analyzing", "downloading"],
+      final: { status: "failed", errorCode: "TOO_LARGE" },
+    });
+    await assert.rejects(
+      () => runByteLimitCase(ctx),
+      (error) => {
+        assertBlockedTimeout(error, "downloading");
+        assert.doesNotMatch(error.message, /failed/, "the post-deadline status is not reported as observed");
+        return true;
+      },
+    );
+    assert.equal(calls.mediaTransferEvidence.length, 0);
+    assert.equal(calls.workDirPresent, 0);
+  });
+
+  it("B4. a poll whose completion was not established is treated as not observed", async () => {
+    for (const timedOut of [undefined, null, "false", 0]) {
+      const { ctx, calls } = makeByteLimitCaseCtx({ timedOut });
+      await assert.rejects(
+        () => runByteLimitCase(ctx),
+        (error) => assertBlockedTimeout(error, "failed"),
+        String(timedOut),
+      );
+      assert.equal(calls.mediaTransferEvidence.length, 0, String(timedOut));
+    }
+  });
+
+  it("B5. through the CLI, a byte-limit poll timeout exits BLOCKED and seals no record", async () => {
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    // The real control-plane session in every respect but one: its poll window
+    // closes before the job's terminal state is seen.
+    const real = makeControlPlaneSession({
+      baseUrl: "https://control.invalid",
+      fetch: world.fetch,
+      sleep: async () => {},
+    });
+    const session = Object.create(real, {
+      pollTrace: {
+        value: async () => ({
+          trace: ["queued", "analyzing", "downloading"],
+          timeline: [],
+          final: { status: "failed", errorCode: "TOO_LARGE" },
+          timedOut: true,
+        }),
+      },
+    });
+    const run = await runCli(
+      ["--stage", "B", "--case", "byte-limit", ...LIVE_ARGS, "--evidence", "/tmp/bl.json"],
+      LIVE_ENV({
+        VIDEOFETCH_ACCEPT_BYTELIMIT_URL: "https://media.invalid/generic/bytelimit",
+        VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL: "https://media.invalid/byte-evidence",
+        VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES: "4563402752",
+      }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, session, files: seedRun() },
+    );
+    assert.equal(run.code, 2, `${run.out}\n${run.err}`);
+    assert.match(run.err, /BLOCKED: case 'byte-limit' did not complete: BLOCKED \/ TIMEOUT — /);
+    assert.match(run.err, /LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN/);
+    assert.equal(run.files.has("/tmp/bl.json"), false, "no case record is sealed");
+    assert.ok(world.calls.fetches.includes("POST /api/download"), "the job was real, and still not graded");
+    assert.ok(!world.calls.fetches.includes("GET /byte-evidence"), "no fixture evidence was requested");
   });
 });
 

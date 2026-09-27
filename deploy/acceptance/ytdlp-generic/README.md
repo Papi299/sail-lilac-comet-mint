@@ -291,7 +291,7 @@ There is no unreviewed layer between Production and the acceptance logic.
 | `--stage A` | **disabled** | Every Stage A gate, including the direct-media regression. Writes the Stage A record and begins the run. |
 | `--stage B --case success` | **enabled** | Generic analysis, job lifecycle, durable evidence, the downloading window, R2, signed GET, sentinel sweep. |
 | `--stage B --case cancellation` | **enabled** | Captures the owned PGID, cancels, proves that exact group died. |
-| `--stage B --case byte-limit` | **enabled** | This case's own unknown-declared-length **media GET** must serve more than the deployed limit and abort as `TOO_LARGE`. The fixture ceiling is **4.25 GiB** (4 GiB reference + 256 MiB headroom), and a capacity preflight refuses the case before any submission unless that ceiling strictly exceeds the **measured** deployed limit — see [the fixture ceiling](#the-fixture-ceiling-is-sized-against-the-current-4-gib-limit). Requires `VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES`. |
+| `--stage B --case byte-limit` | **enabled** | This case's own unknown-declared-length **media GET** must serve more than the deployed limit and abort as `TOO_LARGE`. The fixture ceiling is **4.25 GiB** (4 GiB reference + 256 MiB headroom), and a capacity preflight refuses the case before any submission unless that ceiling strictly exceeds the **measured** deployed limit — see [the fixture ceiling](#the-fixture-ceiling-is-sized-against-the-current-4-gib-limit). Requires `VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES` and `VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL`, both admitted before anything is submitted. A harness poll timeout is `BLOCKED` — see [a poll timeout is not proven](#a-poll-timeout-is-blocked--not-proven). |
 | `--stage B --case shutdown` | **enabled** | Captures the owned PGID, the operator restarts, that exact group must be gone. |
 | `--stage B --case safe-egress` | **enabled** | Forbidden later destination denied, attributed by the **deny counter** named with `--egress-deny-class` (a closed deny-only enum). |
 | `--stage B --case direct-regression` | **enabled** | Post-enable direct job with no yt-dlp process. |
@@ -1233,6 +1233,24 @@ parsed with a strict positive-decimal safe-integer grammar, and a missing or
 malformed value is a **usage error that stops the `byte-limit` case before it
 submits anything**. See "The capacity preflight" below.
 
+`VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL` is a **required, pre-admitted input**
+too (`YTDLP-CURRENT-LIMIT-4GIB-ACCEPTANCE-HARNESS-HARDENING-001`). Without it
+the case can never attribute the transfer it causes, so it is refused where the
+case's other inputs are. The value must be one absolute `https:` URL, with no
+whitespace or control characters anywhere and no userinfo. "Whitespace" and
+"control" here mean Unicode's own classes, `White_Space` and `Cc`, not just
+ASCII. A missing or malformed
+value is a **usage error before the producer runs**, which means before the
+analysis request, before any job and before any fixture request. The CLI reads it
+**once**, carries it on the case context as `byteLimitEvidenceUrl`, and the
+transfer probe uses that admitted value; the environment is never re-read once
+the case has started.
+
+The probe previously read this variable from the environment only when it was
+called, after analysis, job creation and the whole acquisition. So a missing
+value cost a real Production job before the case discovered it could not
+produce evidence. The variable's name is unchanged.
+
 The harness appends `?vf_case=<128-bit hex>` to the submitted URL. The fixture
 must:
 
@@ -1336,15 +1354,104 @@ as invalid fixture evidence.
 
 **Throughput, and reporting it honestly.** The Product's absolute acquisition
 timeout is **600 s** and is unchanged by this correction. Crossing 4 GiB inside
-that deadline requires roughly 7.2 MiB/s sustained end to end. If the threshold
-is not reached, the run must be reported as **TIMEOUT/BLOCKED** — not as a pass,
-and not as a smaller-than-intended threshold proof.
+that deadline needs roughly **6.83 MiB/s (7.16 MB/s) sustained end to end**,
+which is 4,096 MiB / 600 s.
+
+This is a **planning figure only**. It is not an exact required rate, and it is
+not acceptance evidence:
+
+- protocol and tunnel overhead are not included;
+- queueing, job-time analysis and the harness's own observation window are
+  separate matters (see
+  [a poll timeout is not proven](#a-poll-timeout-is-blocked--not-proven));
+- the Product's byte watcher observes on its own 150 ms cadence.
+
+If the threshold is not reached, the run must be reported as
+**TIMEOUT/BLOCKED** — not as a pass, and not as a smaller-than-intended
+threshold proof.
 
 The `--byte-limit-bytes` override in `server.mjs` is **not** how the default is
 made sufficient (it already is). It remains bounded to small automated fixture
 tests, deterministic local characterization, and separately reviewed special
 acceptance circumstances, and passing a value through it does not make that
 value trustworthy acceptance evidence.
+
+#### A poll timeout is BLOCKED / NOT PROVEN
+
+The case follows its job with `pollTrace`. That poll has its **own observation
+window**, 600 s from job creation. When the window closes first, `pollTrace`
+returns `timedOut: true` and attaches one more status read, taken after the
+deadline, as `final`.
+
+The `byte-limit` producer now checks for this immediately after the poll, before
+it requests any fixture evidence
+(`YTDLP-CURRENT-LIMIT-4GIB-ACCEPTANCE-HARNESS-HARDENING-001`). Anything other
+than an explicit `timedOut: false` is:
+
+```
+BLOCKED / TIMEOUT — … did not reach a terminal status within the acceptance
+observation window … (LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)
+```
+
+The producer throws, the CLI exits `BLOCKED`, and **no case record is sealed**.
+A timed-out poll is never a Product `FAIL`, never `TOO_LARGE` and never a
+`PASS`. A post-deadline `final` that looks terminal — even `failed` /
+`TOO_LARGE` — is **not believed**, because the trace never witnessed it, and the
+refusal names only statuses the trace actually recorded.
+
+Before this correction the producer ignored `timedOut`. A job still
+`downloading` at the deadline flowed into outcome grading, and a post-deadline
+`TOO_LARGE` read could be sealed as the case's outcome.
+
+**Two different 600 s boundaries.** Both are 600 s today, but they are different
+mechanisms, and this correction changes neither:
+
+| | Starts | Owned by |
+| :--- | :--- | :--- |
+| Product acquisition deadline | inside the generic download, after queueing and job-time analysis | the Worker (`DOWNLOAD_TIMEOUT`, default 600 s) |
+| Harness observation window | when the harness creates the job | `pollTrace` (`DEFAULT_POLL_TIMEOUT_MS`) |
+
+Because the harness window starts first, it always closes **before** the
+Product deadline for the same job. The gap is the queue wait plus job-time
+analysis, and that analysis is bounded by the Worker's analysis budget (45 s by
+default). The consequences follow. They are recorded as a design finding rather
+than "fixed" by lengthening anything:
+
+- a Product `TIMEOUT` at the full acquisition deadline is not observable by the
+  harness at all; the case reports `BLOCKED / TIMEOUT` instead;
+- a threshold crossing late enough in the Product window that its terminal
+  `TOO_LARGE` lands after the harness window has closed is also
+  `BLOCKED / TIMEOUT`, not a pass.
+
+Both outcomes are honest: an unobserved result is not proven. Whether the
+observation window should gain a reviewed margin beyond the Product deadline is
+a **separate decision**. No timeout, Product deadline or byte-watcher interval
+was changed to make a live run more likely to pass.
+
+#### The narrow current-limit claim
+
+A `--stage B --case byte-limit` run seals **raw observations only**; exit `0`
+means "record written", not "passed". The check `limit.actual-byte-guard` is
+graded only by `--stage B --aggregate`, which also requires an authentic Stage A
+`PASS` for the same run, source SHA and image.
+
+A future current-limit acceptance scoped to Stage A plus this one case therefore
+yields an aggregate whose **overall** Stage-B verdict is `BLOCKED` by
+construction: `success`, `cancellation`, `shutdown`, `safe-egress`,
+`direct-regression` and `kill-switch` were not rerun. That is expected, and no
+partial-aggregate mode exists or is needed. What such a run may claim is exactly:
+
+```
+limit.actual-byte-guard = PASS   (in a correctly sealed, Stage-A-authorized aggregate)
+```
+
+It must **not** be reported as a Stage-B `PASS`, as a Phase-10D rerun, or as
+re-acceptance of the generic matrix.
+
+**No live current-limit acceptance has occurred.** This hardening is source and
+test only. It does not close the live gap, and it does not resolve the separate
+image-identity prerequisite: the harness binds `videofetch-worker:<expected-sha>`,
+and that tag must exist for the running image before a live run can begin.
 
 ### Cancellation and shutdown
 
@@ -2019,7 +2126,9 @@ have been the mechanism), fails if the fixture analyzed as `direct`, fails if
 the bytes served did not exceed the deployed limit (invalid fixture, not
 acceptance evidence), and is `BLOCKED` — `LIVE UNKNOWN-LENGTH BYTE-GUARD CASE
 NOT PROVEN` — if the correlation, the media request, or the effective limit
-cannot be established at all.
+cannot be established at all, or if the harness's poll window closed before a
+terminal status was observed (see
+[a poll timeout is not proven](#a-poll-timeout-is-blocked--not-proven)).
 
 **Before any of that, the case must be capable of producing the evidence at
 all.** The capacity preflight compares the fixture's advertised ceiling against

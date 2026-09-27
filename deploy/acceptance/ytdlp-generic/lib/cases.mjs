@@ -174,6 +174,109 @@ export function parseByteLimitFixtureMaxBytes(raw) {
   }
   return { ok: true, bytes: parsed };
 }
+
+/** The environment variable carrying the fixture's evidence endpoint. Never a secret. */
+export const BYTELIMIT_EVIDENCE_URL_ENV = "VIDEOFETCH_ACCEPT_BYTELIMIT_EVIDENCE_URL";
+
+/**
+ * Admits the controlled fixture's own byte-evidence endpoint
+ * (YTDLP-CURRENT-LIMIT-4GIB-ACCEPTANCE-HARNESS-HARDENING-001).
+ *
+ * The `byte-limit` case cannot produce admissible evidence without it: step 3
+ * of `runByteLimitCase` asks this endpoint what the fixture ACTUALLY served for
+ * this case, and nothing else can answer that. It used to be read from the
+ * environment by the transfer probe itself — after analysis, after a real
+ * Production job had been created and after the whole acquisition had run — so
+ * a missing or unusable value was discovered only once the Production work it
+ * could never grade had already happened. It is now admitted with the case's
+ * other inputs, before anything is submitted, exactly like the digest and the
+ * advertised ceiling above.
+ *
+ * The controlled fixture is reached only through its public HTTPS Quick Tunnel
+ * origin, so the grammar is exactly that and nothing wider:
+ *
+ *   - present and a non-empty string;
+ *   - no whitespace or control character ANYWHERE, by Unicode's own classes —
+ *     see `EVIDENCE_URL_FORBIDDEN_CHARACTER`. The WHATWG parser silently strips
+ *     leading and trailing C0 controls and spaces, removes ASCII tab and
+ *     newline wherever they occur, and percent-encodes other non-ASCII
+ *     characters in a path, query or fragment, so a value carrying any of them
+ *     would otherwise be admitted as a different string from the one supplied;
+ *   - an absolute URL that parses;
+ *   - scheme exactly `https:`;
+ *   - no userinfo: the fixture holds no credential and must never be sent one.
+ *
+ * A refusal never echoes the value. It is not a secret, but the harness prints
+ * no raw URL (§13), and naming the rule that failed is all the operator needs.
+ */
+/**
+ * The characters the evidence-endpoint rule refuses ANYWHERE in the value.
+ *
+ * Exactly the union of two Unicode classes, matched per code point (`u` flag):
+ *
+ *   White_Space  the binary property: ASCII TAB..CR and SPACE, plus U+0085,
+ *                U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029, U+202F,
+ *                U+205F and U+3000
+ *   Cc           General_Category "Control": C0 U+0000..U+001F, DEL U+007F
+ *                and C1 U+0080..U+009F
+ *
+ * The first revision tested an ASCII-only class (U+0000..U+0020 and U+007F),
+ * which honoured the documented "no whitespace or control character anywhere"
+ * rule for ASCII only: NO-BREAK SPACE, NEXT LINE, the line and paragraph
+ * separators and IDEOGRAPHIC SPACE passed it, and the WHATWG parser then
+ * percent-encoded them into an admitted URL. Unicode property escapes are
+ * ES2018 and available on every Node this harness runs under (the VM host's
+ * Node 18 and the Worker image's Node 22).
+ *
+ * "Control" deliberately means Cc. Format characters (Cf, e.g. U+200B, U+FEFF)
+ * are neither White_Space nor Cc, and are not claimed by this rule.
+ */
+const EVIDENCE_URL_FORBIDDEN_CHARACTER = /[\p{White_Space}\p{Cc}]/u;
+
+export function parseByteLimitEvidenceUrl(raw) {
+  if (raw === undefined || raw === null || raw === "") {
+    return {
+      ok: false,
+      reason:
+        `${BYTELIMIT_EVIDENCE_URL_ENV} is required: the byte-limit case can only attribute the ` +
+        "transfer it caused through the controlled fixture's own evidence endpoint, and a run " +
+        "without it would create a real Production job whose evidence it could never obtain",
+    };
+  }
+  if (typeof raw !== "string" || EVIDENCE_URL_FORBIDDEN_CHARACTER.test(raw)) {
+    return {
+      ok: false,
+      reason:
+        `${BYTELIMIT_EVIDENCE_URL_ENV} must be a single absolute URL with no whitespace or control ` +
+        "characters (taken from the fixture's public origin plus its byteEvidencePath)",
+    };
+  }
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return {
+      ok: false,
+      reason: `${BYTELIMIT_EVIDENCE_URL_ENV} is not a well-formed absolute URL`,
+    };
+  }
+  if (parsed.protocol !== "https:") {
+    return {
+      ok: false,
+      reason:
+        `${BYTELIMIT_EVIDENCE_URL_ENV} must use https: — the controlled fixture is reached only ` +
+        "through its public HTTPS origin",
+    };
+  }
+  if (parsed.username !== "" || parsed.password !== "") {
+    return {
+      ok: false,
+      reason: `${BYTELIMIT_EVIDENCE_URL_ENV} must not carry userinfo; the fixture holds no credential`,
+    };
+  }
+  return { ok: true, url: raw };
+}
+
 const isCaseId = (v) => typeof v === "string" && CASE_ID_PATTERN.test(v);
 /** A Docker container object id, as a STRING — never a coerced value (§27). */
 const isInstanceId = (v) => typeof v === "string" && CONTAINER_INSTANCE_PATTERN.test(v);
@@ -1348,6 +1451,18 @@ export async function runByteLimitCase(ctx) {
     );
   }
 
+  //    The fixture's evidence endpoint, admitted by the CLI before this
+  //    producer ran. Defence in depth, exactly like the ceiling above: a
+  //    producer driven directly must not be able to submit a job whose
+  //    transfer it could never attribute. Still ahead of every submission.
+  const evidenceEndpoint = parseByteLimitEvidenceUrl(ctx.byteLimitEvidenceUrl);
+  if (!evidenceEndpoint.ok) {
+    throw new Error(
+      `the controlled fixture's evidence endpoint was not admitted: ${evidenceEndpoint.reason} ` +
+        "(LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)",
+    );
+  }
+
   // 1. Mint the correlation identity and bind the submitted URL to it, so the
   //    fixture's later evidence is about THIS case's transfer and nothing else.
   //    Not a secret: it grants nothing and authenticates nothing.
@@ -1365,11 +1480,47 @@ export async function runByteLimitCase(ctx) {
   const jobId = created.jobId;
 
   const { polled } = await driveJobWithWindow(ctx, jobId, created.status);
+
+  // 2a. The terminal outcome must have been OBSERVED inside the acceptance
+  //     observation window (…-HARNESS-HARDENING-001).
+  //
+  //     `pollTrace` returns `timedOut: true` when its OWN window closes first,
+  //     and then attaches one more status read taken AFTER the deadline as
+  //     `final`. That read is not an observation of the lifecycle: a job still
+  //     `downloading` at the deadline would otherwise flow into the byte
+  //     comparison as if a terminal Product outcome had been seen, and a
+  //     post-deadline `failed/TOO_LARGE` read would be believed without the
+  //     trace ever having witnessed it.
+  //
+  //     This window is the HARNESS's, not the Product's. It starts when the job
+  //     is created, while the Worker's 600 s acquisition deadline starts later,
+  //     after queueing and job-time analysis — so the two are different
+  //     boundaries even though both are 600 s today, and neither is changed
+  //     here. An unobserved terminal state is BLOCKED / TIMEOUT: never a
+  //     Product FAIL, never TOO_LARGE, never a PASS. Anything other than an
+  //     explicit `timedOut: false` is treated the same way, because a poll whose
+  //     completion was not established observed nothing terminal either.
+  //
+  //     Checked before any fixture evidence is requested, so no part of the
+  //     case's outcome is read from a window that never closed on a terminal
+  //     state. Only statuses the trace actually recorded are named.
+  if (polled?.timedOut !== false) {
+    const trace = Array.isArray(polled?.trace) ? polled.trace : [];
+    const lastObserved = trace.length > 0 ? trace[trace.length - 1] : "unknown";
+    throw new Error(
+      "BLOCKED / TIMEOUT — the byte-limit job did not reach a terminal status within the " +
+        `acceptance observation window (last observed ${lastObserved}; trace ` +
+        `${trace.length > 0 ? trace.join(">") : "unavailable"}). No terminal Product outcome was ` +
+        "observed, so this is not a Product result and the current-limit byte guard was not " +
+        "proven (LIVE UNKNOWN-LENGTH BYTE-GUARD CASE NOT PROVEN)",
+    );
+  }
   const finalJob = polled.final;
 
   // 3. Ask the fixture what it ACTUALLY served FOR THIS CASE. This is the
-  //    request whose semantics the byte watcher had to cope with.
-  const transfer = await ctx.mediaTransferEvidence(caseId);
+  //    request whose semantics the byte watcher had to cope with. The endpoint
+  //    is the one admitted before submission; the environment is not re-read.
+  const transfer = await ctx.mediaTransferEvidence(caseId, evidenceEndpoint.url);
   if (transfer.measured !== true) {
     throw new Error(
       `the actual media transfer semantics could not be established: ${transfer.reason} ` +
@@ -1759,7 +1910,12 @@ export const CASE_PRODUCERS = Object.freeze({
     // from the manifest by the CLI. Declared as a NEED so a run that omits it
     // is a usage error before anything is submitted, rather than a producer
     // that discovers it is ungated once a job already exists.
-    needs: ["byteLimitUrl", "byteLimitFixtureMaxBytes"],
+    //
+    // `byteLimitEvidenceUrl` is the same rule applied to the fixture's own
+    // evidence endpoint (…-HARNESS-HARDENING-001): without it the case can
+    // never attribute its transfer, so it is admitted here rather than read
+    // from the environment after a real job has run.
+    needs: ["byteLimitUrl", "byteLimitFixtureMaxBytes", "byteLimitEvidenceUrl"],
     operatorTransition: false,
     spansOneRestart: false,
     summary: "unknown-declared-length over-limit source aborts as TOO_LARGE",
