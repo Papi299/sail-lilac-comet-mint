@@ -103,7 +103,7 @@ Safe for transmission to Vercel. When ready, it contains:
 | | |
 | :--- | :--- |
 | Source | `main` `593f47dfffe79f166d40af6575c6130668e56af0` (PR #63 merge) |
-| Production Worker (P1 rollout) | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest`, from 2026-09-18 21:00Z. Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`, and on 2026-09-27 by the current Worker `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5` (source `f9a8109b…`, `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`). Both still send the field. `e5b1144c…` is now the immediate Worker rollback and `5925515f…` a deeper one (deployment runbook §4j, §9, §11h) |
+| Production Worker (P1 rollout) | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest`, from 2026-09-18 21:00Z. Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`, on 2026-09-27 by `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5` (source `f9a8109b…`, `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`), and later that day by the current Worker `sha256:fd7cdbc9434a3193a797a92b3e669ad00526b79224e382662551903e1d3cf9bf` (source `8f087639…`, `GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`). All three still send the field. `0a6e66b0…` is now the immediate Worker rollback, and `e5b1144c…` and `5925515f…` deeper ones (deployment runbook §4j, §9, §11h) |
 | Vercel (P1 rollout) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from the same source. Superseded on 2026-09-19 by the P2 deployment below. Retained as the first code-rollback layer behind the current redeploy and the original P2 deployment (below; deployment runbook §9) |
 
 It was recorded here as "IMPLEMENTED IN SOURCE — NOT DEPLOYED" until then; that
@@ -204,18 +204,27 @@ and the strict schema accepted it.
   context, **not** a Git attestation. It changes the deployment identity and
   its Access credential, not the accepted P2 API contract.
 
-**Current Production Worker.** `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5`
-as `videofetch-worker:latest` since 2026-09-27 14:02:55Z. Its source is `main`
-`f9a8109bb1302076b5b415b572c0ab288467250a` (PR #88), and it was promoted by
-`SOURCE-FILESIZE-ESTIMATE-DRIFT-001` (*accepted operator-measured*; deployment
-runbook §11h).
-- **What it contains.** It still sends `sourceQuality` and contains clear-HLS v1.
-- **Rollbacks.** The HLS-10 image `sha256:e5b1144c…` is now the immediate Worker
-  rollback, and the P1 image `sha256:5925515f…` is a deeper one.
-- **No change to this contract's rollback ordering.** PR #88 changed no public
-  schema: nothing under `src/shared`, `src/web`, `src/lib/security`,
-  `src/routes/api` or `src/types` differs from the HLS-10 image's source
-  (*repository-verifiable*). No Vercel deployment accompanied it.
+**Current Production Worker.** `sha256:fd7cdbc9434a3193a797a92b3e669ad00526b79224e382662551903e1d3cf9bf`
+as `videofetch-worker:latest` since 2026-09-27 18:43:29Z. Its source is `main`
+`8f087639e7e23fda07c3bda39c4398d6b0dfb561` (PR #90), and it was promoted by
+`GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001` (*accepted operator-measured*;
+deployment runbook §11h).
+- **What it contains.** It still sends `sourceQuality`, and it contains clear-HLS
+  v1 and the declared-only generic preset `fileSize` semantics (item 4 below).
+- **What changed.** Execution-only: private selection-map ownership in the
+  Worker's execution planner is now own-property only (`Object.hasOwn()`
+  instead of `in`). `GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001` changed no
+  shared DTO, no HTTP route, no Vercel parser, no durable-state schema and no
+  public `VideoMetadata` semantics. It hardens private execution planning only,
+  so it adds no numbered field to this contract.
+- **Rollbacks.** The filesize image `sha256:0a6e66b0…` (source `f9a8109b…`) is
+  now the immediate Worker rollback. The HLS-10 image `sha256:e5b1144c…` and the
+  P1 image `sha256:5925515f…` are deeper ones.
+- **No change to this contract's rollback ordering.** Neither PR #88 nor PR #90
+  changed a public schema or the control-plane contract: nothing under
+  `src/shared`, `src/web`, `src/lib/security`, `src/routes/api` or `src/types`
+  differs from the HLS-10 image's source (*repository-verifiable*). No Vercel
+  deployment accompanied either.
 
 **Rollback layers**, as in the deployment runbook §9 (operational detail there
 and in §11h). **Access state comes first.** `dpl_BJYRG7…` keeps its old
@@ -258,7 +267,7 @@ PRODUCTION ACCEPTED (2026-09-19).**
 | Source | `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478` (PR #64 merge), tree `44abfe6e90c0d9ce5bd9eae8af6140e3f39e7ff9` |
 | P2 accepted Production deployment | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from that source by chain of custody (the project has no Git integration, so Vercel does not attest the commit); accepted in Production on 2026-09-19. Current Production is the later provider-recorded redeploy chain `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd` → `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9`, of which `dpl_YrhkEQC4…` is current (above) |
 | Immediate Vercel rollback at P2 | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` — needs no Worker rollback. Now the first code-rollback layer (above) |
-| Production Worker at P2 | unchanged by P2: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`). Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c…` (deployment runbook §4j), and on 2026-09-27 by the current Worker `sha256:0a6e66b0…` (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, runbook §11h); P2 itself did not change |
+| Production Worker at P2 | unchanged by P2: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`). Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c…` (deployment runbook §4j), on 2026-09-27 by `sha256:0a6e66b0…` (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, runbook §11h), and later that day by the current Worker `sha256:fd7cdbc9…` (`GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`, runbook §11h); P2 itself did not change |
 
 It was recorded here as "IMPLEMENTED IN SOURCE / NOT DEPLOYED" until then; that
 state is now history. The deployment and acceptance record is in the deployment
@@ -312,7 +321,8 @@ and were inventory-only. Segmented DASH still is. Clear-HLS v1 was later
 implemented in source (HLS-7), qualified in a retained release candidate (HLS-9B)
 and, on 2026-09-26, **deployed to the Production Worker and accepted** by HLS-10
 on a real public source (deployment runbook §4j). The current Worker image
-(2026-09-27, `sha256:0a6e66b0…`) contains the same clear-HLS source. Every HLS
+(2026-09-27, `sha256:fd7cdbc9…`) still contains that same accepted clear-HLS
+source. Every HLS
 rendition outside that narrow path remains inventory-only. `observedMaxHeight` is still not a claim about a
 provider's absolute maximum, and protected renditions are still not
 downloadable.
@@ -324,6 +334,10 @@ downloadable.
 - **Source.** PR #88, `main` `f9a8109bb1302076b5b415b572c0ab288467250a`.
 - **Worker.** `sha256:0a6e66b0…`, promoted 2026-09-27 14:02:55Z.
 - **Record.** Deployment runbook §11h.
+- **Since.** Later on 2026-09-27 that image was superseded by
+  `sha256:fd7cdbc9…` (`GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`), and
+  `0a6e66b0…` became the immediate Worker rollback. The same accepted `fileSize`
+  semantics remain present in the current image.
 
 It was recorded here as "implemented in source" until then; that state is now
 history. The rules below did not change.
