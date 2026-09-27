@@ -8016,7 +8016,17 @@ is the decisive live analysis proof.
 **10. Keep-original job (*accepted operator-measured*).**
 
 - **Job.** `a7bf2c309fa968bdd1fc538a1297b6ad`, `preset:best`.
-- **Lifecycle.** `queued` → `downloading` → `uploading` → `ready`.
+- **Observed polling trace.** `queued` → `downloading` → `uploading` → `ready`.
+  `queued` is the job-creation response. Three status polls, about 0.5 s
+  apart, then sampled `downloading`, `uploading` and `ready`. This is what the
+  poller saw, not the lifecycle itself.
+- **Durable lifecycle.** The reviewed Worker state machine enforces `queued` →
+  `analyzing` → `downloading` → `processing` → `uploading` → `ready`, and has no
+  direct `downloading` → `uploading` transition. `analyzing` and `processing`
+  were not directly sampled in this job: both fell between polling samples.
+  Both nevertheless committed. `completeAnalysis()` is the only transition into
+  `downloading`, and it is legal only from `analyzing`. `beginUploading()` is
+  legal only from `processing`, so `processing` committed before `uploading`.
 - **Ready.** MP4, durable `fileSize` 48,497.
 - **Delivery.** A `303` to a signed R2 GET returned `200` and delivered
   48,497 bytes, SHA-256
@@ -8028,9 +8038,17 @@ is the decisive live analysis proof.
 **11. Transformed-audio job (*accepted operator-measured*).**
 
 - **Job.** `815a49b3821be0ecabbf399d635f8eb9`, `preset:audio`.
-- **Lifecycle observed.** `queued` → `downloading` → `uploading` → `ready`.
-  `processing` was shorter than the polling interval and was not sampled
-  directly. The produced artifact proves the transform independently.
+- **Observed polling trace.** `queued` → `downloading` → `uploading` → `ready`.
+  `queued` is the job-creation response. Three status polls, about 0.5 s
+  apart, then sampled `downloading`, `uploading` and `ready`. This is what the
+  poller saw, not the lifecycle itself.
+- **Durable lifecycle.** The same source-enforced sequence as item 10:
+  `queued` → `analyzing` → `downloading` → `processing` → `uploading` →
+  `ready`. `analyzing` and `processing` were not directly sampled in this job
+  either. Both nevertheless committed, for the same state-machine reasons:
+  `downloading` is reachable only from `analyzing`, and `beginUploading()` only
+  from `processing`, so `processing` committed before `uploading`. The produced
+  M4A artifact independently proves that the `extract-m4a` transform ran.
 - **Before download.** The preset's `fileSize` was `null` (item 9).
 - **Ready.** M4A, durable `fileSize` 42,277.
 - **Delivery.** A `303` to a signed R2 GET returned `200` and delivered
