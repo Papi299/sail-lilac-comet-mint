@@ -20,7 +20,7 @@ import type {
   MediaExtractor,
 } from "@/services/extractors/types";
 import { convertMedia, ffmpegAvailable } from "@/services/processing/ffmpeg.server";
-import type { NormalizedFormat, VideoMetadata } from "@/types/media";
+import type { NormalizedFormat, QualityPreset, VideoMetadata } from "@/types/media";
 
 const MEDIA_EXT = new Set([
   "mp4",
@@ -70,13 +70,58 @@ export const directExtractor: MediaExtractor = {
 };
 
 /**
- * Worker-side probe. Identical to the application probe except that an SSRF
- * refusal during the optional HEAD is NOT swallowed: for Worker analysis, a
- * redirect into a private address space is a hard rejection, not a missing
- * content-length. Ordinary HEAD failures stay optional.
+ * Worker-side probe. Identical to the application probe except that:
+ *
+ * - an SSRF refusal during the optional HEAD is NOT swallowed: for Worker
+ *   analysis, a redirect into a private address space is a hard rejection, not
+ *   a missing content-length. Ordinary HEAD failures stay optional.
+ * - a preset publishes the source's size only when the Worker fulfils it with
+ *   the original bytes (`withWorkerPresetSizes`).
  */
 export async function probeDirectWorker(url: string, signal?: AbortSignal): Promise<VideoMetadata> {
-  return _probeDirect(url, signal, { rejectUnsafeHeadRedirects: true });
+  return withWorkerPresetSizes(
+    await _probeDirect(url, signal, { rejectUnsafeHeadRedirects: true }),
+  );
+}
+
+/**
+ * DIRECT-PRESET-FILESIZE-PROVENANCE-001: `direct-original.fileSize` is the
+ * source's HEAD `Content-Length`, and it stays that. A preset may repeat it
+ * only when the Worker fulfils the preset by returning those ORIGINAL bytes.
+ * Every other preset publishes `null`: a converted or extracted artifact's size
+ * is unknown until processing completes, and nothing here estimates it.
+ *
+ * Worker-only, because the rule mirrors the Worker's planner. The application's
+ * own `downloadDirect` fulfils presets by different rules and keeps the sizes
+ * `_probeDirect` gives it.
+ */
+function withWorkerPresetSizes(meta: VideoMetadata): VideoMetadata {
+  const original = meta.formats.find((f) => f.id === "direct-original");
+  return {
+    ...meta,
+    presets: meta.presets.map((preset) => ({
+      ...preset,
+      fileSize: original && keepsOriginalBytes(original, preset) ? original.fileSize : null,
+    })),
+  };
+}
+
+/**
+ * True only where `deriveDirectExecutionPlan` (src/worker/execution/format-plan.ts)
+ * plans `keep-original`. Mirrored rather than imported, so this service module
+ * never depends on Worker execution; the Worker direct-analysis suite holds the
+ * two together for every preset the probe can advertise.
+ */
+function keepsOriginalBytes(original: NormalizedFormat, preset: QualityPreset): boolean {
+  // Always `extract-mp3`, even from an MP3 source.
+  if (preset.id === "preset:mp3") return false;
+  // `extract-m4a` from a video source; kept only when the source is already
+  // audio-only and its container is advertised unchanged.
+  if (preset.id === "preset:audio") {
+    return !original.hasVideo && !preset.hasVideo && preset.container === original.container;
+  }
+  // Video presets are kept only in the source's own container, otherwise `convert`.
+  return original.hasVideo && preset.hasVideo && preset.container === original.container;
 }
 
 async function _probeDirect(

@@ -1,5 +1,9 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { config } from "@/lib/config";
 import { AppError } from "@/lib/errors";
 import {
   setSafeHttpTestHooks,
@@ -7,7 +11,9 @@ import {
   type SafeRequestOnce,
 } from "@/lib/security/safe-http.server.ts";
 import { setProcessRunnerTestHooks } from "@/services/processing/process-runner.server.ts";
+import type { WorkerVideoMetadata } from "@/shared/worker/contracts";
 import { analyzeDirectMedia } from "./direct-media.server.ts";
+import { DIRECT_KEEP_CONTAINERS, deriveDirectExecutionPlan } from "./format-plan.ts";
 
 const PUBLIC_ADDR = { address: "93.184.216.34", family: 4 as const };
 const PRIVATE_ADDR = { address: "127.0.0.1", family: 4 as const };
@@ -284,5 +290,219 @@ describe("worker direct-media analysis", () => {
     }
 
     assert.deepEqual(commands, [], "no subprocess may start for a non-direct URL");
+  });
+});
+
+// ── DIRECT-PRESET-FILESIZE-PROVENANCE-001 ────────────────────────────────────
+//
+// `direct-original.fileSize` is the source's HEAD `Content-Length`. A preset
+// may repeat it only when its execution plan returns those original bytes; a
+// converted or extracted output has no known size before processing.
+
+const ORIGINAL_FFMPEG_PATH = config.ffmpegPath;
+
+/**
+ * Makes `ffmpegAvailable()` answer true without a real binary: it needs the
+ * configured path to exist and `-version` to print an FFmpeg banner. The path
+ * is this Node executable, which never runs because the one spawn is answered
+ * by a fake child. The child has no pid, so the runner can never address a
+ * host process group.
+ */
+function installFfmpeg(): void {
+  config.ffmpegPath = process.execPath;
+  setProcessRunnerTestHooks({
+    spawn: () => {
+      const child = new EventEmitter() as EventEmitter & {
+        stdout: PassThrough;
+        stderr: PassThrough;
+        kill: () => boolean;
+      };
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => true;
+      child.stdout.on("end", () => setImmediate(() => child.emit("close", 0)));
+      setImmediate(() => {
+        child.stdout.end("ffmpeg version 7.0-test\n");
+        child.stderr.end();
+      });
+      return child as unknown as ChildProcess;
+    },
+  });
+}
+
+/** FFmpeg absent on any host: the configured path does not exist. */
+function removeFfmpeg(): void {
+  config.ffmpegPath = "/nonexistent/videofetch-test/ffmpeg";
+  setProcessRunnerTestHooks({
+    spawn: () => {
+      throw new Error("no subprocess expected");
+    },
+  });
+}
+
+/** Analyzes `url` behind one HEAD; `contentLength` undefined omits the header. */
+async function analyzeBehindHead(url: string, contentType: string, contentLength?: string) {
+  installHooks({
+    requestOnce: async (args) => {
+      assert.equal(args.method, "HEAD", "analysis must never issue a GET");
+      return {
+        status: 200,
+        headers:
+          contentLength === undefined
+            ? { "content-type": contentType }
+            : { "content-length": contentLength, "content-type": contentType },
+        body: null,
+      };
+    },
+  });
+  return analyzeDirectMedia(url);
+}
+
+function originalOf(meta: WorkerVideoMetadata) {
+  const original = meta.formats.find((f) => f.id === "direct-original");
+  assert.ok(original, "direct analysis advertises its source format");
+  return original;
+}
+
+function presetOf(meta: WorkerVideoMetadata, id: string) {
+  const preset = meta.presets.find((p) => p.id === id);
+  assert.ok(preset, `${id} is advertised`);
+  return preset;
+}
+
+describe("worker direct-media analysis: preset fileSize provenance", () => {
+  afterEach(() => {
+    setSafeHttpTestHooks(null);
+    setProcessRunnerTestHooks(null);
+    config.ffmpegPath = ORIGINAL_FFMPEG_PATH;
+  });
+
+  it("publishes no size for audio extracted from a video source", async () => {
+    installFfmpeg();
+    const meta = await analyzeBehindHead("https://cdn.example.com/clip.mp4", "video/mp4", "2048");
+
+    assert.equal(originalOf(meta).fileSize, 2048, "the source format keeps its HEAD Content-Length");
+    assert.deepEqual(
+      meta.presets.map((p) => p.id),
+      ["preset:best", "preset:audio", "preset:mp3"],
+    );
+
+    const best = presetOf(meta, "preset:best");
+    assert.equal(best.container, "mp4");
+    assert.equal(deriveDirectExecutionPlan(meta, "preset:best").operation, "keep-original");
+    assert.equal(best.fileSize, 2048, "the original bytes are delivered, so the source size is theirs");
+
+    const audio = presetOf(meta, "preset:audio");
+    assert.equal(audio.container, "m4a");
+    assert.equal(deriveDirectExecutionPlan(meta, "preset:audio").operation, "extract-m4a");
+    assert.equal(audio.fileSize, null, "a new M4A is extracted; the video's 2048 bytes are not its size");
+
+    const mp3 = presetOf(meta, "preset:mp3");
+    assert.equal(deriveDirectExecutionPlan(meta, "preset:mp3").operation, "extract-mp3");
+    assert.equal(mp3.fileSize, null);
+  });
+
+  it("publishes no size for a video preset converted to another container", async () => {
+    installFfmpeg();
+    const meta = await analyzeBehindHead("https://cdn.example.com/clip.mkv", "video/x-matroska", "4096");
+
+    const original = originalOf(meta);
+    assert.equal(original.container, "mkv");
+    assert.equal(original.fileSize, 4096, "the source format keeps its HEAD Content-Length");
+
+    const best = presetOf(meta, "preset:best");
+    assert.equal(best.container, "mp4");
+    const plan = deriveDirectExecutionPlan(meta, "preset:best");
+    assert.equal(plan.operation, "convert");
+    assert.equal(plan.targetContainer, "mp4");
+    assert.equal(best.fileSize, null, "a converted MP4 is not the 4096-byte MKV");
+  });
+
+  it("keeps the source size for an audio-only source returned unchanged", async () => {
+    installFfmpeg();
+    const meta = await analyzeBehindHead("https://cdn.example.com/track.mp3", "audio/mpeg", "3072");
+
+    const original = originalOf(meta);
+    assert.equal(original.hasVideo, false);
+    assert.equal(original.fileSize, 3072);
+    assert.deepEqual(meta.presets.map((p) => p.id), ["preset:audio", "preset:mp3"]);
+
+    const audio = presetOf(meta, "preset:audio");
+    assert.equal(audio.container, "mp3");
+    assert.equal(deriveDirectExecutionPlan(meta, "preset:audio").operation, "keep-original");
+    assert.equal(audio.fileSize, 3072, "valid source-size provenance is not suppressed for audio");
+
+    const mp3 = presetOf(meta, "preset:mp3");
+    assert.equal(deriveDirectExecutionPlan(meta, "preset:mp3").operation, "extract-mp3");
+    assert.equal(mp3.fileSize, null, "preset:mp3 is still an extraction, even from an MP3");
+  });
+
+  it("publishes no size anywhere without a valid Content-Length, and estimates none", async () => {
+    installFfmpeg();
+    for (const contentLength of [undefined, "not-a-number", "-1"]) {
+      const meta = await analyzeBehindHead("https://cdn.example.com/clip.mp4", "video/mp4", contentLength);
+
+      assert.equal(originalOf(meta).fileSize, null, `Content-Length ${String(contentLength)}`);
+      assert.deepEqual(
+        meta.presets.map((p) => [p.id, p.fileSize]),
+        [
+          ["preset:best", null],
+          ["preset:audio", null],
+          ["preset:mp3", null],
+        ],
+        `Content-Length ${String(contentLength)}`,
+      );
+    }
+  });
+
+  it("gives every advertised preset the size its execution plan implies", async () => {
+    // Every extension the direct extractor accepts (typed by extension alone),
+    // plus Content-Type, no-FFmpeg and missing-length variants.
+    const scenarios: Array<{ url: string; type: string; length?: string; ffmpeg: boolean }> = [
+      ...DIRECT_KEEP_CONTAINERS.map((ext) => ({
+        url: `https://cdn.example.com/media.${ext}`,
+        type: "application/octet-stream",
+        length: "5000",
+        ffmpeg: true,
+      })),
+      { url: "https://cdn.example.com/clip.mp4", type: "audio/mp4", length: "5000", ffmpeg: true },
+      { url: "https://cdn.example.com/clip.mkv", type: "video/x-matroska", length: "5000", ffmpeg: false },
+      { url: "https://cdn.example.com/clip.mp4", type: "video/mp4", length: "5000", ffmpeg: false },
+      { url: "https://cdn.example.com/clip.mkv", type: "video/x-matroska", ffmpeg: true },
+    ];
+
+    const seen = new Set<string>();
+    for (const scenario of scenarios) {
+      if (scenario.ffmpeg) installFfmpeg();
+      else removeFfmpeg();
+      const meta = await analyzeBehindHead(scenario.url, scenario.type, scenario.length);
+      const original = originalOf(meta);
+      assert.ok(meta.presets.length > 0 || !scenario.ffmpeg, `${scenario.url} advertises presets`);
+
+      for (const preset of meta.presets) {
+        const label = `${scenario.url} (${scenario.type}, ffmpeg ${scenario.ffmpeg}) ${preset.id}`;
+        const plan = deriveDirectExecutionPlan(meta, preset.id);
+        seen.add(plan.operation);
+        switch (plan.operation) {
+          case "keep-original":
+            assert.equal(preset.fileSize, original.fileSize, `${label}: keep-original carries the source size`);
+            break;
+          case "convert":
+          case "extract-m4a":
+          case "extract-mp3":
+            assert.equal(preset.fileSize, null, `${label}: ${plan.operation} has no known output size`);
+            break;
+          default: {
+            const unhandled: never = plan;
+            assert.fail(`${label}: unclassified operation ${JSON.stringify(unhandled)}`);
+          }
+        }
+      }
+    }
+    assert.deepEqual(
+      [...seen].sort(),
+      ["convert", "extract-m4a", "extract-mp3", "keep-original"],
+      "every direct operation was exercised",
+    );
   });
 });
