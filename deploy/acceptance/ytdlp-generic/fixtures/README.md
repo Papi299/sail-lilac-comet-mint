@@ -282,10 +282,20 @@ scheduling. A larger margin would only make a runaway transfer more expensive
 without making the assertion any stronger.
 
 The 256 MiB value is therefore a **bounded practical margin rather than a
-guarantee**. Its adequacy for the real end-to-end current-limit case remains to
-be demonstrated by a future live acceptance run, and that run must **fail
-closed** — reporting BLOCKED/TIMEOUT — if the fixture ceiling or the Product
-timeout is reached before valid threshold evidence is obtained.
+guarantee**. It has since been exercised once end to end, on 2026-09-27 by
+`YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN` (runbook §11):
+
+- this 4.25 GiB ceiling (4,563,402,752 bytes) ran against a measured deployed
+  limit of 4 GiB (4,294,967,296 bytes);
+- the Worker terminated the transfer after **4,309,106,033 bytes** served,
+  below the fixture ceiling;
+- the terminal `TOO_LARGE` was observed inside the harness window.
+
+That is one live observation on one deployment and throughput profile. It is
+**still not a mathematical throughput guarantee**. A different deployment or
+throughput profile can honestly end BLOCKED/TIMEOUT, and every run must still
+**fail closed**, reporting BLOCKED/TIMEOUT, if the fixture ceiling or the
+Product timeout is reached before valid threshold evidence is obtained.
 
 It is a **ceiling, not an allocation**, and nothing here is proportional to it:
 the body is the real MP4 followed by one reused 64 KiB block written with
@@ -305,8 +315,13 @@ in either direction. See "Advertising the ceiling" below.
 > this section describes. The implementation was independently reviewed and
 > merged in **PR #75**, and the ledger row is now **CLOSED**.
 >
-> That closes the fixture/harness drift only. **No live 4 GiB threshold
-> acceptance has been performed** with this ceiling.
+> That closed the fixture/harness drift only. The live 4 GiB threshold
+> acceptance with this ceiling came later: it was **performed on 2026-09-27**
+> (`YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN`), and its narrow
+> aggregate graded `limit.actual-byte-guard = PASS`. The aggregate's overall
+> verdict stayed `BLOCKED` because the other Stage-B cases were deliberately not
+> rerun, so it is not a Stage-B PASS. See the acceptance README's
+> "The narrow current-limit claim".
 
 **Historical — why this was 528 MiB.** The ceiling was chosen, with a
 deliberately small margin, when Production's effective `MAX_FILE_SIZE` was the
