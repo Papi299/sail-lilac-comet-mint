@@ -367,8 +367,8 @@ part in:
 A `null` size does not weaken byte enforcement: acquisition enforces actual
 bytes regardless of metadata. The public shape is unchanged
 (`fileSize: number | null`), so this needs no control-plane change and imposes no
-Vercel/Worker deployment order. Direct analysis is unaffected. Its `fileSize`
-remains the source's HEAD `Content-Length` when available.
+Vercel/Worker deployment order. Direct analysis follows its own rule, stated
+below under "Direct analysis `fileSize`".
 
 **Two sizes, two meanings.**
 
@@ -398,6 +398,35 @@ deployment runbook §11h):
   an upstream-declared size.
 - **Scope.** This is evidence for those observed sources only. The schema did
   not change, and no Vercel deployment was involved.
+
+**Direct analysis `fileSize` (semantics only; no schema change)**
+
+`DIRECT-PRESET-FILESIZE-PROVENANCE-001` — **IMPLEMENTED IN SOURCE — PRODUCTION
+DEPLOYMENT PENDING.** Until a separately authorized Worker promotion, the
+Production Worker still copies the source size onto every direct preset except
+`preset:mp3`.
+
+- **The source format.** `direct-original.fileSize` is the source's HEAD
+  `Content-Length`, when the HEAD returns a valid one; otherwise it is `null`. It
+  describes the source object itself, so it keeps that value even when some
+  presets transform the source.
+- **Presets that return the original bytes.** A direct preset may carry that same
+  value only when its execution plan is `keep-original`, so that the job delivers
+  the source bytes unchanged. That covers a video preset advertised in the
+  source's own container, and `preset:audio` for a source that is already
+  audio-only.
+- **Presets that transform the source.** A preset whose plan is `convert`,
+  `extract-m4a` or `extract-mp3` publishes `null` before download. The new
+  artifact's size is not known until processing completes, and no estimate is
+  made from bitrate, container, duration or anything else. Examples are
+  `preset:audio` for a video source, a video preset converted into another
+  container, and `preset:mp3` always.
+- **After download.** A `ready` job's durable `fileSize` remains the exact byte
+  count of the delivered object, for direct jobs exactly as for generic ones.
+
+The public shape is unchanged (`fileSize: number | null`). No control-plane
+change is needed, and there is no Vercel/Worker deployment order. Byte
+enforcement reads actual bytes, not this metadata.
 
 ---
 
