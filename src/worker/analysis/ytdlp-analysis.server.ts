@@ -612,7 +612,29 @@ type Candidate = {
   readonly container: GenericSourceContainer;
   readonly videoCodec: string | null;
   readonly audioCodec: string | null;
+  /**
+   * The positive upstream-DECLARED size (`filesize`), else `null`
+   * (SOURCE-FILESIZE-ESTIMATE-DRIFT-001).
+   *
+   * This is the only size that leaves the candidate: it becomes the public
+   * preset `fileSize` and the private selection `fileSize`, which download
+   * progress reads as its total. It is never an estimate — `filesize_approx`
+   * can be a nominal-bitrate figure that materially overstates the bytes
+   * actually delivered — and it is neither verified nor the eventual output
+   * size. `null` weakens nothing: acquisition enforces actual bytes.
+   */
   readonly fileSize: number | null;
+  /**
+   * PRIVATE. The size-POLICY value: a positive declared `filesize`, else a
+   * positive `filesize_approx`, else `null` (`knownFileSize`).
+   *
+   * It exists so an approximation keeps doing the conservative jobs it did
+   * before: the per-format and pair size-limit admission gates, and the
+   * within-rung ranking tiebreak. It is not a size claim, and it must never
+   * reach public metadata, a `GenericSourceSelection`, progress, durable state
+   * or the browser.
+   */
+  readonly limitSize: number | null;
   /**
    * PRIVATE. The one raw upstream identifier this candidate was approved with,
    * already proven to satisfy the safe grammar. It exists so execution can name
@@ -858,9 +880,12 @@ function isNonMediaNote(raw: RawFormat): boolean {
 }
 
 /**
- * The ONE size-precedence rule: a declared positive size, else a positive
- * estimate, else unknown. Extracted so the progressive gate and the HLS shadow
- * gate cannot drift onto different readings of the same two fields.
+ * The ONE size-POLICY precedence rule: a declared positive size, else a
+ * positive estimate, else unknown. Extracted so the progressive gate and the
+ * HLS shadow gate cannot drift onto different readings of the same two fields.
+ *
+ * It feeds admission and ranking ONLY (`Candidate.limitSize`). What the Worker
+ * publishes, and what progress reads, is `declaredFileSize` alone.
  *
  * `null` means UNKNOWN, never zero and never "no limit". Metadata size is not
  * a security boundary in either path: the byte ceilings that matter are
@@ -872,6 +897,20 @@ function knownFileSize(raw: RawFormat): number | null {
     return raw.filesize_approx;
   }
   return null;
+}
+
+/**
+ * The positive upstream-DECLARED size, else `null`
+ * (SOURCE-FILESIZE-ESTIMATE-DRIFT-001).
+ *
+ * Deliberately no fallback to `filesize_approx`, and nothing is rounded,
+ * synthesized or inferred — not from duration, bitrate, container or height.
+ * In the pinned runtime an approximation is either extractor-supplied or
+ * yt-dlp's own `duration × tbr` product, and `-J` does not say which, so it is
+ * never presented as a size.
+ */
+function declaredFileSize(raw: RawFormat): number | null {
+  return typeof raw.filesize === "number" && raw.filesize > 0 ? raw.filesize : null;
 }
 
 /**
@@ -986,8 +1025,13 @@ function evaluateRawFormat(
   // A known size already over the limit must not be advertised. An UNKNOWN
   // size is not a rejection: the download path enforces an actual byte limit
   // independently, and metadata size is not a security boundary.
-  const fileSize = knownFileSize(raw);
-  if (fileSize !== null && fileSize > limits.maxFileSizeBytes) return reject("size-over-limit");
+  //
+  // The gate reads the POLICY size, so an approximation over the limit is
+  // still refused exactly as before; only the declared size is carried on as
+  // the candidate's `fileSize` (SOURCE-FILESIZE-ESTIMATE-DRIFT-001).
+  const limitSize = knownFileSize(raw);
+  if (limitSize !== null && limitSize > limits.maxFileSizeBytes) return reject("size-over-limit");
+  const fileSize = declaredFileSize(raw);
 
   return {
     ok: true,
@@ -1000,6 +1044,7 @@ function evaluateRawFormat(
       videoCodec: hasVideo ? normalizeCodecName(raw.vcodec) : null,
       audioCodec: hasAudio ? normalizeCodecName(raw.acodec) : null,
       fileSize,
+      limitSize,
       formatId,
       protocol: protocol as GenericSourceProtocol,
       videoConstraint,
@@ -1018,6 +1063,10 @@ function evaluateRawFormat(
  * order is container, then video codec, then audio codec, then the larger known
  * size, then higher fps, then upstream position — total and deterministic, with
  * no reliance on sort stability.
+ *
+ * "Known size" is the POLICY size (`limitSize`), approximation included, so
+ * withholding estimates from presentation changed no source selection
+ * (SOURCE-FILESIZE-ESTIMATE-DRIFT-001).
  */
 function compareCandidates(a: Candidate, b: Candidate): number {
   const containerRank = (c: Candidate) => (c.container === "mp4" ? 0 : c.container === "m4a" ? 1 : c.container === "webm" ? 2 : 3);
@@ -1052,7 +1101,7 @@ function compareCandidates(a: Candidate, b: Candidate): number {
     containerRank(a) - containerRank(b) ||
     videoRank(a) - videoRank(b) ||
     audioRank(a) - audioRank(b) ||
-    (b.fileSize ?? 0) - (a.fileSize ?? 0) ||
+    (b.limitSize ?? 0) - (a.limitSize ?? 0) ||
     (b.fps ?? 0) - (a.fps ?? 0) ||
     a.index - b.index
   );
@@ -1119,34 +1168,50 @@ const SPLIT_FAMILIES = Object.freeze([
 ] as const);
 
 /**
- * The PAIR-level known-size gate, and the public size a split preset advertises.
+ * The PAIR-level known-size ADMISSION gate. It reads the POLICY size
+ * (`limitSize`), so an approximation takes part exactly as it always has.
  *
  * `selectCandidates` already refused either half individually over the ceiling;
  * this is the additional check a pair needs, because two halves that each fit
  * can still be too large together (§13).
  *
- *   both sizes known   -> the exact sum, gated against the ceiling. The sum must
- *                         be a safe integer: beyond 2^53 an addition silently
- *                         stops being exact, and a budget decision made on an
- *                         inexact number is not a decision.
- *   either unknown     -> advertisable, with a public `fileSize` of `null` (§14).
- *                         No estimate is invented, and the pair is not refused:
- *                         SPLIT-03 enforces ACTUAL bytes against a combined
- *                         budget, which is the real security boundary. Metadata
- *                         size never was one.
+ *   both sizes known   -> the sum, gated against the ceiling. The sum must be a
+ *                         safe integer: beyond 2^53 an addition silently stops
+ *                         being exact, and a budget decision made on an inexact
+ *                         number is not a decision.
+ *   either unknown     -> admitted (§14). The pair is not refused: SPLIT-03
+ *                         enforces ACTUAL bytes against a combined budget,
+ *                         which is the real security boundary. Metadata size
+ *                         never was one.
+ *
+ * What the pair ADVERTISES is a separate question, answered by
+ * `pairDeclaredSize` (SOURCE-FILESIZE-ESTIMATE-DRIFT-001).
  */
-function pairKnownSize(
-  video: Candidate,
-  audio: Candidate,
-  maxFileSizeBytes: number,
-): { readonly advertisable: boolean; readonly fileSize: number | null } {
-  if (video.fileSize === null || audio.fileSize === null) {
-    return { advertisable: true, fileSize: null };
-  }
+function pairWithinSizeLimit(video: Candidate, audio: Candidate, maxFileSizeBytes: number): boolean {
+  if (video.limitSize === null || audio.limitSize === null) return true;
+  const combined = video.limitSize + audio.limitSize;
+  return Number.isSafeInteger(combined) && combined <= maxFileSizeBytes;
+}
+
+/**
+ * The size an ADMITTED split preset advertises: the safe sum of both members'
+ * DECLARED sizes, else `null` (§15; SOURCE-FILESIZE-ESTIMATE-DRIFT-001).
+ *
+ * The private split selection does not carry this sum. It retains each
+ * member's individual declared `fileSize`, and download progress later
+ * recomputes the aggregate total from those members via `splitKnownTotal()`.
+ *
+ * `null` whenever either member's size is unknown OR only approximate — no
+ * estimate is invented, and no approximation is summed into a claim. Even the
+ * declared sum describes the two INPUTS, not the merged output, whose container
+ * overhead differs. A pair that reaches here has passed `pairWithinSizeLimit`,
+ * whose policy sizes equal these declared ones whenever both are declared, so
+ * this sum was already gated.
+ */
+function pairDeclaredSize(video: Candidate, audio: Candidate): number | null {
+  if (video.fileSize === null || audio.fileSize === null) return null;
   const combined = video.fileSize + audio.fileSize;
-  if (!Number.isSafeInteger(combined)) return { advertisable: false, fileSize: null };
-  if (combined > maxFileSizeBytes) return { advertisable: false, fileSize: null };
-  return { advertisable: true, fileSize: combined };
+  return Number.isSafeInteger(combined) ? combined : null;
 }
 
 /**
@@ -1311,8 +1376,7 @@ function planProvenVideoFulfillments(
       continue;
     }
 
-    const size = pairKnownSize(video, audio, opts.maxFileSizeBytes);
-    if (!size.advertisable) {
+    if (!pairWithinSizeLimit(video, audio, opts.maxFileSizeBytes)) {
       shortfalls.set(video, "pair-size");
       continue;
     }
@@ -1331,7 +1395,7 @@ function planProvenVideoFulfillments(
       audio,
       source,
       targetContainer,
-      fileSize: size.fileSize,
+      fileSize: pairDeclaredSize(video, audio),
     });
   }
 
@@ -1535,8 +1599,9 @@ function constructGenericPresets(
     // table's derived target for a pair. Never a second, independently guessed
     // value (§20/§75).
     container: f.targetContainer,
-    // Combined known size for a pair, the source's own size for a muxed
-    // fulfilment, `null` when anything is unknown (§15).
+    // Combined DECLARED size for a pair, the source's own declared size for a
+    // single fulfilment, `null` when anything is unknown or only approximate
+    // (§15; SOURCE-FILESIZE-ESTIMATE-DRIFT-001).
     fileSize: f.fileSize,
     hasVideo: true,
     // DERIVED from the member that would carry the audio stream — the single

@@ -184,4 +184,49 @@ change, and it is confined to ONE scenario:
   the HLS-7 contract.
 - Every other scenario, including `case03-segmented-dash-above-progressive`
   and the HLS rows in `case18` and the synthetic X case (no `url`, or no proven
-  audio), must still match the golden record in full.
+  audio), must still match the golden record in full — apart, for the two
+  synthetic X scenarios only, from the size fields the
+  `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` carve-out below names.
+
+### The SOURCE-FILESIZE-ESTIMATE-DRIFT-001 carve-out — still NOT regenerated
+
+`SOURCE-FILESIZE-ESTIMATE-DRIFT-001` is a deliberate PRESENTATION change.
+
+**What changed.** An upstream `filesize_approx` is no longer published as a
+preset `fileSize`. It is also no longer carried in a private selection's
+`fileSize`, which download progress reads as its total. Only a positive declared
+`filesize` is.
+
+**What did not change.** The approximation still takes part in:
+
+- per-format and pair size-limit admission;
+- clear-HLS admission;
+- within-rung ranking;
+- `size_limit_exceeded` accounting.
+
+**Scenarios affected.** Only two corpus scenarios advertise sources whose sizes
+are approximation-only:
+
+- `x-synthetic-x-progressive-unknown-audio-ffmpeg`
+- `x-synthetic-x-progressive-unknown-audio-no-ffmpeg`
+
+For their `preset:best`, `preset:360` and `preset:240`, exactly three size
+locations are now expected as `null`:
+
+- the preset's `fileSize`;
+- its selection's `source.fileSize`;
+- its plan's `generic.source.fileSize`.
+
+**How the test enforces it.** `source-quality.server.test.ts` names them in
+`ESTIMATE_ONLY_SIZE_SUPPRESSED`. Before comparing, it proves two things:
+
+- the golden record still holds the historical values (2,400,000 / 1,200,000);
+- each equals the fixture row's `filesize_approx`, on a row that declares no
+  `filesize`.
+
+A separate test proves the carve-out names exactly the approximation-only golden
+sizes and nothing else. Every other field of those scenarios, and every other
+scenario, is compared in full: preset ids, upstream ids, plans, selectors and
+`sourceQuality`.
+
+**The golden record is historical and MUST NOT be regenerated.**

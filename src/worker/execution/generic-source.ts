@@ -289,7 +289,13 @@ export const GenericSourceSelectionSchema = z
      * never carries, encodes or paraphrases the upstream codec string.
      */
     audioConstraint: GenericAudioConstraintSchema,
-    /** Known upstream size, when the extractor reported one. Never trusted alone. */
+    /**
+     * Positive upstream-DECLARED source size when present; `null` when only an
+     * approximate or unknown size was available during analysis. This field may
+     * feed progress presentation, so an upstream estimate is deliberately not
+     * carried here (SOURCE-FILESIZE-ESTIMATE-DRIFT-001). Acquisition enforces
+     * actual bytes independently, so it is never trusted as a byte authority.
+     */
     fileSize: z.number().int().positive().nullable(),
   })
   .strict()
