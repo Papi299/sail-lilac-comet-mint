@@ -6962,14 +6962,16 @@ public control plane on the old image and on the new one:
 | Presets / formats | 0 / 0 — the browser showed "No compatible download" | `preset:best`, `preset:360`, `preset:240` |
 | `preset:best` | — | MP4, 360p class, `hasAudio: false`, `audioCodec: null` |
 
-**One real Production job.** It went
-`queued → analyzing → downloading → uploading → ready` in about 5 s. `processing`
+**One real Production job.** Its observed status trace was
+`queued → analyzing → downloading → uploading → ready`, in about 5 s. `processing`
 was not sampled for this fast `keep-original` job; its durable commit is causally
-proven under the accepted lifecycle rule (§11g). The ready download answered `303`
-to a presigned R2 GET, which returned a valid MP4 of **774,763 bytes**: H.264
-848×384, 30 fps, ≈ 59.866 s of video, with an AAC audio stream actually present.
-No FFmpeg or ffprobe process ran during the job, and the per-job workspace held a
-single file, as `keep-original` requires.
+proven under the accepted lifecycle rule (§11g). At source `8b59cdff…`,
+`beginUploading()` is legal only from `processing`, so the durable lifecycle was
+`queued → analyzing → downloading → processing → uploading → ready`. The ready
+download answered `303` to a presigned R2 GET, which returned a valid MP4 of
+**774,763 bytes**: H.264 848×384, 30 fps, ≈ 59.866 s of video, with an AAC audio
+stream actually present. No FFmpeg or ffprobe process ran during the job, and the
+per-job workspace held a single file, as `keep-original` requires.
 
 **Browser acceptance** (*operator-attested*). The operator analyzed the post and
 downloaded it, and the video and its audio both played.
@@ -7126,11 +7128,15 @@ What the retry established:
   intact. `preset:best`, `preset:360` and `preset:240` were unchanged. At that
   acceptance point, on a Production image that predates every HLS step, the two
   HLS renditions stayed inventory-only.
-- **One Production job.** `preset:best` went
-  `queued → analyzing → downloading → uploading → ready` in ≈ 5.3 s. The file
-  route answered `303` to a presigned R2 GET, which delivered 774,763 bytes with
-  SHA-256 `8ee08a22…`, byte-identical to the pre-P1 deliveries of this post (H.264
-  848×384 plus AAC). No FFmpeg or ffprobe ran during the job.
+- **One Production job.** The `preset:best` job's observed status trace was
+  `queued → analyzing → downloading → uploading → ready`, in ≈ 5.3 s. `processing`
+  was not sampled. At source `593f47df…`, `beginUploading()` is legal only from
+  `processing`, so `processing` committed before `uploading`: the durable
+  lifecycle was `queued → analyzing → downloading → processing → uploading →
+  ready`. The file route answered `303` to a presigned R2 GET, which delivered
+  774,763 bytes with SHA-256 `8ee08a22…`, byte-identical to the pre-P1
+  deliveries of this post (H.264 848×384 plus AAC). No FFmpeg or ffprobe ran
+  during the job.
 - **Stability and scope.** VM stability passed 22/22 over ≈ 314 s, Vercel passed
   11/11, there were 0 5xx, and the close checks passed 30/0. No Vercel,
   Cloudflare, R2, systemd-file, `worker.env`, Lima or nftables change was made.
@@ -7204,10 +7210,17 @@ What the deployment established:
 - **Selection identity.** The displayed "Best downloadable — 360p" was the option
   for `preset:best`, and the one create request submitted
   `formatId: "preset:best"`.
-- **One Product job.** `analyzing → downloading → uploading → ready`. The file
-  route answered `303` to a presigned R2 GET, which delivered 774,763 bytes,
-  byte-identical to the P1 acceptance (SHA-256 `8ee08a22…`). The file validated
-  as MP4 with H.264 Main 848×384 at 30 fps and AAC-LC stereo, ≈ 59.9 s.
+- **One Product job.** The browser's recorded status trace was
+  `analyzing → downloading → uploading`. The recorder missed the final poll;
+  `ready` is established by the ready card and by the file route's `303`, both
+  of which require a `ready` job. `queued` and `processing` were not captured.
+  The durable lifecycle was nevertheless the full
+  `queued → analyzing → downloading → processing → uploading → ready`: at the
+  unchanged Worker's source `593f47df…`, `analyzing` is entered only from
+  `queued` and `uploading` only from `processing`. The file route answered
+  `303` to a presigned R2 GET, which delivered 774,763 bytes, byte-identical to
+  the P1 acceptance (SHA-256 `8ee08a22…`). The file validated as MP4 with H.264
+  Main 848×384 at 30 fps and AAC-LC stereo, ≈ 59.9 s.
 - **Stability.** 12 samples over 6 m 19 s. The alias stayed on `dpl_BcefWQ…`,
   READY, and the shell, `/api/health` and Worker health returned 200 throughout.
   The deployment's runtime logs showed 0 5xx and 0 error-level rows. Every 401 was
@@ -7443,8 +7456,13 @@ in general.
 
 - **Job.** Exactly one: `29a78c31d01d139aac78d92bfae991b2` on the X post,
   `preset:best`.
-- **Lifecycle.** `queued` → `analyzing` → `downloading` → `uploading` → `ready`,
-  in about 11 s.
+- **Observed polling trace.** `queued` → `analyzing` → `downloading` →
+  `uploading` → `ready`, in about 11 s. `queued` is the job-creation response;
+  19 status polls then sampled `analyzing`, `downloading`, `uploading` and
+  `ready`.
+- **Durable lifecycle.** `queued` → `analyzing` → `downloading` → `processing` →
+  `uploading` → `ready`. `processing` was not sampled, but it committed: at
+  source `f9a8109b…`, `beginUploading()` is legal only from `processing`.
 - **Progress.** Eight `downloading` samples were observed, and every one had
   `totalBytes: null`.
 - **Delivery.** A `303` to a signed R2 GET returned `200` and delivered
@@ -7743,8 +7761,12 @@ operator-measured*).**
 
 - **Job.** Exactly one: `cdf74bd3364d5f00dc3f132e8011a212` on the X post,
   `preset:best`.
-- **Lifecycle.** `queued` → `analyzing` → `downloading` → `uploading` → `ready`,
-  across 18 sampled states.
+- **Observed polling trace.** `queued` → `analyzing` → `downloading` →
+  `uploading` → `ready`. `queued` is the job-creation response; 18 status polls
+  then sampled `analyzing`, `downloading`, `uploading` and `ready`.
+- **Durable lifecycle.** `queued` → `analyzing` → `downloading` → `processing` →
+  `uploading` → `ready`. `processing` was not sampled, but it committed: at
+  source `8f087639…`, `beginUploading()` is legal only from `processing`.
 - **Progress.** Six `downloading` samples were observed, and every one had
   `totalBytes: null`.
 - **Delivery.** A `303` to a signed R2 GET returned `200` and delivered
