@@ -1033,9 +1033,15 @@ export function executionPlanRequiresProcessing(plan: ExecutionPlan): boolean {
 /** The two private families a generic preset can be owned by. */
 type GenericPresetOwner = "progressive" | "clear-hls";
 
-/** Does this private map say ANYTHING about `id`? Never invokes an accessor. */
+/**
+ * Does this private map claim `id` as an OWN property? An inherited key is no
+ * claim, so a prototype can neither create an owner nor manufacture ambiguity.
+ * An own accessor still claims, and is never invoked: `Object.hasOwn()` reads
+ * no value. Ownership says nothing about the value — each family's derivation
+ * validates that.
+ */
 function claims(map: unknown, id: string): boolean {
-  return typeof map === "object" && map !== null && id in map;
+  return typeof map === "object" && map !== null && Object.hasOwn(map, id);
 }
 
 /**

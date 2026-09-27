@@ -27,6 +27,7 @@ import {
   GENERIC_SPLIT_VIDEO_PRESET_IDS,
   deriveClearHlsExecutionPlan,
   deriveExecutionPlan,
+  deriveGenericExecutionPlan,
   executionPlanRequestedFormatId,
   executionPlanRequiresProcessing,
   executionPlanTargetContainer,
@@ -732,31 +733,85 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
     }
   });
 
-  it("I: an INHERITED or accessor claim still counts, and no accessor is invoked", () => {
-    // Any statement a map makes about the id is a claim for the ambiguity rule.
-    const inherited = Object.create({ "preset:1080": selection() }) as ClearHlsMediaPlaylistSelections;
+  // ── I. Only an OWN property claims ────────────────────────────────────────
+  //
+  // `in` would also see a prototype's keys. Ownership is `Object.hasOwn()`, so an
+  // inherited entry can neither make its family the owner nor create ambiguity.
+
+  /** A progressive map whose ONLY `preset:1080` entry sits on its prototype. */
+  const inheritedProgressive = () =>
+    Object.create({ "preset:1080": progressiveSource }) as GenericSourceSelections;
+
+  /** An HLS map whose ONLY `preset:1080` entry sits on its prototype. */
+  const inheritedHls = () =>
+    Object.create({ "preset:1080": selection() }) as ClearHlsMediaPlaylistSelections;
+
+  it("I: an INHERITED progressive selection alone is NOT an owner", () => {
+    const video = genericMeta([progressive("preset:1080")]);
+    const selections = inheritedProgressive();
+    assert.ok("preset:1080" in selections, "the key IS visible to `in`");
+
+    // Positive control: the same source as an OWN entry is fulfilled.
+    assert.equal(
+      operationOf(
+        deriveExecutionPlan(
+          { strategy: "yt-dlp", video, selections: progressiveSelections, hlsSelections: shadow({}) },
+          "preset:1080",
+        ),
+      ),
+      "keep-original",
+    );
+    // The progressive derivation indexes the map, so on its own it WOULD consume
+    // the inherited entry. Ownership is what refuses it.
+    assert.equal(
+      deriveGenericExecutionPlan(video, selections, "preset:1080").operation,
+      "keep-original",
+      "the inherited entry would genuinely produce a plan",
+    );
     expectFormatUnavailable(
       () =>
         deriveExecutionPlan(
-          {
-            strategy: "yt-dlp",
-            video: genericMeta([progressive("preset:1080")]),
-            selections: progressiveSelections,
-            hlsSelections: inherited,
-          },
+          { strategy: "yt-dlp", video, selections, hlsSelections: shadow({}) },
           "preset:1080",
         ),
-      "an inherited HLS claim beside a progressive one",
+      "an inherited progressive entry owns nothing",
     );
+  });
 
-    let reads = 0;
-    const accessor = Object.defineProperty({}, "preset:1080", {
-      enumerable: true,
-      get() {
-        reads += 1;
-        return selection();
+  it("I: an INHERITED HLS entry beside an own progressive selection is ignored, not ambiguity", () => {
+    const hlsSelections = inheritedHls();
+    assert.ok("preset:1080" in hlsSelections, "the key IS visible to `in`");
+    const plan = deriveExecutionPlan(
+      {
+        strategy: "yt-dlp",
+        video: genericMeta([progressive("preset:1080")]),
+        selections: progressiveSelections,
+        hlsSelections,
       },
-    }) as ClearHlsMediaPlaylistSelections;
+      "preset:1080",
+    );
+    assert.equal(operationOf(plan), "keep-original");
+    assert.equal(JSON.stringify(plan).includes("m3u8"), false, "no HLS provenance in it");
+  });
+
+  it("I: an INHERITED progressive entry beside an own HLS selection is ignored, not ambiguity", () => {
+    const selections = inheritedProgressive();
+    assert.ok("preset:1080" in selections, "the key IS visible to `in`");
+    const analysis = {
+      strategy: "yt-dlp" as const,
+      video: genericMeta([hlsPublic("preset:1080")]),
+      selections,
+      hlsSelections: shadow({ "preset:1080": selection() }),
+    };
+    const plan = deriveExecutionPlan(analysis, "preset:1080");
+    assert.equal(operationOf(plan), "clear-hls-remux");
+    assert.deepEqual(
+      plan.strategy === "yt-dlp" ? plan.generic : null,
+      deriveClearHlsExecutionPlan(analysis.hlsSelections, "preset:1080"),
+    );
+  });
+
+  it("I: INHERITED-only entries own nothing, so the preset is refused", () => {
     expectFormatUnavailable(
       () =>
         deriveExecutionPlan(
@@ -764,13 +819,157 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
             strategy: "yt-dlp",
             video: genericMeta([hlsPublic("preset:1080")]),
             selections: {},
-            hlsSelections: accessor,
+            hlsSelections: inheritedHls(),
+          },
+          "preset:1080",
+        ),
+      "an inherited HLS entry alone",
+    );
+    // Both maps inherited: neither owns it, whichever family the preset looks like.
+    for (const shape of [progressive("preset:1080"), hlsPublic("preset:1080")]) {
+      expectFormatUnavailable(
+        () =>
+          deriveExecutionPlan(
+            {
+              strategy: "yt-dlp",
+              video: genericMeta([shape]),
+              selections: inheritedProgressive(),
+              hlsSelections: inheritedHls(),
+            },
+            "preset:1080",
+          ),
+        `both inherited: ${JSON.stringify(shape)}`,
+      );
+    }
+  });
+
+  it("I: an OWN accessor still claims, and no accessor is invoked", () => {
+    let reads = 0;
+    const accessorMap = <T>(value: T) =>
+      Object.defineProperty({}, "preset:1080", {
+        enumerable: true,
+        get() {
+          reads += 1;
+          return value;
+        },
+      }) as Readonly<Record<string, T>>;
+
+    // Alone it is the HLS owner, and HLS-6 refuses an entry that is not data.
+    expectFormatUnavailable(
+      () =>
+        deriveExecutionPlan(
+          {
+            strategy: "yt-dlp",
+            video: genericMeta([hlsPublic("preset:1080")]),
+            selections: {},
+            hlsSelections: accessorMap(selection()),
           },
           "preset:1080",
         ),
       "an accessor HLS entry",
     );
+    // Beside an own entry in the OTHER map it is a claim, so the preset is
+    // ambiguous and refused — in either direction.
+    expectFormatUnavailable(
+      () =>
+        deriveExecutionPlan(
+          {
+            strategy: "yt-dlp",
+            video: genericMeta([progressive("preset:1080")]),
+            selections: progressiveSelections,
+            hlsSelections: accessorMap(selection()),
+          },
+          "preset:1080",
+        ),
+      "an own accessor HLS claim beside a progressive one",
+    );
+    expectFormatUnavailable(
+      () =>
+        deriveExecutionPlan(
+          {
+            strategy: "yt-dlp",
+            video: genericMeta([hlsPublic("preset:1080")]),
+            selections: accessorMap(progressiveSource),
+            hlsSelections: shadow({ "preset:1080": selection() }),
+          },
+          "preset:1080",
+        ),
+      "an own accessor progressive claim beside an HLS one",
+    );
     assert.equal(reads, 0, "ownership is read without running a getter");
+  });
+
+  it("I: any OWN property claims — a non-enumerable one, or one on a null-prototype map", () => {
+    // Non-enumerable: invisible to `Object.keys()`, still owned.
+    const hidden = Object.defineProperty({}, "preset:1080", {
+      value: selection(),
+      enumerable: false,
+    }) as ClearHlsMediaPlaylistSelections;
+    assert.deepEqual(Object.keys(hidden), []);
+    assert.equal(
+      operationOf(
+        deriveExecutionPlan(
+          {
+            strategy: "yt-dlp",
+            video: genericMeta([hlsPublic("preset:1080")]),
+            selections: {},
+            hlsSelections: hidden,
+          },
+          "preset:1080",
+        ),
+      ),
+      "clear-hls-remux",
+    );
+    expectFormatUnavailable(
+      () =>
+        deriveExecutionPlan(
+          {
+            strategy: "yt-dlp",
+            video: genericMeta([progressive("preset:1080")]),
+            selections: progressiveSelections,
+            hlsSelections: hidden,
+          },
+          "preset:1080",
+        ),
+      "a non-enumerable HLS claim beside a progressive one",
+    );
+
+    // Null prototype: there is no inherited `hasOwnProperty` to call, and none
+    // is needed.
+    const bareProgressive = Object.assign(Object.create(null), {
+      "preset:1080": progressiveSource,
+    }) as GenericSourceSelections;
+    const bareHls = Object.assign(Object.create(null), {
+      "preset:1080": selection(),
+    }) as ClearHlsMediaPlaylistSelections;
+    assert.equal(
+      operationOf(
+        deriveExecutionPlan(
+          {
+            strategy: "yt-dlp",
+            video: genericMeta([progressive("preset:1080")]),
+            selections: bareProgressive,
+            hlsSelections: shadow({}),
+          },
+          "preset:1080",
+        ),
+      ),
+      "keep-original",
+    );
+    assert.equal(
+      operationOf(
+        deriveExecutionPlan(
+          {
+            strategy: "yt-dlp",
+            video: genericMeta([hlsPublic("preset:1080")]),
+            selections: {},
+            hlsSelections: bareHls,
+          },
+          "preset:1080",
+        ),
+      ),
+      "clear-hls-remux",
+    );
   });
 
   // ── Advertising is still required ─────────────────────────────────────────
