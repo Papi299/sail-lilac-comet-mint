@@ -10,9 +10,22 @@ TLS termination, external egress enforcement, network-namespace ownership and
 R2 placement/jurisdiction.
 
 **Status — current as of 2026-09-27, recorded by
-`YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-DOCS-CLOSURE-001`.** It is
-documentation only and re-measured nothing on the VM. It records the
-operator-held evidence of three 2026-09-27 tasks, all in §11:
+`SOURCE-FILESIZE-ESTIMATE-DRIFT-001-DOCS-CLOSURE-001`.** It is documentation
+only and re-measured nothing on the VM. It records the operator-held evidence
+of the `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` rollout, all of it 2026-09-27 (§11,
+§11h):
+
+- the Worker release-candidate qualification;
+- the isolated public-X discriminator qualification;
+- the Production promotion and live acceptance, which moved
+  `videofetch-worker:latest` to `sha256:0a6e66b0…`.
+
+It also records one read-only provider observation of the unchanged Vercel
+Production deployment (2026-09-27 14:43Z).
+
+The previous record was `YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-DOCS-CLOSURE-001`
+(2026-09-27). It recorded the operator-held evidence of three earlier
+2026-09-27 tasks, all in §11:
 
 - the image-identity compatibility alias
   (`YTDLP-CURRENT-LIMIT-4GIB-IMAGE-IDENTITY-COMPATIBILITY-ALIAS-001`);
@@ -21,9 +34,7 @@ operator-held evidence of three 2026-09-27 tasks, all in §11:
 - the live current-limit byte-guard acceptance
   (`YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN`).
 
-It also records one read-only provider observation of the current Vercel
-Production deployment. The previous record was
-`WORKER-LIVENESS-STATIC-USER-PRODUCTION-CLOSURE-001`, which recorded the
+Before that came `WORKER-LIVENESS-STATIC-USER-PRODUCTION-CLOSURE-001`, which recorded the
 operator-held evidence of `WORKER-LIVENESS-STATIC-USER-LIVE-REACCEPTANCE-001`
 (2026-09-26); that closed the last open Worker health item in §10. Before it
 came `WORKER-LIVENESS-STATIC-USER-CORRECTION-001` and its evidence
@@ -31,12 +42,16 @@ reconciliation. That record covered the operator-held evidence of
 `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-LIVE-ACCEPTANCE-001` plus one read-only
 provider observation of Vercel Production. Before it came
 `HLS-10-PRODUCTION-ACCEPTANCE-DOCS-CLOSURE-001` and
-`HLS-PRE-HLS10-DOCS-STATE-RECONCILIATION-001` (both 2026-09-26). The Worker
-image and rollback rows are the accepted operator-measured HLS-10 Production
-state (§4j). None of the later tasks promoted an image: the liveness
-re-acceptance and all three 2026-09-27 tasks observed that same image. The
+`HLS-PRE-HLS10-DOCS-STATE-RECONCILIATION-001` (both 2026-09-26).
+
+The Worker image and rollback rows are now the accepted operator-measured
+`SOURCE-FILESIZE-ESTIMATE-DRIFT-001` Production state (§11h). Between HLS-10
+(2026-09-26) and that promotion no task promoted an image: the liveness
+re-acceptance and the three earlier 2026-09-27 tasks all observed the HLS-10
+image `sha256:e5b1144c…`, which is now the immediate Worker rollback. The
 Vercel Production row names the repaired deployment `dpl_YrhkEQC4…`, observed
-read-only from provider metadata on 2026-09-27.
+read-only from provider metadata on 2026-09-27; the filesize rollout did not
+change it.
 
 - Phase 9 and Phase 10 are complete and accepted. Generic yt-dlp extraction is
   enabled in Production, and the execution plane runs on demand.
@@ -56,8 +71,24 @@ read-only from provider metadata on 2026-09-27.
   source (2026-09-25). HLS-9B qualified and retained a release candidate built
   from merged `main` `f0b47bd5…` (2026-09-26). HLS-10 promoted that exact image,
   `sha256:e5b1144c…`, to `videofetch-worker:latest` and accepted it end to end on
-  a real public HLS source. The immediate Worker rollback is the pre-HLS image
-  `sha256:5925515f…`. See §4j.
+  a real public HLS source. See §4j. It stayed `latest` until 2026-09-27, when
+  `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` promoted `sha256:0a6e66b0…`. That image
+  contains the same clear-HLS source, and its release qualification included
+  the clear-HLS child as a mandatory gate. `sha256:e5b1144c…` is now the
+  immediate Worker rollback, and the pre-HLS image `sha256:5925515f…` is a
+  deeper one.
+- **Generic preset `fileSize` publishes only upstream-declared sizes —
+  `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, CLOSED / DEPLOYED / PRODUCTION
+  ACCEPTED (2026-09-27).**
+  - **Source.** PR #88, merge `f9a8109b…`.
+  - **Promotion.** The qualified candidate `sha256:0a6e66b0…` became
+    `videofetch-worker:latest` at 14:02:55Z. Only the Worker unit was
+    restarted, and Vercel did not change.
+  - **Live proof.** On one public X post, the four approximation-only preset
+    sizes became `null` and nothing else changed. A declared-size YouTube
+    control still published its size. One job's durable `fileSize` equalled
+    the 38,257,789 bytes it delivered.
+  - **Record.** §11h.
 - **Worker health — both §10 items CLOSED / PASS / PRODUCTION ACCEPTED
   (2026-09-26).** `GET /v1/healthz` through the real TLS endpoint was accepted
   first. The external liveness probe's first live deployment failed at the
@@ -113,10 +144,12 @@ records are in §11 and §11a–§11h.
 | Source rendition inventory (P1, `sourceQuality`) | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** — PR #63, Vercel first, Worker promoted 2026-09-18 on the retry; live `sourceQuality` accepted through Vercel | GitHub-verifiable + operator-measured — §11h |
 | Source-vs-downloadable quality UI (P2) | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** — PR #64, browser presentation only; Vercel `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq` deployed 2026-09-19; the Worker did not change | GitHub-verifiable + operator-measured — §11h |
 | Clear-HLS v1 (HLS-1 … HLS-10) | **CLOSED / PASS / PRODUCTION ACCEPTED — deployed in the Production Worker since 2026-09-26.** HLS-7 (PR #77) source-activated it; HLS-8 (PR #78) and HLS-9A (PR #79) merged its deterministic and release-image acceptance tooling. HLS-9B qualified and retained a candidate from merged `main` `f0b47bd567dd978374bfec1a01e6d9768c747160`. HLS-10 promoted that exact image and accepted it on a real public HLS source, with no rollback | source GitHub-verifiable; candidate and Production acceptance operator-measured — §4j |
-| HLS release candidate — promoted | `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a` as `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c` (source `f0b47bd5…`): SPLIT-07 `-03` PASS 47/47 (HLS-9B), promoted by HLS-10 on 2026-09-26 and now also `videofetch-worker:latest`. Package drift against the previous Production image is the `libssl3`/`openssl` pair only, accepted as non-blocking before promotion; HLS-10's real-network acceptance then passed | operator-measured — §4j |
-| Worker runtime source | `f0b47bd567dd978374bfec1a01e6d9768c747160`, tree `2b1099bb146a88f4a4e70bdd3065fba100ef5f7f` (PR #79 merge) — the qualified source of the image promoted 2026-09-26 by `HLS-10-PRODUCTION-PROMOTION-REAL-SOURCE-ACCEPTANCE-001`. The image was **not** built from later `main`: at promotion `main` was `1524cdc4a8f1347431481e7fc4c2772aabe7ac60` (tree `481e4eac86357fb1bc0d1e4e19d498331e21f3fe`), four documentation-only commits ahead, with no runtime-code drift. It superseded P1's `593f47df…` (2026-09-18). Before that came the unknown-audio promotion's `8b59cdff…` (2026-09-18), the 4 GiB rollout's `2e6c0cf9…` (2026-09-17) and SPLIT-08E's `6ce4ce2b…` (2026-09-13) | commit and drift GitHub-verifiable; image↔source identity operator-measured — §4j, §11h |
-| Worker image | `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a` as `videofetch-worker:latest`, also retained as `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c`; pinned yt-dlp `2026.08.19`, unchanged. Observed as `latest` and as the running Worker throughout the HLS-10 acceptance epoch (container `0bfaf6810dc233819ac3281903fc750c66fb5a969ed6725c5408521399dbbf83`, NRestarts 0). It contains clear-HLS v1. Since 2026-09-27 the same image is also addressable as `videofetch-worker:f0b47bd567dd978374bfec1a01e6d9768c747160`. That is a Docker **source-SHA compatibility alias** for the older acceptance harness's naming convention, **not provenance**: the source→image relationship is the accepted HLS-9B/HLS-10 evidence (§11) | operator-measured — §4j, §11 |
-| Previous Worker image — rollback asset | **Immediate:** `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e`, retained as `videofetch-worker:rc-593f47dfffe7-5925515fb002` (source `593f47df…`, the P1 image: pre-HLS, sends `sourceQuality`; Production 2026-09-18 → 2026-09-26). **Deeper:** `sha256:d6aa8b404d015e72bb216f364b900271521d44f66bae672bd012d4239fc52b0e`, retained as `videofetch-worker:rc-8b59cdffbfe5-d6aa8b404d01` (source `8b59cdff…`, the unknown-audio image, without `sourceQuality`), then `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0`, retained as `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799` (source `2e6c0cf9…`, the 4 GiB rollout image), then `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b`, retained as `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (source `6ce4ce2b…`, the SPLIT-08E image, 500 MiB default). Rollback is an image retag onto the same disk-backed unit and workspace | operator-measured — §9, §11h |
+| HLS release candidate — promoted | `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a` as `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c` (source `f0b47bd5…`): SPLIT-07 `-03` PASS 47/47 (HLS-9B), promoted by HLS-10 on 2026-09-26 and `videofetch-worker:latest` until 2026-09-27 — now the **immediate Worker rollback** (below). Package drift against the previous Production image is the `libssl3`/`openssl` pair only, accepted as non-blocking before promotion; HLS-10's real-network acceptance then passed | operator-measured — §4j |
+| Generic preset `fileSize` semantics (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`) | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED — 2026-09-27.** PR #88 (merge `f9a8109b…`). A generic preset `fileSize` now publishes only a positive upstream-declared `filesize`. An approximation-only source publishes `null`, while `filesize_approx` stays private for conservative size-limit admission and ranking. No public schema changed and no Vercel deployment was needed. Live proof: four approximation-only preset sizes on one public X post became `null` with every other field unchanged; a declared-size YouTube control still published its size; one job's durable `fileSize` equalled its delivered bytes | source GitHub-verifiable; candidate, discriminator and Production acceptance operator-measured — §11, §11h |
+| Filesize release candidate — promoted | `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5` as `videofetch-worker:rc-f9a8109bb130-0a6e66b0eb1f` (source `f9a8109b…`): SPLIT-07 `-03` PASS 47/47, with mp4, webm and clear-HLS children passing. The filesize suites passed 370/370 inside the image. Its runtime/package inventory is byte-identical to `sha256:e5b1144c…`. Promoted 2026-09-27 and now also `videofetch-worker:latest` | operator-measured — §11h |
+| Worker runtime source | `f9a8109bb1302076b5b415b572c0ab288467250a`, tree `846707b20ff39cd93f4e258cc7c76a01818f880d` (PR #88 merge) — the qualified source of the image promoted 2026-09-27 by `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`. It was `main` itself at promotion. Relative to the previous Worker source, its only runtime change is in `src/worker/analysis/ytdlp-analysis.server.ts`; the Worker contract, state, HLS and security paths, `Dockerfile.worker` and the package files are identical. It superseded HLS-10's `f0b47bd567dd978374bfec1a01e6d9768c747160` (tree `2b1099bb…`, 2026-09-26). The HLS-10 image was **not** built from later `main`: at that promotion `main` was `1524cdc4a8f1347431481e7fc4c2772aabe7ac60` (tree `481e4eac86357fb1bc0d1e4e19d498331e21f3fe`), four documentation-only commits ahead, with no runtime-code drift. HLS-10 superseded P1's `593f47df…` (2026-09-18). Before that came the unknown-audio promotion's `8b59cdff…` (2026-09-18), the 4 GiB rollout's `2e6c0cf9…` (2026-09-17) and SPLIT-08E's `6ce4ce2b…` (2026-09-13) | commit and drift GitHub-verifiable; image↔source identity operator-measured — §4j, §11h |
+| Worker image | `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5` as `videofetch-worker:latest`, also retained as `videofetch-worker:rc-f9a8109bb130-0a6e66b0eb1f`; pinned yt-dlp `2026.08.19`, unchanged. Promoted 2026-09-27 at 14:02:55Z by `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, and observed as `latest` and as the running Worker throughout that acceptance epoch (container `5952d4e06e4c…`, NRestarts 0). It contains clear-HLS v1 and the filesize fix. **No source-SHA alias exists for this image**; none was created | operator-measured — §11h |
+| Previous Worker image — rollback asset | **Immediate:** `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`, retained as `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c` (source `f0b47bd5…`, the HLS-10 clear-HLS image; Production 2026-09-26 → 2026-09-27). A rollback to it keeps clear HLS and brings back the approximation-backed generic `fileSize`. Since 2026-09-27 (`YTDLP-CURRENT-LIMIT-4GIB-IMAGE-IDENTITY-COMPATIBILITY-ALIAS-001`) the same image is also addressable as `videofetch-worker:f0b47bd567dd978374bfec1a01e6d9768c747160`. That is a Docker **source-SHA compatibility alias** for the older acceptance harness's naming convention, **not provenance**, and it now names the immediate rollback image, **not** current Production. The source→image relationship is the accepted HLS-9B/HLS-10 evidence (§4j, §11). **Deeper:** `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e`, retained as `videofetch-worker:rc-593f47dfffe7-5925515fb002` (source `593f47df…`, the P1 image: pre-HLS, sends `sourceQuality`; Production 2026-09-18 → 2026-09-26), then `sha256:d6aa8b404d015e72bb216f364b900271521d44f66bae672bd012d4239fc52b0e`, retained as `videofetch-worker:rc-8b59cdffbfe5-d6aa8b404d01` (source `8b59cdff…`, the unknown-audio image, without `sourceQuality`), then `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0`, retained as `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799` (source `2e6c0cf9…`, the 4 GiB rollout image), then `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b`, retained as `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (source `6ce4ce2b…`, the SPLIT-08E image, 500 MiB default). Rollback is an image retag onto the same disk-backed unit and workspace | operator-measured — §9, §11h |
 | Vercel Production | `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9` — target `production`, READY / PROMOTED, created 2026-09-27T07:17:55.768Z, build started 07:17:56.654Z, READY 07:18:22.943Z. The provider's deployment-source field is `source: cli`; the provider-recorded action relationship is `meta.action: redeploy` with `meta.originalDeploymentId` `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd`. It is the repaired control plane of `PRODUCTION-CONTROL-PLANE-WORKER-ACCESS-CUTOVER-001`: it consumed the replaced Cloudflare Access pair and restored login / diagnostics / sites to 200 (§11). The redeploy chain continues: Vercel records `dpl_BJYRG7…` (2026-09-26 20:10Z, `source: redeploy`) as a redeploy of `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, the P2 deployment of 2026-09-19 from `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478` by chain of custody. **Rollback — Access state first:** Vercel applies environment changes only to new deployments, so each older deployment keeps its creation-time environment, including its Access pair. `dpl_BJYRG7…` is directly known to carry an Access credential state that did not reach the Worker, so rolling back to it would reintroduce the known-broken path and it is **not** a service-restoring target. The older code layers — `dpl_BcefWQ…`, the **immediate code rollback** `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` (from `593f47df…`, accepts `sourceQuality`, no Worker rollback needed) and the **deeper** `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` (from `397f238b…`, predates `sourceQuality`: roll the Worker back **before** using it) — are code-compatible as described in §9. Their current Access validity has **not** been measured and must not be assumed from code compatibility. Access credential compatibility must be re-established and reverified for any rollback target first (§9) | *provider-observed* deployment metadata (read-only, 2026-09-27) plus accepted operator-measured repair evidence (§11) — establishes deployment identity and state, **not** a Git-attested source commit (§11h) |
 | Execution plane | **on demand**; the idle state is **Stopped** | §3c, §11h |
 | Worker health (§10) | `GET /v1/healthz` through the TLS endpoint: **ACCEPTED 2026-09-26**. External liveness probe: **CLOSED / PASS / PRODUCTION ACCEPTED 2026-09-26** — the static-account deployment from `main` `db20d910…` (PR #84), after the first `DynamicUser` deployment failed and was rolled back. `videofetch-worker-liveness.timer` is enabled on the VM; the service stays `static` | operator-measured — §8, §10, §11 |
@@ -356,10 +389,12 @@ delivered-media ceiling to **4 GiB** (4,294,967,296 bytes) and replaces the reti
 rollout below is complete: it promoted image `sha256:a3b062a2…` (source
 `2e6c0cf9…`) onto the 10 GiB disk-backed workspace, and the 4 GiB limit is live.
 Production has since moved to `sha256:d6aa8b40…` (source `8b59cdff…`, 2026-09-18,
-§11h), then to `sha256:5925515f…` (source `593f47df…`, 2026-09-18, §11h), and then
-to `sha256:e5b1144c…` (source `f0b47bd5…`, 2026-09-26, HLS-10, §4j). All three
-carry the same 4 GiB source default (*source-verifiable*) and run on the same
-workspace; HLS-10 did not change `worker.env`.
+§11h), then to `sha256:5925515f…` (source `593f47df…`, 2026-09-18, §11h), then
+to `sha256:e5b1144c…` (source `f0b47bd5…`, 2026-09-26, HLS-10, §4j), and then to
+`sha256:0a6e66b0…` (source `f9a8109b…`, 2026-09-27,
+`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, §11h). All four carry the same 4 GiB
+source default (*source-verifiable*) and run on the same workspace; neither
+HLS-10 nor the filesize promotion changed `worker.env`.
 
 **Capacity model.** Local media one successful job holds at once:
 
@@ -1211,9 +1246,11 @@ polling exists.
 > `sha256:a3b062a2…`, built from `2e6c0cf9…` (4 GiB rollout Phase 1E, 2026-09-17,
 > §2a), then to `sha256:d6aa8b40…`, built from `8b59cdff…` (unknown-audio
 > promotion, 2026-09-18, §11h), then to `sha256:5925515f…`, built from
-> `593f47df…` (P1 rendition inventory, 2026-09-18, §11h), and then to
+> `593f47df…` (P1 rendition inventory, 2026-09-18, §11h), then to
 > `sha256:e5b1144c…`, built from `f0b47bd5…` (clear-HLS v1, HLS-10, 2026-09-26,
-> §4j); all four also contain it. The *Before SPLIT-05* paragraph is now
+> §4j), and then to `sha256:0a6e66b0…`, built from `f9a8109b…`
+> (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, 2026-09-27, §11h); all five also
+> contain it. The *Before SPLIT-05* paragraph is now
 > **history**: it describes the Production image before SPLIT-08E,
 > `sha256:c3995e18…` (§9).
 >
@@ -1772,10 +1809,11 @@ built from `e4fa646b…`, passed `--quiet` and reported this refusal as
 `PROCESSING_FAILED`. The Production Worker image became `sha256:d3b951d5…`,
 built from `6ce4ce2b…`, on 2026-09-13, then `sha256:a3b062a2…`, built from
 `2e6c0cf9…`, on 2026-09-17, then `sha256:d6aa8b40…`, built from `8b59cdff…`, on
-2026-09-18, then `sha256:5925515f…`, built from `593f47df…`, on 2026-09-18, and
-is now `sha256:e5b1144c…`, built from `f0b47bd5…`, since 2026-09-26 (HLS-10).
-All five contain this source (*image↔source identity operator-measured*, §2a,
-§4j, §11h). No promotion's smoke exercised this
+2026-09-18, then `sha256:5925515f…`, built from `593f47df…`, on 2026-09-18, then
+`sha256:e5b1144c…`, built from `f0b47bd5…`, on 2026-09-26 (HLS-10), and is now
+`sha256:0a6e66b0…`, built from `f9a8109b…`, since 2026-09-27
+(`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`). All six contain this source
+(*image↔source identity operator-measured*, §2a, §4j, §11h). No promotion's smoke exercised this
 refusal path in Production, so its live behaviour there is unproven.
 
 #### Durable lifecycle
@@ -2933,20 +2971,34 @@ repository has no CI). The HLS-8, HLS-9B, package-drift and credential-absence
 records below are unchanged history; the pre-promotion statements in them were
 true when recorded.*
 
+*Current-state note, added 2026-09-27 by
+`SOURCE-FILESIZE-ESTIMATE-DRIFT-001-DOCS-CLOSURE-001`: `sha256:e5b1144c…` is no
+longer `videofetch-worker:latest`. `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` promoted
+`sha256:0a6e66b0…` (source `f9a8109b…`) on 2026-09-27, and `sha256:e5b1144c…` is
+now the immediate Worker rollback (§9, §11h). The new image carries the same
+clear-HLS source. `src/worker/hls` is identical between `f0b47bd5…` and
+`f9a8109b…` (*repository-verifiable*), and the new candidate's SPLIT-07 `-03`
+qualification included the clear-HLS child as a mandatory gate, which passed
+146/146 (*operator-measured*). Clear HLS was neither reimplemented nor
+independently re-accepted on a real HLS source; HLS-10 below remains its
+Production acceptance.*
+
 Three separate states apply, and clear HLS has now reached all three:
 
 | State | Clear-HLS v1 |
 | :--- | :--- |
 | Implemented in merged source | **yes** — source-activated by HLS-7 |
 | Qualified in a retained release candidate | **yes** — HLS-9B, `sha256:e5b1144c…` |
-| Deployed in Production | **yes** — HLS-10, 2026-09-26: `sha256:e5b1144c…` is `videofetch-worker:latest` and the running Worker, accepted on a real public source (below) |
+| Deployed in Production | **yes** — HLS-10, 2026-09-26: `sha256:e5b1144c…` became `videofetch-worker:latest` and the running Worker, accepted on a real public source (below). Since 2026-09-27 the Production image is `sha256:0a6e66b0…` (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`), which contains the same clear-HLS source |
 
 #### What the deployed source supports
 
-The deployed image's source: `main` `f0b47bd567dd978374bfec1a01e6d9768c747160`,
+The HLS-10 image's source: `main` `f0b47bd567dd978374bfec1a01e6d9768c747160`,
 tree `2b1099bb146a88f4a4e70bdd3065fba100ef5f7f` (PR #79 merge;
 *GitHub-verifiable*). Later `main` commits, through `1524cdc4…`, changed
-documentation only.
+documentation only. The current Production image, from `f9a8109b…` (2026-09-27),
+has an identical `src/worker/hls` (*repository-verifiable*), so everything below
+describes it too.
 
 A generic video preset can be backed by exactly three acquisition families:
 
@@ -3150,7 +3202,7 @@ this subsection read "HLS-10 — NOT BEGUN", with Production on the pre-HLS imag
 | :--- | :--- |
 | Promoted image | `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`, retagged **by immutable id** as `videofetch-worker:latest`; still also `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c` |
 | Image source | `f0b47bd567dd978374bfec1a01e6d9768c747160`, tree `2b1099bb146a88f4a4e70bdd3065fba100ef5f7f` — the HLS-9B build, not rebuilt. `main` at promotion was `1524cdc4a8f1347431481e7fc4c2772aabe7ac60`, tree `481e4eac86357fb1bc0d1e4e19d498331e21f3fe`: four documentation-only commits ahead (`README.md` and two `docs/architecture` files), with nothing changed under `src`, `deploy`, `scripts`, the package files or `Dockerfile.worker`. The image was **not** built from `1524cdc4…` |
-| Previous Production — now the immediate rollback | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:rc-593f47dfffe7-5925515fb002` (source `593f47df…`); tag and id verified before promotion and again at the end |
+| Previous Production — the immediate rollback at HLS-10 (a deeper rollback since 2026-09-27, §9) | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:rc-593f47dfffe7-5925515fb002` (source `593f47df…`); tag and id verified before promotion and again at the end |
 | Mutations | `docker image tag <candidate id> videofetch-worker:latest` at 2026-09-26T16:05:26.998Z, then `systemctl restart videofetch-worker.service` — nothing else |
 | Candidate epoch | container `0bfaf6810dc233819ac3281903fc750c66fb5a969ed6725c5408521399dbbf83`, StartedAt `2026-09-26T16:05:27.747382873Z`, NRestarts 0. The same container, image, StartedAt and MainPID held to the end |
 | Pre-promotion gates | GitHub baseline and drift; the HLS-9B records re-hashed (parent `6b8c0b6c…` 47/47, clear-HLS child `c66e2b6c…` 146/146, handoff `02c47382…`, drift audit `138b7208…`); Production, rollback and candidate identities; the Worker idle (queue 0, running 0), re-checked immediately before the retag |
@@ -3282,8 +3334,9 @@ changed. No R2 configuration or credentials changed. No systemd unit changed.
 
 **VM state.** `videofetch` was **Stopped** initially. HLS-10 started it for the
 acceptance and returned it to **Stopped** once the evidence was final. That is
-the expected on-demand idle state, not a rollback. On the next normal boot, the
-unit resolves `videofetch-worker:latest` to the accepted HLS image.
+the expected on-demand idle state, not a rollback. At that point the next normal
+boot resolved `videofetch-worker:latest` to the accepted HLS image. Since
+2026-09-27, `latest` is `sha256:0a6e66b0…` (§11h).
 
 **What HLS-10 does not close.** `genericPresetOwner()` / `id in map` stays
 **OPEN** as non-blocking defense-in-depth debt. The external liveness probe and
@@ -3299,7 +3352,7 @@ not GitHub CI.*
 
 `CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001` is **CLOSED /
 PASS**. No HLS step closed it. A later, dedicated measurement closed it, and it
-measured the **current Production Worker**, not the retained HLS candidate.
+measured the **then-current Production Worker** (2026-09-26), not the retained HLS candidate.
 
 - **Method.** It used the committed observer
   `makeSystemObservers().environmentNames()` in
@@ -4222,18 +4275,25 @@ Because the replica count is exactly 1, a deployment is a brief interruption,
 not a zero-downtime rollout. Queued jobs survive it; interrupted active jobs are
 failed deterministically and may be retried by the user.
 
-**Current rollback assets (recorded 2026-09-26, after HLS-10).**
-`videofetch-worker:latest` resolves to the clear-HLS v1 image
-`sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`
-(§4j), also retained as `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c`. Four
+**Current rollback assets (recorded 2026-09-27, after
+`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`).** `videofetch-worker:latest` resolves to
+`sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5`
+(source `f9a8109b…`; clear-HLS v1 plus declared-only generic preset `fileSize`,
+§11h), also retained as `videofetch-worker:rc-f9a8109bb130-0a6e66b0eb1f`. Five
 earlier Production images are retained locally:
 
 ```
-immediate — the P1 rendition-inventory image, pre-HLS (Production 2026-09-18 21:00Z → 2026-09-26 16:05Z)
+immediate — the HLS-10 clear-HLS image (Production 2026-09-26 16:05Z → 2026-09-27 14:02Z)
+videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c
+  → sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a
+  (also addressable as videofetch-worker:f0b47bd567dd978374bfec1a01e6d9768c747160 —
+   a compatibility alias, not provenance)
+
+deeper — the P1 rendition-inventory image, pre-HLS (Production 2026-09-18 21:00Z → 2026-09-26 16:05Z)
 videofetch-worker:rc-593f47dfffe7-5925515fb002
   → sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e
 
-deeper — the unknown-audio image (Production 2026-09-18 04:56Z → 21:00Z)
+deeper still — the unknown-audio image (Production 2026-09-18 04:56Z → 21:00Z)
 videofetch-worker:rc-8b59cdffbfe5-d6aa8b404d01
   → sha256:d6aa8b404d015e72bb216f364b900271521d44f66bae672bd012d4239fc52b0e
 
@@ -4261,7 +4321,24 @@ and workspace, conceptually:
 
 HLS-10's pre-authorized rollback had the same shape: retag the immediate rollback
 image **by id**, then one `systemctl restart videofetch-worker.service`. It was
-not needed.
+not needed. The `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` promotion's pre-authorized
+rollback had the same shape too: require quiescence, retag `sha256:e5b1144c…` by
+id, and stop and start only `videofetch-worker.service`. It was not needed.
+
+Rolling back to `e5b1144c…` restores the HLS-10 state:
+
+- **Unchanged.** Clear HLS is still offered, `sourceQuality` is still sent, and
+  the pinned yt-dlp, the 4 GiB source default, the unit and the workspace are
+  the same.
+- **Why it is that simple.** The runtime/package inventories of the two images
+  are byte-identical (*operator-measured*). The source differs only in generic
+  analysis (`src/worker/analysis/ytdlp-analysis.server.ts`), and the contract,
+  state, HLS and security paths are identical (*repository-verifiable*).
+- **What returns.** The only behavioural change is that generic analysis again
+  publishes `filesize_approx` as preset `fileSize` when no declared size
+  exists: the `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` defect.
+- **No Vercel change is needed either way.** The public shape of `fileSize`
+  (`number | null`) did not change.
 
 Rolling back to `5925515f…` restores the pre-HLS P1 state that HLS-10 measured
 before promoting. Clear-HLS presets are no longer offered: on the accepted real
@@ -4324,17 +4401,19 @@ also needs the Access re-verification above:
 - **Immediate — `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`**, P1's control plane. It
   already accepts the optional `sourceQuality`, so P2 rolls back on Vercel alone
   (`vercel rollback dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU --yes`), and the Worker stays
-  where it is — `e5b1144c…` since HLS-10. The browser returns to the pre-P2
+  where it is — `0a6e66b0…` since 2026-09-27. The browser returns to the pre-P2
   presentation. Its source, `593f47df…`, has the same contract paths as
   `dpl_BcefWQ…`'s `02b3f15f…` (no file differs under `src/shared`, `src/web`,
-  `src/lib/security` or `src/routes/api`; *repository-verifiable*), and HLS-10
-  proved that contract accepts the HLS Worker live (§4j).
+  `src/lib/security` or `src/routes/api`; *repository-verifiable*). HLS-10
+  proved that contract accepts the HLS Worker live (§4j). PR #88 changed no
+  file under `src/shared` or any other contract path, so the filesize Worker
+  leaves this ordering unchanged (*repository-verifiable*).
 - **Deeper — `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`.** It predates `sourceQuality`,
   and its strict schema rejects a Worker response that carries the field. So while
-  a Worker that sends it is live — `e5b1144c…`, or `5925515f…` after an immediate
-  Worker rollback — rolling Vercel back this far on its own would fail every
-  generic analysis. Roll the Worker back to `d6aa8b40…` first, and only then
-  Vercel.
+  a Worker that sends it is live — `0a6e66b0…`, or `e5b1144c…` / `5925515f…`
+  after a Worker rollback — rolling Vercel back this far on its own would fail
+  every generic analysis. Roll the Worker back to `d6aa8b40…` first, and only
+  then Vercel.
 
 Rolling back to `a3b062a2…` restores the 2026-09-17 Phase-1E state: the same 4 GiB
 limit and workspace, but without the unknown-audio fallback, so an X/Twitter-shaped
@@ -4348,8 +4427,8 @@ been re-validated as a rollback target on the disk-backed workspace.
 
 **No rebuild, no network pull, no Vercel deployment and no Cloudflare change is
 involved.** The durable schema is version **1** on both sides:
-`src/worker/state` is identical across `6ce4ce2b…`, `2e6c0cf9…`, `8b59cdff…` and
-`593f47df…` (*repository-verifiable*), and a version-1 database receives read-only assertions
+`src/worker/state` is identical across `6ce4ce2b…`, `2e6c0cf9…`, `8b59cdff…`,
+`593f47df…`, `f0b47bd5…` and `f9a8109b…` (*repository-verifiable*), and a version-1 database receives read-only assertions
 only — no DDL or DML. SPLIT-08E's preflight proved the same compatibility for its
 own promotion (§11h). Restoring a state snapshot is therefore **not** part of an
 image rollback; it belongs only to affirmative evidence of database corruption.
@@ -4489,8 +4568,12 @@ authorization.
       `worker-env.forbidden-absent` audits both names. `YTDLP_ENABLED=true` is
       the persistent generic feature state (Phase 10E; accepted `worker.env`
       SHA-256 `3583770c…`), and the accepted Production image —
-      `sha256:e5b1144c…` since the HLS-10 clear-HLS promotion (2026-09-26; the
-      control plane reported yt-dlp `2026.08.19` before and after it),
+      `sha256:0a6e66b0…` since the `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`
+      promotion (2026-09-27; the control plane reported yt-dlp `2026.08.19`
+      before and after it, and its runtime inventory is byte-identical to the
+      previous image), `sha256:e5b1144c…` from the HLS-10 clear-HLS promotion
+      (2026-09-26; the control plane reported yt-dlp `2026.08.19` before and
+      after it),
       `sha256:5925515f…` from the P1 rendition-inventory promotion (2026-09-18),
       `sha256:d6aa8b40…` from the unknown-audio promotion earlier that day,
       `sha256:a3b062a2…` from the 4 GiB rollout's Phase 1E (2026-09-17) before it,
@@ -4619,9 +4702,9 @@ authorization.
 | `PHASE-10E-PERSISTENT-ON-DEMAND-GENERIC-ENABLEMENT-001` | **COMPLETE / ACCEPTED** | `/etc/videofetch/worker.env` carries `YTDLP_ENABLED=true` exactly once, with the retired `YTDLP_NETWORK_ISOLATED` and `YTDLP_PATH` absent (accepted SHA-256 `3583770c…`), and the state survives a full VM stop/start. No image rebuild. `YTDLP_ENABLED` is now the operational kill switch — a feature switch, not the network boundary. The VM stays on demand. *Accepted operator-measured Production evidence.* See §11h. |
 | `PHASE-10F-CONTROL-PLANE-503-ERROR-DISAMBIGUATION-001` | **CLOSED / PRODUCTION ACCEPTED** | PR #43, merge `b4640ff6c92e92c0df2737d5a8c3bfc383837e70` (*GitHub-verifiable*). A canonical Worker `503` + `EXTRACTOR_UNAVAILABLE` is preserved by the control plane instead of collapsing to `WORKER_UNAVAILABLE` — a strict canonical shape/contract match, not authenticated provenance (§1b). Proven live through real Production (*accepted operator-measured*). See §11h. |
 | `WORKERCLIENT-TOTAL-RESPONSE-DEADLINE-HARDENING-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | PR #44, merge `45c625041389df7e1b37ef6d25a27b9e629ca134` (*GitHub-verifiable*). One `requestTimeoutMs` budget covers request start → headers → complete body consumption on every Worker response path (§1b). Deployed as Vercel `dpl_BYQq7Jvoqb17HZZodVgzrn1Gt2mC` — chain of custody, not Vercel Git-attested. See §11h. |
-| `SPLIT-08E-PRODUCTION-PROMOTION-001` | **COMPLETE / PRODUCTION ACCEPTED** | The retained split-stream candidate `sha256:d3b951d5…` (source `6ce4ce2b…`) was promoted to `videofetch-worker:latest` on 2026-09-13, in one authorized transaction: quiescence check, clean stop, verified state snapshot, immutable retag, exact-candidate start through the unit's own gates, local boundary checks, and a bounded Production smoke over the unchanged Vercel → Cloudflare Access → named Tunnel → HMAC path. No Production job was created, and no Vercel or Cloudflare configuration changed. The previous image was retained as the rollback asset (§9). *Accepted operator-measured Production evidence*, digest `427896be…`. See §11h. *Superseded as current Production on 2026-09-17 by the 4 GiB rollout's Phase 1E (`MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, below); `sha256:d3b951d5…` is now the retained deeper rollback image; since 2026-09-18 the immediate one is `a3b062a2…` (§9).* |
+| `SPLIT-08E-PRODUCTION-PROMOTION-001` | **COMPLETE / PRODUCTION ACCEPTED** | The retained split-stream candidate `sha256:d3b951d5…` (source `6ce4ce2b…`) was promoted to `videofetch-worker:latest` on 2026-09-13, in one authorized transaction: quiescence check, clean stop, verified state snapshot, immutable retag, exact-candidate start through the unit's own gates, local boundary checks, and a bounded Production smoke over the unchanged Vercel → Cloudflare Access → named Tunnel → HMAC path. No Production job was created, and no Vercel or Cloudflare configuration changed. The previous image was retained as the rollback asset (§9). *Accepted operator-measured Production evidence*, digest `427896be…`. See §11h. *Superseded as current Production on 2026-09-17 by the 4 GiB rollout's Phase 1E (`MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, below); `sha256:d3b951d5…` is now the retained deeper rollback image. The immediate one became `a3b062a2…` on 2026-09-18 and has moved with each promotion since; it is `e5b1144c…` as of 2026-09-27 (§9).* |
 | `WORKER-UNIT-COMMENT-SYNC-001` | **CLOSED — superseded by the 4 GiB rollout's Phase 1C unit installation** | *Finding, as recorded at SPLIT-08E:* the installed `/etc/systemd/system/videofetch-worker.service` carried an older **comment block** than the committed `deploy/systemd/videofetch-worker.service`. Every non-comment directive matched the committed unit exactly, so there was no behavioural difference and nothing to fix in source. SPLIT-08E deliberately did not synchronise it, because it was forbidden from touching systemd. *Closure:* the 4 GiB rollout's Phase 1C (storage-only cutover) installed the exact merged Worker unit — the `deploy/systemd/videofetch-worker.service` blob `ad43ab55f0353de97aedccfcd1820ec6bce71794`, which is also its content at `main` `2e6c0cf9…` (*GitHub-verifiable*). The installed file's SHA-256 `257971338d662606f562a1cb550226304dca3f0db3fd43792520b19d651c94d6` and blob identity were measured at Phase 1C and again at Phase 1E (*accepted operator-measured*). Comments and directives alike are byte-identical to the committed unit, so the comment-only drift no longer exists and no separate operator synchronisation remains pending. |
-| `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | *Source and deployment contract:* PR #58, merge `92d80d88473c8fbca2a1f70ad299b613754a672b`, contributed a 4 GiB default from one shared constant, plan-aware and startup media-workspace gates, an absolute direct-acquisition deadline, the bounded disk workspace (mount unit + verifier + Worker unit bind), and release-image acceptance on a bind workspace (§2a). *Eager ext4 initialization correction:* PR #59, merge `2e6c0cf97a50d06b5d3aebd902ab03c386c01ba4` (both *GitHub-verifiable*). No R2, broker, Vercel, timeout or expiry change. *Rollout (accepted operator-measured):* Phases 1A–1E complete. The initial Phase 1B and the first Phase 1C attempt were rolled back — the latter on an acceptance-harness false negative, not a Product defect (§2a). *Production 2026-09-17 → 2026-09-18:* source `2e6c0cf9…`; image `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0` as `videofetch-worker:latest`, retained as `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799` (superseded as `latest` on 2026-09-18 by the unknown-audio image `d6aa8b40…`, which keeps the same 4 GiB limit and workspace; `a3b062a2…` is now the immediate rollback, §9); limit 4 GiB (4,294,967,296 bytes) with `MAX_FILE_SIZE` absent; 10 GiB disk-backed ext4 workspace; Lima primary disk 32 GiB. Retained rollback image: `sha256:d3b951d5…` as `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (now the deeper rollback, §9). Phase-1E evidence digest `aca50a8e0bb3ddb44d2348109d344fb5fa377d32184fe28327558d6e747f547d` (operator-held). Vercel was not redeployed and did not need to be (§11h). |
+| `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | *Source and deployment contract:* PR #58, merge `92d80d88473c8fbca2a1f70ad299b613754a672b`, contributed a 4 GiB default from one shared constant, plan-aware and startup media-workspace gates, an absolute direct-acquisition deadline, the bounded disk workspace (mount unit + verifier + Worker unit bind), and release-image acceptance on a bind workspace (§2a). *Eager ext4 initialization correction:* PR #59, merge `2e6c0cf97a50d06b5d3aebd902ab03c386c01ba4` (both *GitHub-verifiable*). No R2, broker, Vercel, timeout or expiry change. *Rollout (accepted operator-measured):* Phases 1A–1E complete. The initial Phase 1B and the first Phase 1C attempt were rolled back — the latter on an acceptance-harness false negative, not a Product defect (§2a). *Production 2026-09-17 → 2026-09-18:* source `2e6c0cf9…`; image `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0` as `videofetch-worker:latest`, retained as `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799` (superseded as `latest` on 2026-09-18 by the unknown-audio image `d6aa8b40…`, which keeps the same 4 GiB limit and workspace; `a3b062a2…` then became the immediate rollback, and has been a deeper rollback since, §9); limit 4 GiB (4,294,967,296 bytes) with `MAX_FILE_SIZE` absent; 10 GiB disk-backed ext4 workspace; Lima primary disk 32 GiB. Retained rollback image: `sha256:d3b951d5…` as `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (now the deeper rollback, §9). Phase-1E evidence digest `aca50a8e0bb3ddb44d2348109d344fb5fa377d32184fe28327558d6e747f547d` (operator-held). Vercel was not redeployed and did not need to be (§11h). |
 | `YTDLP-BYTE-LIMIT-FIXTURE-4GIB-DRIFT-001` | **CLOSED — ACCEPTANCE-HARNESS DRIFT CORRECTED** | The historical Phase-10D unknown-length byte-limit fixture had remained capped at **528 MiB** after the Product default moved from 500 MiB to 4 GiB (4,294,967,296 bytes; `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`), so it could no longer cross the current threshold and a known-insufficient live case would only discover that after driving a real job. **PR #75**, implementation commit `1455c1360ba223ffed4c5b986c9d2b34fdc61ff0`, merged as `a0c4e09982371320af1354bf4063d9db528fae12` on 2026-09-20 (*GitHub-verifiable*), corrects the acceptance fixture/harness **without changing Production code** — no `src/**` file differs, and the Product keeps its 4 GiB default, 150 ms actual-byte poll and 600 s absolute acquisition timeout. The controlled fixture now has a **4.25 GiB** ceiling (4,563,402,752 bytes) composed as `BYTE_LIMIT_REFERENCE_MAX_BYTES` (4 GiB) + `BYTE_LIMIT_HEADROOM_BYTES` (256 MiB of bounded *practical* headroom), streamed incrementally from one reused 64 KiB block under backpressure — a ceiling, never a proportional allocation, and no automated test transfers a 4.25 GiB body. `VIDEOFETCH_ACCEPT_BYTELIMIT_MAX_BYTES`, taken from the fixture manifest's `byteLimitMaxBytes`, is parsed fail-closed and compared **before the controlled analysis request and before job creation** against the effective limit measured from the deployed Worker; `fixtureMaxBytes` must be **strictly greater**, and the deployed measurement — not the repository's 4 GiB reference constant — remains authoritative. That preflight is only a **capability gate**: correlated actual-transfer evidence must still show `actualMediaRequestObserved`, `mediaRequestCount === 1`, an absent `Content-Length`, `bytesServed > effectiveMaxFileSizeBytes` and canonical `TOO_LARGE` with no processing or upload, so an overstated advertised ceiling cannot manufacture acceptance. Local deterministic validation on the accepted head reported `ytdlp-fixture.test.mjs` 48/48 and `ytdlp-acceptance.test.mjs` 424/424, with the directly affected acceptance suites also clean (*executor-local evidence, not GitHub CI* — PR #75 carried 0 commit statuses and 0 workflow runs). **No live 4 GiB threshold acceptance was performed.** Historical Phase-10D 500 MiB evidence (`PHASE-10D-YTDLP-PRODUCTION-STAGED-DEPLOYMENT-AND-LIVE-ACCEPTANCE-001`) remains valid for the deployment it measured and is **not** retroactively restated as 4 GiB evidence. The acceptance-harness drift is closed; future current-limit acceptance can now exercise the corrected fixture. *Later (2026-09-27):* that live acceptance was performed with this fixture — `YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN` (below). The sentences above stay as the PR #75 record. See `deploy/acceptance/ytdlp-generic/README.md` and `deploy/acceptance/ytdlp-generic/fixtures/README.md`. |
 | `GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | Progressive HTTP(S) generic sources with established video and UNKNOWN audio (the X/Twitter shape found by `X-TWITTER-FORMAT-COMPATIBILITY-DIAGNOSTIC-001`) may back ordinary video presets as a whole-result fallback: only when no proven video fulfilment exists, with `hasAudio: false` / `audioCodec: null`, as `keep-original`. Audio/MP3 stay proven-only, split semantics and the selector are unchanged, HLS stays excluded, explicit absent-audio single sources stay out of scope, and the public contract and direct strategy are unchanged. *Source:* PR #61, merge `8b59cdffbfe506ff51705b8659cfeb99df82494b`, tree `e0ba8a60…` (*GitHub-verifiable*). *Candidate:* `sha256:d6aa8b404d01…`, accepted 2026-09-17 (acceptance `3a18b252…`, release decision `961649ec…`). *Deployment:* promoted to Production on 2026-09-18 by `GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-PRODUCTION-PROMOTION-001` and accepted end to end on the original X/Twitter failure case, in the browser too; no Vercel redeploy was required and none was made (*accepted operator-measured*). Recorded here on 2026-09-17 as "IMPLEMENTED IN SOURCE — NOT DEPLOYED"; that state is now history. See §11d and §11h. |
 | `GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-PRODUCTION-PROMOTION-001` | **COMPLETE / PRODUCTION ACCEPTED** | 2026-09-18: `videofetch-worker:latest` retagged from the immutable candidate id `d6aa8b404d01…` (prior Production `a3b062a24799…`); only `videofetch-worker.service` restarted, measured health downtime ≈ 2.928 s; every boundary and health check passed; the stability window passed; no rollback. On the original X/Twitter post the old image returned 0 presets and the new one `preset:best` / `preset:360` / `preset:240`, and one real job reached `ready` (774,763 bytes). Evidence `0d7a8251…` (*accepted operator-measured*). See §11h. |
@@ -4633,8 +4716,8 @@ authorization.
 | `X-TWITTER-JONATHAN-TIMING-RENDITION-DIAGNOSTIC-001` | **COMPLETE — SOURCE_ALREADY_IRREGULAR / NO PRODUCT DEFECT** | A second, separately authorized X/Twitter post whose download plays unevenly. The exact progressive 1560×720 source VideoFetch selects is byte-identical to the downloaded file, and every observed X rendition carries the same irregular frame timing: no VideoFetch timing alteration and no inferior observed rendition selected. Logged-in-only renditions were **not** directly observed for this source, because X refused the temporary-browser login. Evidence `a1c8050b…` (*accepted operator-measured*). See §11h. |
 | `NODE22-GENERIC-EXECUTION-TEST-LIVENESS-001` | **CLOSED — TEST-HARNESS COMPATIBILITY CORRECTED** | The debt was re-measured on current source under the image's Node **v22.23.2** (`linux/arm64`, `node:22-bookworm-slim`) and was confirmed real rather than stale, but broader than this ledger originally recorded. Three Promise-backed monitored-acquisition test files could let Node 22 drain the event loop before the Production byte monitor's deliberately `unref()`'d polling timer fired: `src/worker/execution/generic-execution.server.test.ts` (7/20 whole-file runs clean before the fix), `src/worker/execution/ytdlp-download.server.test.ts` (0/10) and `src/worker/execution/ytdlp-split-download.server.test.ts` (0/10). The characteristic result was `cancelledByParent` / "Promise resolution is still pending but the event loop has already resolved". The cause was test-harness liveness, not Product acquisition semantics: in Production the real yt-dlp child keeps the event loop alive, whereas the fake Promise-based runners do not; injecting a ref'd handle without changing Product code made the failure disappear. **PR #73**, implementation commit `22a515e49e8348794c0aec9d48c278d1ffb9eeb1`, merged as `29d7bc2ee9e41686d346bd88e76f613985474239` (*GitHub-verifiable*), adds a bounded 30-second ref'd hold only to those three `*.test.ts` files. No Production module, monitor liveness gate, barrier, ordering assertion or timeout policy changed. On the accepted head under Node 22 the late-byte-monitor case passed 20/20 isolated runs, `generic-execution` passed 20/20 whole-file runs, `ytdlp-download` 10/10 and `ytdlp-split-download` 10/10; the full source-suite comparison improved from 3202 pass / 106 cancelled / 2 fail to 3298 pass / 10 cancelled / 2 fail, with the residual failures and cancellations unchanged from base and outside this debt (*executor-local evidence, not GitHub CI*). `tsc --noEmit` was clean and focused ESLint reported no findings. The implementation debt is closed; Production `runMonitoredAcquisition()` was not changed. |
 | `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001-VERCEL-PRODUCTION-DEPLOYMENT` | **COMPLETE / PRODUCTION ACCEPTED** | 2026-09-19: exactly one Vercel Production deployment, `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from a pristine detached worktree of `main` `02b3f15f…` (tree `44abfe6e…`), with no env, project or domain change. On the authorized X/Twitter case (`authorized-original-x-case`) the live browser showed "Best downloadable — 360p", no higher-quality notice (observed 384 = deliverable 384) and Advanced unavailable (`formats: []`), and it submitted `preset:best`. One job reached `ready`, and the file route's `303` delivered 774,763 bytes, byte-identical to the P1 acceptance. The higher-quality notice and the unknown-resolution state were verified deterministically on the deployed source, not on a live third-party source. No rollback was required, and the Worker did not change. Evidence `7fce201ed8fa4ba844b2730ec2fe7dc04ae97def0168d627134e684a9471e5f1` (*accepted operator-measured*). See §11h. |
-| `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` | **IMPLEMENTED IN SOURCE — PRODUCTION DEPLOYMENT / LIVE ACCEPTANCE PENDING** | *Motivation (historical):* upstream bitrate-derived approximate sizes can materially overestimate the bytes actually delivered. At the P2 acceptance (*accepted operator-measured*), for the authorized X/Twitter case, the browser's estimated size was about 5.9 MB (preset `fileSize` 6,226,064 bytes) while the delivered object was 774,763 bytes (≈ 757 KiB). When the extractor declared no `filesize`, the Worker reported its `filesize_approx`. For this source that approximation derives from upstream nominal bitrate metadata, not from the real bitrate (*accepted operator-measured*, 2026-09-18 X/Twitter diagnostics). It was never a P2 defect, since P2 only displays the size the Worker reports, and never a byte-limit defect, since enforcement reads actual bytes, not metadata. *Design (approved; `SOURCE-FILESIZE-ESTIMATE-DRIFT-001-DESIGN-001`):* minimal suppression. Richer provenance was rejected: the pinned runtime's `-J` output does not record whether `filesize_approx` was extractor-supplied or yt-dlp's own `duration × tbr` product, so "bitrate-derived" cannot be proven. *Source (repository-verifiable), PR #88, branch `fix/source-filesize-estimate-drift-001` from `main` `b4eefb65…`; implementation commit `8aedf62d…`; not merged at the time of writing:* generic analysis now keeps two sizes. The private POLICY size (`limitSize`: positive `filesize`, else positive `filesize_approx`) still drives per-format and split-pair size-limit admission, clear-HLS admission, within-rung ranking and `size_limit_exceeded`, so all of those are behaviourally unchanged. The published and selection size (`fileSize`) is declared-only: a positive `filesize`, else `null`. It is used for public preset `fileSize` and private selection `fileSize`, so an approximation never becomes a download-progress `totalBytes` either. A split pair publishes a size only when both members declare one. There is no public contract field, no control-plane change and no Vercel/Worker ordering requirement. The actual-byte enforcement code is untouched. *Not yet:* this change is not in a Worker image, not deployed, and not accepted in Production. Closing requires a Worker release candidate, a separately authorized promotion and a live acceptance showing all of: `fileSize: null` for approximation-only presets with every other preset field and `sourceQuality` unchanged; a declared-size control that still publishes its size; and a delivered object whose bytes equal the durable `fileSize`. |
-| Clear-HLS v1 — HLS-1 … HLS-10 | **CLOSED / PASS / PRODUCTION ACCEPTED** | *Source (GitHub-verifiable):* HLS-7 (PR #77, `ff9d5c66…`) source-activated a narrow clear-HLS path. The rendition must be public, single-item, non-live and use exactly `m3u8_native`, with a clear VOD media playlist of MPEG-TS segments and video with proven audio. yt-dlp discovers it during metadata analysis only. VideoFetch owns the HLS-2 preflight and HLS-3 fragment acquisition, and the Worker performs the HLS-4 TS → MP4 stream copy only after `beginProcessing()`. yt-dlp's download allowlist is unchanged (`http`, `https`). HLS-8 (PR #78) and HLS-9A (PR #79, SPLIT-07 `-03`) merged the acceptance tooling at `f0b47bd5…`. *Candidate (accepted operator-measured):* HLS-9B qualified and retained `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c` → `sha256:e5b1144c…` (parent `-03` PASS 47/47; mp4 and webm 141/141; clear-HLS 146/146). HLS-8 `-02` is accepted and `-01` is historical and not accepted. *Production (accepted operator-measured):* HLS-10 promoted that exact image on 2026-09-26 and accepted it on a real public HLS source; `videofetch-worker:latest` is now `sha256:e5b1144c…`, and the immediate Worker rollback is `sha256:5925515f…`. Full record: §4j. |
+| `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** (2026-09-27) | *Motivation (historical):* upstream bitrate-derived approximate sizes can materially overestimate the bytes actually delivered. At the P2 acceptance (*accepted operator-measured*), for the authorized X/Twitter case, the browser's estimated size was about 5.9 MB (preset `fileSize` 6,226,064 bytes) while the delivered object was 774,763 bytes (≈ 757 KiB). When the extractor declared no `filesize`, the Worker reported its `filesize_approx`. For this source that approximation derives from upstream nominal bitrate metadata, not from the real bitrate (*accepted operator-measured*, 2026-09-18 X/Twitter diagnostics). It was never a P2 defect, since P2 only displays the size the Worker reports, and never a byte-limit defect, since enforcement reads actual bytes, not metadata. *Design (approved; `SOURCE-FILESIZE-ESTIMATE-DRIFT-001-DESIGN-001`):* minimal suppression. Richer provenance was rejected: the pinned runtime's `-J` output does not record whether `filesize_approx` was extractor-supplied or yt-dlp's own `duration × tbr` product, so "bitrate-derived" cannot be proven. *Source (GitHub-verifiable):* PR #88, branch `fix/source-filesize-estimate-drift-001` from `main` `b4eefb65…`. Implementation commit `8aedf62d38c65eb0d5dd2617849d755bff67c269`, final reviewed head `e84db9810dd5f6a18423d6df80dc07bc782ccc64`. Regular two-parent merge `f9a8109bb1302076b5b415b572c0ab288467250a`, tree `846707b20ff39cd93f4e258cc7c76a01818f880d`, with parents `b4eefb656f6f289874a0bc0af9f9e8f8378a4791` and `e84db981…`; the head and the merge have identical trees. Generic analysis keeps two sizes. The private POLICY size (`limitSize`: positive `filesize`, else positive `filesize_approx`) still drives per-format and split-pair size-limit admission, clear-HLS admission, within-rung ranking and `size_limit_exceeded`, so all of those are behaviourally unchanged. The published and selection size (`fileSize`) is declared-only: a positive `filesize`, else `null`. It is used for public preset `fileSize` and private selection `fileSize`, so an approximation never becomes a download-progress `totalBytes` either. A split pair publishes a size only when both members declare one. There is no public contract field, no control-plane change and no Vercel/Worker ordering requirement. The actual-byte enforcement code is untouched. *Release candidate (accepted operator-measured, 2026-09-27):* `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5`, built from exact `f9a8109b…` by the committed SPLIT-07 driver and retained as `videofetch-worker:rc-f9a8109bb130-0a6e66b0eb1f`. Parent `split07-release-image-candidate-03` PASS 47/47, with all 46 mandatory checks present exactly once (record `1d45f9bd2101220bcb3a536caa8e9b2947a75438aaa9696be90383cd497dd653`); mp4 141/141, webm 141/141, clear-HLS 146/146. The filesize suites passed 370/370 inside the image, and the runtime/package inventory is byte-identical to `sha256:e5b1144c…`. *Public-X discriminator (accepted operator-measured, 2026-09-27; isolated shadow, no Production mutation):* on `https://x.com/J_Nimrodi/status/2100684463789297665/video/1`, the old image published best/720/360/240 = 72,050,624 / 72,050,624 / 27,548,768 / 8,476,544. Each of those sizes was a positive `filesize_approx` with no positive declared `filesize`. The candidate published `null` for all four, public and private, with identical non-size output and the same selected rendition. *Production (accepted operator-measured, 2026-09-27):* the qualified image was promoted at 14:02:55.237Z and only `videofetch-worker.service` was restarted. Live results: (1) through the unchanged control plane, the complete pre/post analysis diff of that X post was exactly the four preset `fileSize` values, each becoming `null`; (2) the declared-size control `YE7VzlLtp-4` still published `preset:144` `fileSize` 13,409,066; (3) one X job observed `totalBytes: null` in all eight `downloading` samples and reached `ready` with a durable `fileSize` of 38,257,789, exactly the bytes delivered through the 303 → signed R2 GET. The immediate Worker rollback is `sha256:e5b1144c…`, and it was not needed. A first promotion attempt (`…-PRODUCTION-PROMOTION-ACCEPTANCE-001`) stopped at its pre-promotion discriminator gate before any mutation, because the supplied X source was not the historical case; the promotion then ran as `…-PRODUCTION-PROMOTION-LIVE-ACCEPTANCE-RETRY-002` with the qualified public discriminator. Full record: §11h. |
+| Clear-HLS v1 — HLS-1 … HLS-10 | **CLOSED / PASS / PRODUCTION ACCEPTED** | *Source (GitHub-verifiable):* HLS-7 (PR #77, `ff9d5c66…`) source-activated a narrow clear-HLS path. The rendition must be public, single-item, non-live and use exactly `m3u8_native`, with a clear VOD media playlist of MPEG-TS segments and video with proven audio. yt-dlp discovers it during metadata analysis only. VideoFetch owns the HLS-2 preflight and HLS-3 fragment acquisition, and the Worker performs the HLS-4 TS → MP4 stream copy only after `beginProcessing()`. yt-dlp's download allowlist is unchanged (`http`, `https`). HLS-8 (PR #78) and HLS-9A (PR #79, SPLIT-07 `-03`) merged the acceptance tooling at `f0b47bd5…`. *Candidate (accepted operator-measured):* HLS-9B qualified and retained `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c` → `sha256:e5b1144c…` (parent `-03` PASS 47/47; mp4 and webm 141/141; clear-HLS 146/146). HLS-8 `-02` is accepted and `-01` is historical and not accepted. *Production (accepted operator-measured):* HLS-10 promoted that exact image on 2026-09-26 and accepted it on a real public HLS source; `videofetch-worker:latest` was then `sha256:e5b1144c…`, with the immediate Worker rollback `sha256:5925515f…`. Since 2026-09-27, `latest` is `sha256:0a6e66b0…` (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, §11h). That image contains the same clear-HLS source, and its release qualification passed the clear-HLS child as a mandatory gate. `sha256:e5b1144c…` is now the immediate Worker rollback. Full record: §4j. |
 | `HLS-PRE-HLS10-RETAINED-CANDIDATE-PACKAGE-DRIFT-AUDIT-001` | **COMPLETE — VERSION-ONLY DRIFT; accepted as non-blocking for HLS promotion preparation** | A read-only comparison of the retained candidate `sha256:e5b1144c…` with Production `sha256:5925515f…`; neither image was executed (*accepted operator-measured*). Both images have 300 installed packages: 298 are identical and 2 changed, with 0 Production-only and 0 candidate-only. The changes are `libssl3` and `openssl`, each `3.0.20-1~deb12u2` → `3.0.22-1~deb12u1`; both are upgrades under `dpkg --compare-versions`, with no downgrade. The CA bundle, `ffmpeg`, `ffprobe`, `python3.11`, Node and yt-dlp are byte-identical. Evidence `/var/tmp/hls09b/package-drift-audit.txt`, SHA-256 `138b7208…` (operator-held). The disposition was not Production acceptance; HLS-10's real-network acceptance was a separate step, and it has since passed (2026-09-26). See §4j. |
 | `CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001` | **CLOSED — runtime absence verified (PASS)** | A dedicated measurement on 2026-09-26 of the live Production Worker, not of the retained HLS candidate. It used the committed names-only observer `makeSystemObservers().environmentNames()` against `videofetch-worker`, from `main` `77732cfe…`. `CLOUDFLARE_ACCESS_CLIENT_ID`, `CLOUDFLARE_ACCESS_CLIENT_SECRET` and `VIDEOFETCH_ACCESS_SECRET` are absent, and so are their case-insensitive variants. The expected control names `WORKER_CONTROL_KEY_ID`, `WORKER_CONTROL_SECRET` and `R2_BROKER_SOCKET_PATH` are present. One stable runtime epoch covered the measurement: image `sha256:5925515f…`, container `cd6e46d0…`, 0 restarts. No secret value, value hash or value length was fetched. Evidence: SHA-256 `702d6a350a08f263a19ac6aa3445ee7a8cd0fe2238fe0d7c213baac6a17f8971` (operator-held). *Accepted operator-measured runtime evidence, not CI.* No HLS step closed it. It was a pre-promotion prerequisite, so HLS-10 had to repeat the check after promotion. HLS-10 did, immediately after the promotion and at the end, on the promoted Worker epoch, and it passed (§4j). The §10 checklist item is closed. See §4j. |
 | `HLS-10-PRODUCTION-PROMOTION-REAL-SOURCE-ACCEPTANCE-001` (executed as `…-RETRY-001`) | **CLOSED / PASS / PRODUCTION ACCEPTED** | 2026-09-26: the qualified HLS-9B image `sha256:e5b1144c…` (source `f0b47bd5…`, not rebuilt; `main` `1524cdc4…` was docs-only ahead, with no runtime-code drift) was retagged by immutable id as `videofetch-worker:latest` at 16:05:26.998Z, and only `videofetch-worker.service` was restarted. Candidate epoch: container `0bfaf6810dc2…`, StartedAt 16:05:27.747Z, NRestarts 0, stable to the end. The post-promotion names-only credential-custody check passed twice on that epoch. The direct regression passed (2,848,208 bytes, equal to the job size and the expected digest). On an operator-approved public HLS test master, the previous image advertised 0 presets (5 HLS renditions withheld, `unsupported_protocol`), and the promoted image advertised `preset:best` plus five named rungs; `preset:144` went through all six durable states, directly observed, with 0 yt-dlp, `ffmpeg` or `ffprobe` processes across 35 downloading samples. A `303` presigned R2 GET delivered 20,049,865 bytes, equal to the Product `fileSize` (SHA-256 `91cd6fc0…`, `video/mp4` from the object's `Content-Type`), and an offline ffprobe found one H.264 and one AAC stream, 634.634 s. No rollback; no Vercel, Cloudflare, R2, systemd or `worker.env` change; the VM ended Stopped. Evidence `/var/tmp/hls10/hls10-production-acceptance.txt`, SHA-256 `83b0e2374eb29effe54190bdbb55890e9252f8583c2334e9ca6d7e648b1dcf2e` (*accepted operator-measured*, not CI). A first attempt stopped before starting the VM and changed nothing. See §4j. |
@@ -6982,8 +7065,9 @@ Advanced is the deliberate difference.
 One operator-side finding: an operator-owned historical acceptance secret file was
 found stale. It is not a Product or deployment defect and is outside repository
 state. The acceptance used a freshly supplied secret, which was deleted afterwards.
-The one open observation is the size estimate, `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`
-(§11).
+The one open observation at P2 was the size estimate,
+`SOURCE-FILESIZE-ESTIMATE-DRIFT-001` (§11). It has since closed: it was deployed
+and accepted in Production on 2026-09-27 (record below).
 
 ### Clear-HLS v1 — source and retained-candidate state before HLS-10 (historical)
 
@@ -7016,7 +7100,9 @@ The full record is §4j; in brief:
   `f0b47bd5…`, not rebuilt) was retagged by immutable id as
   `videofetch-worker:latest` at 16:05:26.998Z, and only
   `videofetch-worker.service` was restarted. The previous Production image
-  `sha256:5925515f…` is now the immediate rollback. No rollback was needed.
+  `sha256:5925515f…` became the immediate rollback; it has been a deeper rollback
+  since 2026-09-27, when `sha256:e5b1144c…` itself became the immediate rollback
+  (record below). No rollback was needed.
 - **Boundaries.** Every execution-plane unit stayed active, and the egress
   verifier passed before, after and at the end. The names-only credential-custody
   check passed immediately after the promotion and at the end, on one stable
@@ -7035,55 +7121,285 @@ The full record is §4j; in brief:
 - **Evidence.** SHA-256
   `83b0e2374eb29effe54190bdbb55890e9252f8583c2334e9ca6d7e648b1dcf2e`.
 
-### Current operating state
+### SOURCE-FILESIZE-ESTIMATE-DRIFT — Production closure
 
-*Recorded 2026-09-27 by `YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-DOCS-CLOSURE-001`,
-superseding the 2026-09-26 record of `HLS-10-PRODUCTION-ACCEPTANCE-DOCS-CLOSURE-001`.
-That record superseded `HLS-PRE-HLS10-DOCS-STATE-RECONCILIATION-001`, which in
-turn superseded the 2026-09-19 records of the P2 closure. This update is
-documentation only.*
+`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, 2026-09-27 — **CLOSED / DEPLOYED /
+PRODUCTION ACCEPTED.** Recorded by
+`SOURCE-FILESIZE-ESTIMATE-DRIFT-001-DOCS-CLOSURE-001` (documentation only).
 
-- *The Worker rows are still the accepted operator-measured HLS-10 Production
-  state (§4j). The three 2026-09-27 tasks (§11) promoted no image: they added
-  one compatibility alias and restarted the Worker only inside the live
-  acceptance.*
-- *The control-plane rows record the repaired Vercel Production deployment. Its
-  metadata was provider-observed read-only on 2026-09-27, and its connectivity
-  was operator-measured by the Access repair and the live acceptance (§11).*
+**Evidence classes.**
+
+- **GitHub-verifiable:** the source facts.
+- **Accepted operator-measured:** the candidate, discriminator and Production
+  facts. That evidence is held outside the repository and is not GitHub CI
+  (this repository has no CI).
+- **Provider-observed:** the Vercel deployment identity. It is not a Git
+  attestation.
+
+**1. Source merge (*GitHub-verifiable*).**
+
+- **PR and merge.** PR #88 was merged as a regular two-parent merge,
+  `f9a8109bb1302076b5b415b572c0ab288467250a` (tree
+  `846707b20ff39cd93f4e258cc7c76a01818f880d`).
+- **Parents.** `b4eefb656f6f289874a0bc0af9f9e8f8378a4791`, and the final reviewed
+  head `e84db9810dd5f6a18423d6df80dc07bc782ccc64`, whose tree is identical.
+- **Implementation commit.** `8aedf62d38c65eb0d5dd2617849d755bff67c269`.
+- **Runtime scope.** Against the previous Worker source `f0b47bd5…`, the only
+  runtime change is in `src/worker/analysis/ytdlp-analysis.server.ts`.
+  - `src/worker/execution/generic-source.ts` changed a comment only; its
+    emitted JavaScript is identical.
+  - Every other `src` change is a test or testdata.
+  - Identical: `src/shared`, `src/web`, `src/lib/security`, `src/routes/api`,
+    `src/types`, `src/worker/state`, `src/worker/hls`, `Dockerfile.worker` and
+    the package files.
+
+**2. Candidate qualification (*accepted operator-measured*).**
+
+- **Build.** The committed SPLIT-07 driver built exact `f9a8109b…` into
+  `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5`.
+- **Retention.** Retained as `videofetch-worker:rc-f9a8109bb130-0a6e66b0eb1f`,
+  tagged from the immutable id.
+- **Release checks.** `split07-release-image-candidate-03` PASS, 47/47, with all
+  46 mandatory checks present exactly once. Parent record
+  `1d45f9bd2101220bcb3a536caa8e9b2947a75438aaa9696be90383cd497dd653`.
+- **Children.**
+  - mp4 141/141 (`c8a5b9442e25423a7eedd0d91888a1ccfed3d106f10e792ca697c9e43ae55ed0`);
+  - webm 141/141 (`ca22b95b7bf7ced8a79c7010dd68e1d0afef161db3c1310f94a2cf1bb5bf568d`);
+  - clear-HLS 146/146 (`394d3854a3f0b0d168aa9d499bc7cf2495bb0179f1b0c5e2a7e7b3f35f95b359`).
+- **In-image tests.** The filesize analysis suites passed 370/370 inside the
+  image, with no network.
+- **Drift.** None against `sha256:e5b1144c…`. Layers 0–11 are identical, and
+  the runtime/package inventory is byte-identical: 300 packages; Node, Python,
+  yt-dlp, FFmpeg and the CA bundle all unchanged.
+- **Production.** Undisturbed.
+- **Package.** `~/vf-filesize-rc-qualification-20260927T113327Z/`.
+  - task summary `f377fa30de8e6e3636a373b1edeac0505344150d8000fe0385417c3c691ebb6e`;
+  - SHA256SUMS `958e53da4882b24ef7a6cd1b0c8f26d34e0710b0d58f6d6b0b793449234cfa77`.
+
+**3. Isolated public-X discriminator qualification (*accepted
+operator-measured*).**
+
+- **Source.** `https://x.com/J_Nimrodi/status/2100684463789297665/video/1`, a
+  PUBLIC test input.
+- **Method.** Four interleaved one-shot analyses: old, candidate, old,
+  candidate.
+  - Each ran its image's own analysis code inside the live Production media
+    network namespace, which was proven by namespace identity.
+  - The safe-egress verifier passed before and after each run.
+  - There was no Product state, broker socket, credential or job.
+- **Old image (`e5b1144c…`).** best/720/360/240 were 72,050,624 / 72,050,624 /
+  27,548,768 / 8,476,544. Each came from a positive `filesize_approx` with no
+  positive declared `filesize`, and the public and private sizes both equalled
+  it.
+- **Candidate.** All four public and private sizes were `null`. Non-size output
+  was identical and the selected rendition was unchanged.
+- **Production.** Not mutated.
+- **Package.** `~/vf-filesize-public-x-discriminator-qualification-20260927T133631Z/`.
+  - task summary `cd8872fc88b64542dc5d8c5bdbc4ee53b2e910c412b16052edb3dd422b106e00`;
+  - comparison `2d2cd849d531ad5dfad0d2f45a197444aae2c64e078d4c3416140e2a33921368`;
+  - SHA256SUMS `c7c3caf861f7063ca56056af7d4ba442f92735ea6377f50f12c1cb08769538a8`.
+
+**4. Immutable Production promotion (*accepted operator-measured*).**
+
+The promotion ran as `…-PRODUCTION-PROMOTION-LIVE-ACCEPTANCE-RETRY-002`. The
+first attempt, `…-001`, stopped at its pre-promotion discriminator gate before
+any mutation, because the supplied X source was not the historical case.
 
 | | |
 | :--- | :--- |
-| Worker source | `f0b47bd567dd978374bfec1a01e6d9768c747160` (PR #79 merge) — the qualified source of the promoted image. The image was not built from later `main` |
-| Worker source tree | `2b1099bb146a88f4a4e70bdd3065fba100ef5f7f` |
-| Worker image — `videofetch-worker:latest` | `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a` — promoted 2026-09-26 by HLS-10 and the running Worker throughout its acceptance epoch (container `0bfaf6810dc233819ac3281903fc750c66fb5a969ed6725c5408521399dbbf83`, StartedAt `2026-09-26T16:05:27.747382873Z`, NRestarts 0); contains clear-HLS v1 |
-| Retained candidate tag | `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c` → the same image (the HLS-9B release candidate, SPLIT-07 `-03` PASS 47/47) |
-| Source-SHA compatibility alias | `videofetch-worker:f0b47bd567dd978374bfec1a01e6d9768c747160` → the same image, since 2026-09-27 (`YTDLP-CURRENT-LIMIT-4GIB-IMAGE-IDENTITY-COMPATIBILITY-ALIAS-001`, evidence `10c03fdb…`). An **alias, not provenance**: it lets the older acceptance harness address the image by its expected source-SHA naming. The source→image relationship remains the accepted HLS-9B/HLS-10 evidence (§4j) |
-| `main` at promotion | `1524cdc4a8f1347431481e7fc4c2772aabe7ac60`, tree `481e4eac86357fb1bc0d1e4e19d498331e21f3fe` — four documentation-only commits ahead of the Worker source, with no runtime-code drift; later `main` commits recorded here are documentation only |
-| Immediate rollback image / tag | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` → `videofetch-worker:rc-593f47dfffe7-5925515fb002` (the pre-HLS P1 image, source `593f47df…`; sends `sourceQuality`, which the current Production control-plane code accepts; any Vercel rollback still requires Access compatibility to be re-established and reverified, §9) — an image-only rollback onto the same disk-backed unit (§9) |
-| Deeper rollback images / tags | `sha256:d6aa8b404d015e72bb216f364b900271521d44f66bae672bd012d4239fc52b0e` → `videofetch-worker:rc-8b59cdffbfe5-d6aa8b404d01` (the unknown-audio image, no `sourceQuality`), then `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0` → `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799` (the 4 GiB rollout image), then `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b` → `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (the SPLIT-08E image, 500 MiB default) (§9) |
+| Retag | `videofetch-worker:latest` ← `sha256:0a6e66b0…` by **immutable id**, 2026-09-27T14:02:55.237Z; no other tag changed |
+| Restart | only `videofetch-worker.service`: stop 0.137 s, start 0.149 s, health downtime 0.948 s |
+| New epoch | MainPID 9673, container `5952d4e06e4c…`, StartedAt 2026-09-27T14:02:55.608Z, NRestarts 0 |
+| Immediate rollback | `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c` → `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a` — verified before promotion; **not needed** |
+| Pre-promotion | control plane login / diagnostics / sites 200, 0 running, 0 queued, yt-dlp enabled; named-tunnel requests observed; quiescence re-checked immediately before the retag |
+
+**5. Live public-X pre/post (*accepted operator-measured*, through the unchanged
+Production control plane).**
+
+- **Repeatability.** Two analyses before and two after; each pair was identical.
+- **Shadow agreement.** Before matched the qualified old-image shadow, and after
+  matched the qualified candidate shadow.
+
+| | Before promotion | After promotion |
+| :--- | :--- | :--- |
+| Duration | 264.892 s | 264.892 s |
+| Presets | `preset:best`, `preset:720`, `preset:360`, `preset:240` | the same |
+| `preset:best` `fileSize` | 72,050,624 | `null` |
+| `preset:720` `fileSize` | 72,050,624 | `null` |
+| `preset:360` `fileSize` | 27,548,768 | `null` |
+| `preset:240` `fileSize` | 8,476,544 | `null` |
+| `sourceQuality` | observed 720, deliverable 720, `unsupported_protocol` ×3 | the same |
+
+The complete before/after diff was **exactly those four `fileSize` values**.
+Labels, resolutions, containers, `formatId`, audio and video flags, codecs, fps,
+capabilities, `sourceQuality`, extractor, duration and `formats` were all
+unchanged. This is one public X post; it is not a claim about X/Twitter sources
+in general.
+
+**6. Declared-size generic control (*accepted operator-measured*).**
+
+- **Result.** After the promotion, `YE7VzlLtp-4` returned extractor `yt-dlp` and
+  `preset:144` `fileSize` **13,409,066**.
+- **What it shows.** Under the reviewed implementation, a positive generic
+  `fileSize` can only come from a positive upstream-declared `filesize`. This is
+  stated for that observed source and run only.
+
+**7. One Production job (*accepted operator-measured*).**
+
+- **Job.** Exactly one: `29a78c31d01d139aac78d92bfae991b2` on the X post,
+  `preset:best`.
+- **Lifecycle.** `queued` → `analyzing` → `downloading` → `uploading` → `ready`,
+  in about 11 s.
+- **Progress.** Eight `downloading` samples were observed, and every one had
+  `totalBytes: null`.
+- **Delivery.** A `303` to a signed R2 GET returned `200` and delivered
+  **38,257,789 bytes**. That exactly equals the ready durable `fileSize` of
+  38,257,789.
+- **Digest.** SHA-256
+  `98cc2dfa7e92a53e0b7ce5d61e16acd698c33bca8346c69ddeb7f5d86a65aa46`.
+- **Media.** H.264 High 1560×720 plus AAC-LC stereo at 48 kHz, ≈ 264.94 s; a
+  full decode succeeded.
+- **Decoder warnings.** The decoder printed 25 timestamp warnings, and nothing
+  else. They reflect the source's own irregular frame timing:
+  `X-TWITTER-JONATHAN-TIMING-RENDITION-DIAGNOSTIC-001` (§11) had already
+  classified that timing as source-side for a post the operator identifies as
+  this same one. They are not a VideoFetch defect.
+- **Afterwards.** 0 running and 0 queued jobs. The workspace held only the empty
+  `jobs/` root, which is its normal post-job state.
+
+**8. The two sizes mean different things.**
+
+- **Before download:** an approximation-only generic preset publishes
+  `fileSize: null`, and download progress reports `totalBytes: null`. No
+  estimate is presented as a byte count.
+- **After download:** the ready job's durable `fileSize` is the exact byte count
+  of the delivered object — 38,257,789 for the accepted job. It is **not** an
+  estimate, and it does not mean the same thing as a preset `fileSize`.
+- **Observation for this one source.** The old approximation (72,050,624) was
+  about 1.88× the delivered bytes. The fix is about provenance and false
+  precision, whichever way an approximation errs; it does not assume
+  approximations always overestimate.
+
+**9. Boundary and custody continuity (*accepted operator-measured*).**
+
+- **After promotion.**
+  - Health 200.
+  - Safe-egress, workspace and media-DNS checks passed.
+  - Broker, media namespace, watchdog and named tunnel healthy.
+  - External liveness healthy on the new epoch.
+  - 0 failed units.
+- **Credential custody, names only.** All 13 forbidden names were absent, and
+  the expected names, including `WORKER_CONTROL_KEY_ID`, `WORKER_CONTROL_SECRET`
+  and `R2_BROKER_SOCKET_PATH`, were present. No value, hash or length was read.
+- **Configuration.** `worker.env` stayed byte-identical (SHA-256
+  `3583770c69e0ef7535077ab3d0eda82b1af836c68849dbfde0aa380f8ca459a1`, with
+  `YTDLP_ENABLED=true`).
+- **No provider changes.** No Vercel deployment, Vercel environment, Cloudflare
+  or R2 change.
+- **Vercel.** Production stayed `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9`, READY /
+  production (*provider-observed*).
+- **Public contract.** Its shape did not change.
+
+**10. Stability — PASS, with one superseded observer self-interference.**
+
+- **First window (≈ 302 s).**
+  - **Required gates — all passed.** Every acceptance gate the promotion task
+    required passed: 11/11 VM samples and 11/11 control-plane samples, with
+    health and control plane healthy, NRestarts 0 and 0 failed units.
+  - **Extra observer — self-interference.** An *extra*, operator-added
+    process-idleness observer (not a required acceptance gate) flagged one
+    transient media-named process at its first capture. Worker diagnostics
+    runs `probeWorkerBinaries()`, which calls `ffmpegAvailable()` and
+    `probeYtdlpRuntime()` on every request (*source-verifiable*). The
+    concurrent diagnostics sampling therefore briefly created the exact
+    processes the observer looks for, and a controlled reproduction confirmed
+    it. That result is superseded observer self-interference, not a Product
+    failure, and nothing was rolled back.
+- **Second window.** A complete second window was run with the observer offset
+  from diagnostics sampling. **PASS**:
+  - 11/11 VM samples over ≈ 299.7 s;
+  - every start and end boundary check passed, with 0 media processes at the
+    idle captures;
+  - liveness healthy at 14:22:53Z;
+  - 11/11 control-plane samples over ≈ 302 s, all 200, 0 server errors;
+  - NRestarts 0, 0 failed units.
+
+**11. Evidence.** `~/vf-filesize-production-promotion-live-acceptance-20260927T135900Z/`
+(0700; files 0600).
+
+- **Package hashes.**
+  - task summary `061434d3bb204ff4c5a9f01c41dd3274ffb60bd3a368798664ba21a207a3f570`;
+  - SHA256SUMS `bb67dee656d09fcad5b519e6df6c76db060fd0704221b255a68cc1ff9387b52f`,
+    55/55 entries verified.
+- **Key records.**
+  - `post-x-delta-gate.json` `6fea3c4c…`;
+  - `x-job.json` `e90611fb…`;
+  - `media-validation.txt` `e77ba42e…`;
+  - `txn.log` `2e7a736c…`;
+  - `final.txt` `fdb61f30…`.
+- **Privacy scan.** CLEAN, with positive controls. The public x.com page URL is
+  allowed. No credential, cookie, signed R2 URL or private media/CDN URL is
+  recorded.
+
+**12. Idle state.** The VM went Stopped → started for the task → **Stopped**
+after acceptance. Stopping it is normal on-demand idle behaviour, not a
+rollback.
+
+### Current operating state
+
+*Recorded 2026-09-27 by `SOURCE-FILESIZE-ESTIMATE-DRIFT-001-DOCS-CLOSURE-001`
+(documentation only). This record supersedes the earlier 2026-09-27 record of
+`YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-DOCS-CLOSURE-001`, which superseded
+the 2026-09-26 record of `HLS-10-PRODUCTION-ACCEPTANCE-DOCS-CLOSURE-001`. That
+record superseded `HLS-PRE-HLS10-DOCS-STATE-RECONCILIATION-001`, which in turn
+superseded the 2026-09-19 records of the P2 closure.*
+
+- *The Worker rows are the accepted operator-measured Production state of
+  `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` (the closure record above). It promoted
+  `sha256:0a6e66b0…` on 2026-09-27; the HLS-10 image `sha256:e5b1144c…` is now
+  the immediate rollback. Between HLS-10 and that promotion, no task promoted
+  an image.*
+- *The control-plane rows record the repaired Vercel Production deployment,
+  unchanged by the filesize rollout. Its metadata was provider-observed
+  read-only on 2026-09-27, most recently at 14:43Z. Its connectivity was
+  operator-measured by the Access repair and both 2026-09-27 live acceptances
+  (§11).*
+
+| | |
+| :--- | :--- |
+| Worker source | `f9a8109bb1302076b5b415b572c0ab288467250a` (PR #88 merge) — the qualified source of the promoted image, built from exact `main` |
+| Worker source tree | `846707b20ff39cd93f4e258cc7c76a01818f880d` |
+| Worker image — `videofetch-worker:latest` | `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5` — promoted **2026-09-27 14:02:55Z** by `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, and the running Worker throughout its acceptance epoch (MainPID 9673, container `5952d4e06e4c…`, StartedAt `2026-09-27T14:02:55.608Z`, NRestarts 0). It contains clear-HLS v1 and declared-only generic preset `fileSize` |
+| Retained candidate tag | `videofetch-worker:rc-f9a8109bb130-0a6e66b0eb1f` → the same image (SPLIT-07 `-03` PASS 47/47; filesize suites 370/370 in the image; no runtime/package drift against `e5b1144c…`) |
+| Source-SHA compatibility alias | `videofetch-worker:f0b47bd567dd978374bfec1a01e6d9768c747160` → `sha256:e5b1144c…`, since 2026-09-27 (`YTDLP-CURRENT-LIMIT-4GIB-IMAGE-IDENTITY-COMPATIBILITY-ALIAS-001`, evidence `10c03fdb…`). An **alias, not provenance**: it lets the older acceptance harness address that image by its expected source-SHA naming. It now names the **immediate rollback image, not current Production**. The source→image relationship remains the accepted HLS-9B/HLS-10 evidence (§4j). **No source-SHA alias exists for `f9a8109b…` / `0a6e66b0…`**; none was created |
+| `main` at promotion | `f9a8109bb1302076b5b415b572c0ab288467250a`, tree `846707b20ff39cd93f4e258cc7c76a01818f880d` — `main` was the Worker source itself |
+| Immediate rollback image / tag | `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a` → `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c` (the HLS-10 clear-HLS image, source `f0b47bd5…`; Production 2026-09-26 → 2026-09-27). It keeps clear HLS and `sourceQuality`, and brings back the approximation-backed generic `fileSize`. No Vercel change is needed either way, because PR #88 changed no public schema. An image-only rollback onto the same disk-backed unit (§9) |
+| Deeper rollback images / tags | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` → `videofetch-worker:rc-593f47dfffe7-5925515fb002` (the pre-HLS P1 image, source `593f47df…`; sends `sourceQuality`, which the current Production control-plane code accepts; the immediate rollback from HLS-10 until 2026-09-27), then `sha256:d6aa8b404d015e72bb216f364b900271521d44f66bae672bd012d4239fc52b0e` → `videofetch-worker:rc-8b59cdffbfe5-d6aa8b404d01` (the unknown-audio image, no `sourceQuality`), then `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0` → `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799` (the 4 GiB rollout image), then `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b` → `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (the SPLIT-08E image, 500 MiB default). Any Vercel rollback still requires Access compatibility to be re-established and reverified (§9) |
 | Product limit | **4 GiB** (4,294,967,296 bytes) — `MAX_FILE_SIZE` absent; the image default is authoritative. LIVE since the 2026-09-17 rollout (§2a, §11h). **Actual-byte guard LIVE ACCEPTED 2026-09-27**: `limit.actual-byte-guard = PASS`, an unknown-length media GET aborted as `TOO_LARGE` after 4,309,106,033 bytes against the measured 4,294,967,296-byte limit, with no processing or upload (`YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN`, §11). This is additional current-limit behavioural evidence, not a replacement for the rollout evidence. The narrow aggregate's overall verdict is `BLOCKED` by design and is not a Stage-B PASS |
 | Product media workspace | 10 GiB disk-backed ext4 (`srv-videofetch-media.mount`), bound at `/tmp/videofetch`; no Product media tmpfs |
 | Worker unit | the committed `deploy/systemd/videofetch-worker.service` (blob `ad43ab55…`), installed byte-identically |
 | Lima primary disk | 32 GiB |
-| Pinned yt-dlp | `2026.08.19` — unchanged by all five promotions (HLS-10: reported by the control plane before and after; the package-drift audit found the artifact byte-identical) |
-| Generic feature | `YTDLP_ENABLED=true`, persisted in `/etc/videofetch/worker.env` (Phase 10E; accepted SHA-256 `3583770c…` unchanged, re-verified at the 2026-09-13 and 2026-09-17 promotions; `worker.env` was not changed by either 2026-09-18 promotion or by HLS-10). The 2026-09-27 live current-limit acceptance temporarily set exactly `YTDLP_ENABLED=false` for its Stage A. It restored the exact accepted bytes, SHA-256 `3583770c69e0ef7535077ab3d0eda82b1af836c68849dbfde0aa380f8ca459a1`, at 08:00:04Z, before its byte-limit case, and left them in place (§11) |
+| Pinned yt-dlp | `2026.08.19` — unchanged by all six promotions (the filesize promotion: reported by the control plane before and after, and the candidate's runtime inventory byte-identical to `e5b1144c…`; HLS-10: reported by the control plane before and after, and the package-drift audit found the artifact byte-identical) |
+| Generic feature | `YTDLP_ENABLED=true`, persisted in `/etc/videofetch/worker.env` (Phase 10E; accepted SHA-256 `3583770c…` unchanged, re-verified at the 2026-09-13 and 2026-09-17 promotions; `worker.env` was not changed by either 2026-09-18 promotion, by HLS-10 or by the 2026-09-27 filesize promotion, which re-verified the hash before and after). The 2026-09-27 live current-limit acceptance temporarily set exactly `YTDLP_ENABLED=false` for its Stage A. It restored the exact accepted bytes, SHA-256 `3583770c69e0ef7535077ab3d0eda82b1af836c68849dbfde0aa380f8ca459a1`, at 08:00:04Z, before its byte-limit case, and left them in place (§11) |
 | Split-stream presets | live in Production since the SPLIT-08E promotion (2026-09-13), and contained in the current image |
 | Unknown-audio video presets | live in Production since 2026-09-18 (`GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001`, §11d), and contained in the current image; the original X/Twitter failure case accepted end to end |
 | Source rendition inventory | `sourceQuality` live in Production since 2026-09-18 21:00Z (`GENERIC-SOURCE-RENDITION-INVENTORY-001`); informational only, and no execution path reads it |
 | Source-vs-downloadable quality UI | `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001` — **live in Production since 2026-09-19** (Vercel only; browser presentation of `sourceQuality`; the Worker did not change) |
-| Clear-HLS v1 | **DEPLOYED / PRODUCTION ACCEPTED since 2026-09-26 (HLS-10).** Deliberately narrow: `m3u8_native` discovery only, a clear VOD MPEG-TS media playlist, one rendition with proven video and audio, VideoFetch-owned acquisition, and a Worker stream-copy remux after `beginProcessing()`. Every HLS rendition outside that path still appears only in `sourceQuality`, as withheld, and never as a download (§4j) |
+| Clear-HLS v1 | **DEPLOYED / PRODUCTION ACCEPTED since 2026-09-26 (HLS-10)**, and contained in the current image, whose release qualification passed the clear-HLS child (146/146). Deliberately narrow: `m3u8_native` discovery only, a clear VOD MPEG-TS media playlist, one rendition with proven video and audio, VideoFetch-owned acquisition, and a Worker stream-copy remux after `beginProcessing()`. Every HLS rendition outside that path still appears only in `sourceQuality`, as withheld, and never as a download (§4j) |
 | Segmented DASH | **not implemented** — such renditions appear only in `sourceQuality`, as withheld, and never as a download |
+| Generic preset `fileSize` | **DEPLOYED / PRODUCTION ACCEPTED 2026-09-27** (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`). Generic preset `fileSize` publishes only a positive upstream-declared `filesize`. Approximation-only sources publish `null`, and so does the private selection size, which feeds progress `totalBytes`. `filesize_approx` stays private, for conservative size-limit admission, clear-HLS admission, ranking and `size_limit_exceeded`. A ready job's durable `fileSize` is the exact delivered byte count, which is a different meaning. Direct analysis is unchanged (HEAD `Content-Length`) |
 | Control plane | Vercel Production `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9` — target `production`, READY / PROMOTED, created 2026-09-27T07:17:55.768Z, build started 07:17:56.654Z, READY 07:18:22.943Z. Provider deployment-source field `source: cli`; provider-recorded action `meta.action: redeploy`, `meta.originalDeploymentId` `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd`. It carries the replaced Cloudflare Access pair, and login, diagnostics and sites answer 200 (§11). Vercel records `dpl_BJYRG7…` (2026-09-26 20:10Z, `source: redeploy`) as a redeploy of the P2 deployment `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, which was from `main` `02b3f15f…` (2026-09-19) by chain of custody. None is Git-attested. Each older deployment keeps its own creation-time environment, including its Access pair (§9). **`dpl_BJYRG7…` is known to carry an Access credential state that did not reach the Worker, so it is not a service-restoring rollback target.** The code layers are the immediate code rollback `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` (`593f47df…`, accepts `sourceQuality`, no Worker rollback needed) and the deeper `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j` (`397f238b…`, predates `sourceQuality`: roll the Worker back first). Their Access validity is unmeasured and must be re-established and reverified before any Vercel rollback (§9) |
 | Vercel project safe-state | `8a85a0e1…` — byte-identical across the SPLIT-08E promotion; not re-measured since, and not by this record |
 | Execution plane | the on-demand `videofetch` Lima VM — idle state **Stopped** |
-| Latest control-plane deployment | 2026-09-27 07:17:55Z — `dpl_YrhkEQC4…`, a Production CLI redeploy (`source: cli`, `meta.action: redeploy`) of `dpl_BJYRG7…`, READY at 07:18:22Z. It is the Access-repair deployment of `PRODUCTION-CONTROL-PLANE-WORKER-ACCESS-CUTOVER-001` (evidence `29008670f9a53285a0ae19ed3f4a677955e7b9a1278e35184423c369f11e0064`, §11), and the control plane of the 2026-09-27 live current-limit acceptance |
+| Latest control-plane deployment | 2026-09-27 07:17:55Z — `dpl_YrhkEQC4…`, a Production CLI redeploy (`source: cli`, `meta.action: redeploy`) of `dpl_BJYRG7…`, READY at 07:18:22Z. It is the Access-repair deployment of `PRODUCTION-CONTROL-PLANE-WORKER-ACCESS-CUTOVER-001` (evidence `29008670f9a53285a0ae19ed3f4a677955e7b9a1278e35184423c369f11e0064`, §11), and the control plane of both 2026-09-27 live acceptances (current-limit, then filesize). The filesize rollout deployed nothing to Vercel |
 | Previous control-plane deployment | 2026-09-26 20:10:31Z — `dpl_BJYRG7…`, a Production **redeploy** of `dpl_BcefWQ…`, READY at 20:11:07Z. It is *provider-observed* (read-only, 2026-09-27) and has no acceptance record. It was made outside the automation of `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-LIVE-ACCEPTANCE-001`, during that task's credential-intake window (§11). Superseded: its Access credential state did not reach the Worker (login 200, Worker-backed routes 503), so it is not a service-restoring rollback target |
 | Earlier control-plane deployment | 2026-09-19 06:57Z — P2 quality UI, `dpl_BcefWQ…`; evidence `7fce201ed8fa4ba844b2730ec2fe7dc04ae97def0168d627134e684a9471e5f1` |
-| Latest live acceptance | 2026-09-27 — `YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN`: fresh Stage A PASS 23/0/0/0 plus one `byte-limit` case, `limit.actual-byte-guard = PASS`, narrow aggregate overall `BLOCKED` by design; evidence `7342aa2b…` (Stage A), `841ac3ae…` (case), `c2d27ce2…` (aggregate), `d9a3e195…` (summary) (§11) |
-| Latest promotion | 2026-09-26 16:05Z — HLS-10, clear-HLS v1; evidence `83b0e2374eb29effe54190bdbb55890e9252f8583c2334e9ca6d7e648b1dcf2e` |
-| Previous promotion | 2026-09-18 21:00Z — P1 rendition inventory, on the retry; evidence `f143de781e4a28e004af4f12479d6fd82c6e633b4a2d9eb112e111b1db13ba2d` |
+| Latest live acceptance | 2026-09-27 — `SOURCE-FILESIZE-ESTIMATE-DRIFT-001` (`…-PRODUCTION-PROMOTION-LIVE-ACCEPTANCE-RETRY-002`): one public X post's four approximation-only preset sizes became `null` with every other field unchanged; the declared-size control `YE7VzlLtp-4` kept `preset:144` `fileSize` 13,409,066; one job's durable `fileSize` 38,257,789 equalled its delivered bytes; stability PASS. Evidence: task summary `061434d3bb204ff4c5a9f01c41dd3274ffb60bd3a368798664ba21a207a3f570`, SHA256SUMS `bb67dee656d09fcad5b519e6df6c76db060fd0704221b255a68cc1ff9387b52f` (closure record above) |
+| Previous live acceptance | 2026-09-27 — `YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN` (still the current-limit evidence; see *Product limit*): fresh Stage A PASS 23/0/0/0 plus one `byte-limit` case, `limit.actual-byte-guard = PASS`, narrow aggregate overall `BLOCKED` by design; evidence `7342aa2b…` (Stage A), `841ac3ae…` (case), `c2d27ce2…` (aggregate), `d9a3e195…` (summary) (§11) |
+| Latest promotion | 2026-09-27 14:02:55Z — `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, accepted image `sha256:0a6e66b0…`; evidence task summary `061434d3bb204ff4c5a9f01c41dd3274ffb60bd3a368798664ba21a207a3f570`. An earlier attempt the same day stopped before any mutation (closure record above) |
+| Previous promotion | 2026-09-26 16:05Z — HLS-10, clear-HLS v1; evidence `83b0e2374eb29effe54190bdbb55890e9252f8583c2334e9ca6d7e648b1dcf2e` |
 | Rolled-back attempt | 2026-09-18 20:30Z — P1 first attempt, ROLLED_BACK on a false-negative gate; evidence `2a95f80619b800e9652999c31575856c9733abd47d579ad8e871bd0626ce804e` |
-| Earlier promotions | 2026-09-18 04:56Z — unknown-audio video presets, evidence `0d7a8251c285a4bd37587145617e8c6e845f63a7315914e1d793ab6a5b88e837`; 2026-09-17 — 4 GiB rollout Phase 1E, evidence `aca50a8e0bb3ddb44d2348109d344fb5fa377d32184fe28327558d6e747f547d`; 2026-09-13 — SPLIT-08E, evidence `427896be60159611c88f2452c69c0fa843502bd9ca5ce9bd2bd3114730845ad4` |
+| Earlier promotions | 2026-09-18 21:00Z — P1 rendition inventory, on the retry, evidence `f143de781e4a28e004af4f12479d6fd82c6e633b4a2d9eb112e111b1db13ba2d`; 2026-09-18 04:56Z — unknown-audio video presets, evidence `0d7a8251c285a4bd37587145617e8c6e845f63a7315914e1d793ab6a5b88e837`; 2026-09-17 — 4 GiB rollout Phase 1E, evidence `aca50a8e0bb3ddb44d2348109d344fb5fa377d32184fe28327558d6e747f547d`; 2026-09-13 — SPLIT-08E, evidence `427896be60159611c88f2452c69c0fa843502bd9ca5ce9bd2bd3114730845ad4` |
 | Safe egress | enforced externally; Phase 9 accepted |
 | 24/7 requirement | **none** |
 
@@ -7114,6 +7430,14 @@ the control plane already accepted, so the Worker did not change (§11h, above).
 application-owned preset under the unchanged strict schema, and there is no
 HLS-specific public vocabulary. HLS-10 measured the unchanged Production control
 plane accepting the promoted Worker's analysis, job and delivery responses (§4j).
+
+**`SOURCE-FILESIZE-ESTIMATE-DRIFT-001` needed no Vercel deployment either.** It
+changes only which value fills the existing nullable `fileSize`
+(`number | null`), inside Worker-side generic analysis. PR #88 changed nothing
+under `src/shared`, `src/web`, `src/lib/security`, `src/routes/api` or
+`src/types` (*repository-verifiable*). The live acceptance measured the
+unchanged `dpl_YrhkEQC4…` accepting the promoted Worker's analysis, job and
+delivery responses (closure record above).
 
 The current control plane, with credential ownership made explicit:
 
