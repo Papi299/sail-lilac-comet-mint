@@ -4268,8 +4268,9 @@ before promoting. Clear-HLS presets are no longer offered: on the accepted real
 source that image advertised 0 presets and reported every HLS rendition in
 `sourceQuality` as withheld (`unsupported_protocol`) (§4j). Everything else is as
 at P1: the same pinned yt-dlp, the same 4 GiB source default, the same unit and
-workspace. The image still sends `sourceQuality`, so both current Vercel
-deployments accept it. Step 1 matters here too: a queued or running job for an
+workspace. The image still sends `sourceQuality`, which the current Production
+control-plane code accepts. Vercel rollback Access compatibility remains a
+separate prerequisite (below). Step 1 matters here too: a queued or running job for an
 HLS-backed preset has no HLS path on the pre-HLS image.
 
 Rolling back to `d6aa8b40…` restores the unknown-audio state from before the P1
@@ -7058,7 +7059,7 @@ documentation only.*
 | Retained candidate tag | `videofetch-worker:rc-f0b47bd567dd-e5b1144c0a7c` → the same image (the HLS-9B release candidate, SPLIT-07 `-03` PASS 47/47) |
 | Source-SHA compatibility alias | `videofetch-worker:f0b47bd567dd978374bfec1a01e6d9768c747160` → the same image, since 2026-09-27 (`YTDLP-CURRENT-LIMIT-4GIB-IMAGE-IDENTITY-COMPATIBILITY-ALIAS-001`, evidence `10c03fdb…`). An **alias, not provenance**: it lets the older acceptance harness address the image by its expected source-SHA naming. The source→image relationship remains the accepted HLS-9B/HLS-10 evidence (§4j) |
 | `main` at promotion | `1524cdc4a8f1347431481e7fc4c2772aabe7ac60`, tree `481e4eac86357fb1bc0d1e4e19d498331e21f3fe` — four documentation-only commits ahead of the Worker source, with no runtime-code drift; later `main` commits recorded here are documentation only |
-| Immediate rollback image / tag | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` → `videofetch-worker:rc-593f47dfffe7-5925515fb002` (the pre-HLS P1 image, source `593f47df…`; sends `sourceQuality`, so both current Vercel deployments accept it) — an image-only rollback onto the same disk-backed unit (§9) |
+| Immediate rollback image / tag | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` → `videofetch-worker:rc-593f47dfffe7-5925515fb002` (the pre-HLS P1 image, source `593f47df…`; sends `sourceQuality`, which the current Production control-plane code accepts; any Vercel rollback still requires Access compatibility to be re-established and reverified, §9) — an image-only rollback onto the same disk-backed unit (§9) |
 | Deeper rollback images / tags | `sha256:d6aa8b404d015e72bb216f364b900271521d44f66bae672bd012d4239fc52b0e` → `videofetch-worker:rc-8b59cdffbfe5-d6aa8b404d01` (the unknown-audio image, no `sourceQuality`), then `sha256:a3b062a24799932e31ec18afa7af913ce380c871e47267ee59d3feb3ac59fed0` → `videofetch-worker:rc-2e6c0cf97a50-a3b062a24799` (the 4 GiB rollout image), then `sha256:d3b951d5189633748cded13016e53c0faf6cdc78392cecde54d60d54adb96b3b` → `videofetch-worker:rc-6ce4ce2b9146-d3b951d51896` (the SPLIT-08E image, 500 MiB default) (§9) |
 | Product limit | **4 GiB** (4,294,967,296 bytes) — `MAX_FILE_SIZE` absent; the image default is authoritative. LIVE since the 2026-09-17 rollout (§2a, §11h). **Actual-byte guard LIVE ACCEPTED 2026-09-27**: `limit.actual-byte-guard = PASS`, an unknown-length media GET aborted as `TOO_LARGE` after 4,309,106,033 bytes against the measured 4,294,967,296-byte limit, with no processing or upload (`YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN`, §11). This is additional current-limit behavioural evidence, not a replacement for the rollout evidence. The narrow aggregate's overall verdict is `BLOCKED` by design and is not a Stage-B PASS |
 | Product media workspace | 10 GiB disk-backed ext4 (`srv-videofetch-media.mount`), bound at `/tmp/videofetch`; no Product media tmpfs |
