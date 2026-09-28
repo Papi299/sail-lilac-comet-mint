@@ -31,7 +31,9 @@ boundary. See [The Product media workspace](#the-product-media-workspace).
 An **external liveness probe** (`systemd/videofetch-worker-liveness.{service,timer}`,
 `bin/vf-worker-liveness-probe`) observes the Worker from the VM host, outside the
 media namespace. It is an observer, not a boundary and not a supervisor: the
-Worker neither requires it nor is started by it. See
+Worker neither requires it nor is started by it. Automatic restart on an
+unhealthy result was reviewed and deliberately not selected; recovery of an
+`active` but unhealthy Worker is a bounded manual procedure. See
 [External Worker liveness](#external-worker-liveness).
 
 ---
@@ -546,7 +548,7 @@ first (step 6a).
 | Worker `inactive` | `OUTCOME=idle`; **no request is made** | `0` |
 | Worker `activating` / `deactivating` / `reloading` | `OUTCOME=transient`; no request | `0` |
 | Worker `active`, healthy | `OUTCOME=healthy` | `0` |
-| Worker `active`, refused / timeout / non-200 / malformed / wrong state | `OUTCOME=unhealthy` | `1` |
+| Worker `active`, refused / timeout / non-200 / malformed / wrong state | `OUTCOME=unhealthy` — currently also some health-helper/tooling failures; see [manual recovery](#manual-recovery-when-the-worker-is-active-but-unhealthy), step 1 | `1` |
 | Worker `failed` | `OUTCOME=failed-unit` — **never** reported as idle | `1` |
 | Worker `ActiveState` not understood | `OUTCOME=unknown-state` | `1` |
 | Worker unit not loaded | `OUTCOME=not-installed` | `2` |
@@ -577,6 +579,179 @@ Restart-on-failure stays with `videofetch-worker.service`'s own `Restart=` and
 `BindsTo=`. The probe unit declares **no** `Requires=`/`Wants=`/`BindsTo=` on the
 Worker, so a tick can never pull an idle Worker up, and `StartLimitIntervalSec=0`
 keeps repeated failures from rate-limiting the probe into silence.
+
+**Automatic restart-on-unhealthy is deliberately absent.** It was reviewed and
+not selected for the current on-demand execution plane (runbook §8,
+"Restart-on-unhealthy — reviewed and NOT selected"). Nothing restarts a Worker
+because `/v1/healthz` failed: not the probe, not an `OnFailure=` unit, not a
+timer, not a sudoers or polkit rule, not any other service.
+`OUTCOME=unhealthy` is a reason to investigate, not an instruction to restart.
+`/v1/healthz` is liveness only, and while the Worker is `active` an unhealthy
+result can come from a wedged event loop, a stalled or sleeping VM, a start-up
+race, the loopback publication path, a foreign listener or the probe's own
+tooling.
+
+#### Manual recovery when the Worker is active but unhealthy
+
+One diagnosis and at most one restart, run on the VM by the operator (`sudo`
+where shown).
+
+**When to start.** Never on one isolated unhealthy tick. Start when either:
+- two **consecutive** timer ticks — distinct runs on the normal 5-minute
+  cadence, not manual runs seconds apart — both report `OUTCOME=unhealthy`; or
+- Worker-backed Product operations are failing while you are using them.
+
+This is an investigation threshold for a person, not an automatic-restart
+algorithm.
+
+**1. Confirm the health result.**
+
+```
+sudo journalctl -u videofetch-worker-liveness.service -n 40 --no-pager
+```
+
+In each unhealthy run, the helper's own verdict line,
+`vf-worker-health-request: FAIL outcome=…` (`connect-failed`, `timeout`,
+`bad-status`, `malformed-body`, `wrong-state` or `body-too-large`), must come
+before `OUTCOME=unhealthy`. If the run instead shows Node error output, a
+missing module, a helper argument or timeout error, `OUTCOME=config-invalid` or
+`OUTCOME=state-unavailable`, it is a probe or deployment-tooling problem: fix
+that, and do **not** restart the Worker for it. The probe currently reports
+some helper/tooling failures as `unhealthy` (runbook §8), which is why this
+check comes first. There is no response body to read; the helper never prints
+one.
+
+**2. Confirm the Worker is still active.**
+
+```
+systemctl show videofetch-worker.service \
+  -p LoadState -p ActiveState -p SubState -p MainPID -p NRestarts -p ActiveEnterTimestamp
+```
+
+Continue only for `LoadState=loaded`, `ActiveState=active` and
+`SubState=running`, with an `ActiveEnterTimestamp` before the first unhealthy
+tick. A `failed` Worker belongs to systemd's `Restart=on-failure`, not to this
+procedure. An intentionally `inactive` Worker stays inactive.
+
+**3. Confirm all six dependencies.**
+
+```
+systemctl is-active videofetch-r2-broker.service videofetch-media-netns.service \
+  videofetch-egress-policy.service videofetch-egress-watchdog.service \
+  videofetch-media-dns.service srv-videofetch-media.mount
+```
+
+All six must print `active`. If any prints anything else, this is a dependency
+or boundary incident, not a Worker-restart case: follow
+[The breach path](#the-breach-path),
+[Fail-closed dependency](#fail-closed-dependency) and runbook §3a/§9. **Never
+use a Worker restart to hide or repair an egress-watchdog failure.** The
+watchdog is `Restart=no` on purpose, and a Worker start transaction activates
+required units that are inactive.
+
+**4. Tell the Worker's listener apart from the publication path.** The Worker
+listens on `0.0.0.0` inside the shared media network namespace, and the host
+reaches it through the port `videofetch-media-netns.service` publishes on VM
+loopback. Ask the same question over both paths from the VM host, printing
+only the HTTP status, with an HTTP client already on the VM such as `curl`
+(nothing is installed for this):
+
+```
+sudo grep '^VIDEOFETCH_WORKER_PORT=' /etc/videofetch/media-egress.env
+sudo docker container inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' videofetch-media-netns
+curl -sS -m 3 -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<port>/v1/healthz
+curl -sS -m 3 -o /dev/null -w '%{http_code}\n' http://<namespace-address>:<port>/v1/healthz
+```
+
+- **Namespace address `200`, loopback not:** the publication path is at
+  fault, not the Worker process. Do **not** restart the Worker for it. The
+  path belongs to `videofetch-media-netns.service`, and restarting that unit
+  stops the Worker through `BindsTo=`: a separate, deliberate decision.
+- **Both fail** (a timeout or `000`): the Worker's listener or event loop.
+- **Any other status on either path:** something answered that is not a
+  healthy Worker, because for this exact request the Worker's route answers
+  only `200`. Treat it as a deployment or security question first;
+  `sudo ss -ltnp` shows what owns the port.
+
+Read the namespace address from the holder each time; never hard-code a
+Docker bridge address. Both requests stay inside the VM. Do not publish or
+expose the health endpoint any further.
+
+**5. Capture evidence before any restart.** The first real incident is worth
+more than a fast recovery.
+
+```
+sudo docker stats --no-stream videofetch-worker
+sudo docker top videofetch-worker -o pid,ppid,stat,etime,comm
+sudo docker container inspect -f '{{.State.Status}} paused={{.State.Paused}} started={{.State.StartedAt}}' videofetch-worker
+free -m
+uptime
+sudo journalctl -u videofetch-worker.service -n 50 --no-pager
+sudo journalctl -u videofetch-worker-liveness.service -n 40 --no-pager
+```
+
+Do not collect environment variables, Worker secrets, HMAC material, R2
+credentials, job URLs, cookies or object keys:
+- `docker top` is limited to process names (`comm`), because full command
+  lines can carry a job's media URL;
+- never run `docker inspect` without `-f`: its full output includes the
+  container environment from `worker.env`, which carries the Worker HMAC
+  secret.
+
+Scrub anything before sharing it outside the VM.
+
+**6. Know the job cost.** A job that is `analyzing`, `downloading`,
+`processing` or `uploading` will end `failed` / `PROCESSING_FAILED` — "Worker
+restarted before the job completed." — and its temporary media is wiped at
+start (`vf-media-workspace-verify --wipe`). `queued` jobs survive and resume;
+`ready`, `failed` and `cancelled` jobs are unchanged. The Worker runs one job
+at a time. These are the existing restart semantics (runbook §7), not a new
+recovery mode.
+
+**7. Restart exactly once.** Only when all of these hold:
+- the Worker is still `active`/`running`;
+- repeated health failure is established (steps 1–2);
+- all six dependencies are `active` (step 3);
+- step 4 points at the Worker, not the publication path;
+- the evidence is captured (step 5).
+
+```
+sudo systemctl restart videofetch-worker.service
+```
+
+This runs the Worker's full pre-start gate chain, including
+`vf-egress-policy-verify` and `vf-media-workspace-verify --wipe`. The command
+belongs to the operator alone. Never put it in the probe, an `OnFailure=` unit,
+a timer, a sudoers or polkit rule, or any other automatic service.
+
+**8. Verify.** Let the Worker finish starting: the unit reports `active`
+before Node is listening. Then run one observation:
+
+```
+sudo systemctl start videofetch-worker-liveness.service
+sudo journalctl -u videofetch-worker-liveness.service -n 5 --no-pager
+```
+
+Expect exactly one `OUTCOME=healthy`, and a new `MainPID` (step 2) and
+container (`sudo docker container inspect -f '{{.Id}}' videofetch-worker`).
+A connection refusal immediately after the restart can still be start-up: wait
+a bounded interval, about 30 seconds, and check once more. Confirm
+Worker-backed Product operation if you need to.
+
+**9. No restart loop.** If the Worker is still unhealthy after that one
+restart, do **not** restart it again. Stop it:
+
+```
+sudo systemctl stop videofetch-worker.service
+```
+
+or end the session by stopping the `videofetch` VM from the Mac
+(`limactl stop videofetch`), the Product's normal idle state. Then open a
+diagnosis task with the evidence from step 5. The policy is one recovery
+attempt, then investigation.
+
+This procedure is manual by design. The re-open criteria and a reserve design
+for automation are in runbook §8; neither is implemented or authorized.
 
 ---
 
