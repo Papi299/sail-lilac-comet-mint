@@ -4542,3 +4542,315 @@ describe("SOURCE-FILESIZE-ESTIMATE-DRIFT-001: declared vs approximate sizes", ()
     assert.equal(plan.strategy === "yt-dlp" ? plan.generic.operation : null, "keep-original");
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001
+//
+// A size field is a byte count only when it is a positive integer. The raw
+// schema still accepts any finite number, so a fractional `filesize` or
+// `filesize_approx` is not a document failure: that one field is unavailable,
+// exactly as if it were absent, and it is never rounded into a different
+// number. The PR #88 roles are unchanged — a declared integer is published and
+// carried privately; an integer approximation stays private policy input — and
+// a malformed declared size can no longer suppress a usable approximation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001: only positive integers are byte counts", () => {
+  const MAX = 10_000_000;
+  const LIM = { maxFileSizeBytes: MAX };
+  const N = 3_000_000;
+
+  /** The REAL internal analyzer over a canned document, at a small ceiling. */
+  async function analyzeFormats(formats: Array<Record<string, unknown>>) {
+    const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats }))));
+    return analyzeGenericMediaInternal(SAFE_URL, {
+      limits: { ...LIMITS, maxFileSizeBytes: MAX },
+      runner,
+      probeRuntime: async () => OK_RUNTIME,
+      validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
+      ffmpegAvailable: true,
+    });
+  }
+  type Analysis = Awaited<ReturnType<typeof analyzeFormats>>;
+
+  /** One muxed 1080p progressive MP4 row carrying only the given size fields. */
+  const muxed = (sizes: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+    format_id: "mux-1080",
+    ext: "mp4",
+    protocol: "https",
+    height: 1080,
+    vcodec: "avc1.640028",
+    acodec: "mp4a.40.2",
+    ...sizes,
+    ...extra,
+  });
+
+  /** An ordinary deliverable 720p row with a valid declared size. */
+  const muxed720 = {
+    format_id: "mux-720", ext: "mp4", protocol: "https", height: 720,
+    vcodec: "avc1.64001F", acodec: "mp4a.40.2", filesize: N,
+  };
+
+  /** `preset:best`'s public size and its private selection size, which must agree. */
+  function bestSizes(result: Analysis) {
+    const preset = result.video.presets.find((p) => p.id === "preset:best");
+    assert.ok(preset, "preset:best is advertised");
+    const source = singleSource(result.selections["preset:best"]);
+    assert.equal(preset.fileSize, source.fileSize, "public and private sizes agree");
+    return { publicSize: preset.fileSize, privateSize: source.fileSize, formatId: source.formatId };
+  }
+
+  /** The candidate's declared and policy sizes, for a single raw row. */
+  function sizesOf(sizes: Record<string, unknown>) {
+    const [c] = selectCandidates([muxed(sizes)], LIM);
+    assert.ok(c, "size metadata alone never costs an in-limit format its eligibility");
+    return { fileSize: c.fileSize, limitSize: c.limitSize };
+  }
+
+  it("the byte-count rule, field by field: only a positive integer survives, unchanged", () => {
+    for (const valid of [1, 1234, N]) {
+      assert.deepEqual(sizesOf({ filesize: valid }), { fileSize: valid, limitSize: valid });
+      assert.deepEqual(sizesOf({ filesize_approx: valid }), { fileSize: null, limitSize: valid });
+    }
+    for (const invalid of [0, -1, 0.5, 1234.5, N + 0.5, Number.MIN_VALUE, null]) {
+      assert.deepEqual(sizesOf({ filesize: invalid }), { fileSize: null, limitSize: null }, `filesize ${invalid}`);
+      assert.deepEqual(sizesOf({ filesize_approx: invalid }), { fileSize: null, limitSize: null }, `filesize_approx ${invalid}`);
+    }
+  });
+
+  describe("single source", () => {
+    it("a fractional declared size alone: the same presets, analyzed without error, size unknown", async () => {
+      const control = await analyzeFormats([muxed({ filesize: 1234 })]);
+      const result = await analyzeFormats([muxed({ filesize: 1234.5 })]);
+
+      assert.deepEqual(
+        result.video.presets.map((p) => p.id),
+        control.video.presets.map((p) => p.id),
+        "the format is not rejected for its size metadata",
+      );
+      assert.deepEqual(bestSizes(result), { publicSize: null, privateSize: null, formatId: "mux-1080" });
+      for (const preset of result.video.presets) assert.equal(preset.fileSize, null, preset.id);
+      for (const [id, value] of Object.entries(result.selections)) {
+        for (const member of selectionMembers(value)) assert.equal(member.fileSize, null, id);
+      }
+      // The public contract still accepts the result, and the public analyzer
+      // resolves rather than failing the whole document.
+      WorkerAnalyzeSuccessSchema.parse({ success: true, video: result.video });
+      const { runner } = fakeRunner(ok(JSON.stringify(singleVideoInfo({ formats: [muxed({ filesize: 1234.5 })] }))));
+      const video = await analyze(SAFE_URL, { runner, ffmpegAvailable: true });
+      assert.equal(video.presets.find((p) => p.id === "preset:best")?.fileSize, null);
+    });
+
+    it("a fractional declared size + an integer approximation: nothing published or carried; the approximation is the policy size", async () => {
+      assert.deepEqual(sizesOf({ filesize: 1234.5, filesize_approx: N }), { fileSize: null, limitSize: N });
+      assert.deepEqual(bestSizes(await analyzeFormats([muxed({ filesize: 1234.5, filesize_approx: N })])), {
+        publicSize: null,
+        privateSize: null,
+        formatId: "mux-1080",
+      });
+    });
+
+    it("an integer declared size + a fractional approximation: the declared size stays authoritative", async () => {
+      assert.deepEqual(sizesOf({ filesize: N, filesize_approx: 2 * N + 0.5 }), { fileSize: N, limitSize: N });
+      assert.deepEqual(bestSizes(await analyzeFormats([muxed({ filesize: N, filesize_approx: 2 * N + 0.5 })])), {
+        publicSize: N,
+        privateSize: N,
+        formatId: "mux-1080",
+      });
+    });
+
+    it("both fractional: size-unknown everywhere, and no policy size is synthesized", async () => {
+      assert.deepEqual(sizesOf({ filesize: 1000.5, filesize_approx: 2000.5 }), { fileSize: null, limitSize: null });
+      assert.deepEqual(bestSizes(await analyzeFormats([muxed({ filesize: 1000.5, filesize_approx: 2000.5 })])), {
+        publicSize: null,
+        privateSize: null,
+        formatId: "mux-1080",
+      });
+    });
+  });
+
+  describe("the size-limit gate", () => {
+    for (const [label, sizes] of [
+      ["a fractional declared size cannot hide an integer approximation over the limit", { filesize: 1234.5, filesize_approx: MAX + 1 }],
+      ["an integer declared size over the limit is not rescued by a fractional approximation", { filesize: MAX + 1, filesize_approx: 2000.5 }],
+    ] as const) {
+      it(`${label}: refused, withheld as size_limit_exceeded`, async () => {
+        assert.equal(selectCandidates([muxed(sizes)], LIM).length, 0);
+
+        const { video, selections } = await analyzeFormats([muxed(sizes), muxed720]);
+        for (const value of Object.values(selections)) {
+          for (const member of selectionMembers(value)) assert.notEqual(member.formatId, "mux-1080");
+        }
+        assert.equal(singleSource(selections["preset:best"]).formatId, "mux-720");
+        assert.deepEqual(video.sourceQuality, {
+          observedMaxHeight: 1080,
+          deliverableMaxHeight: 720,
+          withheld: [{ reason: "size_limit_exceeded", count: 1, maxObservedHeight: 1080 }],
+          protectedUnenumerated: false,
+          maybeProtectedObserved: false,
+        });
+      });
+    }
+
+    it("a fractional value is never rounded into a policy byte count, even past the limit", async () => {
+      // Rounding, flooring or ceiling MAX + 0.5 would give MAX or MAX + 1 and
+      // make it look like a real size decision. It is not a byte count, so the
+      // format is size-UNKNOWN — which is what an absent field has always meant.
+      // Actual bytes are still enforced during acquisition.
+      for (const sizes of [{ filesize: MAX + 0.5 }, { filesize_approx: MAX + 0.5 }]) {
+        assert.deepEqual(sizesOf(sizes), { fileSize: null, limitSize: null });
+        const { video } = await analyzeFormats([muxed(sizes)]);
+        assert.equal(video.presets.find((p) => p.id === "preset:best")?.fileSize, null);
+        assert.deepEqual(video.sourceQuality?.withheld, []);
+      }
+    });
+  });
+
+  describe("ranking", () => {
+    it("a malformed declared size does not remove a valid approximation from the tiebreak", async () => {
+      // Identical in every ranked respect except the approximation, with the
+      // LARGER estimate later in the list, so only the size tiebreak can pick it.
+      const result = await analyzeFormats([
+        muxed({ filesize: 5000.5, filesize_approx: N }, { format_id: "mux-small" }),
+        muxed({ filesize: 1000.5, filesize_approx: 2 * N }, { format_id: "mux-large" }),
+      ]);
+      assert.deepEqual(bestSizes(result), { publicSize: null, privateSize: null, formatId: "mux-large" });
+      assert.equal(singleSource(result.selections["preset:1080"]).formatId, "mux-large");
+
+      // Control: with the same malformed declared sizes and no approximation,
+      // upstream position decides instead.
+      const control = await analyzeFormats([
+        muxed({ filesize: 5000.5 }, { format_id: "mux-small" }),
+        muxed({ filesize: 1000.5 }, { format_id: "mux-large" }),
+      ]);
+      assert.equal(bestSizes(control).formatId, "mux-small");
+    });
+
+    it("a fractional approximation is not a size in the tiebreak either", async () => {
+      // The earlier row's fractional estimate is larger; read as a byte count it
+      // would win. It is unknown, so the later row's integer estimate wins.
+      const result = await analyzeFormats([
+        muxed({ filesize_approx: 2 * N + 0.5 }, { format_id: "mux-frac" }),
+        muxed({ filesize_approx: N }, { format_id: "mux-int" }),
+      ]);
+      assert.equal(bestSizes(result).formatId, "mux-int");
+    });
+  });
+
+  describe("split pair", () => {
+    const videoOnly1080 = (sizes: Record<string, unknown>) => ({
+      format_id: "v", ext: "mp4", protocol: "https", height: 1080, vcodec: "avc1.640028", acodec: "none", ...sizes,
+    });
+    const audioOnlyM4a = (sizes: Record<string, unknown>) => ({
+      format_id: "a", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2", ...sizes,
+    });
+
+    /** The advertised pair's public size and member sizes, or `null` when no pair is advertised. */
+    function pairOutcome(result: Analysis) {
+      const value = result.selections["preset:best"];
+      if (!value || value.kind !== "split") return null;
+      const preset = result.video.presets.find((p) => p.id === "preset:best")!;
+      return { publicSize: preset.fileSize, members: [value.pair.video.fileSize, value.pair.audio.fileSize] };
+    }
+
+    const ADMITTED: ReadonlyArray<
+      readonly [string, Record<string, unknown>, Record<string, unknown>, number | null, [number | null, number | null]]
+    > = [
+      ["integer + integer (unchanged)", { filesize: 6_000_000 }, { filesize: 1_000_000 }, 7_000_000, [6_000_000, 1_000_000]],
+      ["fractional with an integer approximation + integer", { filesize: 6_000_000.5, filesize_approx: 6_000_000 }, { filesize: 1_000_000 }, null, [null, 1_000_000]],
+      ["fractional + integer", { filesize: 6_000_000.5 }, { filesize: 1_000_000 }, null, [null, 1_000_000]],
+      ["integer + fractional", { filesize: 6_000_000 }, { filesize: 1_000_000.5 }, null, [6_000_000, null]],
+      ["fractional + unknown", { filesize: 6_000_000.5 }, {}, null, [null, null]],
+    ];
+    for (const [label, v, a, publicSize, members] of ADMITTED) {
+      it(`${label}, within the limit: admitted; only two declared integers publish a size`, async () => {
+        const outcome = pairOutcome(await analyzeFormats([videoOnly1080(v), audioOnlyM4a(a)]));
+        assert.deepEqual(outcome, { publicSize, members });
+      });
+    }
+
+    for (const [label, v, a] of [
+      ["the video member's", { filesize: 6_000_000.5, filesize_approx: 6_000_000 }, { filesize_approx: 5_000_000 }],
+      ["the audio member's", { filesize_approx: 6_000_000 }, { filesize: 5_000_000.5, filesize_approx: 5_000_000 }],
+    ] as const) {
+      it(`integer approximations over the COMBINED limit behind ${label} fractional declared size: still refused`, async () => {
+        // Each half fits alone (6 MB, 5 MB ≤ 10 MB); together they do not.
+        const result = await analyzeFormats([videoOnly1080(v), audioOnlyM4a(a)]);
+        assert.equal(pairOutcome(result), null);
+        assert.equal(result.video.presets.some((p) => p.hasVideo), false);
+        assert.deepEqual(result.video.sourceQuality?.withheld, [
+          { reason: "size_limit_exceeded", count: 1, maxObservedHeight: 1080 },
+        ]);
+      });
+    }
+  });
+
+  describe("audio", () => {
+    const audioRow = (sizes: Record<string, unknown>) => ({
+      format_id: "a", ext: "m4a", protocol: "https", vcodec: "none", acodec: "mp4a.40.2", ...sizes,
+    });
+
+    for (const [label, sizes] of [
+      ["a fractional declared size", { filesize: 1234.5 }],
+      ["a fractional declared size + an integer approximation", { filesize: 1234.5, filesize_approx: N }],
+    ] as const) {
+      it(`an audio-only source with ${label}: preset:audio and preset:mp3 as usual, size unknown`, async () => {
+        const { video, selections } = await analyzeFormats([audioRow(sizes)]);
+        for (const id of ["preset:audio", "preset:mp3"]) {
+          const preset = video.presets.find((p) => p.id === id);
+          assert.ok(preset, `${id} is advertised`);
+          assert.equal(preset.fileSize, null, id);
+          const source = singleSource(selections[id]);
+          assert.equal(source.formatId, "a");
+          assert.equal(source.fileSize, null, id);
+        }
+      });
+    }
+  });
+
+  describe("clear-HLS admission shares the same reading", () => {
+    const hlsRow = (sizes: Record<string, unknown>) => ({
+      format_id: "hls-1080", ext: "mp4", video_ext: "mp4", audio_ext: "none", protocol: "m3u8_native",
+      height: 1080, vcodec: "avc1.640028", acodec: "mp4a.40.2",
+      url: "https://media.example.invalid/hls/1080/media.m3u8", ...sizes,
+    });
+
+    for (const [label, sizes, admitted] of [
+      ["an integer declared size under the limit (unchanged)", { filesize: N }, true],
+      ["an integer approximation under the limit (unchanged)", { filesize_approx: N }, true],
+      ["an integer approximation over the limit (unchanged)", { filesize_approx: MAX + 1 }, false],
+      ["an integer declared size over the limit + a fractional approximation", { filesize: MAX + 1, filesize_approx: 2000.5 }, false],
+      ["a fractional declared size + an integer approximation over the limit", { filesize: 1000.5, filesize_approx: MAX + 1 }, false],
+      ["a fractional approximation past the limit, which is not rounded into a size", { filesize_approx: MAX + 0.5 }, true],
+    ] as const) {
+      it(`${label}: ${admitted ? "admitted" : "not admitted"}`, async () => {
+        const result = await analyzeFormats([hlsRow(sizes), muxed720]);
+        assert.equal(Object.hasOwn(result.hlsSelections, "preset:1080"), admitted);
+        // The progressive rung is untouched either way.
+        assert.equal(singleSource(result.selections["preset:720"]).formatId, "mux-720");
+      });
+    }
+  });
+
+  it("the private observed size state reads the same byte counts", () => {
+    // HLS rows with no playlist URL: observed, but never a candidate or an HLS
+    // admission, so nothing here depends on preset construction.
+    const row = (sizes: Record<string, unknown>) => ({
+      format_id: "o", ext: "mp4", protocol: "m3u8_native", height: 720, vcodec: "avc1.640028", acodec: "mp4a.40.2", ...sizes,
+    });
+    const { inventory } = analyzeGenericFormats(
+      [
+        row({ filesize: 10 }),
+        row({ filesize: 10, filesize_approx: 20.5 }),
+        row({ filesize: 10.5, filesize_approx: 20 }),
+        row({ filesize: 10.5 }),
+        row({ filesize_approx: 20.5 }),
+      ] as never,
+      { ffmpegAvailable: true, maxFileSizeBytes: MAX },
+    );
+    assert.deepEqual(
+      inventory.renditions.map((r) => r.observed.size),
+      ["exact", "exact", "estimated", "unknown", "unknown"],
+    );
+  });
+});

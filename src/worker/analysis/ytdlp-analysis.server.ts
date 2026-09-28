@@ -613,7 +613,7 @@ type Candidate = {
   readonly videoCodec: string | null;
   readonly audioCodec: string | null;
   /**
-   * The positive upstream-DECLARED size (`filesize`), else `null`
+   * The positive-integer upstream-DECLARED size (`filesize`), else `null`
    * (SOURCE-FILESIZE-ESTIMATE-DRIFT-001).
    *
    * This is the only size that leaves the candidate: it becomes the public
@@ -625,8 +625,8 @@ type Candidate = {
    */
   readonly fileSize: number | null;
   /**
-   * PRIVATE. The size-POLICY value: a positive declared `filesize`, else a
-   * positive `filesize_approx`, else `null` (`knownFileSize`).
+   * PRIVATE. The size-POLICY value: a positive-integer declared `filesize`,
+   * else a positive-integer `filesize_approx`, else `null` (`knownFileSize`).
    *
    * It exists so an approximation keeps doing the conservative jobs it did
    * before: the per-format and pair size-limit admission gates, and the
@@ -880,37 +880,58 @@ function isNonMediaNote(raw: RawFormat): boolean {
 }
 
 /**
- * The ONE size-POLICY precedence rule: a declared positive size, else a
- * positive estimate, else unknown. Extracted so the progressive gate and the
+ * ONE upstream size field read as a byte count: the value itself when it is a
+ * positive integer, else `null` (GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001).
+ *
+ * The raw schema deliberately accepts any finite number, so one odd field costs
+ * that field and not the whole document. This is where a value either becomes a
+ * byte count or is treated exactly like an absent field. A fraction is not a
+ * byte count and is never rounded, floored or truncated into a different one;
+ * zero and negatives are not sizes either.
+ *
+ * Every reader of `filesize` / `filesize_approx` goes through here, so the
+ * policy size, the declared size and the observed size state cannot drift onto
+ * different readings. An integer past 2^53 is still an integer here; it can
+ * never pass a size gate, because the configured ceiling is a safe integer.
+ */
+function positiveIntegerSize(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * The ONE size-POLICY precedence rule: a declared byte count, else an
+ * estimated one, else unknown. Extracted so the progressive gate and the
  * HLS shadow gate cannot drift onto different readings of the same two fields.
  *
  * It feeds admission and ranking ONLY (`Candidate.limitSize`). What the Worker
  * publishes, and what progress reads, is `declaredFileSize` alone.
+ *
+ * Precedence is decided per field, AFTER each is read as a byte count: a
+ * malformed declared size is unavailable, so it cannot suppress a usable
+ * estimate that would otherwise refuse the format
+ * (GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001).
  *
  * `null` means UNKNOWN, never zero and never "no limit". Metadata size is not
  * a security boundary in either path: the byte ceilings that matter are
  * enforced during acquisition.
  */
 function knownFileSize(raw: RawFormat): number | null {
-  if (typeof raw.filesize === "number" && raw.filesize > 0) return raw.filesize;
-  if (typeof raw.filesize_approx === "number" && raw.filesize_approx > 0) {
-    return raw.filesize_approx;
-  }
-  return null;
+  return declaredFileSize(raw) ?? positiveIntegerSize(raw.filesize_approx);
 }
 
 /**
- * The positive upstream-DECLARED size, else `null`
- * (SOURCE-FILESIZE-ESTIMATE-DRIFT-001).
+ * The positive-integer upstream-DECLARED size, else `null`
+ * (SOURCE-FILESIZE-ESTIMATE-DRIFT-001; GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001).
  *
  * Deliberately no fallback to `filesize_approx`, and nothing is rounded,
  * synthesized or inferred — not from duration, bitrate, container or height.
  * In the pinned runtime an approximation is either extractor-supplied or
  * yt-dlp's own `duration × tbr` product, and `-J` does not say which, so it is
- * never presented as a size.
+ * never presented as a size. A fractional `filesize` is `null` here, so it can
+ * never reach the integer `GenericSourceSelection.fileSize` contract.
  */
 function declaredFileSize(raw: RawFormat): number | null {
-  return typeof raw.filesize === "number" && raw.filesize > 0 ? raw.filesize : null;
+  return positiveIntegerSize(raw.filesize);
 }
 
 /**
@@ -2103,12 +2124,12 @@ function observeVideoRendition(raw: RawFormat, index: number): ObservedVideoRend
     container: ext === null ? "unknown" : isObservedVideoContainer(ext) ? ext : "other",
     videoEvidence,
     audio: classifyCodecState(raw.acodec),
-    // The same precedence the size gate uses, so an estimate is never recorded
-    // as a declared size.
+    // The same precedence and byte-count reading the size gate uses, so an
+    // estimate is never recorded as a declared size.
     size:
-      typeof raw.filesize === "number" && raw.filesize > 0
+      declaredFileSize(raw) !== null
         ? "exact"
-        : typeof raw.filesize_approx === "number" && raw.filesize_approx > 0
+        : positiveIntegerSize(raw.filesize_approx) !== null
           ? "estimated"
           : "unknown",
     maybeProtected: raw.has_drm === "maybe",
