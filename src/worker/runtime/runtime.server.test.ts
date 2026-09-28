@@ -5,7 +5,7 @@ import { createServer } from "node:net";
 import { mkdtemp, rm, writeFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AppError } from "../../lib/errors.ts";
+import { AppError, ERROR_MESSAGES } from "../../lib/errors.ts";
 import type { WorkerVideoMetadata, WorkerObjectKey } from "../../shared/worker/contracts.ts";
 import { WorkerClient } from "../../web/worker/worker-client.server.ts";
 import { openWorkerDatabase } from "../state/database.server.ts";
@@ -598,6 +598,11 @@ describe("Worker runtime composition", () => {
           recovered.safeErrorMessage,
           "We couldn't process this video. Try another format or source.",
           "the generic processing message is what the live Stage-B run wrongly saw",
+        );
+        assert.notEqual(
+          recovered.safeErrorMessage,
+          ERROR_MESSAGES.PROCESSING_FAILED,
+          "nor today's generic processing message",
         );
         assert.equal(recovered.stageLabel, "Worker restarted");
 

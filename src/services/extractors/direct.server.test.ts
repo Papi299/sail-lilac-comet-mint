@@ -4,9 +4,15 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { config } from "../../lib/config.ts";
 import { AppError } from "../../lib/errors.ts";
-import { setPinnedRequestFactoryForTests, setSafeHttpTestHooks } from "../../lib/security/safe-http.server.ts";
+import {
+  setPinnedRequestFactoryForTests,
+  setSafeHttpTestHooks,
+  type NodeRequestFactory,
+} from "../../lib/security/safe-http.server.ts";
 import {
   directExtractor,
   downloadDirectOriginalWorker,
@@ -271,5 +277,162 @@ describe("direct acquisition absolute deadline", () => {
     assert.equal(lookups, 0);
     assert.equal(requests, 0);
     assert.deepEqual(deadline.cleared, [deadline.armed[0]!.handle]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001: a transport failure after the
+// response began is the SOURCE failing — NETWORK_ERROR — not an internal one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("direct acquisition transport-failure classification", () => {
+  const MEDIA_URL = "https://cdn.example/video.mp4";
+  let workDir = "";
+
+  beforeEach(async () => {
+    workDir = await mkdtemp(join(tmpdir(), "direct-transport-"));
+  });
+
+  afterEach(async () => {
+    setSafeHttpTestHooks(null);
+    setPinnedRequestFactoryForTests(null);
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  /** A body that delivers one chunk, then fails with `err` on the next read. */
+  function failingBody(err: Error): Readable {
+    let sent = false;
+    return new Readable({
+      read() {
+        if (sent) {
+          this.destroy(err);
+          return;
+        }
+        sent = true;
+        this.push(Buffer.from("partial-media"));
+      },
+    });
+  }
+
+  function serve(body: Readable) {
+    setSafeHttpTestHooks({
+      lookup: async () => [{ address: "8.8.8.8", family: 4 }],
+      requestOnce: async () => ({
+        status: 200,
+        headers: { "content-type": "video/mp4", "content-length": "1000" },
+        body,
+      }),
+    });
+  }
+
+  it("a raw mid-body reset is NETWORK_ERROR, with none of the raw text", async () => {
+    serve(failingBody(Object.assign(new Error("aborted SECRET_UPSTREAM_TEXT"), { code: "ECONNRESET" })));
+    let received = 0;
+    await assert.rejects(
+      downloadDirectOriginalWorker(MEDIA_URL, {
+        workDir,
+        onProgress: (p) => {
+          received = p.downloadedBytes ?? received;
+        },
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.equal(err.code, "NETWORK_ERROR");
+        assert.equal(err.message.includes("SECRET_UPSTREAM_TEXT"), false);
+        assert.equal(err.message.includes("ECONNRESET"), false);
+        return true;
+      },
+    );
+    assert.ok(received > 0, "the failure happened after the body had started");
+  });
+
+  it("an AppError raised on the body keeps its own code", async () => {
+    serve(failingBody(new AppError("TOO_LARGE")));
+    await assert.rejects(downloadDirectOriginalWorker(MEDIA_URL, { workDir }), (err: unknown) => {
+      assert.ok(err instanceof AppError);
+      assert.equal(err.code, "TOO_LARGE");
+      return true;
+    });
+  });
+
+  it("a local file-stream failure is NOT reclassified as a network failure", async () => {
+    serve(Readable.from([Buffer.from("0123456789")]));
+    await assert.rejects(
+      downloadDirectOriginalWorker(MEDIA_URL, { workDir: join(workDir, "does-not-exist") }),
+      (err: unknown) => {
+        assert.equal(err instanceof AppError, false, "a local failure stays internal");
+        return true;
+      },
+    );
+  });
+
+  it("a caller cancellation mid-body is not reclassified as a network failure", async () => {
+    const caller = new AbortController();
+    const body = new Readable({
+      read() {
+        setImmediate(() => this.push(Buffer.from("x")));
+      },
+    });
+    serve(body);
+    let events = 0;
+    await assert.rejects(
+      downloadDirectOriginalWorker(MEDIA_URL, {
+        workDir,
+        signal: caller.signal,
+        onProgress: () => {
+          events += 1;
+          if (events === 4) caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+        },
+      }),
+      (err: unknown) => {
+        assert.ok(!(err instanceof AppError && err.code === "NETWORK_ERROR"));
+        return true;
+      },
+    );
+  });
+
+  it("a real source that closes its connection mid-body is NETWORK_ERROR", async () => {
+    // A real Node HTTP exchange over loopback: the server declares 1000 bytes,
+    // sends 10, then ends the connection. TCP delivers the FIN after the data,
+    // so the client always sees headers and body bytes before the failure.
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "video/mp4", "content-length": "1000" });
+      res.write(Buffer.alloc(10), () => res.socket?.end());
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    try {
+      setSafeHttpTestHooks({ lookup: async () => [{ address: "8.8.8.8", family: 4 }] });
+      // Only the destination is redirected to the loopback server; the request
+      // otherwise runs through the production pinned-request path.
+      const loopback: NodeRequestFactory = (options, callback) => {
+        const { agent, lookup, servername, family, ...rest } = options;
+        void agent;
+        void lookup;
+        void servername;
+        void family;
+        return http.request({ ...rest, protocol: "http:", host: "127.0.0.1", hostname: "127.0.0.1", port }, callback);
+      };
+      setPinnedRequestFactoryForTests({ https: loopback });
+
+      let received = 0;
+      await assert.rejects(
+        downloadDirectOriginalWorker(MEDIA_URL, {
+          workDir,
+          onProgress: (p) => {
+            received = p.downloadedBytes ?? received;
+          },
+        }),
+        (err: unknown) => {
+          assert.ok(err instanceof AppError, "the raw Node error was classified");
+          assert.equal(err.code, "NETWORK_ERROR");
+          return true;
+        },
+      );
+      assert.equal(received, 10, "the connection closed mid-body, after the first bytes");
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

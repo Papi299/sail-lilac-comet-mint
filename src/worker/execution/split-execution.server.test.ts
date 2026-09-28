@@ -1184,11 +1184,18 @@ describe("MAX-FILE-SIZE-4GIB: plan-aware media-workspace preflight at the 4 GiB 
 describe("SPLIT-04: split-path errors are persisted canonically (§60)", () => {
   const RAW = `yt-dlp/ffmpeg said ${SENTINEL} at /private/jobs/video-source.mp4 for format 137 {"streams":[]}`;
 
-  function assertCanonicalFailure(jobId: string, code: keyof typeof ERROR_MESSAGES) {
+  // MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001: every case also names the
+  // closed failure stage the durable status it failed in must produce.
+  function assertCanonicalFailure(
+    jobId: string,
+    code: keyof typeof ERROR_MESSAGES,
+    stage: "Download failed" | "Processing failed" | "Upload failed",
+  ) {
     const view = h.raw.getJob(jobId)!;
     assert.equal(view.status, "failed");
     assert.equal(view.errorCode, code);
     assert.equal(view.safeErrorMessage, ERROR_MESSAGES[code]);
+    assert.equal(view.stageLabel, stage);
     // Only the TEXT columns: numeric timestamps can contain any digit run.
     const text = JSON.stringify(
       h.db
@@ -1211,7 +1218,7 @@ describe("SPLIT-04: split-path errors are persisted canonically (§60)", () => {
         },
       });
       await executorFor(h, deps).execute(job);
-      assertCanonicalFailure(job.jobId, code);
+      assertCanonicalFailure(job.jobId, code, "Download failed");
       assert.equal(rec.merges.length, 0);
     });
   }
@@ -1225,7 +1232,7 @@ describe("SPLIT-04: split-path errors are persisted canonically (§60)", () => {
         },
       });
       await executorFor(h, deps).execute(job);
-      assertCanonicalFailure(job.jobId, code);
+      assertCanonicalFailure(job.jobId, code, "Processing failed");
       assert.ok(!h.calls.includes("beginUploading"));
       assert.equal(h.puts.length, 0);
     });
@@ -1264,7 +1271,7 @@ describe("SPLIT-04: split-path errors are persisted canonically (§60)", () => {
         mergeSplit: async (opts) => produce(opts.workDir),
       });
       await executorFor(h, deps).execute(job);
-      assertCanonicalFailure(job.jobId, "PROCESSING_FAILED");
+      assertCanonicalFailure(job.jobId, "PROCESSING_FAILED", "Processing failed");
       assert.ok(!h.calls.includes("beginUploading"), "validation precedes the uploading transition");
     });
   }
@@ -1274,7 +1281,7 @@ describe("SPLIT-04: split-path errors are persisted canonically (§60)", () => {
     h.failPut = true;
     const { deps } = splitDeps(h, job.jobId, "mp4");
     await executorFor(h, deps).execute(job);
-    assertCanonicalFailure(job.jobId, "PROCESSING_FAILED");
+    assertCanonicalFailure(job.jobId, "PROCESSING_FAILED", "Upload failed");
   });
 });
 

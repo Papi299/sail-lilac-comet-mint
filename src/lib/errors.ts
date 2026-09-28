@@ -28,7 +28,10 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   FORMAT_UNAVAILABLE: "The selected quality is no longer available.",
   SERVER_OVERLOAD:
     "The server is currently processing too many downloads. Please try again shortly.",
-  PROCESSING_FAILED: "We couldn't process this video. Try another format or source.",
+  // The fallback for a failure VideoFetch cannot classify more specifically.
+  // It deliberately gives no advice: nothing is known that says another format
+  // or source would help.
+  PROCESSING_FAILED: "VideoFetch couldn't complete this download.",
   TIMEOUT: "The video took too long to process.",
   NETWORK_ERROR: "We couldn't connect to the source website.",
   EXTRACTION_FAILED: "We couldn't extract the video streams from this page.",

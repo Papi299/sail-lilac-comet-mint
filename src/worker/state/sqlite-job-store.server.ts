@@ -11,6 +11,11 @@ import {
 import { WorkerIdempotencyKeySchema } from "../../shared/worker/auth.ts";
 import { WorkerErrorCodeSchema } from "../../shared/worker/errors.ts";
 import {
+  WORKER_RESTART_SAFE_MESSAGE,
+  WORKER_RESTART_STAGE_LABEL,
+  failedJobStageLabelFor,
+} from "../../shared/worker/job-failure.ts";
+import {
   CompleteAnalysisInputSchema,
   UpdateProgressInputSchema,
   type CompleteAnalysisInput,
@@ -359,21 +364,36 @@ export class SQLiteJobStore implements WorkerJobStore {
       }
 
       const durableJob = rowToDurableJob(row);
-      if (['ready', 'failed', 'cancelled'].includes(durableJob.status)) {
+      const leaving = durableJob.status;
+      if (leaving === 'ready' || leaving === 'failed' || leaving === 'cancelled') {
         this.db.exec("COMMIT");
         return false;
       }
 
+      // MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001: the stage label records
+      // WHICH phase failed, from the closed vocabulary, decided by the durable
+      // status this very transaction is leaving — never by the caller, and never
+      // by anything the failure itself said. Without it the row keeps whatever
+      // the last progress write left, which says nothing about where it failed.
       const updateStmt = this.db.prepare(`
         UPDATE worker_jobs 
         SET status = 'failed', 
             error_code = ?, 
             safe_error_message = ?, 
+            stage_label = ?,
             updated_at_ms = ?,
             finished_at_ms = COALESCE(finished_at_ms, ?)
-        WHERE job_id = ? AND status IN ('queued', 'analyzing', 'downloading', 'processing', 'uploading')
+        WHERE job_id = ? AND status = ?
       `);
-      const result = updateStmt.run(validErrorCode, errorMessage, now, now, jobId);
+      const result = updateStmt.run(
+        validErrorCode,
+        errorMessage,
+        failedJobStageLabelFor(leaving),
+        now,
+        now,
+        jobId,
+        leaving,
+      );
       
       if (result.changes !== 1) {
         throw new Error("Failed to update job status to failed");
@@ -727,17 +747,19 @@ export class SQLiteJobStore implements WorkerJobStore {
       }
 
       if (rows.length > 0) {
+        // The restart message and stage are the shared constants the control
+        // plane allowlists, so the two cannot drift apart.
         const updateStmt = this.db.prepare(`
           UPDATE worker_jobs 
           SET status = 'failed',
               error_code = 'PROCESSING_FAILED',
-              safe_error_message = 'Worker restarted before the job completed.',
-              stage_label = 'Worker restarted',
+              safe_error_message = ?,
+              stage_label = ?,
               updated_at_ms = ?,
               finished_at_ms = COALESCE(finished_at_ms, ?)
           WHERE status IN ('analyzing', 'downloading', 'processing', 'uploading')
         `);
-        updateStmt.run(now, now);
+        updateStmt.run(WORKER_RESTART_SAFE_MESSAGE, WORKER_RESTART_STAGE_LABEL, now, now);
 
         const ids = rows.map(r => r.job_id);
         const placeholders = ids.map(() => '?').join(',');

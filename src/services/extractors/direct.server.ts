@@ -382,9 +382,32 @@ async function transferDirectBody(
       stage: "downloading",
     });
   });
-  // `signal` destroys the body AND the file stream on abort, whichever of the
-  // caller's cancellation or the absolute deadline fired first.
-  await pipeline(nodeReadable, createWriteStream(dest), { signal });
+  // MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001: once the response has begun, a
+  // transport failure — a reset, or the source closing before the body is
+  // complete — reaches here from Node as a raw error ("aborted" / ECONNRESET).
+  // That is the SOURCE failing, not local work, so it is NETWORK_ERROR, and its
+  // text is dropped. The side that failed FIRST decides: once either fails,
+  // `pipeline` destroys the other, so a later error on the response says
+  // nothing about the cause. Both listeners are attached before `pipeline`
+  // attaches its own, so they observe that order. A failure of the local file
+  // stream stays unclassified — an internal failure, as before — and an
+  // AppError (the size ceiling above) or an abort propagates unchanged.
+  const sink = createWriteStream(dest);
+  let firstFailure: "source" | "sink" | null = null;
+  nodeReadable.on("error", () => {
+    firstFailure ??= "source";
+  });
+  sink.on("error", () => {
+    firstFailure ??= "sink";
+  });
+  try {
+    // `signal` destroys the body AND the file stream on abort, whichever of the
+    // caller's cancellation or the absolute deadline fired first.
+    await pipeline(nodeReadable, sink, { signal });
+  } catch (err) {
+    if (err instanceof AppError || signal.aborted || firstFailure !== "source") throw err;
+    throw new AppError("NETWORK_ERROR");
+  }
 }
 
 function headerString(value: string | string[] | undefined): string | null {

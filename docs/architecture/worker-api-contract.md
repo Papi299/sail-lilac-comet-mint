@@ -76,13 +76,13 @@ Safe for transmission to Vercel. When ready, it contains:
 - `jobId`
 - `status`
 - `progress`
-- `stageLabel`
+- `stageLabel` (for a `failed` job, one of the closed failure stages below)
 - `downloadedBytes`
 - `totalBytes`
 - `speed`
 - `eta`
 - `errorCode` (Standard AppError code)
-- `safeErrorMessage` (Sanitized)
+- `safeErrorMessage` (Sanitized; SERVER-TO-SERVER ONLY — never forwarded to the browser, see *Failed-job classification*)
 - `filename` (Display metadata)
 - `fileSize`
 - `mime`
@@ -651,3 +651,74 @@ Vercel validates the returned code against the shared allowlist before mapping i
 | Processing Timeout | 408 Request Timeout | `TIMEOUT` |
 | Processing Failed | 500 Internal Error | `PROCESSING_FAILED` |
 | Job Expired | 410 Gone | `EXPIRED` |
+
+### Failed-job classification
+
+`MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001` — source only; not yet deployed.
+
+A failed job reaches the browser as its most specific allowlisted code, the
+canonical message for that code, and a closed stage. Nothing the failure itself
+said — exception text, yt-dlp or FFmpeg stderr, a URL, a path, an object key,
+a credential — is part of any of the three.
+
+**Worker.** The executor persists the failing `AppError`'s code when it is on
+the allowlist, and `PROCESSING_FAILED` otherwise, always with
+`ERROR_MESSAGES[code]`. `failJob()` also sets `stageLabel` from the durable
+status the job is leaving, never from its caller:
+
+| Status when it failed | `stageLabel` |
+| :--- | :--- |
+| `queued`, `analyzing`, `downloading` | `Download failed` |
+| `processing` | `Processing failed` |
+| `uploading` | `Upload failed` |
+| left active by a previous process (`recover()`) | `Worker restarted` |
+
+`recover()` keeps its existing result: `PROCESSING_FAILED` /
+`Worker restarted before the job completed.` / `Worker restarted`. The message
+and stage are shared constants in `src/shared/worker/job-failure.ts`.
+
+**Control plane.** `WorkerJobViewSchema` rejects a view whose `errorCode` is not
+on the Worker allowlist, including control-plane-only codes such as
+`WORKER_UNAVAILABLE`. The status route then answers HTTP 500 `PROCESSING_FAILED`
+with the canonical message, and the untrusted code is not echoed. For a valid
+view, `toPublicJob()` does **not** forward `safeErrorMessage`. The browser's
+`error` is `ERROR_MESSAGES[errorCode]`, with one exception: the exact restart
+pair above is forwarded as the shared constant. A failed view with no code
+becomes `PROCESSING_FAILED`. A failed view's `stageLabel` is forwarded only when
+it is one of the four stages above; anything else becomes `Failed`. That covers
+a row failed by an older Worker, which still holds its last progress label.
+
+**Classification.**
+
+| Failure | Code | Stage |
+| :--- | :--- | :--- |
+| Source unreachable, refused, non-2xx, or dropped mid-body | `NETWORK_ERROR` | Download failed |
+| Acquisition, analysis or processing deadline | `TIMEOUT` | the phase it ran in |
+| Selected quality no longer offered, or source outside the v1 contract | `FORMAT_UNAVAILABLE` | Download failed (Processing failed if an acquired file is not in the planned container) |
+| Source answered 404, private, removed | `VIDEO_UNAVAILABLE` | Download failed |
+| Page yielded no usable streams | `EXTRACTION_FAILED` | Download failed |
+| Generic extraction disabled or its runtime unavailable | `EXTRACTOR_UNAVAILABLE` | Download failed |
+| Over the size or duration limit | `TOO_LARGE` / `TOO_LONG` | the phase that measured it |
+| Local merge, remux or transcode failure; output validation | `PROCESSING_FAILED` | Processing failed |
+| Object-store write, verification or ready commit | `PROCESSING_FAILED` | Upload failed |
+| Worker restart during execution | `PROCESSING_FAILED` (restart message) | Worker restarted |
+| Anything unclassifiable (local capacity, job directory, unexpected exception) | `PROCESSING_FAILED` | the phase it ran in |
+| Worker unreachable or failing at the transport level | `WORKER_UNAVAILABLE` (control plane only) | — |
+| Worker response outside the contract (unknown code, malformed view) | `PROCESSING_FAILED` (HTTP 500 from the status route) | — |
+
+The canonical `PROCESSING_FAILED` message is `VideoFetch couldn't complete this
+download.`. It gives no advice, because nothing known about such a failure says
+another format or source would help.
+
+**No new error codes.** Merge, remux, transcode and upload failures differ in
+where they happened, not in anything the person can do about them. The closed
+stage carries that distinction. A new code would also need a Vercel-first
+rollout: an older control plane rejects a view carrying a code it does not
+know. The stage vocabulary needs no ordering. An older control plane forwards
+the Worker's `stageLabel` unchanged and never shows it on the error card. A
+newer control plane maps an older Worker's failed-row label to `Failed`.
+
+**Browser.** The error card shows the message, and a heading from a closed table
+keyed by the stage: `Download failed`, `Processing failed`, `Upload failed`, or
+`Download interrupted` for a restart. For anything else it shows
+`We hit a snag`, including analysis errors and failed status polls.

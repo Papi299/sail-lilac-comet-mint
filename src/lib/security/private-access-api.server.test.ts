@@ -41,6 +41,8 @@ import {
   type WorkerControlClient,
 } from "../../web/config/worker-runtime.server.ts";
 import type { ObjectStoreSigner } from "../../web/storage/object-store-signer.server.ts";
+import { WorkerClient } from "../../web/worker/worker-client.server.ts";
+import { WORKER_RESTART_SAFE_MESSAGE } from "../../shared/worker/job-failure.ts";
 
 const SECRET = "0123456789abcdef0123456789abcdef";
 const ANALYZE_LIMIT = config.rateLimitPerMinute;
@@ -832,6 +834,107 @@ describe("job status is served by the worker", () => {
     assert.equal(res.status, 404);
     assert.equal(client.getJobCalls.length, 0);
   });
+});
+
+// ── MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001: a failed job, end to end ─────
+//
+// The REAL WorkerClient, fed a Worker response body by a fake fetch, behind the
+// real status handler: the Worker's wire bytes in, the browser's JSON out.
+
+describe("failed job status through the real Worker client", () => {
+  afterEach(resetAll);
+
+  const HOSTILE =
+    "yt-dlp: ERROR: https://media.example/v.mp4?X-Amz-Signature=deadbeef at /var/lib/videofetch/jobs/x token=sk-live-SECRET";
+
+  function installRealClient(jobJson: Record<string, unknown>): void {
+    const body = JSON.stringify({ success: true, job: jobJson });
+    const client = new WorkerClient({
+      baseUrl: "http://localhost:8080",
+      currentKeyId: "test-key-id",
+      currentSecret: "01234567890123456789012345678901",
+      fetchImplementation: (async () =>
+        new Response(body, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": String(Buffer.byteLength(body)),
+          },
+        })) as unknown as typeof fetch,
+    });
+    setWorkerClientForTests(client);
+  }
+
+  async function status(): Promise<{ res: Response; raw: string }> {
+    const res = await handleDownloadStatus(
+      apiRequest(`/api/download/${JOB_ID}/status`, { cookie: authedCookie(), site: "same-origin" }),
+      JOB_ID,
+    );
+    return { res, raw: await res.text() };
+  }
+
+  function assertNoRawText(raw: string) {
+    for (const fragment of ["X-Amz-Signature", "/var/lib", "sk-live", "yt-dlp: ERROR", "media.example"]) {
+      assert.equal(raw.includes(fragment), false, `the browser response leaked ${fragment}`);
+    }
+  }
+
+  it("delivers the specific code, its canonical message and the closed stage — never the Worker's text", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    installRealClient(
+      workerJob({
+        status: "failed",
+        errorCode: "NETWORK_ERROR",
+        safeErrorMessage: HOSTILE,
+        stageLabel: "Download failed",
+      }),
+    );
+    const { res, raw } = await status();
+    assert.equal(res.status, 200);
+    const body = JSON.parse(raw);
+    assert.equal(body.status, "failed");
+    assert.equal(body.errorCode, "NETWORK_ERROR");
+    assert.equal(body.error, ERROR_MESSAGES.NETWORK_ERROR);
+    assert.equal(body.stageLabel, "Download failed");
+    assertNoRawText(raw);
+  });
+
+  it("keeps the restart pair intact", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    installRealClient(
+      workerJob({
+        status: "failed",
+        errorCode: "PROCESSING_FAILED",
+        safeErrorMessage: WORKER_RESTART_SAFE_MESSAGE,
+        stageLabel: "Worker restarted",
+      }),
+    );
+    const body = JSON.parse((await status()).raw);
+    assert.equal(body.errorCode, "PROCESSING_FAILED");
+    assert.equal(body.error, "Worker restarted before the job completed.");
+    assert.equal(body.stageLabel, "Worker restarted");
+  });
+
+  for (const code of ["INTERNAL_BOOM_CODE", "WORKER_UNAVAILABLE", "ACCESS_REQUIRED", "processing_failed", ""]) {
+    it(`rejects an untrusted Worker error code ${JSON.stringify(code)} and answers the safe fallback`, async () => {
+      setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+      installRealClient({
+        ...workerJob({ status: "failed", stageLabel: "Download failed" }),
+        errorCode: code,
+        safeErrorMessage: HOSTILE,
+      });
+      const { res, raw } = await status();
+      assert.equal(res.status, 500);
+      const body = JSON.parse(raw);
+      assert.equal(body.success, false);
+      assert.deepEqual(body.error, {
+        code: "PROCESSING_FAILED",
+        message: "VideoFetch couldn't complete this download.",
+      });
+      if (code) assert.equal(raw.includes(code), false, "the untrusted code must not be echoed");
+      assertNoRawText(raw);
+    });
+  }
 });
 
 // ── /api/download/:jobId/file ───────────────────────────────────────────────

@@ -51,14 +51,17 @@ export const DIRECT_FORMAT_ID = "direct-original";
  * recovered — it is still legitimately queued — but the shutdown case captures
  * the job in durable `downloading`, so it is always inside the recovered set.
  *
- * `safeErrorMessage` is asserted rather than skipped as brittle: it is a
- * literal in the Worker's own SQL, not a formatted or localized string, and it
- * is the only field that distinguishes "the restart path recovered this job"
- * from "the job failed for some other reason and happened to be classified
- * PROCESSING_FAILED" — which every internal acquisition failure is. Without it,
- * a job that failed on its own a moment before the restart would satisfy the
- * check. The harness reads it through the browser projection `error`, which
- * `src/web/jobs/public-job.ts` documents as where `safeErrorMessage` surfaces.
+ * `safeErrorMessage` is asserted rather than skipped as brittle: it is a fixed
+ * constant (`WORKER_RESTART_SAFE_MESSAGE`, src/shared/worker/job-failure.ts)
+ * bound into the Worker's own recovery SQL, not a formatted or localized
+ * string, and it is the only field that distinguishes "the restart path
+ * recovered this job" from "the job failed for some other reason and happened
+ * to be classified PROCESSING_FAILED" — which every internal acquisition
+ * failure is. Without it, a job that failed on its own a moment before the
+ * restart would satisfy the check. The harness reads it through the browser
+ * projection `error`: since MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001,
+ * `src/web/jobs/public-job.ts` derives `error` from the code and forwards this
+ * exact restart pair as the one exception.
  */
 export const RESTART_RECOVERY = Object.freeze({
   status: "failed",

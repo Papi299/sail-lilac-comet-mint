@@ -6,7 +6,7 @@ import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { AppError } from "../../lib/errors.ts";
+import { AppError, ERROR_MESSAGES } from "../../lib/errors.ts";
 import { setTempDirectoryForTests } from "../../services/temp/files.server.ts";
 import type { WorkerVideoMetadata, WorkerObjectKey } from "../../shared/worker/contracts.ts";
 import { openWorkerDatabase } from "../state/database.server.ts";
@@ -487,9 +487,10 @@ describe("JobExecutor.abortActiveForShutdown", () => {
     assert.equal(view?.errorCode, "PROCESSING_FAILED");
     assert.equal(
       view?.safeErrorMessage,
-      "We couldn't process this video. Try another format or source.",
+      ERROR_MESSAGES.PROCESSING_FAILED,
       "an ordinary failure keeps the generic safe message",
     );
+    assert.equal(view?.stageLabel, "Download failed", "it failed while downloading");
     assert.equal(failCalls.length, 1, "the ordinary classifier still runs");
   });
 
@@ -568,9 +569,6 @@ describe("JobExecutor.abortActiveForShutdown", () => {
       "an aborted signal alone is not shutdown provenance",
     );
     assert.equal(view?.errorCode, "PROCESSING_FAILED");
-    assert.equal(
-      view?.safeErrorMessage,
-      "We couldn't process this video. Try another format or source.",
-    );
+    assert.equal(view?.safeErrorMessage, ERROR_MESSAGES.PROCESSING_FAILED);
   });
 });
