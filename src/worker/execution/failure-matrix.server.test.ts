@@ -14,6 +14,10 @@ import type { DurableWorkerJob } from "@/worker/state/job-store";
 import type { ObjectStoreWriter, ObjectStorePutInput } from "@/worker/storage/writer.ts";
 import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
 import type { WorkerRequestedFormatId } from "../../shared/worker/contracts.ts";
+import { Readable } from "node:stream";
+import { setSafeHttpTestHooks } from "@/lib/security/safe-http.server";
+import { WORKER_RESTART_SAFE_MESSAGE } from "@/shared/worker/job-failure";
+import { toPublicJob } from "@/web/jobs/public-job";
 
 /** Markers that must never survive into durable state or any log line. */
 const RAW_MARKERS = [
@@ -418,5 +422,218 @@ describe("failure matrix", () => {
 
     assert.equal(analyzed, 0);
     assertSafeTerminalFailure(h, executor, job.jobId, "EXPIRED", "expired job");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001: from a Worker execution failure to
+// the browser DTO. Each case runs the real executor against the real durable
+// store and then projects the stored view through the control plane's own
+// `toPublicJob`, so the code, message and stage asserted here are exactly what
+// `/api/download/:jobId/status` would send.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("failure classification end to end: Worker → public job", () => {
+  let h: Harness;
+
+  beforeEach(() => {
+    h = makeHarness();
+  });
+
+  afterEach(() => {
+    setSafeHttpTestHooks(null);
+    h.cleanup();
+  });
+
+  /** Capacity is not under test here, so the preflight never reads the disk. */
+  const plenty: Pick<JobExecutorDeps, "availableWorkDirBytes"> = {
+    availableWorkDirBytes: async () => Number.MAX_SAFE_INTEGER,
+  };
+
+  function assertPublicFailure(
+    jobId: string,
+    code: ErrorCode,
+    stage: string,
+    message: string = ERROR_MESSAGES[code],
+  ) {
+    const dto = toPublicJob(h.store.getJob(jobId)!, Date.now());
+    assert.equal(dto.status, "failed");
+    assert.equal(dto.errorCode, code);
+    assert.equal(dto.error, message);
+    assert.equal(dto.stageLabel, stage);
+    const json = JSON.stringify(dto);
+    for (const marker of [...RAW_MARKERS, "ECONNRESET", h.tempDir]) {
+      assert.ok(!json.includes(marker), `the public job leaked ${marker}`);
+    }
+    return dto;
+  }
+
+  it("a connection reset mid-body in the REAL direct downloader → NETWORK_ERROR, not PROCESSING_FAILED", async () => {
+    // What Node's HTTP client really emits when the source drops the
+    // connection after the headers: a raw, non-AppError "aborted" / ECONNRESET.
+    const reset = Object.assign(new Error("aborted SECRET_HTTP_TOKEN"), { code: "ECONNRESET" });
+    let sent = false;
+    const body = new Readable({
+      read() {
+        if (sent) {
+          this.destroy(reset);
+          return;
+        }
+        sent = true;
+        this.push(Buffer.from("partial-media"));
+      },
+    });
+    setSafeHttpTestHooks({
+      lookup: async () => [{ address: "8.8.8.8", family: 4 }],
+      requestOnce: async () => ({
+        status: 200,
+        headers: { "content-type": "video/mp4", "content-length": "1000" },
+        body,
+      }),
+    });
+
+    const job = claimJob(h.store, "direct-original");
+    // No `downloadOriginal` seam: the production direct downloader runs.
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+      ...plenty,
+      analyze: async () => buildMeta({ container: "mp4", hasVideo: true }),
+    });
+    await executor.execute(job);
+
+    const dto = assertPublicFailure(job.jobId, "NETWORK_ERROR", "Download failed");
+    assert.notEqual(dto.errorCode, "PROCESSING_FAILED");
+    assert.equal(h.puts.length, 0);
+  });
+
+  const acquisition: ReadonlyArray<readonly [ErrorCode, string]> = [
+    ["NETWORK_ERROR", "connect refused: SECRET_HTTP_TOKEN"],
+    ["TIMEOUT", "deadline passed writing PRIVATE_FS_PATH=/var/jobs"],
+    ["TOO_LARGE", "exceeded while writing PRIVATE_FS_PATH=/var/secret"],
+    ["VIDEO_UNAVAILABLE", "404 from SECRET_HTTP_TOKEN host"],
+    ["EXTRACTION_FAILED", "ERROR: [generic] SECRET_HTTP_TOKEN unsupported"],
+    ["EXTRACTOR_UNAVAILABLE", "spawn PRIVATE_FS_PATH/yt-dlp ENOENT"],
+    ["FORMAT_UNAVAILABLE", "requested format not available: SECRET_HTTP_TOKEN"],
+  ];
+  for (const [code, raw] of acquisition) {
+    it(`acquisition ${code} stays ${code} with its canonical message`, async () => {
+      const job = claimJob(h.store, "direct-original");
+      const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+        ...plenty,
+        analyze: async () => buildMeta({ container: "mp4", hasVideo: true }),
+        downloadOriginal: async () => {
+          throw new AppError(code, raw);
+        },
+      });
+      await executor.execute(job);
+      assertPublicFailure(job.jobId, code, "Download failed");
+    });
+  }
+
+  const reanalysis: ReadonlyArray<ErrorCode> = [
+    "VIDEO_UNAVAILABLE",
+    "EXTRACTION_FAILED",
+    "EXTRACTOR_UNAVAILABLE",
+    "NETWORK_ERROR",
+    "TIMEOUT",
+    "TOO_LONG",
+  ];
+  for (const code of reanalysis) {
+    it(`execution-time analysis ${code} stays ${code}`, async () => {
+      const job = claimJob(h.store, "direct-original");
+      const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+        ...plenty,
+        analyze: async () => {
+          throw new AppError(code, "stderr: SECRET_HTTP_TOKEN at PRIVATE_FS_PATH");
+        },
+      });
+      await executor.execute(job);
+      assertPublicFailure(job.jobId, code, "Download failed");
+    });
+  }
+
+  it("a format no longer offered at execution time → FORMAT_UNAVAILABLE", async () => {
+    const job = claimJob(h.store, "preset:720");
+    let downloaded = 0;
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+      ...plenty,
+      // Re-analysis no longer advertises the requested preset.
+      analyze: async () => buildMeta({ container: "mp4", hasVideo: true }),
+      downloadOriginal: async () => {
+        downloaded += 1;
+        throw new Error("unreachable");
+      },
+    });
+    await executor.execute(job);
+    assertPublicFailure(job.jobId, "FORMAT_UNAVAILABLE", "Download failed");
+    assert.equal(downloaded, 0);
+  });
+
+  it("a local transcode failure → PROCESSING_FAILED, the neutral message and the Processing stage", async () => {
+    const job = claimJob(h.store, "preset:mp3");
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+      ...plenty,
+      analyze: async () =>
+        buildMeta({ container: "mp4", hasVideo: true }, [
+          { id: "preset:mp3", container: "mp3", hasVideo: false },
+        ]),
+      downloadOriginal: async (_url, ctx) => ({
+        filePath: writeOriginal(ctx.workDir, "mp4"),
+        container: "mp4",
+        mime: "video/mp4",
+        fileSize: 8,
+      }),
+      processLocally: async () => {
+        throw new Error("ffmpeg exited 1: FFMPEG_SECRET in PRIVATE_FS_PATH");
+      },
+    });
+    await executor.execute(job);
+    const dto = assertPublicFailure(job.jobId, "PROCESSING_FAILED", "Processing failed");
+    assert.equal(dto.error, "VideoFetch couldn't complete this download.");
+    assert.ok(!/another format|another source/i.test(dto.error ?? ""), "no unfounded advice");
+  });
+
+  it("an object-store failure → PROCESSING_FAILED with the Upload stage and no storage text", async () => {
+    const job = claimJob(h.store, "direct-original");
+    const failingWriter: ObjectStoreWriter = {
+      ...h.writer,
+      async put() {
+        throw new Error("provider rejected upload: R2_SECRET=aki123");
+      },
+    };
+    const executor = new JobExecutor(h.store, failingWriter, () => Date.now(), new Map(), {
+      ...plenty,
+      analyze: async () => buildMeta({ container: "mp4", hasVideo: true }),
+      downloadOriginal: async (_url, ctx) => ({
+        filePath: writeOriginal(ctx.workDir, "mp4"),
+        container: "mp4",
+        mime: "video/mp4",
+        fileSize: 8,
+      }),
+    });
+    await executor.execute(job);
+    assertPublicFailure(job.jobId, "PROCESSING_FAILED", "Upload failed");
+  });
+
+  it("an arbitrary non-AppError exception → PROCESSING_FAILED, and none of its text is public", async () => {
+    const job = claimJob(h.store, "direct-original");
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+      ...plenty,
+      analyze: async () => {
+        const err = new TypeError("SECRET_HTTP_TOKEN=abc at PRIVATE_FS_PATH/worker.ts:1:1");
+        (err as { code?: string }).code = "NOT_A_WORKER_CODE";
+        throw err;
+      },
+    });
+    await executor.execute(job);
+    const dto = assertPublicFailure(job.jobId, "PROCESSING_FAILED", "Download failed");
+    assert.ok(!JSON.stringify(dto).includes("NOT_A_WORKER_CODE"));
+    assert.ok(!JSON.stringify(dto).includes("worker.ts"));
+  });
+
+  it("a Worker restart keeps its exact restart message and stage", () => {
+    const job = claimJob(h.store, "direct-original");
+    assert.equal(h.store.getJob(job.jobId)!.status, "analyzing");
+    h.store.recover();
+    assertPublicFailure(job.jobId, "PROCESSING_FAILED", "Worker restarted", WORKER_RESTART_SAFE_MESSAGE);
   });
 });

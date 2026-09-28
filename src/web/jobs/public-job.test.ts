@@ -6,6 +6,11 @@ import {
   type WorkerJobStatus,
   type WorkerJobView,
 } from "../../shared/worker/contracts.ts";
+import { WORKER_ERROR_CODES } from "../../shared/worker/errors.ts";
+import {
+  FAILED_JOB_STAGE_LABELS,
+  WORKER_RESTART_SAFE_MESSAGE,
+} from "../../shared/worker/job-failure.ts";
 import { PublicJobSchema, isTerminalPublicStatus, toPublicJob } from "./public-job.ts";
 
 const JOB_ID = "0123456789abcdef0123456789abcdef";
@@ -249,5 +254,120 @@ describe("public browser job DTO", () => {
     assert.throws(() =>
       PublicJobSchema.parse({ ...toPublicJob(readyJob(), NOW), objectKey: OBJECT_KEY }),
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001: the browser's error and failure
+// stage are decided by the control plane, from closed vocabularies.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("public job failure classification", () => {
+  const HOSTILE =
+    "ffmpeg: /var/lib/videofetch/jobs/abc/source.mp4: Invalid data; " +
+    "https://media.example/v.mp4?X-Amz-Signature=deadbeef token=sk-live-SECRET\n    at run (worker.ts:1:1)";
+
+  it("never forwards a Worker safeErrorMessage: every code gets its canonical message", () => {
+    for (const code of WORKER_ERROR_CODES) {
+      const dto = toPublicJob(
+        workerJob({ status: "failed", errorCode: code, safeErrorMessage: HOSTILE }),
+        NOW,
+      );
+      assert.equal(dto.errorCode, code, code);
+      assert.equal(dto.error, ERROR_MESSAGES[code], code);
+      const json = JSON.stringify(dto);
+      for (const fragment of ["/var/lib", "X-Amz-Signature", "sk-live", "worker.ts", "Invalid data"]) {
+        assert.equal(json.includes(fragment), false, `${code} leaked ${fragment}`);
+      }
+    }
+  });
+
+  it("preserves the specific code rather than collapsing it to PROCESSING_FAILED", () => {
+    for (const code of ["NETWORK_ERROR", "TIMEOUT", "FORMAT_UNAVAILABLE", "VIDEO_UNAVAILABLE",
+      "EXTRACTION_FAILED", "EXTRACTOR_UNAVAILABLE", "TOO_LARGE", "TOO_LONG"] as const) {
+      const dto = toPublicJob(
+        workerJob({ status: "failed", errorCode: code, safeErrorMessage: ERROR_MESSAGES[code] }),
+        NOW,
+      );
+      assert.equal(dto.errorCode, code);
+      assert.equal(dto.error, ERROR_MESSAGES[code]);
+    }
+  });
+
+  it("replaces the PROCESSING_FAILED copy an older Worker stored with today's canonical message", () => {
+    const dto = toPublicJob(
+      workerJob({
+        status: "failed",
+        errorCode: "PROCESSING_FAILED",
+        safeErrorMessage: "We couldn't process this video. Try another format or source.",
+      }),
+      NOW,
+    );
+    assert.equal(dto.error, "VideoFetch couldn't complete this download.");
+    assert.equal(dto.error, ERROR_MESSAGES.PROCESSING_FAILED);
+  });
+
+  it("forwards the restart message only as the exact restart pair", () => {
+    const restart = toPublicJob(
+      workerJob({
+        status: "failed",
+        errorCode: "PROCESSING_FAILED",
+        safeErrorMessage: WORKER_RESTART_SAFE_MESSAGE,
+        stageLabel: "Worker restarted",
+      }),
+      NOW,
+    );
+    assert.equal(restart.errorCode, "PROCESSING_FAILED");
+    assert.equal(restart.error, "Worker restarted before the job completed.");
+    assert.equal(restart.stageLabel, "Worker restarted");
+
+    // The same sentence under another code, or not byte-exact, is not the pair.
+    for (const [errorCode, safeErrorMessage] of [
+      ["TIMEOUT", WORKER_RESTART_SAFE_MESSAGE],
+      ["PROCESSING_FAILED", `${WORKER_RESTART_SAFE_MESSAGE} `],
+      ["PROCESSING_FAILED", WORKER_RESTART_SAFE_MESSAGE.toLowerCase()],
+      ["PROCESSING_FAILED", `${WORKER_RESTART_SAFE_MESSAGE} ${HOSTILE}`],
+    ] as const) {
+      const dto = toPublicJob(workerJob({ status: "failed", errorCode, safeErrorMessage }), NOW);
+      assert.equal(dto.error, ERROR_MESSAGES[errorCode], JSON.stringify(safeErrorMessage));
+    }
+  });
+
+  it("gives a failed job with no code the canonical fallback instead of no explanation", () => {
+    const dto = toPublicJob(workerJob({ status: "failed", errorCode: null, safeErrorMessage: HOSTILE }), NOW);
+    assert.equal(dto.errorCode, "PROCESSING_FAILED");
+    assert.equal(dto.error, ERROR_MESSAGES.PROCESSING_FAILED);
+  });
+
+  it("gives a job without a code that has not failed no error at all", () => {
+    for (const status of ["queued", "downloading", "cancelled"] as const) {
+      const dto = toPublicJob(workerJob({ status, safeErrorMessage: HOSTILE }), NOW);
+      assert.equal(dto.errorCode, null, status);
+      assert.equal(dto.error, null, status);
+    }
+  });
+
+  it("forwards a failed job's stage only from the closed failure vocabulary", () => {
+    for (const stageLabel of FAILED_JOB_STAGE_LABELS) {
+      const dto = toPublicJob(
+        workerJob({ status: "failed", errorCode: "NETWORK_ERROR", stageLabel }),
+        NOW,
+      );
+      assert.equal(dto.stageLabel, stageLabel);
+    }
+    // An older Worker leaves its last progress label on a failed row; anything
+    // outside the vocabulary becomes the canonical "Failed".
+    for (const stageLabel of [null, "downloading", "Downloading 42%", "fetching https://media.example/x", HOSTILE]) {
+      const dto = toPublicJob(
+        workerJob({ status: "failed", errorCode: "NETWORK_ERROR", stageLabel }),
+        NOW,
+      );
+      assert.equal(dto.stageLabel, "Failed", JSON.stringify(stageLabel));
+    }
+  });
+
+  it("the PROCESSING_FAILED message gives no advice nothing supports", () => {
+    assert.equal(ERROR_MESSAGES.PROCESSING_FAILED, "VideoFetch couldn't complete this download.");
+    assert.equal(/another format|another source|try/i.test(ERROR_MESSAGES.PROCESSING_FAILED), false);
   });
 });

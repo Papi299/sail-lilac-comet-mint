@@ -677,6 +677,10 @@ export class JobExecutor {
     });
 
     if (readyResult.type === "storage_failure") {
+      // No existing code is more specific, and object-store detail is not for
+      // the browser. What IS known — that the upload failed — is recorded by
+      // `failJob()` as the "Upload failed" stage of the `uploading` status
+      // this failure leaves.
       throw new AppError("PROCESSING_FAILED");
     }
     // `job_state_conflict` means another writer already committed a terminal

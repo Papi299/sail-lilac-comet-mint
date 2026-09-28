@@ -208,7 +208,12 @@ export interface WorkerJobStore {
   claimNextQueuedJob(): DurableWorkerJob | null;
 
   cancelJob(jobId: string): CancelJobResult;
-  
+
+  /**
+   * Moves a non-terminal job to `failed` with an allowlisted code and its safe
+   * message, and sets `stageLabel` to the closed failure stage for the status
+   * it left (`failedJobStageLabelFor`). A terminal job is left untouched.
+   */
   failJob(jobId: string, errorCode: string, errorMessage: string): boolean;
 
   getJob(jobId: string): WorkerJobView | null;

@@ -6042,8 +6042,10 @@ describe("restart recovery contract", () => {
       { recoveredErrorCode: "TIMEOUT" },
       { recoveredErrorCode: null },
       // The generic PROCESSING_FAILED copy, not the restart sentence: this is
-      // what every ordinary internal acquisition failure produces.
+      // what every ordinary internal acquisition failure produces — the copy
+      // older builds stored, and the one they store now.
       { recoveredSafeErrorMessage: "We couldn't process this video. Try another format or source." },
+      { recoveredSafeErrorMessage: "VideoFetch couldn't complete this download." },
       { recoveredSafeErrorMessage: null },
       { recoveredSafeErrorMessage: "worker restarted before the job completed." },
       { restartObserved: false },

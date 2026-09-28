@@ -9,6 +9,7 @@ import { ProgressCard } from "@/components/video/progress-card";
 import { CompleteCard } from "@/components/video/complete-card";
 import { DownloadHistory } from "@/components/video/history";
 import { PrivateAccessGate } from "@/components/video/private-access-gate";
+import { ErrorCard } from "@/components/video/error-card";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -21,6 +22,7 @@ import {
   type HistoryItem,
 } from "@/lib/client-api";
 import { hasDownloadOptions, initialSelectionId } from "@/lib/download-options";
+import { errorCardHeading, terminalJobMessage } from "@/lib/job-failure-ui";
 import type { VideoMetadata } from "@/types/media";
 import type { JobProgress } from "@/types/job";
 
@@ -77,12 +79,7 @@ function Downloader() {
             // through the existing terminal/error card with a canonical
             // message. No cancellation UI is introduced in this phase.
             setPhase("error");
-            setError(
-              next.error ||
-                (next.status === "cancelled"
-                  ? "This download was cancelled."
-                  : "We couldn't process this video. Try another format or source."),
-            );
+            setError(terminalJobMessage(next));
             saveHistoryItem({
               jobId,
               title: next.title || video?.title || "Video",
@@ -203,19 +200,10 @@ function Downloader() {
         ) : null}
 
         {phase === "error" && error ? (
-          <Card>
-            <CardContent className="space-y-3 p-5 sm:p-6">
-              <h2 className="font-medium">We hit a snag</h2>
-              <p className="text-sm text-muted-foreground">{error}</p>
-              <button
-                type="button"
-                className="text-sm underline-offset-4 hover:underline"
-                onClick={reset}
-              >
-                Start over
-              </button>
-            </CardContent>
-          </Card>
+          // Only a FAILED job's closed stage label can change the heading; an
+          // analysis error or a failed poll has no job stage and keeps the
+          // generic one.
+          <ErrorCard heading={errorCardHeading(job)} message={error} onReset={reset} />
         ) : null}
 
         {video && (phase === "ready" || phase === "processing" || phase === "complete") ? (
