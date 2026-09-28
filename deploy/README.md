@@ -547,8 +547,9 @@ first (step 6a).
 | VM stopped | no tick at all; `Persistent=false`, so **no catch-up** after boot | — |
 | Worker `inactive` | `OUTCOME=idle`; **no request is made** | `0` |
 | Worker `activating` / `deactivating` / `reloading` | `OUTCOME=transient`; no request | `0` |
-| Worker `active`, healthy | `OUTCOME=healthy` | `0` |
-| Worker `active`, refused / timeout / non-200 / malformed / wrong state | `OUTCOME=unhealthy` — currently also some health-helper/tooling failures; see [manual recovery](#manual-recovery-when-the-worker-is-active-but-unhealthy), step 1 | `1` |
+| Worker `active`, healthy | `OUTCOME=healthy` — only on the helper's own success verdict | `0` |
+| Worker `active`, refused / timeout / non-200 / malformed / wrong state | `OUTCOME=unhealthy` — only on the helper's own `FAIL` verdict, with one of its six failure outcomes | `1` |
+| Worker `active`, but the health helper breaks its own protocol: its argument/configuration error, a Node or module failure, a signal, an unexpected exit status, or output that is not exactly its one verdict line | `OUTCOME=config-invalid reason=health-helper-contract helper_status=<n>` — a probe tooling or deployment fault, **not** evidence that the Worker is unhealthy | `2` |
 | Worker `failed` | `OUTCOME=failed-unit` — **never** reported as idle | `1` |
 | Worker `ActiveState` not understood | `OUTCOME=unknown-state` | `1` |
 | Worker unit not loaded | `OUTCOME=not-installed` | `2` |
@@ -558,6 +559,35 @@ first (step 6a).
 | unknown argument | `OUTCOME=usage-error` | `2` |
 | terminated by a signal | `OUTCOME=interrupted` | `2` |
 | any exit not covered above | `OUTCOME=internal-error` — never success | `2` |
+
+**Only the helper's own protocol can speak for the Worker.** The probe accepts
+exactly two results from `vf-worker-health-request.mjs` as health verdicts
+(`WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001`):
+
+| Helper exit | Helper output: exactly one line | Probe result |
+| :--- | :--- | :--- |
+| `0` | `vf-worker-health-request: OK outcome=healthy target=http://127.0.0.1:<port>/v1/healthz …` | `OUTCOME=healthy`, `0` |
+| `1` | `vf-worker-health-request: FAIL outcome=<o> target=http://127.0.0.1:<port>/v1/healthz …`, where `<o>` is `connect-failed`, `timeout`, `bad-status`, `body-too-large`, `malformed-body` or `wrong-state` | `OUTCOME=unhealthy`, `1` |
+| anything else | anything else | `OUTCOME=config-invalid reason=health-helper-contract helper_status=<n>`, `2` |
+
+- **Both halves must agree.** A helper that exits `0` without its `OK` line
+  is never reported healthy. `FAIL` with exit `0`, `OK` with exit `1`, and
+  either line with any other status (`2`, `3`, or `128+n` after a signal) are
+  tooling faults.
+- **The helper's text is data.** It is echoed for the operator, at most 20
+  lines, with any `OUTCOME=` in it defanged to `OUTCOME:`, so it can never
+  become a second verdict. It is never evaluated or executed, and it never
+  reaches the `OUTCOME=` line, which carries only the helper's numeric exit
+  status. The HTTP body is still never printed.
+- **Nothing about the request changed.** The target is still fixed to
+  `127.0.0.1` and `/v1/healthz`, with one total timeout, a body cap, no
+  redirects and no credentials.
+
+**Installed vs source.** This classification is in the repository source. It
+is **not yet installed** on the Production VM: the probe accepted there on
+2026-09-26 (runbook §8) still maps every nonzero helper exit to
+`OUTCOME=unhealthy`, and any helper exit `0` to `OUTCOME=healthy`, until a
+separate live deployment and re-acceptance installs this revision.
 
 **Every run emits exactly one `OUTCOME=` line.** Known paths go through one
 exit function. An EXIT trap covers everything else: a shell error, or a
@@ -588,8 +618,11 @@ timer, not a sudoers or polkit rule, not any other service.
 `OUTCOME=unhealthy` is a reason to investigate, not an instruction to restart.
 `/v1/healthz` is liveness only, and while the Worker is `active` an unhealthy
 result can come from a wedged event loop, a stalled or sleeping VM, a start-up
-race, the loopback publication path, a foreign listener or the probe's own
-tooling.
+race, the loopback publication path or a foreign listener. On a VM still
+running the probe installed before
+`WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001` — Production, until its
+live re-acceptance — it can also come from the probe's own tooling; the
+source probe reports that as `OUTCOME=config-invalid`.
 
 #### Manual recovery when the Worker is active but unhealthy
 
@@ -613,12 +646,16 @@ sudo journalctl -u videofetch-worker-liveness.service -n 40 --no-pager
 In each unhealthy run, the helper's own verdict line,
 `vf-worker-health-request: FAIL outcome=…` (`connect-failed`, `timeout`,
 `bad-status`, `malformed-body`, `wrong-state` or `body-too-large`), must come
-before `OUTCOME=unhealthy`. If the run instead shows Node error output, a
-missing module, a helper argument or timeout error, `OUTCOME=config-invalid` or
-`OUTCOME=state-unavailable`, it is a probe or deployment-tooling problem: fix
-that, and do **not** restart the Worker for it. The probe currently reports
-some helper/tooling failures as `unhealthy` (runbook §8), which is why this
-check comes first. There is no response body to read; the helper never prints
+before `OUTCOME=unhealthy`. Only a run with that genuine verdict counts toward
+the threshold above. If the run instead shows Node error output, a missing
+module, a helper argument or timeout error, `OUTCOME=config-invalid` (for
+example `reason=health-helper-contract`) or `OUTCOME=state-unavailable`, it is
+a probe or deployment-tooling problem: fix that, and do **not** restart the
+Worker for it. A probe from the current source reports those tooling faults as
+`config-invalid` itself. The probe installed on Production still reports them
+as `unhealthy` until `WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001` is
+deployed and live-accepted (runbook §8), which is why this check comes first
+and stays first. There is no response body to read; the helper never prints
 one.
 
 **2. Confirm the Worker is still active.**
@@ -1038,8 +1075,10 @@ The order is not a convenience — it is the fail-closed boundary.
 
    Expect exactly one `OUTCOME=` line: `healthy` with the Worker running, or
    `idle` with it stopped. `OUTCOME=state-unavailable` means the account
-   cannot query systemd. Stop, do not enable the timer, and roll back
-   (below).
+   cannot query systemd.
+   `OUTCOME=config-invalid reason=health-helper-contract` means the installed
+   Node or request module did not answer with the helper's protocol. In
+   either case stop, do not enable the timer, and roll back (below).
 
    **6d. Enable the TIMER only.** The service has no `[Install]` section on
    purpose:

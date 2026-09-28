@@ -310,7 +310,7 @@ records are in §11 and §11a–§11h.
 | Vercel rollback topology (Hobby) | **Current → immediate known-good rollback target: `dpl_8k6e59…` → `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9`.** Provider `isRollbackCandidate` is `true` on both and `false` on `dpl_BJYRG7…`, which stays retained but is neither eligible nor service-restoring (its environment snapshot carries an Access credential state that did not reach the Worker, §11). On Hobby, Instant Rollback reaches only the single eligible previous Production deployment; a rollback to an older one is refused with HTTP 402. The older deployments — `dpl_BcefWQ…`, `dpl_AFFCLwLi…`, `dpl_BAnK2x…` and earlier — are historical **code-compatibility** layers only, **not** Hobby rollback targets. Rollback readiness needs four separate properties — code compatibility, Cloudflare Access credential compatibility, login-secret compatibility and provider rollback reachability — and must be re-established after every Production deployment, credential rotation and rollback (§9) | *provider-observed* (read-only, 2026-09-28); the mechanics operator-measured on a disposable probe project on the same Hobby team (§9, §11, §11h) |
 | Vercel retention | Project settings read a 30-day Production expiration and `deploymentsToKeep: 10`, but the provider-assigned expirations exempt only the **three most recent** Production deployments: `dpl_8k6e59…`, `dpl_YrhkEQC4…` and `dpl_BJYRG7…`. Every older listed deployment carries an expiration — `dpl_BcefWQ…` 2026-10-19 (assigned when `dpl_8k6e59…` was created), `dpl_AFFCLwLi…` 2026-10-18, `dpl_BAnK2x…` 2026-10-11, the oldest 2026-09-29. **Listed is not protected** (§9) | *provider-observed* (read-only, 2026-09-28) |
 | Execution plane | **on demand**; the idle state is **Stopped** | §3c, §11h |
-| Worker health (§10) | `GET /v1/healthz` through the TLS endpoint: **ACCEPTED 2026-09-26**. External liveness probe: **CLOSED / PASS / PRODUCTION ACCEPTED 2026-09-26** — the static-account deployment from `main` `db20d910…` (PR #84), after the first `DynamicUser` deployment failed and was rolled back. `videofetch-worker-liveness.timer` is enabled on the VM; the service stays `static`. The probe is an observer only: automatic restart-on-unhealthy was reviewed on 2026-09-28 and **not selected**, so an `active` but unhealthy Worker is handled by the bounded manual procedure in `deploy/README.md` (`WORKER-RESTART-ON-UNHEALTHY-DECISION-CLOSURE-001`) | operator-measured — §8, §10, §11; the restart decision is repository/source-verifiable analysis — §8, §11 |
+| Worker health (§10) | `GET /v1/healthz` through the TLS endpoint: **ACCEPTED 2026-09-26**. External liveness probe: **CLOSED / PASS / PRODUCTION ACCEPTED 2026-09-26** — the static-account deployment from `main` `db20d910…` (PR #84), after the first `DynamicUser` deployment failed and was rolled back. `videofetch-worker-liveness.timer` is enabled on the VM; the service stays `static`. The probe is an observer only: automatic restart-on-unhealthy was reviewed on 2026-09-28 and **not selected**, so an `active` but unhealthy Worker is handled by the bounded manual procedure in `deploy/README.md` (`WORKER-RESTART-ON-UNHEALTHY-DECISION-CLOSURE-001`). The helper-result classification hardening (`WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001`) is **implemented in source only**: the installed probe keeps its broad mapping of any nonzero helper exit to `unhealthy` until a separate live re-acceptance (§8) | operator-measured — §8, §10, §11; the restart decision and the source-only classification are repository/source-verifiable — §8, §11 |
 | Product media workspace | **4 GiB delivered-media limit (4,294,967,296 bytes) LIVE** on the bounded 10 GiB disk-backed ext4 workspace bound at `/tmp/videofetch` — no Product media tmpfs. `MAX_FILE_SIZE` is absent, so the image default applies. `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, rollout Phases 1A–1E complete, Production accepted 2026-09-17. **Actual-byte guard at that limit LIVE ACCEPTED 2026-09-27** (`limit.actual-byte-guard = PASS`, `YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN`): additional behavioural evidence for the current limit, not a replacement for the 2026-09-17 rollout evidence | contract repository/source-verifiable; deployment and live byte-guard operator-measured — §2a, §11, §11h |
 
 Precisely:
@@ -4338,7 +4338,75 @@ behalf.** What exists is systemd's `Restart=on-failure` on
 Worker that is running but answers unhealthily is *observed* — the probe
 records `OUTCOME=unhealthy` and its own unit enters `failed` — and the operator
 decides what happens next. Automatic restart-on-unhealthy was reviewed and
-**not selected**; see the next subsection.
+**not selected**; see "Restart-on-unhealthy" below.
+
+### Helper-result classification — IMPLEMENTED IN SOURCE, live re-acceptance pending (2026-09-28)
+
+*`WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001` — source, tests and
+documentation only. Evidence class: repository/source-verifiable, from
+deterministic tests that run the probe against a stub `systemctl`, real
+loopback listeners and stand-in helper modules. No VM was started, nothing was
+installed, and no Worker, systemd, Docker, Vercel, Cloudflare or R2 state
+changed.*
+
+**Current deployed Production behaviour.** By the state of record, the probe
+installed on the VM is the one accepted on 2026-09-26 (below); this task did
+not re-measure it. Its source file at `main` `db20d910…` is blob-identical to
+the pre-change probe at `main` `c20d1f75…`, which this task measured. It maps
+helper exit `0` to `OUTCOME=healthy` and **any** nonzero helper exit to
+`OUTCOME=unhealthy`. Until a separate live deployment and
+re-acceptance installs the new revision, three things stay true on
+Production:
+- a helper configuration error reads `unhealthy`;
+- so does a Node or module failure;
+- another program at the Node or module path that exits `0` reads `healthy`.
+
+Step 1 of the manual procedure in `deploy/README.md` separates the first two
+from a genuine failure: it confirms the helper's own `FAIL outcome=` line
+before any unhealthy run counts. The third shows only as a `healthy` run
+whose output lacks the helper's `OK outcome=healthy` line.
+
+**Repository source behaviour.** The probe accepts only the helper's own
+protocol as a health verdict:
+
+| Helper result | Source probe |
+| :--- | :--- |
+| exit `0` and exactly one line `vf-worker-health-request: OK outcome=healthy target=http://127.0.0.1:<port>/v1/healthz …` | `OUTCOME=healthy`, exit `0` |
+| exit `1` and exactly one line `vf-worker-health-request: FAIL outcome=<o> target=http://127.0.0.1:<port>/v1/healthz …`, where `<o>` is `connect-failed`, `timeout`, `bad-status`, `body-too-large`, `malformed-body` or `wrong-state` | `OUTCOME=unhealthy`, exit `1` |
+| anything else: the helper's exit `2`, a Node syntax, import or runtime failure, a signal, another executable at the Node or module path, an unknown outcome, an exit status that disagrees with the line, or any extra output line | `OUTCOME=config-invalid reason=health-helper-contract helper_status=<n>`, exit `2` |
+
+- **The vocabulary.** The six failure outcomes duplicate the helper's
+  `LIVENESS_OUTCOMES`, and the liveness policy suite keeps the two identical.
+- **The target.** The reported target is compared with the helper's fixed
+  host and path and the delivered port. A leading-zero port, which
+  `vf_validate_port` accepts, is normalized first.
+- **Diagnostics.** The helper's text stays diagnostic only. It is echoed at
+  most 20 lines, with `OUTCOME=` defanged, is never evaluated, and never
+  reaches the `OUTCOME=` line.
+- **Unchanged.** The HTTP health contract (`127.0.0.1`, `/v1/healthz`, no
+  redirects, no credentials, a body cap, one total timeout, strict `200`,
+  JSON object and `status: "ok"`); the helper module itself; every Worker-state
+  classification; exactly one `OUTCOME=` line; the observer-only model; and
+  the units, cadence, identity and privileges.
+
+Measured on the untouched base versus the head, with the Worker's real
+listener healthy in each tooling case:
+
+| Case | Base (the installed probe's source) | Source |
+| :--- | :--- | :--- |
+| real helper, healthy listener | `healthy` / `0` | `healthy` / `0` |
+| real helper: `connect-failed`, `timeout`, `bad-status`, `malformed-body`, `wrong-state`, `body-too-large` | `unhealthy` / `1` | `unhealthy` / `1` |
+| real helper, configuration error (`--timeout-ms 0`), helper exit `2` | `unhealthy` / `1` | `config-invalid` / `2` |
+| module that crashes at load, or a Node import/syntax failure (exit `1`) | `unhealthy` / `1` | `config-invalid` / `2` |
+| module or Node stand-in that exits `0` with no verdict | **`healthy` / `0`** | `config-invalid` / `2` |
+| `FAIL outcome=made-up-value`, exit `1` | `unhealthy` / `1` | `config-invalid` / `2` |
+| `FAIL outcome=timeout` with exit `0` | **`healthy` / `0`** | `config-invalid` / `2` |
+
+**What closes it.** A separate, authorized live deployment and
+re-acceptance: install the revised probe (the request module is unchanged),
+then run the real unit once with the Worker running (`healthy`) and once with
+it stopped (`idle`), as in `deploy/README.md` step 6c. Until then this item is
+implemented in source only. It is not deployed and not closed.
 
 ### Restart-on-unhealthy — reviewed and NOT selected (2026-09-28)
 
@@ -4378,26 +4446,34 @@ Worker stays active, external /v1/healthz check fails
    | start-up race: `Type=simple` makes the unit `active` when the container client starts, before Node listens | no — transient |
    | loopback publication broken (owned by `videofetch-media-netns.service`) | no |
    | a foreign listener answering the port | no — and it is a security question first |
-   | health-helper or tooling failure (item 2) | no |
+   | health-helper or tooling failure — through the installed probe only; the source probe reports it as `config-invalid` (item 2) | no |
 
    `OUTCOME=unhealthy` is therefore **not** the same statement as "the Worker
    process must be restarted".
 
 2. **The probe's classification is not precise enough for privileged
-   automation.** The probe runs the Node helper `vf-worker-health-request.mjs`
-   and maps helper exit `0` to `healthy` and **any** nonzero exit to
-   `unhealthy`. The helper itself exits `0` when healthy, `1` for a genuine
-   HTTP/liveness failure and `2` for an argument or configuration error, and
-   Node exits nonzero on its own if it cannot load or run the module. The
-   probe's earlier checks catch a missing Node or module
-   (`OUTCOME=config-invalid`), but a helper configuration error or a Node
-   runtime failure after those checks is surfaced as `OUTCOME=unhealthy`. The
-   probe's exit `1` also covers `failed-unit` and `unknown-state`. An operator
-   can tell these apart from the helper's own `FAIL outcome=` line; a
-   supervisor acting on the probe's result could not. Correcting it is the
-   separate, optional `WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001`
-   (§11). It improves observability accuracy but is **not** required for
-   current operation.
+   automation.** The probe runs the Node helper `vf-worker-health-request.mjs`.
+   The helper exits `0` when healthy, `1` for a genuine HTTP/liveness failure
+   and `2` for an argument or configuration error, and Node exits nonzero on
+   its own if it cannot load or run the module.
+   - *Installed on Production:* the probe accepted on 2026-09-26 maps helper
+     exit `0` to `healthy` and **any** nonzero exit to `unhealthy`. Its
+     earlier checks catch a missing Node or module
+     (`OUTCOME=config-invalid`), but a helper configuration error or a Node
+     runtime failure after those checks is surfaced as `OUTCOME=unhealthy`.
+   - *Repository source:* since `WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001`
+     (above), only the helper's own verdict yields `healthy` or `unhealthy`,
+     and every other helper result is
+     `OUTCOME=config-invalid reason=health-helper-contract`, exit `2`. This
+     is implemented in source only; its live deployment and re-acceptance
+     are pending.
+   - *Both:* the probe's exit `1` also covers `failed-unit` and
+     `unknown-state`. An operator can tell these apart from the helper's own
+     `FAIL outcome=` line; a supervisor acting on the probe's exit code alone
+     could not.
+
+   The classification fix improves observability accuracy. It was **not**
+   required for current operation, and it does not reopen this decision.
 
 3. **Process recovery already exists.** A Worker that actually exits or fails
    is restarted by PID 1 through `Restart=on-failure` / `RestartSec=5`. A
@@ -4464,7 +4540,8 @@ ever reconsidered, the preferred candidate is a **separate root-owned recovery
 oneshot**, triggered by a liveness failure, while the probe stays unprivileged
 and observer-only. Its required properties:
 - fix the helper/tooling classification first
-  (`WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001`);
+  (`WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001` — implemented in
+  source; it must also be deployed and live re-accepted);
 - never grant restart authority to `videofetch-liveness`;
 - validate the Worker (`loaded`/`active`/`running`) and all six dependencies
   independently, immediately before acting;
@@ -5394,7 +5471,7 @@ authorization.
 | `VERCEL-KNOWN-GOOD-ROLLBACK-POINT-001` | **CLOSED / PASS / PRODUCTION ACCEPTED — 2026-09-28** | Exactly one Production mutation: `dpl_YrhkEQC4…` redeployed to Production as `dpl_8k6e59juv1Z3Srb9NSNBmmVGh5Nb` (created 13:25:25Z, aliased 13:25:55Z; `source: cli`, `meta.action: redeploy`, `meta.originalDeploymentId` `dpl_YrhkEQC4…`). Preflight: no project environment row changed after `dpl_YrhkEQC4…` was created; the Worker matched its state of record (`629ec04b…`, `worker.env` `3583770c…`). Baseline on `dpl_YrhkEQC4…`: run 3 fully clean (run 2 had one transient file-route 503 on the Vercel → Cloudflare edge leg that never reached the named tunnel; the same file returned 303 17 s later, and the Product Owner required one more full baseline). Uploaded source tree and the eight served client assets identical to `dpl_YrhkEQC4…`'s. Post-redeploy on `dpl_8k6e59…`: login/session 200, diagnostics 200 (`status: ok`), sites 200, named tunnel +2 / +5, controlled direct fixture analyzed, one `preset:best` job `ready`, file route 303, 48,497 delivered bytes equal to the fixture (`44827ff8…`); no runtime error. Provider `isRollbackCandidate`: `dpl_8k6e59…` and `dpl_YrhkEQC4…` true, `dpl_BJYRG7…` false. No rollback needed. VM Stopped → Running → Stopped; no environment, credential, Cloudflare, Worker, Git or source change. Evidence operator-held, `MANIFEST.sha256` `a20bd1e849c8b74332ba792561af8e3bd1c289dd9014ce8d32364742f9f8ea82`; Vercel safe state `f825cf84…` → `f36c841d…`, every difference a consequence of the one redeploy (*accepted operator-measured*). See §9, §11h. |
 | `WORKER-RESTART-ON-UNHEALTHY-DESIGN-AUDIT-001` | **COMPLETE — AUTOMATIC RESTART NOT RECOMMENDED** | 2026-09-28, read-only, at `main` `940dbcebe15cff19561afb4f07c7397d29a01ef2` (tree `51142852…`): no mutation, no VM start, no Worker, systemd or Docker action, no provider or Production request. *Question:* should a Worker that stays `active` but repeatedly fails `/v1/healthz` be restarted automatically, and if so by whom, on what evidence and within what bounds? *Inspected:* the probe and its Node helper, the liveness, Worker and six dependency units, the egress watchdog and its breach path, the workspace verifier, the Worker health route, start-up, shutdown and durable recovery with their tests, and the systemd 255 manual pages. *Findings:* (a) `/v1/healthz` is liveness only (§8); (b) the probe maps any nonzero helper exit to `OUTCOME=unhealthy`, so some helper/tooling faults surface as unhealthy, and its exit `1` also covers `failed-unit` and `unknown-state`; (c) `Type=simple` makes the Worker `active` before Node listens, so one tick can see a start-up race; (d) a restart transaction activates required units that are inactive, which could interact with a boundary incident; (e) with the systemd 255 defaults (10 s / 5 starts; the VM's manager configuration was not read) and `RestartSec=5`, the Worker's start limit cannot trip, so process-crash restarts are effectively unbounded — recorded as an observation, no change proposed. *Options compared:* restart authority in the probe (rejected), an `OnFailure=`-triggered root recovery unit (kept only as the reserve design, §8), a stateful supervisor, a watchdog pinged from inside the container (rejected: it would hand the untrusted container a socket to PID 1), and no automatic restart (selected). Report delivered to the Product Owner; not committed (*repository/source-verifiable analysis*; no live measurement). |
 | `WORKER-RESTART-ON-UNHEALTHY-DECISION-CLOSURE-001` | **DECISION RECORDED — automatic restart-on-unhealthy NOT selected (documentation only)** | 2026-09-28. Records the audit's decision: the liveness probe stays observer-only, `Restart=on-failure` keeps owning actual process failure, and an `active` but unhealthy Worker is diagnosed by the operator. §8 now describes `/v1/healthz` as liveness only (it was "liveness/readiness"), states the decision and its six cumulative reasons, the re-open criteria and a clearly labelled reserve design. `deploy/README.md` ("What a failed probe does, and does not do") gains the bounded manual procedure: investigate after two consecutive unhealthy timer ticks or a live Product failure, confirm the helper's own verdict, require the Worker `active`/`running` and all six dependencies `active`, tell the listener apart from the publication path, capture evidence, restart **at most once**, verify, and never loop. *Unchanged:* the probe, the health helper, every systemd unit, the Worker application and its tests; nothing was deployed, and no VM, Worker, Docker, Vercel, Cloudflare or R2 action was taken (*repository/source-verifiable*). |
-| `WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001` | **OPEN — OPTIONAL HARDENING; not required for current operation, not scheduled** | Make sure a health-helper configuration or tooling failure can never be collapsed into `OUTCOME=unhealthy` (§8, reason 2): today the probe maps any nonzero exit of `vf-worker-health-request.mjs` to `unhealthy`, although the helper uses `2` for argument/configuration errors and Node exits nonzero when it cannot load or run the module. It would improve observability accuracy even with manual recovery, and it is a prerequisite of the reserve design. It changes the probe's documented exit-code contract, so it needs its own reviewed source task and a live re-acceptance of the probe; the decision closure deliberately did not change it. |
+| `WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001` | **IMPLEMENTED IN SOURCE — LIVE DEPLOYMENT / RE-ACCEPTANCE PENDING** | 2026-09-28, from `main` `c20d1f7528f76fca869174dd0ae20a4bb91a8d84` (tree `1343f249…`). Source, tests and documentation only: no VM start, no install, no Worker, systemd, Docker, Vercel, Cloudflare or R2 action, no Production request. *Defect:* the probe mapped helper exit `0` to `healthy` and any nonzero exit of `vf-worker-health-request.mjs` to `unhealthy` (§8, reason 2). Measured on the untouched base: the helper's own configuration error (exit `2`) and a Node/module failure (exit `1`) both read `unhealthy` / `1`; a stand-in that exits `0` with no verdict, and `FAIL outcome=timeout` with exit `0`, both read `healthy` / `0`. *Fix:* `deploy/bin/vf-worker-liveness-probe` accepts only the helper's own protocol. `healthy` needs exit `0` plus exactly one `vf-worker-health-request: OK outcome=healthy` line naming the fixed loopback target. `unhealthy` needs exit `1` plus exactly one `FAIL` line whose outcome is one of the helper's six (`connect-failed`, `timeout`, `bad-status`, `body-too-large`, `malformed-body`, `wrong-state`). Every other helper result is `OUTCOME=config-invalid reason=health-helper-contract helper_status=<n>`, exit `2`. Helper text stays diagnostic: at most 20 lines, `OUTCOME=` defanged, never evaluated. *Unchanged:* the helper module, the HTTP health contract, every Worker-state classification, exactly one `OUTCOME=` line, the observer-only model, the units, cadence, identity and privileges; automatic restart stays rejected. *Validation:* the liveness policy suite runs the probe against stub systemd, real loopback listeners and stand-in helper modules; its new discriminator tests fail on the base and pass on the head, and targeted mutants of each guard are killed. *Deployment:* **not deployed.** The installed Production probe keeps the broad mapping until a separate, authorized live deployment and re-acceptance installs this revision and re-runs `deploy/README.md` step 6c; only then can this row close. |
 | `GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** (2026-09-28) | *Issue (excluded from `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`):* the raw yt-dlp schema accepts any finite `filesize` / `filesize_approx`, deliberately, so one odd field cannot invalidate the whole document. The generic size readers, however, only checked `> 0`. A positive fractional declared `filesize` (for example `1234.5`) therefore became the candidate `fileSize` and reached the integer `GenericSourceSelection.fileSize` contract in `toSelection()`. The resulting `ZodError` failed the entire generic analysis (HTTP `PROCESSING_FAILED`) on the muxed, split and audio paths. As the policy size, the same fraction also hid a valid integer `filesize_approx` over the ceiling from the progressive and clear-HLS size gates. *Rule:* one local predicate, `positiveIntegerSize()`, is now the only reader of either field. A size is a byte count only when it is a positive integer; it is never rounded, floored, truncated or coerced. Any other value is unavailable, exactly like an absent field. A valid integer declared size is still the public and private `fileSize`. A valid integer approximation is still private policy input only: per-format, pair and clear-HLS admission, ranking, and `size_limit_exceeded`. A malformed declared size no longer suppresses a valid approximation. Malformed metadata on its own leaves the format size-unknown rather than rejected. So a fractional value past the ceiling no longer refuses a format at analysis, because it is not a size. *Unchanged:* actual-byte enforcement during acquisition, which remains the boundary; the raw and execution schemas; the public API shape; the `sourceQuality` vocabulary; direct media. *Source (GitHub-verifiable):* PR #97, merge `53bb32b64045523c47480bdc37e696ea391cb46c` (tree `f68857e8…`); 18 of the 26 new tests fail on the untouched base `86e28ab2…`. *Candidate (accepted operator-measured):* `sha256:6ececc01…`, retained as `videofetch-worker:rc-53bb32b64045-6ececc018029`, built from a clean checkout of exact `main`. SPLIT-07 `-03` PASS 47/47, with mp4 141/141, webm 141/141 and clear-HLS 146/146 children. Its runtime/package inventory is byte-identical to `sha256:629ec04b…` (layers 0–11 identical; only the source-copy layers differ). An in-image discriminator passed 34/34, and on the previous image, offline, the same probe reproduced the private-schema `ZodError` in 9 cases and the clear-HLS approximation-precedence defect, while every integer control stayed identical. In-image tests passed 1275/1275 across 22 suites under recorded test-environment preconditions (a 5 GiB `/tmp` cap for keep-original suites, 9 GiB for three processing and clear-HLS suites that need the existing 2 × 4 GiB workspace condition, the committed `.env.example` mounted read-only); those are not Production configuration. *Production (accepted operator-measured):* promoted at 2026-09-28T17:34:09.403Z, Worker-only restart, about 2.08 s of health downtime; accepted at 17:43:33Z, well inside the 75-minute dead-man window; no rollback. The accepted public X generic control analyzed identically twice before and twice after promotion (best/720/360/240 all `fileSize: null`); one X `preset:best` job delivered 38,257,789 bytes equal to its durable `fileSize`, byte-identical to two earlier accepted deliveries; a controlled 48,497-byte direct fixture analyzed identically before and after, and its keep-original job delivered the fixture byte for byte. 5-minute stability PASS; no `ZodError` in the Worker log. The immediate Worker rollback is now `sha256:629ec04b…`. `worker.env`, Vercel, Cloudflare and R2 administration unchanged. The fractional-metadata behaviour was proven in the candidate image, not on a live source. Full record: §11h. |
 
 ---
