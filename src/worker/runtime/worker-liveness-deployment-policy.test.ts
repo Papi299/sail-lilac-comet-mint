@@ -13,6 +13,7 @@ import {
   LIVENESS_HOST,
   LIVENESS_PATH,
   LIVENESS_EXPECTED_STATUS,
+  LIVENESS_OUTCOMES,
 } from "../../../deploy/bin/vf-worker-health-request.mjs";
 
 /**
@@ -342,6 +343,47 @@ describe("external Worker liveness probe — source contract", () => {
     // non-200 and therefore a failure.
     assert.doesNotMatch(requestExec, /follow(-|_)?redirect/i);
     assert.match(requestExec, /status\s*!==\s*200/, "only 200 passes");
+  });
+
+  it("accepts only the helper's own verdicts, in the helper's own closed vocabulary", () => {
+    // WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001. The probe duplicates
+    // the helper's outcome list rather than importing it (it is bash), so the
+    // two are kept identical HERE. A new helper outcome the probe does not know
+    // becomes a tooling fault, never a silent health verdict.
+    const verdicts = [...probeExec.matchAll(/"(\d+) (OK|FAIL) ([^"\s]*)"/g)].map(
+      ([, status, word, outcome]) => `${status} ${word} ${outcome}`,
+    );
+    const failures = Object.values(LIVENESS_OUTCOMES).filter((o) => o !== LIVENESS_OUTCOMES.HEALTHY);
+    assert.equal(failures.length, 6, "the helper's six genuine liveness failures");
+    assert.deepEqual(
+      [...verdicts].sort(),
+      [`0 OK ${LIVENESS_OUTCOMES.HEALTHY}`, ...failures.map((o) => `1 FAIL ${o}`)].sort(),
+      "healthy only with exit 0 + OK; unhealthy only with exit 1 + a closed FAIL outcome",
+    );
+    // The verdict must name the fixed loopback target the helper dials.
+    assert.ok(
+      probeExec.includes(`target=http://${LIVENESS_HOST}:`) && probeExec.includes(`${LIVENESS_PATH}"`),
+      "the helper's reported target is checked against the helper's own constants",
+    );
+    assert.match(probeExec, /verdict config-invalid 2 "reason=health-helper-contract helper_status=\$STATUS"/);
+  });
+
+  it("treats the helper's output as data: never evaluated, sourced or executed", () => {
+    for (const forbidden of [/\beval\b/, /\bsource\b/, /\b(ba)?sh\s+-c\b/, /\bexec\b/]) {
+      assert.doesNotMatch(probeExec, forbidden, `the probe must not use ${forbidden}`);
+    }
+    // The only sourced file is the shared validator library.
+    const sourced = probeExec.split("\n").filter((line) => /^\s*\.\s+/.test(line));
+    assert.deepEqual(sourced.map((line) => line.trim()), ['. "$LIB"']);
+    // Every read of the captured output is a quoted expansion, never a command
+    // word, and it never reaches the OUTCOME line: that is built only from
+    // closed words, the unit, the validated port and the numeric status.
+    const uses = [...probeExec.matchAll(/.{0,2}\$\{?OUTPUT\}?.?/g)].map(([m]) => m);
+    assert.ok(uses.length >= 2, "the output is captured and classified");
+    for (const use of uses) assert.match(use, /"\$OUTPUT"/, `unquoted use of the helper's output: ${use}`);
+    for (const line of probeExec.split("\n").filter((l) => /\bverdict\s+\S+\s+\d/.test(l))) {
+      assert.doesNotMatch(line, /\$\{?(OUTPUT|output|line|rest|outcome)\b/, `helper text in a verdict: ${line.trim()}`);
+    }
   });
 });
 
@@ -949,6 +991,58 @@ describe("liveness probe behaviour", () => {
   const sockets = new Set<net.Socket>();
   let requests: string[] = [];
 
+  /**
+   * Writes a stand-in for the request module, for the VF_WORKER_HEALTH_REQUEST
+   * seam, and returns its path. The body sees `port` — the value the probe
+   * passed with --port, exactly as the real module receives it — and `target`,
+   * the target line the real module would print for it.
+   */
+  async function fakeHelper(name: string, body: string): Promise<string> {
+    const path = join(sandbox, `fake-helper-${name}.mjs`);
+    await writeFile(
+      path,
+      [
+        'const port = process.argv[process.argv.indexOf("--port") + 1];',
+        "const target = `target=http://127.0.0.1:${port}/v1/healthz`;",
+        body,
+        "",
+      ].join("\n"),
+    );
+    return path;
+  }
+
+  /** An active Worker whose real listener is HEALTHY, so no fault below is the Worker's. */
+  async function activeHealthyWorker(): Promise<void> {
+    await listen((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
+    });
+    await setUnitState({ LoadState: "loaded", ActiveState: "active", SubState: "running" });
+    await setIsFailed("active");
+  }
+
+  /**
+   * The helper-contract verdict: a tooling/deployment fault, exit 2, exactly
+   * one OUTCOME record, and never either health verdict.
+   */
+  async function expectToolingFault(label: string, extra: NodeJS.ProcessEnv, helperStatus: number): Promise<void> {
+    const run = await runProbe(extra);
+    const all = `${run.stdout}${run.stderr}`;
+    assert.equal(run.status, 2, `${label}: must exit 2, got ${run.status}:\n${all}`);
+    assert.equal(run.outcome, "config-invalid", `${label}: outcome:\n${all}`);
+    assert.equal(run.outcomeCount, 1, `${label}: exactly one OUTCOME record:\n${all}`);
+    assert.match(
+      run.stdout,
+      new RegExp(
+        `^vf-worker-liveness-probe: OUTCOME=config-invalid reason=health-helper-contract helper_status=${helperStatus}$`,
+        "m",
+      ),
+      `${label}:\n${all}`,
+    );
+    assert.doesNotMatch(all, /OUTCOME=(healthy|unhealthy)\b/, `${label}: a tooling fault is never a health verdict`);
+    assert.match(run.stderr, /NOT evidence about the Worker's health/, `${label}: the operator is told why`);
+  }
+
   before(async () => {
     sandbox = await mkdtemp(join(tmpdir(), "vf-liveness-"));
     const bin = join(sandbox, "bin");
@@ -973,6 +1067,10 @@ exit 0
       nft: `#!/bin/bash\necho "nft $*" >> "$VT/mutations.log"\nexit 0\n`,
       curl: `#!/bin/bash\necho "curl $*" >> "$VT/mutations.log"\nexit 0\n`,
       wget: `#!/bin/bash\necho "wget $*" >> "$VT/mutations.log"\nexit 0\n`,
+      // Some other executable installed where the pinned Node should be: it
+      // runs, prints nothing and exits 0 or 1 without ever loading the helper.
+      "fake-node-true": `#!/bin/bash\nexit 0\n`,
+      "fake-node-false": `#!/bin/bash\nexit 1\n`,
     };
     for (const [name, body] of Object.entries(stubs)) {
       const path = join(bin, name);
@@ -1183,6 +1281,7 @@ exit 0
 
       const run = await runProbe();
       assert.equal(run.status, 1, `body ${body} must fail`);
+      assert.equal(run.outcome, "unhealthy", `body ${body}`);
       assert.match(`${run.stdout}${run.stderr}`, /outcome=malformed-body/, `body ${body}`);
     }
   });
@@ -1197,6 +1296,7 @@ exit 0
 
       const run = await runProbe();
       assert.equal(run.status, 1, `state '${state}' must fail`);
+      assert.equal(run.outcome, "unhealthy", `state '${state}'`);
       assert.match(`${run.stdout}${run.stderr}`, /outcome=wrong-state/, `state '${state}'`);
     }
   });
@@ -1210,6 +1310,7 @@ exit 0
 
     const run = await runProbe();
     assert.equal(run.status, 1);
+    assert.equal(run.outcome, "unhealthy");
     assert.match(`${run.stdout}${run.stderr}`, /outcome=body-too-large/);
   });
 
@@ -1260,6 +1361,185 @@ exit 0
     assert.equal(run.status, 2);
     assert.equal(run.outcome, "config-invalid");
     assert.match(run.stdout, /reason=port-unavailable/);
+  });
+
+  // ── WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001 ─────────────────────
+  //
+  // Before this task the probe mapped helper exit 0 to healthy and ANY nonzero
+  // exit to unhealthy. In every case below the Worker's real listener is
+  // healthy, so an `unhealthy` (or a `healthy` that no request produced) would
+  // be the probe's own tooling speaking for the Worker.
+
+  it("reports the helper's own configuration error (its exit 2) as a tooling fault, not as unhealthy", async () => {
+    await activeHealthyWorker();
+    for (const timeout of ["0", "abc", "60001", "1.5"]) {
+      await expectToolingFault(`--timeout-ms ${timeout}`, { VF_LIVENESS_TIMEOUT_MS: timeout }, 2);
+    }
+    // The helper refused its arguments before dialling anything, so there is
+    // no health evidence at all — let alone evidence of an unhealthy Worker.
+    assert.equal(connections, 0, "no health request was made");
+  });
+
+  it("reports a Node or module failure that exits 1 as a tooling fault, not as a Worker failure", async () => {
+    await activeHealthyWorker();
+    const crashes: Record<string, string> = {
+      "throws-while-loading": 'throw new Error("simulated module failure");',
+      "syntax-error": "const = ;",
+      "missing-import": 'import "./no-such-dependency.mjs";',
+      "unhandled-rejection": 'await Promise.reject(new Error("simulated rejection"));',
+      "silent-exit-1": "process.exit(1);",
+    };
+    for (const [name, body] of Object.entries(crashes)) {
+      await expectToolingFault(name, { VF_WORKER_HEALTH_REQUEST: await fakeHelper(name, body) }, 1);
+    }
+    await expectToolingFault("another executable at the Node path, exiting 1", { VF_NODE: join(sandbox, "bin", "fake-node-false") }, 1);
+    assert.equal(connections, 0, "none of these made a health request");
+  });
+
+  it("NEVER reports healthy without the helper's own success verdict", async () => {
+    await activeHealthyWorker();
+    const exitsZero: Record<string, string> = {
+      "silent-exit-0": "process.exit(0);",
+      "unrelated-text": 'console.log("all good");',
+      "lowercase-ok": 'console.log("vf-worker-health-request: ok outcome=healthy " + target);',
+      "another-module": 'console.log("vf-worker-health-requests: OK outcome=healthy " + target);',
+      "outcome-prefix": 'console.log("vf-worker-health-request: OK outcome=healthyish " + target);',
+      "no-target": 'console.log("vf-worker-health-request: OK outcome=healthy");',
+      "wrong-port": 'console.log("vf-worker-health-request: OK outcome=healthy target=http://127.0.0.1:1/v1/healthz");',
+      "wrong-path": 'console.log(`vf-worker-health-request: OK outcome=healthy target=http://127.0.0.1:${port}/healthz`);',
+      "wrong-host": 'console.log(`vf-worker-health-request: OK outcome=healthy target=http://10.0.0.1:${port}/v1/healthz`);',
+      "target-suffix": 'console.log("vf-worker-health-request: OK outcome=healthy " + target + "x");',
+    };
+    for (const [name, body] of Object.entries(exitsZero)) {
+      await expectToolingFault(name, { VF_WORKER_HEALTH_REQUEST: await fakeHelper(name, body) }, 0);
+    }
+    await expectToolingFault("another executable at the Node path, exiting 0", { VF_NODE: join(sandbox, "bin", "fake-node-true") }, 0);
+    assert.equal(connections, 0, "and no health request was made by any of them");
+  });
+
+  it("rejects a FAIL outcome outside the helper's closed vocabulary", async () => {
+    await activeHealthyWorker();
+    for (const outcome of ["made-up-value", "healthy", "", "TIMEOUT", "timeout,bad-status"]) {
+      const helper = await fakeHelper(
+        `fail-${outcome || "empty"}`,
+        `console.error("vf-worker-health-request: FAIL outcome=${outcome} " + target); process.exitCode = 1;`,
+      );
+      await expectToolingFault(`FAIL outcome='${outcome}'`, { VF_WORKER_HEALTH_REQUEST: helper }, 1);
+    }
+  });
+
+  it("requires the helper's exit status and its verdict line to agree", async () => {
+    await activeHealthyWorker();
+    const ok = 'console.log("vf-worker-health-request: OK outcome=healthy " + target + " http_status=200");';
+    const fail = 'console.error("vf-worker-health-request: FAIL outcome=timeout " + target);';
+    const mismatches: Array<[string, string, number]> = [
+      ["exit-0-with-FAIL", `${fail} process.exitCode = 0;`, 0],
+      ["exit-1-with-OK", `${ok} process.exitCode = 1;`, 1],
+      ["exit-2-with-FAIL", `${fail} process.exitCode = 2;`, 2],
+      ["exit-2-with-OK", `${ok} process.exitCode = 2;`, 2],
+      ["exit-3-with-OK", `${ok} process.exitCode = 3;`, 3],
+      ["exit-3-with-FAIL", `${fail} process.exitCode = 3;`, 3],
+      ["exit-42-silent", "process.exit(42);", 42],
+      ["killed-by-signal", 'process.kill(process.pid, "SIGKILL");', 137],
+    ];
+    for (const [name, body, status] of mismatches) {
+      await expectToolingFault(name, { VF_WORKER_HEALTH_REQUEST: await fakeHelper(name, body) }, status);
+    }
+  });
+
+  it("accepts exactly one verdict line: a stray warning, stack or blank line voids it", async () => {
+    await activeHealthyWorker();
+    // The real helper's full lines, INCLUDING the diagnostic tail after the
+    // target — so the extra line below is caught by the one-line rule itself,
+    // not incidentally by the target comparison.
+    const okLine = '"vf-worker-health-request: OK outcome=healthy " + target + \' http_status=200 detail="status ok"\'';
+    const ok = `console.log(${okLine});`;
+    const fail =
+      'console.error("vf-worker-health-request: FAIL outcome=timeout " + target + \' detail="no complete response within 700ms"\');';
+    const extra: Array<[string, string, number]> = [
+      ["warning-then-OK", `console.error("(node:1) Warning: simulated"); ${ok}`, 0],
+      ["OK-then-warning", `${ok} console.error("(node:1) Warning: simulated");`, 0],
+      ["blank-then-OK", `console.log(""); ${ok}`, 0],
+      ["OK-twice", `${ok} ${ok}`, 0],
+      ["OK-with-carriage-return", `console.log(${okLine} + "\\r");`, 0],
+      ["FAIL-then-stack", `${fail} console.error("    at simulated (file:///x.mjs:1:1)"); process.exitCode = 1;`, 1],
+    ];
+    for (const [name, body, status] of extra) {
+      await expectToolingFault(name, { VF_WORKER_HEALTH_REQUEST: await fakeHelper(name, body) }, status);
+    }
+  });
+
+  it("accepts a protocol-conformant stand-in, so every rejection above is for its stated reason", async () => {
+    // The positive control for the fakes: the SAME seam and the SAME fixture
+    // shape, speaking the protocol correctly, yields the health verdicts.
+    await activeHealthyWorker();
+    const healthy = await fakeHelper(
+      "conformant-ok",
+      'console.log("vf-worker-health-request: OK outcome=healthy " + target + \' http_status=200 detail="status ok"\');',
+    );
+    const ok = await runProbe({ VF_WORKER_HEALTH_REQUEST: healthy });
+    assert.equal(ok.status, 0, `${ok.stdout}${ok.stderr}`);
+    assert.equal(ok.outcome, "healthy");
+
+    for (const outcome of Object.values(LIVENESS_OUTCOMES).filter((o) => o !== LIVENESS_OUTCOMES.HEALTHY)) {
+      const helper = await fakeHelper(
+        `conformant-${outcome}`,
+        `console.error("vf-worker-health-request: FAIL outcome=${outcome} " + target + ' detail="simulated"'); process.exitCode = 1;`,
+      );
+      const run = await runProbe({ VF_WORKER_HEALTH_REQUEST: helper });
+      assert.equal(run.status, 1, `${outcome}: ${run.stdout}${run.stderr}`);
+      assert.equal(run.outcome, "unhealthy", outcome);
+      assert.equal(run.outcomeCount, 1, outcome);
+    }
+  });
+
+  it("accepts a delivered port with leading zeros, exactly as the shared validator does", async () => {
+    // vf_validate_port accepts `08080`; the helper prints it back as 8080, so
+    // the target comparison must not turn a working configuration into a fault.
+    await activeHealthyWorker();
+    const run = await runProbe({ VIDEOFETCH_WORKER_PORT: `00${port}` });
+    assert.equal(run.status, 0, `${run.stdout}${run.stderr}`);
+    assert.equal(run.outcome, "healthy");
+    assert.equal(connections, 1, "the real request was made");
+  });
+
+  it("cannot be made to print a second OUTCOME record by anything the helper prints", async () => {
+    await activeHealthyWorker();
+    // Not the helper's protocol: a tooling fault, whatever it claims.
+    await expectToolingFault(
+      "forged outer verdict",
+      {
+        VF_WORKER_HEALTH_REQUEST: await fakeHelper(
+          "forged-verdict",
+          'console.log("vf-worker-liveness-probe: OUTCOME=healthy unit=videofetch-worker.service");',
+        ),
+      },
+      0,
+    );
+    // The helper's protocol, with free diagnostic text after the target: the
+    // verdict stands, and the text is shown defanged, not as a second record.
+    const tail = await fakeHelper(
+      "forged-tail",
+      'console.log("vf-worker-health-request: OK outcome=healthy " + target + " OUTCOME=unhealthy");',
+    );
+    const run = await runProbe({ VF_WORKER_HEALTH_REQUEST: tail });
+    assert.equal(run.status, 0, `${run.stdout}${run.stderr}`);
+    assert.equal(run.outcome, "healthy");
+    assert.equal(run.outcomeCount, 1, `${run.stdout}${run.stderr}`);
+    assert.match(run.stdout, /OUTCOME:unhealthy/, "the helper's text is still shown to the operator");
+  });
+
+  it("bounds the helper's diagnostic output", async () => {
+    await activeHealthyWorker();
+    const flood = await fakeHelper(
+      "flood",
+      'for (let i = 1; i <= 100; i += 1) console.error(`simulated line ${i}`); process.exitCode = 1;',
+    );
+    await expectToolingFault("100 lines of output", { VF_WORKER_HEALTH_REQUEST: flood }, 1);
+    const run = await runProbe({ VF_WORKER_HEALTH_REQUEST: flood });
+    const shown = run.stdout.split("\n").filter((line) => line.startsWith("vf-worker-liveness-probe: simulated line "));
+    assert.equal(shown.length, 20, "at most 20 helper lines are echoed");
+    assert.match(run.stdout, /\(80 further health helper output lines not shown\)/);
   });
 
   it("emits EXACTLY ONE OUTCOME line on every expected path", async () => {
@@ -1315,6 +1595,9 @@ exit 0
         status: 1,
       },
       { name: "usage error", setup: unit("active", "active"), args: ["--restart-worker"], outcome: "usage-error", status: 2 },
+      { name: "health helper configuration error", setup: unit("active", "active"), extra: { VF_LIVENESS_TIMEOUT_MS: "0" }, outcome: "config-invalid", status: 2 },
+      { name: "health helper replaced by a silent exit 0", setup: unit("active", "active"), extra: { VF_NODE: join(sandbox, "bin", "fake-node-true") }, outcome: "config-invalid", status: 2 },
+      { name: "health helper replaced by a silent exit 1", setup: unit("active", "active"), extra: { VF_NODE: join(sandbox, "bin", "fake-node-false") }, outcome: "config-invalid", status: 2 },
     );
 
     for (const c of cases) {
@@ -1369,6 +1652,12 @@ exit 0
       await setIsFailed(failed);
       await runProbe();
     }
+    // A tooling fault is reported, never repaired.
+    await setUnitState({ LoadState: "loaded", ActiveState: "active", SubState: "running" });
+    await setIsFailed("active");
+    await runProbe({ VF_LIVENESS_TIMEOUT_MS: "0" });
+    await runProbe({ VF_NODE: join(sandbox, "bin", "fake-node-false") });
+    await runProbe({ VF_WORKER_HEALTH_REQUEST: await fakeHelper("replay-crash", 'throw new Error("simulated");') });
     await setUnitState({ LoadState: "not-found", ActiveState: "inactive", SubState: "dead" });
     await runProbe();
 

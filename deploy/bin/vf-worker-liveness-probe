@@ -49,11 +49,13 @@
 #
 #   Worker inactive               -> intentional idle; NO request is made (exit 0)
 #   Worker activating/stopping    -> bounded transient; NO request is made (exit 0)
-#   Worker active and healthy     -> healthy (exit 0)
-#   Worker active and not healthy -> a real fault (exit 1)
+#   Worker active and healthy     -> healthy (exit 0), on the helper's own OK only
+#   Worker active and not healthy -> a real fault (exit 1), on the helper's own
+#                                    closed-vocabulary FAIL only
 #   Worker failed                 -> a real fault, never disguised as idle (exit 1)
 #   Worker unit not loaded        -> a deployment fault (exit 2)
-#   configuration / tooling fault -> a deployment fault (exit 2)
+#   configuration / tooling fault -> a deployment fault (exit 2), including a
+#                                    health helper that breaks its protocol
 #
 # It is also STATELESS. It keeps no counter, no history and no spool file, so
 # time the VM spent powered off cannot be replayed as accumulated failures. The
@@ -72,7 +74,7 @@
 # Exit codes:
 #   0  healthy, or a bounded not-applicable state (idle / transient)
 #   1  FAILURE: the Worker unit failed, or it is active and not healthy
-#   2  configuration or deployment fault
+#   2  configuration, deployment or probe-tooling fault; never a health verdict
 
 set -uo pipefail
 VF_PROG=vf-worker-liveness-probe
@@ -246,13 +248,96 @@ fi
 OUTPUT="$("$NODE" "$HEALTH_REQUEST" --port "$PORT" --timeout-ms "$TIMEOUT_MS" 2>&1)"
 STATUS=$?
 
-printf '%s\n' "$OUTPUT" | while IFS= read -r line; do
-  [ -n "$line" ] && say "$line"
-done
+# Diagnostics only, and bounded. The helper's text is echoed for the operator,
+# never executed, and it decides nothing below. It cannot impersonate this
+# probe: `OUTCOME=` in it is defanged, so the verdict line stays the run's only
+# record. At most 20 lines are shown — a Node stack trace fits; a runaway
+# module does not flood the journal.
+printf '%s\n' "$OUTPUT" | {
+  shown=0
+  hidden=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if [ "$shown" -lt 20 ]; then
+      say "${line//OUTCOME=/OUTCOME:}"
+      shown=$((shown + 1))
+    else
+      hidden=$((hidden + 1))
+    fi
+  done
+  [ "$hidden" -eq 0 ] || say "($hidden further health helper output lines not shown)"
+}
 
-if [ "$STATUS" -eq 0 ]; then
-  verdict healthy 0 "unit=$WORKER_UNIT port=$PORT path=/v1/healthz"
-fi
+# ── Only the helper's own protocol can speak for the Worker ────────────────
+#
+# vf-worker-health-request.mjs prints EXACTLY ONE line and exits with a status
+# that must agree with it:
+#
+#   exit 0  "vf-worker-health-request: OK outcome=healthy target=<t> ..."
+#   exit 1  "vf-worker-health-request: FAIL outcome=<one of six> target=<t> ..."
+#   exit 2  an argument or configuration error, with no verdict at all
+#
+# where <t> is http://127.0.0.1:<port>/v1/healthz for the port passed in. A
+# result is a health verdict only when ALL of it holds. Anything else — the
+# helper's exit 2, a Node syntax, import or runtime failure, a signal, a stray
+# warning line, another executable at the Node or module path, an unknown
+# outcome, or a status that disagrees with its line — is a fault in this
+# probe's own tooling or deployment. That is reported as config-invalid (exit
+# 2): it is NOT evidence that the Worker is unhealthy, and exit 0 without the
+# helper's success line is never healthy.
+#
+# The six failure outcomes duplicate LIVENESS_OUTCOMES in the helper; the
+# deployment-policy suite keeps the two lists identical.
+HELPER_CLASS=contract-violation
+classify_helper_result() {
+  local status="$1" output="$2"
+  # The helper prints the port as a number, so a delivered 08080 is 8080.
+  local target="target=http://127.0.0.1:$((10#$PORT))/v1/healthz"
+  local verdict_word rest outcome
 
-echo "$VF_PROG: the Worker is active but did not satisfy the health contract" >&2
-verdict unhealthy 1 "unit=$WORKER_UNIT port=$PORT path=/v1/healthz"
+  case "$output" in
+    *$'\n'* | *$'\r'*) return 0 ;;
+  esac
+  case "$output" in
+    "vf-worker-health-request: OK outcome="*)
+      verdict_word=OK
+      rest="${output#"vf-worker-health-request: OK outcome="}"
+      ;;
+    "vf-worker-health-request: FAIL outcome="*)
+      verdict_word=FAIL
+      rest="${output#"vf-worker-health-request: FAIL outcome="}"
+      ;;
+    *) return 0 ;;
+  esac
+  outcome="${rest%% *}"
+  rest="${rest#"$outcome"}"
+  case "$rest" in
+    " $target" | " $target "*) ;;
+    *) return 0 ;;
+  esac
+
+  case "$status $verdict_word $outcome" in
+    "0 OK healthy")
+      HELPER_CLASS=healthy
+      ;;
+    "1 FAIL connect-failed" | "1 FAIL timeout" | "1 FAIL bad-status" | \
+      "1 FAIL body-too-large" | "1 FAIL malformed-body" | "1 FAIL wrong-state")
+      HELPER_CLASS=unhealthy
+      ;;
+  esac
+}
+classify_helper_result "$STATUS" "$OUTPUT"
+
+case "$HELPER_CLASS" in
+  healthy)
+    verdict healthy 0 "unit=$WORKER_UNIT port=$PORT path=/v1/healthz"
+    ;;
+  unhealthy)
+    echo "$VF_PROG: the Worker is active but did not satisfy the health contract" >&2
+    verdict unhealthy 1 "unit=$WORKER_UNIT port=$PORT path=/v1/healthz"
+    ;;
+esac
+
+echo "$VF_PROG: the health request helper ended with status $STATUS without the verdict its protocol requires" >&2
+echo "$VF_PROG: this is a probe tooling or deployment fault, NOT evidence about the Worker's health" >&2
+verdict config-invalid 2 "reason=health-helper-contract helper_status=$STATUS"
