@@ -7456,13 +7456,13 @@ in general.
 
 - **Job.** Exactly one: `29a78c31d01d139aac78d92bfae991b2` on the X post,
   `preset:best`.
-- **Observed polling trace.** `queued` → `analyzing` → `downloading` →
-  `uploading` → `ready`, in about 11 s. `queued` is the job-creation response;
-  19 status polls then sampled `analyzing`, `downloading`, `uploading` and
-  `ready`.
+- **Recorded status sequence.** `queued` → `analyzing` → `downloading` →
+  `uploading` → `ready`, in about 11 s. This is the sampled sequence, not the
+  complete durable lifecycle.
 - **Durable lifecycle.** `queued` → `analyzing` → `downloading` → `processing` →
-  `uploading` → `ready`. `processing` was not sampled, but it committed: at
-  source `f9a8109b…`, `beginUploading()` is legal only from `processing`.
+  `uploading` → `ready`. `processing` is absent from the recorded sequence, but
+  it necessarily committed before `uploading`: at source `f9a8109b…`,
+  `beginUploading()` is legal only from `processing`.
 - **Progress.** Eight `downloading` samples were observed, and every one had
   `totalBytes: null`.
 - **Delivery.** A `303` to a signed R2 GET returned `200` and delivered
@@ -7761,12 +7761,13 @@ operator-measured*).**
 
 - **Job.** Exactly one: `cdf74bd3364d5f00dc3f132e8011a212` on the X post,
   `preset:best`.
-- **Observed polling trace.** `queued` → `analyzing` → `downloading` →
-  `uploading` → `ready`. `queued` is the job-creation response; 18 status polls
-  then sampled `analyzing`, `downloading`, `uploading` and `ready`.
+- **Recorded status sequence.** `queued` → `analyzing` → `downloading` →
+  `uploading` → `ready`, across 18 sampled states. This is the sampled
+  sequence, not the complete durable lifecycle.
 - **Durable lifecycle.** `queued` → `analyzing` → `downloading` → `processing` →
-  `uploading` → `ready`. `processing` was not sampled, but it committed: at
-  source `8f087639…`, `beginUploading()` is legal only from `processing`.
+  `uploading` → `ready`. `processing` is absent from the recorded sequence, but
+  it necessarily committed before `uploading`: at source `8f087639…`,
+  `beginUploading()` is legal only from `processing`.
 - **Progress.** Six `downloading` samples were observed, and every one had
   `totalBytes: null`.
 - **Delivery.** A `303` to a signed R2 GET returned `200` and delivered
