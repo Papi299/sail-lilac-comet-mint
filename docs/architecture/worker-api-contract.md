@@ -104,7 +104,7 @@ Safe for transmission to Vercel. When ready, it contains:
 | :--- | :--- |
 | Source | `main` `593f47dfffe79f166d40af6575c6130668e56af0` (PR #63 merge) |
 | Production Worker (P1 rollout) | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest`, from 2026-09-18 21:00Z. Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`, on 2026-09-27 by `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5` (source `f9a8109b…`, `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`), later that day by `sha256:fd7cdbc9434a3193a797a92b3e669ad00526b79224e382662551903e1d3cf9bf` (source `8f087639…`, `GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`), and then by the current Worker `sha256:629ec04baf36a2a2ef523f3e4408174242f345d811795d9e34ce169ec9051a80` (source `083cbfcc…`, `DIRECT-PRESET-FILESIZE-PROVENANCE-001`). All four still send the field. `fd7cdbc9…` is now the immediate Worker rollback, and `0a6e66b0…`, `e5b1144c…` and `5925515f…` deeper ones (deployment runbook §4j, §9, §11h) |
-| Vercel (P1 rollout) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from the same source. Superseded on 2026-09-19 by the P2 deployment below. Retained as the first code-rollback layer behind the current redeploy and the original P2 deployment (below; deployment runbook §9) |
+| Vercel (P1 rollout) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from the same source. Superseded on 2026-09-19 by the P2 deployment below. Now a historical code-compatibility layer only: it is **not** reachable through Hobby Instant Rollback, and it carries a provider-assigned expiration (below; deployment runbook §9) |
 
 It was recorded here as "IMPLEMENTED IN SOURCE — NOT DEPLOYED" until then; that
 state is now history. The rollout record is in the deployment runbook (§11h).
@@ -185,24 +185,31 @@ and the strict schema accepted it.
 
 **The ordering constraint still holds for rollback.**
 
-**Current Production.** Vercel Production is `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9`
-(since 2026-09-27 07:18Z), observed read-only from the provider on 2026-09-27.
+**Current Production** (as of 2026-09-28, recorded by
+`VERCEL-ROLLBACK-RUNBOOK-STATE-OF-RECORD-CLOSURE-001`). Vercel Production is
+`dpl_8k6e59juv1Z3Srb9NSNBmmVGh5Nb` (since 2026-09-28 13:25:55Z), observed
+read-only from the provider on 2026-09-28.
 - **Deployment.** Target `production`, READY / PROMOTED, created
-  2026-09-27T07:17:55.768Z, build started 07:17:56.654Z, READY at
-  07:18:22.943Z. The provider's deployment-source field is `source: cli`.
+  2026-09-28T13:25:25.371Z, READY at 13:25:54.815Z. The provider's
+  deployment-source field is `source: cli`.
 - **Origin.** The provider-recorded action relationship is
   `meta.action: redeploy`, with `meta.originalDeploymentId`
-  `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd`. Vercel in turn records `dpl_BJYRG7…`
-  (2026-09-26 20:10Z, `source: redeploy`) as a redeploy of the P2 deployment
-  `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, carrying the P2 source's CLI-recorded
-  commit `02b3f15f…`.
-- **Why it exists.** It is the control-plane Access repair
+  `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9`. Its uploaded source tree is identical to
+  that of `dpl_YrhkEQC4…`, of `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd` and of the P2
+  deployment `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, which carries the P2 source's
+  CLI-recorded commit `02b3f15f…`.
+- **Why it exists.** `VERCEL-KNOWN-GOOD-ROLLBACK-POINT-001` redeployed the
+  accepted `dpl_YrhkEQC4…` once and accepted the result live, so that
+  `dpl_YrhkEQC4…` became the known-good immediate Hobby rollback target
+  (deployment runbook §9, §11h). No environment, credential or code changed.
+- **Previous Production.** `dpl_YrhkEQC4…` (2026-09-27 07:18Z → 2026-09-28
+  13:25Z), a redeploy of `dpl_BJYRG7…`. It was the control-plane Access repair
   (`PRODUCTION-CONTROL-PLANE-WORKER-ACCESS-CUTOVER-001`, deployment runbook
-  §11). Only the two Vercel Cloudflare Access variables changed, and the
+  §11): only the two Vercel Cloudflare Access variables changed, and the
   redeploy restored the Worker-backed routes to 200.
 - **What that establishes.** This is provider metadata and chain-of-custody
-  context, **not** a Git attestation. It changes the deployment identity and
-  its Access credential, not the accepted P2 API contract.
+  context, **not** a Git attestation. The redeploys changed deployment identity
+  and environment snapshots, not the accepted P2 API contract.
 
 **Current Production Worker.** `sha256:629ec04baf36a2a2ef523f3e4408174242f345d811795d9e34ce169ec9051a80`
 as `videofetch-worker:latest` since 2026-09-27 21:12:15Z. Its source is `main`
@@ -235,38 +242,51 @@ deployment runbook §11h).
   `src/types` differs from the HLS-10 image's source (*repository-verifiable*).
   No Vercel deployment accompanied any of them.
 
-**Rollback layers**, as in the deployment runbook §9 (operational detail there
-and in §11h). **Access state comes first.** `dpl_BJYRG7…` keeps its old
-environment snapshot. That snapshot carries an Access credential state that did
-not reach the Worker, so it is **not** a service-restoring rollback target. The
-Access validity of the code layers below is unmeasured. Re-establish and
-reverify Access credential compatibility for any target before using it:
+**Vercel rollback — current** (the procedure is in the deployment runbook §9).
+The project is on the Hobby plan, where Instant Rollback reaches only the single
+provider-eligible previous Production deployment; a rollback to an older one is
+refused (HTTP 402).
+- **Immediate known-good rollback target:** `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9`.
+  It carries the same uploaded source, and so the same accepted P2 contract, as
+  current Production.
+- **Known broken:** `dpl_BJYRG7…`. Its environment snapshot carries an Access
+  credential state that did not reach the Worker: login returned 200, but the
+  Worker-backed routes returned 503. It is retained, but it is no longer the
+  eligible rollback target.
+- **Readiness is four properties, not one:** code compatibility (this
+  contract), Cloudflare Access credential compatibility, login-secret
+  (`VIDEOFETCH_ACCESS_SECRET`) compatibility and provider rollback
+  reachability. Code compatibility says nothing about the other three.
 
-1. **The redeploy's original, `dpl_BcefWQ…`.** It is the P2 deployment itself,
-   so its contract is the accepted P2 one.
-2. **First code rollback, `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` (P1).** It already
-   accepts the optional field, so the control plane can roll back on Vercel
-   alone, with the Worker left in place.
-3. **Deeper rollback, `dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`.** It predates the
-   field. While the live Worker sends it, that deployment would reject every
-   generic analysis, so roll the Worker back first.
+**Environment of existing deployments.** Each Vercel deployment keeps the
+environment it was created with, including its Access pair and its
+`VIDEOFETCH_ACCESS_SECRET`. Rollback and promotion reuse that snapshot; only a
+redeploy takes the project's current environment. Editing the project
+environment never repairs an existing deployment.
 
-**Environment of older deployments.** Vercel applies environment changes only
-to new deployments, so each older deployment keeps the environment it was
-created with.
-- **Before rolling back** to one, re-establish and reverify that its
-  Cloudflare Access Service Auth configuration is still usable. Code
-  compatibility says nothing about it.
-- **Known broken:** `dpl_BJYRG7…`. Its Access state did not reach the Worker:
-  login returned 200, but the Worker-backed routes returned 503.
-- **Not recorded here:** which credential version any older deployment holds.
+**Historical code layers — contract compatibility only, not Hobby rollback
+targets.** They still matter to this contract's ordering, but none is
+reachable through Hobby Instant Rollback, their credential state is
+unmeasured, and each carries a provider-assigned expiration:
 
-**A Worker rollback on its own is safe.** `dpl_BcefWQ…` and `dpl_AFFCLwLi…`
-both accept a Worker that omits the field.
+1. **`dpl_BcefWQ…`**, the P2 deployment itself. Its contract is the accepted P2
+   one.
+2. **`dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` (P1).** It already accepts the optional
+   field, so its code is compatible with the current Worker, with no Worker
+   rollback.
+3. **`dpl_BAnK2xRmJgx62dZFByxUTwT6GJ1j`.** It predates the field. While the
+   live Worker sends it, that code would reject every generic analysis, so it
+   would need the Worker rolled back first.
+
+Reaching any of them would be a historical-source redeploy with the current
+environment, not a rollback (deployment runbook §9).
+
+**A Worker rollback on its own is safe.** The P2 code layer — current
+Production `dpl_8k6e59…`, the rollback target `dpl_YrhkEQC4…` and
+`dpl_BcefWQ…` — and the P1 layer `dpl_AFFCLwLi…` all accept a Worker that
+omits the field.
 - **Why.** The field is optional in the shared contract, which P2 did not
   change, and P1's Vercel-first step measured it for `dpl_AFFCLwLi…`.
-- **The current deployment.** `dpl_YrhkEQC4…` is a provider-recorded redeploy
-  of `dpl_BJYRG7…`, which Vercel records as a redeploy of `dpl_BcefWQ…`.
 
 **Browser presentation — `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001`, DEPLOYED /
 PRODUCTION ACCEPTED (2026-09-19).**
@@ -274,8 +294,8 @@ PRODUCTION ACCEPTED (2026-09-19).**
 | | |
 | :--- | :--- |
 | Source | `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478` (PR #64 merge), tree `44abfe6e90c0d9ce5bd9eae8af6140e3f39e7ff9` |
-| P2 accepted Production deployment | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from that source by chain of custody (the project has no Git integration, so Vercel does not attest the commit); accepted in Production on 2026-09-19. Current Production is the later provider-recorded redeploy chain `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd` → `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9`, of which `dpl_YrhkEQC4…` is current (above) |
-| Immediate Vercel rollback at P2 | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` — needs no Worker rollback. Now the first code-rollback layer (above) |
+| P2 accepted Production deployment | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from that source by chain of custody (the project has no Git integration, so Vercel does not attest the commit); accepted in Production on 2026-09-19. The same uploaded source continues through the provider-recorded redeploy chain `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd` → `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9` → `dpl_8k6e59juv1Z3Srb9NSNBmmVGh5Nb`, of which `dpl_8k6e59…` is current Production and `dpl_YrhkEQC4…` the known-good immediate Hobby rollback target (above) |
+| Immediate Vercel rollback at P2 (historical) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` — needed no Worker rollback. Now a code-compatibility layer only, **not** reachable through Hobby Instant Rollback (above) |
 | Production Worker at P2 | unchanged by P2: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`). Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c…` (deployment runbook §4j), on 2026-09-27 by `sha256:0a6e66b0…` (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, runbook §11h), later that day by `sha256:fd7cdbc9…` (`GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`, runbook §11h), and then by the current Worker `sha256:629ec04b…` (`DIRECT-PRESET-FILESIZE-PROVENANCE-001`, runbook §11h); P2 itself did not change |
 
 It was recorded here as "IMPLEMENTED IN SOURCE / NOT DEPLOYED" until then; that
