@@ -103,7 +103,7 @@ Safe for transmission to Vercel. When ready, it contains:
 | | |
 | :--- | :--- |
 | Source | `main` `593f47dfffe79f166d40af6575c6130668e56af0` (PR #63 merge) |
-| Production Worker (P1 rollout) | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest`, from 2026-09-18 21:00Z. Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`, on 2026-09-27 by `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5` (source `f9a8109b…`, `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`), later that day by `sha256:fd7cdbc9434a3193a797a92b3e669ad00526b79224e382662551903e1d3cf9bf` (source `8f087639…`, `GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`), and then by the current Worker `sha256:629ec04baf36a2a2ef523f3e4408174242f345d811795d9e34ce169ec9051a80` (source `083cbfcc…`, `DIRECT-PRESET-FILESIZE-PROVENANCE-001`). All four still send the field. `fd7cdbc9…` is now the immediate Worker rollback, and `0a6e66b0…`, `e5b1144c…` and `5925515f…` deeper ones (deployment runbook §4j, §9, §11h) |
+| Production Worker (P1 rollout) | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest`, from 2026-09-18 21:00Z. Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`, on 2026-09-27 by `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5` (source `f9a8109b…`, `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`), later that day by `sha256:fd7cdbc9434a3193a797a92b3e669ad00526b79224e382662551903e1d3cf9bf` (source `8f087639…`, `GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`), then by `sha256:629ec04baf36a2a2ef523f3e4408174242f345d811795d9e34ce169ec9051a80` (source `083cbfcc…`, `DIRECT-PRESET-FILESIZE-PROVENANCE-001`), and on 2026-09-28 by the current Worker `sha256:6ececc018029f1d984be980c35b73c5b6e2e09f17b80408bc674ab6ff020b93b` (source `53bb32b6…`, `GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001`). All five still send the field. `629ec04b…` is now the immediate Worker rollback, and `fd7cdbc9…`, `0a6e66b0…`, `e5b1144c…` and `5925515f…` deeper ones (deployment runbook §4j, §9, §11h) |
 | Vercel (P1 rollout) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from the same source. Superseded on 2026-09-19 by the P2 deployment below. Now a historical code-compatibility layer only: it is **not** reachable through Hobby Instant Rollback, and it carries a provider-assigned expiration (below; deployment runbook §9) |
 
 It was recorded here as "IMPLEMENTED IN SOURCE — NOT DEPLOYED" until then; that
@@ -186,9 +186,11 @@ and the strict schema accepted it.
 **The ordering constraint still holds for rollback.**
 
 **Current Production** (as of 2026-09-28, recorded by
-`VERCEL-ROLLBACK-RUNBOOK-STATE-OF-RECORD-CLOSURE-001`). Vercel Production is
-`dpl_8k6e59juv1Z3Srb9NSNBmmVGh5Nb` (since 2026-09-28 13:25:55Z), observed
-read-only from the provider on 2026-09-28.
+`VERCEL-ROLLBACK-RUNBOOK-STATE-OF-RECORD-CLOSURE-001` and re-observed by
+`GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001-PRODUCTION-DOCS-CLOSURE-001`). Vercel
+Production is `dpl_8k6e59juv1Z3Srb9NSNBmmVGh5Nb` (since 2026-09-28 13:25:55Z),
+observed read-only from the provider on 2026-09-28. The 2026-09-28 Worker
+rollout below deployed nothing to Vercel.
 - **Deployment.** Target `production`, READY / PROMOTED, created
   2026-09-28T13:25:25.371Z, READY at 13:25:54.815Z. The provider's
   deployment-source field is `source: cli`.
@@ -211,36 +213,42 @@ read-only from the provider on 2026-09-28.
   context, **not** a Git attestation. The redeploys changed deployment identity
   and environment snapshots, not the accepted P2 API contract.
 
-**Current Production Worker.** `sha256:629ec04baf36a2a2ef523f3e4408174242f345d811795d9e34ce169ec9051a80`
-as `videofetch-worker:latest` since 2026-09-27 21:12:15Z. Its source is `main`
-`083cbfcc14b98170385d1737c1a5f318e81a38f6` (PR #92), and it was promoted by
-`DIRECT-PRESET-FILESIZE-PROVENANCE-001` (*accepted operator-measured*;
-deployment runbook §11h).
+**Current Production Worker.** `sha256:6ececc018029f1d984be980c35b73c5b6e2e09f17b80408bc674ab6ff020b93b`
+as `videofetch-worker:latest`, also retained as
+`videofetch-worker:rc-53bb32b64045-6ececc018029`, since 2026-09-28 17:34:09Z.
+Its source is `main` `53bb32b64045523c47480bdc37e696ea391cb46c` (PR #97), and
+it was promoted by `GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001` and accepted at
+17:43:33Z (*accepted operator-measured*; deployment runbook §11h).
 - **What it contains.** It still sends `sourceQuality`. It contains clear-HLS
-  v1, the declared-only generic preset `fileSize` semantics (item 4 below) and
-  own-property generic preset ownership.
-- **What changed.** PR #92 changed no public schema. It changed the semantics
-  of an existing nullable field for transformed direct presets only: such a
-  preset's `fileSize` is now `null` before download, where it used to repeat
-  the source's `Content-Length` ("Direct analysis `fileSize`", below). No
-  other public field changed.
-- **Predecessor.** `sha256:fd7cdbc9434a3193a797a92b3e669ad00526b79224e382662551903e1d3cf9bf`
-  (source `8f087639…`, PR #90), promoted 2026-09-27 18:43:29Z by
-  `GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`. That change was
-  execution-only: private selection-map ownership in the Worker's execution
-  planner became own-property only (`Object.hasOwn()` instead of `in`). It
-  changed no shared DTO, no HTTP route, no Vercel parser, no durable-state
-  schema and no public `VideoMetadata` semantics, so it added no numbered field
-  to this contract.
-- **Rollbacks.** The ownership-hardening image `sha256:fd7cdbc9…` is now the
-  immediate Worker rollback. The filesize image `sha256:0a6e66b0…` (source
+  v1, the declared-only generic preset `fileSize` semantics read as
+  positive-integer byte counts (item 4 below), own-property generic preset
+  ownership and the plan-aware direct preset `fileSize` ("Direct analysis
+  `fileSize`", below).
+- **What changed.** PR #97 changed no public schema. It hardens how Worker-side
+  generic analysis interprets yt-dlp's existing numeric size metadata before
+  that metadata reaches the existing nullable integer `fileSize` contract: only
+  a positive integer counts as a byte count (item 4 below). No public field
+  and no public error code changed.
+- **Predecessor — now the immediate Worker rollback.**
+  `sha256:629ec04baf36a2a2ef523f3e4408174242f345d811795d9e34ce169ec9051a80`,
+  retained as `videofetch-worker:rc-083cbfcc14b9-629ec04baf36` (source
+  `083cbfcc…`, PR #92), Production from 2026-09-27 21:12:15Z until 2026-09-28
+  17:34:09Z (`DIRECT-PRESET-FILESIZE-PROVENANCE-001`). PR #92 changed the
+  semantics of an existing nullable field for transformed direct presets only.
+  A rollback to it keeps every earlier accepted behaviour and restores the
+  pre-integer-hardening size reading: a fractional declared `filesize` again
+  fails the whole generic analysis at the Worker's private selection schema,
+  and a fractional approximation again counts in size policy.
+- **Deeper rollbacks.** The ownership-hardening image `sha256:fd7cdbc9…`
+  (source `8f087639…`, PR #90; an execution-only change that added no numbered
+  field to this contract), the filesize image `sha256:0a6e66b0…` (source
   `f9a8109b…`), the HLS-10 image `sha256:e5b1144c…` and the P1 image
-  `sha256:5925515f…` are deeper ones.
-- **No change to this contract's rollback ordering.** None of PR #88, PR #90
-  and PR #92 changed a public schema or the control-plane contract: nothing
-  under `src/shared`, `src/web`, `src/lib/security`, `src/routes/api` or
-  `src/types` differs from the HLS-10 image's source (*repository-verifiable*).
-  No Vercel deployment accompanied any of them.
+  `sha256:5925515f…`.
+- **No change to this contract's rollback ordering.** None of PR #88, PR #90,
+  PR #92 and PR #97 changed a public schema or the control-plane contract:
+  nothing under `src/shared`, `src/web`, `src/lib/security`, `src/routes/api`
+  or `src/types` differs from the HLS-10 image's source
+  (*repository-verifiable*). No Vercel deployment accompanied any of them.
 
 **Vercel rollback — current** (the procedure is in the deployment runbook §9).
 The project is on the Hobby plan, where Instant Rollback reaches only the single
@@ -296,7 +304,7 @@ PRODUCTION ACCEPTED (2026-09-19).**
 | Source | `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478` (PR #64 merge), tree `44abfe6e90c0d9ce5bd9eae8af6140e3f39e7ff9` |
 | P2 accepted Production deployment | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from that source by chain of custody (the project has no Git integration, so Vercel does not attest the commit); accepted in Production on 2026-09-19. The same uploaded source continues through the provider-recorded redeploy chain `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd` → `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9` → `dpl_8k6e59juv1Z3Srb9NSNBmmVGh5Nb`, of which `dpl_8k6e59…` is current Production and `dpl_YrhkEQC4…` the known-good immediate Hobby rollback target (above) |
 | Immediate Vercel rollback at P2 (historical) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` — needed no Worker rollback. Now a code-compatibility layer only, **not** reachable through Hobby Instant Rollback (above) |
-| Production Worker at P2 | unchanged by P2: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`). Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c…` (deployment runbook §4j), on 2026-09-27 by `sha256:0a6e66b0…` (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, runbook §11h), later that day by `sha256:fd7cdbc9…` (`GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`, runbook §11h), and then by the current Worker `sha256:629ec04b…` (`DIRECT-PRESET-FILESIZE-PROVENANCE-001`, runbook §11h); P2 itself did not change |
+| Production Worker at P2 | unchanged by P2: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`). Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c…` (deployment runbook §4j), on 2026-09-27 by `sha256:0a6e66b0…` (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, runbook §11h), later that day by `sha256:fd7cdbc9…` (`GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`, runbook §11h), then by `sha256:629ec04b…` (`DIRECT-PRESET-FILESIZE-PROVENANCE-001`, runbook §11h), and on 2026-09-28 by the current Worker `sha256:6ececc01…` (`GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001`, runbook §11h); P2 itself did not change |
 
 It was recorded here as "IMPLEMENTED IN SOURCE / NOT DEPLOYED" until then; that
 state is now history. The deployment and acceptance record is in the deployment
@@ -350,7 +358,7 @@ and were inventory-only. Segmented DASH still is. Clear-HLS v1 was later
 implemented in source (HLS-7), qualified in a retained release candidate (HLS-9B)
 and, on 2026-09-26, **deployed to the Production Worker and accepted** by HLS-10
 on a real public source (deployment runbook §4j). The current Worker image
-(2026-09-27, `sha256:629ec04b…`) still contains that same accepted clear-HLS
+(2026-09-28, `sha256:6ececc01…`) still contains that same accepted clear-HLS
 source. Every HLS
 rendition outside that narrow path remains inventory-only. `observedMaxHeight` is still not a claim about a
 provider's absolute maximum, and protected renditions are still not
@@ -364,30 +372,34 @@ downloadable.
 - **Worker.** `sha256:0a6e66b0…`, promoted 2026-09-27 14:02:55Z.
 - **Record.** Deployment runbook §11h.
 - **Since.** Later on 2026-09-27 that image was superseded by
-  `sha256:fd7cdbc9…` (`GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`), and
-  then by `sha256:629ec04b…` (`DIRECT-PRESET-FILESIZE-PROVENANCE-001`).
-  `0a6e66b0…` is now a deeper Worker rollback, behind `fd7cdbc9…`. The same
-  accepted generic `fileSize` semantics remain present in the current image.
+  `sha256:fd7cdbc9…` (`GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`), then
+  by `sha256:629ec04b…` (`DIRECT-PRESET-FILESIZE-PROVENANCE-001`), and on
+  2026-09-28 by `sha256:6ececc01…` (`GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001`).
+  `0a6e66b0…` is now a deeper Worker rollback, behind `629ec04b…` and
+  `fd7cdbc9…`. The same accepted generic `fileSize` semantics remain present in
+  the current image, which since 2026-09-28 applies them only to size fields
+  that are positive integers ("Positive-integer byte counts", below).
 
 It was recorded here as "implemented in source" until then; that state is now
-history. The rules below did not change.
+history. The declared-versus-approximate rules below did not change at that
+deployment; the positive-integer qualification is the 2026-09-28 rule below.
 
 For generic yt-dlp analysis:
 
-- A non-null preset `fileSize` is a positive, **upstream-declared** source size
-  (yt-dlp's `filesize`).
+- A non-null preset `fileSize` is a positive-integer, **upstream-declared**
+  source size (yt-dlp's `filesize`).
 - It is not independently verified by VideoFetch, and it is not a promise of the
   exact size of the delivered object.
 - For a split-merge preset, a non-null value is the sum of the two inputs'
   declared sizes. That is input metadata, not the final merged object's size.
-- When a source reports only `filesize_approx`, or no size at all, `fileSize` is
-  `null`.
+- When a source reports only `filesize_approx`, no size at all, or a declared
+  `filesize` that is not a positive integer, `fileSize` is `null`.
 - The Worker's private per-preset selection follows the same rule. Download
   progress reads that selection as its `totalBytes`, so an estimate never becomes
   a progress total either.
 
-`filesize_approx` remains a private, conservative analysis input. It still takes
-part in:
+A **positive-integer** `filesize_approx` remains a private, conservative analysis
+input. Only such a value takes part in:
 
 - per-format and split-pair size-limit admission;
 - clear-HLS admission;
@@ -403,7 +415,8 @@ below under "Direct analysis `fileSize`".
 **Two sizes, two meanings.**
 
 - **Before download (generic).** A preset `fileSize` describes the source ahead
-  of acquisition. It is `null` unless the source declared its size. The private
+  of acquisition. It is `null` unless the source declared its size as a
+  positive integer. The private
   selection size, which download progress uses as its `totalBytes`, follows the
   same rule.
 - **After download.** A `ready` job's durable `fileSize` is the exact byte count
@@ -429,13 +442,88 @@ deployment runbook §11h):
 - **Scope.** This is evidence for those observed sources only. The schema did
   not change, and no Vercel deployment was involved.
 
+**Positive-integer byte counts — generic analysis (semantics only; no schema
+change)**
+
+`GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001` — **CLOSED / DEPLOYED / PRODUCTION
+ACCEPTED — 2026-09-28.**
+- **Source.** PR #97, `main` `53bb32b64045523c47480bdc37e696ea391cb46c`.
+- **Worker.** `sha256:6ececc01…`, promoted 2026-09-28 17:34:09Z and accepted
+  17:43:33Z. It is the current Production Worker (above).
+- **Record.** Deployment runbook §11h.
+
+yt-dlp's `filesize` and `filesize_approx` are interpreted as byte counts only
+when they are **positive integers**. A value is never rounded, floored, ceiled,
+truncated or string-coerced.
+
+| Size metadata | Use |
+| :--- | :--- |
+| positive-integer `filesize` | may become the public preset `fileSize`, the private selection `fileSize` and the progress `totalBytes` source |
+| positive-integer `filesize_approx` | private size policy only (per-format, split-pair and clear-HLS admission, within-rung ranking, `size_limit_exceeded` accounting) |
+| fractional, zero, negative, missing or null | unavailable size metadata, exactly like an absent field |
+| actual transferred bytes | runtime enforcement |
+
+- **Malformed declared size, valid approximation.** With `filesize` `1234.5`
+  and `filesize_approx` `5000000000`, the declared size is unavailable and the
+  valid integer approximation still drives private size policy, so it can still
+  refuse an over-limit format. Before this rule, a positive fractional declared
+  value took precedence and could hide that approximation.
+- **Fraction above the ceiling.** A value such as `MAX_FILE_SIZE + 0.5` is not
+  an over-limit byte count; it is malformed size metadata, so the format's size
+  is unknown and an otherwise eligible format may pass analysis. This is
+  intentional. Actual acquisition byte limits remain authoritative and did not
+  change.
+- **Ranking.** A fractional approximation takes no part in size-based ranking:
+  a value that is not a byte count for admission is not one for ranking either.
+- **Split.** A member with a fractional declared size carries `fileSize: null`
+  and no longer poisons the Worker's private selection validation. A split
+  preset's public combined `fileSize` stays non-null only when both members
+  declare valid integer sizes; valid integer approximations stay private
+  pair-size policy. Combined actual-byte budgets are unchanged.
+- **Audio.** An eligible audio-only source whose declared size is fractional no
+  longer fails analysis; its preset and private `fileSize` are `null`, and audio
+  and MP3 eligibility follow the existing rules.
+- **Schemas.** The raw yt-dlp layer stays deliberately broad
+  (`filesize` and `filesize_approx` as `z.number().finite().nullish()`): it
+  describes untrusted extractor JSON. The normalization layer decides what is a
+  byte count. The Worker's private execution schema stays strict
+  (`fileSize: z.number().int().positive().nullable()`) and was **not**
+  weakened; malformed metadata is now stopped before it reaches it.
+- **Unchanged.** Acquisition actual-byte ceilings, the 4 GiB Product media
+  default, yt-dlp acquisition limits, split combined actual-byte handling,
+  `TOO_LARGE`, R2 upload constraints, media workspace sizing and the
+  download/process/upload lifecycle. Metadata size remains preflight
+  information; actual transferred bytes remain the enforcement boundary.
+
+The public shape is unchanged: preset `fileSize` stays `number | null`. There
+is no new field, schema version, error code or withheld reason, no
+control-plane change and no Vercel/Worker deployment order.
+
+**Accepted in Production** (*accepted operator-measured*, 2026-09-28;
+deployment runbook §11h):
+
+- **The fractional behaviour** was proven inside the exact candidate image
+  (34/34), with the previous image as a negative control that reproduced the
+  old private-schema failure. It was not observed on a live source, and no
+  live source was sought for it.
+- **Ordinary generic path.** The accepted public X control analyzed identically
+  before and after promotion (`preset:best`, `preset:720`, `preset:360` and
+  `preset:240`, approximation-only, all `fileSize` `null`; `sourceQuality`
+  observed and deliverable 720 with `unsupported_protocol` ×3). One
+  `preset:best` job's `ready` durable `fileSize` was 38,257,789, exactly the
+  bytes delivered through the `303` signed R2 GET.
+- **Scope.** This is evidence for that observed source at that time. The
+  schema did not change, and no Vercel deployment was involved.
+
 **Direct analysis `fileSize` (semantics only; no schema change)**
 
 `DIRECT-PRESET-FILESIZE-PROVENANCE-001` — **CLOSED / DEPLOYED / PRODUCTION
 ACCEPTED — 2026-09-27.**
 - **Source.** PR #92, `main` `083cbfcc14b98170385d1737c1a5f318e81a38f6`.
-- **Worker.** `sha256:629ec04b…`, promoted 2026-09-27 21:12:15Z. It is the
-  current Production Worker (above).
+- **Worker.** `sha256:629ec04b…`, promoted 2026-09-27 21:12:15Z. It was the
+  Production Worker until 2026-09-28 17:34:09Z and is now the immediate Worker
+  rollback. The current Worker `sha256:6ececc01…` keeps these direct semantics
+  unchanged: PR #97 did not touch direct analysis.
 - **Record.** Deployment runbook §11h.
 
 It was recorded here as "IMPLEMENTED IN SOURCE — PRODUCTION DEPLOYMENT
