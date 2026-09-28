@@ -393,9 +393,11 @@ operation.
 ## External Worker liveness
 
 `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001`; runtime identity
-corrected by `WORKER-LIVENESS-STATIC-USER-CORRECTION-001`
+corrected by `WORKER-LIVENESS-STATIC-USER-CORRECTION-001`; helper-result
+classification hardened by `WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001`
 
-**Installed and live-accepted in Production on 2026-09-26.**
+**Installed and live-accepted in Production on 2026-09-26; probe executable
+updated and live re-accepted on 2026-09-28.**
 - **The first live deployment failed.** It ran on 2026-09-26
   (`WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-LIVE-ACCEPTANCE-001`) with the probe as
   a `DynamicUser`. Its first timer tick could not query systemd, so it was
@@ -414,6 +416,17 @@ corrected by `WORKER-LIVENESS-STATIC-USER-CORRECTION-001`
   - `healthy` again once the Worker was restored.
 
   The record is in the runbook (§8, §10). Its evidence is operator-held, not CI.
+- **The probe executable was then updated in place (2026-09-28).**
+  `WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001-LIVE-REACCEPTANCE`
+  replaced only `/usr/local/sbin/vf-worker-liveness-probe` with the PR #99
+  revision from `main` `0965e04e…` (SHA-256 `f9a2cb36…`). That revision
+  reports health-helper tooling faults as `config-invalid`
+  ([below](#on-demand-execution-is-idle-not-an-outage)). The account, the
+  request module, the service and the timer were not reinstalled and stayed
+  byte-unchanged. It passed the step-6c checks as the account, and live runs
+  gave `healthy`, `config-invalid` for stand-in tooling faults, and `idle`.
+  The record is in the runbook (§8, §11). Its evidence is operator-held, not
+  CI.
 - **What stays on the VM.** The `videofetch-liveness` account, the four
   artefacts and the enabled `videofetch-worker-liveness.timer`. The service
   itself stays `static` and runs only on timer ticks. The VM stays on demand:
@@ -583,11 +596,19 @@ exactly two results from `vf-worker-health-request.mjs` as health verdicts
   `127.0.0.1` and `/v1/healthz`, with one total timeout, a body cap, no
   redirects and no credentials.
 
-**Installed vs source.** This classification is in the repository source. It
-is **not yet installed** on the Production VM: the probe accepted there on
-2026-09-26 (runbook §8) still maps every nonzero helper exit to
-`OUTCOME=unhealthy`, and any helper exit `0` to `OUTCOME=healthy`, until a
-separate live deployment and re-acceptance installs this revision.
+**Deployed in Production.** This classification was installed on the
+Production VM and live re-accepted on 2026-09-28
+(`WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001-LIVE-REACCEPTANCE`, runbook
+§8). Only the probe executable changed. As the service account and inside the
+unit's sandbox, the installed probe reported:
+- a stand-in helper that exits `0` silently → `config-invalid`, `helper_status=0`, exit `2`;
+- a stand-in helper that exits `1` silently → `config-invalid`, `helper_status=1`, exit `2`;
+- the real helper's own configuration error → `config-invalid`, `helper_status=2`, exit `2`;
+- the real helper against the running Worker → `healthy`, exit `0`.
+
+The probe accepted on 2026-09-26 mapped every nonzero helper exit to
+`OUTCOME=unhealthy` and any helper exit `0` to `OUTCOME=healthy`. That is the
+historical before-state; it is no longer installed.
 
 **Every run emits exactly one `OUTCOME=` line.** Known paths go through one
 exit function. An EXIT trap covers everything else: a shell error, or a
@@ -618,11 +639,9 @@ timer, not a sudoers or polkit rule, not any other service.
 `OUTCOME=unhealthy` is a reason to investigate, not an instruction to restart.
 `/v1/healthz` is liveness only, and while the Worker is `active` an unhealthy
 result can come from a wedged event loop, a stalled or sleeping VM, a start-up
-race, the loopback publication path or a foreign listener. On a VM still
-running the probe installed before
-`WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001` — Production, until its
-live re-acceptance — it can also come from the probe's own tooling; the
-source probe reports that as `OUTCOME=config-invalid`.
+race, the loopback publication path or a foreign listener. The probe's own
+tooling is no longer on that list: the installed probe reports a helper,
+Node or module fault as `OUTCOME=config-invalid`, not `unhealthy`.
 
 #### Manual recovery when the Worker is active but unhealthy
 
@@ -651,12 +670,13 @@ the threshold above. If the run instead shows Node error output, a missing
 module, a helper argument or timeout error, `OUTCOME=config-invalid` (for
 example `reason=health-helper-contract`) or `OUTCOME=state-unavailable`, it is
 a probe or deployment-tooling problem: fix that, and do **not** restart the
-Worker for it. A probe from the current source reports those tooling faults as
-`config-invalid` itself. The probe installed on Production still reports them
-as `unhealthy` until `WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001` is
-deployed and live-accepted (runbook §8), which is why this check comes first
-and stays first. There is no response body to read; the helper never prints
-one.
+Worker for it. The installed probe enforces this split itself: it reports
+`unhealthy` only on the helper's own `FAIL` verdict, and any tooling fault as
+`config-invalid` (`WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001`, deployed
+2026-09-28). The check stays first because the verdict line is still the
+evidence: its `FAIL outcome=` value (for example `connect-failed` versus
+`bad-status`) is the first clue for step 4. There is no response body to read;
+the helper never prints one.
 
 **2. Confirm the Worker is still active.**
 
