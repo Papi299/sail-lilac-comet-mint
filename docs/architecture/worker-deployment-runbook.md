@@ -9,6 +9,19 @@ made by the Product Owner, because it determines persistent-volume semantics,
 TLS termination, external egress enforcement, network-namespace ownership and
 R2 placement/jurisdiction.
 
+**Architecture decision — 2026-09-28,
+`WORKER-RESTART-ON-UNHEALTHY-DECISION-CLOSURE-001`.** Automatic
+restart-on-unhealthy was reviewed by the read-only
+`WORKER-RESTART-ON-UNHEALTHY-DESIGN-AUDIT-001` and is **not selected** for the
+current on-demand execution plane. The external liveness probe stays an
+observer only, `Restart=on-failure` still owns actual Worker process failure,
+and an `active` Worker that fails `/v1/healthz` is diagnosed by the operator
+through a bounded manual procedure (§8; `deploy/README.md`). This record is
+documentation only: it started no VM, contacted no Worker or provider and
+changed no deployed state. It adds the decision to §8, §11 and the Worker
+health row below; the state of record is otherwise unchanged from the record
+that follows.
+
 **Status — current as of 2026-09-28, recorded by
 `VERCEL-ROLLBACK-RUNBOOK-STATE-OF-RECORD-CLOSURE-001`.** It is documentation
 only: it started no VM, contacted no Worker and mutated no provider state. Its
@@ -250,7 +263,7 @@ records are in §11 and §11a–§11h.
 | Vercel rollback topology (Hobby) | **Current → immediate known-good rollback target: `dpl_8k6e59…` → `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9`.** Provider `isRollbackCandidate` is `true` on both and `false` on `dpl_BJYRG7…`, which stays retained but is neither eligible nor service-restoring (its environment snapshot carries an Access credential state that did not reach the Worker, §11). On Hobby, Instant Rollback reaches only the single eligible previous Production deployment; a rollback to an older one is refused with HTTP 402. The older deployments — `dpl_BcefWQ…`, `dpl_AFFCLwLi…`, `dpl_BAnK2x…` and earlier — are historical **code-compatibility** layers only, **not** Hobby rollback targets. Rollback readiness needs four separate properties — code compatibility, Cloudflare Access credential compatibility, login-secret compatibility and provider rollback reachability — and must be re-established after every Production deployment, credential rotation and rollback (§9) | *provider-observed* (read-only, 2026-09-28); the mechanics operator-measured on a disposable probe project on the same Hobby team (§9, §11, §11h) |
 | Vercel retention | Project settings read a 30-day Production expiration and `deploymentsToKeep: 10`, but the provider-assigned expirations exempt only the **three most recent** Production deployments: `dpl_8k6e59…`, `dpl_YrhkEQC4…` and `dpl_BJYRG7…`. Every older listed deployment carries an expiration — `dpl_BcefWQ…` 2026-10-19 (assigned when `dpl_8k6e59…` was created), `dpl_AFFCLwLi…` 2026-10-18, `dpl_BAnK2x…` 2026-10-11, the oldest 2026-09-29. **Listed is not protected** (§9) | *provider-observed* (read-only, 2026-09-28) |
 | Execution plane | **on demand**; the idle state is **Stopped** | §3c, §11h |
-| Worker health (§10) | `GET /v1/healthz` through the TLS endpoint: **ACCEPTED 2026-09-26**. External liveness probe: **CLOSED / PASS / PRODUCTION ACCEPTED 2026-09-26** — the static-account deployment from `main` `db20d910…` (PR #84), after the first `DynamicUser` deployment failed and was rolled back. `videofetch-worker-liveness.timer` is enabled on the VM; the service stays `static` | operator-measured — §8, §10, §11 |
+| Worker health (§10) | `GET /v1/healthz` through the TLS endpoint: **ACCEPTED 2026-09-26**. External liveness probe: **CLOSED / PASS / PRODUCTION ACCEPTED 2026-09-26** — the static-account deployment from `main` `db20d910…` (PR #84), after the first `DynamicUser` deployment failed and was rolled back. `videofetch-worker-liveness.timer` is enabled on the VM; the service stays `static`. The probe is an observer only: automatic restart-on-unhealthy was reviewed on 2026-09-28 and **not selected**, so an `active` but unhealthy Worker is handled by the bounded manual procedure in `deploy/README.md` (`WORKER-RESTART-ON-UNHEALTHY-DECISION-CLOSURE-001`) | operator-measured — §8, §10, §11; the restart decision is repository/source-verifiable analysis — §8, §11 |
 | Product media workspace | **4 GiB delivered-media limit (4,294,967,296 bytes) LIVE** on the bounded 10 GiB disk-backed ext4 workspace bound at `/tmp/videofetch` — no Product media tmpfs. `MAX_FILE_SIZE` is absent, so the image default applies. `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`, rollout Phases 1A–1E complete, Production accepted 2026-09-17. **Actual-byte guard at that limit LIVE ACCEPTED 2026-09-27** (`limit.actual-byte-guard = PASS`, `YTDLP-CURRENT-LIMIT-4GIB-LIVE-ACCEPTANCE-001-RERUN`): additional behavioural evidence for the current limit, not a replacement for the 2026-09-17 rollout evidence | contract repository/source-verifiable; deployment and live byte-guard operator-measured — §2a, §11, §11h |
 
 Precisely:
@@ -4177,8 +4190,22 @@ shutdown grace so a clean SIGTERM is not truncated by an immediate SIGKILL.
 
 | Endpoint | Use |
 | :--- | :--- |
-| `GET /v1/healthz` | Unauthenticated liveness/readiness. **Unchanged.** |
+| `GET /v1/healthz` | Unauthenticated **liveness only** — no readiness or dependency check (below). **Unchanged.** |
 | `GET /v1/diagnostics` | **Authenticated.** Never use it to gate container health. |
+
+**Liveness, not readiness.** The Worker's HTTP server answers
+`GET /v1/healthz` with `200 {"status":"ok"}` immediately after route matching
+(`src/worker/http/server.server.ts`): before any body is read, before
+authentication and before any asynchronous work. It checks nothing else — not
+SQLite or durable state, R2 or the broker, yt-dlp, FFmpeg, DNS, safe egress,
+Cloudflare, authentication or the media workspace. The only readiness it
+implies is a start-up fact: the listener is bound only after configuration
+validation, the media-workspace capacity check, migrations, durable recovery
+and runtime construction have all succeeded (§7). After that it performs no
+ongoing readiness check. A `200` means the Worker process is listening and its
+event loop answered; a failed request does not, by itself, say which component
+is at fault. Earlier revisions of this table said "liveness/readiness", which
+overstated the endpoint; the endpoint and its API contract are unchanged.
 
 ### Liveness ownership — the image ships NO healthcheck
 
@@ -4198,7 +4225,7 @@ boundary outranks the convenience of a built-in healthcheck.
 | :--- | :--- |
 | Health endpoint | The Worker application — `/v1/healthz`, unchanged |
 | Health **probe** | The deployment layer / VM supervisor, **from outside the restricted media namespace** |
-| Restart-on-unhealthy | The deployment layer |
+| Restart-on-unhealthy | **Not automated, by decision** (2026-09-28, below). The operator diagnoses and may restart once, by the manual procedure in `deploy/README.md` |
 
 The probe reaches the Worker the same way the tunnel does — over the published
 loopback address on the VM host, outside the media namespace — so it never
@@ -4231,13 +4258,154 @@ the VM: `deploy/bin/vf-worker-liveness-probe`, run by
 | On-demand preserved | a stopped VM produces no ticks and `Persistent=false` forbids catch-up; an `inactive` Worker is `idle` with **no request made**; a `failed` Worker is always a failure |
 | Observer, not supervisor | read-only `systemctl show`/`is-failed` only; no activating dependency on the Worker; `StartLimitIntervalSec=0` so failures cannot silence it |
 
-**Restart-on-unhealthy is still NOT implemented, and this probe does not add
-it.** What exists is systemd's `Restart=on-failure` on
+**The probe never restarts anything, and nothing restarts the Worker on its
+behalf.** What exists is systemd's `Restart=on-failure` on
 `videofetch-worker.service`, which acts when the Worker *process* fails. A
-Worker that is running but answers unhealthily is now *observed* — the probe
-records `OUTCOME=unhealthy` and its own unit enters `failed` — but nothing
-restarts it on that basis. Adding such an action would be a separate, reviewed
-decision; it is out of scope here and deliberately absent.
+Worker that is running but answers unhealthily is *observed* — the probe
+records `OUTCOME=unhealthy` and its own unit enters `failed` — and the operator
+decides what happens next. Automatic restart-on-unhealthy was reviewed and
+**not selected**; see the next subsection.
+
+### Restart-on-unhealthy — reviewed and NOT selected (2026-09-28)
+
+*`WORKER-RESTART-ON-UNHEALTHY-DESIGN-AUDIT-001`, a read-only audit of `main`
+`940dbceb…`, concluded **AUTOMATIC RESTART NOT RECOMMENDED**;
+`WORKER-RESTART-ON-UNHEALTHY-DECISION-CLOSURE-001` records the decision.
+Evidence class: repository/source-verifiable analysis, plus the systemd 255
+manual pages for start limits, `OnFailure=`, `Requires=` and `BindsTo=`. No
+live measurement was made, and no Worker, probe or unit changed.*
+
+**Decision.** The current on-demand execution plane has **no automated
+restart-on-unhealthy supervisor**. The external liveness probe stays an
+**observer only**, and the two failure cases stay separate:
+
+```
+Worker process exits or fails
+  → videofetch-worker.service  Restart=on-failure  (RestartSec=5)
+  → systemd owns process recovery
+
+Worker stays active, external /v1/healthz check fails
+  → OUTCOME=unhealthy  (the probe's own unit enters failed)
+  → the operator investigates (deploy/README.md) — no automatic restart
+```
+
+**Why automatic restart was rejected.** The reasons are cumulative.
+
+1. **An unhealthy result is ambiguous.** `/v1/healthz` is liveness only
+   (above). While the Worker unit is `active`, `OUTCOME=unhealthy` can mean
+   any of the following, and only some are repaired by a Worker restart:
+
+   | Cause | Repaired by a Worker restart? |
+   | :--- | :--- |
+   | event loop permanently wedged | likely |
+   | process alive, listener no longer answering | likely |
+   | temporary CPU, GC or memory stall (for example during a large job) | no — it clears itself, and a restart destroys the running job |
+   | VM pause or Mac sleep during the request | no — transient |
+   | start-up race: `Type=simple` makes the unit `active` when the container client starts, before Node listens | no — transient |
+   | loopback publication broken (owned by `videofetch-media-netns.service`) | no |
+   | a foreign listener answering the port | no — and it is a security question first |
+   | health-helper or tooling failure (item 2) | no |
+
+   `OUTCOME=unhealthy` is therefore **not** the same statement as "the Worker
+   process must be restarted".
+
+2. **The probe's classification is not precise enough for privileged
+   automation.** The probe runs the Node helper `vf-worker-health-request.mjs`
+   and maps helper exit `0` to `healthy` and **any** nonzero exit to
+   `unhealthy`. The helper itself exits `0` when healthy, `1` for a genuine
+   HTTP/liveness failure and `2` for an argument or configuration error, and
+   Node exits nonzero on its own if it cannot load or run the module. The
+   probe's earlier checks catch a missing Node or module
+   (`OUTCOME=config-invalid`), but a helper configuration error or a Node
+   runtime failure after those checks is surfaced as `OUTCOME=unhealthy`. The
+   probe's exit `1` also covers `failed-unit` and `unknown-state`. An operator
+   can tell these apart from the helper's own `FAIL outcome=` line; a
+   supervisor acting on the probe's result could not. Correcting it is the
+   separate, optional `WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001`
+   (§11). It improves observability accuracy but is **not** required for
+   current operation.
+
+3. **Process recovery already exists.** A Worker that actually exits or fails
+   is restarted by PID 1 through `Restart=on-failure` / `RestartSec=5`. A
+   second supervisor for that case would compete with it.
+
+4. **Fail-closed dependencies.** The Worker has `Requires=`/`After=`/`BindsTo=`
+   on `videofetch-r2-broker.service`, `videofetch-media-netns.service`,
+   `videofetch-egress-policy.service`, `videofetch-egress-watchdog.service`,
+   `videofetch-media-dns.service` and `srv-videofetch-media.mount`. The egress
+   watchdog deliberately has **no automatic repair path**: a breach stops the
+   Worker and leaves the failure visible for the operator (§3a). A start or
+   restart transaction also activates required units that are inactive, so an
+   automatic health-triggered restart that raced a dependency or boundary
+   incident could pull components back toward active. The fatal
+   `vf-egress-policy-verify` pre-start gate would still refuse an invalid
+   boundary, but the architecture deliberately does not turn liveness into an
+   implicit repair mechanism. Outside PID 1's own boot-time activation and
+   `Restart=` handling, every automation around the Worker — the watchdog's
+   breach path and `BindsTo=` propagation — only ever stops it.
+
+5. **A restart is not free.** Every Worker start runs
+   `vf-media-workspace-verify --wipe`, and durable recovery (§7) turns an
+   interrupted `analyzing`, `downloading`, `processing` or `uploading` job into
+   `failed` / `PROCESSING_FAILED` — "Worker restarted before the job
+   completed." `queued` jobs survive and resume; `ready`, `failed` and
+   `cancelled` rows are unchanged. The Worker runs one job at a time, so a
+   false-positive restart can destroy one legitimate in-flight job. A Worker
+   whose event loop is wedged cannot run its `SIGTERM` handler and is killed
+   when `docker stop`'s 15-second grace expires; the durable outcome is the
+   same.
+
+6. **On-demand operation.** VideoFetch is not an unattended 24×7 service. A
+   stopped VM produces no probe tick, `Persistent=false` replays none after
+   boot, and an intentionally inactive Worker is `idle` and is never started
+   by the liveness mechanism. The execution plane runs while the operator is
+   using it, and stopping the VM ends any wedged session. That does not prove
+   a fault cannot happen. It lowers the benefit of autonomous recovery, and it
+   lets the first real incident be diagnosed instead of erased by a restart.
+
+**What the operator does instead.** `deploy/README.md`, "What a failed probe
+does, and does not do", holds the bounded manual procedure:
+- investigate after two consecutive unhealthy timer ticks, or a live Product
+  failure — never after one isolated tick;
+- confirm the helper's own verdict;
+- confirm the Worker is `active`/`running` and all six dependencies are
+  `active` — a dependency or boundary incident is excluded from the procedure;
+- tell the Worker's listener apart from the publication path;
+- capture evidence;
+- restart **once**, verify, and stop rather than loop.
+
+**Re-open criteria.** Revisit this decision only if:
+
+1. a real, confirmed `active` and persistently unhealthy Worker incident occurs
+   whose root cause cannot reasonably be removed in application or deployment
+   code; or
+2. VideoFetch moves from operator-attended, on-demand execution to unattended
+   or 24×7 operation.
+
+That automation is possible is not a reason to reopen it.
+
+**RESERVE DESIGN — NOT IMPLEMENTED / NOT CURRENTLY AUTHORIZED.** Recorded so
+that a future investigation does not start from zero. If automatic recovery is
+ever reconsidered, the preferred candidate is a **separate root-owned recovery
+oneshot**, triggered by a liveness failure, while the probe stays unprivileged
+and observer-only. Its required properties:
+- fix the helper/tooling classification first
+  (`WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001`);
+- never grant restart authority to `videofetch-liveness`;
+- validate the Worker (`loaded`/`active`/`running`) and all six dependencies
+  independently, immediately before acting;
+- require multiple consecutive genuine unhealthy observations — audit value
+  **3**, which is at least ~10 minutes of sustained failure at the current
+  5-minute cadence;
+- keep boot-scoped state only, with no recovery debt across VM boots — audit
+  value: a `/run`-scoped, root-only lockout marker;
+- a strict budget — audit value: at most **1** automated restart per VM boot,
+  then lockout;
+- act with `try-restart` (and `--job-mode=fail`, so it cannot replace a
+  pending stop) on the one fixed Worker unit — never an unconditional start,
+  and no other unit;
+- keep observing after lockout: the probe's `StartLimitIntervalSec=0` stays;
+- hold no credentials, no Docker socket and no network access.
 
 ### First live deployment — FAILED and rolled back (2026-09-26)
 
@@ -5093,7 +5261,7 @@ authorization.
 | `CLOUDFLARE-ACCESS-WORKER-CREDENTIAL-ABSENCE-VERIFICATION-001` | **CLOSED — runtime absence verified (PASS)** | A dedicated measurement on 2026-09-26 of the live Production Worker, not of the retained HLS candidate. It used the committed names-only observer `makeSystemObservers().environmentNames()` against `videofetch-worker`, from `main` `77732cfe…`. `CLOUDFLARE_ACCESS_CLIENT_ID`, `CLOUDFLARE_ACCESS_CLIENT_SECRET` and `VIDEOFETCH_ACCESS_SECRET` are absent, and so are their case-insensitive variants. The expected control names `WORKER_CONTROL_KEY_ID`, `WORKER_CONTROL_SECRET` and `R2_BROKER_SOCKET_PATH` are present. One stable runtime epoch covered the measurement: image `sha256:5925515f…`, container `cd6e46d0…`, 0 restarts. No secret value, value hash or value length was fetched. Evidence: SHA-256 `702d6a350a08f263a19ac6aa3445ee7a8cd0fe2238fe0d7c213baac6a17f8971` (operator-held). *Accepted operator-measured runtime evidence, not CI.* No HLS step closed it. It was a pre-promotion prerequisite, so HLS-10 had to repeat the check after promotion. HLS-10 did, immediately after the promotion and at the end, on the promoted Worker epoch, and it passed (§4j). The §10 checklist item is closed. See §4j. |
 | `HLS-10-PRODUCTION-PROMOTION-REAL-SOURCE-ACCEPTANCE-001` (executed as `…-RETRY-001`) | **CLOSED / PASS / PRODUCTION ACCEPTED** | 2026-09-26: the qualified HLS-9B image `sha256:e5b1144c…` (source `f0b47bd5…`, not rebuilt; `main` `1524cdc4…` was docs-only ahead, with no runtime-code drift) was retagged by immutable id as `videofetch-worker:latest` at 16:05:26.998Z, and only `videofetch-worker.service` was restarted. Candidate epoch: container `0bfaf6810dc2…`, StartedAt 16:05:27.747Z, NRestarts 0, stable to the end. The post-promotion names-only credential-custody check passed twice on that epoch. The direct regression passed (2,848,208 bytes, equal to the job size and the expected digest). On an operator-approved public HLS test master, the previous image advertised 0 presets (5 HLS renditions withheld, `unsupported_protocol`), and the promoted image advertised `preset:best` plus five named rungs; `preset:144` went through all six durable states, directly observed, with 0 yt-dlp, `ffmpeg` or `ffprobe` processes across 35 downloading samples. A `303` presigned R2 GET delivered 20,049,865 bytes, equal to the Product `fileSize` (SHA-256 `91cd6fc0…`, `video/mp4` from the object's `Content-Type`), and an offline ffprobe found one H.264 and one AAC stream, 634.634 s. No rollback; no Vercel, Cloudflare, R2, systemd or `worker.env` change; the VM ended Stopped. Evidence `/var/tmp/hls10/hls10-production-acceptance.txt`, SHA-256 `83b0e2374eb29effe54190bdbb55890e9252f8583c2334e9ca6d7e648b1dcf2e` (*accepted operator-measured*, not CI). A first attempt stopped before starting the VM and changed nothing. See §4j. |
 | `genericPresetOwner()` / `id in map` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** (2026-09-27) | `GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`. *Before:* `genericPresetOwner()` (`src/worker/execution/format-plan.ts`, since HLS-7) decided which private selection map claims a requested preset with `id in map`, and `in` walks the prototype chain. An inherited progressive entry alone therefore counted as an executable owner, and `deriveGenericExecutionPlan()` indexes the map, so that entry could be consumed. An inherited entry in either map also counted toward the both-maps ambiguity refusal. *Now:* only an OWN property claims, tested with `Object.hasOwn()`. An inherited entry in either map can no longer establish ownership or create ambiguity. *Unchanged:* both own maps still fail closed as `FORMAT_UNAVAILABLE`, and so does neither. The preset must still be advertised with `id === formatId`, and its public facts must still match the owning family. There is still no fallback or precedence between families. Own-accessor detection still invokes no getter, and ownership still validates no value, because each family's derivation does that. Analyzer-produced maps were already ordinary own-property maps, so ordinary Product output behaves identically. This is defense in depth against malformed or future input, not a fix for an observed Production exploit. No schema, durable-state, Vercel or package change. *Source (GitHub-verifiable):* PR #90, implementation commit `d0f05e60664479bd6c96b6f2be849134bb54c538`, review-correction commit `ac165150c6315a4bedb0ddd21670993e7ebec4e7` (the HLS acceptance record's ownership note became a scope disclaimer). Regular two-parent merge `8f087639e7e23fda07c3bda39c4398d6b0dfb561`, tree `42e7550c882e56f045f62d795d0ce856eb428467`, parents `8bee8616a04f04c354ac2b722bfa772e02d61e6f` and `ac165150…`; the approved head and the merge have identical trees. *Release candidate (accepted operator-measured):* `sha256:fd7cdbc9434a3193a797a92b3e669ad00526b79224e382662551903e1d3cf9bf`, retained as `videofetch-worker:rc-8f087639e7e2-fd7cdbc9434a`; SPLIT-07 `-03` PASS 47/47 (mp4 141/141, webm 141/141, clear-HLS 146/146); ownership and planning suites 317/317 and a direct ownership probe 21/21 inside the exact image, which is the behavioural proof of the malformed-map hardening; runtime/package inventory byte-identical to `sha256:0a6e66b0…`. *Production (accepted operator-measured), three transactions:* (1) the first promotion task was ROLLED BACK by its YouTube full-equality gate, which the old image later reproduced and which was therefore adjudicated a false negative; (2) the retry's first transaction was rolled back by its 75-minute dead-man safety timeout while the operator session was idle — a safety rollback with no candidate verdict; (3) the retry's second transaction promoted the image at 18:43:29.674Z and was accepted at 18:56:03Z. Every rollback was verified. Accepted live results: X analysis unchanged PRE → POST, the declared-size YouTube control PASS, one X job's durable `fileSize` 38,257,789 equal to its delivered bytes, 5-minute stability PASS. The immediate Worker rollback at that promotion was `sha256:0a6e66b0…`. *Since:* at 21:12:15Z the same day the direct-filesize image `sha256:629ec04b…` superseded `fd7cdbc9…` and keeps own-property ownership; `fd7cdbc9…` is now the immediate Worker rollback (`DIRECT-PRESET-FILESIZE-PROVENANCE-001`, below). Evidence task summaries `b1e7b888…` (candidate), `61616e17…` (first task), `057413e1…` (retry). Full record: §11h. |
-| `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001` | **IMPLEMENTED IN SOURCE (PR #83). Live gates: TLS — CLOSED / PASS / PRODUCTION ACCEPTED; external liveness — CLOSED / PASS / PRODUCTION ACCEPTED (after the static-account correction)** | Source foundation for the two §10 health items; the source alone closed **neither**. *(1) External liveness probe:* `deploy/bin/vf-worker-liveness-probe` + `vf-worker-health-request.mjs`, run by `videofetch-worker-liveness.service` on `videofetch-worker-liveness.timer`. It runs in the VM host namespace, outside `videofetch-media-netns` and the container (no `nsenter`, no `docker`), and probes only `http://127.0.0.1:<VIDEOFETCH_WORKER_PORT>/v1/healthz`. The authoritative port source is `media-egress.env`. In the original PR #83 shape, the probe's `DynamicUser` did not open the root-only `0700` `/etc/videofetch`; PID 1 read the file as root through `EnvironmentFile=` and passed only the value. PR #84 changed the runtime identity, not this configuration-delivery boundary: the current `videofetch-liveness` account likewise never opens `/etc/videofetch`, and PID 1 still delivers the port. The request runs on the pinned host Node the broker already requires, so no new host package is added. Every run emits exactly one `OUTCOME=` line. On-demand semantics: a stopped VM produces no ticks and `Persistent=false` forbids catch-up; an `inactive` Worker is `idle` with no request; a `failed` Worker is a failure, never idle. It is an observer only: read-only `systemctl` verbs, no activating dependency on the Worker, `StartLimitIntervalSec=0`, and **no restart action** — restart-on-unhealthy remains unimplemented (§8). *(2) TLS `/v1/healthz` acceptance tooling:* `deploy/acceptance/worker-health/` — HTTPS only, exact path, ordinary certificate validation, no redirect, 200 + `{"status":"ok"}`, Access Service Auth pair from the environment both-or-neither, no Worker HMAC. The 4096-byte body limit is enforced while streaming. Evidence schema `worker-tls-healthz-02` records only measured facts (`-01` is retired; it never produced accepted evidence) and withholds the hostname and every credential value, in a new `0600` file that is never overwritten. **Not run against Production by this task.** *Validation:* executor-local deterministic tests only (`src/worker/runtime/worker-liveness-deployment-policy.test.ts`, `scripts/worker-tls-healthz-acceptance.test.mjs`) — not GitHub CI. *Unchanged:* `Dockerfile.worker` (still no `HEALTHCHECK`, no curl/wget), Worker capabilities, the media namespace, the safe-egress policy, every bind, every credential scope and all Cloudflare configuration. *Review correction (`…-REVIEW-CORRECTION-001`), still source only:* (a) port delivery through PID 1 `EnvironmentFile=`, because the first revision's DynamicUser could not traverse the root-only `/etc/videofetch`; (b) exactly one `OUTCOME=` on every exit; (c) evidence stage semantics; (d) the body cap enforced while streaming; (e) exclusive `0600` evidence creation. *Remaining gates, as first recorded:* installing and accepting the probe on the VM — including the DynamicUser `/opt/videofetch` traversal check and `systemd-analyze verify`, neither available to the executor — and a live TLS run, each under its own authorization. *Live outcome (2026-09-26, `…-LIVE-ACCEPTANCE-001`, next row):* the TLS run PASSED and closed the TLS §10 box. The probe's first deployment failed at the systemd state query under `DynamicUser=` and was rolled back, so the liveness box stayed open at that point. *Liveness closed later that day:* the static-account correction (`WORKER-LIVENESS-STATIC-USER-CORRECTION-001`, PR #84, below) was deployed and accepted by `WORKER-LIVENESS-STATIC-USER-LIVE-REACCEPTANCE-001` (below), which closed the liveness §10 box. This source-only task produced neither live result. |
+| `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-IMPLEMENTATION-001` | **IMPLEMENTED IN SOURCE (PR #83). Live gates: TLS — CLOSED / PASS / PRODUCTION ACCEPTED; external liveness — CLOSED / PASS / PRODUCTION ACCEPTED (after the static-account correction)** | Source foundation for the two §10 health items; the source alone closed **neither**. *(1) External liveness probe:* `deploy/bin/vf-worker-liveness-probe` + `vf-worker-health-request.mjs`, run by `videofetch-worker-liveness.service` on `videofetch-worker-liveness.timer`. It runs in the VM host namespace, outside `videofetch-media-netns` and the container (no `nsenter`, no `docker`), and probes only `http://127.0.0.1:<VIDEOFETCH_WORKER_PORT>/v1/healthz`. The authoritative port source is `media-egress.env`. In the original PR #83 shape, the probe's `DynamicUser` did not open the root-only `0700` `/etc/videofetch`; PID 1 read the file as root through `EnvironmentFile=` and passed only the value. PR #84 changed the runtime identity, not this configuration-delivery boundary: the current `videofetch-liveness` account likewise never opens `/etc/videofetch`, and PID 1 still delivers the port. The request runs on the pinned host Node the broker already requires, so no new host package is added. Every run emits exactly one `OUTCOME=` line. On-demand semantics: a stopped VM produces no ticks and `Persistent=false` forbids catch-up; an `inactive` Worker is `idle` with no request; a `failed` Worker is a failure, never idle. It is an observer only: read-only `systemctl` verbs, no activating dependency on the Worker, `StartLimitIntervalSec=0`, and **no restart action** — restart-on-unhealthy remains unimplemented (§8). *(2026-09-28: automatic restart-on-unhealthy was then reviewed and deliberately not selected — `WORKER-RESTART-ON-UNHEALTHY-DECISION-CLOSURE-001`, below.)* *(2) TLS `/v1/healthz` acceptance tooling:* `deploy/acceptance/worker-health/` — HTTPS only, exact path, ordinary certificate validation, no redirect, 200 + `{"status":"ok"}`, Access Service Auth pair from the environment both-or-neither, no Worker HMAC. The 4096-byte body limit is enforced while streaming. Evidence schema `worker-tls-healthz-02` records only measured facts (`-01` is retired; it never produced accepted evidence) and withholds the hostname and every credential value, in a new `0600` file that is never overwritten. **Not run against Production by this task.** *Validation:* executor-local deterministic tests only (`src/worker/runtime/worker-liveness-deployment-policy.test.ts`, `scripts/worker-tls-healthz-acceptance.test.mjs`) — not GitHub CI. *Unchanged:* `Dockerfile.worker` (still no `HEALTHCHECK`, no curl/wget), Worker capabilities, the media namespace, the safe-egress policy, every bind, every credential scope and all Cloudflare configuration. *Review correction (`…-REVIEW-CORRECTION-001`), still source only:* (a) port delivery through PID 1 `EnvironmentFile=`, because the first revision's DynamicUser could not traverse the root-only `/etc/videofetch`; (b) exactly one `OUTCOME=` on every exit; (c) evidence stage semantics; (d) the body cap enforced while streaming; (e) exclusive `0600` evidence creation. *Remaining gates, as first recorded:* installing and accepting the probe on the VM — including the DynamicUser `/opt/videofetch` traversal check and `systemd-analyze verify`, neither available to the executor — and a live TLS run, each under its own authorization. *Live outcome (2026-09-26, `…-LIVE-ACCEPTANCE-001`, next row):* the TLS run PASSED and closed the TLS §10 box. The probe's first deployment failed at the systemd state query under `DynamicUser=` and was rolled back, so the liveness box stayed open at that point. *Liveness closed later that day:* the static-account correction (`WORKER-LIVENESS-STATIC-USER-CORRECTION-001`, PR #84, below) was deployed and accepted by `WORKER-LIVENESS-STATIC-USER-LIVE-REACCEPTANCE-001` (below), which closed the liveness §10 box. This source-only task produced neither live result. |
 | `WORKER-EXTERNAL-LIVENESS-TLS-HEALTH-LIVE-ACCEPTANCE-001` | **PARTIAL — TLS PASS / LIVENESS FAILED AND ROLLED BACK** | 2026-09-26, from `main` `394fe60c…`. The VM was initially Stopped and was returned to Stopped. *TLS:* PASS — schema `worker-tls-healthz-02`, HTTP `200`, healthy body matched, TLS verification enabled, no redirect, Access Service Auth used, no Worker HMAC — over public HTTPS → Cloudflare Access → named tunnel → VM loopback → Worker. Evidence `5745ece713e824585d9d21c67214b4c140d7a58e91aa4251a4323a4f0ae03f35`, *accepted operator-measured Production evidence, not CI*; it closes the TLS §10 box. *Liveness:* the PR #83 artefacts were installed byte-identically. The `DynamicUser` Node prerequisite (`v22.23.2`) and `systemd-analyze verify` passed, and the timer was enabled (`Persistent=no`, service `static`). The first timer-triggered probe returned exactly one `OUTCOME=state-unavailable`. On this VM (classic `dbus-daemon` 1.14.10) the `DynamicUser` identity could not complete the read-only systemd query; a static unprivileged identity could. No liveness stage was reached, the Worker was never stopped or restarted, and the deployment was fully rolled back. Evidence `867f6eca937e0fa004ce8e3ce5924ee07aa2d78b5444dd919b2cbdfb0c5448da`, *operator-measured failed-deployment evidence*: it proves the failure and the rollback, not acceptance. *What changed — three scopes, not one claim:* (a) **the liveness deployment actions** changed only the four task-owned VM artefacts and the timer's enablement and unit state; all of it was rolled back, and they did not touch the Worker image, the safe-egress policy, R2 or any Worker credential. (b) **The TLS acceptance harness** made one read-only HTTPS `GET /v1/healthz`. It mutated nothing in Cloudflare, Vercel or R2, rotated no credential and used no Worker HMAC material; the task's own automation made only read-only Vercel API calls (environment metadata, and one read of `WORKER_BASE_URL` by id). (c) **The provider state around the acceptance did change:** Vercel records a new Production deployment, `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd`. It is `source: redeploy` of `dpl_BcefWQ…`, created 2026-09-26T20:10:31.374Z and READY at 20:11:07.464Z, which is after the credential-intake step began (19:38Z) and before the TLS run (20:14:25Z). It was made outside the task's automation (*provider-observed*, read-only, 2026-09-27). Whether the Cloudflare Access Service Auth credential changed in that window is not established by the recorded evidence and is not claimed either way. The TLS PASS accepts the ingress as it was when the run executed; Vercel is not on the path it measures. *Later the same day:* the liveness half was superseded by the accepted static-account deployment, `WORKER-LIVENESS-STATIC-USER-LIVE-REACCEPTANCE-001` (below). This row's liveness result stays FAILED AND ROLLED BACK as history. See §8, §10, §11h. |
 | `WORKER-LIVENESS-STATIC-USER-CORRECTION-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** | Replaces `DynamicUser=yes` in `videofetch-worker-liveness.service` with the dedicated static system account `User=videofetch-liveness` / `Group=videofetch-liveness`. The account has its own group only (no `docker`, no `videofetch-broker`, no `SupplementaryGroups=`), `nologin`, no home, no sudo and no capability. `RemoveIPC=yes`, which `DynamicUser=` implied, is now explicit. Unchanged: every other hardening directive, PID 1's `EnvironmentFile=` port delivery, `/etc/videofetch` `0700 root:root`, the probe's logic and the timer. `deploy/README.md` step 6 now provisions the account idempotently before the unit is installed. Before the timer is enabled, it then checks, as that account, the pinned Node (`v22.23.2`) and the probe's exact read-only systemd query, followed by one on-demand run. The policy suite fails if `DynamicUser=` returns or the identity changes, and it pins that ordering in the docs. No repository test emulates the VM's D-Bus. *Validation:* executor-local only, not GitHub CI. PR #84, merged as `main` `db20d910…`, corrected the runtime identity in source; this task itself installed nothing. *Deployed:* `WORKER-LIVENESS-STATIC-USER-LIVE-REACCEPTANCE-001` (next row) installed the correction on the VM, and it passed live, which closed the liveness §10 box. |
 | `WORKER-LIVENESS-STATIC-USER-LIVE-REACCEPTANCE-001` | **CLOSED / PASS / PRODUCTION ACCEPTED** | 2026-09-26, 21:25–21:41Z, from `main` `db20d910eafc743da3a86667c6c523e15b1836b5` (tree `3b870cb9…`), by `deploy/README.md` step 6a → 6d. The VM was initially Stopped and was returned to Stopped. The Production stack was healthy beforehand on Worker image `sha256:e5b1144c…`; no image was promoted. *Account:* `videofetch-liveness`, its own group only, no `docker`/broker membership, `/nonexistent` never created, `nologin`, password locked, no sudo, no capabilities; `/etc/videofetch` stays unreadable to it. *Artefacts:* all four byte-identical to merged source and root-owned; `systemd-analyze verify` produced no output. *Decisive gates, as the account:* Node `v22.23.2` and the exact systemd query (`LoadState=loaded`); zero `Transport endpoint is not connected`. *Behaviour:* Worker active → `OUTCOME=healthy` (`396d19a3…`). Only the Worker stopped → manual `OUTCOME=idle` (`49018116…`), then a naturally scheduled timer tick `OUTCOME=idle` (`1415ed85…`, 21:38:57Z). The Worker stayed inactive throughout, with no main PID, no container, no Docker start or pull, and no broker, network or safe-egress change. Worker restored through its normal start path on the same image → `OUTCOME=healthy` (`d5595ac0…`). The probe never restarted the Worker; the one deliberate stop and start changed its epoch, as intended. *Persistent result:* account, four artefacts and `videofetch-worker-liveness.timer` enabled (`Persistent=no`); service `static`. *Not changed:* `/etc/videofetch`, D-Bus/systemd policy, R2, Cloudflare, Vercel; TLS was not re-run. Evidence `5c3a0b3e91a47c174588dbefb49ec39c1d982cf94c9abe8d72e3d6378ecf1e83`, *accepted operator-measured Production evidence, not CI*. See §8, §10. |
@@ -5105,6 +5273,9 @@ authorization.
 | `VERCEL-ROLLBACK-READINESS-AUDIT-001` | **COMPLETE — NOT ROLLBACK READY at the time; resolved by `VERCEL-KNOWN-GOOD-ROLLBACK-POINT-001`** | 2026-09-28, read-only: no mutation, no VM, no Production traffic. *Found:* the team is on the Hobby plan, whose Instant Rollback reaches only the immediately previous Production deployment — then the known-broken `dpl_BJYRG7…`. Every older retained deployment predated the 2026-09-27 Access replacement (provider environment metadata), and `vercel promote` does not apply to an already-promoted deployment. Retained deployments carry CLI-recorded `meta.gitCommitSha` / `gitCommitRef` values that match the chain-of-custody commits but are client-supplied, not Git attestation (§11h). Its retention reading ("keep 10") was corrected by the probe (next row). Report delivered to the Product Owner; not committed (*provider-observed*). |
 | `VERCEL-HOBBY-ROLLBACK-MECHANICS-PROBE-001` | **COMPLETE — mechanics resolved; staged-slot retention UNRESOLVED** | 2026-09-28, on a disposable Vercel project in the same Hobby team: no VideoFetch code, no secret, plain sentinel variables, five builds, deleted afterwards (verified 404/410). *Measured:* a rollback to an older Production deployment is refused with HTTP 402 and to the immediately previous one accepted (201, no rebuild); the eligible predecessor follows Production-deployment ordering, not the last-serving deployment; existing deployments, rollback and promotion keep the creation-time environment while a redeploy takes the current one, including a later-added variable; `--prod --skip-domain` yields provider `readySubstate: STAGED` but moves the team-scoped automatic alias; promotion reuses the deployment id without rebuild and exits rollback state; only the three most recent Production deployments are exempt from expiration. The real project's values-free canonical safe state was byte-identical before and after (`29df6da2e5d8b3bc830095a9b052e88171cfbac4f8bce74c0bbbe2e0fd5b5e12`). *Boundary note:* a provider fetch helper used for protected probe URLs minted shareable links on probe deployments and revoked one pre-existing shareable link on an unrelated project in the same team (not VideoFetch); later tasks forbid that class of tool. Direct reads of non-current protected probe deployments were then not performed, and Deployment Protection was left unchanged. Evidence operator-held, `MANIFEST.sha256` `dc836e15d113820979ed6cf11f094e457761e79ac9fec2cafefd3af882e840a2` (*operator-measured*). See §9. |
 | `VERCEL-KNOWN-GOOD-ROLLBACK-POINT-001` | **CLOSED / PASS / PRODUCTION ACCEPTED — 2026-09-28** | Exactly one Production mutation: `dpl_YrhkEQC4…` redeployed to Production as `dpl_8k6e59juv1Z3Srb9NSNBmmVGh5Nb` (created 13:25:25Z, aliased 13:25:55Z; `source: cli`, `meta.action: redeploy`, `meta.originalDeploymentId` `dpl_YrhkEQC4…`). Preflight: no project environment row changed after `dpl_YrhkEQC4…` was created; the Worker matched its state of record (`629ec04b…`, `worker.env` `3583770c…`). Baseline on `dpl_YrhkEQC4…`: run 3 fully clean (run 2 had one transient file-route 503 on the Vercel → Cloudflare edge leg that never reached the named tunnel; the same file returned 303 17 s later, and the Product Owner required one more full baseline). Uploaded source tree and the eight served client assets identical to `dpl_YrhkEQC4…`'s. Post-redeploy on `dpl_8k6e59…`: login/session 200, diagnostics 200 (`status: ok`), sites 200, named tunnel +2 / +5, controlled direct fixture analyzed, one `preset:best` job `ready`, file route 303, 48,497 delivered bytes equal to the fixture (`44827ff8…`); no runtime error. Provider `isRollbackCandidate`: `dpl_8k6e59…` and `dpl_YrhkEQC4…` true, `dpl_BJYRG7…` false. No rollback needed. VM Stopped → Running → Stopped; no environment, credential, Cloudflare, Worker, Git or source change. Evidence operator-held, `MANIFEST.sha256` `a20bd1e849c8b74332ba792561af8e3bd1c289dd9014ce8d32364742f9f8ea82`; Vercel safe state `f825cf84…` → `f36c841d…`, every difference a consequence of the one redeploy (*accepted operator-measured*). See §9, §11h. |
+| `WORKER-RESTART-ON-UNHEALTHY-DESIGN-AUDIT-001` | **COMPLETE — AUTOMATIC RESTART NOT RECOMMENDED** | 2026-09-28, read-only, at `main` `940dbcebe15cff19561afb4f07c7397d29a01ef2` (tree `51142852…`): no mutation, no VM start, no Worker, systemd or Docker action, no provider or Production request. *Question:* should a Worker that stays `active` but repeatedly fails `/v1/healthz` be restarted automatically, and if so by whom, on what evidence and within what bounds? *Inspected:* the probe and its Node helper, the liveness, Worker and six dependency units, the egress watchdog and its breach path, the workspace verifier, the Worker health route, start-up, shutdown and durable recovery with their tests, and the systemd 255 manual pages. *Findings:* (a) `/v1/healthz` is liveness only (§8); (b) the probe maps any nonzero helper exit to `OUTCOME=unhealthy`, so some helper/tooling faults surface as unhealthy, and its exit `1` also covers `failed-unit` and `unknown-state`; (c) `Type=simple` makes the Worker `active` before Node listens, so one tick can see a start-up race; (d) a restart transaction activates required units that are inactive, which could interact with a boundary incident; (e) with the systemd 255 defaults (10 s / 5 starts; the VM's manager configuration was not read) and `RestartSec=5`, the Worker's start limit cannot trip, so process-crash restarts are effectively unbounded — recorded as an observation, no change proposed. *Options compared:* restart authority in the probe (rejected), an `OnFailure=`-triggered root recovery unit (kept only as the reserve design, §8), a stateful supervisor, a watchdog pinged from inside the container (rejected: it would hand the untrusted container a socket to PID 1), and no automatic restart (selected). Report delivered to the Product Owner; not committed (*repository/source-verifiable analysis*; no live measurement). |
+| `WORKER-RESTART-ON-UNHEALTHY-DECISION-CLOSURE-001` | **DECISION RECORDED — automatic restart-on-unhealthy NOT selected (documentation only)** | 2026-09-28. Records the audit's decision: the liveness probe stays observer-only, `Restart=on-failure` keeps owning actual process failure, and an `active` but unhealthy Worker is diagnosed by the operator. §8 now describes `/v1/healthz` as liveness only (it was "liveness/readiness"), states the decision and its six cumulative reasons, the re-open criteria and a clearly labelled reserve design. `deploy/README.md` ("What a failed probe does, and does not do") gains the bounded manual procedure: investigate after two consecutive unhealthy timer ticks or a live Product failure, confirm the helper's own verdict, require the Worker `active`/`running` and all six dependencies `active`, tell the listener apart from the publication path, capture evidence, restart **at most once**, verify, and never loop. *Unchanged:* the probe, the health helper, every systemd unit, the Worker application and its tests; nothing was deployed, and no VM, Worker, Docker, Vercel, Cloudflare or R2 action was taken (*repository/source-verifiable*). |
+| `WORKER-LIVENESS-TOOLING-FAULT-CLASSIFICATION-001` | **OPEN — OPTIONAL HARDENING; not required for current operation, not scheduled** | Make sure a health-helper configuration or tooling failure can never be collapsed into `OUTCOME=unhealthy` (§8, reason 2): today the probe maps any nonzero exit of `vf-worker-health-request.mjs` to `unhealthy`, although the helper uses `2` for argument/configuration errors and Node exits nonzero when it cannot load or run the module. It would improve observability accuracy even with manual recovery, and it is a prerequisite of the reserve design. It changes the probe's documented exit-code contract, so it needs its own reviewed source task and a live re-acceptance of the probe; the decision closure deliberately did not change it. |
 
 ---
 
