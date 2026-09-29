@@ -26,7 +26,7 @@
 // ── The clear-HLS child (since -03) ─────────────────────────────────────────
 //
 // HLS is not a SPLIT-06 family, so it is not in `splitAcceptance`. Its child is
-// the HLS-09 release record (`hls09-release-image-full-path-01`), recorded in
+// the HLS-09 release record (`hls09-release-image-full-path-02` since -04), recorded in
 // its own `hlsAcceptance` block and validated from its exact bytes exactly as
 // the SPLIT-06 children are: schema, verdict, every check, the release source
 // and the candidate image it names, the network mode, and a digest re-checked
@@ -86,15 +86,26 @@ import {
  *        the SAME immutable candidate image id as every other candidate
  *        container, naming the same release source, offline; the harness
  *        re-verified before that child and again after it; and a candidate run
- *        ledger that includes it. The current HLS-aware release-image
- *        qualification: mp4 + webm + clear-HLS.
+ *        ledger that includes it. The HLS-aware release-image qualification
+ *        for sources whose generic yt-dlp vocabulary was `http`/`https`:
+ *        mp4 + webm + clear-HLS. -03 records stay VALID for exactly the
+ *        candidates they qualified (e.g. RC e5b1144c) and are never re-read
+ *        under -04.
+ *   -04  everything -03 means, with the clear-HLS child's schema moved to
+ *        `hls09-release-image-full-path-02` (GENERIC-SEGMENTED-DASH-EXECUTION-001
+ *        restated HLS-7's protocol invariant for the one shared vocabulary that
+ *        now carries `http_dash_segments`). The current release-image
+ *        qualification: mp4 + webm + clear-HLS. It does NOT by itself run a
+ *        segmented-DASH child; the pinned DASH downloader contract is carried by
+ *        the two policy verifiers every -04 PASS already requires.
  */
-export const SPLIT07_EVIDENCE_SCHEMA = "split07-release-image-candidate-03";
+export const SPLIT07_EVIDENCE_SCHEMA = "split07-release-image-candidate-04";
 
-/** The historical parent schemas. Never rewritten, and never read as -03. */
+/** The historical parent schemas. Never rewritten, and never read as -04. */
 export const HISTORICAL_SPLIT07_SCHEMAS = Object.freeze([
   "split07-release-image-candidate-01",
   "split07-release-image-candidate-02",
+  "split07-release-image-candidate-03",
 ]);
 
 /** The exact SPLIT-06 schema a SPLIT-07 PASS accepts as a child. */
@@ -103,7 +114,7 @@ export const REQUIRED_CHILD_SCHEMA = "split06-deterministic-full-path-04";
 /** Both families are required. One is not a release-image acceptance. */
 export const REQUIRED_SPLIT_FAMILIES = Object.freeze(["mp4", "webm"]);
 
-/** The exact HLS child schema a -03 PASS accepts (since -03). */
+/** The exact HLS child schema a PASS accepts (a child since -03; its `-02` since -04). */
 export const REQUIRED_HLS_CHILD_SCHEMA = HLS09_RELEASE_EVIDENCE_SCHEMA;
 
 /** The candidate-run purpose of the clear-HLS release child. */
@@ -851,17 +862,22 @@ function hlsAcceptanceBlock(input) {
 /**
  * Reads a parent record back under the CURRENT schema's rules.
  *
- * Returns the problems; an empty list means the record is a `-03` record for
+ * Returns the problems; an empty list means the record is a `-04` record for
  * exactly `expected` (`{ sourceCommit, imageId }`) and, when it says PASS,
- * that it earns PASS under -03 rules. A historical `-01`/`-02` record is never
- * silently read as `-03`: it is named as historical, because a `-02` PASS
- * proves mp4 + webm and nothing about clear HLS.
+ * that it earns PASS under -04 rules. A historical `-01`/`-02`/`-03` record is
+ * never silently read as `-04`: it is named as historical, because a `-02` PASS
+ * proves mp4 + webm and nothing about clear HLS, and a `-03` PASS proves clear
+ * HLS under the protocol invariant `-04` restated.
  */
 export function validateReleaseParentRecord(record, expected = {}) {
   if (record === null || typeof record !== "object" || Array.isArray(record)) return ["the record is not an object"];
   const problems = [];
   if (HISTORICAL_SPLIT07_SCHEMAS.includes(record.schema)) {
-    problems.push(`${record.schema} is a historical schema, not ${SPLIT07_EVIDENCE_SCHEMA}; it does not qualify clear HLS`);
+    // True of all three: -01/-02 carry no clear-HLS child at all, and a -03
+    // child proved clear HLS under the protocol invariant -04 restated.
+    problems.push(
+      `${record.schema} is a historical schema, not ${SPLIT07_EVIDENCE_SCHEMA}; it does not qualify clear HLS under the current protocol invariant`,
+    );
     return problems;
   }
   if (record.schema !== SPLIT07_EVIDENCE_SCHEMA) {

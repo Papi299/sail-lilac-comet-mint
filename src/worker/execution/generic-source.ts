@@ -53,25 +53,89 @@ export function isSafeFormatId(value: unknown): value is SafeFormatId {
   return typeof value === "string" && SAFE_FORMAT_ID_PATTERN.test(value);
 }
 
-// ── Source protocol policy (§16) ─────────────────────────────────────────────
+// ── Source protocol policy (§16; GENERIC-SEGMENTED-DASH-EXECUTION-001) ───────
 
 /**
- * The only source protocols generic v1 may acquire, unchanged from Phase 10C2.
+ * The ONE closed vocabulary of source protocols the generic yt-dlp downloader
+ * may acquire. Analysis admission, the private selection schema and the
+ * acquisition selector all read THIS list, so the analysis path and the
+ * download path cannot drift onto two different ones.
  *
- * Re-exported through this module so the download path and the analysis path
- * cannot drift onto two different lists. Native HLS stays excluded: `HlsFD`
- * decides at DOWNLOAD time, from manifest bytes analysis never fetched, whether
- * to delegate to `FFmpegFD` — which would run local media work while the
- * durable job still says `downloading`.
+ * Each member was admitted against the pinned 2026.08.19 runtime, under the
+ * closed base policy's `--downloader=native`, and only because it selects a
+ * native downloader that cannot hand acquisition to FFmpeg:
  *
- * This list governs the yt-dlp downloader ONLY. Clear HLS became deliverable
- * in HLS-7 without widening it: that path never hands yt-dlp a download, so
- * nothing about it belongs here.
+ *   `http`, `https`        `HttpFD`. One progressive body, one `.part`.
+ *   `http_dash_segments`   `DashSegmentsFD`, a `FragmentFD`. Its per-fragment
+ *                          delegate is looked up as `dash_frag_urls`, which the
+ *                          `native` policy leaves unmapped, so the fragments are
+ *                          fetched by its own `HttpQuietDownloader` and appended
+ *                          in order — no external downloader and no `FFmpegFD`,
+ *                          live or not. The pinned `real_download` also refuses
+ *                          a live DASH source outright, and analysis refuses
+ *                          live sources before that.
+ *
+ * Deliberately NOT members, and not to be added by analogy:
+ *
+ *   `m3u8`, `m3u8_native`  `HlsFD` decides at DOWNLOAD time, from manifest bytes
+ *                          analysis never fetched, whether to delegate to
+ *                          `FFmpegFD`, and `m3u8` maps to `FFmpegFD` outright.
+ *                          Clear HLS became deliverable in HLS-7 WITHOUT
+ *                          widening this list: that path never hands yt-dlp a
+ *                          download, so nothing about it belongs here.
+ *   `http_dash_segments_generator`
+ *                          The same class, but only the pinned YouTube
+ *                          extractor's live-from-start path emits it. Its
+ *                          fragments are a callable that keeps polling the live
+ *                          manifest during the download, so their count and
+ *                          bytes are not a fact analysis can describe (the `-J`
+ *                          document cannot even serialize them), and this
+ *                          product never passes `--live-from-start` or accepts a
+ *                          live source.
+ *
+ * The pinned downloader selection behind this list is a tested contract, not a
+ * comment: see `verify-download-policy.py` (inside the image) and the runtime
+ * contract test beside `ytdlp-runtime.server.ts`.
  */
-export const GENERIC_SOURCE_PROTOCOLS = Object.freeze(["http", "https"] as const);
+export const GENERIC_SOURCE_PROTOCOLS = Object.freeze([
+  "http",
+  "https",
+  "http_dash_segments",
+] as const);
 
-export const GenericSourceProtocolSchema = z.enum(["http", "https"]);
+export const GenericSourceProtocolSchema = z.enum(GENERIC_SOURCE_PROTOCOLS);
 export type GenericSourceProtocol = z.infer<typeof GenericSourceProtocolSchema>;
+
+/** True exactly for a member of `GENERIC_SOURCE_PROTOCOLS`, compared verbatim. */
+export function isGenericSourceProtocol(value: string): value is GenericSourceProtocol {
+  return (GENERIC_SOURCE_PROTOCOLS as readonly string[]).includes(value);
+}
+
+/**
+ * How an approved protocol lays its bytes down in the job directory while it
+ * is being acquired. Total over the vocabulary, so a new member cannot be added
+ * without deciding its layout.
+ *
+ *   `progressive`  one body streamed into `<name>.part`, renamed to `<name>`.
+ *   `segmented`    the pinned `FragmentFD` grammar: an aggregate
+ *                  `<name>.part`, a bookkeeping `<name>.ytdl`, and, one at a
+ *                  time under `--concurrent-fragments=1`, the fragment in
+ *                  flight as `<name>.part-Frag<N>.part`, renamed to
+ *                  `<name>.part-Frag<N>` once complete, then appended to the
+ *                  aggregate and removed. The byte guard and the directory
+ *                  grammar are both chosen from this value.
+ */
+export type GenericAcquisitionLayout = "progressive" | "segmented";
+
+export function genericAcquisitionLayout(protocol: GenericSourceProtocol): GenericAcquisitionLayout {
+  switch (protocol) {
+    case "http":
+    case "https":
+      return "progressive";
+    case "http_dash_segments":
+      return "segmented";
+  }
+}
 
 // ── Source container allowlist (§15) ─────────────────────────────────────────
 
@@ -349,6 +413,30 @@ export const GenericSourceSelectionSchema = z
         path: ["hasAudio"],
         message: "a selection must carry video, audio, or both",
       });
+    }
+
+    // GENERIC-SEGMENTED-DASH-EXECUTION-001: a SEGMENTED source is executable
+    // only as one half of a split pair — proven video-only, or proven
+    // audio-only — because only then does the Worker's own FFmpeg rewrite it
+    // after `beginProcessing()`, which is what validates the fragmented
+    // artifact the pinned `FragmentFD` leaves (`--fixup=never` suppresses the
+    // pinned runtime's own DASH repairs). A muxed or unknown-audio segmented
+    // source would be delivered verbatim, so it is not representable here at
+    // all. The single-source plan variants additionally refuse every segmented
+    // source (`format-plan.ts`), so a proven audio-only half cannot be kept
+    // verbatim as an audio product either.
+    if (genericAcquisitionLayout(selection.protocol) === "segmented") {
+      const videoOnly =
+        selection.videoConstraint !== "absent" && selection.audioConstraint === "absent";
+      const audioOnly =
+        selection.videoConstraint === "absent" && selection.audioConstraint === "codec-present";
+      if (!videoOnly && !audioOnly) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["protocol"],
+          message: "a segmented source must be a proven video-only or proven audio-only split member",
+        });
+      }
     }
   });
 

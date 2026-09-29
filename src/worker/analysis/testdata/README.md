@@ -33,7 +33,8 @@ fixture, and they hold for any site — see
 
 `protocol` is `http` because the capture ran over loopback. A live acceptance
 run reaches the same page through an HTTPS Quick Tunnel and reports `https`.
-Both are in `YTDLP_V1_NATIVE_PROTOCOLS`, and nothing in the classification under
+Both are in `GENERIC_SOURCE_PROTOCOLS` (named `YTDLP_V1_NATIVE_PROTOCOLS` in the
+analyzer until `GENERIC-SEGMENTED-DASH-EXECUTION-001`), and nothing in the classification under
 test depends on which of the two it is.
 
 **Sanitization.** Media URLs, the fixture host, request headers, cookies and the
@@ -124,7 +125,7 @@ and bitrate, so `acodec` is never set; the HLS audio renditions get
 What the Worker must conclude from it:
 
 - the four HLS formats are ineligible on protocol alone
-  (`YTDLP_V1_NATIVE_PROTOCOLS` stays `http`/`https`);
+  (no HLS spelling is in `GENERIC_SOURCE_PROTOCOLS`, the one generic yt-dlp vocabulary);
 - the two progressive formats are eligible, with `videoConstraint: "video-ext"`
   and `audioConstraint: "unknown"`;
 - no PROVEN video fulfilment exists (nothing is muxed with a real `acodec`, and

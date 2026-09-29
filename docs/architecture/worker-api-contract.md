@@ -354,7 +354,12 @@ The higher-quality notice and the unknown-resolution state were verified on the
 deployed source by deterministic render tests, not on a live third-party source.
 
 P2 changes presentation only. At P2, HLS and segmented DASH were not implemented
-and were inventory-only. Segmented DASH still is. Clear-HLS v1 was later
+and were inventory-only. In Production segmented DASH still is; split-half
+segmented DASH is implemented in source only by
+`GENERIC-SEGMENTED-DASH-EXECUTION-001` (runbook §4k), with no public schema
+change: an executable DASH rendition is simply reported as deliverable,
+`not_selected` or a pairing/size reason instead of `unsupported_protocol`, and
+no DASH URL, fragment, protocol or format id reaches the browser. Clear-HLS v1 was later
 implemented in source (HLS-7), qualified in a retained release candidate (HLS-9B)
 and, on 2026-09-26, **deployed to the Production Worker and accepted** by HLS-10
 on a real public source (deployment runbook §4j). The current Worker image

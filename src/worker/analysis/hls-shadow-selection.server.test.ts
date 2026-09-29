@@ -18,7 +18,6 @@ import {
 } from "../hls/hls-source-selection.ts";
 import { YTDLP_RUNTIME, type YtdlpRuntimeStatus } from "../runtime/ytdlp-runtime.server.ts";
 import {
-  YTDLP_V1_NATIVE_PROTOCOLS,
   analyzeGenericFormats,
   analyzeGenericMedia,
   analyzeGenericMediaInternal,
@@ -563,9 +562,9 @@ describe("HLS-7 activation: clear HLS composes with the progressive ladder", () 
     ...internal,
   });
 
-  it("leaves both protocol policies exactly http and https", () => {
-    assert.deepEqual([...YTDLP_V1_NATIVE_PROTOCOLS], ["http", "https"]);
-    assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https"]);
+  it("keeps HLS out of the one yt-dlp protocol vocabulary", () => {
+    assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https", "http_dash_segments"]);
+    assert.equal(GENERIC_SOURCE_PROTOCOLS.some((p) => p.includes("m3u8")), false);
   });
 
   it("never makes an HLS rendition a yt-dlp acquisition candidate", () => {

@@ -217,12 +217,16 @@ export type WorkerQualityPreset = z.infer<typeof QualityPresetSchema>;
  * first boundary it met, in the analyzer's existing gate order.
  *
  *   unsupported_protocol      its delivery protocol is absent, or is outside
- *                             current delivery capability. Segmented DASH lands
- *                             here, as do HLS renditions outside the narrow
- *                             clear-HLS v1 path (or any HLS rendition when that
- *                             path cannot run for the analysis). A clear-HLS
- *                             rendition that path does take is deliverable or
- *                             `not_selected` instead.
+ *                             current delivery capability. HLS renditions
+ *                             outside the narrow clear-HLS v1 path land here (or
+ *                             any HLS rendition when that path cannot run for the
+ *                             analysis), as does a segmented-DASH rendition that
+ *                             is not a proven video-only split half. A clear-HLS
+ *                             rendition that path does take, or a video-only
+ *                             segmented-DASH rendition, is reported by what the
+ *                             analysis then did with it instead — deliverable,
+ *                             `not_selected`, a pairing reason, or the first
+ *                             other gate it failed.
  *   unsupported_container     its container is outside the closed set current
  *                             generic delivery keeps verbatim (mp4, webm).
  *   unsupported_stream_shape  a video codec is named, but the reported stream

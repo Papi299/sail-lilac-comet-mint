@@ -5,14 +5,17 @@
 //                  historical runtime (`run-hls-acceptance.mjs`). Identity is
 //                  the source commit/tree, the accepted historical base source
 //                  and digest, and the overlay image. Record:
-//                  `hls08-deterministic-full-path-02`, unchanged.
+//                  `hls08-deterministic-full-path-03` (-02 until
+//                  GENERIC-SEGMENTED-DASH-EXECUTION-001 restated the protocol
+//                  invariant).
 //   release-image  HLS-09. The ACTUAL `Dockerfile.worker` release candidate,
 //                  launched by the SPLIT-07 parent
 //                  (`run-release-image-acceptance.mjs`). Identity is the release
 //                  source commit/tree, the parent's source-context-clean
 //                  assertion, the candidate build label, the candidate immutable
 //                  image id and the run subject Docker executed. Record:
-//                  `hls09-release-image-full-path-01`.
+//                  `hls09-release-image-full-path-02` (-01 before the same
+//                  restatement).
 //
 // The behavioral run — real analysis, real yt-dlp discovery, the ordinary
 // planner, HLS-2/3/4, the upload lifecycle, `ready`, the three negatives — is

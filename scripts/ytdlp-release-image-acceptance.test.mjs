@@ -1486,11 +1486,12 @@ describe("SPLIT-07 evidence builder", () => {
   });
 
   it("names a NEW schema, and never reuses or bumps SPLIT-06's", () => {
-    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-03");
+    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-04");
     assert.equal(REQUIRED_CHILD_SCHEMA, "split06-deterministic-full-path-04");
-    assert.equal(REQUIRED_HLS_CHILD_SCHEMA, "hls09-release-image-full-path-01");
+    assert.equal(REQUIRED_HLS_CHILD_SCHEMA, "hls09-release-image-full-path-02");
     assert.notEqual(SPLIT07_EVIDENCE_SCHEMA, REQUIRED_CHILD_SCHEMA);
-    assert.notEqual(REQUIRED_HLS_CHILD_SCHEMA, "hls08-deterministic-full-path-02", "HLS-08 overlay evidence is not a release child");
+    assert.notEqual(REQUIRED_HLS_CHILD_SCHEMA, "hls08-deterministic-full-path-03", "HLS-08 overlay evidence is not a release child");
+    assert.notEqual(REQUIRED_HLS_CHILD_SCHEMA, "hls09-release-image-full-path-01", "the pre-DASH HLS-09 child is historical");
   });
 
   it("keeps a FAIL record emittable, so a failure is reportable", () => {
@@ -2291,7 +2292,7 @@ describe("SPLIT-07 parent evidence is created exclusively", () => {
   it("A1: with the pre-flight blind, the exclusive create itself refuses and leaves the file untouched", async () => {
     const { result, error, world } = await drive({ files: [[PARENT, PRIOR]] }, {}, { readdir: async () => [] });
     assert.equal(result, null);
-    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-03 verdict/);
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-04 verdict/);
     assert.ok(world.files.get(PARENT).equals(PRIOR), "the existing bytes must be unchanged");
     assert.deepEqual(world.writeCalls.map((call) => call.options), [{ encoding: "utf8", flag: "wx" }]);
   });
@@ -2302,7 +2303,7 @@ describe("SPLIT-07 parent evidence is created exclusively", () => {
     const lines = [];
     const { result, error, world } = await drive({ competitorAtWrite: competitor }, {}, { log: (line) => lines.push(line) });
     assert.equal(result, null, "a lost race returns no result, and so no PASS");
-    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-03 verdict/);
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-04 verdict/);
     assert.match(String(error?.message), /has NOT been modified/);
     assert.equal(world.files.get(PARENT).toString("utf8"), competitor, "the competing record must be byte-identical");
     assert.deepEqual(
@@ -2381,11 +2382,12 @@ describe("SPLIT-07 -02 evidence gates", () => {
     assert.equal(record.harness.commitIsReleaseSource, true);
   });
 
-  it("treats -01 and -02 as historical: the builder emits only -03", () => {
-    assert.equal(buildReleaseEvidence(evidenceInput()).schema, "split07-release-image-candidate-03");
+  it("treats -01, -02 and -03 as historical: the builder emits only -04", () => {
+    assert.equal(buildReleaseEvidence(evidenceInput()).schema, "split07-release-image-candidate-04");
     assert.deepEqual([...HISTORICAL_SPLIT07_SCHEMAS], [
       "split07-release-image-candidate-01",
       "split07-release-image-candidate-02",
+      "split07-release-image-candidate-03",
     ]);
     assert.ok(!HISTORICAL_SPLIT07_SCHEMAS.includes(SPLIT07_EVIDENCE_SCHEMA));
   });
@@ -2582,7 +2584,8 @@ describe("SPLIT-07 -03 clear-HLS child record validation", () => {
     missingCheck.checks = missingCheck.checks.filter((check) => check.name !== "hls3/each-fragment-requested-exactly-once");
     const cases = [
       ["HLS-08 overlay schema", passingHlsChild(null, { schema: "hls08-deterministic-full-path-02" }), /schema is/],
-      ["a future schema", passingHlsChild(null, { schema: "hls09-release-image-full-path-02" }), /schema is/],
+      ["the pre-DASH HLS-09 schema", passingHlsChild(null, { schema: "hls09-release-image-full-path-01" }), /schema is/],
+      ["a future schema", passingHlsChild(null, { schema: "hls09-release-image-full-path-03" }), /schema is/],
       ["verdict FAIL", passingHlsChild(null, { verdict: "FAIL" }), /verdict is FAIL/],
       ["one failed check", failedCheck, /1 of \d+ checks did not pass/],
       ["a missing mandatory check", missingCheck, /mandatory checks absent/],
@@ -2626,11 +2629,11 @@ describe("SPLIT-07 -03 clear-HLS child record validation", () => {
 });
 
 describe("SPLIT-07 -03 evidence gates", () => {
-  it("emits a -03 PASS with mp4 + webm + the clear-HLS child", () => {
+  it("emits a -04 PASS with mp4 + webm + the clear-HLS child", () => {
     const record = buildReleaseEvidence(evidenceInput());
-    assert.equal(record.schema, "split07-release-image-candidate-03");
+    assert.equal(record.schema, "split07-release-image-candidate-04");
     assert.equal(record.verdict, "PASS");
-    assert.equal(record.hlsAcceptance.requiredChildSchema, "hls09-release-image-full-path-01");
+    assert.equal(record.hlsAcceptance.requiredChildSchema, "hls09-release-image-full-path-02");
     assert.equal(record.hlsAcceptance.executed, true);
     assert.equal(record.hlsAcceptance.child.candidateImageId, IMAGE_ID);
     assert.equal(record.hlsAcceptance.child.runImageId, IMAGE_ID);
@@ -2723,7 +2726,7 @@ describe("SPLIT-07 -03 evidence gates", () => {
     relabelled.checks = relabelled.checks.filter((check) => !check.name.startsWith("hls/"));
     relabelled.image.candidateRuns = relabelled.image.candidateRuns.filter((entry) => entry.purpose !== HLS_CANDIDATE_RUN_PURPOSE);
     assert.ok(validateReleaseParentRecord(relabelled).some((problem) => /missing required checks/.test(problem)));
-    assert.ok(validateReleaseParentRecord({ ...current, schema: "split07-release-image-candidate-04" }).length > 0);
+    assert.ok(validateReleaseParentRecord({ ...current, schema: "split07-release-image-candidate-05" }).length > 0);
     assert.ok(validateReleaseParentRecord(current, { sourceCommit: "f".repeat(40) }).includes("source commit mismatch"));
     assert.ok(validateReleaseParentRecord(current, { imageId: IMAGE_B }).includes("image id mismatch"));
     assert.ok(validateReleaseParentRecord({ ...current, harness: { ...current.harness, verifiedAfterRun: false } }).length > 0);
@@ -2738,7 +2741,7 @@ describe("SPLIT-07 -03 driver: the clear-HLS child", () => {
     const { result, error, world } = await drive();
     assert.equal(error, null, error ? String(error.message) : undefined);
     assert.equal(result.verdict, "PASS");
-    assert.equal(result.record.schema, "split07-release-image-candidate-03");
+    assert.equal(result.record.schema, "split07-release-image-candidate-04");
     const childOrder = world.dockerCalls
       .filter((call) => call.args[0] === "run" && (call.args.includes("--family") || call.args.includes("--acceptance-mode")))
       .map((call) => (call.args.includes("--family") ? call.args[call.args.indexOf("--family") + 1] : "clear-hls"));

@@ -12,7 +12,7 @@ import {
   type SourceQuality,
 } from "../../shared/worker/contracts.ts";
 import { deriveExecutionPlan } from "../execution/format-plan.ts";
-import { buildGenericFormatSelector } from "../execution/generic-source.ts";
+import { buildGenericFormatSelector, isSafeFormatId } from "../execution/generic-source.ts";
 import {
   YTDLP_ANALYSIS_MAX_RAW_FORMATS,
   analyzeGenericFormats,
@@ -126,10 +126,17 @@ const EXPECTED: Record<string, Expected> = {
     deliverable: 2160,
     withheld: [],
   },
+  // GENERIC-SEGMENTED-DASH-EXECUTION-001: `http_dash_segments` is now an
+  // admitted protocol, so these two DASH video rows are no longer refused on
+  // protocol. They are refused by the NEXT gate instead — their upstream ids
+  // (`dash-video=5000000`, `dash-video=16000000`) carry `=`, which the safe
+  // literal grammar excludes — and are reported for that real reason. Nothing
+  // delivered moved: the golden record still matches this scenario in full.
+  // Before this task the row read `unsupported_protocol`, 2, 2160.
   "case03-segmented-dash-above-progressive": {
     observed: 2160,
     deliverable: 720,
-    withheld: [["unsupported_protocol", 2, 2160]],
+    withheld: [["unsafe_selector_identity", 2, 2160]],
   },
   "case04-unsupported-container": {
     observed: 2160,
@@ -503,13 +510,15 @@ describe("P1 rendition inventory: the corpus", () => {
   }
 });
 
-describe("P1 rendition inventory: segmented DASH and non-admitted HLS stay inventory-only", () => {
+describe("P1 rendition inventory: non-admitted HLS stays inventory-only", () => {
   // case02 left this list in HLS-7: its clear-HLS rows are admitted and now
-  // delivered (see the HLS-7 describe below). What remains are manifests clear
-  // HLS v1 does not take — segmented DASH, an HLS row with no playlist URL and a
-  // hostile height, and X-shaped HLS video with no proven audio.
+  // delivered (see the HLS-7 describe below). case03 left it in
+  // GENERIC-SEGMENTED-DASH-EXECUTION-001: segmented DASH is an admitted protocol
+  // now, and its rows are refused by a later gate (see the describe after this
+  // one). What remains are manifests clear HLS v1 does not take — an HLS row
+  // with no playlist URL and a hostile height, and X-shaped HLS video with no
+  // proven audio.
   const manifestScenarios = [
-    "case03-segmented-dash-above-progressive",
     "case18-hostile-height-not-a-fact",
     "x-synthetic-x-progressive-unknown-audio-ffmpeg",
   ];
@@ -595,6 +604,42 @@ describe("P1 rendition inventory: segmented DASH and non-admitted HLS stay inven
       protectedUnenumerated: false,
       maybeProtectedObserved: false,
     });
+  });
+});
+
+describe("GENERIC-SEGMENTED-DASH-EXECUTION-001: case03's DASH rows now fail a LATER gate", () => {
+  it("case03: admitted by protocol, refused by the safe-id grammar, and nothing delivered moves", async () => {
+    const scenario = CORPUS.find((s) => s.name === "case03-segmented-dash-above-progressive")!;
+    const { video, selections, hlsSelections } = await analyzeScenario(scenario);
+    assert.deepEqual(hlsSelections, {});
+
+    const formats = (documentOf(scenario).formats ?? []) as Array<Record<string, unknown>>;
+    const dashIds = formats
+      .filter((f) => f.protocol === "http_dash_segments")
+      .map((f) => String(f.format_id));
+    assert.equal(dashIds.length, 3, "positive control: the scenario carries DASH rows");
+    // The rows are refused for their identifiers — which really are outside
+    // the grammar — and for nothing about their protocol.
+    for (const id of dashIds) assert.equal(isSafeFormatId(id), false, id);
+    const { inventory } = analyzeGenericFormats(formats as never, {
+      ffmpegAvailable: scenario.ffmpegAvailable,
+      maxFileSizeBytes: scenario.maxFileSizeBytes,
+    });
+    assert.deepEqual(
+      inventory.renditions.map((r) => [r.observed.height, r.observed.protocol, r.disposition]),
+      [
+        [720, "progressive", "deliverable"],
+        [1080, "dash-segmented", "unsafe-format-id"],
+        [2160, "dash-segmented", "unsafe-format-id"],
+      ],
+    );
+
+    // No selection names a DASH row; every preset is still the progressive 720.
+    const named = JSON.stringify(selections);
+    for (const id of dashIds) assert.equal(named.includes(id), false, id);
+    assert.deepEqual(sourceQualityOf(video).withheld, [
+      { reason: "unsafe_selector_identity", count: 2, maxObservedHeight: 2160 },
+    ]);
   });
 });
 

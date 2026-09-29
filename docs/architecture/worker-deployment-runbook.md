@@ -1103,9 +1103,14 @@ protocol. Measured against the pinned release's own `_get_suitable_downloader`:
 | :--- | :--- | :--- |
 | `https` (progressive) | no | `HttpFD` |
 | `m3u8_native` | no | `HlsFD` |
+| `http_dash_segments` | no | `DashSegmentsFD` (fragment delegate `dash_frag_urls` → none) |
 | `http_dash_segments` | yes | `DashSegmentsFD` |
 | `m3u8` / `m3u8_native` | **yes** | **`FFmpegFD`** |
 | `rtmp_ffmpeg` | — | **`FFmpegFD`** |
+
+*(The two `http_dash_segments` rows are the basis on which
+`GENERIC-SEGMENTED-DASH-EXECUTION-001` admitted that protocol — in source only,
+as split halves only; see §4k.)*
 
 **It guarantees** that no third-party downloader is ever invoked
 (`get_external_downloader()` is not even reached for the value `native`), that
@@ -1554,10 +1559,12 @@ work running while a future durable job still reports `downloading`. This is the
 fail-closed reading of the §4d acquisition boundary and can be widened later by
 a phase that proves the manifest is native — with evidence.
 
-> **Still current after HLS-7.** This rule governs what the **yt-dlp
-> downloader** may acquire, and no later phase has widened it.
-> `YTDLP_V1_NATIVE_PROTOCOLS` and `GENERIC_SOURCE_PROTOCOLS` are both still
-> exactly `["http", "https"]`. HLS-7 did not add `m3u8_native` to yt-dlp's
+> **Still current after HLS-7, for HLS.** This rule governs what the **yt-dlp
+> downloader** may acquire. No phase has widened it to HLS. HLS-7 left both
+> lists at exactly `["http", "https"]`; since `GENERIC-SEGMENTED-DASH-EXECUTION-001`
+> (source only) there is ONE list, `GENERIC_SOURCE_PROTOCOLS`, equal to
+> `["http", "https", "http_dash_segments"]` — a proven-native DASH spelling,
+> admitted with pinned-runtime evidence (§4k), and still no HLS spelling. HLS-7 did not add `m3u8_native` to yt-dlp's
 > download allowlist, and it did not make yt-dlp HLS acquisition acceptable.
 > Clear-HLS v1 renditions are discovered by yt-dlp during analysis, then
 > acquired by VideoFetch's own playlist preflight and fragment transport (§4j).
@@ -1890,10 +1897,16 @@ no DASH/fragments            no split video+audio merge
 >   Production by HLS-10 on 2026-09-26** (§4j). HLS acquisition is VideoFetch's
 >   own, not yt-dlp's.
 >
-> Every yt-dlp-side line still holds. yt-dlp downloads only progressive
-> HTTP/HTTPS source formats with its native downloader, and runs no FFmpeg and no
-> postprocessing. It performs neither the split merge nor any HLS download. *no
-> DASH/fragments* is unchanged: segmented DASH remains non-executable.
+> In Production, every yt-dlp-side line still holds. yt-dlp downloads only
+> progressive HTTP/HTTPS source formats with its native downloader, and runs no
+> FFmpeg and no postprocessing. It performs neither the split merge nor any HLS
+> download.
+>
+> *progressive HTTP/HTTPS source formats only* and *no DASH/fragments* are
+> superseded **in source only** by `GENERIC-SEGMENTED-DASH-EXECUTION-001`
+> (IMPLEMENTED IN SOURCE — PRODUCTION DEPLOYMENT / ACCEPTANCE PENDING): yt-dlp
+> may also acquire a segmented-DASH (`http_dash_segments`) split half with its
+> native `DashSegmentsFD`, still with no FFmpeg and no postprocessing (§4k).
 
 Source containers are a closed allowlist: **mp4/webm** for video, and
 mp4/webm/m4a/mp3/ogg/opus/aac/flac/wav for audio-only. An unknown or absent
@@ -1930,9 +1943,12 @@ uploader can influence the path.
 
 Five independent mechanisms, none trusted alone:
 
-1. `--downloader=native` (inherited from the base policy) → `HttpFD`;
-2. a single progressive http/https source, so no fragment or manifest
-   downloader is reachable and no merge is possible;
+1. `--downloader=native` (inherited from the base policy) → `HttpFD` (and,
+   since `GENERIC-SEGMENTED-DASH-EXECUTION-001` in source, `DashSegmentsFD`
+   with no fragment delegate for a segmented-DASH split half, §4k);
+2. a single approved source per subprocess on a protocol from the closed
+   vocabulary, so no HLS or other delegating downloader is reachable and no
+   merge is possible (at Phase 10C3: a single progressive http/https source);
 3. a PATH that resolves nothing, so `ffmpeg`/`ffprobe` cannot be found by bare
    name;
 4. `--ffmpeg-location` at a fixed nonexistent path, which makes the pinned
@@ -3269,9 +3285,12 @@ authoritative check of the playlist is the HLS-2 preflight at job time. A
 playlist that fails it fails the job closed with an existing public code
 (`FORMAT_UNAVAILABLE`). No HLS-specific error code exists.
 
-**The yt-dlp acquisition boundary did not move.** `YTDLP_V1_NATIVE_PROTOCOLS`
-and `GENERIC_SOURCE_PROTOCOLS` are both still exactly `["http", "https"]`.
-`m3u8_native` was **not** added to yt-dlp's download allowlist. yt-dlp may
+**The yt-dlp acquisition boundary did not move for HLS.** HLS-7 left
+`YTDLP_V1_NATIVE_PROTOCOLS` and `GENERIC_SOURCE_PROTOCOLS` both exactly
+`["http", "https"]`. (`GENERIC-SEGMENTED-DASH-EXECUTION-001` later merged them
+into the one `GENERIC_SOURCE_PROTOCOLS` and added `http_dash_segments` in source
+— still no HLS spelling; §4k.) `m3u8_native` was **not** added to yt-dlp's
+download allowlist. yt-dlp may
 discover a clear-HLS rendition, but it never downloads one. The warnings in
 §4c and §4g are still current: `m3u8_native` resolves to `HlsFD`, which can
 delegate to `FFmpegFD`, and live HLS goes straight to `FFmpegFD`. Those
@@ -3305,7 +3324,9 @@ analysis never fetches — is refused by the job-time HLS-2 preflight
 - separate HLS audio-rendition pairing;
 - HLS subtitles;
 - any HLS protocol spelling other than exactly `m3u8_native`;
-- **segmented DASH**, which remains inventory-only and non-executable.
+- **segmented DASH** — not an HLS concern. It was inventory-only here; since
+  `GENERIC-SEGMENTED-DASH-EXECUTION-001` (source only) a segmented-DASH split
+  half is acquired by yt-dlp's native `DashSegmentsFD`, never by this path (§4k).
 
 An HLS rendition that analysis does not admit to the clear-HLS v1 path still
 appears in `sourceQuality` as withheld with `unsupported_protocol`, and so does
@@ -3669,6 +3690,150 @@ both closed later on 2026-09-26:
 - The external liveness probe. Its first live deployment failed and was rolled
   back; the static-account deployment was then accepted (§8, §10).
 - `GET /v1/healthz` through the TLS endpoint — accepted (§10).
+
+### 4k. Segmented DASH — IMPLEMENTED IN SOURCE — PRODUCTION DEPLOYMENT / ACCEPTANCE PENDING
+
+*Recorded 2026-09-29 by `GENERIC-SEGMENTED-DASH-EXECUTION-001` (Draft PR,
+`feat/generic-segmented-dash-execution-001`). Source only: no image was built, no
+candidate was qualified, nothing was deployed, and the Production Worker does
+not contain this change. In Production a segmented-DASH rendition is still
+withheld exactly as §4g/§11h describe.*
+
+**What is admitted.** `GENERIC_SOURCE_PROTOCOLS`
+(`src/worker/execution/generic-source.ts`) is now the ONE closed vocabulary the
+analyzer, the private selection schema and the acquisition selector all read:
+`http`, `https`, `http_dash_segments`. The analyzer's former second list
+(`YTDLP_V1_NATIVE_PROTOCOLS`) is gone. NOT admitted: `http_dash_segments_generator`
+(emitted only by the pinned YouTube extractor's live-from-start path; its
+fragments are a callable that keeps polling the live manifest during the
+download), `m3u8`, `m3u8_native` (unchanged: clear HLS stays VideoFetch-owned,
+§4j), and every other spelling.
+
+**Pinned downloader proof** (yt-dlp `2026.08.19`, artifact SHA-256
+`1fa6733c…`, read from the pinned source and executed):
+
+| Protocol | Live | Downloader under the acquisition argv | Fragment delegate (`dash_frag_urls`) | FFmpeg |
+| :--- | :--- | :--- | :--- | :--- |
+| `http` / `https` | either | `HttpFD` | — | never |
+| `http_dash_segments` | no | `DashSegmentsFD` | none — fragments fetched natively | never |
+| `http_dash_segments` | yes | `DashSegmentsFD` (and it refuses live DASH itself) | none | never |
+| `http_dash_segments`, WITHOUT `--downloader=native` | yes | **`FFmpegFD`** | — | control only |
+
+The selection does not move when FFmpeg is made available. Proven by
+`src/worker/runtime/ytdlp-dash-downloader-contract.server.test.ts` (executes the
+pinned artifact; runs automatically inside the image, elsewhere only against a
+copy whose digest equals the pin) and re-proven inside every release candidate
+by `verify-download-policy.py` §7. The static pin in `generic-source.test.ts`
+fails the moment the runtime pin changes, so an upgrade cannot pass without this
+boundary being reviewed again.
+
+**Scope: split halves only.** A segmented source may be a proven video-only
+half (`audioConstraint: "absent"`) or a proven audio-only half
+(`videoConstraint: "absent"`, audio `codec-present`) of an ordinary
+`merge-split` pair — DASH + DASH, DASH + HTTPS or HTTPS + DASH; protocols never
+have to match. It never backs a `keep-original`, `extract-m4a` or `extract-mp3`
+plan (refused by the plan schema, the analyzer's preset construction and its
+structural assertion), and a muxed or unknown-audio segmented rendition is not a
+candidate at all (withheld as `unsupported_protocol`). Why: the pinned runtime
+marks every MPD-derived format `is_dash_periods`, and its default fixup would run
+`FFmpegFixupDuplicateMoovPP` (and `FFmpegFixupM4aPP` for DASH m4a) on every such
+download. `--fixup=never` correctly suppresses that during `downloading`, so the
+acquired file is the raw fragment concatenation. Only the Worker's own merge,
+after `beginProcessing()`, rewrites and validates it. Single-source DASH would be
+delivered verbatim, which nothing has yet proven safe.
+
+**Acquisition policy.** Unchanged except ONE added option:
+`--abort-on-unavailable-fragments`. The pinned default (`skip_unavailable_fragments=True`)
+skips a failed fragment after the first and exits 0 with media missing — proven
+against the pinned artifact on a local MPD. Every other rule stands:
+`--downloader=native`, dead acquisition `PATH`, dead `--ffmpeg-location`,
+`--fixup=never`, `--concurrent-fragments=1`, `--no-keep-fragments`, no
+postprocessor/external-downloader/merge/remux/exec options, one source per
+subprocess, no `+` and no `/` in any selector.
+
+**Fragment grammar** (pinned `FragmentFD`, observed on the real artifact):
+
+| Entry | Meaning |
+| :--- | :--- |
+| `<final>.ytdl` | JSON bookkeeping; not media; must be gone at success |
+| `<final>.part` | the aggregate, while fragments are appended |
+| `<final>.part-Frag<N>.part` | the fragment in flight (`N` from 1; fragment 1 is the init segment) |
+| `<final>.part-Frag<N>` | a completed fragment, about to be appended and removed |
+| `<final>` | the aggregate after the final rename |
+
+**Byte guard and progress.** For a segmented half the monitor lists the job
+directory each poll and charges the aggregate, the fragment in flight, any
+completed fragment's bytes not yet in the aggregate, and every unexpected entry
+against the run's allowance (the combined split budget minus the validated video
+bytes). "Not yet in the aggregate" is exact when the fragment was seen in flight
+(the pinned downloader appends strictly sequentially); a fragment never seen in
+flight is charged whole — conservative, and it can refuse media within one
+fragment of the ceiling. Progress counts each byte once and stays monotonic;
+`totalBytes` stays `null` unless both halves declared sizes. A segmented run's
+stdout is never read as a `--max-filesize` refusal (its fragments print no
+witness). Residual, deliberate: a single fragment whose DECLARED length alone
+exceeds the allowance is refused by the pinned per-fragment `HttpFD` before any
+byte is written and surfaces as a failed fragment — `EXTRACTION_FAILED`, not
+`TOO_LARGE`.
+
+**Workspace.** The 2 × `MAX_FILE_SIZE` bound is unchanged: during acquisition the
+physical peak is at most the combined allowance plus one fragment during its
+append window, itself ≤ 2 × max; processing is unchanged. Success still requires
+exactly `video-source.<ext>` then both halves — no fragment, `.part`, `.ytdl` or
+other entry.
+
+**Lifecycle.** `downloading` = acquisition only; `processing` = Worker
+FFmpeg only. Asserted (not inferred) by
+`src/worker/execution/segmented-dash-execution.server.test.ts`: every yt-dlp run
+starts while `downloading`, and every ffprobe and the FFmpeg merge start only
+after `beginProcessing()`.
+
+**Public contract.** Unchanged: no new field, reason, preset id or schema. A
+segmented rendition that became executable is now `deliverable` /
+`not_selected` / a pairing or size reason instead of `unsupported_protocol`, and
+one refused by an ordinary gate is reported for that gate (e.g. an MPD
+Representation id containing `=` is `unsafe_selector_identity`). No DASH URL,
+fragment URL, protocol, format id or selector reaches the browser, SQLite, logs
+or errors.
+
+**Release harness.** The clear-HLS acceptance chain imported the retired list and
+asserted "exactly `http`/`https`". Its invariant is restated as "the one
+vocabulary names no HLS spelling and equals exactly the reviewed
+`http`/`https`/`http_dash_segments`", which bumps
+`hls08-deterministic-full-path-03`, `hls09-release-image-full-path-02` and the
+parent `split07-release-image-candidate-04`. No record of any of the three has
+been produced yet. A dedicated segmented-DASH release-image child (real media
+merged by the image's own FFmpeg) does not exist yet and is the next
+harness task.
+
+**Mandatory Production acceptance source:**
+`https://youtu.be/S_XfAWeXRFQ?si=WAQXxhU-vUaD5PjB` (the user-reported failure:
+"Higher source quality detected · Highest observed 1080p · Best downloadable:
+Resolution unavailable · …a stream type VideoFetch does not support yet"). The
+rollout must (1) analyze it with the exact candidate; (2) record the sanitized
+protocol family and `sourceQuality`; (3) establish the highest accessible non-DRM
+quality; (4) if 1080p is accessible, confirm `preset:1080` is advertised; (5)
+submit it; (6) reach `ready`; (7) deliver a file with video and audio; (8)
+confirm 1080p when 1080p was selected; (9) confirm the unsupported-quality
+warning is absent for that quality; (10) confirm no generic "We hit a snag"
+masks a known failure.
+
+> **Finding recorded by this task — not a Production measurement.** A
+> metadata-only `-J` of that URL on 2026-09-29, with the hash-verified pinned
+> artifact and the Worker's own analysis argv, from a NON-Production host (no
+> cookies, no credentials, no media), exposed NO segmented DASH: `https`
+> adaptive video-only renditions up to 1080p (mp4 and webm), `https` audio-only
+> renditions, and `m3u8_native` video-only renditions up to 1080p plus two HLS
+> audio renditions with unknown codec. From that vantage current `main` already
+> advertises `preset:1080` (an `https` + `https` split). The Production symptom
+> matches a result in which the `https` renditions are absent and only the HLS
+> ones remain. So: **REGRESSION SOURCE REQUIRES ADDITIONAL ADAPTIVE SHAPE:
+> `m3u8_native` split (video-only + audio-only HLS renditions)** — the next
+> required work is a metadata-only diagnosis of that URL under the Production
+> image and egress, then, if confirmed, split clear-HLS (VideoFetch-owned
+> acquisition of an HLS video-only and audio-only pair, with audio presence
+> established by the transport's own checks rather than by metadata). This DASH
+> task does not claim to fix that URL.
 
 ---
 
@@ -6462,7 +6627,9 @@ MP4 formats passed every eligibility gate with established video, but carried no
   half, or a reason to admit an otherwise-ineligible format.
 - **Explicit absent-audio single sources stay out of scope.** A single progressive
   source with `acodec: "none"` is still advertised only as a split video half.
-- **HLS stays excluded.** `YTDLP_V1_NATIVE_PROTOCOLS` is still exactly `http`, `https`.
+- **HLS stays excluded.** `YTDLP_V1_NATIVE_PROTOCOLS` was exactly `http`, `https` at this
+  task (since `GENERIC-SEGMENTED-DASH-EXECUTION-001`, source only: the one
+  `GENERIC_SOURCE_PROTOCOLS`, which adds `http_dash_segments` and still no HLS, §4k).
 - **Enforced three times.** `assertGenericPresetBuild` fails analysis closed on:
   - a public/private audio mismatch;
   - an unknown source behind audio or MP3;
@@ -7918,8 +8085,10 @@ Advanced is the deliberate difference.
 **Scope.** P2 made the existing capability more truthful and added none:
 
 - at P2, HLS and segmented DASH were not implemented and were inventory-only.
-  Segmented DASH still is. Clear-HLS v1 was implemented in source later, by
-  HLS-7, and deployed to Production by HLS-10 on 2026-09-26 (§4j);
+  Clear-HLS v1 was implemented in source later, by HLS-7, and deployed to
+  Production by HLS-10 on 2026-09-26 (§4j). Segmented-DASH split halves were
+  implemented in source by `GENERIC-SEGMENTED-DASH-EXECUTION-001` and are not
+  deployed (§4k);
 - `observedMaxHeight` is not a provider's absolute maximum;
 - protected (DRM) renditions are not downloadable;
 - acquisition, processing and Worker execution are unchanged;
@@ -9343,7 +9512,7 @@ That record superseded the 2026-09-26 record of
 | Source rendition inventory | `sourceQuality` live in Production since 2026-09-18 21:00Z (`GENERIC-SOURCE-RENDITION-INVENTORY-001`); informational only, and no execution path reads it |
 | Source-vs-downloadable quality UI | `SOURCE-VS-DOWNLOADABLE-QUALITY-UI-001` — **live in Production since 2026-09-19** (Vercel only; browser presentation of `sourceQuality`; the Worker did not change) |
 | Clear-HLS v1 | **DEPLOYED / PRODUCTION ACCEPTED since 2026-09-26 (HLS-10)**, and contained in the current image, whose release qualification passed the clear-HLS child (146/146). Deliberately narrow: `m3u8_native` discovery only, a clear VOD MPEG-TS media playlist, one rendition with proven video and audio, VideoFetch-owned acquisition, and a Worker stream-copy remux after `beginProcessing()`. Every HLS rendition outside that path still appears only in `sourceQuality`, as withheld, and never as a download (§4j) |
-| Segmented DASH | **not implemented** — such renditions appear only in `sourceQuality`, as withheld, and never as a download |
+| Segmented DASH | **not in Production** — such renditions appear only in `sourceQuality`, as withheld, and never as a download. Split-half segmented DASH is **IMPLEMENTED IN SOURCE — PRODUCTION DEPLOYMENT / ACCEPTANCE PENDING** (`GENERIC-SEGMENTED-DASH-EXECUTION-001`, Draft PR, §4k); no image containing it has been built |
 | Generic preset `fileSize` | **DEPLOYED / PRODUCTION ACCEPTED 2026-09-27** (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, first in `sha256:0a6e66b0…`, and kept by the current image). Generic preset `fileSize` publishes only a positive-integer upstream-declared `filesize`. Approximation-only sources publish `null`, and so does the private selection size, which feeds progress `totalBytes`. A positive-integer `filesize_approx` stays private, for conservative size-limit admission, clear-HLS admission, ranking and `size_limit_exceeded`. Since 2026-09-28 (`GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001`, next row) a size field that is not a positive integer is unavailable for all of these purposes. A ready job's durable `fileSize` is the exact delivered byte count, which is a different meaning. These generic rules are unchanged by the direct-filesize rollout. Direct media follows its own provenance rule (next row), which is not the generic one |
 | Generic size-metadata reading | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED — 2026-09-28** (`GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001`, in the current image). yt-dlp `filesize` and `filesize_approx` are byte counts only when they are positive integers; a fractional, zero, negative, missing or null value is unavailable and is never rounded or coerced. A malformed declared size cannot hide a valid integer approximation, a fraction past the ceiling is size-unknown rather than a refusal, and a fractional approximation takes no part in ranking. The raw schema stays broad, the execution schema stays strict, and actual-byte enforcement is unchanged. The public shape is unchanged: preset `fileSize` stays a nullable number |
 | Generic preset ownership | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED — 2026-09-27** (`GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`, first in `sha256:fd7cdbc9…`, and kept by the current image). In private execution planning, only an own property of a private selection map establishes which family owns a requested generic preset; a prototype property can neither create an owner nor a false both-maps ambiguity. The maps are Worker-internal: public analysis neither accepts nor returns them, and no public field changed |

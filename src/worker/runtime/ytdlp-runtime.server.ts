@@ -274,8 +274,16 @@ export function ytdlpPolicyArgs(opts: { workDir?: string } = {}): readonly strin
  *     https               is_live=False  -> HttpFD          (native)
  *     m3u8_native         is_live=False  -> HlsFD           (native)
  *     m3u8_native         is_live=True   -> FFmpegFD        <-- forced
+ *     http_dash_segments  is_live=False  -> DashSegmentsFD  (native)
  *     http_dash_segments  is_live=True   -> DashSegmentsFD  (native prevents FFmpegFD)
+ *     dash_frag_urls      (the fragment delegate DashSegmentsFD looks up)
+ *                                        -> none            (fragments fetched natively)
  *     rtmp_ffmpeg                        -> FFmpegFD        <-- forced
+ *
+ * GENERIC-SEGMENTED-DASH-EXECUTION-001 admitted `http_dash_segments` to the
+ * generic source vocabulary on the strength of the two DASH rows; both are
+ * re-proven against the pinned artifact by `verify-download-policy.py` and by
+ * `ytdlp-dash-downloader-contract.server.test.ts`.
  */
 export const YTDLP_FFMPEG_ACQUISITION_MODES = Object.freeze([
   // `if protocol in ('m3u8', 'm3u8_native'): if info_dict.get('is_live'): return FFmpegFD`

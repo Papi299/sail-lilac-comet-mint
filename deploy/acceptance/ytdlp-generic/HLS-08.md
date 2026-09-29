@@ -21,7 +21,7 @@ qualification) and **not** HLS-10 (promotion or real-source acceptance).
 The orchestrator `hls-full-path.mjs` is shared with HLS-09. It takes a required,
 explicit `--acceptance-mode`; HLS-08 is `overlay` mode, and `run-hls-acceptance.mjs`
 passes it. The mode changes only identity and the record: overlay mode still
-emits `hls08-deterministic-full-path-02` with exactly the mandatory checks and
+emits `hls08-deterministic-full-path-03` with exactly the mandatory checks and
 PASS meaning described here. `release-image` mode is HLS-09's, launched by the
 SPLIT-07 release-image gate — see [`HLS-09.md`](HLS-09.md).
 
@@ -280,15 +280,17 @@ stopping it again afterwards is the operator's step.
 
 ## Evidence
 
-Schema `hls08-deterministic-full-path-02` (`lib/hls-evidence.mjs`).
+Schema `hls08-deterministic-full-path-03` (`lib/hls-evidence.mjs`).
 
 | Schema | Meaning |
 | :--- | :--- |
 | `-01` | **Historical, not accepted for HLS-8 closure.** The first record, from PR #78 head `da4f63d9…`. Its hostname/page-echo placement check was too permissive: it admitted any hostname occurrence not followed by `:` or `/` (so `<host>.evil`, `<host>X`, `<host>?x=1`, or the bare hostname in any unrelated field) and any occurrence followed by the page route (so `<page>?x=1`, `<page>#x`, `<page>/extra`). |
 | `-02` | Field-aware privacy placement, as described above. The single durable privacy check of `-01` is split into exact-echo, rows, views and raw-bytes checks, and the public exact echo is its own check. |
+| `-03` | Everything `-02` means, with HLS-7's protocol invariant RESTATED by `GENERIC-SEGMENTED-DASH-EXECUTION-001`: the two retired checks (`invariants/ytdlp-native-protocols-http-https`, `invariants/generic-source-protocols-http-https`) required both yt-dlp lists to be exactly `http`/`https`; there is now ONE list, deliberately carrying `http_dash_segments`, so `-03` requires `invariants/generic-source-protocols-exclude-hls` (no HLS spelling) and `invariants/generic-source-protocols-reviewed-vocabulary` (exactly `http`/`https`/`http_dash_segments`). **No `-03` record has been produced yet.** |
 
-`-01` records are never rewritten or re-read under `-02`; the `-02` validator
-refuses them on the schema. There is no
+`-01` records are never rewritten or re-read under `-02`, nor `-02` records under
+`-03`; the current validator refuses them on the schema. The accepted `-02` record
+(PR #78, PASS 144/144) stays historically true for the source it named. There is no
 partial PASS: every name in `HLS08_MANDATORY_CHECKS` must be recorded exactly
 once and pass, and every other recorded check must pass. The builder is an
 allowlist, refuses raw-material keys (`stderr`, `stdout`, `argv`,

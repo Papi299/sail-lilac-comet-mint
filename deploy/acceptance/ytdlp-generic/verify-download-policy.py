@@ -14,7 +14,12 @@ What it proves (§66):
      any QuickJS binary;
   5. the approved absolute Node path still executes;
   6. under the fixed nonexistent --ffmpeg-location, the pinned release reports
-     FFmpeg and ffprobe as UNAVAILABLE, and FFmpegFD is unavailable with it.
+     FFmpeg and ffprobe as UNAVAILABLE, and FFmpegFD is unavailable with it;
+  7. (GENERIC-SEGMENTED-DASH-EXECUTION-001) every admitted source protocol
+     selects a NATIVE downloader under the parsed policy: http/https -> HttpFD,
+     http_dash_segments -> DashSegmentsFD whose fragment delegate
+     (`dash_frag_urls`) resolves to nothing, live or not, and whether or not
+     FFmpeg is available — and fragment skipping is OFF.
 
 Usage:
     /usr/bin/python3 verify-download-policy.py /usr/local/lib/videofetch/yt-dlp
@@ -90,6 +95,7 @@ def main(artifact: str) -> int:
         f"--max-filesize={MAX_BYTES}",
         "--concurrent-fragments=1",
         "--no-keep-fragments",
+        "--abort-on-unavailable-fragments",
         "--no-mtime",
         "--no-overwrites",
         f"--format={SELECTOR}",
@@ -122,6 +128,9 @@ def main(artifact: str) -> int:
     expect("ffmpeg location", opts.ffmpeg_location, DEAD_FFMPEG)
     expect("concurrent fragments", opts.concurrent_fragment_downloads, 1)
     expect("keep fragments", opts.keep_fragments, False)
+    # The pinned DEFAULT is True: a failed fragment after the first would be
+    # skipped and the run would still exit 0 with media missing.
+    expect("skip unavailable fragments (--abort-on-unavailable-fragments)", opts.skip_unavailable_fragments, False)
     expect("overwrites", opts.overwrites, False)
     expect("updatetime (--no-mtime)", opts.updatetime, False)
     expect("retries (raw)", opts.retries, "2")
@@ -148,6 +157,55 @@ def main(artifact: str) -> int:
     expect("no thumbnail written", getattr(opts, "writethumbnail", False), False)
     expect("no cookies file", getattr(opts, "cookiefile", None), None)
     expect("no cookies from browser", getattr(opts, "cookiesfrombrowser", None), None)
+
+    # ── 7. admitted protocols select a native, non-delegating downloader ────
+    # Run before §6, which rewrites PATH for the rest of this process.
+    print("\n7. admitted source protocols select a native downloader that never delegates to FFmpeg")
+    from yt_dlp.downloader import get_suitable_downloader
+    from yt_dlp.downloader.external import FFmpegFD as _FFmpegFD
+
+    selection_params = {"external_downloader": opts.external_downloader}
+
+    def select(protocol, is_live, frag_lookup=False):
+        info = {"protocol": protocol, "url": "https://example.invalid/m", "is_live": is_live,
+                "fragments": [{"url": "https://example.invalid/f1"}]}
+        if frag_lookup:
+            # Exactly the lookup DashSegmentsFD.real_download makes for its fragments.
+            found = get_suitable_downloader(dict(info), selection_params, None, protocol="dash_frag_urls", to_stdout=False)
+        else:
+            found = get_suitable_downloader(dict(info), selection_params)
+        return found.__name__ if found else None
+
+    def selection_table():
+        rows = {}
+        for live in (False, True):
+            for proto in ("http", "https"):
+                rows[f"{proto} live={live}"] = select(proto, live)
+            rows[f"http_dash_segments live={live}"] = select("http_dash_segments", live)
+            rows[f"http_dash_segments live={live} fragment delegate"] = select("http_dash_segments", live, frag_lookup=True)
+        return rows
+
+    wanted = {}
+    for live in (False, True):
+        wanted[f"http live={live}"] = "HttpFD"
+        wanted[f"https live={live}"] = "HttpFD"
+        wanted[f"http_dash_segments live={live}"] = "DashSegmentsFD"
+        wanted[f"http_dash_segments live={live} fragment delegate"] = None
+    observed = selection_table()
+    for key, value in wanted.items():
+        expect(key, observed.get(key), value)
+    # FFmpeg availability must not move any selection: pretend it IS available.
+    real_available = _FFmpegFD.available
+    _FFmpegFD.available = classmethod(lambda cls, path=None: True)
+    try:
+        expect("selection unchanged when FFmpeg is available", selection_table(), observed)
+    finally:
+        _FFmpegFD.available = real_available
+    # Control: WITHOUT the native policy a live DASH source goes to FFmpegFD,
+    # so the expectations above are held by `--downloader=native` itself.
+    selection_params = {"external_downloader": None}
+    expect("control: live DASH without the native policy", select("http_dash_segments", True), "FFmpegFD")
+    selection_params = {"external_downloader": opts.external_downloader}
 
     # ── 4. the acquisition PATH resolves nothing ────────────────────────────
     print("\n4. the acquisition PATH resolves no media or JS tooling")

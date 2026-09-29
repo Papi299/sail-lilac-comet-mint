@@ -59,10 +59,10 @@ export const HLS08_ORCHESTRATOR = "deploy/acceptance/ytdlp-generic/hls-full-path
  * to be present (`lib/hls-acceptance-mode.mjs`):
  *
  *   overlay        HLS-08: the candidate source overlaid on the accepted
- *                  historical runtime; emits `hls08-deterministic-full-path-02`.
+ *                  historical runtime; emits `hls08-deterministic-full-path-03`.
  *   release-image  HLS-09: the real `Dockerfile.worker` release candidate,
  *                  launched by the SPLIT-07 parent; emits
- *                  `hls09-release-image-full-path-01`.
+ *                  `hls09-release-image-full-path-02`.
  */
 export const HLS_ACCEPTANCE_MODE_FLAG = "--acceptance-mode";
 export const HLS_ACCEPTANCE_MODES = Object.freeze({
