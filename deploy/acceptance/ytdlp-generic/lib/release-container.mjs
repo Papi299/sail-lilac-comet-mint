@@ -682,6 +682,95 @@ export function releaseHlsAcceptanceRunArgs({
   ]);
 }
 
+/** The DASH-01 segmented-DASH release child, at its repository-relative path. */
+export const DASH01_ORCHESTRATOR = "deploy/acceptance/ytdlp-generic/dash-full-path.mjs";
+
+/**
+ * The DASH-01 segmented-DASH release child `docker run` argv, against the
+ * RELEASE image (since SPLIT-07 `-05`).
+ *
+ * Its own builder, like the clear-HLS child's. The container shape is exactly
+ * the SPLIT-06 release run's — `--network none`, `--cap-drop=ALL`,
+ * `no-new-privileges`, `--read-only`, the Product media workspace bound at
+ * `/tmp/videofetch` in Production's exact `--mount type=bind` form, the harness
+ * scratch tmpfs with `TMPDIR` pointing at it, the harness read-only at its
+ * repository-relative path, the report directory — and, unlike the clear-HLS
+ * child, NO `--add-host`: the segmented fixture is addressed by loopback IP
+ * through an exact-fixture URL validator, as SPLIT-06's is.
+ *
+ * The identity the child records is placed here from the PARENT's
+ * observations; the immutable id is also this container's run subject, so the
+ * child is told exactly the id Docker is told to execute.
+ */
+export function releaseDashAcceptanceRunArgs({
+  imageId,
+  harnessDir,
+  reportDir,
+  mediaWorkspaceDir,
+  evidenceName,
+  sourceCommit,
+  sourceTree,
+  candidateTag,
+  containerReportDir = REPORT_MOUNT_TARGET,
+}) {
+  assertImmutableImageId(imageId);
+  requireAbsoluteHostPath("the harness directory", harnessDir);
+  requireAbsoluteHostPath("the report directory", reportDir);
+  const productMediaMount = productMediaWorkspaceMount(mediaWorkspaceDir);
+  if (hostPathsOverlap(mediaWorkspaceDir, reportDir)) {
+    throw new Error("the Product media workspace must not overlap the report directory");
+  }
+  if (hostPathsOverlap(mediaWorkspaceDir, harnessDir)) {
+    throw new Error("the Product media workspace must not overlap the harness directory");
+  }
+  if (typeof evidenceName !== "string" || !/^[A-Za-z0-9._-]+$/.test(evidenceName)) {
+    throw new Error("the evidence filename must be a plain basename");
+  }
+  for (const [label, value] of [["source commit", sourceCommit], ["source tree", sourceTree]]) {
+    if (typeof value !== "string" || !/^[0-9a-f]{40}$/.test(value)) {
+      throw new Error(`the release ${label} must be a full 40-hex SHA`);
+    }
+  }
+  assertCandidateReference(candidateTag);
+  return assertNoForbiddenMounts([
+    "run",
+    "--rm",
+    ...RELEASE_HARDENING_ARGS,
+    "--read-only",
+    "--mount",
+    productMediaMount,
+    "--tmpfs",
+    HARNESS_SCRATCH_TMPFS,
+    ...RELEASE_RUN_ENVIRONMENT.flatMap((entry) => ["-e", entry]),
+    "-v",
+    `${harnessDir}:${HARNESS_MOUNT_TARGET}:ro`,
+    "-v",
+    `${reportDir}:${containerReportDir}`,
+    "-w",
+    "/app",
+    "--entrypoint",
+    "/usr/local/bin/node",
+    imageId,
+    "--import",
+    "./scripts/register-ts-aliases.mjs",
+    "--experimental-strip-types",
+    DASH01_ORCHESTRATOR,
+    "--evidence",
+    `${containerReportDir}/${evidenceName}`,
+    "--source-commit",
+    sourceCommit,
+    "--source-tree",
+    sourceTree,
+    "--source-context-clean",
+    "--candidate-tag",
+    candidateTag,
+    "--candidate-image-id",
+    imageId,
+    "--run-image-id",
+    imageId,
+  ]);
+}
+
 /**
  * The docker-run options the HLS-09 release child may carry, with whether each
  * takes a value. Anything else — `--privileged`, `--user`, `--env-file`,
@@ -717,6 +806,36 @@ const RELEASE_HLS_FORBIDDEN_NAMES =
  * must run in `release-image` mode.
  */
 export function releaseHlsRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }) {
+  return releaseChildRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }, RELEASE_HLS_CHILD_MODEL);
+}
+
+/**
+ * The DASH-01 release child's run posture (since SPLIT-07 `-05`), re-derived
+ * structurally exactly as the clear-HLS child's is — with NO `--add-host`, the
+ * DASH orchestrator exactly once, and the child told the immutable id it runs
+ * as, both as candidate image and as run subject.
+ */
+export function releaseDashRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }) {
+  return releaseChildRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }, RELEASE_DASH_CHILD_MODEL);
+}
+
+const RELEASE_HLS_CHILD_MODEL = Object.freeze({
+  addHost: HLS08_FIXTURE_HOST_MAPPING,
+  orchestrator: HLS08_ORCHESTRATOR,
+  orchestratorMessage: "the clear-HLS orchestrator must run exactly once",
+  mode: { flag: HLS_ACCEPTANCE_MODE_FLAG, value: HLS_ACCEPTANCE_MODES.releaseImage },
+  identityFlags: false,
+});
+
+const RELEASE_DASH_CHILD_MODEL = Object.freeze({
+  addHost: null,
+  orchestrator: DASH01_ORCHESTRATOR,
+  orchestratorMessage: "the segmented-DASH orchestrator must run exactly once",
+  mode: null,
+  identityFlags: true,
+});
+
+function releaseChildRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }, model) {
   const argv = Array.isArray(args) ? args.map(String) : [];
   const violations = [];
   if (argv[0] !== "run") violations.push("not a docker run");
@@ -764,7 +883,11 @@ export function releaseHlsRunPostureViolations(args, { reportDir, harnessDir, me
   if (values("--rm").length !== 1) violations.push("--rm missing");
   if (values("--read-only").length !== 1) violations.push("--read-only missing");
   exactlyOnce("--network", "none", "--network none missing or overridden");
-  exactlyOnce("--add-host", HLS08_FIXTURE_HOST_MAPPING, "exactly one --add-host with the fixture mapping is required");
+  if (model.addHost === null) {
+    if (values("--add-host").length !== 0) violations.push("no --add-host is allowed");
+  } else {
+    exactlyOnce("--add-host", model.addHost, "exactly one --add-host with the fixture mapping is required");
+  }
   exactlyOnce("--cap-drop", "ALL", "--cap-drop=ALL missing or overridden");
   exactlyOnce("--security-opt", "no-new-privileges", "no-new-privileges missing or overridden");
   exactlyOnce("--mount", expectedMediaMount, "exactly one Product media workspace bind at /tmp/videofetch is required");
@@ -779,15 +902,22 @@ export function releaseHlsRunPostureViolations(args, { reportDir, harnessDir, me
   }
 
   const tail = argv.slice(i + 1);
-  if (tail.filter((arg) => arg === HLS08_ORCHESTRATOR).length !== 1) {
-    violations.push("the clear-HLS orchestrator must run exactly once");
+  if (tail.filter((arg) => arg === model.orchestrator).length !== 1) {
+    violations.push(model.orchestratorMessage);
   }
-  const modeAt = tail.indexOf(HLS_ACCEPTANCE_MODE_FLAG);
-  if (
-    tail.filter((arg) => arg === HLS_ACCEPTANCE_MODE_FLAG).length !== 1 ||
-    tail[modeAt + 1] !== HLS_ACCEPTANCE_MODES.releaseImage
-  ) {
-    violations.push("the orchestrator must run in release-image mode");
+  if (model.mode !== null) {
+    const modeAt = tail.indexOf(model.mode.flag);
+    if (tail.filter((arg) => arg === model.mode.flag).length !== 1 || tail[modeAt + 1] !== model.mode.value) {
+      violations.push("the orchestrator must run in release-image mode");
+    }
+  }
+  if (model.identityFlags) {
+    const told = (flag) => tail.flatMap((arg, at) => (arg === flag ? [tail[at + 1]] : []));
+    const candidate = told("--candidate-image-id");
+    const subject = told("--run-image-id");
+    if (candidate.length !== 1 || subject.length !== 1 || candidate[0] !== image || subject[0] !== image) {
+      violations.push("the child must be told exactly the immutable id it runs as");
+    }
   }
 
   if (argv.some((arg) => RELEASE_HLS_FORBIDDEN_NAMES.test(arg))) {

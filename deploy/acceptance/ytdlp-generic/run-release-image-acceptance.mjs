@@ -2,14 +2,16 @@
 //
 // The SPLIT-07 host driver: verify a clean release source, build the ACTUAL
 // `Dockerfile.worker` image, characterize it, and run the existing SPLIT-06
-// deterministic full path against it — mp4 AND webm — and (since -03) the
-// HLS-09 clear-HLS release child, before emitting one release-image candidate
-// record. Every child runs the same immutable candidate image id.
+// deterministic full path against it — mp4 AND webm — (since -03) the HLS-09
+// clear-HLS release child and (since -05) the DASH-01 segmented-DASH real-media
+// child, before emitting one release-image candidate record. Every child runs
+// the same immutable candidate image id.
 //
 // ── Child order (deterministic) ────────────────────────────────────────────
 //
 //   characterization → SPLIT-06 mp4 → clear workspace → SPLIT-06 webm
-//   → clear workspace → HLS-09 clear-HLS → clear workspace → parent
+//   → clear workspace → HLS-09 clear-HLS → clear workspace
+//   → DASH-01 segmented DASH → clear workspace → parent
 //
 // Before each child the harness is re-verified and the Product media workspace
 // must be empty; after each child the workspace is cleared and re-proven empty.
@@ -95,6 +97,8 @@ import {
   productMediaWorkspaceMount,
   releaseAcceptanceRunArgs,
   releaseBuildArgs,
+  releaseDashAcceptanceRunArgs,
+  releaseDashRunPostureViolations,
   releaseHlsAcceptanceRunArgs,
   releaseHlsRunPostureViolations,
 } from "./lib/release-container.mjs";
@@ -112,6 +116,8 @@ import {
   ALLOWED_IMAGE_ENTRYPOINTS,
   assertChildUnchanged,
   buildReleaseEvidence,
+  DASH_CANDIDATE_RUN_PURPOSE,
+  emptyDashChildObservation,
   emptyHlsChildObservation,
   ENTRYPOINT_SHIM_PATH,
   EXPECTED_IMAGE_CONFIG,
@@ -124,6 +130,7 @@ import {
   renderReleaseEvidence,
   SPLIT07_EVIDENCE_SCHEMA,
   validateChildRecord,
+  validateDashChildRecord,
   validateHlsChildRecord,
   validateReleaseParentRecord,
 } from "./lib/release-evidence.mjs";
@@ -759,6 +766,57 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       `${hlsChild.checkCount} checks sha256=${hlsChild.sha256 ?? "n/a"}\n`);
     await clearMediaWorkspace("hls09-clear-hls");
 
+    // ── 6c. The DASH-01 segmented-DASH real-media child (since -05) ────────
+    //
+    // Real fragmented DASH through the candidate's own pinned yt-dlp
+    // `DashSegmentsFD`, real ffprobe input validation, the real
+    // `mergeSplitMedia` FFmpeg stream copy and real output validation, on a
+    // deterministic 1920x1080 fixture; plus its three bounded negatives. Same
+    // hardening as the SPLIT-06 children and no `--add-host`; the posture is
+    // re-derived from the argv before it runs.
+    await verifyHarnessAt("before-dash01-segmented-dash");
+    await admitMediaWorkspace("before-dash01-segmented-dash");
+    const dashEvidenceName = `dash01-segmented-dash-${now()}.json`;
+    await admitEvidencePath(join(opts.report, dashEvidenceName), deps);
+    const dashArgs = releaseDashAcceptanceRunArgs({
+      imageId: runSubject,
+      harnessDir,
+      reportDir: opts.report,
+      mediaWorkspaceDir: opts.mediaWorkspace,
+      evidenceName: dashEvidenceName,
+      sourceCommit: provenance.source,
+      sourceTree: provenance.tree,
+      candidateTag: image,
+    });
+    const dashViolations = releaseDashRunPostureViolations(dashArgs, {
+      reportDir: opts.report,
+      harnessDir,
+      mediaWorkspaceDir: opts.mediaWorkspace,
+    });
+    if (dashViolations.length > 0) {
+      throw new Error(`refusing a segmented-DASH child with posture violations: ${dashViolations.join("; ")}`);
+    }
+    log(`[split07] DASH-01 segmented DASH against the release candidate\n`);
+    const dashResult = await runCandidate(DASH_CANDIDATE_RUN_PURPOSE, dashArgs);
+    let dashChild;
+    try {
+      dashChild = validateDashChildRecord({
+        bytes: await readFileBytes(join(opts.report, dashEvidenceName)),
+        expected: {
+          sourceCommit: provenance.source,
+          sourceTree: provenance.tree,
+          candidateTag: image,
+          candidateImageId: imageId,
+        },
+      });
+    } catch {
+      dashChild = emptyDashChildObservation("the segmented-DASH child record is unreadable");
+    }
+    dashChild = { ...dashChild, path: dashEvidenceName, exitCode: dashResult.code };
+    log(`[split07] DASH-01 segmented DASH: ${dashChild.verdict ?? "UNREADABLE"} ` +
+      `${dashChild.checkCount} checks sha256=${dashChild.sha256 ?? "n/a"}\n`);
+    await clearMediaWorkspace("dash01-segmented-dash");
+
     // The children are re-read and re-hashed here, so the digests the parent
     // records describe bytes that were still identical at assembly time.
     const children = [];
@@ -781,8 +839,17 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       });
       hlsChildReverified = true;
     }
+    let dashChildReverified = false;
+    if (dashChild.sha256 !== null) {
+      assertChildUnchanged({
+        family: "segmented-DASH",
+        expectedSha256: dashChild.sha256,
+        bytes: await readFileBytes(join(opts.report, dashChild.path)),
+      });
+      dashChildReverified = true;
+    }
 
-    // The harness must STILL be exactly what was verified, now that all three
+    // The harness must STILL be exactly what was verified, now that all four
     // children have consumed it. A harness modified at any point in the run
     // makes the run's own measurements untrustworthy, so the record is refused
     // outright rather than emitted as a FAIL.
@@ -856,6 +923,32 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       "hls/child-evidence-unchanged-before-assembly",
       hlsChildReverified,
       hlsChild.sha256 ?? "no bytes to re-verify",
+    );
+
+    // The segmented-DASH child (since -05): it ran, its record is a validated
+    // DASH-01 PASS, it names this release source, and it ran as the immutable
+    // id this driver told Docker to execute for it, offline.
+    const dashRun = candidateRuns.find((entry) => entry.purpose === DASH_CANDIDATE_RUN_PURPOSE);
+    checks.record("dash/segmented-dash-child-executed", dashRun !== undefined, DASH_CANDIDATE_RUN_PURPOSE);
+    checks.record("dash/segmented-dash-child-passed", dashChild.ok === true, dashChild.reason);
+    checks.record(
+      "dash/child-names-the-release-source",
+      dashChild.sourceCommit === provenance.source && dashChild.sourceTree === provenance.tree,
+      `${String(dashChild.sourceCommit)} ${String(dashChild.sourceTree)}`,
+    );
+    checks.record(
+      "dash/child-ran-in-the-candidate-image",
+      dashRun?.subject === imageId &&
+        dashChild.candidateImageId === imageId &&
+        dashChild.runImageId === imageId &&
+        dashChild.candidateTag === image &&
+        dashChild.networkMode === "none",
+      imageId,
+    );
+    checks.record(
+      "dash/child-evidence-unchanged-before-assembly",
+      dashChildReverified,
+      dashChild.sha256 ?? "no bytes to re-verify",
     );
 
     // ── 7. Production identity, AFTER ──────────────────────────────────────
@@ -1002,6 +1095,26 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
           runImageId: hlsChild.runImageId,
           networkMode: hlsChild.networkMode,
           reason: hlsChild.reason,
+        },
+      },
+      dashAcceptance: {
+        executed: dashRun !== undefined,
+        child: {
+          schema: dashChild.schema,
+          verdict: dashChild.verdict,
+          ok: dashChild.ok,
+          sha256: dashChild.sha256,
+          bytes: dashChild.bytes,
+          checkCount: dashChild.checkCount,
+          failedCheckCount: dashChild.failedCheckCount,
+          evidenceFile: dashChild.path,
+          sourceCommit: dashChild.sourceCommit,
+          sourceTree: dashChild.sourceTree,
+          candidateTag: dashChild.candidateTag,
+          candidateImageId: dashChild.candidateImageId,
+          runImageId: dashChild.runImageId,
+          networkMode: dashChild.networkMode,
+          reason: dashChild.reason,
         },
       },
       production: {

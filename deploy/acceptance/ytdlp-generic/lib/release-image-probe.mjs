@@ -71,6 +71,7 @@ const HARNESS_PATHS = [
   "/app/verify",
   "/app/scripts/ytdlp-split-acceptance.test.mjs",
   "/app/scripts/ytdlp-release-image-acceptance.test.mjs",
+  "/app/scripts/ytdlp-dash-acceptance.test.mjs",
 ];
 
 async function main(argv) {

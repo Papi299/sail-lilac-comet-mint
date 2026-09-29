@@ -31,9 +31,19 @@
 // the SPLIT-06 children are: schema, verdict, every check, the release source
 // and the candidate image it names, the network mode, and a digest re-checked
 // immediately before the parent is assembled.
+//
+// ── The segmented-DASH child (since -05) ────────────────────────────────────
+//
+// GENERIC-SEGMENTED-DASH-EXECUTION-001 made `http_dash_segments` executable as
+// split halves. The DASH-01 child (`dash01-release-image-full-path-01`) is the
+// real-media proof of that path in the candidate image: the pinned native
+// `DashSegmentsFD`, the real ffprobe and the real `mergeSplitMedia` FFmpeg, on
+// a deterministic 1920x1080 segmented fixture. It has its own `dashAcceptance`
+// block and is validated from its exact bytes exactly as the clear-HLS child is.
 
 import { createHash } from "node:crypto";
 
+import { DASH01_RELEASE_EVIDENCE_SCHEMA, validateDashReleaseChildRecord } from "./dash-evidence.mjs";
 import { FORBIDDEN_EVIDENCE_KEYS, stripForbiddenKeys } from "./evidence.mjs";
 import {
   HLS09_RELEASE_EVIDENCE_SCHEMA,
@@ -94,18 +104,26 @@ import {
  *   -04  everything -03 means, with the clear-HLS child's schema moved to
  *        `hls09-release-image-full-path-02` (GENERIC-SEGMENTED-DASH-EXECUTION-001
  *        restated HLS-7's protocol invariant for the one shared vocabulary that
- *        now carries `http_dash_segments`). The current release-image
- *        qualification: mp4 + webm + clear-HLS. It does NOT by itself run a
- *        segmented-DASH child; the pinned DASH downloader contract is carried by
- *        the two policy verifiers every -04 PASS already requires.
+ *        now carries `http_dash_segments`). mp4 + webm + clear-HLS. It runs no
+ *        segmented-DASH child, so it proves nothing about real fragmented-DASH
+ *        media reaching the Worker's FFmpeg; no -04 record was ever produced.
+ *        Historical; never read as -05.
+ *   -05  everything -04 means, PLUS a validated, byte-hashed DASH-01
+ *        segmented-DASH real-media child (`dash01-release-image-full-path-01`)
+ *        PASS, executed by the SAME immutable candidate image id, naming the
+ *        same release source, offline; the harness re-verified before that
+ *        child and again after it; `dash01:segmented-dash` in the candidate run
+ *        ledger. The current release-image qualification:
+ *        mp4 + webm + clear-HLS + segmented DASH.
  */
-export const SPLIT07_EVIDENCE_SCHEMA = "split07-release-image-candidate-04";
+export const SPLIT07_EVIDENCE_SCHEMA = "split07-release-image-candidate-05";
 
-/** The historical parent schemas. Never rewritten, and never read as -04. */
+/** The historical parent schemas. Never rewritten, and never read as -05. */
 export const HISTORICAL_SPLIT07_SCHEMAS = Object.freeze([
   "split07-release-image-candidate-01",
   "split07-release-image-candidate-02",
   "split07-release-image-candidate-03",
+  "split07-release-image-candidate-04",
 ]);
 
 /** The exact SPLIT-06 schema a SPLIT-07 PASS accepts as a child. */
@@ -120,10 +138,16 @@ export const REQUIRED_HLS_CHILD_SCHEMA = HLS09_RELEASE_EVIDENCE_SCHEMA;
 /** The candidate-run purpose of the clear-HLS release child. */
 export const HLS_CANDIDATE_RUN_PURPOSE = "hls09:clear-hls";
 
+/** The exact segmented-DASH child schema a PASS accepts (since -05). */
+export const REQUIRED_DASH_CHILD_SCHEMA = DASH01_RELEASE_EVIDENCE_SCHEMA;
+
+/** The candidate-run purpose of the segmented-DASH release child. */
+export const DASH_CANDIDATE_RUN_PURPOSE = "dash01:segmented-dash";
+
 /**
  * Every candidate container a PASS requires, by purpose: four image probes,
- * two policy verifiers, SPLIT-06 mp4 and webm, and (since -03) the HLS-09
- * clear-HLS child. Each one must have executed the immutable image ID; a
+ * two policy verifiers, SPLIT-06 mp4 and webm, (since -03) the HLS-09
+ * clear-HLS child and (since -05) the DASH-01 segmented-DASH child. Each one must have executed the immutable image ID; a
  * purpose missing from the record is a characterization that never ran.
  */
 export const REQUIRED_CANDIDATE_RUN_PURPOSES = Object.freeze([
@@ -134,19 +158,21 @@ export const REQUIRED_CANDIDATE_RUN_PURPOSES = Object.freeze([
   ...POLICY_VERIFIERS.map((verifier) => `verifier:${verifier}`),
   ...REQUIRED_SPLIT_FAMILIES.map((family) => `split06:${family}`),
   HLS_CANDIDATE_RUN_PURPOSE,
+  DASH_CANDIDATE_RUN_PURPOSE,
 ]);
 
 /**
- * Where the harness is re-verified, in order (since -03 exactly). The harness
- * is consumed by every child, so it is verified before any Docker command,
- * after the build, before EACH child, and once more after the last child —
- * the clear-HLS one — before the parent record is assembled.
+ * Where the harness is re-verified, in order (exactly). The harness is consumed
+ * by every child, so it is verified before any Docker command, after the
+ * build, before EACH child, and once more after the last child — since -05 the
+ * segmented-DASH one — before the parent record is assembled.
  */
 export const HARNESS_VERIFICATION_POINTS = Object.freeze([
   "before-docker",
   "after-build",
   ...REQUIRED_SPLIT_FAMILIES.map((family) => `before-split06-${family}`),
   "before-hls09-clear-hls",
+  "before-dash01-segmented-dash",
   "after-children",
 ]);
 
@@ -307,6 +333,11 @@ export const REQUIRED_PASS_CHECKS = Object.freeze([
   "hls/child-names-the-release-source",
   "hls/child-ran-in-the-candidate-image",
   "hls/child-evidence-unchanged-before-assembly",
+  "dash/segmented-dash-child-executed",
+  "dash/segmented-dash-child-passed",
+  "dash/child-names-the-release-source",
+  "dash/child-ran-in-the-candidate-image",
+  "dash/child-evidence-unchanged-before-assembly",
   "production/latest-image-id-unchanged",
   "production/worker-container-unchanged",
 ]);
@@ -471,6 +502,58 @@ export function emptyHlsChildObservation(reason = null) {
 }
 
 /**
+ * Validates the DASH-01 segmented-DASH child record read from disk (since -05).
+ *
+ * The same discipline as the clear-HLS child: the PARENT reads the exact bytes,
+ * hashes them, parses them, and requires the exact DASH-01 schema, a `PASS`
+ * verdict, every one of the child's mandatory checks present exactly once and
+ * every recorded check passing, the release source commit AND tree, the
+ * candidate's immutable id as both candidate image and run subject, the
+ * parent's build label, `--network none`, and no private fixture material.
+ * Only grammar-checked values are echoed.
+ */
+export function validateDashChildRecord({ bytes, expected }) {
+  if (!Buffer.isBuffer(bytes)) {
+    throw new ReleaseEvidenceError("the DASH child record must be validated from its exact bytes");
+  }
+  const digest = sha256Hex(bytes);
+  let record;
+  try {
+    record = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return {
+      ...emptyDashChildObservation(),
+      sha256: digest, bytes: bytes.length, reason: "the DASH child record is not parseable JSON",
+    };
+  }
+  const problems = validateDashReleaseChildRecord(record, expected);
+  const checks = Array.isArray(record?.checks) ? record.checks : [];
+  return {
+    ok: problems.length === 0,
+    schema: typeof record?.schema === "string" && /^[a-z0-9-]{1,80}$/.test(record.schema) ? record.schema : null,
+    verdict: ["PASS", "FAIL", "BLOCKED"].includes(record?.verdict) ? record.verdict : null,
+    sha256: digest,
+    bytes: bytes.length,
+    checkCount: checks.length,
+    failedCheckCount: checks.filter((check) => check?.ok !== true).length,
+    sourceCommit: isFullGitSha(record?.source?.commit) ? record.source.commit : null,
+    sourceTree: isFullGitSha(record?.source?.tree) ? record.source.tree : null,
+    candidateTag: isCandidateReference(record?.image?.candidateTag) ? record.image.candidateTag : null,
+    candidateImageId: imageIdOrNull(record?.image?.imageId),
+    runImageId: imageIdOrNull(record?.image?.runSubject),
+    networkMode: typeof record?.network?.mode === "string" && /^[a-z]{1,16}$/.test(record.network.mode)
+      ? record.network.mode
+      : null,
+    reason: problems.length > 0 ? problems.join("; ") : null,
+  };
+}
+
+/** The observation for a DASH child that never produced readable bytes. */
+export function emptyDashChildObservation(reason = null) {
+  return emptyHlsChildObservation(reason);
+}
+
+/**
  * Assembles the record from an ALLOWLIST.
  *
  * Every field is named here. Nothing is spread in from an observation object,
@@ -577,6 +660,10 @@ export function buildReleaseEvidence(input) {
     // facts and a digest only — never the child document itself.
     hlsAcceptance: hlsAcceptanceBlock(input.hlsAcceptance),
 
+    // Since -05: the segmented-DASH real-media child. Sanitized facts and a
+    // digest only — never the child document itself.
+    dashAcceptance: dashAcceptanceBlock(input.dashAcceptance),
+
     production: input.production,
 
     checks: input.checks,
@@ -606,9 +693,10 @@ export function buildReleaseEvidence(input) {
  * record: every required check must be present (a stage that never ran cannot
  * be silently absent), every check in the ledger must pass (including ones not
  * on the required list), both SPLIT-06 children must independently be
- * validated PASS records of the exact SPLIT-06 schema, and (since -03) the
+ * validated PASS records of the exact SPLIT-06 schema, (since -03) the
  * clear-HLS child must be a validated PASS of the exact HLS-09 schema naming
- * this source and this image.
+ * this source and this image, and (since -05) so must the DASH-01
+ * segmented-DASH child.
  */
 function assertPassEarned(record) {
   const checks = Array.isArray(record.checks) ? record.checks : [];
@@ -701,6 +789,36 @@ function assertPassEarned(record) {
   }
   if (hls.child.networkMode !== "none") {
     throw new ReleaseEvidenceError("refusing to emit a PASS record whose clear-HLS child was not offline");
+  }
+
+  // -05: the segmented-DASH real-media child executed, passed, and names
+  // exactly this release source and this candidate image, offline.
+  const dash = record.dashAcceptance;
+  if (dash?.executed !== true || dash.child === null || typeof dash.child !== "object") {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record without an executed DASH-01 segmented-DASH child");
+  }
+  if (dash.child.schema !== REQUIRED_DASH_CHILD_SCHEMA) {
+    throw new ReleaseEvidenceError(
+      `refusing to emit a PASS record whose segmented-DASH child is ${String(dash.child.schema)}, not ${REQUIRED_DASH_CHILD_SCHEMA}`,
+    );
+  }
+  if (
+    dash.child.verdict !== "PASS" || dash.child.ok !== true ||
+    !(dash.child.checkCount > 0) || dash.child.failedCheckCount !== 0
+  ) {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record whose segmented-DASH child did not pass");
+  }
+  if (typeof dash.child.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(dash.child.sha256)) {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record whose segmented-DASH child has no content digest");
+  }
+  if (dash.child.sourceCommit !== record.source?.commit || dash.child.sourceTree !== record.source?.tree) {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record whose segmented-DASH child names another source");
+  }
+  if (dash.child.candidateImageId !== imageId || dash.child.runImageId !== imageId) {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record whose segmented-DASH child names another image");
+  }
+  if (dash.child.networkMode !== "none") {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record whose segmented-DASH child was not offline");
   }
   const runs = Array.isArray(record.image?.candidateRuns) ? record.image.candidateRuns : [];
   const purposes = runs.map((entry) => String(entry?.purpose)).sort();
@@ -797,8 +915,9 @@ function verifiedHarness(harness) {
     harness.driverInsideHarness === true &&
     typeof harness.worktreeIsReleaseContext === "boolean" &&
     typeof harness.commitIsReleaseSource === "boolean" &&
-    // -03: EXACTLY every checkpoint, in order — including the one before the
-    // clear-HLS child — and the last one after all three children.
+    // EXACTLY every checkpoint, in order — including the ones before the
+    // clear-HLS (-03) and segmented-DASH (-05) children — and the last one
+    // after all four children.
     Array.isArray(harness.verificationPoints) &&
     harness.verificationPoints.length === HARNESS_VERIFICATION_POINTS.length &&
     harness.verificationPoints.every((point, i) => point === HARNESS_VERIFICATION_POINTS[i]);
@@ -823,7 +942,7 @@ function verifiedHarness(harness) {
     commitIsReleaseSource: harness.commitIsReleaseSource,
     verifiedBy:
       "run-release-image-acceptance.mjs: git against --harness, before any Docker command and at every checkpoint " +
-      "to the end of all three children (SPLIT-06 mp4, SPLIT-06 webm, HLS-09 clear-HLS)",
+      "to the end of all four children (SPLIT-06 mp4, SPLIT-06 webm, HLS-09 clear-HLS, DASH-01 segmented DASH)",
   };
 }
 
@@ -860,23 +979,34 @@ function hlsAcceptanceBlock(input) {
 }
 
 /**
+ * The `dashAcceptance` block (since -05), from an allowlist. Absent input is
+ * recorded as not executed — which a PASS then refuses — rather than assumed.
+ */
+function dashAcceptanceBlock(input) {
+  const block = hlsAcceptanceBlock(input);
+  return { ...block, requiredChildSchema: REQUIRED_DASH_CHILD_SCHEMA };
+}
+
+/**
  * Reads a parent record back under the CURRENT schema's rules.
  *
- * Returns the problems; an empty list means the record is a `-04` record for
+ * Returns the problems; an empty list means the record is a `-05` record for
  * exactly `expected` (`{ sourceCommit, imageId }`) and, when it says PASS,
- * that it earns PASS under -04 rules. A historical `-01`/`-02`/`-03` record is
- * never silently read as `-04`: it is named as historical, because a `-02` PASS
- * proves mp4 + webm and nothing about clear HLS, and a `-03` PASS proves clear
- * HLS under the protocol invariant `-04` restated.
+ * that it earns PASS under -05 rules. A historical `-01`..`-04` record is never
+ * silently read as `-05`: it is named as historical, because a `-02` PASS
+ * proves mp4 + webm and nothing about clear HLS, a `-03` PASS proves clear HLS
+ * under the protocol invariant `-04` restated, and a `-04` PASS carries no
+ * real-media segmented-DASH child.
  */
 export function validateReleaseParentRecord(record, expected = {}) {
   if (record === null || typeof record !== "object" || Array.isArray(record)) return ["the record is not an object"];
   const problems = [];
   if (HISTORICAL_SPLIT07_SCHEMAS.includes(record.schema)) {
-    // True of all three: -01/-02 carry no clear-HLS child at all, and a -03
-    // child proved clear HLS under the protocol invariant -04 restated.
+    // True of all four: -01/-02 carry no clear-HLS child, -03 proved clear HLS
+    // under the protocol invariant -04 restated, and none of them carries the
+    // real-media segmented-DASH child -05 requires.
     problems.push(
-      `${record.schema} is a historical schema, not ${SPLIT07_EVIDENCE_SCHEMA}; it does not qualify clear HLS under the current protocol invariant`,
+      `${record.schema} is a historical schema, not ${SPLIT07_EVIDENCE_SCHEMA}; it does not carry the real-media segmented-DASH child`,
     );
     return problems;
   }
