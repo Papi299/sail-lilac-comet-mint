@@ -10,18 +10,22 @@ import {
   GENERIC_SOURCE_PROTOCOLS,
   GENERIC_VIDEO_SOURCE_CONTAINERS,
   GenericPresetSourceSchema,
+  GenericSourceProtocolSchema,
   GenericSourceSelectionSchema,
   GenericSplitSourceSelectionSchema,
   SAFE_FORMAT_ID_PATTERN,
   asSingleSource,
   asSplitPair,
   buildGenericFormatSelector,
+  genericAcquisitionLayout,
+  isGenericSourceProtocol,
   isSafeFormatId,
   splitTargetContainer,
   toGenericSourceContainer,
   type GenericSourceSelection,
 } from "./generic-source.ts";
 import { buildGenericPresets, selectCandidates } from "../analysis/ytdlp-analysis.server.ts";
+import { YTDLP_RUNTIME } from "../runtime/ytdlp-runtime.server.ts";
 
 /**
  * Phase 10C3 §51: the raw upstream `format_id` boundary.
@@ -180,15 +184,52 @@ describe("generic source: container allowlist (§15)", () => {
 });
 
 describe("generic source: protocol policy (§16)", () => {
-  it("permits exactly http and https", () => {
-    assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https"]);
+  it("permits exactly http, https and segmented DASH — the ONE shared vocabulary", () => {
+    assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https", "http_dash_segments"]);
+    assert.ok(Object.isFrozen(GENERIC_SOURCE_PROTOCOLS));
+    // The schema is built from the same list, not from a second copy of it.
+    assert.deepEqual([...GenericSourceProtocolSchema.options], [...GENERIC_SOURCE_PROTOCOLS]);
+    for (const p of GENERIC_SOURCE_PROTOCOLS) assert.equal(isGenericSourceProtocol(p), true, p);
   });
 
-  it("refuses every manifest, fragment and streaming protocol", () => {
+  it("HARD GATE: the vocabulary was reviewed against exactly this pinned runtime", () => {
+    // GENERIC-SEGMENTED-DASH-EXECUTION-001 admitted `http_dash_segments` because
+    // the pinned 2026.08.19 artifact (this exact digest) resolves it to
+    // `DashSegmentsFD` with NO fragment delegate under `--downloader=native`.
+    // A runtime upgrade can change that selection, so changing the pin fails
+    // HERE until the boundary is reviewed again and this test restated. The
+    // runtime proof itself is `ytdlp-dash-downloader-contract.server.test.ts`
+    // and, inside the image, `verify-download-policy.py`.
+    assert.equal(YTDLP_RUNTIME.expectedVersion, "2026.08.19");
+    assert.equal(
+      YTDLP_RUNTIME.sha256,
+      "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6",
+    );
+    assert.deepEqual(
+      GENERIC_SOURCE_PROTOCOLS.filter((p) => genericAcquisitionLayout(p) === "segmented"),
+      ["http_dash_segments"],
+    );
+  });
+
+  it("maps every member to exactly one acquisition layout", () => {
+    assert.deepEqual(
+      GENERIC_SOURCE_PROTOCOLS.map((p) => [p, genericAcquisitionLayout(p)]),
+      [
+        ["http", "progressive"],
+        ["https", "progressive"],
+        ["http_dash_segments", "segmented"],
+      ],
+    );
+  });
+
+  it("refuses every other manifest, fragment and streaming protocol — by spelling, not analogy", () => {
     for (const protocol of [
       "m3u8",
       "m3u8_native",
-      "http_dash_segments",
+      "http_dash_segments_generator",
+      "HTTP_DASH_SEGMENTS",
+      "http_dash_segments+https",
+      "dash",
       "rtmp",
       "rtmp_ffmpeg",
       "ism",
@@ -203,6 +244,113 @@ describe("generic source: protocol policy (§16)", () => {
         false,
         `${protocol} must never be an executable generic protocol`,
       );
+      assert.equal(isGenericSourceProtocol(protocol), false, protocol);
+      // Refused even in the shapes segmented DASH IS admitted in, so the
+      // refusal is the protocol's, not the shape's.
+      for (const half of [DASH_VIDEO_HALF, DASH_AUDIO_HALF]) {
+        assert.equal(GenericSourceSelectionSchema.safeParse({ ...half, protocol }).success, false, protocol);
+      }
+    }
+  });
+});
+
+// ── GENERIC-SEGMENTED-DASH-EXECUTION-001 ─────────────────────────────────────
+
+const DASH_VIDEO_HALF: GenericSourceSelection = {
+  formatId: "137",
+  protocol: "http_dash_segments",
+  container: "mp4",
+  hasVideo: true,
+  hasAudio: false,
+  videoConstraint: "codec-present",
+  audioConstraint: "absent",
+  fileSize: null,
+};
+
+const DASH_AUDIO_HALF: GenericSourceSelection = {
+  formatId: "140",
+  protocol: "http_dash_segments",
+  container: "m4a",
+  hasVideo: false,
+  hasAudio: true,
+  videoConstraint: "absent",
+  audioConstraint: "codec-present",
+  fileSize: null,
+};
+
+describe("generic source: a segmented source is a split half and nothing else", () => {
+  it("represents a proven video-only and a proven audio-only DASH half", () => {
+    assert.equal(GenericSourceSelectionSchema.safeParse(DASH_VIDEO_HALF).success, true);
+    assert.equal(GenericSourceSelectionSchema.safeParse(DASH_AUDIO_HALF).success, true);
+    // `video-ext` is an approved video constraint for a video half too.
+    assert.equal(
+      GenericSourceSelectionSchema.safeParse({ ...DASH_VIDEO_HALF, videoConstraint: "video-ext" }).success,
+      true,
+    );
+  });
+
+  it("refuses a MUXED segmented source outright", () => {
+    const muxed = { ...MUXED, protocol: "http_dash_segments" };
+    const parsed = GenericSourceSelectionSchema.safeParse(muxed);
+    assert.equal(parsed.success, false);
+    assert.ok(
+      parsed.error!.issues.some((i) => i.path.join(".") === "protocol"),
+      "refused by the segmented rule, not by anything incidental",
+    );
+    // The same shape on a progressive protocol is fine: the rule is the layout's.
+    assert.equal(GenericSourceSelectionSchema.safeParse(MUXED).success, true);
+  });
+
+  it("refuses a segmented video source whose audio is merely UNKNOWN", () => {
+    const unknownAudio = { ...DASH_VIDEO_HALF, audioConstraint: "unknown" as const };
+    assert.equal(GenericSourceSelectionSchema.safeParse(unknownAudio).success, false);
+    assert.equal(
+      GenericSourceSelectionSchema.safeParse({ ...unknownAudio, protocol: "https" }).success,
+      true,
+      "control: unknown audio is representable progressively",
+    );
+  });
+
+  it("pairs DASH+DASH and DASH+HTTPS alike — protocols never have to match", () => {
+    const httpsAudio = { ...DASH_AUDIO_HALF, protocol: "https" as const };
+    const httpsVideo = { ...DASH_VIDEO_HALF, protocol: "https" as const };
+    for (const [video, audio] of [
+      [DASH_VIDEO_HALF, DASH_AUDIO_HALF],
+      [DASH_VIDEO_HALF, httpsAudio],
+      [httpsVideo, DASH_AUDIO_HALF],
+    ] as const) {
+      const pair = GenericSplitSourceSelectionSchema.safeParse({ video, audio });
+      assert.equal(pair.success, true, `${video.protocol}+${audio.protocol}`);
+    }
+  });
+
+  it("keeps every existing pair invariant for DASH members", () => {
+    const bad = [
+      // same upstream id twice
+      { video: DASH_VIDEO_HALF, audio: { ...DASH_AUDIO_HALF, formatId: "137" } },
+      // cross-family container combination
+      { video: { ...DASH_VIDEO_HALF, container: "webm" as const }, audio: DASH_AUDIO_HALF },
+      // swapped roles
+      { video: DASH_AUDIO_HALF, audio: DASH_VIDEO_HALF },
+    ];
+    for (const pair of bad) {
+      assert.equal(GenericSplitSourceSelectionSchema.safeParse(pair).success, false);
+    }
+  });
+
+  it("builds a complete selector binding the EXACT approved DASH protocol", () => {
+    assert.equal(
+      buildGenericFormatSelector(DASH_VIDEO_HALF),
+      'b*[format_id="137"][protocol="http_dash_segments"][ext="mp4"][vcodec!="none"][acodec="none"]',
+    );
+    assert.equal(
+      buildGenericFormatSelector(DASH_AUDIO_HALF),
+      'b*[format_id="140"][protocol="http_dash_segments"][ext="m4a"][vcodec="none"][acodec!="none"]',
+    );
+    for (const half of [DASH_VIDEO_HALF, DASH_AUDIO_HALF]) {
+      const selector = buildGenericFormatSelector(half);
+      assert.doesNotMatch(selector, /[/+,]/, "no fallback, no merge, no list");
+      assert.ok(selector.startsWith(`${GENERIC_FORMAT_SELECTOR_ATOM}[format_id=`), "never a bare id atom");
     }
   });
 });

@@ -14,7 +14,6 @@ import {
   YTDLP_ANALYSIS_FFMPEG_LOCATION,
   YTDLP_ANALYSIS_MAX_TITLE_LENGTH,
   YTDLP_ANALYSIS_PATH,
-  YTDLP_V1_NATIVE_PROTOCOLS,
   buildYtdlpAnalysisEnvironment,
   analyzeGenericFormats,
   analyzeGenericMedia,
@@ -37,6 +36,7 @@ import {
 } from "../hls/hls-source-selection.ts";
 import { deriveExecutionPlan } from "../execution/format-plan.ts";
 import {
+  GENERIC_SOURCE_PROTOCOLS,
   buildGenericFormatSelector,
   splitTargetContainer,
   type GenericPresetSource,
@@ -727,8 +727,8 @@ describe("generic analysis: candidate eligibility", () => {
     assert.equal(selectCandidates([withoutProtocol], LIMITS).length, 0);
   });
 
-  it("only allows the documented native protocol list", () => {
-    assert.deepEqual([...YTDLP_V1_NATIVE_PROTOCOLS], ["http", "https"]);
+  it("only admits the ONE shared protocol vocabulary", () => {
+    assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https", "http_dash_segments"]);
   });
 
   it("drops storyboards, images and subtitle tracks", () => {
@@ -3797,7 +3797,7 @@ describe("GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001", () => {
     });
 
     it("HLS stays excluded: only the two progressive formats are candidates", () => {
-      assert.deepEqual([...YTDLP_V1_NATIVE_PROTOCOLS], ["http", "https"]);
+      assert.equal(GENERIC_SOURCE_PROTOCOLS.some((p) => p.includes("m3u8")), false);
       const candidates = selectCandidates(FORMATS, LIMITS);
       assert.deepEqual(
         candidates.map((c) => [c.formatId, c.protocol, c.videoConstraint, c.audioConstraint]),

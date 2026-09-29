@@ -24,7 +24,11 @@ What it proves (§52):
   6. the UNKNOWN-audio progressive VIDEO shape that may now back an ordinary
      video preset (GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001) is
      re-selected by its UNCHANGED selector when `acodec` is missing, None or
-     later known, never when it is `"none"`, and never through an HLS twin.
+     later known, never when it is `"none"`, and never through an HLS twin;
+  7. each SEGMENTED DASH split half (GENERIC-SEGMENTED-DASH-EXECUTION-001) is
+     re-selected exactly by its own selector, bound to the exact approved
+     protocol spelling, never as a progressive twin, never the reverse, and
+     never a muxed DASH rendition.
 
 Exit status is 0 only when every expectation holds.
 
@@ -188,6 +192,27 @@ FORMATS = [
     {"format_id": "xhls-audio", "ext": "mp4", "protocol": "m3u8_native",
      "vcodec": "none", "video_ext": "none", "audio_ext": "mp4",
      "height": None, "url": "https://example.invalid/21"},
+    # ── SEGMENTED DASH halves (GENERIC-SEGMENTED-DASH-EXECUTION-001) ────────
+    # Shaped as the pinned `_parse_mpd_periods` shapes a SegmentList
+    # Representation: `parse_codecs` sets the other codec to exactly "none",
+    # and `_fill_sorting_fields` fills video_ext/audio_ext from ext.
+    {"format_id": "dash-v1080", "ext": "mp4", "protocol": "http_dash_segments",
+     "container": "mp4_dash", "vcodec": "avc1.640028", "acodec": "none",
+     "video_ext": "mp4", "audio_ext": "none", "height": 1080,
+     "url": "https://example.invalid/22.mpd",
+     "fragment_base_url": "https://example.invalid/", "fragments": [{"path": "v1.m4s"}]},
+    {"format_id": "dash-a128", "ext": "m4a", "protocol": "http_dash_segments",
+     "container": "m4a_dash", "vcodec": "none", "acodec": "mp4a.40.2",
+     "video_ext": "none", "audio_ext": "m4a", "height": None,
+     "url": "https://example.invalid/23.mpd",
+     "fragment_base_url": "https://example.invalid/", "fragments": [{"path": "a1.m4s"}]},
+    # A MUXED segmented rendition: representable to yt-dlp, never approved by
+    # the application, and never reachable through a split half's selector.
+    {"format_id": "dash-muxed", "ext": "mp4", "protocol": "http_dash_segments",
+     "vcodec": "avc1.640028", "acodec": "mp4a.40.2",
+     "video_ext": "mp4", "audio_ext": "none", "height": 720,
+     "url": "https://example.invalid/24.mpd",
+     "fragment_base_url": "https://example.invalid/", "fragments": [{"path": "m1.m4s"}]},
 ]
 
 
@@ -401,6 +426,33 @@ def main(artifact: str) -> int:
     for incomplete in (False, True):
         expect(f"b* performs no fallback for a vanished unknown source, incomplete_formats={incomplete}",
                select(build_selector("xprog-gone", "https", "mp4", "unknown", "video-ext"), incomplete), [])
+
+    print("\n11. SEGMENTED DASH halves are re-selected exactly, by their exact protocol")
+    # GENERIC-SEGMENTED-DASH-EXECUTION-001. Each half of a pair is acquired by
+    # its OWN single-source selector; the protocol filter binds the exact
+    # approved spelling, so a DASH half can never be re-selected as a
+    # progressive twin, nor the reverse.
+    dash_video = build_selector("dash-v1080", "http_dash_segments", "mp4", "absent", "codec-present")
+    dash_audio = build_selector("dash-a128", "http_dash_segments", "m4a", "codec-present", "absent")
+    expect("the DASH video half's selector",
+           dash_video,
+           'b*[format_id="dash-v1080"][protocol="http_dash_segments"][ext="mp4"]'
+           '[vcodec!="none"][acodec="none"]')
+    expect("no `/` fallback and no `+` merge in either half",
+           [("/" in s, "+" in s) for s in (dash_video, dash_audio)], [(False, False), (False, False)])
+    expect("DASH video half re-selected", select(dash_video), ["dash-v1080"])
+    expect("DASH audio half re-selected", select(dash_audio), ["dash-a128"])
+    expect("the DASH id under an https protocol constraint selects nothing",
+           select(build_selector("dash-v1080", "https", "mp4", "absent", "codec-present")), [])
+    expect("an https id under the DASH protocol constraint selects nothing",
+           select(build_selector("137", "http_dash_segments", "mp4", "absent", "codec-present")), [])
+    expect("the unadmitted generator spelling selects nothing",
+           select(build_selector("dash-v1080", "http_dash_segments_generator", "mp4", "absent", "codec-present")), [])
+    expect("a muxed DASH rendition is not a video half",
+           select(build_selector("dash-muxed", "http_dash_segments", "mp4", "absent", "codec-present")), [])
+    for incomplete in (False, True):
+        expect(f"b* performs no fallback for a vanished DASH half, incomplete_formats={incomplete}",
+               select(build_selector("dash-gone", "http_dash_segments", "mp4", "absent", "codec-present"), incomplete), [])
 
     print()
     if failures:

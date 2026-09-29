@@ -44,10 +44,10 @@
 // `--acceptance-mode` is required (`lib/hls-acceptance-mode.mjs`):
 //
 //   overlay        HLS-08. The candidate source overlaid on the accepted
-//                  historical runtime; emits `hls08-deterministic-full-path-02`.
+//                  historical runtime; emits `hls08-deterministic-full-path-03`.
 //   release-image  HLS-09. The ACTUAL `Dockerfile.worker` release candidate,
 //                  launched by the SPLIT-07 parent; emits
-//                  `hls09-release-image-full-path-01`.
+//                  `hls09-release-image-full-path-02`.
 //
 // Only identity and the record differ. Everything this file measures, and
 // every behavioral check, is the same code in both modes.
@@ -89,10 +89,7 @@ import {
 } from "../../../src/services/processing/process-runner.server.ts";
 import { ffmpegAvailable } from "../../../src/services/processing/ffmpeg.server.ts";
 import { resolveFfprobePath } from "../../../src/services/processing/ffprobe.server.ts";
-import {
-  YTDLP_V1_NATIVE_PROTOCOLS,
-  analyzeGenericMediaInternal,
-} from "../../../src/worker/analysis/ytdlp-analysis.server.ts";
+import { analyzeGenericMediaInternal } from "../../../src/worker/analysis/ytdlp-analysis.server.ts";
 import { createMediaAnalysisPolicy } from "../../../src/worker/analysis/media-analyzer.server.ts";
 import { deriveExecutionPlan } from "../../../src/worker/execution/format-plan.ts";
 import { GENERIC_SOURCE_PROTOCOLS } from "../../../src/worker/execution/generic-source.ts";
@@ -344,12 +341,28 @@ async function preflight(checks) {
   };
 }
 
-/** HLS-7's load-bearing invariants, read from the Product constants. */
+/**
+ * HLS-7's load-bearing invariants, read from the Product constants.
+ *
+ * GENERIC-SEGMENTED-DASH-EXECUTION-001 restated the protocol invariant. HLS-7's
+ * claim was never "the yt-dlp list is exactly http/https"; it was "clear HLS is
+ * delivered WITHOUT handing HLS to the yt-dlp downloader". The DASH task
+ * replaced the two lists with ONE vocabulary and deliberately added a DASH
+ * spelling to it, so the check now states the real claim — no HLS spelling —
+ * plus the exact reviewed vocabulary, so any other widening fails too.
+ */
 function checkInvariants(checks) {
-  const native = [...YTDLP_V1_NATIVE_PROTOCOLS];
   const generic = [...GENERIC_SOURCE_PROTOCOLS];
-  checks.require("invariants/ytdlp-native-protocols-http-https", sameList(native, ["http", "https"]), native.join(","));
-  checks.require("invariants/generic-source-protocols-http-https", sameList(generic, ["http", "https"]), generic.join(","));
+  checks.require(
+    "invariants/generic-source-protocols-exclude-hls",
+    generic.length > 0 && generic.every((p) => !p.includes("m3u8")),
+    generic.join(","),
+  );
+  checks.require(
+    "invariants/generic-source-protocols-reviewed-vocabulary",
+    sameList(generic, ["http", "https", "http_dash_segments"]),
+    generic.join(","),
+  );
   checks.require(
     "invariants/raw-hls-id-is-not-a-requestable-format-id",
     !WorkerRequestedFormatIdSchema.safeParse(HLS08_RAW_FORMAT_ID).success,
@@ -361,7 +374,6 @@ function checkInvariants(checks) {
       PRODUCT_HLS_OUTPUT_PARTIAL_FILE_NAME === HLS_OUTPUT_PARTIAL_FILE_NAME,
   );
   return {
-    ytdlpNativeProtocols: native,
     genericSourceProtocols: generic,
     rawHlsIdRequestable: false,
   };

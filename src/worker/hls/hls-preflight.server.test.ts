@@ -16,7 +16,6 @@ import {
   type DnsAnswer,
   type SafeRequestOnce,
 } from "@/lib/security/safe-http.server.ts";
-import { YTDLP_V1_NATIVE_PROTOCOLS } from "../analysis/ytdlp-analysis.server.ts";
 import { GENERIC_SOURCE_PROTOCOLS } from "../execution/generic-source.ts";
 import {
   HLS_V1_MAX_FRAGMENTS,
@@ -1354,9 +1353,9 @@ describe("clear-HLS preflight: inside its boundary", () => {
     assert.equal(code.includes("Reachability"), false, "...and comments should be gone");
   });
 
-  it("never widens yt-dlp's protocol policies: both are still exactly http and https", () => {
-    assert.deepEqual([...YTDLP_V1_NATIVE_PROTOCOLS], ["http", "https"]);
-    assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https"]);
+  it("never widens yt-dlp's protocol vocabulary with an HLS spelling", () => {
+    assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https", "http_dash_segments"]);
+    assert.equal(GENERIC_SOURCE_PROTOCOLS.some((p) => p.includes("m3u8")), false);
   });
 
   it("is named by no production module outside the HLS directory", () => {

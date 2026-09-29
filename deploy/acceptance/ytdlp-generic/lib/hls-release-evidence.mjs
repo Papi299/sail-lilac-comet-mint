@@ -7,7 +7,7 @@
 //
 // ── Why a NEW schema rather than HLS-08's ───────────────────────────────────
 //
-// `hls08-deterministic-full-path-02` is OVERLAY evidence: it asserts an
+// `hls08-deterministic-full-path-03` is OVERLAY evidence: it asserts an
 // accepted historical base source and digest, and an overlay image that
 // differs from that base. For a freshly built release candidate every one of
 // those assertions is false — there is no historical base and no overlay — and
@@ -48,8 +48,14 @@ import { isFullGitSha } from "./split-provenance.mjs";
  *        with HLS-08 `-02`'s field-aware privacy placement. Identity is the
  *        release candidate's, as observed by the SPLIT-07 parent; there is no
  *        historical-base or overlay assertion.
+ *   -02  Everything -01 means, over the shared behavioral checks as HLS-08 -03
+ *        restated them: the protocol invariant is "the one yt-dlp vocabulary
+ *        names no HLS spelling and is exactly the reviewed
+ *        `http`/`https`/`http_dash_segments`", no longer "both lists are
+ *        exactly `http`/`https`" (GENERIC-SEGMENTED-DASH-EXECUTION-001). -01
+ *        records are historical and never re-read under -02.
  */
-export const HLS09_RELEASE_EVIDENCE_SCHEMA = "hls09-release-image-full-path-01";
+export const HLS09_RELEASE_EVIDENCE_SCHEMA = "hls09-release-image-full-path-02";
 
 /**
  * The RELEASE identity checks, replacing HLS-08's four overlay identity checks

@@ -38,8 +38,20 @@ import {
  *        refuse it entirely; raw SQLite bytes are scanned for HLS acquisition
  *        provenance only. The single durable privacy check of -01 is split
  *        into exact-echo, rows, views and raw-bytes checks.
+ *   -03  Everything -02 means, with HLS-7's protocol invariant RESTATED
+ *        (GENERIC-SEGMENTED-DASH-EXECUTION-001). -02 required the two yt-dlp
+ *        protocol lists to be exactly `http`/`https`
+ *        (`invariants/ytdlp-native-protocols-http-https`,
+ *        `invariants/generic-source-protocols-http-https`). There is now ONE
+ *        vocabulary, and it deliberately carries `http_dash_segments`, so -03
+ *        requires instead that it names no HLS spelling
+ *        (`invariants/generic-source-protocols-exclude-hls`) and equals exactly
+ *        the reviewed `http`/`https`/`http_dash_segments`
+ *        (`invariants/generic-source-protocols-reviewed-vocabulary`). -02
+ *        records stay historically true for the source they named; they are
+ *        never re-read under -03.
  */
-export const HLS08_EVIDENCE_SCHEMA = "hls08-deterministic-full-path-02";
+export const HLS08_EVIDENCE_SCHEMA = "hls08-deterministic-full-path-03";
 
 /**
  * Keys that must never appear anywhere in a record, on top of the shared list.
@@ -127,9 +139,9 @@ export const HLS_BEHAVIORAL_MANDATORY_CHECKS = Object.freeze([
   "preflight/ffmpeg-available-predicate",
   "preflight/ffprobe-is-ffmpeg-sibling",
   "preflight/ffprobe-executes",
-  // HLS-7 invariants
-  "invariants/ytdlp-native-protocols-http-https",
-  "invariants/generic-source-protocols-http-https",
+  // HLS-7 invariants (restated by GENERIC-SEGMENTED-DASH-EXECUTION-001; -03)
+  "invariants/generic-source-protocols-exclude-hls",
+  "invariants/generic-source-protocols-reviewed-vocabulary",
   "invariants/raw-hls-id-is-not-a-requestable-format-id",
   // fixture validity
   "fixture/at-least-three-mpegts-segments",

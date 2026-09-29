@@ -19,8 +19,9 @@ verified clean release source
   → image / config / runtime / hardening qualification, policy verifiers
   → SPLIT-06 mp4 child     (split06-deterministic-full-path-04)
   → SPLIT-06 webm child    (split06-deterministic-full-path-04)
-  → HLS-09 clear-HLS child (hls09-release-image-full-path-01)   ← new
-  → ONE HLS-aware SPLIT-07 parent PASS (split07-release-image-candidate-03)
+  → HLS-09 clear-HLS child (hls09-release-image-full-path-02; -01 before GENERIC-SEGMENTED-DASH-EXECUTION-001)
+  → ONE HLS-aware SPLIT-07 parent PASS (split07-release-image-candidate-05, which
+    also requires the DASH-01 segmented-DASH child; -04 and -03 before it)
 ```
 
 Every candidate container — the clear-HLS child included — executes the same
@@ -30,7 +31,7 @@ immutable `sha256:` image id. The tag is a build and diagnostic label only.
 
 ## Why HLS-08's `-02` record cannot be reused
 
-`hls08-deterministic-full-path-02` is **overlay** evidence. It asserts that the
+`hls08-deterministic-full-path-02`/`-03` is **overlay** evidence. It asserts that the
 accepted historical base source is `593f47df…`, that the accepted historical
 base digest is `sha256:5925515f…`, and that the overlay image differs from that
 base. Every one of those statements is false for a freshly built release
@@ -46,8 +47,8 @@ The orchestrator `hls-full-path.mjs` is not forked. It takes a required
 
 | Mode | Launched by | Identity | Record |
 | :--- | :--- | :--- | :--- |
-| `overlay` | `run-hls-acceptance.mjs` (HLS-08) | source commit/tree, accepted historical base source and digest, overlay image | `hls08-deterministic-full-path-02`, unchanged |
-| `release-image` | `run-release-image-acceptance.mjs` (SPLIT-07) | source commit/tree, the parent's source-context-clean assertion, candidate build label, candidate immutable image id, the run subject Docker executed | `hls09-release-image-full-path-01` |
+| `overlay` | `run-hls-acceptance.mjs` (HLS-08) | source commit/tree, accepted historical base source and digest, overlay image | `hls08-deterministic-full-path-03` (`-02` before GENERIC-SEGMENTED-DASH-EXECUTION-001) |
+| `release-image` | `run-release-image-acceptance.mjs` (SPLIT-07) | source commit/tree, the parent's source-context-clean assertion, candidate build label, candidate immutable image id, the run subject Docker executed | `hls09-release-image-full-path-02` (`-01` before GENERIC-SEGMENTED-DASH-EXECUTION-001) |
 
 - The mode is **explicit** and given exactly once. It is never inferred from
   which identity flags happen to be present: release identity flags alone do not
@@ -93,7 +94,11 @@ replace HLS-08's four overlay identity checks one-for-one in meaning:
 
 There is no historical-base or overlay assertion in release mode.
 
-## The release child's record — `hls09-release-image-full-path-01`
+## The release child's record — `hls09-release-image-full-path-02`
+
+*`-02` differs from `-01` only in the shared protocol invariant, restated by
+`GENERIC-SEGMENTED-DASH-EXECUTION-001` (see the schema history below). Everything else in this
+section applies to both.*
 
 `lib/hls-release-evidence.mjs`. An allowlisted release identity followed by
 exactly HLS-08's behavioral blocks:
@@ -180,7 +185,7 @@ docker run --rm --network none --cap-drop=ALL --security-opt no-new-privileges -
 3. builds the argv, re-checks its posture, and runs it by the immutable id,
    recording `hls09:clear-hls` in the candidate run ledger;
 4. validates the child from its **exact bytes** (`validateHlsChildRecord`):
-   parseable JSON, schema exactly `hls09-release-image-full-path-01`, verdict
+   parseable JSON, schema exactly `hls09-release-image-full-path-02`, verdict
    `PASS`, every mandatory check present and every check passing, source commit
    and tree equal to the release source, candidate image id and run image id
    equal to the parent's candidate id, the parent's build label, `network.mode`
@@ -218,8 +223,10 @@ clear-HLS chain offline.
 | Schema | Status | Meaning |
 | :--- | :--- | :--- |
 | `hls08-deterministic-full-path-01` | historical, **not accepted** | First HLS-08 record; its hostname placement check was too permissive. |
-| `hls08-deterministic-full-path-02` | **accepted** | Overlay / source-runtime deterministic HLS evidence (PR #78 head `6296b0db…`, tree `677c5a24…`, PASS 144/144). Unchanged. |
-| `hls09-release-image-full-path-01` | current | The same clear-HLS full path and negatives, executed by a real `Dockerfile.worker` release candidate, with release identity. |
+| `hls08-deterministic-full-path-02` | **accepted**, historical | Overlay / source-runtime deterministic HLS evidence (PR #78 head `6296b0db…`, tree `677c5a24…`, PASS 144/144). Never re-read under `-03`. |
+| `hls09-release-image-full-path-01` | **accepted**, historical | The same clear-HLS full path and negatives, executed by a real `Dockerfile.worker` release candidate, with release identity; carried by every `split07-release-image-candidate-03` PASS. Never re-read under `-02`. |
+| `hls08-deterministic-full-path-03` | current overlay schema | `-02` with the protocol invariant restated by `GENERIC-SEGMENTED-DASH-EXECUTION-001` (no HLS spelling in the one yt-dlp vocabulary, which is exactly `http`/`https`/`http_dash_segments`). No record produced yet. |
+| `hls09-release-image-full-path-02` | current release schema | `-01` over the same restated behavioral checks. No record produced yet. |
 
 These scopes are not interchangeable: an overlay PASS is not release-image
 evidence, and a release child is never read as overlay evidence. HLS-8 remains a
@@ -243,7 +250,7 @@ HLS-9A never produces a deployable or retained candidate.
 | :--- | :--- |
 | `hls-full-path.mjs` | The one clear-HLS orchestrator, in either mode. |
 | `lib/hls-acceptance-mode.mjs` | The explicit mode boundary: argv parsing (mixed identity fails closed), per-mode identity checks, per-mode record. |
-| `lib/hls-release-evidence.mjs` | The `hls09-release-image-full-path-01` record, its PASS gate and privacy gates, and the parent-side record validator. |
+| `lib/hls-release-evidence.mjs` | The `hls09-release-image-full-path-02` record, its PASS gate and privacy gates, and the parent-side record validator. |
 | `lib/hls-evidence.mjs` | HLS-08's record, unchanged in meaning; exports the shared behavioral check list. |
 | `lib/release-container.mjs` | `releaseHlsAcceptanceRunArgs` and `releaseHlsRunPostureViolations`; `--add-host` in the closed run-subject grammar. |
 | `lib/release-evidence.mjs` | The `-03` parent: `hlsAcceptance`, `validateHlsChildRecord`, the HLS run purpose, the PASS gate. |

@@ -20,6 +20,8 @@ import {
   GENERIC_VIDEO_SOURCE_CONTAINERS,
   GenericSourceSelectionSchema,
   GenericSplitSourceSelectionSchema,
+  genericAcquisitionLayout,
+  isGenericSourceProtocol,
   isSafeFormatId,
   splitTargetContainer,
   toGenericSourceContainer,
@@ -143,36 +145,28 @@ export const YTDLP_ANALYSIS_MAX_TITLE_LENGTH = 1024;
 export const YTDLP_ANALYSIS_MIN_TIMEOUT_MS = 1_000;
 
 // ── Acquisition eligibility ──────────────────────────────────────────────────
-
-/**
- * The ONLY source protocols a Phase-10 v1 candidate may use.
- *
- * Determined by reading `_get_suitable_downloader` in the pinned 2026.08.19
- * release: with `--downloader=native` in the base policy, a plain `http`/`https`
- * format resolves to `HttpFD`, which acquires bytes and nothing else.
- *
- * Native HLS is deliberately EXCLUDED even though `m3u8_native` selects `HlsFD`
- * under the native downloader policy. `HlsFD.real_download` inspects the media
- * playlist at DOWNLOAD time and, when `can_download()` rejects it (DRM markers,
- * AES-128 with ffmpeg present, other unsupported tags), constructs an
- * `FFmpegFD` and delegates to it — `yt_dlp/downloader/hls.py`, the
- * `if not can_download:` branch. That decision depends on manifest bytes this
- * analysis never fetches, so HLS eligibility CANNOT be proven native at
- * analysis time, and advertising it would risk local FFmpeg work running while
- * a future durable job still reports `downloading`.
- *
- * This is the fail-closed reading of the recorded acquisition boundary, and it
- * describes ONE thing: what the generic yt-dlp DOWNLOADER may acquire. It is
- * not the list of protocols the Product can deliver. Clear HLS (HLS-7) is
- * delivered WITHOUT widening it: yt-dlp only analyzes such a rendition, and
- * VideoFetch's own playlist preflight, fragment transport and post-
- * `beginProcessing()` remux acquire and process it (see
- * `clearHlsShadowCandidate` and `composeGenericVideoOwnership`). Adding an HLS
- * or DASH spelling here would hand that acquisition back to yt-dlp, whose
- * `HlsFD` can delegate to `FFmpegFD` during `downloading` — the exact boundary
- * this list exists to hold.
- */
-export const YTDLP_V1_NATIVE_PROTOCOLS = Object.freeze(["http", "https"] as const);
+//
+// The protocols a candidate may be acquired on are NOT listed here. They are
+// `GENERIC_SOURCE_PROTOCOLS` in `generic-source.ts` — the ONE closed vocabulary
+// the private selection schema and the acquisition selector also read — so
+// analysis can never admit a protocol execution would refuse, or the reverse
+// (GENERIC-SEGMENTED-DASH-EXECUTION-001 replaced this module's own copy of the
+// list with that one authority).
+//
+// That vocabulary describes ONE thing: what the generic yt-dlp DOWNLOADER may
+// acquire under the native policy. It is not the list of protocols the Product
+// can deliver. Native HLS stays outside it, because `HlsFD.real_download`
+// inspects the media playlist at DOWNLOAD time and may construct an `FFmpegFD`
+// and delegate to it — a decision that depends on manifest bytes this analysis
+// never fetches. Clear HLS (HLS-7) is delivered WITHOUT widening it: yt-dlp only
+// analyzes such a rendition, and VideoFetch's own playlist preflight, fragment
+// transport and post-`beginProcessing()` remux acquire and process it (see
+// `clearHlsShadowCandidate` and `composeGenericVideoOwnership`).
+//
+// Segmented DASH (`http_dash_segments`) IS a member: under the native policy the
+// pinned `DashSegmentsFD` fetches and appends the fragments itself and never
+// delegates. What a SEGMENTED source may back is narrower than what a
+// progressive one may — see `evaluateRawFormat`'s last gate.
 
 /**
  * `live_status` values that make a source ineligible for Phase-10 v1.
@@ -802,13 +796,21 @@ export function normalizeCodecName(codec: string | null | undefined): string | n
  * a preset that would fail at download time is worse than an absent one,
  * because the user has already chosen it by then.
  *
- *   1. its protocol is explicitly `http` or `https` (see YTDLP_V1_NATIVE_PROTOCOLS);
+ *   1. its protocol is explicitly a member of `GENERIC_SOURCE_PROTOCOLS`
+ *      (`http`, `https` or `http_dash_segments`);
  *   2. its upstream `format_id` satisfies the safe literal grammar (§11);
  *   3. its container is in the closed source allowlist for its stream shape (§15);
  *   4. it carries video, audio, or both — an empty format describes nothing;
  *   5. its VIDEO shape is establishable as exactly one of the three approved
  *      constraints, with no contradiction between `vcodec` and `video_ext`;
- *   6. any KNOWN size is within the configured maximum.
+ *   6. any KNOWN size is within the configured maximum;
+ *   7. a SEGMENTED source is a proven split-pair half — video with audio
+ *      proven absent, or audio proven present with video proven absent
+ *      (GENERIC-SEGMENTED-DASH-EXECUTION-001).
+ *
+ * Gates 2-6 apply to a segmented source exactly as they do to a progressive
+ * one; the protocol is never a reason to weaken any of them, and a segmented
+ * format that fails one of them is withheld for THAT reason.
  *
  * Requirement 1 is deliberately strict about ABSENCE too: a format with no
  * `protocol` field is not eligible. yt-dlp derives a missing protocol from the
@@ -851,7 +853,8 @@ export type CandidateRejection =
   | "video-shape-unestablished"
   | "no-stream"
   | "container-not-allowed"
-  | "size-over-limit";
+  | "size-over-limit"
+  | "segmented-not-split-half";
 
 export type FormatEvaluation =
   | { readonly ok: true; readonly candidate: Candidate }
@@ -946,9 +949,7 @@ function evaluateRawFormat(
   const reject = (rejection: CandidateRejection): FormatEvaluation => ({ ok: false, rejection });
   const protocol = typeof raw.protocol === "string" ? raw.protocol.toLowerCase() : null;
   if (protocol === null) return reject("protocol-missing");
-  if (!(YTDLP_V1_NATIVE_PROTOCOLS as readonly string[]).includes(protocol)) {
-    return reject("protocol-unsupported");
-  }
+  if (!isGenericSourceProtocol(protocol)) return reject("protocol-unsupported");
 
   // §11: a candidate whose upstream identifier does not satisfy the approved
   // literal grammar is NOT executable, so it must not be advertised either.
@@ -1054,6 +1055,21 @@ function evaluateRawFormat(
   if (limitSize !== null && limitSize > limits.maxFileSizeBytes) return reject("size-over-limit");
   const fileSize = declaredFileSize(raw);
 
+  // Gate 7 (GENERIC-SEGMENTED-DASH-EXECUTION-001), deliberately LAST so a
+  // segmented format failing any ordinary gate above is reported for that
+  // gate. A segmented source is admitted only as a proven split-pair half:
+  // exactly the shapes `isSplitVideoCandidate` / `isSplitAudioCandidate`
+  // accept. Only a pair's merge — the Worker's own FFmpeg, after
+  // `beginProcessing()` — rewrites and validates the fragmented artifact the
+  // pinned `FragmentFD` leaves; a muxed or unknown-audio segmented source would
+  // be kept verbatim, which nothing has proven safe. The private selection and
+  // plan schemas state the same rule, so it cannot be bypassed from here.
+  if (genericAcquisitionLayout(protocol) === "segmented") {
+    const videoHalf = hasVideo && audioConstraint === "absent";
+    const audioHalf = !hasVideo && audioConstraint === "codec-present";
+    if (!videoHalf && !audioHalf) return reject("segmented-not-split-half");
+  }
+
   return {
     ok: true,
     candidate: {
@@ -1067,7 +1083,7 @@ function evaluateRawFormat(
       fileSize,
       limitSize,
       formatId,
-      protocol: protocol as GenericSourceProtocol,
+      protocol,
       videoConstraint,
       audioConstraint,
       index,
@@ -1696,7 +1712,15 @@ function constructGenericPresets(
   // currently backing every video preset — can never become an audio or MP3
   // source: extracting from a silent file is a `PROCESSING_FAILED`, not a
   // download.
-  const audioOnly = candidates.filter((c) => c.hasAudio && !c.hasVideo);
+  //
+  // And both pools are PROGRESSIVE only (GENERIC-SEGMENTED-DASH-EXECUTION-001).
+  // An audio product is a single-source plan, and a single-source plan never
+  // names a segmented source: a proven audio-only DASH candidate may be a
+  // pair's audio half above, but it is never kept verbatim or extracted here.
+  // (A muxed segmented candidate cannot exist at all — see `evaluateRawFormat`.)
+  const audioOnly = candidates.filter(
+    (c) => c.hasAudio && !c.hasVideo && genericAcquisitionLayout(c.protocol) === "progressive",
+  );
   const bestAudioOnly = bestOf(audioOnly);
   const audioSource = bestAudioOnly ?? (opts.ffmpegAvailable ? bestOf(muxedVideo) : null);
 
@@ -1847,6 +1871,12 @@ export function assertGenericPresetBuild(
 
     if (value.kind === "single") {
       const source = value.source;
+
+      // A single source is always PROGRESSIVE: only a pair may name a
+      // segmented source (GENERIC-SEGMENTED-DASH-EXECUTION-001). Construction
+      // never builds one, and the plan schema would refuse it; asserting it
+      // here makes it a property of the analyzer's output as well.
+      if (genericAcquisitionLayout(source.protocol) !== "progressive") fail();
 
       if (audioProduct) {
         // An audio product is built on PROVEN audio and on nothing else. An
@@ -2181,8 +2211,12 @@ function dispositionOf(
 /** Maps a private cause onto the closed public vocabulary. Total by construction. */
 function withheldReasonFor(cause: WithheldCause): SourceQualityWithheldReason {
   switch (cause) {
+    // `segmented-not-split-half`: a segmented rendition that is not a proven
+    // video-only split half (for a VIDEO-like row: muxed, or audio unknown) is a
+    // stream type current delivery does not support — exactly this reason.
     case "protocol-missing":
     case "protocol-unsupported":
+    case "segmented-not-split-half":
       return "unsupported_protocol";
     case "container-not-allowed":
       return "unsupported_container";

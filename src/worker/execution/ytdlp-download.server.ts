@@ -16,7 +16,12 @@ import {
   type YtdlpProbeOptions,
   type YtdlpRuntimeStatus,
 } from "../runtime/ytdlp-runtime.server.ts";
-import { buildGenericFormatSelector, type GenericSourceSelection } from "./generic-source.ts";
+import {
+  buildGenericFormatSelector,
+  genericAcquisitionLayout,
+  type GenericAcquisitionLayout,
+  type GenericSourceSelection,
+} from "./generic-source.ts";
 import {
   GenericExecutionPlanSchema,
   type GenericSingleSourceExecutionPlan,
@@ -50,17 +55,29 @@ import {
  * work while the durable job still says `downloading`. That is enforced by five
  * independent mechanisms, no one of which is trusted alone (§24):
  *
- *   1. `--downloader=native`, inherited from the closed base policy, so
- *      acquisition uses `HttpFD`;
- *   2. a single progressive http/https source PER SUBPROCESS — a split pair is
- *      two runs, never one `+`-joined selection — so no fragment or manifest
- *      downloader is reachable and no merge is possible;
+ *   1. `--downloader=native`, inherited from the closed base policy, so a
+ *      progressive source uses `HttpFD` and a segmented-DASH source uses
+ *      `DashSegmentsFD` with NO fragment delegate (the pinned runtime maps its
+ *      `dash_frag_urls` lookup to nothing under `native`);
+ *   2. ONE approved source PER SUBPROCESS, on a protocol from the closed
+ *      `GENERIC_SOURCE_PROTOCOLS` vocabulary — a split pair is two runs, never
+ *      one `+`-joined selection — so no HLS or other delegating downloader is
+ *      reachable and no merge is possible;
  *   3. a PATH that resolves nothing, so `ffmpeg`/`ffprobe` cannot be found by
  *      bare name;
  *   4. `--ffmpeg-location` pointed at a fixed nonexistent path, which makes the
  *      pinned release treat FFmpeg as unavailable outright;
  *   5. `--fixup=never`, so no post-download media repair is attempted even if
- *      something were available.
+ *      something were available. For a segmented source this is load-bearing,
+ *      not defence in depth: the pinned runtime marks every MPD-derived format
+ *      `is_dash_periods`, and its default fixup would run
+ *      `FFmpegFixupDuplicateMoovPP` (and `FFmpegFixupM4aPP` for DASH m4a) on
+ *      every such download.
+ *
+ * GENERIC-SEGMENTED-DASH-EXECUTION-001: a segmented source is acquired ONLY as
+ * one half of a split pair (the plan schema refuses it anywhere else), so the
+ * fragmented artifact `DashSegmentsFD` leaves is always rewritten and validated
+ * by the Worker's own merge after `beginProcessing()` — never delivered as is.
  *
  * ─── What this module must never do ─────────────────────────────────────────
  *
@@ -200,6 +217,9 @@ export function buildYtdlpDownloadEnvironment(opts: { workDir: string }): NodeJS
  *   --max-filesize         `'--max-filesize'`
  *   --concurrent-fragments `'-N', '--concurrent-fragments'`
  *   --no-keep-fragments    `'--no-keep-fragments'`
+ *   --abort-on-unavailable-fragments
+ *                          `'--abort-on-unavailable-fragments', '--no-skip-unavailable-fragments'`
+ *                          -> skip_unavailable_fragments=False
  *   --no-mtime             `'--no-mtime'`
  *   --no-overwrites        `'-w', '--no-overwrites'`
  *   --format               `'-f', '--format'`
@@ -267,14 +287,31 @@ export function ytdlpDownloadPolicyArgs(opts: {
     // writing anything — or, when the refused response is a LATER one of the
     // same download (the next chunk of an extractor-chunked source, or a
     // resumed retry), after the earlier responses filled this run's `.part`.
+    //
+    // For a segmented source the pinned `FragmentFD` hands this value to each
+    // FRAGMENT's own quiet `HttpFD`, so it bounds one fragment's declared
+    // length — never the aggregate — and a refusal there prints no witness
+    // and surfaces as a failed fragment (a non-zero exit). The segmented
+    // actual-byte guard, not this option, is what bounds the whole run.
     `--max-filesize=${maxFileSizeArg(opts.maxFileSizeBytes)}`,
 
     // ── fragment policy ──────────────────────────────────────────────────
-    // A progressive http/https source should never fragment. Both options are
-    // stated anyway so a future source shape cannot quietly gain parallel
-    // fragment downloads or leave fragment files behind.
+    // A progressive source never fragments. A segmented-DASH source does, and
+    // for it all three options are load-bearing (GENERIC-SEGMENTED-DASH-
+    // EXECUTION-001):
+    //
+    //   - ONE fragment in flight at a time, so the fragment-aware byte guard
+    //     sees at most one fragment beside the aggregate, and fragment
+    //     retries share this run's single deadline sequentially;
+    //   - completed fragments are deleted as soon as they are appended;
+    //   - a fragment that cannot be fetched ABORTS the run. The pinned
+    //     default is to SKIP any fragment after the first, report
+    //     "Skipping fragment", and exit 0 with media silently missing from the
+    //     middle of the artifact. Here it is a failed run instead: the pinned
+    //     release reports the error and exits non-zero.
     "--concurrent-fragments=1",
     "--no-keep-fragments",
+    "--abort-on-unavailable-fragments",
 
     // ── filesystem hygiene ───────────────────────────────────────────────
     // No upstream mtime is applied, and an existing file is never silently
@@ -812,9 +849,11 @@ export async function downloadGenericOriginal(
   // Every size the monitor observes for this run arrives here — and ONLY while
   // the run's monitor is still live: `runMonitoredAcquisition` owns that
   // liveness gate (CORRECTION-01 §7/§8). The byte policy and the progress
-  // arithmetic below are the single-source downloader's own, unchanged.
-  const onObserved = (observed: number) => {
-    if (observed > maxBytes) {
+  // arithmetic below are the single-source downloader's own, unchanged: a
+  // single-source plan is always progressive (the plan schema refuses a
+  // segmented source here), so its two readings are one number.
+  const onObserved = ({ guardBytes, progressBytes: observed }: ObservedAcquisitionBytes) => {
+    if (guardBytes > maxBytes) {
       abortOnce("overflow", new AppError("TOO_LARGE"));
       return;
     }
@@ -869,6 +908,7 @@ export async function downloadGenericOriginal(
       signal: controller.signal,
       callerSignal: deps.signal,
       abortCause: () => abortCause,
+      layout: genericAcquisitionLayout(validPlan.source.protocol),
       partPath,
       finalPath,
       statSize,
@@ -902,6 +942,84 @@ function acquisitionBudgetMs(limits: GenericDownloadLimits): number {
   );
 }
 
+// ── Segmented acquisition grammar (GENERIC-SEGMENTED-DASH-EXECUTION-001) ─────
+
+/**
+ * What ONE job-directory entry is to a SEGMENTED run whose final artifact is
+ * named `finalName` — read against the pinned `FragmentFD` naming and nothing
+ * wider:
+ *
+ *   `<final>`                    aggregate, after the final rename
+ *   `<final>.part`               aggregate, while fragments are appended
+ *   `<final>.part-Frag<N>.part`  the fragment in flight
+ *   `<final>.part-Frag<N>`       a completed fragment, about to be appended to
+ *                                the aggregate and removed
+ *   `<final>.ytdl`               the downloader's JSON bookkeeping file
+ *   anything else                unexpected
+ *
+ * Read out of the pinned 2026.08.19 `fragment.py`, and exercised against the
+ * pinned artifact by the runtime contract test: `_download_fragment` names a
+ * fragment `'%s-Frag%d' % (ctx['tmpfilename'], ctx['fragment_index'])`, where
+ * `tmpfilename` is `<final>.part` and the index is `DashSegmentsFD`'s
+ * `frag_index`, counting from 1 (plain decimal: no sign, no leading zero); the
+ * fragment's own `HttpQuietDownloader` streams into that name plus `.part`
+ * and renames it on success; `ytdl_filename()` is `<final>.ytdl`.
+ *
+ * The classification decides only what the byte guard and progress COUNT. It
+ * never makes an entry acceptable: a successful run must still leave exactly
+ * its final artifact (`assertExactEntries`), so a surviving fragment, `.part`,
+ * `.ytdl` or unexpected entry is refused there, not here.
+ */
+export type SegmentedAcquisitionEntry =
+  | "aggregate"
+  | "fragment-in-flight"
+  | "fragment-complete"
+  | "bookkeeping"
+  | "unexpected";
+
+const SEGMENTED_FRAGMENT_SUFFIX = /^\.part-Frag[1-9][0-9]{0,8}(\.part)?$/;
+
+export function classifySegmentedAcquisitionEntry(
+  finalName: string,
+  entry: string,
+): SegmentedAcquisitionEntry {
+  if (entry === finalName || entry === `${finalName}.part`) return "aggregate";
+  if (entry === `${finalName}.ytdl`) return "bookkeeping";
+  if (entry.startsWith(finalName)) {
+    const match = SEGMENTED_FRAGMENT_SUFFIX.exec(entry.slice(finalName.length));
+    if (match !== null) return match[1] === undefined ? "fragment-complete" : "fragment-in-flight";
+  }
+  return "unexpected";
+}
+
+/**
+ * One sample of what ONE acquisition run holds, in two readings.
+ *
+ *   guardBytes     what the byte GUARD charges: the aggregate, the fragment in
+ *                  flight, every completed fragment's bytes that are not yet in
+ *                  the aggregate, and every unexpected entry. No fragment, and
+ *                  no entry of any name, escapes the ceiling.
+ *   progressBytes  the media acquired so far, each byte ONCE: the aggregate, the
+ *                  fragment in flight, and a completed fragment's not-yet-
+ *                  appended bytes only when they are known exactly.
+ *
+ * "Not yet in the aggregate" is exact whenever the monitor saw that fragment in
+ * flight: under `--concurrent-fragments=1` the pinned `FragmentFD` appends
+ * fragments strictly one after another, so while fragment N is in flight the
+ * aggregate holds exactly the bytes before N. A completed fragment the monitor
+ * never saw in flight is charged WHOLE by the guard — it may then be counted a
+ * second time inside the aggregate it is being appended to, which is the
+ * conservative direction — and not at all by progress, which therefore never
+ * counts a fragment twice.
+ *
+ * For a progressive run the two are the same single number the monitor has
+ * always produced.
+ */
+type ObservedAcquisitionBytes = {
+  readonly guardBytes: number;
+  readonly progressBytes: number;
+};
+
 // ── One monitored acquisition subprocess (shared) ────────────────────────────
 
 /**
@@ -911,8 +1029,18 @@ function acquisitionBudgetMs(limits: GenericDownloadLimits): number {
  * Shared by the single-source downloader and by EACH half of a split pair, so
  * the load-bearing lifecycle rules below exist once rather than in two copies
  * that could drift. It owns no byte policy and no progress arithmetic:
- * `onObserved` receives the size observed for THIS run's `.part`/final path and
- * decides both.
+ * `onObserved` receives what THIS run holds on disk and decides both.
+ *
+ * WHAT is observed follows the run's acquisition layout
+ * (GENERIC-SEGMENTED-DASH-EXECUTION-001):
+ *
+ *   progressive  the run's `.part`, else its final path — exactly as before,
+ *                one stat each, and one number for both readings;
+ *   segmented    every entry the run added to the job directory, read against
+ *                the pinned `FragmentFD` grammar (`classifySegmentedAcquisitionEntry`),
+ *                the aggregate first, and charged as `ObservedAcquisitionBytes`
+ *                describes: the aggregate, the fragment in flight, completed
+ *                fragment bytes not yet appended, and anything unexpected.
  *
  * Nor does it own an abort cause. The first-cause latch belongs to the calling
  * OPERATION and is only read here, through `abortCause`, so the two runs of a
@@ -954,12 +1082,14 @@ async function runMonitoredAcquisition(opts: {
   readonly callerSignal: AbortSignal | undefined;
   /** Reads the operation's one-way first-cause latch. */
   readonly abortCause: () => AbortCause;
+  /** How THIS run's approved source lays its bytes down; chooses the sampler. */
+  readonly layout: GenericAcquisitionLayout;
   readonly partPath: string;
   readonly finalPath: string;
   readonly statSize: (path: string) => Promise<number | null>;
   readonly pollMs: number;
   /** Called synchronously, and ONLY while this run's monitor is live. */
-  readonly onObserved: (observed: number) => void;
+  readonly onObserved: (observed: ObservedAcquisitionBytes) => void;
 }): Promise<void> {
   const { statSize, partPath, finalPath } = opts;
 
@@ -982,7 +1112,7 @@ async function runMonitoredAcquisition(opts: {
   // sample can neither report progress during audio nor abort the audio child.
   let monitorActive = true;
 
-  const sample = async () => {
+  const sampleProgressive = async () => {
     if (!monitorActive) return;
 
     // Either path may be absent: before yt-dlp creates the file, and after it
@@ -996,8 +1126,104 @@ async function runMonitoredAcquisition(opts: {
     const observed = partSize ?? finalSize;
     if (observed === null) return;
 
-    opts.onObserved(observed);
+    opts.onObserved({ guardBytes: observed, progressBytes: observed });
   };
+
+  // GENERIC-SEGMENTED-DASH-EXECUTION-001. A segmented run's in-flight fragment
+  // has an index-bearing name no fixed path can anticipate, so the job
+  // directory itself is listed. Everything the run ADDED counts — entries that
+  // were there before it (a split pair's validated video half) are the
+  // caller's, already inside its combined budget. Names are only classified
+  // here, never accepted: a transient entry the job directory legitimately
+  // sees mid-run (`HOME` and `TMPDIR` point into it) is still counted by the
+  // guard, and the run's success is decided by the exact directory proof that
+  // follows it.
+  const finalName = basename(finalPath);
+  // PER RUN: for each fragment seen in flight, the aggregate size it will
+  // extend (see `ObservedAcquisitionBytes`). At most the one or two fragments
+  // currently on disk are remembered; the rest are pruned.
+  const aggregateBefore = new Map<string, number>();
+  const sampleSegmented = async () => {
+    if (!monitorActive) return;
+
+    let names: string[];
+    try {
+      names = await opts.readDir(opts.workDir);
+    } catch {
+      return;
+    }
+    if (!monitorActive) return;
+
+    const before = new Set(opts.entriesBefore);
+    const owned = names
+      .filter((name) => !before.has(name))
+      .map((name) => ({ name, kind: classifySegmentedAcquisitionEntry(finalName, name) }))
+      // The bookkeeping file is JSON state, not media, and is bounded by the
+      // pinned writer (a handful of integers); it is refused at completion.
+      .filter((entry) => entry.kind !== "bookkeeping")
+      // The aggregate FIRST, so every fragment below is stat'ed after it.
+      .sort((a, b) => Number(a.kind !== "aggregate") - Number(b.kind !== "aggregate"));
+
+    let aggregate = 0;
+    let inFlight = 0;
+    let unexpected = 0;
+    const completed: Array<{ readonly name: string; readonly size: number }> = [];
+    let sized = 0;
+    for (const entry of owned) {
+      // Any entry may vanish between the listing and its stat — a fragment is
+      // renamed, appended and removed in quick succession. That is not an
+      // error; the next sample sees the new state.
+      const size = await statSize(join(opts.workDir, entry.name));
+      if (!monitorActive) return;
+      if (size === null) continue;
+      sized += 1;
+      switch (entry.kind) {
+        case "aggregate":
+          aggregate += size;
+          break;
+        case "fragment-in-flight": {
+          inFlight += size;
+          // This fragment was still in flight AFTER the aggregate was read, so
+          // that reading predates its append: it is exactly the aggregate this
+          // fragment will extend.
+          const fragment = entry.name.slice(0, -".part".length);
+          if (!aggregateBefore.has(fragment)) aggregateBefore.set(fragment, aggregate);
+          break;
+        }
+        case "fragment-complete":
+          completed.push({ name: entry.name, size });
+          break;
+        default:
+          unexpected += size;
+      }
+    }
+    if (sized === 0) return;
+
+    let pendingCharged = 0;
+    let pendingKnown = 0;
+    for (const fragment of completed) {
+      const base = aggregateBefore.get(fragment.name);
+      if (base === undefined) {
+        // Never seen in flight: charged whole, and never counted as progress.
+        pendingCharged += fragment.size;
+        continue;
+      }
+      const notYetAppended = Math.max(0, base + fragment.size - aggregate);
+      pendingCharged += notYetAppended;
+      pendingKnown += notYetAppended;
+    }
+    const present = new Set(owned.map((entry) => entry.name));
+    for (const fragment of [...aggregateBefore.keys()]) {
+      if (!present.has(fragment) && !present.has(`${fragment}.part`)) aggregateBefore.delete(fragment);
+    }
+
+    opts.onObserved({
+      guardBytes: aggregate + inFlight + pendingCharged + unexpected,
+      progressBytes: aggregate + inFlight + pendingKnown,
+    });
+  };
+
+  const sample = opts.layout === "segmented" ? sampleSegmented : sampleProgressive;
 
   let timer: ReturnType<typeof setInterval> | null = null;
   let sampling = false;
@@ -1095,6 +1321,14 @@ async function runMonitoredAcquisition(opts: {
   // nothing new, or only this run's own partial `.part` — with every artifact
   // validated before this run intact. Anything short of that returns, and the
   // ordinary validation refuses it exactly as before.
+  //
+  // The witness is `HttpFD`'s own line for a PROGRESSIVE download. A segmented
+  // run never prints it: its fragments are fetched by the pinned
+  // `HttpQuietDownloader`, whose `to_screen` is a no-op, and a refused fragment
+  // is a failed fragment that exits non-zero. So a segmented run's stdout is
+  // never read as a size refusal at all; its bytes are bounded by the segmented
+  // guard, and a zero exit is judged by the exact directory proof alone.
+  if (opts.layout !== "progressive") return;
   if (!isPinnedMaxFilesizeRefusal(result.stdout, opts.maxFileSizeBytes)) return;
   throwIfEarlierCause(opts);
   if (!(await isPinnedRefusalShape(opts))) return;
@@ -1182,16 +1416,24 @@ function throwIfEarlierCause(opts: {
 type SplitHalfPaths = {
   readonly role: GenericSplitRole;
   readonly container: string;
+  /** The approved member's acquisition layout: which grammar monitors it. */
+  readonly layout: GenericAcquisitionLayout;
   /** The exact directory entry a successful run of this half leaves behind. */
   readonly name: string;
   readonly finalPath: string;
   readonly partPath: string;
 };
 
-function splitHalfPaths(workDir: string, role: GenericSplitRole, container: string): SplitHalfPaths {
+function splitHalfPaths(
+  workDir: string,
+  role: GenericSplitRole,
+  member: GenericSourceSelection,
+): SplitHalfPaths {
+  const container = member.container;
   return {
     role,
     container,
+    layout: genericAcquisitionLayout(member.protocol),
     name: `${YTDLP_SPLIT_OUTPUT_BASENAMES[role]}.${container}`,
     finalPath: expectedSplitSourcePath(workDir, role, container),
     partPath: expectedSplitPartPath(workDir, role, container),
@@ -1297,8 +1539,8 @@ export async function downloadGenericSplitSources(
   // Each half's fixed final and `.part` paths, from ROLE + approved container.
   // The role basenames differ, so these four paths cannot collide — and that is
   // proven here, before anything runs, rather than assumed (§18).
-  const video = splitHalfPaths(workDir, "video", validPlan.pair.video.container);
-  const audio = splitHalfPaths(workDir, "audio", validPlan.pair.audio.container);
+  const video = splitHalfPaths(workDir, "video", validPlan.pair.video);
+  const audio = splitHalfPaths(workDir, "audio", validPlan.pair.audio);
   const paths = [video.finalPath, video.partPath, audio.finalPath, audio.partPath];
   if (new Set(paths).size !== paths.length) throw new AppError("PROCESSING_FAILED");
 
@@ -1435,18 +1677,24 @@ export async function downloadGenericSplitSources(
         signal: controller.signal,
         callerSignal: deps.signal,
         abortCause: () => abortCause,
+        // Per HALF, from that member's own approved protocol: a DASH video
+        // half and an HTTPS audio half are monitored each by its own grammar.
+        layout: half.layout,
         partPath: half.partPath,
         finalPath: half.finalPath,
         statSize,
         pollMs,
-        onObserved: (observed) => {
+        onObserved: ({ guardBytes, progressBytes }) => {
           // The COMBINED live guard: bytes already validated for earlier halves
-          // plus this half's observed bytes, measured from actual files.
-          if (acquiredBytes + observed > maxBytes) {
+          // plus EVERY byte this half's run holds — for a segmented half, its
+          // aggregate and any fragment on disk — measured from actual files.
+          if (acquiredBytes + guardBytes > maxBytes) {
             abortOnce("overflow", new AppError("TOO_LARGE"));
             return;
           }
-          report(acquiredBytes + observed);
+          // Progress counts each acquired byte once; `report` keeps the one
+          // aggregate stream monotonic across fragment moves and restarts.
+          report(acquiredBytes + progressBytes);
         },
       });
 

@@ -15,7 +15,6 @@ import {
   type ClearHlsMediaPlaylistSelection,
   type ClearHlsMediaPlaylistSelections,
 } from "../hls/hls-source-selection.ts";
-import { YTDLP_V1_NATIVE_PROTOCOLS } from "../analysis/ytdlp-analysis.server.ts";
 import {
   GENERIC_SOURCE_PROTOCOLS,
   GenericPresetSourceSchema,
@@ -1081,12 +1080,40 @@ function productionSourceFiles(): string[] {
 const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
 
 describe("HLS-7 structure: activated at ONE point, and nowhere else", () => {
-  it("leaves both protocol policies exactly http and https", () => {
-    assert.deepEqual([...YTDLP_V1_NATIVE_PROTOCOLS], ["http", "https"]);
-    assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https"]);
+  it("keeps HLS out of the one yt-dlp protocol vocabulary", () => {
+    assert.deepEqual([...GENERIC_SOURCE_PROTOCOLS], ["http", "https", "http_dash_segments"]);
+    assert.equal(GENERIC_SOURCE_PROTOCOLS.some((p) => p.includes("m3u8")), false);
   });
 
-  it("keeps the public withheld vocabulary unchanged — segmented DASH still lands on unsupported_protocol", () => {
+  it("the HLS acceptance orchestrator still LOADS, and requires the restated protocol invariant", async () => {
+    // GENERIC-SEGMENTED-DASH-EXECUTION-001 removed the analyzer's second
+    // protocol list, which this orchestrator used to import: a stale import
+    // would not fail its check, it would fail to load at all.
+    //
+    // Non-literal specifiers on purpose: the harness is untyped `.mjs`, and a
+    // literal import would pull it into `tsc`'s program. The runtime import is
+    // exactly the same.
+    const harness = "../../../deploy/acceptance/ytdlp-generic";
+    const orchestrator = (await import(`${harness}/hls-full-path.mjs`)) as { createChecks?: unknown };
+    assert.equal(typeof orchestrator.createChecks, "function");
+    const evidence = (await import(`${harness}/lib/hls-evidence.mjs`)) as {
+      HLS_BEHAVIORAL_MANDATORY_CHECKS: readonly string[];
+      HLS08_EVIDENCE_SCHEMA: string;
+    };
+    const mandatory = [...evidence.HLS_BEHAVIORAL_MANDATORY_CHECKS];
+    for (const restated of [
+      "invariants/generic-source-protocols-exclude-hls",
+      "invariants/generic-source-protocols-reviewed-vocabulary",
+    ]) {
+      assert.ok(mandatory.includes(restated), restated);
+    }
+    for (const retired of ["invariants/ytdlp-native-protocols-http-https", "invariants/generic-source-protocols-http-https"]) {
+      assert.equal(mandatory.includes(retired), false, retired);
+    }
+    assert.equal(evidence.HLS08_EVIDENCE_SCHEMA, "hls08-deterministic-full-path-03");
+  });
+
+  it("keeps the public withheld vocabulary unchanged — no HLS-specific reason", () => {
     assert.ok((SOURCE_QUALITY_WITHHELD_REASONS as readonly string[]).includes("unsupported_protocol"));
     for (const reason of SOURCE_QUALITY_WITHHELD_REASONS) {
       assert.equal(/hls|m3u8|playlist/i.test(reason), false, `${reason}: no HLS-specific reason`);

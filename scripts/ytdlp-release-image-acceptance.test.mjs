@@ -57,6 +57,9 @@ import {
   RELEASE_RUN_ENVIRONMENT,
   releaseAcceptanceRunArgs,
   releaseBuildArgs,
+  DASH01_ORCHESTRATOR,
+  releaseDashAcceptanceRunArgs,
+  releaseDashRunPostureViolations,
   releaseHlsAcceptanceRunArgs,
   releaseHlsRunPostureViolations,
   REPORT_MOUNT_TARGET,
@@ -68,6 +71,11 @@ import {
   HLS09_MANDATORY_CHECKS,
   HLS09_RELEASE_EVIDENCE_SCHEMA,
 } from "../deploy/acceptance/ytdlp-generic/lib/hls-release-evidence.mjs";
+import {
+  buildDashReleaseEvidence,
+  DASH01_MANDATORY_CHECKS,
+  DASH01_RELEASE_EVIDENCE_SCHEMA,
+} from "../deploy/acceptance/ytdlp-generic/lib/dash-evidence.mjs";
 import {
   buildExpectedSourceManifest,
   compareSourceManifests,
@@ -93,6 +101,10 @@ import {
   HARNESS_VERIFICATION_POINTS,
   HISTORICAL_SPLIT07_SCHEMAS,
   HLS_CANDIDATE_RUN_PURPOSE,
+  DASH_CANDIDATE_RUN_PURPOSE,
+  emptyDashChildObservation,
+  REQUIRED_DASH_CHILD_SCHEMA,
+  validateDashChildRecord,
   ReleaseEvidenceError,
   REQUIRED_CANDIDATE_RUN_PURPOSES,
   REQUIRED_CHILD_SCHEMA,
@@ -130,7 +142,8 @@ const PARENT = `${REPORT}/split07-release-image-1700000000000.json`;
 const STATUS_TRACKED = "status --porcelain=v1 --untracked-files=all --ignored=no --ignore-submodules=none";
 const STATUS_IGNORED = "status --porcelain=v1 --untracked-files=all --ignored=matching --ignore-submodules=none";
 const HARNESS_POINTS = [
-  "before-docker", "after-build", "before-split06-mp4", "before-split06-webm", "before-hls09-clear-hls", "after-children",
+  "before-docker", "after-build", "before-split06-mp4", "before-split06-webm", "before-hls09-clear-hls",
+  "before-dash01-segmented-dash", "after-children",
 ];
 const HARNESS_DIR = `${HARNESS}/deploy/acceptance/ytdlp-generic`;
 
@@ -272,6 +285,33 @@ function passingHlsChild(flags = null, overrides = {}) {
   return deepMerge(record, overrides);
 }
 
+/**
+ * A PASS segmented-DASH release child, built by the REAL DASH-01 builder (so
+ * its privacy and PASS gates apply), recording the identity flags it was GIVEN.
+ * `overrides` are deep-merged AFTER the builder to model a child broken in
+ * exactly one respect.
+ */
+function passingDashChild(flags = null, overrides = {}) {
+  const f = flags ?? {
+    sourceCommit: SOURCE, sourceTree: TREE, sourceContextClean: true,
+    candidateTag: TAG, candidateImageId: IMAGE_ID, runImageId: IMAGE_ID,
+  };
+  const record = buildDashReleaseEvidence({
+    verdict: "PASS",
+    startedAt: "2026-09-29T00:00:00.000Z",
+    finishedAt: "2026-09-29T00:00:30.000Z",
+    source: { commit: f.sourceCommit, tree: f.sourceTree, contextClean: f.sourceContextClean },
+    image: { candidateTag: f.candidateTag, imageId: f.candidateImageId, runSubject: f.runImageId },
+    network: { observedInterfaceNames: ["lo"] },
+    toolchain: { node: "v22.23.2" },
+    fixture: { video: { width: 1920, height: 1080 } },
+    cases: { "dash-dash": {}, "dash-progressive": {} },
+    negativeCases: {},
+    checks: DASH01_MANDATORY_CHECKS.map((name) => ({ name, ok: true, detail: null })),
+  });
+  return deepMerge(record, overrides);
+}
+
 /** A child record's exact on-disk bytes. */
 function recordBytes(record) {
   return Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8");
@@ -283,7 +323,7 @@ function recordBytes(record) {
  *
  * `spec` fields:
  *   git / harnessGit        overrides for individual release-context / harness git answers
- *   harnessChange           { after: "start"|"build"|"split06:mp4"|"split06:webm"|"hls09:clear-hls", kind }
+ *   harnessChange           { after: "start"|"build"|"split06:mp4"|"split06:webm"|"hls09:clear-hls"|"dash01:segmented-dash", kind }
  *                           makes the harness stop verifying from that event on
  *   imageConfig / configOverrides / probes   what image A (the inspected one) reports
  *   imageBProbes            what image B reports, if it is ever executed
@@ -292,6 +332,7 @@ function recordBytes(record) {
  *   children                per-family child record overrides (or `null` to omit the file)
  *   hls                     clear-HLS child overrides (or `null` to omit the file,
  *                           or `{ raw: "<bytes>" }` for unparseable bytes)
+ *   dash                    segmented-DASH child overrides, the same shapes as `hls`
  *   verifiers               per-verifier exit code
  *   production / productionAfter             Production observations
  *   files                   [path, bytes] entries already on the fake filesystem
@@ -540,6 +581,26 @@ function createWorld(spec = {}) {
       const name = evidenceArg.slice(evidenceArg.lastIndexOf("/") + 1);
       const reportMount = args.find((arg) => String(arg).endsWith(":/report"));
       const hostReport = reportMount ? String(reportMount).slice(0, -":/report".length) : REPORT;
+      if (args.includes(DASH01_ORCHESTRATOR)) {
+        // The segmented-DASH child: echoes the identity flags it was given.
+        const dash = Object.prototype.hasOwnProperty.call(spec, "dash") ? spec.dash : {};
+        if (dash !== null) {
+          const flags = {
+            sourceCommit: flagValue(args, "--source-commit"),
+            sourceTree: flagValue(args, "--source-tree"),
+            sourceContextClean: args.includes("--source-context-clean"),
+            candidateTag: flagValue(args, "--candidate-tag"),
+            candidateImageId: flagValue(args, "--candidate-image-id"),
+            runImageId: flagValue(args, "--run-image-id"),
+          };
+          files.set(
+            `${hostReport}/${name}`,
+            typeof dash.raw === "string" ? Buffer.from(dash.raw, "utf8") : recordBytes(passingDashChild(flags, dash)),
+          );
+        }
+        events.add(DASH_CANDIDATE_RUN_PURPOSE);
+        return ok("", spec.dashExit ?? 0);
+      }
       if (flagValue(args, "--acceptance-mode") === "release-image") {
         // The clear-HLS child: echoes the identity flags it was given.
         const hls = Object.prototype.hasOwnProperty.call(spec, "hls") ? spec.hls : {};
@@ -767,6 +828,15 @@ function evidenceInput(overrides = {}) {
       child: {
         schema: REQUIRED_HLS_CHILD_SCHEMA, verdict: "PASS", ok: true, sha256: sha256("clear-hls"), bytes: 100,
         checkCount: HLS09_MANDATORY_CHECKS.length, failedCheckCount: 0, evidenceFile: "hls09-clear-hls.json",
+        sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG, candidateImageId: IMAGE_ID, runImageId: IMAGE_ID,
+        networkMode: "none", reason: null,
+      },
+    },
+    dashAcceptance: {
+      executed: true,
+      child: {
+        schema: REQUIRED_DASH_CHILD_SCHEMA, verdict: "PASS", ok: true, sha256: sha256("segmented-dash"), bytes: 100,
+        checkCount: DASH01_MANDATORY_CHECKS.length, failedCheckCount: 0, evidenceFile: "dash01-segmented-dash.json",
         sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG, candidateImageId: IMAGE_ID, runImageId: IMAGE_ID,
         networkMode: "none", reason: null,
       },
@@ -1486,11 +1556,14 @@ describe("SPLIT-07 evidence builder", () => {
   });
 
   it("names a NEW schema, and never reuses or bumps SPLIT-06's", () => {
-    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-03");
+    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-05");
     assert.equal(REQUIRED_CHILD_SCHEMA, "split06-deterministic-full-path-04");
-    assert.equal(REQUIRED_HLS_CHILD_SCHEMA, "hls09-release-image-full-path-01");
+    assert.equal(REQUIRED_HLS_CHILD_SCHEMA, "hls09-release-image-full-path-02");
+    assert.equal(REQUIRED_DASH_CHILD_SCHEMA, "dash01-release-image-full-path-01");
+    assert.equal(REQUIRED_DASH_CHILD_SCHEMA, DASH01_RELEASE_EVIDENCE_SCHEMA);
     assert.notEqual(SPLIT07_EVIDENCE_SCHEMA, REQUIRED_CHILD_SCHEMA);
-    assert.notEqual(REQUIRED_HLS_CHILD_SCHEMA, "hls08-deterministic-full-path-02", "HLS-08 overlay evidence is not a release child");
+    assert.notEqual(REQUIRED_HLS_CHILD_SCHEMA, "hls08-deterministic-full-path-03", "HLS-08 overlay evidence is not a release child");
+    assert.notEqual(REQUIRED_HLS_CHILD_SCHEMA, "hls09-release-image-full-path-01", "the pre-DASH HLS-09 child is historical");
   });
 
   it("keeps a FAIL record emittable, so a failure is reportable", () => {
@@ -2242,9 +2315,23 @@ describe("SPLIT-07 harness provenance (driver)", () => {
     assert.equal(world.writeCalls.length, 0, "no parent evidence may be written");
   });
 
-  it("refuses the record when the harness changes while the last child — clear-HLS — runs", async () => {
+  it("refuses the record when the harness changes between the clear-HLS and segmented-DASH children, before DASH runs", async () => {
     for (const kind of ["modified", "staged", "ignored", "hidden", "moved"]) {
       const { result, error, world } = await drive({ harnessChange: { after: HLS_CANDIDATE_RUN_PURPOSE, kind } });
+      assert.equal(result, null, `${kind} must be refused`);
+      assert.match(String(error?.message), /\(before-dash01-segmented-dash\)/);
+      assert.equal(
+        world.dockerCalls.filter((c) => c.args.includes(DASH01_ORCHESTRATOR)).length,
+        0,
+        "the segmented-DASH child must never run on a changed harness",
+      );
+      assert.equal(world.writeCalls.length, 0, "no parent evidence may be written");
+    }
+  });
+
+  it("refuses the record when the harness changes while the last child — segmented DASH — runs", async () => {
+    for (const kind of ["modified", "staged", "ignored", "hidden", "moved"]) {
+      const { result, error, world } = await drive({ harnessChange: { after: DASH_CANDIDATE_RUN_PURPOSE, kind } });
       assert.equal(result, null, `${kind} must be refused`);
       assert.match(String(error?.message), /\(after-children\)/);
       assert.equal(world.writeCalls.length, 0, "no parent evidence may be written");
@@ -2291,7 +2378,7 @@ describe("SPLIT-07 parent evidence is created exclusively", () => {
   it("A1: with the pre-flight blind, the exclusive create itself refuses and leaves the file untouched", async () => {
     const { result, error, world } = await drive({ files: [[PARENT, PRIOR]] }, {}, { readdir: async () => [] });
     assert.equal(result, null);
-    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-03 verdict/);
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-05 verdict/);
     assert.ok(world.files.get(PARENT).equals(PRIOR), "the existing bytes must be unchanged");
     assert.deepEqual(world.writeCalls.map((call) => call.options), [{ encoding: "utf8", flag: "wx" }]);
   });
@@ -2302,7 +2389,7 @@ describe("SPLIT-07 parent evidence is created exclusively", () => {
     const lines = [];
     const { result, error, world } = await drive({ competitorAtWrite: competitor }, {}, { log: (line) => lines.push(line) });
     assert.equal(result, null, "a lost race returns no result, and so no PASS");
-    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-03 verdict/);
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-05 verdict/);
     assert.match(String(error?.message), /has NOT been modified/);
     assert.equal(world.files.get(PARENT).toString("utf8"), competitor, "the competing record must be byte-identical");
     assert.deepEqual(
@@ -2381,11 +2468,13 @@ describe("SPLIT-07 -02 evidence gates", () => {
     assert.equal(record.harness.commitIsReleaseSource, true);
   });
 
-  it("treats -01 and -02 as historical: the builder emits only -03", () => {
-    assert.equal(buildReleaseEvidence(evidenceInput()).schema, "split07-release-image-candidate-03");
+  it("treats -01 through -04 as historical: the builder emits only -05", () => {
+    assert.equal(buildReleaseEvidence(evidenceInput()).schema, "split07-release-image-candidate-05");
     assert.deepEqual([...HISTORICAL_SPLIT07_SCHEMAS], [
       "split07-release-image-candidate-01",
       "split07-release-image-candidate-02",
+      "split07-release-image-candidate-03",
+      "split07-release-image-candidate-04",
     ]);
     assert.ok(!HISTORICAL_SPLIT07_SCHEMAS.includes(SPLIT07_EVIDENCE_SCHEMA));
   });
@@ -2582,7 +2671,8 @@ describe("SPLIT-07 -03 clear-HLS child record validation", () => {
     missingCheck.checks = missingCheck.checks.filter((check) => check.name !== "hls3/each-fragment-requested-exactly-once");
     const cases = [
       ["HLS-08 overlay schema", passingHlsChild(null, { schema: "hls08-deterministic-full-path-02" }), /schema is/],
-      ["a future schema", passingHlsChild(null, { schema: "hls09-release-image-full-path-02" }), /schema is/],
+      ["the pre-DASH HLS-09 schema", passingHlsChild(null, { schema: "hls09-release-image-full-path-01" }), /schema is/],
+      ["a future schema", passingHlsChild(null, { schema: "hls09-release-image-full-path-03" }), /schema is/],
       ["verdict FAIL", passingHlsChild(null, { verdict: "FAIL" }), /verdict is FAIL/],
       ["one failed check", failedCheck, /1 of \d+ checks did not pass/],
       ["a missing mandatory check", missingCheck, /mandatory checks absent/],
@@ -2626,11 +2716,15 @@ describe("SPLIT-07 -03 clear-HLS child record validation", () => {
 });
 
 describe("SPLIT-07 -03 evidence gates", () => {
-  it("emits a -03 PASS with mp4 + webm + the clear-HLS child", () => {
+  it("emits a -05 PASS with mp4 + webm + the clear-HLS child + the segmented-DASH child", () => {
     const record = buildReleaseEvidence(evidenceInput());
-    assert.equal(record.schema, "split07-release-image-candidate-03");
+    assert.equal(record.schema, "split07-release-image-candidate-05");
+    assert.equal(record.dashAcceptance.requiredChildSchema, "dash01-release-image-full-path-01");
+    assert.equal(record.dashAcceptance.executed, true);
+    assert.equal(record.dashAcceptance.child.candidateImageId, IMAGE_ID);
+    assert.equal(record.dashAcceptance.child.runImageId, IMAGE_ID);
     assert.equal(record.verdict, "PASS");
-    assert.equal(record.hlsAcceptance.requiredChildSchema, "hls09-release-image-full-path-01");
+    assert.equal(record.hlsAcceptance.requiredChildSchema, "hls09-release-image-full-path-02");
     assert.equal(record.hlsAcceptance.executed, true);
     assert.equal(record.hlsAcceptance.child.candidateImageId, IMAGE_ID);
     assert.equal(record.hlsAcceptance.child.runImageId, IMAGE_ID);
@@ -2650,11 +2744,11 @@ describe("SPLIT-07 -03 evidence gates", () => {
     ]);
   });
 
-  it("requires the HLS run purpose in the candidate ledger: nine runs, every one by the immutable id", () => {
+  it("requires the HLS and DASH run purposes in the candidate ledger: ten runs, every one by the immutable id", () => {
     assert.deepEqual([...REQUIRED_CANDIDATE_RUN_PURPOSES], [
       "probe:manifest", "probe:tools", "probe:env", "probe:runtime",
       "verifier:verify-selector.py", "verifier:verify-download-policy.py",
-      "split06:mp4", "split06:webm", "hls09:clear-hls",
+      "split06:mp4", "split06:webm", "hls09:clear-hls", "dash01:segmented-dash",
     ]);
     const missing = evidenceInput();
     missing.image.candidateRuns = missing.image.candidateRuns.filter((entry) => entry.purpose !== HLS_CANDIDATE_RUN_PURPOSE);
@@ -2707,7 +2801,7 @@ describe("SPLIT-07 -03 evidence gates", () => {
     }
   });
 
-  it("reads a -03 record back, and never silently reads a historical -02 or -01 record as -03", () => {
+  it("reads a -05 record back, and never silently reads a historical -01..-04 record as -05", () => {
     const current = JSON.parse(renderReleaseEvidence(buildReleaseEvidence(evidenceInput())));
     assert.deepEqual(validateReleaseParentRecord(current, { sourceCommit: SOURCE, imageId: IMAGE_ID }), []);
     for (const schema of HISTORICAL_SPLIT07_SCHEMAS) {
@@ -2715,7 +2809,7 @@ describe("SPLIT-07 -03 evidence gates", () => {
       // in, is named historical — never read under -03 rules as a PASS.
       const problems = validateReleaseParentRecord({ ...current, schema }, { sourceCommit: SOURCE, imageId: IMAGE_ID });
       assert.equal(problems.length, 1, schema);
-      assert.match(problems[0], /historical schema.*does not qualify clear HLS/, schema);
+      assert.match(problems[0], /historical schema.*does not carry the real-media segmented-DASH child/, schema);
     }
     // A -02-shaped record relabelled -03: no HLS child, so no -03 PASS.
     const relabelled = JSON.parse(JSON.stringify(current));
@@ -2723,7 +2817,13 @@ describe("SPLIT-07 -03 evidence gates", () => {
     relabelled.checks = relabelled.checks.filter((check) => !check.name.startsWith("hls/"));
     relabelled.image.candidateRuns = relabelled.image.candidateRuns.filter((entry) => entry.purpose !== HLS_CANDIDATE_RUN_PURPOSE);
     assert.ok(validateReleaseParentRecord(relabelled).some((problem) => /missing required checks/.test(problem)));
-    assert.ok(validateReleaseParentRecord({ ...current, schema: "split07-release-image-candidate-04" }).length > 0);
+    assert.ok(validateReleaseParentRecord({ ...current, schema: "split07-release-image-candidate-06" }).length > 0);
+    // A -04-shaped record relabelled -05: no DASH child, so no -05 PASS.
+    const noDash = JSON.parse(JSON.stringify(current));
+    delete noDash.dashAcceptance;
+    noDash.checks = noDash.checks.filter((check) => !check.name.startsWith("dash/"));
+    noDash.image.candidateRuns = noDash.image.candidateRuns.filter((entry) => entry.purpose !== DASH_CANDIDATE_RUN_PURPOSE);
+    assert.ok(validateReleaseParentRecord(noDash).some((problem) => /missing required checks/.test(problem)));
     assert.ok(validateReleaseParentRecord(current, { sourceCommit: "f".repeat(40) }).includes("source commit mismatch"));
     assert.ok(validateReleaseParentRecord(current, { imageId: IMAGE_B }).includes("image id mismatch"));
     assert.ok(validateReleaseParentRecord({ ...current, harness: { ...current.harness, verifiedAfterRun: false } }).length > 0);
@@ -2734,22 +2834,27 @@ describe("SPLIT-07 -03 evidence gates", () => {
 describe("SPLIT-07 -03 driver: the clear-HLS child", () => {
   const hlsCalls = (world) => world.dockerCalls.filter((call) => call.args.includes("--acceptance-mode"));
 
-  it("runs mp4, webm, then clear-HLS — all by the immutable id — and PASSes with a bound -03 record", async () => {
+  it("runs mp4, webm, clear-HLS, then segmented DASH — all by the immutable id — and PASSes with a bound -05 record", async () => {
     const { result, error, world } = await drive();
     assert.equal(error, null, error ? String(error.message) : undefined);
     assert.equal(result.verdict, "PASS");
-    assert.equal(result.record.schema, "split07-release-image-candidate-03");
+    assert.equal(result.record.schema, "split07-release-image-candidate-05");
     const childOrder = world.dockerCalls
-      .filter((call) => call.args[0] === "run" && (call.args.includes("--family") || call.args.includes("--acceptance-mode")))
-      .map((call) => (call.args.includes("--family") ? call.args[call.args.indexOf("--family") + 1] : "clear-hls"));
-    assert.deepEqual(childOrder, ["mp4", "webm", "clear-hls"]);
+      .filter((call) =>
+        call.args[0] === "run" &&
+        (call.args.includes("--family") || call.args.includes("--acceptance-mode") || call.args.includes(DASH01_ORCHESTRATOR)))
+      .map((call) => {
+        if (call.args.includes("--family")) return call.args[call.args.indexOf("--family") + 1];
+        return call.args.includes(DASH01_ORCHESTRATOR) ? "segmented-dash" : "clear-hls";
+      });
+    assert.deepEqual(childOrder, ["mp4", "webm", "clear-hls", "segmented-dash"]);
     const [hlsCall] = hlsCalls(world);
     assert.equal(dockerRunSubject(hlsCall.args), IMAGE_ID);
     assert.deepEqual(
       releaseHlsRunPostureViolations(hlsCall.args, { reportDir: REPORT, harnessDir: HARNESS_DIR, mediaWorkspaceDir: MEDIA_WORKSPACE }),
       [],
     );
-    assert.equal(world.executed.length, 9);
+    assert.equal(world.executed.length, 10);
     assert.ok(world.executed.every((id) => id === IMAGE_ID));
     const hls = result.record.hlsAcceptance;
     assert.equal(hls.executed, true);
@@ -2916,5 +3021,267 @@ describe("SPLIT-07 -03 driver: the clear-HLS child", () => {
           : world.deps.readFile(path),
     };
     await assert.rejects(runReleaseImageAcceptance(world.options, deps), /did not read back as written/);
+  });
+});
+
+// ── 10. The -05 segmented-DASH real-media release child ────────────────────
+
+describe("SPLIT-07 -05 segmented-DASH release child invocation (container model)", () => {
+  const dashArgs = (overrides = {}) =>
+    releaseDashAcceptanceRunArgs({
+      imageId: IMAGE_ID, harnessDir: HARNESS_DIR, reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE,
+      evidenceName: "dash01-segmented-dash-1.json", sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG,
+      ...overrides,
+    });
+  const posture = (args) =>
+    releaseDashRunPostureViolations(args, { reportDir: REPORT, harnessDir: HARNESS_DIR, mediaWorkspaceDir: MEDIA_WORKSPACE });
+  const values = (args, flag) => args.flatMap((arg, i) => (arg === flag ? [args[i + 1]] : []));
+
+  it("has exactly the SPLIT-06 release posture, NO --add-host, by immutable id", () => {
+    const args = dashArgs();
+    assert.deepEqual(posture(args), []);
+    assert.equal(dockerRunSubject(args), IMAGE_ID);
+    assert.deepEqual(values(args, "--network"), ["none"]);
+    assert.deepEqual(values(args, "--add-host"), [], "the segmented fixture is addressed by loopback IP, never by name");
+    assert.equal(args.filter((arg) => arg === "--cap-drop=ALL").length, 1);
+    assert.deepEqual(values(args, "--security-opt"), ["no-new-privileges"]);
+    assert.equal(args.filter((arg) => arg === "--read-only").length, 1);
+    assert.deepEqual(values(args, "--mount"), [`type=bind,source=${MEDIA_WORKSPACE},target=/tmp/videofetch`]);
+    assert.deepEqual(values(args, "--tmpfs"), [HARNESS_SCRATCH_TMPFS]);
+    assert.deepEqual(values(args, "-e"), [...RELEASE_RUN_ENVIRONMENT]);
+    assert.deepEqual(mountTargets(args), [PRODUCT_MEDIA_TARGET, HARNESS_SCRATCH_TARGET, HARNESS_MOUNT_TARGET, "/report"]);
+    const tail = args.slice(args.indexOf(IMAGE_ID) + 1);
+    assert.deepEqual(tail.slice(0, 4), [
+      "--import", "./scripts/register-ts-aliases.mjs", "--experimental-strip-types", DASH01_ORCHESTRATOR,
+    ]);
+    assert.equal(DASH01_ORCHESTRATOR, "deploy/acceptance/ytdlp-generic/dash-full-path.mjs");
+    const flag = (name) => tail[tail.indexOf(name) + 1];
+    assert.equal(flag("--evidence"), "/report/dash01-segmented-dash-1.json");
+    assert.equal(flag("--source-commit"), SOURCE);
+    assert.equal(flag("--source-tree"), TREE);
+    assert.ok(tail.includes("--source-context-clean"));
+    assert.equal(flag("--candidate-tag"), TAG);
+    assert.equal(flag("--candidate-image-id"), IMAGE_ID);
+    assert.equal(flag("--run-image-id"), IMAGE_ID);
+    assert.ok(!tail.includes("--acceptance-mode"), "the DASH child has one mode: release-image");
+  });
+
+  it("refuses inputs it cannot place faithfully", () => {
+    assert.throws(() => dashArgs({ imageId: TAG }), /immutable/);
+    assert.throws(() => dashArgs({ sourceCommit: "abc" }), /full 40-hex SHA/);
+    assert.throws(() => dashArgs({ candidateTag: "videofetch-worker:latest" }), /latest/);
+    assert.throws(() => dashArgs({ evidenceName: "../x.json" }), /plain basename/);
+    assert.throws(() => dashArgs({ mediaWorkspaceDir: REPORT }), /overlap/);
+  });
+
+  it("treats every departure from the model as a posture violation", () => {
+    const base = dashArgs();
+    const imageAt = base.indexOf(IMAGE_ID);
+    const inject = (...extra) => [...base.slice(0, imageAt), ...extra, ...base.slice(imageAt)];
+    const replaced = (from, to) => base.map((arg) => (arg === from ? to : arg));
+    const without = (flag) => {
+      const args = [...base];
+      args.splice(args.indexOf(flag), 2);
+      return args;
+    };
+    const cases = {
+      "an --add-host": inject("--add-host", HLS08_FIXTURE_HOST_MAPPING),
+      "host networking": replaced("none", "host"),
+      "a privileged container": inject("--privileged"),
+      "an extra bind": inject("-v", "/var/run/docker.sock:/var/run/docker.sock"),
+      "no read-only root": base.filter((arg) => arg !== "--read-only"),
+      "no harness scratch tmpfs": without("--tmpfs"),
+      "the clear-HLS orchestrator instead": replaced(DASH01_ORCHESTRATOR, "deploy/acceptance/ytdlp-generic/hls-full-path.mjs"),
+      "a tag as the run subject": replaced(IMAGE_ID, TAG),
+      "told another candidate id": (() => {
+        const args = [...base];
+        args[args.indexOf("--candidate-image-id") + 1] = IMAGE_B;
+        return args;
+      })(),
+      "told another run id": (() => {
+        const args = [...base];
+        args[args.indexOf("--run-image-id") + 1] = IMAGE_B;
+        return args;
+      })(),
+    };
+    for (const [label, args] of Object.entries(cases)) {
+      assert.ok(posture(args).length > 0, `${label} must be a posture violation`);
+    }
+    assert.deepEqual(posture(inject("--add-host", HLS08_FIXTURE_HOST_MAPPING)), ["no --add-host is allowed"]);
+  });
+
+  it("leaves the clear-HLS child's posture model exactly as it was", () => {
+    const hls = releaseHlsAcceptanceRunArgs({
+      imageId: IMAGE_ID, harnessDir: HARNESS_DIR, reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE,
+      evidenceName: "hls09-clear-hls-1.json", sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG,
+    });
+    const dirs = { reportDir: REPORT, harnessDir: HARNESS_DIR, mediaWorkspaceDir: MEDIA_WORKSPACE };
+    assert.deepEqual(releaseHlsRunPostureViolations(hls, dirs), []);
+    // Each child's argv is a violation under the OTHER child's model.
+    assert.ok(releaseDashRunPostureViolations(hls, dirs).length > 0);
+    assert.ok(releaseHlsRunPostureViolations(dashArgs(), dirs).length > 0);
+  });
+});
+
+describe("SPLIT-07 -05 segmented-DASH child validation", () => {
+  const expected = { sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG, candidateImageId: IMAGE_ID };
+  const validate = (record) => validateDashChildRecord({ bytes: recordBytes(record), expected });
+
+  it("accepts a real DASH-01 PASS naming this source and image", () => {
+    const observation = validate(passingDashChild());
+    assert.equal(observation.ok, true, observation.reason);
+    assert.equal(observation.schema, "dash01-release-image-full-path-01");
+    assert.equal(observation.checkCount, DASH01_MANDATORY_CHECKS.length);
+    assert.deepEqual([observation.candidateImageId, observation.runImageId, observation.networkMode], [IMAGE_ID, IMAGE_ID, "none"]);
+  });
+
+  it("refuses each way a DASH child can fall short", () => {
+    const dropped = passingDashChild();
+    dropped.checks = dropped.checks.filter((check) => check.name !== "dash-dash/output/resolution-is-1920x1080");
+    const failing = passingDashChild();
+    failing.checks = failing.checks.map((check) =>
+      check.name === "dash-progressive/output/exactly-one-audio-stream" ? { ...check, ok: false } : check);
+    for (const [label, record, reason] of [
+      ["a future schema", passingDashChild(null, { schema: "dash01-release-image-full-path-02" }), /schema is/],
+      ["a FAIL verdict", passingDashChild(null, { verdict: "FAIL" }), /verdict is FAIL/],
+      ["the resolution check removed", dropped, /mandatory checks absent/],
+      ["the audio-stream check failed", failing, /did not pass/],
+      ["another source commit", passingDashChild(null, { source: { commit: "d".repeat(40) } }), /source commit/],
+      ["another source tree", passingDashChild(null, { source: { tree: "e".repeat(40) } }), /source tree/],
+      ["another candidate image", passingDashChild(null, { image: { imageId: IMAGE_B } }), /candidate image id/],
+      ["another run image", passingDashChild(null, { image: { runSubject: IMAGE_B } }), /run image id/],
+      ["a network", passingDashChild(null, { network: { mode: "bridge" } }), /network mode/],
+      ["a leaked fixture route", passingDashChild(null, { fixture: { note: "/dash01-video-1.m4s" } }), /private fixture material/],
+    ]) {
+      const observation = validate(record);
+      assert.equal(observation.ok, false, label);
+      assert.match(String(observation.reason), reason, label);
+    }
+    assert.match(validateDashChildRecord({ bytes: Buffer.from("{nope"), expected }).reason, /not parseable JSON/);
+    assert.equal(emptyDashChildObservation("gone").ok, false);
+  });
+
+  it("refuses a PASS parent for each way the DASH child can fall short, and still emits the FAIL", () => {
+    const child = (overrides) => ({ dashAcceptance: { child: overrides } });
+    for (const [label, overrides, reason] of [
+      ["DASH child missing", { dashAcceptance: { executed: false, child: null } }, /without an executed DASH-01 segmented-DASH child/],
+      ["DASH child absent entirely", null, /without an executed DASH-01 segmented-DASH child/],
+      ["DASH schema wrong", child({ schema: "hls09-release-image-full-path-02" }), /segmented-DASH child is hls09/],
+      ["DASH verdict FAIL", child({ verdict: "FAIL", ok: false }), /segmented-DASH child did not pass/],
+      ["one DASH check failed", child({ failedCheckCount: 1 }), /segmented-DASH child did not pass/],
+      ["no DASH checks", child({ checkCount: 0 }), /segmented-DASH child did not pass/],
+      ["no DASH digest", child({ sha256: null }), /segmented-DASH child has no content digest/],
+      ["DASH source wrong", child({ sourceCommit: "d".repeat(40) }), /segmented-DASH child names another source/],
+      ["DASH image wrong", child({ runImageId: IMAGE_B }), /segmented-DASH child names another image/],
+      ["DASH network not none", child({ networkMode: "bridge" }), /segmented-DASH child was not offline/],
+    ]) {
+      const input = evidenceInput(overrides ?? {});
+      if (overrides === null) delete input.dashAcceptance;
+      assert.throws(() => buildReleaseEvidence(input), reason, label);
+      assert.equal(buildReleaseEvidence({ ...input, verdict: "FAIL" }).verdict, "FAIL", label);
+    }
+    assert.deepEqual(REQUIRED_PASS_CHECKS.filter((name) => name.startsWith("dash/")), [
+      "dash/segmented-dash-child-executed",
+      "dash/segmented-dash-child-passed",
+      "dash/child-names-the-release-source",
+      "dash/child-ran-in-the-candidate-image",
+      "dash/child-evidence-unchanged-before-assembly",
+    ]);
+  });
+});
+
+describe("SPLIT-07 -05 driver: the segmented-DASH child", () => {
+  const dashCalls = (world) => world.dockerCalls.filter((call) => call.args.includes(DASH01_ORCHESTRATOR));
+
+  it("runs it last, by the immutable id, in the model posture, and binds its validated, hashed record", async () => {
+    const { result, error, world } = await drive();
+    assert.equal(error, null, error ? String(error.message) : undefined);
+    assert.equal(result.verdict, "PASS");
+    const [call] = dashCalls(world);
+    assert.equal(dockerRunSubject(call.args), IMAGE_ID);
+    assert.deepEqual(
+      releaseDashRunPostureViolations(call.args, { reportDir: REPORT, harnessDir: HARNESS_DIR, mediaWorkspaceDir: MEDIA_WORKSPACE }),
+      [],
+    );
+    const dash = result.record.dashAcceptance;
+    assert.equal(dash.executed, true);
+    assert.equal(dash.child.schema, DASH01_RELEASE_EVIDENCE_SCHEMA);
+    assert.deepEqual([dash.child.candidateImageId, dash.child.runImageId, dash.child.candidateTag], [IMAGE_ID, IMAGE_ID, TAG]);
+    const childBytes = world.files.get(`${REPORT}/${dash.child.evidenceFile}`);
+    assert.equal(dash.child.sha256, createHash("sha256").update(childBytes).digest("hex"));
+    assert.equal(dash.child.checks, undefined, "the parent never embeds the child document");
+    for (const name of REQUIRED_PASS_CHECKS.filter((check) => check.startsWith("dash/"))) {
+      assert.equal(result.checks.find((c) => c.name === name)?.ok, true, name);
+    }
+    assert.deepEqual(result.record.harness.verificationPoints, HARNESS_POINTS);
+  });
+
+  for (const [label, dash, check, reason] of [
+    ["the DASH child record is missing", null, "dash/segmented-dash-child-passed", /unreadable/],
+    ["the DASH child bytes are unparseable", { raw: "{not json" }, "dash/segmented-dash-child-passed", /not parseable JSON/],
+    ["the DASH child verdict is FAIL", { verdict: "FAIL" }, "dash/segmented-dash-child-passed", /verdict is FAIL/],
+    ["the DASH child names another source commit", { source: { commit: "d".repeat(40) } }, "dash/child-names-the-release-source", null],
+    ["the DASH child names another run image", { image: { runSubject: IMAGE_B } }, "dash/child-ran-in-the-candidate-image", null],
+    ["the DASH child ran with a network", { network: { mode: "bridge" } }, "dash/child-ran-in-the-candidate-image", null],
+  ]) {
+    it(`FAILs — never PASSes — when ${label}`, async () => {
+      const { result, error } = await drive({ dash });
+      assert.equal(error, null, error ? String(error.message) : undefined);
+      assert.equal(result.verdict, "FAIL");
+      assert.equal(result.record.verdict, "FAIL");
+      const failed = result.checks.find((c) => c.name === check);
+      assert.equal(failed.ok, false, check);
+      if (reason) assert.match(String(failed.detail), reason);
+      assert.equal(result.checks.find((c) => c.name === "dash/segmented-dash-child-passed").ok, false);
+    });
+  }
+
+  it("FAILs when the real-media child recorded a failed output check", async () => {
+    const checks = DASH01_MANDATORY_CHECKS.map((name) => ({
+      name, ok: name !== "dash-dash/output/resolution-is-1920x1080", detail: null,
+    }));
+    const { result } = await drive({ dash: { verdict: "FAIL", checks } });
+    assert.equal(result.verdict, "FAIL");
+    assert.match(result.checks.find((c) => c.name === "dash/segmented-dash-child-passed").detail, /did not pass/);
+  });
+
+  it("refuses the record when the DASH child's bytes change before the parent is assembled", async () => {
+    const world = createWorld();
+    const reads = new Map();
+    const deps = {
+      ...world.deps,
+      readFile: async (path) => {
+        const key = String(path);
+        const bytes = await world.deps.readFile(path);
+        if (!/\/dash01-segmented-dash-/.test(key)) return bytes;
+        reads.set(key, (reads.get(key) ?? 0) + 1);
+        return reads.get(key) === 1 ? bytes : Buffer.concat([bytes, Buffer.from(" ", "utf8")]);
+      },
+    };
+    await assert.rejects(runReleaseImageAcceptance(world.options, deps), /segmented-DASH child evidence changed after it was observed/);
+    assert.equal(world.writeCalls.length, 0, "no parent record may be written");
+  });
+
+  it("refuses to run the DASH child when its evidence path already exists, or on a non-empty workspace", async () => {
+    const taken = `${REPORT}/dash01-segmented-dash-1700000000000.json`;
+    const occupied = await drive({ files: [[taken, recordBytes(passingDashChild())]] });
+    assert.equal(occupied.result, null);
+    assert.match(String(occupied.error?.message), /refusing to replace an existing evidence artifact/);
+    assert.equal(dashCalls(occupied.world).length, 0);
+
+    const world = createWorld();
+    let listings = 0;
+    const deps = {
+      ...world.deps,
+      // before-docker, before-mp4, clear-mp4 (2), before-webm, clear-webm (2),
+      // before-hls09, clear-hls09 (2), then before-dash01 is the 11th listing.
+      listMediaWorkspace: async () => {
+        listings += 1;
+        return listings === 11 ? ["stray"] : [];
+      },
+    };
+    await assert.rejects(runReleaseImageAcceptance(world.options, deps), /is not empty \(before-dash01-segmented-dash\)/);
+    assert.equal(dashCalls(world).length, 0);
+    assert.equal(world.writeCalls.length, 0);
   });
 });

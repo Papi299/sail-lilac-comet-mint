@@ -11,7 +11,9 @@ SPLIT-07 answers one question SPLIT-06 cannot:
 > one exact, clean Git commit, contain exactly that commit's application source,
 > carry the hardened configuration and pinned media runtime the deployment
 > contract relies on, and execute the full split-stream chain — mp4 **and**
-> webm — and (since `-03`) the activated clear-HLS chain, deterministically?
+> webm — (since `-03`) the activated clear-HLS chain, and (since `-05`) real
+> fragmented segmented-DASH media through the Worker's own FFmpeg,
+> deterministically?
 
 ```
 release source   (clean Git worktree, exact commit + tree)
@@ -20,11 +22,13 @@ acceptance harness (clean Git worktree, exact commit + tree, verified throughout
   → image identity / configuration / runtime / hardening
   → SPLIT-06 mp4 PASS    (split06-deterministic-full-path-04, validated, hashed)
   → SPLIT-06 webm PASS   (split06-deterministic-full-path-04, validated, hashed)
-  → HLS-09 clear-HLS PASS (hls09-release-image-full-path-01, validated, hashed)
-  → SPLIT-07 PASS        (split07-release-image-candidate-03, created exclusively, read back)
+  → HLS-09 clear-HLS PASS (hls09-release-image-full-path-02, validated, hashed)
+  → DASH-01 segmented-DASH PASS (dash01-release-image-full-path-01, validated, hashed)
+  → SPLIT-07 PASS        (split07-release-image-candidate-05, created exclusively, read back)
 ```
 
 The clear-HLS child is HLS-09's; its own contract is in [`HLS-09.md`](HLS-09.md).
+The segmented-DASH child is DASH-01's; its own contract is in [`DASH-01.md`](DASH-01.md).
 
 ---
 
@@ -62,8 +66,8 @@ actual built image rather than asserted from the Dockerfile text:
 | :--- | :--- |
 | **Source** | The build context was a real Git worktree root at the exact expected commit and tree, with nothing modified, staged, untracked, ignored, or hidden by assume-unchanged/skip-worktree — **before** Docker ran and **again after** the build read it. |
 | **Recipe** | The image was built by `Dockerfile.worker` from that context, with no build arg, no secret and no host network. Its committed blob and SHA-256 are recorded. |
-| **Harness** | The executable acceptance harness — driver, SPLIT-06 and clear-HLS orchestrators, Python verifiers, image probe, evidence evaluators — was a real Git worktree root at the operator's explicit `--harness-source`/`--harness-tree`, clean in the same ways as the release context, **before any Docker command and at every checkpoint through the end of all three children**; and the executing driver file is that checkout's own. |
-| **Run subject** | Every candidate container — four probes, two verifiers, two SPLIT-06 children and the clear-HLS child — executed the image's immutable `sha256:` id, as parsed from the argv Docker received. None executed the mutable tag. |
+| **Harness** | The executable acceptance harness — driver, SPLIT-06, clear-HLS and segmented-DASH orchestrators, Python verifiers, image probe, evidence evaluators — was a real Git worktree root at the operator's explicit `--harness-source`/`--harness-tree`, clean in the same ways as the release context, **before any Docker command and at every checkpoint through the end of all four children**; and the executing driver file is that checkout's own. |
+| **Run subject** | Every candidate container — four probes, two verifiers, two SPLIT-06 children, the clear-HLS child and the segmented-DASH child — executed the image's immutable `sha256:` id, as parsed from the argv Docker received. None executed the mutable tag. |
 | **Source → image** | Every regular file the recipe places in `/app` (`package.json`, `package-lock.json`, the alias loader and hooks, all of `src/**`) is present in the image with byte-identical content; no unexplained file is present; `src/broker/**` is absent and its removal is accounted for; the acceptance harness is not baked in. |
 | **Configuration** | Linux; architecture recorded and compared with the accepted Worker's; `WorkingDir=/app`; runtime user `node`; `CMD` is exactly the standalone Worker entry point, and `ENTRYPOINT` is at most the base image's inherited `docker-entrypoint.sh` exec shim — observed root-owned, unwritable, at its real path, digest recorded; only `8080/tcp` exposed; no `HEALTHCHECK`; no image-declared volume; the expected non-secret defaults present. |
 | **Environment** | No `YTDLP_ENABLED`, no retired `YTDLP_NETWORK_ISOLATED`/`YTDLP_PATH`, and no Worker HMAC, Cloudflare Access, R2 broker-parent, legacy R2 writer or Vercel signer name — checked in the image config **and** inside a running container. |
@@ -72,7 +76,8 @@ actual built image rather than asserted from the Dockerfile text:
 | **Media tools** | `ffmpeg` and `ffprobe` are present and executable by the runtime user; Node, Python, ffmpeg and ffprobe versions are recorded exactly. |
 | **Offline policy** | `verify-selector.py` and `verify-download-policy.py` (which pins PR #54's `--no-quiet` contract) exit 0 against the image's own artifact. |
 | **Full path** | The unchanged SPLIT-06 harness PASSes for **mp4 and webm**, executing the candidate image's own `/app/src`, dependency graph, alias loader, Node, Python, yt-dlp, FFmpeg and ffprobe. |
-| **Clear HLS** (since `-03`) | The HLS-08 clear-HLS positive full path and its three bounded negatives PASS in the orchestrator's `release-image` mode (`hls09-release-image-full-path-01`), executed by the same image's own runtime, naming this release source and this immutable id, offline. |
+| **Clear HLS** (since `-03`) | The HLS-08 clear-HLS positive full path and its three bounded negatives PASS in the orchestrator's `release-image` mode (`hls09-release-image-full-path-02` since `-04`; `-01` under `-03`), executed by the same image's own runtime, naming this release source and this immutable id, offline. |
+| **Segmented DASH** (since `-05`) | The DASH-01 real-media child PASSes (`dash01-release-image-full-path-01`): a deterministic 1920×1080 fragmented-MP4 fixture served as an MPD `SegmentList` is acquired by the image's pinned native `DashSegmentsFD` (identity read from the child's own output, every fragment fetched once in order, the artifact byte-identical to init + fragments, no residue), validated by the image's real ffprobe, merged by the real `mergeSplitMedia` FFmpeg stream copy and validated again (one video + one audio stream, 1920×1080), with segmented and with progressive audio; every FFmpeg/ffprobe spawn at `processing` and none at `downloading`; and its three bounded negatives fail closed. Same image, same source, offline. |
 | **No disturbance** | `videofetch-worker:latest`'s image id, and the running Worker container's image id, start time and restart count, are identical before and after the run. |
 
 ### The inherited ENTRYPOINT
@@ -157,10 +162,10 @@ Run the driver **from** the harness checkout.
 
 The harness is consumed throughout the run, so it is re-verified at every
 checkpoint: `before-docker`, `after-build`, `before-split06-mp4`,
-`before-split06-webm`, `before-hls09-clear-hls` (since `-03`) and
-`after-children`. The last one comes after **all three** children have executed
-and before the parent record is assembled; since `-03` the record must list
-exactly that sequence. A harness that changes at any point makes the run's own
+`before-split06-webm`, `before-hls09-clear-hls` (since `-03`),
+`before-dash01-segmented-dash` (since `-05`) and `after-children`. The last one
+comes after **all four** children have executed and before the parent record is
+assembled; the record must list exactly that sequence. A harness that changes at any point makes the run's own
 measurements untrustworthy, so the driver **refuses the record outright**. That
 means no parent record, PASS or FAIL, and the refusal says which checkpoint
 failed.
@@ -185,9 +190,10 @@ even though the daemon itself would run all three.
 Configuration and id come from one `docker image inspect`, so they describe one
 image. The driver records the run subject of every candidate container from
 the very argv it hands Docker, parsed by a closed-grammar `dockerRunSubject`.
-It then checks that all nine required containers ran the id: the four probes
-(manifest, tools, env, runtime), the two verifiers, SPLIT-06 mp4 and webm, and
-(since `-03`) the clear-HLS child, purpose `hls09:clear-hls`.
+It then checks that all ten required containers ran the id: the four probes
+(manifest, tools, env, runtime), the two verifiers, SPLIT-06 mp4 and webm,
+(since `-03`) the clear-HLS child, purpose `hls09:clear-hls`, and (since `-05`)
+the segmented-DASH child, purpose `dash01:segmented-dash`.
 
 The grammar is closed: it understands exactly the options the container model
 emits, now including `--add-host` as a one-value option for the clear-HLS
@@ -230,6 +236,12 @@ pinned yt-dlp subprocess resolves the HLS fixture through, as HLS-08 does. Its
 posture is re-derived structurally before launch (`releaseHlsRunPostureViolations`;
 see `HLS-09.md`).
 
+The segmented-DASH child (since `-05`) uses exactly this layout with **no**
+`--add-host`: its fixture is addressed by loopback IP through an exact-fixture
+URL validator, as SPLIT-06's is. Its posture is re-derived structurally before
+launch too (`releaseDashRunPostureViolations`), which additionally requires that
+the child is told exactly the immutable id it runs as.
+
 ### The writable surfaces mirror Production
 
 Besides the report directory, the children get two writable surfaces, and
@@ -264,7 +276,7 @@ What the driver enforces (`run-release-image-acceptance.mjs`,
   `/etc/videofetch`.
 - **An existing, real, empty directory.** A symlink or non-directory is
   refused. Emptiness is checked before any Docker command and again before each
-  child — mp4, webm and clear-HLS.
+  child — mp4, webm, clear-HLS and segmented DASH.
 - **Cleared between children.** After each child the driver removes what it
   left — normally the executor's empty `jobs/` root — and re-proves the
   directory empty. A workspace it cannot clear stops the run instead of letting
@@ -360,14 +372,14 @@ fixtures, the checks, what PASS requires — is unchanged; only the caller is ne
 
 ## What `--network none` proves, and what it does not
 
-Every candidate container — probes, verifiers, both SPLIT-06 runs and the
-clear-HLS run — gets `--network none`, `--read-only`, `--cap-drop=ALL` and
+Every candidate container — probes, verifiers, both SPLIT-06 runs, the
+clear-HLS run and the segmented-DASH run — gets `--network none`, `--read-only`, `--cap-drop=ALL` and
 `--security-opt no-new-privileges`, and never `--privileged`, `--cap-add`, a host
 network or the Docker socket.
 
 `--network none` **proves** the run is offline and deterministic: the container
-has a loopback interface and nothing else, the SPLIT-06 and HLS fixtures bind
-`127.0.0.1` inside that namespace, and no DNS, public address, proxy or host
+has a loopback interface and nothing else, the SPLIT-06, HLS and DASH fixtures
+bind `127.0.0.1` inside that namespace, and no DNS, public address, proxy or host
 service is reachable. A PASS therefore cannot depend on anything the machine
 happened to be able to reach. The clear-HLS child's one `--add-host` entry only
 names the loopback fixture; it adds no route. That child also records the
@@ -405,13 +417,25 @@ a release build. A `-03` PASS therefore also requires the HLS-09 clear-HLS child
 family: it is recorded in its own `hlsAcceptance` block, and `splitAcceptance`
 still holds exactly mp4 and webm.
 
+## Why the segmented-DASH child must pass too (since `-05`)
+
+`GENERIC-SEGMENTED-DASH-EXECUTION-001` made `http_dash_segments` executable as a
+split half. That artifact is a different SHAPE from anything SPLIT-06 or HLS-09
+feed the Worker's FFmpeg: the raw concatenation of a fragmented-MP4 init segment
+and its `moof`+`mdat` fragments, written by the pinned native `DashSegmentsFD`
+with `--fixup=never`, so no yt-dlp repair has touched it. The unit and
+full-path tests fake yt-dlp, FFmpeg and ffprobe; only a real run can show that
+this raw artifact is processable by the image's own ffprobe and FFmpeg. A `-05`
+PASS therefore also requires the DASH-01 child (`DASH-01.md`) to PASS on the same
+immutable image. It has its own `dashAcceptance` block.
+
 Child order is fixed and tested: characterization → mp4 → clear workspace →
-webm → clear workspace → clear-HLS → clear workspace → final harness
-verification → child re-hashing → parent.
+webm → clear workspace → clear-HLS → clear workspace → segmented DASH → clear
+workspace → final harness verification → child re-hashing → parent.
 
 ## The evidence
 
-**Schema: `split07-release-image-candidate-03`.** SPLIT-07 has its own
+**Schema: `split07-release-image-candidate-05`.** SPLIT-07 has its own
 identifier, because its record claims something strictly larger and different
 in kind than a SPLIT-06 one. Bump it when the record's **meaning** changes;
 never rewrite an older record.
@@ -420,7 +444,9 @@ never rewrite an older record.
 | :--- | :--- | :--- |
 | `-01` | historical | The release source was verified. The image was built by the real recipe and characterized. Both children passed. The harness `HEAD` was **recorded but not verified**. Candidates ran **by tag**. The parent was written after a directory check, not exclusively. It lacks the current harness and immutable-run-subject guarantees. |
 | `-02` | valid split-stream release qualification | Everything in `-01`. **Plus:** the executable harness was provenance-bound against explicit expectations and unchanged through the whole run. Every candidate container executed the immutable image id. The record was created exclusively. Requires mp4 + webm; does **not** qualify clear HLS. |
-| `-03` | current, HLS-aware | Everything in `-02`. **Plus:** a validated, byte-hashed HLS-09 clear-HLS child (`hls09-release-image-full-path-01`) PASS, on the same immutable image id, naming the same release source, offline; the harness re-verified before that child and after it; `hls09:clear-hls` in the candidate run ledger; the parent read back after it was written. mp4 + webm + clear-HLS. |
+| `-03` | valid HLS-aware release qualification, historical | Everything in `-02`. **Plus:** a validated, byte-hashed HLS-09 clear-HLS child (`hls09-release-image-full-path-01`) PASS, on the same immutable image id, naming the same release source, offline; the harness re-verified before that child and after it; `hls09:clear-hls` in the candidate run ledger; the parent read back after it was written. mp4 + webm + clear-HLS. Valid for exactly the candidates it qualified; never re-read under `-04`. |
+| `-04` | historical, never produced | Everything in `-03`, with the clear-HLS child moved to `hls09-release-image-full-path-02`: `GENERIC-SEGMENTED-DASH-EXECUTION-001` restated HLS-7's protocol invariant for the one shared yt-dlp vocabulary, which now carries `http_dash_segments`. It ran no segmented-DASH child, so it proved nothing about real fragmented-DASH media reaching the Worker's FFmpeg. **No `-04` record was ever produced**; the review of PR #102 superseded it with `-05` before any run. |
+| `-05` | current | Everything in `-04`. **Plus:** a validated, byte-hashed DASH-01 segmented-DASH real-media child (`dash01-release-image-full-path-01`) PASS, on the same immutable image id, naming the same release source, offline; the harness re-verified before that child and after it; `dash01:segmented-dash` in the candidate run ledger. mp4 + webm + clear-HLS + segmented DASH. The pinned DASH downloader contract is still also carried by the two policy verifiers (`verify-download-policy.py` §7, `verify-selector.py` §11). |
 
 `-01` records are **historical**. They are never rewritten, never re-read under
 later rules, and never sufficient to authorize SPLIT-07B. They stay useful as
@@ -428,8 +454,8 @@ debugging history. `-02` records remain **valid** for exactly what they proved
 — split-stream release qualification, mp4 + webm — and are not invalid
 globally; they are simply insufficient for clear-HLS release qualification
 (HLS-9). A `-02` record is never rewritten as `-03`, and
-`validateReleaseParentRecord` names a `-01`/`-02` record as historical rather
-than reading it under `-03` rules. SPLIT-06 children remain
+`validateReleaseParentRecord` names a `-01`..`-04` record as historical rather
+than reading it under `-05` rules. SPLIT-06 children remain
 `split06-deterministic-full-path-04`: nothing about what a SPLIT-06 PASS means
 changed.
 
@@ -450,7 +476,7 @@ For the clear-HLS child (since `-03`) the driver refuses an evidence path that
 already exists before launching it (as it now does for every child: a stale
 record is never adopted), and a dedicated validator (`validateHlsChildRecord`)
 reads the **exact bytes** and requires: parseable JSON; schema exactly
-`hls09-release-image-full-path-01`; verdict `PASS`; every HLS-09 mandatory check
+`hls09-release-image-full-path-02`; verdict `PASS`; every HLS-09 mandatory check
 present and every check passing; source commit **and** tree equal to the
 release source; candidate image id **and** run image id equal to the parent's
 candidate id; the parent's build label; `network.mode` `none`; non-deployable;
@@ -461,17 +487,28 @@ verdict, `ok`, SHA-256, byte and check counts, file name, source commit and
 tree, candidate label, candidate and run image ids, network mode and reason —
 only grammar-checked values, never the child document.
 
+The segmented-DASH child (since `-05`) is handled identically by
+`validateDashChildRecord`: an evidence path refused if it already exists, the
+exact bytes read, parsed, hashed and re-hashed before assembly, schema exactly
+`dash01-release-image-full-path-01`, verdict `PASS`, every DASH-01 mandatory check
+present exactly once and every check passing, the release source commit and
+tree, the candidate id as candidate image and run subject, the build label,
+`network.mode` `none`, non-deployable, and no private fixture material. The
+parent's `dashAcceptance` block records the same grammar-checked fields.
+
 A PASS parent is refused unless **all** of the following hold:
 - every check in `REQUIRED_PASS_CHECKS` is present **and** passing, and no other
   check failed — including `hls/clear-hls-child-executed`,
   `hls/clear-hls-child-passed`, `hls/child-names-the-release-source`,
-  `hls/child-ran-in-the-candidate-image` and
-  `hls/child-evidence-unchanged-before-assembly`;
+  `hls/child-ran-in-the-candidate-image`,
+  `hls/child-evidence-unchanged-before-assembly` and their five `dash/…`
+  counterparts;
 - both SPLIT-06 children passed as above;
 - the clear-HLS child executed and passed as above — missing, failed, of
   another schema, naming another image or another source: **no PASS**;
+- the segmented-DASH child executed and passed likewise: **no PASS** otherwise;
 - the image id is a full immutable id, and every required candidate container
-  — all nine — ran it;
+  — all ten — ran it;
 - the candidate tag is not deployable.
 
 A FAIL record is still written, so an image failure is always reportable. A
@@ -502,7 +539,9 @@ before a long run rather than after it. It is not the correctness boundary.
 
 ## How to run it
 
-Runs where Docker is — on this project, inside the Lima VM. The driver is plain
+Runs where Docker is — on this project, inside the Lima VM, or on an isolated
+non-Production Docker host (the PR #102 review qualification ran it on Docker
+Desktop on the Mac, never touching the Production VM). The driver is plain
 ESM that runs on the guest's Node 18.
 
 ```sh
@@ -519,8 +558,9 @@ sudo install -d -m 2775 -o 1000 -g 1000 /var/tmp/split07
 # 4. The Product media workspace: an EXISTING, EMPTY directory on disk (never a
 #    tmpfs), writable by uid 1000 and clearable by the operator, outside the
 #    context, the harness and the report directory, and never a Production path.
-#    The clear-HLS child's Product preflight needs 8,589,934,592 bytes available
-#    on its filesystem under the default 4 GiB limit; check it first (`df -B1`).
+#    The clear-HLS and segmented-DASH children's Product preflights each need
+#    8,589,934,592 bytes available on its filesystem under the default 4 GiB
+#    limit; check it first (`df -B1`).
 sudo install -d -m 2770 -o 1000 -g 1000 /var/tmp/split07-media
 
 # 5. The run — the driver runs FROM the harness checkout it names.
@@ -554,7 +594,8 @@ Exit status:
   argument, release-context or harness provenance, the driver binding, a Product
   media workspace that is missing, not empty or could not be cleared, an invalid
   image id, the build, a harness that changed mid-run, a child evidence path
-  that already existed, a clear-HLS child argv outside the posture model, a
+  that already existed, a clear-HLS or segmented-DASH child argv outside its
+  posture model, a
   child record whose bytes changed before assembly, or an occupied, lost or
   unreadable-back evidence path.
 
@@ -587,11 +628,11 @@ can support HLS-9B; a `-02` PASS proves nothing about clear HLS. See
 | Artifact | After a run |
 | :--- | :--- |
 | the candidate image | removed unless `--keep-image` |
-| probe, verifier, SPLIT-06 and clear-HLS containers | removed (`--rm`) |
+| probe, verifier, SPLIT-06, clear-HLS and segmented-DASH containers | removed (`--rm`) |
 | child media in the Product media workspace | removed by the driver after each child, which re-proves the directory empty |
 | the `--media-workspace` directory itself | **kept**, empty; the operator removes it |
 | child fixtures, temporary databases and object sinks | gone with the containers' harness scratch tmpfs |
-| the two SPLIT-06 child records and the clear-HLS child record | **kept**, in the report directory |
+| the two SPLIT-06 child records, the clear-HLS and the segmented-DASH child records | **kept**, in the report directory |
 | the SPLIT-07 parent record | **kept**, in the report directory |
 | `videofetch-worker:latest`, the running Worker | untouched, and measured as such |
 
@@ -601,14 +642,15 @@ can support HLS-9B; a `-02` PASS proves nothing about clear HLS. See
 
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
-| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice and the clear-HLS child once, writes and reads back the parent record. Admits the required `--media-workspace` empty and clears it after each child. |
+| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, the clear-HLS child once and the segmented-DASH child once, writes and reads back the parent record. Admits the required `--media-workspace` empty and clears it after each child. |
 | `lib/release-provenance.mjs` | — | The shared clean-worktree gate, applied to the release context and to the harness; the release-input identities; the `/app` source manifest from Git objects. |
-| `lib/release-container.mjs` | — | Every `docker` argv. Non-deployable tags for build and cleanup; the immutable-id grammar for every run subject; `dockerRunSubject`'s closed grammar (with `--add-host`); the real Dockerfile; the hardening flags; the Product media workspace `--mount type=bind` (never a Production host path) and the harness scratch tmpfs; the forbidden-mount guard; `releaseHlsAcceptanceRunArgs` and its structural posture check. |
+| `lib/release-container.mjs` | — | Every `docker` argv. Non-deployable tags for build and cleanup; the immutable-id grammar for every run subject; `dockerRunSubject`'s closed grammar (with `--add-host`); the real Dockerfile; the hardening flags; the Product media workspace `--mount type=bind` (never a Production host path) and the harness scratch tmpfs; the forbidden-mount guard; `releaseHlsAcceptanceRunArgs` and `releaseDashAcceptanceRunArgs` and their structural posture checks. |
 | `lib/release-image-probe.mjs` | inside the candidate, at `/verify` | Import-free observer: `/app` manifest, forbidden tools, env names, runtime identity. Observes; never judges. |
-| `lib/release-evidence.mjs` | — | The `split07-release-image-candidate-03` record, SPLIT-06 and clear-HLS child validation and re-verification, the verified-harness gate, the PASS gate (including the immutable-run-subject ledger), and the read-back validator. |
-| `hls-full-path.mjs`, `lib/hls-acceptance-mode.mjs`, `lib/hls-release-evidence.mjs` | inside the candidate / — | The clear-HLS child in `release-image` mode and its `hls09-release-image-full-path-01` record — see `HLS-09.md`. |
+| `lib/release-evidence.mjs` | — | The `split07-release-image-candidate-05` record, SPLIT-06, clear-HLS and segmented-DASH child validation and re-verification, the verified-harness gate, the PASS gate (including the immutable-run-subject ledger), and the read-back validator. |
+| `hls-full-path.mjs`, `lib/hls-acceptance-mode.mjs`, `lib/hls-release-evidence.mjs` | inside the candidate / — | The clear-HLS child in `release-image` mode and its `hls09-release-image-full-path-02` record — see `HLS-09.md`. |
+| `dash-full-path.mjs`, `lib/dash-argv.mjs`, `lib/dash-evidence.mjs`, `lib/dash-observers.mjs`, `fixtures/dash-media.mjs`, `fixtures/dash-server.mjs` | inside the candidate / — | The segmented-DASH real-media child and its `dash01-release-image-full-path-01` record — see `DASH-01.md`. |
 | `lib/provenance.mjs` | — | Shared with the Phase-10D harness; SPLIT-07 uses only its `writeEvidenceExclusive`, the `wx` exclusive-create writer. |
-| `scripts/ytdlp-release-image-acceptance.test.mjs` | `npm test` | Harness self-tests against a scripted Git/Docker fake. No Docker, no network. |
+| `scripts/ytdlp-release-image-acceptance.test.mjs`, `scripts/ytdlp-dash-acceptance.test.mjs` | `npm test` | Harness self-tests against a scripted Git/Docker fake and the DASH-01 modules' pure parts. No Docker, no network. |
 
 `container-policy.test.ts` asserts the same image properties against the
 Dockerfile **text**; SPLIT-07 asserts them against the **built image**. The two

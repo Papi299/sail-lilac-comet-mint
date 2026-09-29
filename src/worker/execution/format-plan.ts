@@ -18,6 +18,7 @@ import {
   GenericSourceSelectionSchema,
   GenericSplitSourceSelectionSchema,
   GenericSplitTargetContainerSchema,
+  genericAcquisitionLayout,
   splitTargetContainer,
   type GenericSourceSelection,
   type GenericSourceSelections,
@@ -367,11 +368,38 @@ function refineProvenAudioExtraction(
   plan: { readonly source: GenericSourceSelection },
   ctx: z.RefinementCtx,
 ): void {
+  refineProgressiveSingleSource(plan, ctx);
   if (plan.source.audioConstraint !== "codec-present" || plan.source.hasAudio !== true) {
     ctx.addIssue({
       code: "custom",
       path: ["source", "audioConstraint"],
       message: "an audio extraction requires a source with proven audio",
+    });
+  }
+}
+
+/**
+ * GENERIC-SEGMENTED-DASH-EXECUTION-001: every SINGLE-source plan names a
+ * PROGRESSIVE source.
+ *
+ * A segmented (DASH) source leaves the pinned `FragmentFD`'s raw fragment
+ * concatenation, and with `--fixup=never` nothing repairs it during
+ * `downloading`. Only a `merge-split` plan is proven to rewrite that artifact
+ * with the Worker's own FFmpeg after `beginProcessing()` and validate the
+ * result, so only a pair may name one. `keep-original` would deliver it
+ * verbatim, and the extraction variants have no reviewed evidence for it, so
+ * all three refuse it rather than assume a fragmented file behaves like a
+ * progressive one.
+ */
+function refineProgressiveSingleSource(
+  plan: { readonly source: GenericSourceSelection },
+  ctx: z.RefinementCtx,
+): void {
+  if (genericAcquisitionLayout(plan.source.protocol) !== "progressive") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["source", "protocol"],
+      message: "a single-source plan requires a progressive source",
     });
   }
 }
@@ -548,6 +576,10 @@ export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
       const issue = (path: string[], message: string) =>
         ctx.addIssue({ code: "custom", path, message });
 
+      // Kept VERBATIM, so never a segmented source (see
+      // `refineProgressiveSingleSource`).
+      refineProgressiveSingleSource(plan, ctx);
+
       // Stated as an invariant of the plan rather than left to derivation.
       if (plan.targetContainer !== plan.source.container) {
         issue(["targetContainer"], "keep-original must deliver the source container");
@@ -616,6 +648,13 @@ export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
    * `pair` carries TWO raw upstream identifiers. They are private to exactly
    * the same extent the single-source `source` is: never browser-facing, never
    * durable, never logged, never in an error message.
+   *
+   * GENERIC-SEGMENTED-DASH-EXECUTION-001: this is the ONE plan variant whose
+   * sources may be segmented. Each member carries its own individually
+   * approved protocol — DASH + DASH and DASH + HTTPS are both valid pairs —
+   * because each half is acquired by its own independent invocation, and the
+   * merge that follows is what rewrites a fragmented half into the delivered
+   * container. Protocols are never required to match for symmetry.
    */
   z
     .object({

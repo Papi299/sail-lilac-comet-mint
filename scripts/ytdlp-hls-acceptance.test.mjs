@@ -1161,7 +1161,7 @@ describe("hls evidence record", () => {
   it("a PASS carrying every mandatory check builds, with the fixed schema, substitutions and non-claims", () => {
     const record = buildHlsEvidence(evidenceInput());
     assert.equal(record.schema, HLS08_EVIDENCE_SCHEMA);
-    assert.equal(record.schema, "hls08-deterministic-full-path-02");
+    assert.equal(record.schema, "hls08-deterministic-full-path-03");
     assert.equal(record.image.deployable, false);
     assert.equal(record.network.mode, "none");
     assert.match(record.substitutions.submittedUrlValidator, /NOT Production SSRF/);
@@ -1473,8 +1473,8 @@ describe("hls acceptance modes (the explicit boundary)", () => {
     assert.deepEqual({ ...HLS_ACCEPTANCE_MODES }, { overlay: "overlay", releaseImage: "release-image" });
     assert.equal(HLS_ACCEPTANCE_MODE_FLAG, "--acceptance-mode");
     assert.deepEqual({ ...HLS_MODE_EVIDENCE_SCHEMAS }, {
-      overlay: "hls08-deterministic-full-path-02",
-      "release-image": "hls09-release-image-full-path-01",
+      overlay: "hls08-deterministic-full-path-03",
+      "release-image": "hls09-release-image-full-path-02",
     });
   });
 
@@ -1588,7 +1588,7 @@ describe("hls acceptance identity checks", () => {
   });
 });
 
-describe("hls release-image evidence (hls09-release-image-full-path-01)", () => {
+describe("hls release-image evidence (hls09-release-image-full-path-02)", () => {
   /** The behavioral blocks alone — what the orchestrator measures in either mode. */
   function behavioral(checks) {
     const { source: _source, image: _image, ...rest } = evidenceInput(checks ? { checks } : {});
@@ -1609,7 +1609,7 @@ describe("hls release-image evidence (hls09-release-image-full-path-01)", () => 
     return out;
   }
 
-  it("overlay mode still produces HLS-08 -02, byte-identical to the HLS-08 builder", () => {
+  it("overlay mode still produces HLS-08 -03, byte-identical to the HLS-08 builder", () => {
     const viaMode = buildAcceptanceEvidence(OVERLAY_OPTS, behavioral());
     const direct = buildHlsEvidence(evidenceInput({
       source: {
@@ -1621,15 +1621,15 @@ describe("hls release-image evidence (hls09-release-image-full-path-01)", () => 
         overlayImage: hlsOverlayImageTag(HEAD), overlayImageId: OVERLAY_ID,
       },
     }));
-    assert.equal(viaMode.schema, "hls08-deterministic-full-path-02");
+    assert.equal(viaMode.schema, "hls08-deterministic-full-path-03");
     assert.equal(renderAcceptanceEvidence(OVERLAY_OPTS, viaMode), renderHlsEvidence(direct));
     assert.deepEqual(imageRemovalFact(OVERLAY_OPTS), { overlayRemovedBy: "run-hls-acceptance.mjs unless --keep-image" });
   });
 
-  it("release mode produces HLS-09 -01 with release identity and no historical-base or overlay field", () => {
+  it("release mode produces HLS-09 -02 with release identity and no historical-base or overlay field", () => {
     const record = buildAcceptanceEvidence(RELEASE_OPTS, behavioral(releasePassing()), observed);
     assert.equal(record.schema, HLS09_RELEASE_EVIDENCE_SCHEMA);
-    assert.equal(record.schema, "hls09-release-image-full-path-01");
+    assert.equal(record.schema, "hls09-release-image-full-path-02");
     assert.equal(record.verdict, "PASS");
     assert.deepEqual(record.source.commit, HEAD);
     assert.equal(record.source.contextClean, true);
@@ -1666,7 +1666,7 @@ describe("hls release-image evidence (hls09-release-image-full-path-01)", () => 
     // HLS-08's complete PASS ledger lacks the release identity: no release PASS.
     assert.throws(
       () => buildAcceptanceEvidence(RELEASE_OPTS, behavioral(passingChecks()), observed),
-      /refusing to emit a PASS hls09-release-image-full-path-01 record: release\/source-identity-present: recorded 0 times/,
+      /refusing to emit a PASS hls09-release-image-full-path-02 record: release\/source-identity-present: recorded 0 times/,
     );
   });
 
@@ -1726,7 +1726,7 @@ describe("hls release-image evidence (hls09-release-image-full-path-01)", () => 
     }
   });
 
-  it("release record privacy stays fail-closed: the same leaks, keys and placements as HLS-08 -02", () => {
+  it("release record privacy stays fail-closed: the same leaks, keys and placements as HLS-08 -03", () => {
     const leaks = [
       HLS08_PRIVATE_MARKERS.execution, HLS08_PRIVATE_MARKERS.browser, HLS08_RAW_FORMAT_ID, HLS_FIXTURE_HOSTNAME,
       "http://anything.example/x", "sig=abc",
