@@ -3693,11 +3693,13 @@ both closed later on 2026-09-26:
 
 ### 4k. Segmented DASH — IMPLEMENTED IN SOURCE — PRODUCTION DEPLOYMENT / ACCEPTANCE PENDING
 
-*Recorded 2026-09-29 by `GENERIC-SEGMENTED-DASH-EXECUTION-001` (Draft PR,
-`feat/generic-segmented-dash-execution-001`). Source only: no image was built, no
-candidate was qualified, nothing was deployed, and the Production Worker does
-not contain this change. In Production a segmented-DASH rendition is still
-withheld exactly as §4g/§11h describe.*
+*Recorded 2026-09-29 by `GENERIC-SEGMENTED-DASH-EXECUTION-001` (Draft PR #102,
+`feat/generic-segmented-dash-execution-001`) and its review corrections. Source
+only: nothing was deployed, promoted or retagged, and the Production Worker does
+not contain this change. The only images built were temporary, structurally
+non-deployable qualification candidates on an isolated Docker Desktop host (never
+the Production VM), removed after the run. In Production a segmented-DASH
+rendition is still withheld exactly as §4g/§11h describe.*
 
 **What is admitted.** `GENERIC_SOURCE_PROTOCOLS`
 (`src/worker/execution/generic-source.ts`) is now the ONE closed vocabulary the
@@ -3776,17 +3778,28 @@ exceeds the allowance is refused by the pinned per-fragment `HttpFD` before any
 byte is written and surfaces as a failed fragment — `EXTRACTION_FAILED`, not
 `TOO_LARGE`.
 
-**Workspace.** The 2 × `MAX_FILE_SIZE` bound is unchanged: during acquisition the
-physical peak is at most the combined allowance plus one fragment during its
-append window, itself ≤ 2 × max; processing is unchanged. Success still requires
-exactly `video-source.<ext>` then both halves — no fragment, `.part`, `.ytdl` or
-other entry.
+**Workspace.** The 2 × `MAX_FILE_SIZE` bound is unchanged. During acquisition the
+media on disk is at most the combined allowance, plus one fragment's copy during
+its append window (the monitor charges the not-yet-appended bytes once, as
+designed), plus whatever arrives within one guard poll (150 ms) after a
+violation — the guard is reactive, exactly as it is for progressive sources, and
+kills the run on the first poll that observes the violation. `.ytdl` bookkeeping
+is a few hundred bytes and is gone before processing. None of that approaches
+the 2 × preflight, and processing is unchanged (inputs + output). Success still
+requires exactly `video-source.<ext>` then both halves — no fragment, `.part`,
+`.ytdl` or other entry. Measured on real media by DASH-01 (below): acquisition
+peak = the two artifacts exactly; processing peak = inputs + output exactly; the
+guard negative observed 172,566 B on disk against a 160,136 B allowance at the
+kill — one fragment in flight, bounded as stated.
 
 **Lifecycle.** `downloading` = acquisition only; `processing` = Worker
-FFmpeg only. Asserted (not inferred) by
-`src/worker/execution/segmented-dash-execution.server.test.ts`: every yt-dlp run
-starts while `downloading`, and every ffprobe and the FFmpeg merge start only
-after `beginProcessing()`.
+FFmpeg/ffprobe only. Asserted by
+`src/worker/execution/segmented-dash-execution.server.test.ts` (faked
+subprocesses) and — with the real binaries — by DASH-01, which records the
+durable status at the instant of EVERY Worker subprocess spawn: the runtime
+probe and both yt-dlp acquisitions at `downloading`; the two input ffprobes, the
+one FFmpeg stream copy and the output ffprobe at `processing`; zero FFmpeg or
+ffprobe while `downloading`.
 
 **Public contract.** Unchanged: no new field, reason, preset id or schema. A
 segmented rendition that became executable is now `deliverable` /
@@ -3800,40 +3813,92 @@ or errors.
 asserted "exactly `http`/`https`". Its invariant is restated as "the one
 vocabulary names no HLS spelling and equals exactly the reviewed
 `http`/`https`/`http_dash_segments`", which bumps
-`hls08-deterministic-full-path-03`, `hls09-release-image-full-path-02` and the
-parent `split07-release-image-candidate-04`. No record of any of the three has
-been produced yet. A dedicated segmented-DASH release-image child (real media
-merged by the image's own FFmpeg) does not exist yet and is the next
-harness task.
+`hls08-deterministic-full-path-03` and `hls09-release-image-full-path-02`.
+
+**Real-media qualification: DASH-01** (`deploy/acceptance/ytdlp-generic/DASH-01.md`,
+schema `dash01-release-image-full-path-01`). A mandatory child of every SPLIT-07
+release-image run since `split07-release-image-candidate-05` (`-04` is historical:
+it never ran real fragmented DASH and no `-04` record was ever produced). Inside the
+candidate image, offline, with NO faked yt-dlp, FFmpeg or ffprobe, it drives a
+deterministic local 1920×1080 segmented-DASH fixture (fragmented MP4 cut into an
+init + media segments and served as an MPD `SegmentList`; audio as segmented DASH
+M4A, and separately as progressive M4A) through the real analysis → `preset:1080`
+→ fresh execution analysis → merge-split plan → pinned `DashSegmentsFD`
+acquisition → real ffprobe input validation → the real `mergeSplitMedia` FFmpeg
+stream copy → real output validation → upload lifecycle → `ready`, plus three
+bounded negatives (fragment-aware guard → `TOO_LARGE` inside the held fragment;
+combined split budget → `TOO_LARGE`; a 404 fragment → `EXTRACTION_FAILED`, aborted
+not skipped). It fails the candidate if native DASH acquisition, fragment-residue
+cleanliness, byte accounting, input ffprobe, the real merge, output ffprobe, the
+video or audio stream, the 1920×1080 geometry, or the downloading/processing
+boundary fails.
+
+Result for the PR #102 head (GENERIC-SEGMENTED-DASH-EXECUTION-001 review
+corrections, 2026-09-29, isolated Docker Desktop on the Mac — never the
+Production VM): the raw fragmented artifact acquired by the pinned runtime is
+byte-for-byte the init + fragment concatenation and IS processable by the
+Worker's real ffprobe (`mov,mp4,m4a,3gp,3g2,mj2`, h264 1920×1080, video only /
+aac, audio only), the real stream-copy merge exits 0, and the delivered MP4 has
+exactly one h264 1920×1080 video stream and one aac audio stream with
+compressed-packet identity to the acquired inputs. No application change was
+needed. The complete report is in PR #102.
 
 **Mandatory Production acceptance source:**
-`https://youtu.be/S_XfAWeXRFQ?si=WAQXxhU-vUaD5PjB` (the user-reported failure:
-"Higher source quality detected · Highest observed 1080p · Best downloadable:
-Resolution unavailable · …a stream type VideoFetch does not support yet"). The
-rollout must (1) analyze it with the exact candidate; (2) record the sanitized
-protocol family and `sourceQuality`; (3) establish the highest accessible non-DRM
-quality; (4) if 1080p is accessible, confirm `preset:1080` is advertised; (5)
-submit it; (6) reach `ready`; (7) deliver a file with video and audio; (8)
-confirm 1080p when 1080p was selected; (9) confirm the unsupported-quality
-warning is absent for that quality; (10) confirm no generic "We hit a snag"
-masks a known failure.
+`https://youtu.be/S_XfAWeXRFQ?si=WAQXxhU-vUaD5PjB`.
 
-> **Finding recorded by this task — not a Production measurement.** A
-> metadata-only `-J` of that URL on 2026-09-29, with the hash-verified pinned
-> artifact and the Worker's own analysis argv, from a NON-Production host (no
-> cookies, no credentials, no media), exposed NO segmented DASH: `https`
-> adaptive video-only renditions up to 1080p (mp4 and webm), `https` audio-only
-> renditions, and `m3u8_native` video-only renditions up to 1080p plus two HLS
-> audio renditions with unknown codec. From that vantage current `main` already
-> advertises `preset:1080` (an `https` + `https` split). The Production symptom
-> matches a result in which the `https` renditions are absent and only the HLS
-> ones remain. So: **REGRESSION SOURCE REQUIRES ADDITIONAL ADAPTIVE SHAPE:
-> `m3u8_native` split (video-only + audio-only HLS renditions)** — the next
-> required work is a metadata-only diagnosis of that URL under the Production
-> image and egress, then, if confirmed, split clear-HLS (VideoFetch-owned
-> acquisition of an HLS video-only and audio-only pair, with audio presence
-> established by the transport's own checks rather than by metadata). This DASH
-> task does not claim to fix that URL.
+**Status: `UNRESOLVED — PRODUCTION EXECUTION FAILURE REQUIRES DIAGNOSIS`.**
+
+The user's supplied Production regression is a **complete download failure**, not
+merely a missing-quality issue: VideoFetch analyzed the URL and showed
+source-quality information, the user started a download, the download failed,
+the terminal UI showed the generic "We hit a snag", and no video was delivered at
+any quality. The higher-source-quality / unsupported-stream warning the user
+also saw is an additional symptom.
+
+A non-Production metadata inspection (2026-09-29; hash-verified pinned artifact,
+the Worker's own analysis argv, no cookies, no credentials, no media) observed
+executable-looking `https` adaptive video/audio (video-only up to 1080p, mp4 and
+webm; audio-only) plus `m3u8_native` renditions, and did not observe segmented
+DASH. Current `main` could construct an `https` 1080p split from that
+non-Production inventory. Therefore neither segmented DASH nor split HLS has yet
+been established as the cause of the Production failure, and this DASH work does
+not claim to fix that URL. The source remains unresolved pending a
+Production-image diagnosis.
+
+The regression is **not** considered fixed until an actual VideoFetch job for the
+supplied source reaches `ready` and delivers validated media; and, if 1080p is
+accessible, non-DRM and within Product limits at acceptance time, until
+`preset:1080` also completes. Advertising a preset does not satisfy it; fixing
+the source-quality warning does not satisfy it.
+
+**The next required task — a Production-image diagnostic** (not part of PR #102).
+It must capture, safely: (1) the public/browser analysis; (2) the requested
+preset; (3) a fresh execution analysis; (4) the selected private video protocol
+family; (5) the selected private audio protocol family; (6) the durable stage
+before failure; (7) the canonical error code; (8) whether video acquisition
+started and (9) completed; (10) whether audio acquisition started and (11)
+completed; (12) whether `beginProcessing()` committed; (13) whether ffprobe
+started; (14) whether the FFmpeg merge started; (15) whether output validation
+started; (16) whether upload started; (17) bounded, sanitized logs. It must
+never capture signed media URLs, raw yt-dlp stderr in user-visible evidence,
+cookies, secrets or access tokens. No code may special-case YouTube (hostname,
+extractor, video id or format ids).
+
+**PR #101 relationship.** PR #101 (media-execution failure classification) is
+merged into source but NOT deployed, so Production still uses the older
+classification and the historical "We hit a snag" cannot identify the failing
+subsystem — it is not evidence of an FFmpeg, network, extraction, HLS or DASH
+failure. The diagnostic must either deploy #101's classification first (as part
+of a coordinated release) or gather internal sanitized evidence independently of
+the old browser message.
+
+**Coordinated rollout.** Nothing is deployed now. After PR #102 passes
+independent review and is merged, the Production-image diagnosis identifies the
+YouTube failure, and any additional required fix is implemented and reviewed,
+the preferred release is ONE coordinated acceptance sequence covering PR #101,
+PR #102 and that fix — avoiding multiple Worker rollouts. The release candidate
+must PASS `split07-release-image-candidate-05` (including DASH-01), and the
+supplied YouTube source must reach `ready` with validated media.
 
 ---
 
