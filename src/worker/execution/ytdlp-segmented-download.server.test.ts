@@ -173,9 +173,16 @@ function emulateFragmentFd(final: string, e: Emulation): Child {
       await sleep(ms);
       stopIfAborted();
     };
+    const startedAt = Date.now();
     const hold = async () => {
-      // Parked until the run is aborted (by the guard, the caller or a test).
-      for (;;) await tick();
+      // Parked until the run is aborted (by the guard, the caller or a test) —
+      // or until this run's own budget elapses, which the hardened runner
+      // enforces as TIMEOUT. So a guard that never fires fails as TIMEOUT
+      // rather than hanging the suite.
+      for (;;) {
+        if (Date.now() - startedAt > call.timeoutMs) throw new AppError("TIMEOUT");
+        await tick();
+      }
     };
     const part = `${final}.part`;
     const ytdl = `${final}.ytdl`;
