@@ -165,6 +165,16 @@ is no HLS-specific format id, field or error code. Such a preset states
 Production on a real public source (`preset:best` and five named rungs), and the
 unchanged Vercel control plane accepted it (deployment runbook §4j).
 
+**Clear-HLS v2 changes no contract either** (`HLS-V2-ADAPTIVE-VOD-EXPANSION-001`,
+IMPLEMENTED IN SOURCE — PRODUCTION DEPLOYMENT / ACCEPTANCE PENDING; deployment
+runbook §4m). It lets a muxed fMP4 media playlist fulfil the same ordinary
+preset with the same public facts. The segment family is learned only by the
+Worker's job-time playlist preflight, and it is never exposed. `sourceQuality`
+is unaffected, because analysis fetches no media playlist. Separate HLS audio
+renditions stay unsupported and keep being reported as `unsupported_protocol`:
+the pinned yt-dlp exposes no video→audio relationship to pair on. No Vercel
+deployment and no deployment-order constraint follows.
+
 **Deployment order — VERCEL FIRST.** `VideoMetadataSchema` is strict, so a
 control plane that predates this field REJECTS a Worker response that carries it
 (`PROCESSING_FAILED`), while the new control plane accepts a Worker that omits

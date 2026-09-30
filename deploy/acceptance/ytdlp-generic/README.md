@@ -174,27 +174,39 @@ not an overlay. It does the following, and deploys nothing and never touches
 - (since `-05`) runs the DASH-01 segmented-DASH real-media child against it —
   pinned `DashSegmentsFD` acquisition, real ffprobe, the real `mergeSplitMedia`
   FFmpeg stream copy and real output validation, plus three bounded negatives;
+- (since `-06`) runs the HLS-11 clear-HLS v2 real-media child against it — a
+  1080p MPEG-TS control and a 1080p fMP4 rendition through the real HLS-2/3/4
+  chain, real ffprobe and FFmpeg, five fail-closed negatives and the
+  split-master pairing case;
 - creates its record exclusively, and reads it back.
 
 See [`SPLIT-07.md`](SPLIT-07.md), for the clear-HLS child [`HLS-09.md`](HLS-09.md),
-and for the segmented-DASH child [`DASH-01.md`](DASH-01.md).
+for the segmented-DASH child [`DASH-01.md`](DASH-01.md), and for the clear-HLS v2
+child [`HLS-11.md`](HLS-11.md).
 
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
-| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, the clear-HLS child once and the segmented-DASH child once, writes the `split07-release-image-candidate-05` record (`-04` is historical — it ran no real-media segmented-DASH child and no `-04` record was ever produced; `-03` is valid HLS-aware qualification under the pre-`GENERIC-SEGMENTED-DASH-EXECUTION-001` protocol invariant; `-02` is valid split-stream-only qualification and does not qualify clear HLS; `-01` is historical). Requires `--media-workspace`: an existing, EMPTY, uid-1000-writable directory on disk, never the report directory or a Production path — admitted before any Docker command and cleared after each child. |
+| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, the clear-HLS child once, the segmented-DASH child once and the clear-HLS v2 child once, writes the `split07-release-image-candidate-06` record (`-05` is valid release qualification for exactly the candidates it qualified — it ran no clear-HLS v2 child; `-04` is historical — it ran no real-media segmented-DASH child and no `-04` record was ever produced; `-03` is valid HLS-aware qualification under the pre-`GENERIC-SEGMENTED-DASH-EXECUTION-001` protocol invariant; `-02` is valid split-stream-only qualification and does not qualify clear HLS; `-01` is historical). Requires `--media-workspace`: an existing, EMPTY, uid-1000-writable directory on disk, never the report directory or a Production path — admitted before any Docker command and cleared after each child. |
 | `lib/release-provenance.mjs` | — | The clean-worktree gate for the release context and the harness, and the `/app` source manifest from Git objects. |
-| `lib/release-container.mjs` | — | Every `docker` argv: non-deployable tags, immutable-id run subjects, hardening, the Product media workspace bound in Production's exact `--mount type=bind` form (the 2 GiB tmpfs is retired, `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`), the forbidden-mount guard, and the clear-HLS and segmented-DASH children's argv and structural posture checks. |
+| `lib/release-container.mjs` | — | Every `docker` argv: non-deployable tags, immutable-id run subjects, hardening, the Product media workspace bound in Production's exact `--mount type=bind` form (the 2 GiB tmpfs is retired, `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`), the forbidden-mount guard, and the clear-HLS, segmented-DASH and clear-HLS v2 children's argv and structural posture checks. |
 | `lib/release-image-probe.mjs` | inside the candidate, at `/verify` | Import-free observer: manifest, forbidden tools, env names, runtime identity. |
-| `lib/release-evidence.mjs` | — | The parent record, SPLIT-06, clear-HLS and segmented-DASH child validation and re-hashing, the PASS gate, and the read-back validator. |
+| `lib/release-evidence.mjs` | — | The parent record, SPLIT-06, clear-HLS, segmented-DASH and clear-HLS v2 child validation and re-hashing, the PASS gate, and the read-back validator. |
 | `dash-full-path.mjs` | inside the release candidate | The DASH-01 real-media orchestrator (release-image mode only), launched by SPLIT-07. |
 | `lib/dash-argv.mjs` | — | Its command line: exactly the parent's identity flags. |
 | `lib/dash-evidence.mjs` | — | The `dash01-release-image-full-path-01` record, its mandatory checks, PASS and privacy gates, and the parent-side validator. |
 | `lib/dash-observers.mjs` | — | The spawn observer (durable status at every Worker spawn), the job-directory sampler (independent FragmentFD grammar), the downloader-identity reader, the yt-dlp runner ledger. |
 | `fixtures/dash-media.mjs` | — | The deterministic 1920x1080 fragmented-MP4 recipes, the init/segment splitter, the closed route grammar and the two MPDs. |
 | `fixtures/dash-server.mjs` | inside the release candidate, loopback only | The closed-route fixture service with its sanitized ledger and its pace/hold/failing behaviours. |
+| `hls11-full-path.mjs` | inside the release candidate | The HLS-11 clear-HLS v2 real-media orchestrator, launched by SPLIT-07 with the parent's identity flags. |
+| `lib/hls11-evidence.mjs` | — | The `hls11-release-image-full-path-01` record, its 137 mandatory checks, PASS and privacy gates, and the parent-side validator. |
+| `lib/hls11-fixture-url.mjs` | — | The HLS-11 hostname, `--add-host` mapping, closed per-case routes and exact page validator. Import-free. |
+| `lib/hls11-observers.mjs` | — | The HLS spawn observer (durable status, input, demuxer), the HLS workspace sampler and the `-J` pairing-fact reducer. |
+| `fixtures/hls11-media.mjs` | — | The bit-exact 1080p MPEG-TS/fMP4 recipes, the masters (including the split master) and the negative playlists. |
+| `fixtures/hls11-server.mjs` | inside the release candidate, loopback only | The closed-route fixture service and its sanitized ledger. |
 
-Self-tests: `scripts/ytdlp-release-image-acceptance.test.mjs` and
-`scripts/ytdlp-dash-acceptance.test.mjs` — no Docker, no network.
+Self-tests: `scripts/ytdlp-release-image-acceptance.test.mjs`,
+`scripts/ytdlp-dash-acceptance.test.mjs` and `scripts/ytdlp-hls11-acceptance.test.mjs`
+— no Docker, no network.
 
 ### HLS-08 — the deterministic clear-HLS full-path harness
 

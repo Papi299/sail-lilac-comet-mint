@@ -20,8 +20,9 @@ verified clean release source
   → SPLIT-06 mp4 child     (split06-deterministic-full-path-04)
   → SPLIT-06 webm child    (split06-deterministic-full-path-04)
   → HLS-09 clear-HLS child (hls09-release-image-full-path-02; -01 before GENERIC-SEGMENTED-DASH-EXECUTION-001)
-  → ONE HLS-aware SPLIT-07 parent PASS (split07-release-image-candidate-05, which
-    also requires the DASH-01 segmented-DASH child; -04 and -03 before it)
+  → ONE HLS-aware SPLIT-07 parent PASS (split07-release-image-candidate-06, which
+    also requires the DASH-01 segmented-DASH child and the HLS-11 clear-HLS v2
+    child; -05, -04 and -03 before it)
 ```
 
 Every candidate container — the clear-HLS child included — executes the same
