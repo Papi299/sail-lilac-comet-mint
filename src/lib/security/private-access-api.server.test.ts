@@ -836,6 +836,141 @@ describe("job status is served by the worker", () => {
   });
 });
 
+// ── BROWSER-JOB-STATUS-POLL-RESILIENCE-001: status failures keep their meaning ─
+//
+// The browser retries a status read on WORKER_UNAVAILABLE and on any 5xx, and
+// stops on NOT_FOUND / EXPIRED / an access failure. So a definitive code must
+// mean exactly that, and an unexpected failure of the handler must not be
+// reported as a missing job.
+
+describe("status failures keep their meaning", () => {
+  afterEach(resetAll);
+
+  const RAW = "TypeError: boom at /var/lib/videofetch/jobs/x token=sk-live-SECRET X-Amz-Signature=deadbeef";
+
+  function assertNoRaw(raw: string) {
+    for (const fragment of ["boom", "/var/lib", "sk-live", "X-Amz-Signature", "TypeError"]) {
+      assert.equal(raw.includes(fragment), false, `the browser response leaked ${fragment}`);
+    }
+  }
+
+  async function authedStatus(jobId = JOB_ID): Promise<{ res: Response; raw: string }> {
+    const res = await handleDownloadStatus(
+      apiRequest(`/api/download/${jobId}/status`, { cookie: authedCookie(), site: "same-origin" }),
+      jobId,
+    );
+    return { res, raw: await res.text() };
+  }
+
+  it("a job the Worker does not have is NOT_FOUND", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    const { client } = installWorker();
+    client.failWith = new AppError("NOT_FOUND");
+    const { res, raw } = await authedStatus();
+    assert.equal(res.status, 404);
+    assert.deepEqual(JSON.parse(raw).error, { code: "NOT_FOUND", message: ERROR_MESSAGES.NOT_FOUND });
+  });
+
+  it("an invalid job id is NOT_FOUND without calling the Worker", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    const { client } = installWorker();
+    const { res, raw } = await authedStatus("not-a-job");
+    assert.equal(res.status, 404);
+    assert.equal(JSON.parse(raw).error.code, "NOT_FOUND");
+    assert.equal(client.getJobCalls.length, 0);
+  });
+
+  it("an access failure is ACCESS_REQUIRED, not NOT_FOUND", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    installWorker();
+    const res = await handleDownloadStatus(apiRequest(`/api/download/${JOB_ID}/status`), JOB_ID);
+    assert.equal(res.status, 401);
+    assert.equal((await readJson(res)).error?.code, "ACCESS_REQUIRED");
+  });
+
+  it("an unreachable Worker is WORKER_UNAVAILABLE", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    const { client } = installWorker();
+    client.failWith = new AppError("WORKER_UNAVAILABLE", RAW);
+    const { res, raw } = await authedStatus();
+    assert.equal(res.status, 503);
+    assert.deepEqual(JSON.parse(raw).error, {
+      code: "WORKER_UNAVAILABLE",
+      message: ERROR_MESSAGES.WORKER_UNAVAILABLE,
+    });
+    assertNoRaw(raw);
+  });
+
+  it("a Worker transport failure through the real client is WORKER_UNAVAILABLE", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    setWorkerClientForTests(
+      new WorkerClient({
+        baseUrl: "http://localhost:8080",
+        currentKeyId: "test-key-id",
+        currentSecret: "01234567890123456789012345678901",
+        fetchImplementation: (async () => {
+          throw new TypeError(RAW);
+        }) as unknown as typeof fetch,
+      }),
+    );
+    const { res, raw } = await authedStatus();
+    assert.equal(res.status, 503);
+    assert.equal(JSON.parse(raw).error.code, "WORKER_UNAVAILABLE");
+    assertNoRaw(raw);
+  });
+
+  it("an edge error page in front of the Worker reaches the browser as a 5xx", async () => {
+    // A dead tunnel answers with the edge's HTML page, not a Worker envelope.
+    // The browser must be able to treat it as transient, so it is a 5xx.
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    setWorkerClientForTests(
+      new WorkerClient({
+        baseUrl: "http://localhost:8080",
+        currentKeyId: "test-key-id",
+        currentSecret: "01234567890123456789012345678901",
+        fetchImplementation: (async () =>
+          new Response(`<html>502 Bad Gateway ${RAW}</html>`, {
+            status: 502,
+            headers: { "Content-Type": "text/html" },
+          })) as unknown as typeof fetch,
+      }),
+    );
+    const { res, raw } = await authedStatus();
+    assert.ok(res.status >= 500, `expected a 5xx, got ${res.status}`);
+    assertNoRaw(raw);
+  });
+
+  for (const [label, thrown] of [
+    ["a plain Error", new Error(RAW)],
+    ["a TypeError", new TypeError(RAW)],
+    ["a thrown string", RAW],
+  ] as const) {
+    it(`an unexpected handler failure (${label}) is a 500 PROCESSING_FAILED, not NOT_FOUND`, async () => {
+      setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+      const { client } = installWorker();
+      client.failWith = thrown as Error;
+      const { res, raw } = await authedStatus();
+      assert.equal(res.status, 500);
+      assert.deepEqual(JSON.parse(raw), {
+        success: false,
+        error: { code: "PROCESSING_FAILED", message: ERROR_MESSAGES.PROCESSING_FAILED },
+      });
+      assertNoRaw(raw);
+    });
+  }
+
+  it("a Worker view the public DTO refuses is a 500, not NOT_FOUND", async () => {
+    setPrivateAccessTestEnv({ nodeEnv: "production", secret: SECRET });
+    const { client } = installWorker();
+    // Bypasses the schema on purpose: `toPublicJob` itself must throw.
+    client.job = { ...readyJob(), jobId: "not-a-job-id" } as unknown as WorkerJobView;
+    const { res, raw } = await authedStatus();
+    assert.equal(res.status, 500);
+    assert.equal(JSON.parse(raw).error.code, "PROCESSING_FAILED");
+    assert.equal(raw.includes("not-a-job-id"), false);
+  });
+});
+
 // ── MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001: a failed job, end to end ─────
 //
 // The REAL WorkerClient, fed a Worker response body by a fake fetch, behind the

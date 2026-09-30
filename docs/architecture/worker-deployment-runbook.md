@@ -3900,6 +3900,121 @@ PR #102 and that fix — avoiding multiple Worker rollouts. The release candidat
 must PASS `split07-release-image-candidate-05` (including DASH-01), and the
 supplied YouTube source must reach `ready` with validated media.
 
+*Later (2026-09-29, `YOUTUBE-PRODUCTION-EXECUTION-DIAGNOSTIC-001`):* the
+Production-image diagnostic did **not** reproduce a media failure. One real
+Production `preset:1080` job for the supplied source ran `queued → analyzing →
+downloading → processing → uploading → ready` in 67 s and delivered a validated
+1080p MP4, through `https` video-only + `https` audio-only → merge-split → Worker
+FFmpeg stream copy; no segmented DASH was involved, so PR #102 does not explain
+this failure, and PR #101 only improves its classification. The Worker database
+held no failed or cancelled row for the source (such rows are never deleted),
+which leaves a failed browser status read as the only UI path consistent with
+the report. **Current Production successfully downloads the source at 1080p.
+The historical failure is consistent with the confirmed one-shot browser polling
+defect and observed tunnel interruptions, but that historical causal chain was
+not directly reproduced** (`NOT REPRODUCED — CONSISTENT WITH CONFIRMED
+STATUS-POLL DEFECT`). The polling defect is corrected in source by §4l. The
+sentences above stay as the PR #102 record; the source remains the mandatory
+acceptance source for the coordinated rollout, which now also carries §4l.
+
+---
+
+### 4l. Browser job-status polling — IMPLEMENTED IN SOURCE — NOT DEPLOYED
+
+*Recorded 2026-09-30 by `BROWSER-JOB-STATUS-POLL-RESILIENCE-001` (Draft PR,
+`fix/browser-job-status-poll-resilience-001`). Vercel/browser source only: no
+Worker, yt-dlp, DASH, HLS, FFmpeg, R2, systemd or tunnel change; nothing was
+deployed. PR #101 and PR #102 remain MERGED — NOT DEPLOYED.*
+
+**The defect.** The downloader polled `GET /api/download/:jobId/status` with a
+fixed 800 ms interval, and any rejected read set the page to its terminal error
+card ("We hit a snag"). That also tore the polling effect down, so ONE transient
+failure — a dropped tunnel connection, a `WORKER_UNAVAILABLE`, a browser network
+blip — permanently abandoned a job the Worker kept running and might finish.
+The browser also kept only the error's message text, so it could not tell a
+transient failure from a definitive one without matching English strings.
+
+**Typed browser error.** Every control-plane call now fails with a
+`ClientApiError` (`src/lib/client-api.ts`) carrying only structure: `kind`
+(`response` or `network`), `status` (the HTTP status, or null with no
+response), and `code` — the envelope's `error.code` only if it is one of the
+application's own `ErrorCode`s (`Object.hasOwn(ERROR_MESSAGES, code)`), else
+null. A malformed body, an HTML error page, or an unknown or differently-cased
+code keeps only the status and the generic message; no part of an unrecognized
+body reaches the page. A rejected `fetch` becomes `network` with
+application-owned copy, never the browser's "Failed to fetch". A status 2xx
+whose body is not a job status (for example an interstitial page) is a
+`response` failure carrying that 2xx.
+
+**Classification** (`classifyStatusPollFailure`, structure only):
+
+| Failed status read | Class |
+| :--- | :--- |
+| no response (`network`), including an aborted hung request | transient |
+| `WORKER_UNAVAILABLE` | transient |
+| any other 5xx, with or without an envelope (`PROCESSING_FAILED` 500, edge 502/504) | transient |
+| 408, 429 (`RATE_LIMITED`) | transient |
+| a 2xx whose body is not a job status | transient |
+| `NOT_FOUND`, `EXPIRED`, `ACCESS_REQUIRED`, `ACCESS_NOT_CONFIGURED` (503), `FORBIDDEN` | definitive |
+| any other 4xx | definitive |
+
+A dead tunnel reaches the browser as a **500 `PROCESSING_FAILED`**, not as
+`WORKER_UNAVAILABLE`: the edge's HTML error page fails the Worker response
+contract in `WorkerClient`. Treating every 5xx as transient is what makes the
+browser tolerate it. The cost is bounded: a persistent 5xx (for example a
+Worker view the control plane refuses) ends in the recoverable retry-exhausted
+state below, not in a terminal card.
+
+**Loop** (`src/lib/job-status-poller.ts`). Single flight: the next request is
+scheduled only after the previous one settles, so at most one status request
+per job is ever in flight, and a slow response delays the loop rather than
+stacking requests. Healthy cadence 800 ms after each answer. Transient backoff
+800 ms → 1.5 s → 3 s → 5 s (cap), reset by any successful read. A read not
+settled after 15 s is aborted and counted as transient (healthy Production round
+trips measured ~0.4 s). **Retry budget: 120 s of continuous outage**, measured
+in elapsed time from the start of the first failed request, reset by any
+successful read. It is sized against the Production tunnel as measured on
+2026-09-29: each all-connection drop re-registered within 1–2 s of detection,
+while a read caught in one can take up to the control plane's 30 s Worker
+request budget to fail. Multi-minute outages (2026-09-17) are not ordinary
+reconnects and end in the retry-exhausted state.
+
+**Page state** (`src/lib/downloader-state.ts`). One reducer owns `phase`,
+`job` and `error`, plus a browser-only `connectivity` of `connected`,
+`reconnecting` or `retry_exhausted`. Every poll result is tagged with its job id
+and polling-session generation and is dropped unless both match the current
+state, so a reset, a replacing job, a superseded session or an unmount cannot be
+overwritten by a late response; the loop itself also reports nothing after
+`stop()`, which aborts its request in flight. History is derived from accepted
+state and records only a job's own terminal status.
+
+**What the person sees.**
+
+| Situation | Screen |
+| :--- | :--- |
+| healthy | progress card, as before |
+| transient failure | progress card with the last known progress, plus "Connection interrupted. Reconnecting…" / "Your download may still be running." — the phase stays `processing` and the job id is kept |
+| recovered | the notice clears; progress continues; `ready` shows the ordinary complete card and download link |
+| budget exhausted | last known progress, plus "We couldn't reconnect to the processing worker." / "Your download may still be running.", with **Retry status** (resumes the SAME job id at once, fresh budget; never resubmits or reanalyzes) and **Start over**; nothing is written to history |
+| job `failed` / `cancelled` | PR #101's terminal card, unchanged: closed stage heading and canonical message |
+| definitive status answer | the error card with the generic heading and the code's canonical message; not recorded as a failed job |
+
+**Control-plane correction.** `handleDownloadStatus` answered any unexpected
+non-`AppError` failure as `NOT_FOUND` (404), which would tell the browser a job
+that may still be running does not exist. Its fallback is now
+`PROCESSING_FAILED` (500, canonical message). Every definitive answer —
+malformed id and missing job (`NOT_FOUND`), `EXPIRED`, access failures,
+`WORKER_UNAVAILABLE` — was already an `AppError` and keeps its code. No public
+error code was added.
+
+**Separate, not changed here.** The Production named tunnel's repeated
+all-connection QUIC drops (`timeout: no recent network activity`) are an
+operational concern for a separate bounded tunnel-stability task; this PR does
+not touch the cloudflared protocol or configuration.
+
+**Deployment.** Vercel-only. It is independent of the Worker version and is
+intended to ship with the coordinated #101 + #102 rollout (§4k).
+
 ---
 
 ## 5. Object storage (R2)

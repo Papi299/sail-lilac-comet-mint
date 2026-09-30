@@ -239,7 +239,13 @@ export async function handleDownloadStatus(request: Request, jobId: string): Pro
     const result = await getWorkerClient().getJob(validId);
     return Response.json(toPublicJob(result.job, Date.now()));
   } catch (err) {
-    return safeJsonError(err, "NOT_FOUND");
+    // Every definitive answer — a missing or malformed job id (NOT_FOUND), an
+    // expired job (EXPIRED), an access failure, an unreachable Worker
+    // (WORKER_UNAVAILABLE) — arrives here as an AppError and keeps its code.
+    // Anything else is an unexpected failure of this handler: it is answered
+    // as an unclassified 500, never as a NOT_FOUND that would tell the browser
+    // a job which may still be running does not exist.
+    return safeJsonError(err, "PROCESSING_FAILED");
   }
 }
 
