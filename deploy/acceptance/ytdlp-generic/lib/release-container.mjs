@@ -31,8 +31,9 @@
 // `assertNoForbiddenMounts` is applied to every argv this module produces. The
 // harness is the observer; everything observed is the image's own.
 //
-// Import-free apart from the HLS-08 container model's constants (itself
-// import-free), so the driver runs on the VM's Node 18.
+// Import-free apart from the HLS-08 container model's constants and the HLS-11
+// fixture mapping (both themselves import-free), so the driver runs on the VM's
+// Node 18.
 
 import {
   HLS08_FIXTURE_HOST_MAPPING,
@@ -40,6 +41,7 @@ import {
   HLS_ACCEPTANCE_MODES,
   HLS_ACCEPTANCE_MODE_FLAG,
 } from "./hls-container.mjs";
+import { HLS11_FIXTURE_HOST_MAPPING } from "./hls11-fixture-url.mjs";
 
 /** The one repository name a SPLIT-07 candidate may use. */
 export const CANDIDATE_IMAGE_REPOSITORY = "videofetch-worker";
@@ -685,6 +687,9 @@ export function releaseHlsAcceptanceRunArgs({
 /** The DASH-01 segmented-DASH release child, at its repository-relative path. */
 export const DASH01_ORCHESTRATOR = "deploy/acceptance/ytdlp-generic/dash-full-path.mjs";
 
+/** The HLS-11 clear-HLS v2 release child, at its repository-relative path. */
+export const HLS11_ORCHESTRATOR = "deploy/acceptance/ytdlp-generic/hls11-full-path.mjs";
+
 /**
  * The DASH-01 segmented-DASH release child `docker run` argv, against the
  * RELEASE image (since SPLIT-07 `-05`).
@@ -772,6 +777,89 @@ export function releaseDashAcceptanceRunArgs({
 }
 
 /**
+ * The HLS-11 clear-HLS v2 release child `docker run` argv, against the RELEASE
+ * image (since SPLIT-07 `-06`, HLS-V2-ADAPTIVE-VOD-EXPANSION-001).
+ *
+ * The clear-HLS child's container shape exactly — `--network none`,
+ * `--cap-drop=ALL`, `no-new-privileges`, `--read-only`, the Product media
+ * workspace at `/tmp/videofetch` in Production's `--mount type=bind` form, the
+ * harness scratch tmpfs with `TMPDIR`, the harness read-only, the report
+ * directory — with its OWN single `--add-host` mapping (a hostname disjoint
+ * from HLS-08's) and, like DASH-01, the identity flags instead of a mode flag.
+ */
+export function releaseHls11AcceptanceRunArgs({
+  imageId,
+  harnessDir,
+  reportDir,
+  mediaWorkspaceDir,
+  evidenceName,
+  sourceCommit,
+  sourceTree,
+  candidateTag,
+  containerReportDir = REPORT_MOUNT_TARGET,
+}) {
+  assertImmutableImageId(imageId);
+  requireAbsoluteHostPath("the harness directory", harnessDir);
+  requireAbsoluteHostPath("the report directory", reportDir);
+  const productMediaMount = productMediaWorkspaceMount(mediaWorkspaceDir);
+  if (hostPathsOverlap(mediaWorkspaceDir, reportDir)) {
+    throw new Error("the Product media workspace must not overlap the report directory");
+  }
+  if (hostPathsOverlap(mediaWorkspaceDir, harnessDir)) {
+    throw new Error("the Product media workspace must not overlap the harness directory");
+  }
+  if (typeof evidenceName !== "string" || !/^[A-Za-z0-9._-]+$/.test(evidenceName)) {
+    throw new Error("the evidence filename must be a plain basename");
+  }
+  for (const [label, value] of [["source commit", sourceCommit], ["source tree", sourceTree]]) {
+    if (typeof value !== "string" || !/^[0-9a-f]{40}$/.test(value)) {
+      throw new Error(`the release ${label} must be a full 40-hex SHA`);
+    }
+  }
+  assertCandidateReference(candidateTag);
+  return assertNoForbiddenMounts([
+    "run",
+    "--rm",
+    ...RELEASE_HARDENING_ARGS,
+    "--read-only",
+    // The ONE acceptance-only name mapping, for the pinned yt-dlp subprocess.
+    "--add-host",
+    HLS11_FIXTURE_HOST_MAPPING,
+    "--mount",
+    productMediaMount,
+    "--tmpfs",
+    HARNESS_SCRATCH_TMPFS,
+    ...RELEASE_RUN_ENVIRONMENT.flatMap((entry) => ["-e", entry]),
+    "-v",
+    `${harnessDir}:${HARNESS_MOUNT_TARGET}:ro`,
+    "-v",
+    `${reportDir}:${containerReportDir}`,
+    "-w",
+    "/app",
+    "--entrypoint",
+    "/usr/local/bin/node",
+    imageId,
+    "--import",
+    "./scripts/register-ts-aliases.mjs",
+    "--experimental-strip-types",
+    HLS11_ORCHESTRATOR,
+    "--evidence",
+    `${containerReportDir}/${evidenceName}`,
+    "--source-commit",
+    sourceCommit,
+    "--source-tree",
+    sourceTree,
+    "--source-context-clean",
+    "--candidate-tag",
+    candidateTag,
+    "--candidate-image-id",
+    imageId,
+    "--run-image-id",
+    imageId,
+  ]);
+}
+
+/**
  * The docker-run options the HLS-09 release child may carry, with whether each
  * takes a value. Anything else — `--privileged`, `--user`, `--env-file`,
  * `--env`, `--cap-add`, `--pull`, `-p`, … — is a violation by construction.
@@ -819,12 +907,29 @@ export function releaseDashRunPostureViolations(args, { reportDir, harnessDir, m
   return releaseChildRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }, RELEASE_DASH_CHILD_MODEL);
 }
 
+/**
+ * The HLS-11 release child's run posture (since SPLIT-07 `-06`): the clear-HLS
+ * shape with its OWN single `--add-host` mapping, the HLS-11 orchestrator
+ * exactly once, and the child told the immutable id it runs as.
+ */
+export function releaseHls11RunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }) {
+  return releaseChildRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }, RELEASE_HLS11_CHILD_MODEL);
+}
+
 const RELEASE_HLS_CHILD_MODEL = Object.freeze({
   addHost: HLS08_FIXTURE_HOST_MAPPING,
   orchestrator: HLS08_ORCHESTRATOR,
   orchestratorMessage: "the clear-HLS orchestrator must run exactly once",
   mode: { flag: HLS_ACCEPTANCE_MODE_FLAG, value: HLS_ACCEPTANCE_MODES.releaseImage },
   identityFlags: false,
+});
+
+const RELEASE_HLS11_CHILD_MODEL = Object.freeze({
+  addHost: HLS11_FIXTURE_HOST_MAPPING,
+  orchestrator: HLS11_ORCHESTRATOR,
+  orchestratorMessage: "the clear-HLS v2 orchestrator must run exactly once",
+  mode: null,
+  identityFlags: true,
 });
 
 const RELEASE_DASH_CHILD_MODEL = Object.freeze({

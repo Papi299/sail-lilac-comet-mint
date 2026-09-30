@@ -85,6 +85,14 @@ export const FORBIDDEN_REQUEST_HEADER_NAMES = Object.freeze([
 /** The only request kinds the Product's HLS code may make through this path. */
 const ADMITTED_KINDS = new Set(["media", "fragment"]);
 
+/**
+ * HLS-11 (HLS v2): the fMP4 initialization map is one more Product media
+ * request. HLS-08/HLS-09 keep `ADMITTED_KINDS` above; HLS-11 passes this set
+ * together with its own route classifier. Nothing else about the transport
+ * differs between the two.
+ */
+export const HLS_V2_ADMITTED_KINDS = Object.freeze(["media", "init", "fragment"]);
+
 /** A refusal. It never names a URL, a header value or a marker. */
 export class HlsTransportRefusal extends Error {
   constructor(reason) {
@@ -154,6 +162,9 @@ function headerValue(headers, name) {
  * @param {() => string} opts.statusNow the durable job status right now
  * @param {() => string} [opts.caseNow] the acceptance case label right now
  * @param {Function} opts.realRequest   Node's `http.request`
+ * @param {(path: string) => {kind: string, variant: unknown, family: unknown, ordinal: unknown}} [opts.classify]
+ *        the fixture's route classifier; HLS-08's by default
+ * @param {readonly string[]} [opts.admittedKinds] request kinds the Product may make; HLS-08's by default
  */
 export function createHlsSafeHttpTransport({
   port,
@@ -163,7 +174,10 @@ export function createHlsSafeHttpTransport({
   realRequest,
   hostname = HLS_FIXTURE_HOSTNAME,
   syntheticAddress = HLS_SYNTHETIC_PUBLIC_ADDRESS,
+  classify = classifyHlsFixturePath,
+  admittedKinds = ADMITTED_KINDS,
 }) {
+  const admitted = new Set(admittedKinds);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     throw new Error("the acceptance transport needs the exact fixture port");
   }
@@ -219,8 +233,8 @@ export function createHlsSafeHttpTransport({
     const hostHeader = headerValue(options.headers, "host");
     if (hostHeader !== `${hostname}:${port}`) refuse("Host header is not the fixture authority");
 
-    const route = classifyHlsFixturePath(options.path);
-    if (!ADMITTED_KINDS.has(route.kind)) refuse(`route kind ${route.kind} is not an HLS media request`);
+    const route = classify(options.path);
+    if (!admitted.has(route.kind)) refuse(`route kind ${route.kind} is not an HLS media request`);
 
     const names = lowerCaseHeaderNames(options.headers);
     const entry = {

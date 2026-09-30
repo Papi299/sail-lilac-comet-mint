@@ -3,15 +3,17 @@
 // The SPLIT-07 host driver: verify a clean release source, build the ACTUAL
 // `Dockerfile.worker` image, characterize it, and run the existing SPLIT-06
 // deterministic full path against it — mp4 AND webm — (since -03) the HLS-09
-// clear-HLS release child and (since -05) the DASH-01 segmented-DASH real-media
-// child, before emitting one release-image candidate record. Every child runs
-// the same immutable candidate image id.
+// clear-HLS release child, (since -05) the DASH-01 segmented-DASH real-media
+// child and (since -06) the HLS-11 clear-HLS v2 real-media child, before
+// emitting one release-image candidate record. Every child runs the same
+// immutable candidate image id.
 //
 // ── Child order (deterministic) ────────────────────────────────────────────
 //
 //   characterization → SPLIT-06 mp4 → clear workspace → SPLIT-06 webm
 //   → clear workspace → HLS-09 clear-HLS → clear workspace
-//   → DASH-01 segmented DASH → clear workspace → parent
+//   → DASH-01 segmented DASH → clear workspace
+//   → HLS-11 clear-HLS v2 → clear workspace → parent
 //
 // Before each child the harness is re-verified and the Product media workspace
 // must be empty; after each child the workspace is cleared and re-proven empty.
@@ -99,6 +101,8 @@ import {
   releaseBuildArgs,
   releaseDashAcceptanceRunArgs,
   releaseDashRunPostureViolations,
+  releaseHls11AcceptanceRunArgs,
+  releaseHls11RunPostureViolations,
   releaseHlsAcceptanceRunArgs,
   releaseHlsRunPostureViolations,
 } from "./lib/release-container.mjs";
@@ -118,12 +122,14 @@ import {
   buildReleaseEvidence,
   DASH_CANDIDATE_RUN_PURPOSE,
   emptyDashChildObservation,
+  emptyHls11ChildObservation,
   emptyHlsChildObservation,
   ENTRYPOINT_SHIM_PATH,
   EXPECTED_IMAGE_CONFIG,
   EXPECTED_IMAGE_ENVIRONMENT_NAMES,
   EXPECTED_YTDLP_RUNTIME,
   FORBIDDEN_IMAGE_ENVIRONMENT_NAMES,
+  HLS11_CANDIDATE_RUN_PURPOSE,
   HLS_CANDIDATE_RUN_PURPOSE,
   REQUIRED_CANDIDATE_RUN_PURPOSES,
   REQUIRED_SPLIT_FAMILIES,
@@ -131,6 +137,7 @@ import {
   SPLIT07_EVIDENCE_SCHEMA,
   validateChildRecord,
   validateDashChildRecord,
+  validateHls11ChildRecord,
   validateHlsChildRecord,
   validateReleaseParentRecord,
 } from "./lib/release-evidence.mjs";
@@ -817,6 +824,56 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       `${dashChild.checkCount} checks sha256=${dashChild.sha256 ?? "n/a"}\n`);
     await clearMediaWorkspace("dash01-segmented-dash");
 
+    // ── 6d. The HLS-11 clear-HLS v2 real-media child (since -06) ───────────
+    //
+    // Real 1920x1080 MPEG-TS and fMP4 (init + fragments) HLS renditions through
+    // the candidate's own analysis, planner, HLS-2/3/4 chain, ffprobe and
+    // FFmpeg, plus five fail-closed negatives and the split-master pairing
+    // case. The clear-HLS child's hardening with its OWN single `--add-host`;
+    // the posture is re-derived from the argv before it runs.
+    await verifyHarnessAt("before-hls11-clear-hls-v2");
+    await admitMediaWorkspace("before-hls11-clear-hls-v2");
+    const hls11EvidenceName = `hls11-clear-hls-v2-${now()}.json`;
+    await admitEvidencePath(join(opts.report, hls11EvidenceName), deps);
+    const hls11Args = releaseHls11AcceptanceRunArgs({
+      imageId: runSubject,
+      harnessDir,
+      reportDir: opts.report,
+      mediaWorkspaceDir: opts.mediaWorkspace,
+      evidenceName: hls11EvidenceName,
+      sourceCommit: provenance.source,
+      sourceTree: provenance.tree,
+      candidateTag: image,
+    });
+    const hls11Violations = releaseHls11RunPostureViolations(hls11Args, {
+      reportDir: opts.report,
+      harnessDir,
+      mediaWorkspaceDir: opts.mediaWorkspace,
+    });
+    if (hls11Violations.length > 0) {
+      throw new Error(`refusing a clear-HLS v2 child with posture violations: ${hls11Violations.join("; ")}`);
+    }
+    log(`[split07] HLS-11 clear-HLS v2 against the release candidate\n`);
+    const hls11Result = await runCandidate(HLS11_CANDIDATE_RUN_PURPOSE, hls11Args);
+    let hls11Child;
+    try {
+      hls11Child = validateHls11ChildRecord({
+        bytes: await readFileBytes(join(opts.report, hls11EvidenceName)),
+        expected: {
+          sourceCommit: provenance.source,
+          sourceTree: provenance.tree,
+          candidateTag: image,
+          candidateImageId: imageId,
+        },
+      });
+    } catch {
+      hls11Child = emptyHls11ChildObservation("the clear-HLS v2 child record is unreadable");
+    }
+    hls11Child = { ...hls11Child, path: hls11EvidenceName, exitCode: hls11Result.code };
+    log(`[split07] HLS-11 clear-HLS v2: ${hls11Child.verdict ?? "UNREADABLE"} ` +
+      `${hls11Child.checkCount} checks sha256=${hls11Child.sha256 ?? "n/a"}\n`);
+    await clearMediaWorkspace("hls11-clear-hls-v2");
+
     // The children are re-read and re-hashed here, so the digests the parent
     // records describe bytes that were still identical at assembly time.
     const children = [];
@@ -848,8 +905,17 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       });
       dashChildReverified = true;
     }
+    let hls11ChildReverified = false;
+    if (hls11Child.sha256 !== null) {
+      assertChildUnchanged({
+        family: "clear-HLS-v2",
+        expectedSha256: hls11Child.sha256,
+        bytes: await readFileBytes(join(opts.report, hls11Child.path)),
+      });
+      hls11ChildReverified = true;
+    }
 
-    // The harness must STILL be exactly what was verified, now that all four
+    // The harness must STILL be exactly what was verified, now that all five
     // children have consumed it. A harness modified at any point in the run
     // makes the run's own measurements untrustworthy, so the record is refused
     // outright rather than emitted as a FAIL.
@@ -949,6 +1015,32 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       "dash/child-evidence-unchanged-before-assembly",
       dashChildReverified,
       dashChild.sha256 ?? "no bytes to re-verify",
+    );
+
+    // The clear-HLS v2 child (since -06): it ran, its record is a validated
+    // HLS-11 PASS, it names this release source, and it ran as the immutable id
+    // this driver told Docker to execute for it, offline.
+    const hls11Run = candidateRuns.find((entry) => entry.purpose === HLS11_CANDIDATE_RUN_PURPOSE);
+    checks.record("hls11/clear-hls-v2-child-executed", hls11Run !== undefined, HLS11_CANDIDATE_RUN_PURPOSE);
+    checks.record("hls11/clear-hls-v2-child-passed", hls11Child.ok === true, hls11Child.reason);
+    checks.record(
+      "hls11/child-names-the-release-source",
+      hls11Child.sourceCommit === provenance.source && hls11Child.sourceTree === provenance.tree,
+      `${String(hls11Child.sourceCommit)} ${String(hls11Child.sourceTree)}`,
+    );
+    checks.record(
+      "hls11/child-ran-in-the-candidate-image",
+      hls11Run?.subject === imageId &&
+        hls11Child.candidateImageId === imageId &&
+        hls11Child.runImageId === imageId &&
+        hls11Child.candidateTag === image &&
+        hls11Child.networkMode === "none",
+      imageId,
+    );
+    checks.record(
+      "hls11/child-evidence-unchanged-before-assembly",
+      hls11ChildReverified,
+      hls11Child.sha256 ?? "no bytes to re-verify",
     );
 
     // ── 7. Production identity, AFTER ──────────────────────────────────────
@@ -1115,6 +1207,26 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
           runImageId: dashChild.runImageId,
           networkMode: dashChild.networkMode,
           reason: dashChild.reason,
+        },
+      },
+      hls11Acceptance: {
+        executed: hls11Run !== undefined,
+        child: {
+          schema: hls11Child.schema,
+          verdict: hls11Child.verdict,
+          ok: hls11Child.ok,
+          sha256: hls11Child.sha256,
+          bytes: hls11Child.bytes,
+          checkCount: hls11Child.checkCount,
+          failedCheckCount: hls11Child.failedCheckCount,
+          evidenceFile: hls11Child.path,
+          sourceCommit: hls11Child.sourceCommit,
+          sourceTree: hls11Child.sourceTree,
+          candidateTag: hls11Child.candidateTag,
+          candidateImageId: hls11Child.candidateImageId,
+          runImageId: hls11Child.runImageId,
+          networkMode: hls11Child.networkMode,
+          reason: hls11Child.reason,
         },
       },
       production: {
