@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 
 /**
- * Worker-owned CLEAR-HLS v1 MEDIA PLAYLIST parser (HLS-1).
+ * Worker-owned CLEAR-HLS MEDIA PLAYLIST parser (HLS-1, widened by HLS v2).
  *
  * ─── What this module is ────────────────────────────────────────────────────
  *
@@ -9,6 +9,22 @@ import { Buffer } from "node:buffer";
  * text document into a small immutable application-owned plan. It performs no
  * I/O of any kind: no network, no DNS, no filesystem, no subprocess, no clock.
  * Give it a string, get a frozen structure or a thrown rejection.
+ *
+ * ─── Two segment families, one closed grammar ───────────────────────────────
+ *
+ * HLS-V2-ADAPTIVE-VOD-EXPANSION-001 admits exactly ONE construct the v1 subset
+ * refused: a single `#EXT-X-MAP:URI="…"` initialization map, which is what a
+ * fragmented-MP4 (fMP4/CMAF) media playlist carries. The plan therefore now
+ * names one of two segment families, and the family is decided by that one
+ * construct and nothing else:
+ *
+ *   mpegts  no initialization map — the v1 subset, parsed exactly as before;
+ *   fmp4    exactly one initialization map, declared before the first
+ *           fragment, whose reference the plan retains beside the fragments.
+ *
+ * Neither is a claim about the bytes. A family is what the PLAYLIST declares;
+ * the Worker's real ffprobe, through an explicit demuxer for that family, is
+ * what later decides whether the acquired bytes really are that container.
  *
  * ─── What this module is NOT ────────────────────────────────────────────────
  *
@@ -43,6 +59,12 @@ import { Buffer } from "node:buffer";
  * discontinuities, no fMP4, no audio pairing, no subtitles, no DRM, a bounded
  * finite fragment count, a closed tag vocabulary, and ordinary fragment URI
  * lines only.
+ *
+ * The approved v2 grammar is that subset plus the ONE initialization map
+ * described above (HLS-V2-ADAPTIVE-VOD-EXPANSION-001 §15–§17). Everything else
+ * the v1 subset refused is still refused: byte ranges — including a
+ * `BYTERANGE` attribute on the map itself — discontinuities, keys, live and
+ * event shapes, master constructs, subtitles and every unknown tag.
  */
 
 // ── Input bounds (§7, §17) ───────────────────────────────────────────────────
@@ -89,8 +111,10 @@ export const HLS_V1_MAX_FRAGMENT_REFERENCE_BYTES = 2048;
  *   #EXTM3U               the mandatory first line; proves the document is a
  *                         playlist at all
  *   #EXT-X-VERSION        bounded sanity only; the transport never branches on
- *                         the value, because every version-gated feature (byte
- *                         ranges, initialization maps, fMP4) is already refused
+ *                         the value. v1 could say every version-gated feature
+ *                         was refused outright; v2 admits the initialization
+ *                         map on its own closed terms (see `HLS_V2_ALLOWED_TAGS`)
+ *                         and still does not consult the version to do so
  *   #EXT-X-TARGETDURATION RFC-required in a media playlist; its presence is
  *                         part of what distinguishes one from a master playlist
  *   #EXT-X-MEDIA-SEQUENCE structural validation only, and NOT retained: the
@@ -113,7 +137,27 @@ export const HLS_V1_ALLOWED_TAGS = Object.freeze([
   "#EXT-X-ENDLIST",
 ] as const);
 
-const ALLOWED_TAGS = new Set<string>(HLS_V1_ALLOWED_TAGS);
+/**
+ * The ONLY tags the v2 grammar admits: the v1 vocabulary above, unchanged, plus
+ * exactly one more.
+ *
+ *   #EXT-X-MAP            the fMP4 initialization map, admitted ONLY as
+ *                         `#EXT-X-MAP:URI="<reference>"` — one quoted URI and
+ *                         no other attribute — at most once, and before the
+ *                         first fragment, so exactly one map applies to every
+ *                         fragment. A `BYTERANGE` attribute is refused as a byte
+ *                         range; any other attribute, an unquoted or empty URI,
+ *                         a second map, or a map after a fragment has begun is
+ *                         refused as well. The reference is held to the SAME
+ *                         grammar and bound as a fragment reference.
+ *
+ * `HLS_V1_ALLOWED_TAGS` stays exported, unchanged, as the historical v1 subset:
+ * the accepted HLS-08/HLS-09 acceptance fixtures are checked against it, and an
+ * MPEG-TS playlist still uses nothing outside it.
+ */
+export const HLS_V2_ALLOWED_TAGS = Object.freeze([...HLS_V1_ALLOWED_TAGS, "#EXT-X-MAP"] as const);
+
+const ALLOWED_TAGS = new Set<string>(HLS_V2_ALLOWED_TAGS);
 
 /**
  * Tags that get their OWN rejection reason instead of the generic unknown-tag
@@ -132,10 +176,12 @@ const EXPLICITLY_REFUSED_TAGS = new Map<string, ClearHlsPlaylistRejection>([
   // No key URI is ever parsed, retained, resolved, fetched or exposed.
   ["#EXT-X-KEY", "encrypted"],
   ["#EXT-X-SESSION-KEY", "encrypted"],
-  // §12 — an initialization map means fMP4, not the TS concatenation v1 does.
-  ["#EXT-X-MAP", "initialization_map"],
+  // §12 — v1 refused `#EXT-X-MAP` here, because an initialization map means
+  // fMP4. HLS v2 admits it through the allowlist instead, on the closed terms
+  // `readInitializationMap` enforces; it is deliberately NOT listed here.
+  //
   // §13 — byte ranges would require Range request semantics. The transport is
-  // ordinary whole-response streaming only.
+  // ordinary whole-response streaming only, in v2 as in v1.
   ["#EXT-X-BYTERANGE", "byte_range"],
   // §14 — a discontinuity means more than one concatenation program. v1
   // produces exactly one muxed TS stream.
@@ -170,7 +216,9 @@ export type ClearHlsPlaylistRejection =
   | "missing_extm3u"
   | "master_playlist"
   | "encrypted"
-  | "initialization_map"
+  | "malformed_initialization_map"
+  | "initialization_map_position"
+  | "initialization_map_reference_too_long"
   | "byte_range"
   | "discontinuity"
   | "live_or_event"
@@ -207,7 +255,9 @@ const REJECTION_MESSAGES: Record<ClearHlsPlaylistRejection, string> = {
   missing_extm3u: "playlist does not begin with the required header line",
   master_playlist: "document is a master playlist, not a media playlist",
   encrypted: "playlist declares encryption",
-  initialization_map: "playlist declares an initialization map",
+  malformed_initialization_map: "playlist declares an unsupported initialization map",
+  initialization_map_position: "playlist declares its initialization map after a fragment",
+  initialization_map_reference_too_long: "playlist has an overlong initialization map reference",
   byte_range: "playlist declares a byte range",
   discontinuity: "playlist declares a discontinuity",
   live_or_event: "playlist is not a finite VOD playlist",
@@ -263,21 +313,43 @@ export type ClearHlsFragmentReference = {
 };
 
 /**
- * The closed v1 acquisition model.
+ * The closed acquisition model: one member per approved segment family.
  *
  * Intentionally tiny. No raw manifest text, no tag map, no key material, no
  * arbitrary metadata, no selector strings — nothing that would let a later
  * stage re-interpret the manifest instead of using what was approved here.
  *
- * `segmentType` is a private literal, not an upstream value: v1 accepts exactly
- * one segment type, and writing it down keeps the downstream `-f mpegts` remux
- * honest about what it is being handed.
+ * `segmentType` is a private literal, not an upstream value, and it is the
+ * discriminant: it keeps each downstream stage honest about which explicit
+ * demuxer it is handing the bytes to.
+ *
+ *   mpegts  the v1 model, EXACTLY as before: its own key set is unchanged.
+ *   fmp4    the same, plus `initializationMap` — the ONE map reference, as
+ *           original text, in the same wrapper a fragment reference uses. No
+ *           map attribute other than its URI survives, because none is
+ *           admitted.
+ *
+ * There is no optional member and no member that may be absent: an fMP4 plan
+ * without its map, or an MPEG-TS plan carrying one, cannot be spelled.
  */
-export type ClearHlsMediaPlaylist = {
+export type ClearHlsMpegTsMediaPlaylist = {
   readonly segmentType: "mpegts";
   readonly fragments: readonly ClearHlsFragmentReference[];
   readonly fragmentCount: number;
 };
+
+export type ClearHlsFmp4MediaPlaylist = {
+  readonly segmentType: "fmp4";
+  readonly initializationMap: ClearHlsFragmentReference;
+  readonly fragments: readonly ClearHlsFragmentReference[];
+  readonly fragmentCount: number;
+};
+
+export type ClearHlsMediaPlaylist = ClearHlsMpegTsMediaPlaylist | ClearHlsFmp4MediaPlaylist;
+
+/** The closed set of segment families a media playlist may declare. */
+export const CLEAR_HLS_SEGMENT_TYPES = Object.freeze(["mpegts", "fmp4"] as const);
+export type ClearHlsSegmentType = (typeof CLEAR_HLS_SEGMENT_TYPES)[number];
 
 // ── Lexical grammar (§8, §17, §19, §20) ──────────────────────────────────────
 
@@ -414,13 +486,80 @@ function validateFragmentReference(line: string): void {
   if (!FRAGMENT_REFERENCE_PATTERN.test(line)) refuse("invalid_fragment_reference");
 }
 
+/**
+ * One attribute of an `#EXT-X-MAP` attribute list: an RFC 8216 §4.2
+ * AttributeName, `=`, and either a quoted-string or an unquoted run.
+ *
+ * The unquoted alternative exists only so that every syntactically ordinary
+ * attribute is TOKENISED and then refused by name; it is never accepted as a
+ * URI. A quoted-string may contain commas, so it is consumed whole before the
+ * separator is looked for.
+ */
+const MAP_ATTRIBUTE_PATTERN = /^([A-Z0-9-]+)=("[^"]*"|[^",]*)/;
+
+/**
+ * Read an `#EXT-X-MAP` value under the closed v2 grammar and return the ONE
+ * reference it names, as original text.
+ *
+ *   - the attribute list must tokenise cleanly: `NAME=VALUE` pairs separated by
+ *     single commas, no leading, trailing or doubled comma, no repeated name;
+ *   - a `BYTERANGE` attribute anywhere is refused as `byte_range` — a partial
+ *     initialization resource would need Range requests, which this transport
+ *     never sends;
+ *   - `URI` is the only other name admitted, and it must be present;
+ *   - its value must be a quoted string, and the text between the quotes is
+ *     held to exactly the fragment-reference grammar and byte bound.
+ *
+ * Nothing about the value is interpolated into a refusal, and no attribute
+ * other than the URI survives.
+ */
+function readInitializationMap(value: string | null): string {
+  if (value === null || value.length === 0) refuse("malformed_initialization_map");
+
+  const attributes = new Map<string, string>();
+  let rest = value;
+  for (;;) {
+    const match = rest.match(MAP_ATTRIBUTE_PATTERN);
+    if (match === null) refuse("malformed_initialization_map");
+    const [whole, name, raw] = match as unknown as [string, string, string];
+    if (attributes.has(name)) refuse("malformed_initialization_map");
+    attributes.set(name, raw);
+    rest = rest.slice(whole.length);
+    if (rest.length === 0) break;
+    if (!rest.startsWith(",")) refuse("malformed_initialization_map");
+    rest = rest.slice(1);
+    if (rest.length === 0) refuse("malformed_initialization_map");
+  }
+
+  if (attributes.has("BYTERANGE")) refuse("byte_range");
+  for (const name of attributes.keys()) {
+    if (name !== "URI") refuse("malformed_initialization_map");
+  }
+
+  const raw = attributes.get("URI");
+  if (raw === undefined) refuse("malformed_initialization_map");
+  if (raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) {
+    refuse("malformed_initialization_map");
+  }
+  const reference = raw.slice(1, -1);
+  if (reference.length === 0) refuse("malformed_initialization_map");
+  if (reference !== reference.trim()) refuse("malformed_initialization_map");
+  if (utf8Bytes(reference) > HLS_V1_MAX_FRAGMENT_REFERENCE_BYTES) {
+    refuse("initialization_map_reference_too_long");
+  }
+  if (!FRAGMENT_REFERENCE_PATTERN.test(reference)) refuse("malformed_initialization_map");
+  return reference;
+}
+
 // ── The parser (§6) ──────────────────────────────────────────────────────────
 
 /**
- * Read one media-playlist document into the closed v1 model.
+ * Read one media-playlist document into the closed model: `mpegts` for a
+ * playlist inside the v1 subset, `fmp4` for one that adds the single approved
+ * initialization map.
  *
  * Pure and synchronous. Throws `ClearHlsPlaylistError` for anything outside the
- * approved subset, and never echoes any part of the input in doing so.
+ * approved grammar, and never echoes any part of the input in doing so.
  */
 export function parseClearHlsMediaPlaylist(input: string): ClearHlsMediaPlaylist {
   // A runtime guard even though the parameter is typed: HLS-2 will hand this an
@@ -453,6 +592,7 @@ export function parseClearHlsMediaPlaylist(input: string): ClearHlsMediaPlaylist
   let sawTargetDuration = false;
   let sawEndList = false;
   let pendingExtinf = false;
+  let initializationMap: string | null = null;
 
   for (let index = 1; index < lines.length; index += 1) {
     const line = lines[index] ?? "";
@@ -519,6 +659,14 @@ export function parseClearHlsMediaPlaylist(input: string): ClearHlsMediaPlaylist
           if (pendingExtinf) refuse("extinf_without_fragment");
           sawEndList = true;
           break;
+        case "#EXT-X-MAP":
+          // HLS v2 §16: ONE map, applying to EVERY fragment. A repeat was
+          // already refused by the duplicate guard above; a map that arrives
+          // once a fragment's declaration has begun would leave that fragment
+          // with no map, or with a different one, so it is refused here.
+          if (pendingExtinf || fragments.length > 0) refuse("initialization_map_position");
+          initializationMap = readInitializationMap(value);
+          break;
         default:
           refuse("unknown_tag");
       }
@@ -538,10 +686,20 @@ export function parseClearHlsMediaPlaylist(input: string): ClearHlsMediaPlaylist
   if (!sawEndList) refuse("missing_endlist");
   if (fragments.length === 0) refuse("no_fragments");
 
-  // §23 — the plan, its fragment collection and every entry are frozen, so a
-  // later stage cannot edit the approved set between approval and acquisition.
+  // §23 — the plan, its fragment collection, the map reference and every entry
+  // are frozen, so a later stage cannot edit the approved set between approval
+  // and acquisition.
+  if (initializationMap === null) {
+    // Byte-for-byte the v1 model: no initialization map, no new key.
+    return Object.freeze({
+      segmentType: "mpegts",
+      fragments: Object.freeze(fragments),
+      fragmentCount: fragments.length,
+    });
+  }
   return Object.freeze({
-    segmentType: "mpegts",
+    segmentType: "fmp4",
+    initializationMap: Object.freeze({ reference: initializationMap }),
     fragments: Object.freeze(fragments),
     fragmentCount: fragments.length,
   });

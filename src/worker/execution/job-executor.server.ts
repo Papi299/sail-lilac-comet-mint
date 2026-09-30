@@ -27,9 +27,9 @@ import {
   type GenericSplitExecutionPlan,
 } from "./format-plan.ts";
 import {
-  acquireSelectedClearHlsTs,
-  processAcquiredClearHlsTs,
-  type ClearHlsAcquiredTs,
+  acquireSelectedClearHlsMedia,
+  processAcquiredClearHlsMedia,
+  type ClearHlsAcquiredMedia,
   type ClearHlsAcquisitionProgress,
   type ClearHlsProcessedMp4,
 } from "../hls/hls-execution.server.ts";
@@ -142,7 +142,9 @@ export type DownloadGenericSplitFn = (
 /**
  * HLS-6: acquires the ONE clear-HLS rendition a `clear-hls-remux` plan names —
  * HLS-2's bounded playlist preflight, then HLS-3's sequential fragment
- * transport into one local MPEG-TS aggregate.
+ * transport into one local aggregate: MPEG-TS, or (HLS v2) an fMP4
+ * initialization map followed by its fragments. The family is whatever the
+ * fresh playlist declared; the plan does not carry it.
  *
  * Typed on the HLS plan partition, the exact complement of the two yt-dlp
  * seams above, so none of the three can be asked to do another's job.
@@ -164,10 +166,11 @@ export type AcquireClearHlsFn = (
     signal: AbortSignal;
     onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
   },
-) => Promise<ClearHlsAcquiredTs>;
+) => Promise<ClearHlsAcquiredMedia>;
 
 /**
- * HLS-6: the clear-HLS MPEG-TS → MP4 stream-copy remux, dependency-injected for
+ * HLS-6: the clear-HLS → MP4 stream-copy remux (MPEG-TS, or fMP4 since HLS v2),
+ * dependency-injected for
  * the same reason as `LocalProcessingFn` — so an acceptance test can observe the
  * durable job status at the exact moment HLS-4 would be invoked.
  *
@@ -178,7 +181,7 @@ export type AcquireClearHlsFn = (
  * convention rather than a type.
  */
 export type ProcessClearHlsFn = (opts: {
-  source: ClearHlsAcquiredTs;
+  source: ClearHlsAcquiredMedia;
   workDir: string;
   timeoutMs: number;
   maxOutputBytes: number;
@@ -262,12 +265,12 @@ type AcquiredExecutionMedia =
       readonly sources: GenericSplitSourcesDownload;
     }
   /**
-   * HLS-6: one acquired clear-HLS MPEG-TS aggregate, bound to the plan it was
-   * acquired for — deliberately its OWN member rather than an
-   * `OriginalDownloadResult`.
+   * HLS-6: one acquired clear-HLS aggregate — MPEG-TS, or since HLS v2 an fMP4
+   * initialization map + fragments — bound to the plan it was acquired for,
+   * and deliberately its OWN member rather than an `OriginalDownloadResult`.
    *
    * `OriginalDownloadResult` represents a DELIVERABLE source: a container and a
-   * MIME the upload lifecycle may act on. An MPEG-TS aggregate is neither. It is
+   * MIME the upload lifecycle may act on. An acquired aggregate is neither. It is
    * an intermediate that only becomes deliverable media once HLS-4 has remuxed
    * it, so flattening it into that type — which would mean giving it
    * `container: "mp4"` and `mime: "video/mp4"` before a single frame had been
@@ -278,7 +281,7 @@ type AcquiredExecutionMedia =
   | {
       readonly kind: "clear-hls";
       readonly plan: ClearHlsExecutionPlan;
-      readonly source: ClearHlsAcquiredTs;
+      readonly source: ClearHlsAcquiredMedia;
     };
 
 export type JobExecutorDeps = {
@@ -439,13 +442,13 @@ export class JobExecutor {
     this.acquireClearHls =
       deps.acquireClearHls ??
       ((plan, workDir, ctx) =>
-        acquireSelectedClearHlsTs({
+        acquireSelectedClearHlsMedia({
           plan,
           workDir,
           signal: ctx.signal,
           ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
         }));
-    this.processClearHls = deps.processClearHls ?? ((opts) => processAcquiredClearHlsTs(opts));
+    this.processClearHls = deps.processClearHls ?? ((opts) => processAcquiredClearHlsMedia(opts));
     // HLS-6 §24: the ordinary Product planner, and nothing else, by default.
     this.derivePlanForExecution = deps.derivePlanForExecution ?? deriveExecutionPlan;
     this.availableWorkDirBytes = deps.availableWorkDirBytes ?? availableBytesOnWorkDirFilesystem;
@@ -745,7 +748,7 @@ export class JobExecutor {
     if (generic.operation === "clear-hls-remux") {
       const report = this.makeProgressReporter(jobId);
       let acquisitionLive = true;
-      let source: ClearHlsAcquiredTs;
+      let source: ClearHlsAcquiredMedia;
       try {
         source = await this.acquireClearHls(generic, workDir, {
           signal,
@@ -756,7 +759,7 @@ export class JobExecutor {
       } finally {
         acquisitionLive = false;
       }
-      return { kind: "clear-hls", plan: generic, source: assertAcquiredClearHlsTs(source) };
+      return { kind: "clear-hls", plan: generic, source: assertAcquiredClearHlsMedia(source) };
     }
 
     if (generic.operation !== "merge-split") {
@@ -913,7 +916,7 @@ export class JobExecutor {
    */
   private async executeClearHlsPlan(
     plan: ClearHlsExecutionPlan,
-    source: ClearHlsAcquiredTs,
+    source: ClearHlsAcquiredMedia,
     workDir: string,
     signal: AbortSignal,
   ): Promise<string> {
@@ -927,7 +930,7 @@ export class JobExecutor {
 
     // The delivered artifact must be the remux's OWN output. Read through
     // `unknown` rather than trusted by type: this is a module boundary, and an
-    // injected or alternate implementation handing the MPEG-TS aggregate back
+    // injected or alternate implementation handing the acquired aggregate back
     // as if it had been processed is exactly the failure this refuses.
     const container: unknown = (produced as { container?: unknown } | null)?.container;
     if (container !== plan.targetContainer) throw new AppError("PROCESSING_FAILED");
@@ -1108,7 +1111,7 @@ function assertSingleOriginal(raw: OriginalDownloadResult): OriginalDownloadResu
 
 /**
  * HLS-6: the executor's own proof that clear-HLS acquisition handed back what
- * an MPEG-TS aggregate must be.
+ * an acquired aggregate must be — an MPEG-TS one, or since HLS v2 an fMP4 one.
  *
  * HLS-3 already guarantees every property below, and HLS-4 re-validates the
  * same artifact far more strictly before it goes anywhere near a subprocess.
@@ -1120,14 +1123,16 @@ function assertSingleOriginal(raw: OriginalDownloadResult): OriginalDownloadResu
  * validation is defence in depth precisely because it re-reads what acquisition
  * committed; handing it a reconstruction here would quietly remove that.
  */
-function assertAcquiredClearHlsTs(raw: ClearHlsAcquiredTs): ClearHlsAcquiredTs {
+function assertAcquiredClearHlsMedia(raw: ClearHlsAcquiredMedia): ClearHlsAcquiredMedia {
   const candidate = raw as { filePath?: unknown; segmentType?: unknown; fileSize?: unknown } | null;
   if (typeof candidate !== "object" || candidate === null) {
     throw new AppError("PROCESSING_FAILED");
   }
-  // An MPEG-TS aggregate, stated as such. Anything else must never be allowed
-  // to continue as if it were one.
-  if (candidate.segmentType !== "mpegts") throw new AppError("PROCESSING_FAILED");
+  // An aggregate of one of the two approved families, stated as such.
+  // Anything else must never be allowed to continue as if it were one.
+  if (candidate.segmentType !== "mpegts" && candidate.segmentType !== "fmp4") {
+    throw new AppError("PROCESSING_FAILED");
+  }
   if (typeof candidate.filePath !== "string" || candidate.filePath.length === 0) {
     throw new AppError("PROCESSING_FAILED");
   }

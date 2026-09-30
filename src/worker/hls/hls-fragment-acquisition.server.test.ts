@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { getEventListeners } from "node:events";
-import { chmodSync, existsSync, readFileSync, readdirSync, statSync, truncateSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import type { IncomingHttpHeaders } from "node:http";
 import { tmpdir } from "node:os";
@@ -25,12 +33,16 @@ import {
   HLS_V1_MAX_FRAGMENT_URL_BYTES,
   preflightClearHlsMediaPlaylist,
   type ClearHlsAcquisitionPlan,
+  type ClearHlsFmp4AcquisitionPlan,
+  type ClearHlsMpegTsAcquisitionPlan,
 } from "./hls-preflight.server.ts";
 import {
   ClearHlsAcquisitionError,
   HLS_V1_MAX_AGGREGATE_BYTES,
   HLS_V1_MAX_FRAGMENT_BYTES,
   HLS_V1_MAX_FRAGMENT_REDIRECTS,
+  FMP4_AGGREGATE_FILE_NAME,
+  acquireClearHlsFmp4,
   acquireClearHlsTs,
   hlsV1EffectiveAggregateLimitBytes,
   setClearHlsFinalizationBarrierForTests,
@@ -108,7 +120,7 @@ function workDirEntries(): string[] {
 // ── Fixture construction ─────────────────────────────────────────────────────
 
 /** A plan shaped exactly the way HLS-2 freezes one. */
-function planOf(urls: readonly string[]): ClearHlsAcquisitionPlan {
+function planOf(urls: readonly string[]): ClearHlsMpegTsAcquisitionPlan {
   return Object.freeze({
     segmentType: "mpegts" as const,
     fragments: Object.freeze(urls.map((url) => Object.freeze({ url }))),
@@ -344,7 +356,9 @@ function acquire(
   opts: AcquireOptions = {},
 ): Promise<ClearHlsAcquiredTs> {
   return acquireClearHlsTs({
-    plan,
+    // Typed on the whole union so forged and real HLS-2 plans reach the
+    // runtime gate; the MPEG-TS entry point refuses every other family there.
+    plan: plan as ClearHlsMpegTsAcquisitionPlan,
     workDir: opts.workDir ?? workDir,
     signal: opts.signal ?? new AbortController().signal,
     timeoutMs: opts.timeoutMs ?? HARNESS_BUDGET_MS,
@@ -575,6 +589,276 @@ describe("clear-HLS acquisition: one aggregate TS artifact, byte for byte", () =
     const result = await acquire(plan);
     assert.deepEqual(readFileSync(result.filePath), Buffer.concat([a, b]));
   });
+});
+
+// ── HLS v2: the fMP4 initialization map, then the fragments ─────────────────
+
+const INIT = "https://origin.example/media/init.mp4";
+const FMP4_NAME = "hls-source.fmp4";
+const FMP4_PARTIAL_NAME = "hls-source.fmp4.part";
+
+function fmp4PlanOf(initUrl: string, urls: readonly string[]): ClearHlsFmp4AcquisitionPlan {
+  return Object.freeze({
+    segmentType: "fmp4" as const,
+    initializationMap: Object.freeze({ url: initUrl }),
+    fragments: Object.freeze(urls.map((url) => Object.freeze({ url }))),
+    fragmentCount: urls.length,
+  });
+}
+
+function acquireFmp4(plan: unknown, opts: AcquireOptions = {}) {
+  return acquireClearHlsFmp4({
+    // Typed loosely so forged plans reach the runtime gate.
+    plan: plan as ClearHlsFmp4AcquisitionPlan,
+    workDir: opts.workDir ?? workDir,
+    signal: opts.signal ?? new AbortController().signal,
+    timeoutMs: opts.timeoutMs ?? HARNESS_BUDGET_MS,
+    onProgress: opts.onProgress,
+  });
+}
+
+describe("HLS v2 fMP4 acquisition: the map first, then every fragment, into ONE file", () => {
+  it("names the fMP4 aggregate distinctly from the MPEG-TS one", () => {
+    assert.equal(FMP4_AGGREGATE_FILE_NAME, FMP4_NAME);
+    assert.notEqual(FMP4_AGGREGATE_FILE_NAME, AGGREGATE_NAME);
+  });
+
+  it("writes the initialization map, then the fragments, byte for byte", async () => {
+    const init = payload("I", 40);
+    const a = payload("A", 64);
+    const b = payload("B", 96);
+    const net = fakeNetwork({ [INIT]: serve(init), [F1]: serve(a), [F2]: serve(b) });
+    const result = await acquireFmp4(fmp4PlanOf(INIT, [F1, F2]));
+    assert.equal(result.segmentType, "fmp4");
+    assert.equal(result.filePath, join(workDir, FMP4_NAME));
+    assert.equal(result.fileSize, init.length + a.length + b.length);
+    assert.deepEqual(readFileSync(result.filePath), Buffer.concat([init, a, b]));
+    assert.deepEqual(Object.keys(result).sort(), ["filePath", "fileSize", "segmentType"]);
+    assert.ok(Object.isFrozen(result));
+    assert.deepEqual(net.requests.map((r) => r.url), [INIT, F1, F2], "the map strictly first");
+    assert.deepEqual(workDirEntries(), [FMP4_NAME], "only the final fMP4 artifact remains");
+  });
+
+  it("fetches the map through the same fixed safe-HTTP profile, once, one body at a time", async () => {
+    const net = fakeNetwork({ [INIT]: serve(payload("I", 8)), [F1]: serve(payload("A", 8)) });
+    await acquireFmp4(fmp4PlanOf(INIT, [F1]));
+    for (const request of net.requests) {
+      assert.equal(request.method, "GET");
+      assert.deepEqual(request.headers, FIXED_PROFILE);
+    }
+    assert.deepEqual(net.lookups, ["origin.example", "origin.example"], "request-time DNS for the map too");
+    assert.equal(net.peakLiveBodies(), 1);
+  });
+
+  it("does not request fragment 1 while the map's body is incomplete", async () => {
+    const init = manualBody();
+    const net = fakeNetwork({ [INIT]: { status: 200, body: init.stream }, [F1]: serve(payload("A", 8)) });
+    const pending = acquireFmp4(fmp4PlanOf(INIT, [F1]));
+    await waitFor(() => net.requests.length === 1, "the map request");
+    init.push(payload("I", 8));
+    await settle();
+    assert.equal(net.requests.length, 1, "no fragment may start mid-map");
+    init.end();
+    await pending;
+    assert.deepEqual(net.requests.map((r) => r.url), [INIT, F1]);
+  });
+
+  it("consumes a real HLS-2 fMP4 plan end to end", async () => {
+    const playlistUrl = "https://origin.example/media/index.m3u8";
+    const init = payload("I", 24);
+    const a = payload("A", 64);
+    const document = [
+      "#EXTM3U",
+      "#EXT-X-VERSION:7",
+      "#EXT-X-TARGETDURATION:2",
+      "#EXT-X-PLAYLIST-TYPE:VOD",
+      '#EXT-X-MAP:URI="init.mp4"',
+      "#EXTINF:2.0,",
+      "seg1.ts",
+      "#EXT-X-ENDLIST",
+      "",
+    ].join("\n");
+    fakeNetwork({ [playlistUrl]: serve(Buffer.from(document, "utf8")), [INIT]: serve(init), [F1]: serve(a) });
+    const plan = await preflightClearHlsMediaPlaylist({ playlistUrl, signal: new AbortController().signal });
+    assert.ok(plan.segmentType === "fmp4");
+    const result = await acquireFmp4(plan);
+    assert.deepEqual(readFileSync(result.filePath), Buffer.concat([init, a]));
+  });
+
+  it("reports 0 before the map and advances only on media fragments, bytes including the map", async () => {
+    fakeNetwork({
+      [INIT]: serve(payload("I", 5)),
+      [F1]: serve(payload("A", 10)),
+      [F2]: serve(payload("B", 20)),
+    });
+    const seen: ClearHlsAcquisitionProgress[] = [];
+    await acquireFmp4(fmp4PlanOf(INIT, [F1, F2]), { onProgress: (p) => seen.push(p) });
+    assert.deepEqual(
+      seen.map((p) => [p.progress, p.downloadedBytes]),
+      [
+        [0, 0],
+        [50, 15],
+        [100, 35],
+      ],
+    );
+  });
+});
+
+describe("HLS v2 fMP4 acquisition: the map is media, bounded like any fragment", () => {
+  it("counts the map's actual bytes against the aggregate limit", async () => {
+    const init = payload("I", 100);
+    const a = payload("A", 100);
+    await withConfig({ maxFileSize: 200 }, async () => {
+      fakeNetwork({ [INIT]: serve(init), [F1]: serve(a) });
+      assert.equal((await acquireFmp4(fmp4PlanOf(INIT, [F1]))).fileSize, 200);
+    });
+    await rm(join(workDir, FMP4_NAME));
+    await withConfig({ maxFileSize: 199 }, async () => {
+      const net = fakeNetwork({ [INIT]: serve(init), [F1]: serve(a) });
+      await refusedWith(acquireFmp4(fmp4PlanOf(INIT, [F1])), "aggregate_too_large");
+      assert.deepEqual(net.requests.map((r) => r.url), [INIT, F1]);
+      noArtifacts();
+    });
+  });
+
+  it("refuses a map that alone passes the aggregate limit, before any fragment", async () => {
+    await withConfig({ maxFileSize: 64 }, async () => {
+      const net = fakeNetwork({ [INIT]: serve(payload("I", 65)), [F1]: serve(payload("A", 1)) });
+      await refusedWith(acquireFmp4(fmp4PlanOf(INIT, [F1])), "aggregate_too_large");
+      assert.deepEqual(net.requests.map((r) => r.url), [INIT], "no fragment after a refused map");
+      noArtifacts();
+    });
+  });
+
+  it("holds the map to the per-resource ceiling, declared or streamed", async () => {
+    const net = fakeNetwork({
+      [INIT]: { status: 200, headers: { "content-length": String(HLS_V1_MAX_FRAGMENT_BYTES + 1) }, body: bodyOf(payload("I", 8)).stream },
+      [F1]: serve(payload("A", 8)),
+    });
+    await refusedWith(acquireFmp4(fmp4PlanOf(INIT, [F1])), "fragment_too_large");
+    assert.deepEqual(net.requests.map((r) => r.url), [INIT]);
+    noArtifacts();
+  });
+
+  for (const [label, served, reason] of [
+    ["an HTTP 404", { status: 404 }, "fragment_http_status"],
+    ["an HTTP 206", { status: 206, body: bodyOf(payload("I", 8)).stream }, "fragment_http_status"],
+    ["a gzip coding", { status: 200, headers: { "content-encoding": "gzip" }, body: bodyOf(payload("I", 8)).stream }, "fragment_encoding"],
+    ["no body", { status: 200, body: null }, "network_error"],
+  ] as const) {
+    it(`fails the whole acquisition on a map with ${label}, and never requests a fragment`, async () => {
+      const net = fakeNetwork({ [INIT]: served as Served, [F1]: serve(payload("A", 8)) });
+      await refusedWith(acquireFmp4(fmp4PlanOf(INIT, [F1])), reason);
+      assert.deepEqual(net.requests.map((r) => r.url), [INIT]);
+      noArtifacts();
+    });
+  }
+
+  it("refuses a map whose DNS answer is private, before any fragment", async () => {
+    const privateInit = "https://private-init.example/init.mp4";
+    const net = fakeNetwork(
+      { [privateInit]: serve(payload("I", 8)), [F1]: serve(payload("A", 8)) },
+      { dns: { "private-init.example": [PRIVATE] } },
+    );
+    await refusedWith(acquireFmp4(fmp4PlanOf(privateInit, [F1])), "destination_rejected");
+    assert.equal(net.requests.length, 0, "no request is built from a private answer");
+    noArtifacts();
+  });
+
+  it("refuses a map redirect to a disallowed destination", async () => {
+    const net = fakeNetwork(
+      { [INIT]: redirect("http://127.0.0.1/init.mp4"), [F1]: serve(payload("A", 8)) },
+    );
+    await refusedWith(acquireFmp4(fmp4PlanOf(INIT, [F1])), "destination_rejected");
+    assert.deepEqual(net.requests.map((r) => r.url), [INIT]);
+    noArtifacts();
+  });
+
+  it("cancels during the map's body, removing the partial and requesting no fragment", async () => {
+    const init = manualBody();
+    const net = fakeNetwork({ [INIT]: { status: 200, body: init.stream }, [F1]: serve(payload("A", 8)) });
+    const controller = new AbortController();
+    const pending = acquireFmp4(fmp4PlanOf(INIT, [F1]), { signal: controller.signal });
+    await waitFor(() => existsSync(join(workDir, FMP4_PARTIAL_NAME)), "the fMP4 partial");
+    init.push(payload("I", 8));
+    await waitFor(() => statSync(join(workDir, FMP4_PARTIAL_NAME)).size === 8, "the accepted map bytes");
+    controller.abort();
+    await refusedWith(pending, "cancelled");
+    assert.equal(init.stats.destroyed, true);
+    assert.deepEqual(net.requests.map((r) => r.url), [INIT]);
+    noArtifacts();
+  });
+
+  it("stops on the one deadline while the map never answers", async () => {
+    const net = fakeNetwork({ [INIT]: neverAnswers, [F1]: serve(payload("A", 8)) });
+    await refusedWith(acquireFmp4(fmp4PlanOf(INIT, [F1]), { timeoutMs: 40 }), "timeout");
+    assert.deepEqual(net.requests.map((r) => r.url), [INIT]);
+    noArtifacts();
+  });
+
+  it("refuses a pre-existing fMP4 artifact without touching it", async () => {
+    const existing = join(workDir, FMP4_NAME);
+    writeFileSync(existing, "PRE-EXISTING");
+    const net = fakeNetwork({ [INIT]: serve(payload("I", 8)), [F1]: serve(payload("A", 8)) });
+    await refusedWith(acquireFmp4(fmp4PlanOf(INIT, [F1])), "output_error");
+    assert.equal(net.requests.length, 0);
+    assert.equal(readFileSync(existing, "utf8"), "PRE-EXISTING");
+  });
+});
+
+describe("HLS v2 fMP4 acquisition: each family's gate refuses the other's plan", () => {
+  const ts = planOf([F1]);
+  const fmp4 = fmp4PlanOf(INIT, [F1]);
+  const forgedFmp4: ReadonlyArray<readonly [string, unknown]> = [
+    ["an MPEG-TS plan", ts],
+    ["a plan with no map", Object.freeze({ segmentType: "fmp4", fragments: fmp4.fragments, fragmentCount: 1 })],
+    ["a null map", Object.freeze({ segmentType: "fmp4", initializationMap: null, fragments: fmp4.fragments, fragmentCount: 1 })],
+    ["an unfrozen map", Object.freeze({ segmentType: "fmp4", initializationMap: { url: INIT }, fragments: fmp4.fragments, fragmentCount: 1 })],
+    [
+      "a map carrying extra fields",
+      Object.freeze({
+        segmentType: "fmp4",
+        initializationMap: Object.freeze({ url: INIT, byteRange: "0-720" }),
+        fragments: fmp4.fragments,
+        fragmentCount: 1,
+      }),
+    ],
+    ["an empty map URL", Object.freeze({ segmentType: "fmp4", initializationMap: Object.freeze({ url: "" }), fragments: fmp4.fragments, fragmentCount: 1 })],
+    [
+      "an overlong map URL",
+      Object.freeze({
+        segmentType: "fmp4",
+        initializationMap: Object.freeze({ url: `https://origin.example/${"a".repeat(HLS_V1_MAX_FRAGMENT_URL_BYTES)}` }),
+        fragments: fmp4.fragments,
+        fragmentCount: 1,
+      }),
+    ],
+    ["a plan carrying an extra field", Object.freeze({ ...fmp4, headers: { Cookie: "s=1" } })],
+    ["an unfrozen plan", { ...fmp4 }],
+    ["a count that disagrees", Object.freeze({ ...fmp4, fragmentCount: 2 })],
+    ["an empty fragment list", Object.freeze({ ...fmp4, fragments: Object.freeze([]), fragmentCount: 0 })],
+  ];
+  for (const [label, plan] of forgedFmp4) {
+    it(`the fMP4 entry point refuses ${label} before any I/O`, async () => {
+      const net = fakeNetwork({ [INIT]: serve(payload("I", 8)), [F1]: serve(payload("A", 8)) });
+      await refusedWith(acquireFmp4(plan), "invalid_plan");
+      assert.equal(net.requests.length, 0);
+      assert.equal(net.lookups.length, 0);
+      noArtifacts();
+    });
+  }
+
+  for (const [label, plan] of [
+    ["an fMP4 plan", fmp4],
+    ["an MPEG-TS-labelled plan that also carries a map", Object.freeze({ ...ts, initializationMap: Object.freeze({ url: INIT }) })],
+  ] as const) {
+    it(`the MPEG-TS entry point refuses ${label} rather than acquiring it without its map`, async () => {
+      const net = fakeNetwork({ [INIT]: serve(payload("I", 8)), [F1]: serve(payload("A", 8)) });
+      await refusedWith(acquire(plan as ClearHlsAcquisitionPlan), "invalid_plan");
+      assert.equal(net.requests.length, 0);
+      noArtifacts();
+    });
+  }
 });
 
 // ── Sequentiality and zero retries (§42, §36, §11) ───────────────────────────
@@ -2235,7 +2519,8 @@ describe("clear-HLS acquisition: inside its boundary", () => {
     const gate = code.lastIndexOf("controller.signal.throwIfAborted();");
     const disarm = code.indexOf("disarmStopSources();", gate);
     const built = code.indexOf("Object.freeze({", gate);
-    const terminal = code.indexOf("reportSafely(onProgress, plan.fragmentCount", gate);
+    // HLS v2: the count comes from the admitted snapshot, not the plan object.
+    const terminal = code.indexOf("reportSafely(onProgress, fragmentCount, aggregateBytes, fragmentCount)", gate);
     const returned = code.indexOf("return result;", gate);
     assert.ok(gate > 0, "there is a final stop gate");
     assert.ok(disarm > gate, "stop sources are disarmed at the commit point");
@@ -2279,15 +2564,18 @@ describe("clear-HLS acquisition: inside its boundary", () => {
   });
 
   it("never reports 100 from inside the transfer loop", () => {
-    const loop = code.slice(
-      code.indexOf("for (const fragment of plan.fragments)"),
-      code.indexOf("return aggregateBytes;"),
-    );
+    // HLS v2: the loop iterates the admitted snapshot's fragment URLs; the
+    // fMP4 initialization map is fetched before it and never reported.
+    const start = code.indexOf("for (const url of resources.fragmentUrls)");
+    assert.ok(start > 0, "the transfer loop is where this test expects it");
+    const loop = code.slice(start, code.indexOf("return aggregateBytes;", start));
     assert.ok(loop.includes("reportSafely(onProgress"), "the loop still reports completed fragments");
     assert.ok(
-      loop.includes("if (completed < plan.fragmentCount)"),
+      loop.includes("if (completed < fragmentCount)"),
       "the last fragment's report is withheld for finalization",
     );
+    const map = code.slice(code.indexOf("if (resources.initializationUrl !== null)"), start);
+    assert.equal(map.includes("reportSafely("), false, "the initialization map is not a fragment for progress");
   });
 
   it("arms exactly one deadline for the whole acquisition", () => {

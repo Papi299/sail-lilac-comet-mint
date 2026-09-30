@@ -779,7 +779,21 @@ describe("clear-HLS preflight: HLS-1 is the semantic authority (§20)", () => {
       "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nhttps://variants.example/v.m3u8\n",
       "master_playlist",
     ],
-    ["an initialization map", playlist(["a.ts"], { extra: ['#EXT-X-MAP:URI="init.mp4"'] }), "initialization_map"],
+    [
+      "a byte-range initialization map (HLS v2 keeps it refused)",
+      playlist(["a.m4s"], { extra: ['#EXT-X-MAP:URI="init.mp4",BYTERANGE="720@0"'] }),
+      "byte_range",
+    ],
+    [
+      "an initialization map with an attribute outside the v2 grammar",
+      playlist(["a.m4s"], { extra: ['#EXT-X-MAP:URI="init.mp4",IV=0x1'] }),
+      "malformed_initialization_map",
+    ],
+    [
+      "a second initialization map",
+      playlist(["a.m4s"], { extra: ['#EXT-X-MAP:URI="init.mp4"', '#EXT-X-MAP:URI="init2.mp4"'] }),
+      "duplicate_tag",
+    ],
     ["an empty body", "", "empty"],
   ];
   for (const [label, source, rejection] of cases) {
@@ -853,6 +867,114 @@ describe("clear-HLS preflight: every fragment URL passes the static policy (§23
     const references = Array.from({ length: 1000 }, (_, i) => `s${i}.ts`);
     fakeNetwork({ [base]: serve(playlist(references)) });
     await refusedWith(preflight(base), "fragment_url_invalid");
+  });
+});
+
+// ── HLS v2: the fMP4 initialization map (§16, §29) ───────────────────────────
+
+describe("clear-HLS preflight: an fMP4 playlist becomes an fmp4 plan", () => {
+  const fmp4 = (references: readonly string[], map = "init.mp4", extra: readonly string[] = []) =>
+    playlist(references, { extra: [...extra, `#EXT-X-MAP:URI="${map}"`] });
+
+  it("resolves the map and every fragment into the closed fmp4 plan", async () => {
+    const net = fakeNetwork({ [PLAYLIST_URL]: serve(fmp4(["seg-0.m4s", "seg-1.m4s"])) });
+    const plan = await preflight();
+    assert.ok(plan.segmentType === "fmp4");
+    assert.equal(plan.initializationMap.url, "https://origin.example/media/init.mp4");
+    assert.deepEqual(urls(plan), [
+      "https://origin.example/media/seg-0.m4s",
+      "https://origin.example/media/seg-1.m4s",
+    ]);
+    assert.equal(plan.fragmentCount, 2);
+    assert.deepEqual(Object.keys(plan).sort(), ["fragmentCount", "fragments", "initializationMap", "segmentType"]);
+    assert.deepEqual(Object.keys(plan.initializationMap), ["url"]);
+    // The map is NOT fetched here: HLS-3 fetches it, through the same safe path.
+    assert.deepEqual(net.requests.map((r) => r.url), [PLAYLIST_URL]);
+    assert.deepEqual(net.lookups, ["origin.example"]);
+  });
+
+  it("resolves the map against the FINAL redirected URL, never the requested one", async () => {
+    const final = "https://cdn.example/final/dir/index.m3u8";
+    fakeNetwork({
+      [PLAYLIST_URL]: redirect(final),
+      [final]: serve(fmp4(["seg-0.m4s"], "../init/init.mp4")),
+    });
+    const plan = await preflight();
+    assert.ok(plan.segmentType === "fmp4");
+    assert.equal(plan.initializationMap.url, "https://cdn.example/final/init/init.mp4");
+    assert.deepEqual(urls(plan), ["https://cdn.example/final/dir/seg-0.m4s"]);
+  });
+
+  it("carries a signed map query exactly as written", async () => {
+    const signed = "init.mp4?Expires=1758240000&Signature=abc~def_-&Key-Pair-Id=K123";
+    fakeNetwork({ [PLAYLIST_URL]: serve(fmp4(["seg-0.m4s"], signed)) });
+    const plan = await preflight();
+    assert.ok(plan.segmentType === "fmp4");
+    assert.equal(plan.initializationMap.url, `https://origin.example/media/${signed}`);
+  });
+
+  it("freezes the plan, the map entry, the fragments and every entry", async () => {
+    fakeNetwork({ [PLAYLIST_URL]: serve(fmp4(["seg-0.m4s", "seg-1.m4s"])) });
+    const plan = await preflight();
+    assert.ok(plan.segmentType === "fmp4");
+    assert.ok(Object.isFrozen(plan));
+    assert.ok(Object.isFrozen(plan.initializationMap));
+    assert.ok(Object.isFrozen(plan.fragments));
+    for (const fragment of plan.fragments) assert.ok(Object.isFrozen(fragment));
+    try {
+      (plan.initializationMap as { url: string }).url = "http://127.0.0.1/rewritten.mp4";
+    } catch {
+      // Strict mode throws; what matters is the value afterwards.
+    }
+    assert.equal(plan.initializationMap.url, "https://origin.example/media/init.mp4");
+  });
+
+  const unacceptableMaps: readonly (readonly [string, string])[] = [
+    ["loopback IPv4", "http://127.0.0.1/init.mp4"],
+    ["private IPv4", "http://10.1.2.3/init.mp4"],
+    ["link-local IPv6", "http://[fe80::1]/init.mp4"],
+    ["localhost", "http://localhost/init.mp4"],
+    [".internal", "http://svc.internal/init.mp4"],
+    ["a username and password", "https://user:pass@cdn.example/init.mp4"],
+    ["file:", "file:///etc/passwd"],
+    ["data:", "data:video/mp4;base64,AAAA"],
+    ["sample:", "sample:init"],
+  ];
+  for (const [label, bad] of unacceptableMaps) {
+    it(`refuses the WHOLE plan when the map is ${label}, before resolving fragments`, async () => {
+      const net = fakeNetwork({ [PLAYLIST_URL]: serve(fmp4(["seg-0.m4s", "seg-1.m4s"], bad)) });
+      const err = await refusedWith(preflight(), "initialization_map_url_invalid");
+      assert.equal(err.playlistRejection, null);
+      leaksNothing(err, bad, "init.mp4");
+      assert.deepEqual(net.requests.map((r) => r.url), [PLAYLIST_URL]);
+    });
+  }
+
+  it("refuses a resolved map URL one byte over HLS_V1_MAX_FRAGMENT_URL_BYTES", async () => {
+    const directory = `https://origin.example/${"d".repeat(2500)}/`;
+    const map = `${"a".repeat(HLS_V1_MAX_FRAGMENT_URL_BYTES - directory.length - 3)}.mp4`;
+    const base = `${directory}index.m3u8`;
+    assert.equal(Buffer.byteLength(`${directory}${map}`, "utf8"), HLS_V1_MAX_FRAGMENT_URL_BYTES + 1);
+    fakeNetwork({ [base]: serve(fmp4(["ok.m4s"], map)) });
+    await refusedWith(preflight(base), "initialization_map_url_invalid");
+  });
+
+  it("still refuses an unacceptable fragment in an otherwise valid fMP4 plan", async () => {
+    fakeNetwork({ [PLAYLIST_URL]: serve(fmp4(["seg-0.m4s", "http://127.0.0.1/seg-1.m4s"])) });
+    await refusedWith(preflight(), "fragment_url_invalid");
+  });
+
+  it("maps every v2 rejection through the HLS-1 reason, never fetching the map", async () => {
+    for (const [source, rejection] of [
+      [fmp4(["a.m4s"], "init.mp4", ["#EXT-X-DISCONTINUITY"]), "discontinuity"],
+      [fmp4(["a.m4s"], "init.mp4", ['#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://k"']), "encrypted"],
+      [fmp4(["a.m4s"], "init.mp4", ["#EXT-X-PLAYLIST-TYPE:EVENT"]), "live_or_event"],
+    ] as const) {
+      const net = fakeNetwork({ [PLAYLIST_URL]: serve(source) });
+      const err = await refusedWith(preflight(), "playlist_rejected");
+      assert.equal(err.playlistRejection, rejection);
+      assert.deepEqual(net.requests.map((r) => r.url), [PLAYLIST_URL]);
+    }
   });
 });
 

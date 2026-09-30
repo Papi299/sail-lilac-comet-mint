@@ -13,19 +13,43 @@ import { runProcess } from "@/services/processing/process-runner.server";
 import type { WorkspaceFootprint } from "../execution/workspace-capacity.ts";
 import {
   AGGREGATE_FILE_NAME as HLS_ACQUIRED_TS_FILE_NAME,
+  FMP4_AGGREGATE_FILE_NAME as HLS_ACQUIRED_FMP4_FILE_NAME,
+  type ClearHlsAcquiredFmp4,
+  type ClearHlsAcquiredMedia,
   type ClearHlsAcquiredTs,
 } from "./hls-fragment-acquisition.server.ts";
 
+/** The closed family vocabulary, read off HLS-3's own artifact union. */
+type ClearHlsSegmentType = ClearHlsAcquiredMedia["segmentType"];
+
 /**
- * Worker-owned CLEAR-HLS v1 LOCAL PROCESSING (HLS-4).
+ * Worker-owned CLEAR-HLS LOCAL PROCESSING (HLS-4, widened by HLS v2).
  *
  * ─── What this module is ────────────────────────────────────────────────────
  *
- * The component that turns the raw MPEG-TS artifact HLS-3 acquired into a
- * validated MP4, by STREAM COPY only. It validates the input before anything
- * is spawned, probes it with an explicit MPEG-TS demuxer, remuxes it with one
- * fixed FFmpeg command, and then proves the produced MP4 is what it claims to
- * be — independently of FFmpeg's exit status.
+ * The component that turns the raw artifact HLS-3 acquired into a validated
+ * MP4, by STREAM COPY only. It validates the input before anything is spawned,
+ * probes it with an explicit demuxer for its declared family, remuxes it with
+ * one fixed FFmpeg command, and then proves the produced MP4 is what it claims
+ * to be — independently of FFmpeg's exit status.
+ *
+ * ─── Two entry points, one processing core ──────────────────────────────────
+ *
+ *   `processClearHlsTsToMp4()`    an MPEG-TS aggregate (`hls-source.ts`),
+ *                                 probed and demuxed as `mpegts`. The v1 path,
+ *                                 exactly as before.
+ *   `processClearHlsFmp4ToMp4()`  an fMP4 aggregate (`hls-source.fmp4`, HLS v2)
+ *                                 — initialization segment + media fragments —
+ *                                 probed as ISO-BMFF and demuxed with the SAME
+ *                                 explicit `mov` demuxer the split merge uses.
+ *
+ * Everything else is shared and identical: the input authority, the exactly
+ * one-video + one-audio shape on both sides, the explicit stream maps, stream
+ * copy with no encoder named anywhere, the output ceiling, the finalization
+ * barrier and the commit point. HLS v2 was admitted only after the pinned
+ * FFmpeg 5.1.9 stream-copied a real init + CMAF-fragment concatenation into a
+ * faststart MP4 with every video and audio packet byte-identical; a source that
+ * cannot be copied that way fails, and is never re-encoded.
  *
  * ─── What this module is NOT ────────────────────────────────────────────────
  *
@@ -91,8 +115,8 @@ export type ClearHlsProcessedMp4 = {
  * `timeoutMs` is the ONE budget for the whole primitive. `maxOutputBytes` is
  * the Product delivered-media ceiling this call must respect.
  */
-export type ClearHlsProcessingRequest = {
-  readonly source: ClearHlsAcquiredTs;
+export type ClearHlsProcessingRequest<A = ClearHlsAcquiredTs> = {
+  readonly source: A;
   readonly workDir: string;
   readonly timeoutMs: number;
   readonly maxOutputBytes: number;
@@ -144,16 +168,34 @@ export const HLS_V1_MP4_STREAM_SHAPE = Object.freeze({
   audio: 1,
 } as const);
 
+/**
+ * The ONLY fMP4 input shape HLS v2 will process: an ISO-BMFF file carrying
+ * exactly one video and exactly one audio stream.
+ *
+ * The same rule as the MPEG-TS one, for the same reason. HLS v2 still delivers
+ * only a SELF-CONTAINED muxed rendition: separate HLS audio pairing was not
+ * admitted (pinned yt-dlp exposes no video→audio group relationship), so a
+ * video-only or audio-only fMP4 rendition is refused here rather than
+ * delivered silent or pictureless.
+ */
+export const HLS_V2_FMP4_STREAM_SHAPE = Object.freeze({
+  family: "iso-bmff",
+  video: 1,
+  audio: 1,
+} as const);
+
 // ── Workspace footprint ──────────────────────────────────────────────────────
 
 /**
  * What HLS v1 processing costs the media workspace, in units of the Product
  * `maxFileSizeBytes` ceiling.
  *
- * During a successful remux the acquired MPEG-TS and the produced MP4 coexist:
- * HLS-3 bounds the source at the Product ceiling and this module bounds the
- * output at the same ceiling, so the peak is `2 ×` — 8,589,934,592 bytes at the
- * 4 GiB default. That is the same footprint `convert`, `extract-*` and
+ * During a successful remux the acquired aggregate and the produced MP4
+ * coexist: HLS-3 bounds the source at the Product ceiling and this module
+ * bounds the output at the same ceiling, so the peak is `2 ×` — 8,589,934,592
+ * bytes at the 4 GiB default. HLS v2 does not change this: an fMP4 aggregate
+ * is ONE file whose initialization map is counted inside the same actual-byte
+ * bound, so it is still `<= max`, and the output is still `<= max`. That is the same footprint `convert`, `extract-*` and
  * `merge-split` already have, which is why `STARTUP_WORKSPACE_FOOTPRINT` is
  * already sufficient for it.
  *
@@ -232,8 +274,15 @@ export type ValidatedClearHlsAcquiredTs = {
   readonly fileSize: number;
 };
 
-/** The three fields HLS-3's frozen result carries, and the only three. */
-const ACQUIRED_TS_FIELDS = ["filePath", "segmentType", "fileSize"] as const;
+/** The fMP4 counterpart (HLS v2), on exactly the same terms. */
+export type ValidatedClearHlsAcquiredFmp4 = {
+  readonly filePath: string;
+  readonly segmentType: "fmp4";
+  readonly fileSize: number;
+};
+
+/** The three fields HLS-3's frozen result carries, for either family, and the only three. */
+const ACQUIRED_ARTIFACT_FIELDS = ["filePath", "segmentType", "fileSize"] as const;
 
 /**
  * PARSE an acquired artifact into a validated snapshot, or refuse it.
@@ -284,15 +333,32 @@ const ACQUIRED_TS_FIELDS = ["filePath", "segmentType", "fileSize"] as const;
  * snapshot is frozen so the caller cannot mutate what it validated either.
  */
 export function parseAcquiredTsArtifact(value: unknown): ValidatedClearHlsAcquiredTs | null {
+  return parseAcquiredArtifact(value, "mpegts");
+}
+
+/**
+ * PARSE an acquired fMP4 artifact (HLS v2) into a validated snapshot, or refuse
+ * it — the SAME rules as `parseAcquiredTsArtifact`, requiring `segmentType`
+ * `fmp4` instead. An MPEG-TS artifact is refused here, and an fMP4 one there.
+ */
+export function parseAcquiredFmp4Artifact(value: unknown): ValidatedClearHlsAcquiredFmp4 | null {
+  return parseAcquiredArtifact(value, "fmp4");
+}
+
+/** The one implementation behind both parsers, for one required family. */
+function parseAcquiredArtifact<S extends ClearHlsSegmentType>(
+  value: unknown,
+  requiredSegmentType: S,
+): { readonly filePath: string; readonly segmentType: S; readonly fileSize: number } | null {
   if (typeof value !== "object" || value === null) return null;
   if (!Object.isFrozen(value)) return null;
   if (Object.getPrototypeOf(value) !== Object.prototype) return null;
 
   // The COMPLETE own-property set: strings and symbols, enumerable or not.
-  if (Reflect.ownKeys(value).length !== ACQUIRED_TS_FIELDS.length) return null;
+  if (Reflect.ownKeys(value).length !== ACQUIRED_ARTIFACT_FIELDS.length) return null;
 
   const captured: Record<string, unknown> = {};
-  for (const field of ACQUIRED_TS_FIELDS) {
+  for (const field of ACQUIRED_ARTIFACT_FIELDS) {
     // An OWN descriptor, so an inherited value can never stand in for one.
     const descriptor = Object.getOwnPropertyDescriptor(value, field);
     if (descriptor === undefined) return null;
@@ -306,12 +372,12 @@ export function parseAcquiredTsArtifact(value: unknown): ValidatedClearHlsAcquir
   // members, so the set is exactly these three fields.
 
   const { filePath, segmentType, fileSize } = captured;
-  if (segmentType !== "mpegts") return null;
+  if (segmentType !== requiredSegmentType) return null;
   if (typeof filePath !== "string" || filePath.length === 0) return null;
   if (typeof fileSize !== "number") return null;
   if (!Number.isSafeInteger(fileSize) || fileSize <= 0) return null;
 
-  return Object.freeze({ filePath, segmentType: "mpegts" as const, fileSize });
+  return Object.freeze({ filePath, segmentType: requiredSegmentType, fileSize });
 }
 
 // ── Filesystem helpers ───────────────────────────────────────────────────────
@@ -382,6 +448,35 @@ export function buildClearHlsRemuxArgs(opts: {
   sourcePath: string;
   outputPath: string;
 }): string[] {
+  return remuxArgs("mpegts", opts);
+}
+
+/**
+ * The exact fMP4 remux argv (HLS v2): `buildClearHlsRemuxArgs`, token for
+ * token, with the ONE input demuxer changed from `mpegts` to `mov` — the same
+ * explicit ISO-BMFF demuxer, with the same per-input `-protocol_whitelist file`,
+ * that the split merge already uses for its MP4 inputs.
+ *
+ * No option is added for fMP4. Verified against the pinned FFmpeg 5.1.9 on a
+ * real 1920x1080 H.264 + AAC init + three-fragment concatenation whose fragments
+ * each carry `styp`, `sidx` and `moof`/`mdat` boxes: this exact argv exited 0 and
+ * produced a faststart `ftyp moov free mdat` MP4 of one video and one audio
+ * stream, with every video and every audio packet byte-identical to the input's.
+ * The pinned `mov` demuxer's `enable_drefs` is off by default, so an external
+ * data reference inside a crafted input is not followed either.
+ */
+export function buildClearHlsFmp4RemuxArgs(opts: {
+  sourcePath: string;
+  outputPath: string;
+}): string[] {
+  return remuxArgs("mov", opts);
+}
+
+/** The one argv both families share; only the explicit input demuxer differs. */
+function remuxArgs(
+  demuxer: "mpegts" | "mov",
+  opts: { sourcePath: string; outputPath: string },
+): string[] {
   return [
     // NEVER overwrite. The primitive refuses an existing output entry before
     // spawning; `-n` makes FFmpeg refuse one that appeared between that check
@@ -407,9 +502,10 @@ export function buildClearHlsRemuxArgs(opts: {
     // Explicit demuxer. The input is NEVER auto-detected: a `.ts` suffix is not
     // evidence of anything, and letting FFmpeg probe an attacker-shaped local
     // file into some unrelated demuxer is exactly the hazard this avoids.
-    // Verified in the pinned runtime: `-f mpegts` on a real MP4 exits 1.
+    // Verified in the pinned runtime: `-f mpegts` on a real MP4 exits 1, and
+    // `-f mov` on a real MPEG-TS exits 1 ("moov atom not found").
     "-f",
-    "mpegts",
+    demuxer,
     "-i",
     opts.sourcePath,
 
@@ -499,23 +595,80 @@ function stopFailure(cause: StopCause): AppError {
     : new AppError("PROCESSING_FAILED", "Download was cancelled.");
 }
 
+// ── The two families ─────────────────────────────────────────────────────────
+
+/**
+ * Everything that differs between the two families, and nothing else: the
+ * artifact parser (which fixes the required `segmentType`), the HLS-3 file name
+ * that is the only acceptable source, the approved source shape (whose family
+ * chooses the explicit probe demuxer) and the remux argv builder.
+ */
+type ProcessingFamily = {
+  readonly parse: (
+    value: unknown,
+  ) => { readonly filePath: string; readonly segmentType: ClearHlsSegmentType; readonly fileSize: number } | null;
+  readonly sourceFileName: string;
+  readonly sourceShape: typeof HLS_V1_TS_STREAM_SHAPE | typeof HLS_V2_FMP4_STREAM_SHAPE;
+  readonly buildArgs: (opts: { sourcePath: string; outputPath: string }) => string[];
+};
+
+const MPEGTS_PROCESSING: ProcessingFamily = Object.freeze({
+  parse: parseAcquiredTsArtifact,
+  sourceFileName: HLS_ACQUIRED_TS_FILE_NAME,
+  sourceShape: HLS_V1_TS_STREAM_SHAPE,
+  buildArgs: buildClearHlsRemuxArgs,
+});
+
+const FMP4_PROCESSING: ProcessingFamily = Object.freeze({
+  parse: parseAcquiredFmp4Artifact,
+  sourceFileName: HLS_ACQUIRED_FMP4_FILE_NAME,
+  sourceShape: HLS_V2_FMP4_STREAM_SHAPE,
+  buildArgs: buildClearHlsFmp4RemuxArgs,
+});
+
 // ── The processing primitive ─────────────────────────────────────────────────
 
 /**
  * Validate one acquired MPEG-TS artifact and remux it, by stream copy, into a
- * validated MP4 inside the same job work directory.
+ * validated MP4 inside the same job work directory. The v1 entry point,
+ * unchanged in behaviour; it refuses an fMP4 artifact before any I/O. See
+ * `processAggregateToMp4` for the lifecycle.
+ */
+export async function processClearHlsTsToMp4(
+  request: ClearHlsProcessingRequest<ClearHlsAcquiredTs>,
+): Promise<ClearHlsProcessedMp4> {
+  return processAggregateToMp4(request, MPEGTS_PROCESSING);
+}
+
+/**
+ * Validate one acquired fMP4 artifact (HLS v2) — initialization segment plus
+ * media fragments — and remux it, by stream copy, into a validated MP4 inside
+ * the same job work directory. It refuses an MPEG-TS artifact before any I/O.
+ * See `processAggregateToMp4` for the lifecycle, which is the MPEG-TS one with
+ * the ISO-BMFF demuxer.
+ */
+export async function processClearHlsFmp4ToMp4(
+  request: ClearHlsProcessingRequest<ClearHlsAcquiredFmp4>,
+): Promise<ClearHlsProcessedMp4> {
+  return processAggregateToMp4(request, FMP4_PROCESSING);
+}
+
+/**
+ * Validate one acquired aggregate of the given family and remux it, by stream
+ * copy, into a validated MP4 inside the same job work directory.
  *
  * Lifecycle:
  *
  *    1. validate the request bounds, and PARSE the supplied artifact into a
- *       validated snapshot, before ANY I/O — past that point the caller's
- *       object is never read again;
+ *       validated snapshot of THIS family, before ANY I/O — past that point the
+ *       caller's object is never read again;
  *    2. resolve the real work directory and prove the source is a contained,
- *       regular, non-symlink file at the FIXED HLS-3 artifact location;
+ *       regular, non-symlink file at the family's FIXED HLS-3 artifact
+ *       location;
  *    3. prove the on-disk size equals the artifact's declared `fileSize`;
  *    4. require both output names to be free;
- *    5. probe the source through an explicit MPEG-TS demuxer and require the
- *       approved one-video + one-audio shape;
+ *    5. probe the source through the family's explicit demuxer (`mpegts`, or
+ *       `mov` for fMP4) and require the approved one-video + one-audio shape;
  *    6. stream-copy it to the partial output with one fixed FFmpeg command;
  *    7. validate the produced partial: contained, regular, non-empty, within
  *       the Product ceiling, and an ISO-BMFF file of the approved shape;
@@ -546,8 +699,9 @@ function stopFailure(cause: StopCause): AppError {
  * path, upstream URL, hostname, source title, codec text, signal reason or
  * subprocess diagnostic in them.
  */
-export async function processClearHlsTsToMp4(
-  request: ClearHlsProcessingRequest,
+async function processAggregateToMp4(
+  request: ClearHlsProcessingRequest<unknown>,
+  family: ProcessingFamily,
 ): Promise<ClearHlsProcessedMp4> {
   // Destructuring is itself a snapshot: every request field is read exactly
   // once here and only the locals are used afterwards.
@@ -565,7 +719,7 @@ export async function processClearHlsTsToMp4(
   // THE PARSING BOUNDARY. `request.source` is read exactly once, right here,
   // and every later mention of `source` is this module's own validated
   // snapshot. The supplied object is never consulted again.
-  const source = parseAcquiredTsArtifact(request.source);
+  const source = family.parse(request.source);
   if (source === null) throw new AppError("PROCESSING_FAILED");
 
   const deadlineMs = monotonicNowMs() + timeoutMs;
@@ -654,7 +808,7 @@ export async function processClearHlsTsToMp4(
     // produced, and processing it would mean remuxing media this pipeline never
     // acquired. The expected location is the shared HLS-3 constant joined onto
     // the real work directory.
-    const expectedSourcePath = join(workDirReal, HLS_ACQUIRED_TS_FILE_NAME);
+    const expectedSourcePath = join(workDirReal, family.sourceFileName);
     if (sourcePath !== expectedSourcePath) throw new AppError("PROCESSING_FAILED");
 
     // ── 3. The declared size must be the real size ─────────────────────────
@@ -683,11 +837,11 @@ export async function processClearHlsTsToMp4(
     const sourceProbe = await probeLocalMedia({
       inputPath: sourcePath,
       workDir: workDirReal,
-      family: HLS_V1_TS_STREAM_SHAPE.family,
+      family: family.sourceShape.family,
       timeoutMs: stageBudgetMs(),
       signal: controller.signal,
     });
-    if (!hasExactStreamShape(sourceProbe, HLS_V1_TS_STREAM_SHAPE)) {
+    if (!hasExactStreamShape(sourceProbe, family.sourceShape)) {
       throw new AppError("PROCESSING_FAILED");
     }
 
@@ -701,7 +855,7 @@ export async function processClearHlsTsToMp4(
     owned = partialPath;
     const remux = await runProcess({
       command: config.ffmpegPath,
-      args: buildClearHlsRemuxArgs({ sourcePath, outputPath: partialPath }),
+      args: family.buildArgs({ sourcePath, outputPath: partialPath }),
       timeoutMs: budget,
       cwd: workDirReal,
       signal: controller.signal,

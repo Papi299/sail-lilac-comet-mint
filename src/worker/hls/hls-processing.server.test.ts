@@ -34,15 +34,19 @@ import {
   requiredWorkspaceBytes,
   workspaceFootprintForPlan,
 } from "../execution/workspace-capacity.ts";
-import { AGGREGATE_FILE_NAME } from "./hls-fragment-acquisition.server.ts";
+import { AGGREGATE_FILE_NAME, FMP4_AGGREGATE_FILE_NAME } from "./hls-fragment-acquisition.server.ts";
 import {
   HLS_OUTPUT_FILE_NAME,
   HLS_OUTPUT_PARTIAL_FILE_NAME,
   HLS_V1_MP4_STREAM_SHAPE,
   HLS_V1_PROCESSING_WORKSPACE_FOOTPRINT,
   HLS_V1_TS_STREAM_SHAPE,
+  HLS_V2_FMP4_STREAM_SHAPE,
+  buildClearHlsFmp4RemuxArgs,
   buildClearHlsRemuxArgs,
+  parseAcquiredFmp4Artifact,
   parseAcquiredTsArtifact,
+  processClearHlsFmp4ToMp4,
   processClearHlsTsToMp4,
   remainingBudgetMs,
   setClearHlsProcessingBarrierForTests,
@@ -1046,6 +1050,175 @@ describe("HLS-4 remux argv: fixed, stream-copy only, no network, no overwrite", 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// C2. HLS v2: THE fMP4 FAMILY (§18, §25, §27)
+// ─────────────────────────────────────────────────────────────────────────────
+
+type Fmp4Artifact = { readonly filePath: string; readonly segmentType: "fmp4"; readonly fileSize: number };
+
+function fmp4SourcePath(): string {
+  return join(workDir, FMP4_AGGREGATE_FILE_NAME);
+}
+
+async function writeFmp4Source(bytes = 4096): Promise<Fmp4Artifact> {
+  const path = fmp4SourcePath();
+  await writeFile(path, Buffer.alloc(bytes, 0x66));
+  return Object.freeze({ filePath: path, segmentType: "fmp4" as const, fileSize: bytes });
+}
+
+async function runFmp4(overrides: RunOverrides = {}): Promise<ClearHlsProcessedMp4> {
+  const source = "source" in overrides ? overrides.source : await writeFmp4Source();
+  return processClearHlsFmp4ToMp4({
+    source: source as Fmp4Artifact,
+    workDir: overrides.workDir ?? workDir,
+    timeoutMs: overrides.timeoutMs ?? 5_000,
+    maxOutputBytes: overrides.maxOutputBytes ?? 1_000_000,
+    signal: overrides.signal ?? controller.signal,
+  });
+}
+
+/**
+ * The fMP4 happy path. The pinned ISO-BMFF captures ARE the fMP4 captures: the
+ * pinned ffprobe's output for a real init + fragment concatenation, through
+ * the product's exact probe argv, is byte-identical to them (see
+ * `testdata/README.md`).
+ */
+async function happyFmp4Script(): Promise<Step[]> {
+  return [
+    { kind: "probe", stdout: await pinned("iso-bmff-merged") },
+    { kind: "ffmpeg" },
+    { kind: "probe", stdout: await pinned("iso-bmff-merged") },
+    { kind: "probe", stdout: await pinned("iso-bmff-merged") },
+  ];
+}
+
+describe("HLS v2 fMP4 processing: the same primitive, the ISO-BMFF demuxer", () => {
+  const SOURCE = "/jobs/abc/hls-source.fmp4";
+  const OUTPUT = "/jobs/abc/hls-output.mp4.part";
+
+  it("builds the v1 argv token for token, with ONLY the input demuxer changed to mov", () => {
+    const ts = buildClearHlsRemuxArgs({ sourcePath: SOURCE, outputPath: OUTPUT });
+    const fmp4 = buildClearHlsFmp4RemuxArgs({ sourcePath: SOURCE, outputPath: OUTPUT });
+    assert.equal(fmp4.length, ts.length);
+    const differing = fmp4.flatMap((arg, i) => (arg === ts[i] ? [] : [i]));
+    assert.equal(differing.length, 1, "exactly one token differs");
+    const at = differing[0]!;
+    assert.equal(ts[at], "mpegts");
+    assert.equal(fmp4[at], "mov");
+    assert.equal(fmp4[at - 1], "-f");
+    assert.equal(fmp4[at + 1], "-i", "the demuxer applies to the one input");
+    assert.equal(fmp4.filter((arg) => arg === "copy").length, 2, "stream copy, both streams");
+    assert.equal(fmp4.includes("-y"), false);
+  });
+
+  it("pins the approved fMP4 input shape as exactly one video and one audio ISO-BMFF stream", () => {
+    assert.deepEqual({ ...HLS_V2_FMP4_STREAM_SHAPE }, { family: "iso-bmff", video: 1, audio: 1 });
+    assert.ok(Object.isFrozen(HLS_V2_FMP4_STREAM_SHAPE));
+  });
+
+  it("remuxes an approved fMP4 aggregate into a validated MP4 at the fixed name", async () => {
+    const { calls } = harness([
+      { kind: "probe", stdout: await pinned("iso-bmff-merged") },
+      { kind: "ffmpeg", write: async (path) => { await writeFile(path, Buffer.alloc(7_777, 5)); } },
+      { kind: "probe", stdout: await pinned("iso-bmff-merged") },
+      { kind: "probe", stdout: await pinned("iso-bmff-merged") },
+    ]);
+    const result = await runFmp4({ source: await writeFmp4Source(4_096) });
+    assert.deepEqual({ ...result }, { filePath: outputPath(), container: "mp4", fileSize: 7_777 });
+    assert.ok(Object.isFrozen(result));
+    assert.deepEqual(calls.map((call) => call.command), [FFPROBE, config.ffmpegPath, FFPROBE, FFPROBE]);
+
+    // The source probe names the ISO-BMFF demuxer explicitly, file-only.
+    const probe = calls[0]!.args;
+    assert.equal(probe[probe.indexOf("-f") + 1], "mov");
+    assert.equal(probe[probe.indexOf("-protocol_whitelist") + 1], "file");
+    assert.equal(probe[probe.length - 1], join(workDirReal, FMP4_AGGREGATE_FILE_NAME));
+    // The remux is exactly the fMP4 argv over the fixed source and partial.
+    assert.deepEqual(
+      calls[1]!.args,
+      buildClearHlsFmp4RemuxArgs({ sourcePath: join(workDirReal, FMP4_AGGREGATE_FILE_NAME), outputPath: partialPath() }),
+    );
+    assert.equal(calls[1]!.options.shell, false);
+    assert.deepEqual(workDirEntries(), [FMP4_AGGREGATE_FILE_NAME, HLS_OUTPUT_FILE_NAME].sort());
+  });
+
+  it("refuses every fMP4 input shape except exactly one video and one audio", async () => {
+    for (const [label, stdout] of [
+      ["video-only", await pinned("iso-bmff-video-only")],
+      ["audio-only", await pinned("iso-bmff-audio-only")],
+      ["two video + one audio", doc(ISO, ["video", "video", "audio"])],
+      ["one video + two audio", doc(ISO, ["video", "audio", "audio"])],
+      ["an extra subtitle", doc(ISO, ["video", "audio", "subtitle"])],
+      ["an MPEG-TS family", doc(MPEGTS, ["video", "audio"])],
+      ["a WebM family", doc(WEBM, ["video", "audio"])],
+    ] as const) {
+      const { calls } = harness([{ kind: "probe", stdout }]);
+      await rejectsWith("PROCESSING_FAILED", () => runFmp4(), label);
+      assert.equal(calls.length, 1, `${label}: nothing past the source probe`);
+      assert.deepEqual(workDirEntries(), [FMP4_AGGREGATE_FILE_NAME], `${label}: no partial`);
+    }
+  });
+
+  it("refuses a video-only fMP4 rendition before any FFmpeg run (no silent delivery)", async () => {
+    const { calls } = harness([{ kind: "probe", stdout: await pinned("iso-bmff-video-only") }]);
+    await rejectsWith("PROCESSING_FAILED", () => runFmp4());
+    assert.equal(calls.length, 1, "only the source probe ran");
+    assert.deepEqual(workDirEntries(), [FMP4_AGGREGATE_FILE_NAME], "no partial was created");
+  });
+
+  it("each family's entry point refuses the other family's artifact before any I/O", async () => {
+    const { calls } = harness(await happyFmp4Script());
+    const fmp4 = await writeFmp4Source();
+    await rejectsWith("PROCESSING_FAILED", () => run({ source: fmp4 }), "TS entry, fMP4 artifact");
+    const ts = await writeSource();
+    await rejectsWith("PROCESSING_FAILED", () => runFmp4({ source: ts }), "fMP4 entry, TS artifact");
+    assert.equal(calls.length, 0, "no subprocess for a family mismatch");
+    assert.equal(parseAcquiredFmp4Artifact(ts), null);
+    assert.equal(parseAcquiredTsArtifact(fmp4), null);
+    assert.deepEqual({ ...parseAcquiredFmp4Artifact(fmp4)! }, { ...fmp4 });
+  });
+
+  it("refuses an fMP4 artifact that does not sit at the fixed fMP4 name", async () => {
+    const { calls } = harness(await happyFmp4Script());
+    // A regular file of the right size at the MPEG-TS name, labelled fmp4.
+    await writeFile(sourcePath(), Buffer.alloc(4096, 1));
+    const forged = Object.freeze({ filePath: sourcePath(), segmentType: "fmp4" as const, fileSize: 4096 });
+    await rejectsWith("PROCESSING_FAILED", () => runFmp4({ source: forged }));
+    assert.equal(calls.length, 0);
+  });
+
+  it("removes its own partial when FFmpeg refuses to copy the fMP4 input", async () => {
+    const { calls } = harness([
+      { kind: "probe", stdout: await pinned("iso-bmff-merged") },
+      { kind: "ffmpeg", code: 1 },
+    ]);
+    await rejectsWith("PROCESSING_FAILED", () => runFmp4());
+    assert.equal(calls.length, 2);
+    assert.deepEqual(workDirEntries(), [FMP4_AGGREGATE_FILE_NAME], "the source stays; the partial is gone");
+  });
+
+  it("holds the produced MP4 to the Product ceiling, measured from disk", async () => {
+    harness([
+      { kind: "probe", stdout: await pinned("iso-bmff-merged") },
+      { kind: "ffmpeg", write: async (path) => { await writeFile(path, Buffer.alloc(1_001, 5)); } },
+    ]);
+    await rejectsWith("TOO_LARGE", () => runFmp4({ maxOutputBytes: 1_000 }));
+    assert.deepEqual(workDirEntries(), [FMP4_AGGREGATE_FILE_NAME]);
+  });
+
+  it("stops a cancellation that lands while FFmpeg is running on an fMP4 input", async () => {
+    const { calls } = harness([
+      { kind: "probe", stdout: await pinned("iso-bmff-merged") },
+      { kind: "hang" },
+    ], (index) => {
+      if (index === 1) setImmediate(() => controller.abort());
+    });
+    await rejectsWith("PROCESSING_FAILED", () => runFmp4());
+    assert.equal(calls.length, 2);
+    assert.deepEqual(workDirEntries(), [FMP4_AGGREGATE_FILE_NAME]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // D. NO-CLOBBER (§13)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1806,8 +1979,15 @@ describe("HLS-4 processing: inside its boundary", () => {
       1,
       "the supplied artifact object is referenced exactly once",
     );
-    assert.ok(code.includes("const source = parseAcquiredTsArtifact(request.source);"));
-    assert.equal(code.split("parseAcquiredTsArtifact(").length - 1, 2, "declared, and called once");
+    // HLS v2: the ONE read goes through the family's parser, and each family's
+    // parser is exactly the named one, sharing ONE implementation.
+    assert.ok(code.includes("const source = family.parse(request.source);"));
+    assert.ok(code.includes("parse: parseAcquiredTsArtifact,"));
+    assert.ok(code.includes("parse: parseAcquiredFmp4Artifact,"));
+    assert.equal(code.split("parseAcquiredTsArtifact(").length - 1, 1, "declared, and never called directly");
+    assert.equal(code.split("parseAcquiredFmp4Artifact(").length - 1, 1, "declared, and never called directly");
+    assert.ok(code.includes('return parseAcquiredArtifact(value, "mpegts");'));
+    assert.ok(code.includes('return parseAcquiredArtifact(value, "fmp4");'));
     // No re-read of the original through any other spelling.
     for (const forbidden of [
       "request.source.",
@@ -1819,7 +1999,7 @@ describe("HLS-4 processing: inside its boundary", () => {
     }
     // The parser itself reads each field through an own DATA descriptor and
     // counts the COMPLETE own-property set.
-    assert.ok(code.includes("Reflect.ownKeys(value).length !== ACQUIRED_TS_FIELDS.length"));
+    assert.ok(code.includes("Reflect.ownKeys(value).length !== ACQUIRED_ARTIFACT_FIELDS.length"));
     assert.ok(code.includes("Object.getOwnPropertyDescriptor(value, field)"));
     assert.ok(code.includes('if (!("value" in descriptor)) return null;'));
     assert.ok(code.includes("Object.getPrototypeOf(value) !== Object.prototype"));

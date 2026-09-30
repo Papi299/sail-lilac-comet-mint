@@ -21,9 +21,12 @@ import type { DirectExecutionPlan, ExecutionPlan, GenericExecutionPlan } from ".
  *                         merged artifact (<= max, SPLIT-02) coexist until the
  *                         executor unwinds.
  *
- *   clear-hls-      2 × — the acquired MPEG-TS aggregate (<= max, HLS-3) and
- *   remux                 the remuxed MP4 (<= max, HLS-4) coexist until the
- *                         executor unwinds. This is the same statement HLS-4
+ *   clear-hls-      2 × — the acquired aggregate (<= max, HLS-3) and the
+ *   remux                 remuxed MP4 (<= max, HLS-4) coexist until the
+ *                         executor unwinds. The aggregate is MPEG-TS, or since
+ *                         HLS v2 one fMP4 file whose initialization map is
+ *                         counted inside the same actual-byte bound — still
+ *                         ONE input, so still 2 ×. This is the same statement HLS-4
  *                         makes as `HLS_V1_PROCESSING_WORKSPACE_FOOTPRINT`, and
  *                         a cross-invariant test pins the two together so they
  *                         cannot drift apart. HLS-4 could only state it beside

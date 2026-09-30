@@ -5,8 +5,10 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CLEAR_HLS_SEGMENT_TYPES,
   ClearHlsPlaylistError,
   HLS_V1_ALLOWED_TAGS,
+  HLS_V2_ALLOWED_TAGS,
   HLS_V1_MAX_FRAGMENTS,
   HLS_V1_MAX_FRAGMENT_REFERENCE_BYTES,
   HLS_V1_MAX_PLAYLIST_BYTES,
@@ -43,6 +45,31 @@ function validPlaylist(
   for (let i = 0; i < count; i += 1) {
     lines.push("#EXTINF:10.0,");
     lines.push(opts.references?.[i] ?? `seg${i}.ts`);
+  }
+  lines.push("#EXT-X-ENDLIST");
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * A minimal, valid, clear VOD fMP4 playlist (HLS v2): one initialization map
+ * line, then `count` fragments. `mapLine` replaces the map line verbatim, so a
+ * case can put any map spelling in the one place a map is admitted.
+ */
+function fmp4Playlist(
+  count = 2,
+  opts: { readonly mapLine?: string; readonly extra?: readonly string[]; readonly references?: readonly string[] } = {},
+): string {
+  const lines = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:7",
+    "#EXT-X-TARGETDURATION:2",
+    "#EXT-X-PLAYLIST-TYPE:VOD",
+    ...(opts.extra ?? []),
+    opts.mapLine ?? '#EXT-X-MAP:URI="init.mp4"',
+  ];
+  for (let i = 0; i < count; i += 1) {
+    lines.push("#EXTINF:2.0,");
+    lines.push(opts.references?.[i] ?? `seg-${i}.m4s`);
   }
   lines.push("#EXT-X-ENDLIST");
   return `${lines.join("\n")}\n`;
@@ -225,7 +252,7 @@ describe("clear-HLS playlist parser: the approved v1 subset", () => {
 // ── The closed vocabulary (§15) ──────────────────────────────────────────────
 
 describe("clear-HLS playlist parser: the closed tag vocabulary", () => {
-  it("permits exactly the seven approved tags", () => {
+  it("keeps the historical v1 subset at exactly the seven approved tags", () => {
     assert.deepEqual(
       [...HLS_V1_ALLOWED_TAGS],
       [
@@ -240,13 +267,19 @@ describe("clear-HLS playlist parser: the closed tag vocabulary", () => {
     );
   });
 
+  it("admits exactly one tag beyond the v1 subset in the v2 grammar: the initialization map", () => {
+    assert.deepEqual([...HLS_V2_ALLOWED_TAGS], [...HLS_V1_ALLOWED_TAGS, "#EXT-X-MAP"]);
+    assert.deepEqual([...CLEAR_HLS_SEGMENT_TYPES], ["mpegts", "fmp4"]);
+  });
+
   it("refuses every RFC 8216 tag outside the allowlist", () => {
     // Tags a general HLS reader would accept. Each must fail closed, whether it
     // carries a dedicated reason or falls to the generic one.
     const outside = [
       "#EXT-X-KEY:METHOD=AES-128,URI=\"k.bin\"",
       "#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"k.bin\"",
-      "#EXT-X-MAP:URI=\"init.mp4\"",
+      // `#EXT-X-MAP` left this list in HLS v2; its closed grammar is pinned in
+      // its own block below, including every refused spelling.
       "#EXT-X-BYTERANGE:1000@0",
       "#EXT-X-DISCONTINUITY",
       "#EXT-X-DISCONTINUITY-SEQUENCE:1",
@@ -446,15 +479,7 @@ describe("clear-HLS playlist parser: encryption is categorically refused (§11)"
   });
 });
 
-describe("clear-HLS playlist parser: non-TS and range constructs (§12–§14)", () => {
-  it("refuses an initialization map", () => {
-    const err = refusedWith(
-      validPlaylist(1, { extra: ["#EXT-X-MAP:URI=\"init-MAPSENTINEL.mp4\""] }),
-      "initialization_map",
-    );
-    leaksNothing(err, "MAPSENTINEL");
-  });
-
+describe("clear-HLS playlist parser: range and discontinuity constructs (§13–§14)", () => {
   it("refuses byte ranges", () => {
     refusedWith(validPlaylist(1, { extra: ["#EXT-X-BYTERANGE:75232@0"] }), "byte_range");
     // A byte range attaches to the fragment that follows it.
@@ -472,6 +497,201 @@ describe("clear-HLS playlist parser: non-TS and range constructs (§12–§14)",
   it("refuses discontinuities", () => {
     refusedWith(validPlaylist(1, { extra: ["#EXT-X-DISCONTINUITY"] }), "discontinuity");
     refusedWith(validPlaylist(1, { extra: ["#EXT-X-DISCONTINUITY-SEQUENCE:2"] }), "discontinuity");
+  });
+});
+
+// ── HLS v2: the fMP4 initialization map (§15–§17, §36) ───────────────────────
+
+describe("clear-HLS playlist parser: the v2 fMP4 grammar", () => {
+  it("parses a clear VOD fMP4 playlist into the fmp4 model", () => {
+    const plan = parseClearHlsMediaPlaylist(fmp4Playlist(3));
+    assert.equal(plan.segmentType, "fmp4");
+    assert.ok(plan.segmentType === "fmp4");
+    assert.equal(plan.initializationMap.reference, "init.mp4");
+    assert.equal(plan.fragmentCount, 3);
+    assert.deepEqual(
+      plan.fragments.map((f) => f.reference),
+      ["seg-0.m4s", "seg-1.m4s", "seg-2.m4s"],
+    );
+  });
+
+  it("carries exactly the four fmp4 keys, and a map entry of exactly one", () => {
+    const plan = parseClearHlsMediaPlaylist(fmp4Playlist(1));
+    assert.deepEqual(Object.keys(plan).sort(), [
+      "fragmentCount",
+      "fragments",
+      "initializationMap",
+      "segmentType",
+    ]);
+    assert.ok(plan.segmentType === "fmp4");
+    assert.deepEqual(Object.keys(plan.initializationMap), ["reference"]);
+  });
+
+  it("still parses a playlist without a map as the unchanged mpegts model", () => {
+    const plan = parseClearHlsMediaPlaylist(validPlaylist(2));
+    assert.equal(plan.segmentType, "mpegts");
+    assert.deepEqual(Object.keys(plan).sort(), ["fragmentCount", "fragments", "segmentType"]);
+    assert.equal("initializationMap" in plan, false);
+  });
+
+  it("accepts the exact FFmpeg hls-muxer fMP4 shape (version 7, map before the first EXTINF)", () => {
+    const source = [
+      "#EXTM3U",
+      "#EXT-X-VERSION:7",
+      "#EXT-X-TARGETDURATION:2",
+      "#EXT-X-MEDIA-SEQUENCE:0",
+      "#EXT-X-PLAYLIST-TYPE:VOD",
+      '#EXT-X-MAP:URI="init.mp4"',
+      "#EXTINF:2.000000,",
+      "seg-0.m4s",
+      "#EXTINF:2.000000,",
+      "seg-1.m4s",
+      "#EXT-X-ENDLIST",
+      "",
+    ].join("\n");
+    const plan = parseClearHlsMediaPlaylist(source);
+    assert.equal(plan.segmentType, "fmp4");
+    assert.equal(plan.fragmentCount, 2);
+  });
+
+  it("accepts relative, absolute and signed-looking map references verbatim", () => {
+    for (const reference of [
+      "init.mp4",
+      "../media/init.mp4",
+      "/abs/init.mp4",
+      "https://cdn.example/init.mp4",
+      "https://cdn.example/init.mp4?Expires=1758240000&Signature=abc~def_-&Key-Pair-Id=K123",
+      "init.mp4?a=1,b=2",
+    ]) {
+      const plan = parseClearHlsMediaPlaylist(fmp4Playlist(1, { mapLine: `#EXT-X-MAP:URI="${reference}"` }));
+      assert.ok(plan.segmentType === "fmp4");
+      assert.equal(plan.initializationMap.reference, reference);
+    }
+  });
+
+  it("accepts a map reference of exactly the maximum length", () => {
+    const tail = "a".repeat(HLS_V1_MAX_FRAGMENT_REFERENCE_BYTES - "https://cdn.example/".length);
+    const reference = `https://cdn.example/${tail}`;
+    assert.equal(Buffer.byteLength(reference, "utf8"), HLS_V1_MAX_FRAGMENT_REFERENCE_BYTES);
+    const plan = parseClearHlsMediaPlaylist(fmp4Playlist(1, { mapLine: `#EXT-X-MAP:URI="${reference}"` }));
+    assert.ok(plan.segmentType === "fmp4");
+    assert.equal(plan.initializationMap.reference, reference);
+  });
+
+  it("freezes the fmp4 plan, its map entry, its fragments and every entry", () => {
+    const plan = parseClearHlsMediaPlaylist(fmp4Playlist(2));
+    assert.ok(plan.segmentType === "fmp4");
+    assert.ok(Object.isFrozen(plan));
+    assert.ok(Object.isFrozen(plan.initializationMap));
+    assert.ok(Object.isFrozen(plan.fragments));
+    for (const fragment of plan.fragments) assert.ok(Object.isFrozen(fragment));
+    const mutable = plan as unknown as { initializationMap: { reference: string }; segmentType: string };
+    try {
+      mutable.initializationMap.reference = "swapped.mp4";
+    } catch {
+      // Strict mode throws; the value afterwards is what matters.
+    }
+    try {
+      mutable.segmentType = "mpegts";
+    } catch {
+      // As above.
+    }
+    assert.equal(plan.initializationMap.reference, "init.mp4");
+    assert.equal(plan.segmentType, "fmp4");
+  });
+});
+
+describe("clear-HLS playlist parser: every v2 map outside the closed grammar fails closed (§16, §17, §36)", () => {
+  it("refuses a BYTERANGE attribute on the map, wherever it sits, as a byte range", () => {
+    for (const mapLine of [
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4",BYTERANGE="720@0"',
+      '#EXT-X-MAP:BYTERANGE="720@0",URI="init-MAPSENTINEL.mp4"',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4",BYTERANGE=720@0',
+    ]) {
+      leaksNothing(refusedWith(fmp4Playlist(1, { mapLine }), "byte_range"), "MAPSENTINEL", "720@0");
+    }
+  });
+
+  it("refuses a byte-range fragment inside an fMP4 playlist", () => {
+    const source = fmp4Playlist(1).replace("#EXTINF:2.0,\nseg-0.m4s", "#EXTINF:2.0,\n#EXT-X-BYTERANGE:1000@0\nseg-0.m4s");
+    refusedWith(source, "byte_range");
+  });
+
+  it("refuses a second map, agreeing or not", () => {
+    refusedWith(
+      fmp4Playlist(1, { extra: ['#EXT-X-MAP:URI="init.mp4"'] }),
+      "duplicate_tag",
+    );
+    refusedWith(
+      fmp4Playlist(1, { extra: ['#EXT-X-MAP:URI="other.mp4"'] }),
+      "duplicate_tag",
+    );
+    // A second map between fragments is the same repeat.
+    const between = fmp4Playlist(2).replace("#EXTINF:2.0,\nseg-1.m4s", '#EXT-X-MAP:URI="init2.mp4"\n#EXTINF:2.0,\nseg-1.m4s');
+    refusedWith(between, "duplicate_tag");
+  });
+
+  it("refuses a first map that arrives once a fragment declaration has begun", () => {
+    const afterFragment = validPlaylist(2).replace("#EXTINF:10.0,\nseg1.ts", '#EXT-X-MAP:URI="init.mp4"\n#EXTINF:10.0,\nseg1.ts');
+    refusedWith(afterFragment, "initialization_map_position");
+    const insideDeclaration = validPlaylist(1).replace("#EXTINF:10.0,\nseg0.ts", '#EXTINF:10.0,\n#EXT-X-MAP:URI="init.mp4"\nseg0.ts');
+    refusedWith(insideDeclaration, "initialization_map_position");
+  });
+
+  it("refuses every malformed map spelling, without echoing it", () => {
+    for (const mapLine of [
+      "#EXT-X-MAP",
+      "#EXT-X-MAP:",
+      "#EXT-X-MAP:URI=init-MAPSENTINEL.mp4",
+      '#EXT-X-MAP:URI=""',
+      '#EXT-X-MAP:uri="init-MAPSENTINEL.mp4"',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4",',
+      '#EXT-X-MAP:,URI="init-MAPSENTINEL.mp4"',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4",,IV=0x1',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4",URI="init-MAPSENTINEL.mp4"',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4" ',
+      '#EXT-X-MAP: URI="init-MAPSENTINEL.mp4"',
+      '#EXT-X-MAP:URI = "init-MAPSENTINEL.mp4"',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4"X',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4',
+      '#EXT-X-MAP:URI="init MAPSENTINEL.mp4"',
+      '#EXT-X-MAP:URI=" init-MAPSENTINEL.mp4"',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4#frag"',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL-ü.mp4"',
+      '#EXT-X-MAP:URI="init<MAPSENTINEL>.mp4"',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4",IV=0x0123456789abcdef0123456789abcdef',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4",KEYFORMAT="identity"',
+      '#EXT-X-MAP:URI="init-MAPSENTINEL.mp4",METHOD=AES-128',
+      '#EXT-X-MAP:BANDWIDTH=1',
+    ]) {
+      const err = refusedWith(fmp4Playlist(1, { mapLine }), "malformed_initialization_map");
+      leaksNothing(err, "MAPSENTINEL", "init-");
+    }
+  });
+
+  it("refuses an overlong map reference", () => {
+    const tail = "a".repeat(HLS_V1_MAX_FRAGMENT_REFERENCE_BYTES - "https://cdn.example/".length + 1);
+    const reference = `https://cdn.example/${tail}`;
+    const err = refusedWith(
+      fmp4Playlist(1, { mapLine: `#EXT-X-MAP:URI="${reference}"` }),
+      "initialization_map_reference_too_long",
+    );
+    leaksNothing(err, tail.slice(0, 64));
+  });
+
+  it("keeps every v1 refusal in force inside an fMP4 playlist", () => {
+    refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-KEY:METHOD=AES-128,URI=\"KEYSENTINEL\""] }), "encrypted");
+    refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://KEYSENTINEL\""] }), "encrypted");
+    refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"KEYSENTINEL\""] }), "encrypted");
+    refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-DISCONTINUITY"] }), "discontinuity");
+    refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-DISCONTINUITY-SEQUENCE:1"] }), "discontinuity");
+    refusedWith(fmp4Playlist(1).replace("#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-PLAYLIST-TYPE:EVENT"), "live_or_event");
+    refusedWith(fmp4Playlist(1).replace("#EXT-X-ENDLIST\n", ""), "missing_endlist");
+    refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-INDEPENDENT-SEGMENTS"] }), "unknown_tag");
+    refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"s\",NAME=\"n\",URI=\"s.m3u8\""] }), "master_playlist");
+    refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-I-FRAMES-ONLY"] }), "unknown_tag");
+    refusedWith(`${fmp4Playlist(1)}#EXT-X-MAP:URI="late.mp4"\n`, "content_after_endlist");
+    refusedWith(fmp4Playlist(HLS_V1_MAX_FRAGMENTS + 1), "too_many_fragments");
   });
 });
 

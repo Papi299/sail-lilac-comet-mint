@@ -418,8 +418,9 @@ function refineProgressiveSingleSource(
  * merging: the two operations share a vocabulary, not a capability.
  *
  * `preset:audio` and `preset:mp3` are not members, so an HLS audio product is
- * unrepresentable rather than merely refused — HLS v1 has no audio pairing and
- * no independent HLS audio capability. `direct-original` is not a member either:
+ * unrepresentable rather than merely refused — clear HLS has no audio pairing
+ * (HLS v2 did not add one: the pinned yt-dlp exposes no video→audio rendition
+ * relationship) and no independent HLS audio capability. `direct-original` is not a member either:
  * HLS analysis advertises no concrete formats.
  */
 export const ClearHlsVideoPresetIdSchema = z.enum(GENERIC_SPLIT_VIDEO_PRESET_IDS);
@@ -428,8 +429,9 @@ export type ClearHlsVideoPresetId = z.infer<typeof ClearHlsVideoPresetIdSchema>;
 /**
  * The ONE container a clear-HLS plan can ever deliver.
  *
- * Not a caller choice and not derived from the source: HLS-4 remuxes MPEG-TS
- * into MP4 with a fixed argv that names the `mp4` muxer explicitly, so any other
+ * Not a caller choice and not derived from the source: HLS-4 remuxes MPEG-TS —
+ * or, since HLS v2, an fMP4 aggregate — into MP4 with a fixed argv that names
+ * the `mp4` muxer explicitly, so any other
  * value here would be a claim the processing primitive cannot honour.
  */
 export const CLEAR_HLS_TARGET_CONTAINER = "mp4" as const;

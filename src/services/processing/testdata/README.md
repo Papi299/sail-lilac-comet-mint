@@ -76,6 +76,30 @@ directions against the same pinned build:
 In every refusal ffprobe still prints an empty `{}` document on stdout, which
 is why `probeLocalMedia()` gates on the exit code before parsing.
 
+## fMP4 aggregates reuse the ISO-BMFF captures (HLS v2)
+
+HLS-V2-ADAPTIVE-VOD-EXPANSION-001 processes one more input: an fMP4 HLS
+aggregate, which is the initialization segment followed by every media fragment
+(`ftyp moov` then `styp sidx sidx moof mdat` per fragment, as the pinned FFmpeg
+hls muxer writes them with `-hls_segment_type fmp4`). No new file was added,
+because the pinned ffprobe's output for those aggregates, through the exact
+`buildProbeArgs()` command with `-f mov`, is **byte-identical** to the existing
+captures:
+
+| fMP4 aggregate (init + fragments) | Byte-identical to |
+| --- | --- |
+| video + audio | `pinned-ffprobe-iso-bmff-merged.json` |
+| video only | `pinned-ffprobe-iso-bmff-video-only.json` |
+| audio only | `pinned-ffprobe-iso-bmff-audio-only.json` |
+
+Captured with the same image and ffprobe as the `mpegts-*` row above, offline,
+from `testsrc`/`sine` media (320x180, 15 fps, 2 s, 1 s fragments). The same run
+re-verified the cross-family refusals for the new input: `-f mpegts` on the fMP4
+aggregate exits 1 (`End of file`), and `-f mov` on the fragments WITHOUT their
+initialization segment exits 1 (`trun track id unknown, no tfhd was found`,
+`error reading header`) — so an acquisition that skipped the map could not be
+mistaken for a valid input.
+
 ## Sanitization
 
 Nothing was removed. The capture used `-show_entries` limited to

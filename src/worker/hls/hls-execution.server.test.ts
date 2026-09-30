@@ -7,6 +7,7 @@ import { AppError, ERROR_MESSAGES } from "@/lib/errors";
 import { WORKER_ERROR_CODES } from "@/shared/worker/errors";
 import {
   ClearHlsAcquisitionError,
+  type ClearHlsAcquiredFmp4,
   type ClearHlsAcquiredTs,
   type ClearHlsAcquisitionFailure,
   type ClearHlsAcquisitionProgress,
@@ -20,9 +21,10 @@ import type { ClearHlsProcessedMp4 } from "./hls-processing.server.ts";
 import {
   CLEAR_HLS_ACQUISITION_ERROR_CODES,
   CLEAR_HLS_PREFLIGHT_ERROR_CODES,
-  acquireSelectedClearHlsTs,
-  processAcquiredClearHlsTs,
+  acquireSelectedClearHlsMedia,
+  processAcquiredClearHlsMedia,
   type ClearHlsAcquisitionPrimitives,
+  type ClearHlsProcessingPrimitives,
 } from "./hls-execution.server.ts";
 
 /**
@@ -57,6 +59,20 @@ const ARTIFACT: ClearHlsAcquiredTs = Object.freeze({
   fileSize: 4096,
 });
 
+/** HLS v2: an fMP4 plan and the artifact its primitive commits. */
+const FMP4_ACQUISITION_PLAN: ClearHlsAcquisitionPlan = Object.freeze({
+  segmentType: "fmp4",
+  initializationMap: Object.freeze({ url: "https://media.example.invalid/f/init.mp4" }),
+  fragments: Object.freeze([Object.freeze({ url: "https://media.example.invalid/f/0.m4s" })]),
+  fragmentCount: 1,
+});
+
+const FMP4_ARTIFACT: ClearHlsAcquiredFmp4 = Object.freeze({
+  filePath: "/work/job-1/hls-source.fmp4",
+  segmentType: "fmp4",
+  fileSize: 8192,
+});
+
 /**
  * Every member of HLS-2's closed refusal vocabulary, written out.
  *
@@ -77,6 +93,7 @@ const PREFLIGHT_FAILURES: readonly ClearHlsPreflightFailure[] = [
   "playlist_invalid_utf8",
   "playlist_rejected",
   "fragment_url_invalid",
+  "initialization_map_url_invalid",
 ];
 
 /** The same, for HLS-3. */
@@ -97,8 +114,18 @@ function primitives(over: Partial<ClearHlsAcquisitionPrimitives> = {}): ClearHls
   return {
     preflight: async () => ACQUISITION_PLAN,
     acquire: async () => ARTIFACT,
+    acquireFmp4: async () => FMP4_ARTIFACT,
     ...over,
   } as ClearHlsAcquisitionPrimitives;
+}
+
+/** One HLS-4 fake per family; a family the case does not expect fails loudly. */
+function processors(over: Partial<ClearHlsProcessingPrimitives>): ClearHlsProcessingPrimitives {
+  return {
+    mpegts: async () => assert.fail("the MPEG-TS processor must not run"),
+    fmp4: async () => assert.fail("the fMP4 processor must not run"),
+    ...over,
+  } as ClearHlsProcessingPrimitives;
 }
 
 function order(over: Record<string, unknown> = {}) {
@@ -107,7 +134,7 @@ function order(over: Record<string, unknown> = {}) {
     workDir: "/work/job-1",
     signal: new AbortController().signal,
     ...over,
-  } as Parameters<typeof acquireSelectedClearHlsTs>[0];
+  } as Parameters<typeof acquireSelectedClearHlsMedia>[0];
 }
 
 async function refusal(run: () => Promise<unknown>, label: string): Promise<AppError> {
@@ -128,7 +155,7 @@ describe("HLS-6 acquisition: preflight, then fragments, and nothing else", () =>
   it("hands HLS-2 exactly the plan's playlist URL and the caller's signal", async () => {
     const controller = new AbortController();
     const seen: unknown[] = [];
-    await acquireSelectedClearHlsTs(
+    await acquireSelectedClearHlsMedia(
       order({ signal: controller.signal }),
       primitives({
         preflight: async (request) => {
@@ -149,7 +176,7 @@ describe("HLS-6 acquisition: preflight, then fragments, and nothing else", () =>
   it("hands HLS-3 the EXACT plan HLS-2 produced, and this job's workDir", async () => {
     const seen: unknown[] = [];
     const controller = new AbortController();
-    await acquireSelectedClearHlsTs(
+    await acquireSelectedClearHlsMedia(
       order({ workDir: "/work/job-7", signal: controller.signal }),
       primitives({
         acquire: async (request) => {
@@ -172,7 +199,7 @@ describe("HLS-6 acquisition: preflight, then fragments, and nothing else", () =>
 
   it("passes a narrowing acquisition budget through when one is given", async () => {
     let seen: number | undefined;
-    await acquireSelectedClearHlsTs(
+    await acquireSelectedClearHlsMedia(
       order({ acquisitionTimeoutMs: 1234 }),
       primitives({
         acquire: async (request) => {
@@ -185,7 +212,7 @@ describe("HLS-6 acquisition: preflight, then fragments, and nothing else", () =>
   });
 
   it("returns the HLS-3 artifact IDENTICALLY, so HLS-4 revalidates what was committed", async () => {
-    const acquired = await acquireSelectedClearHlsTs(order(), primitives());
+    const acquired = await acquireSelectedClearHlsMedia(order(), primitives());
     assert.equal(acquired, ARTIFACT);
     assert.equal(acquired.segmentType, "mpegts");
   });
@@ -194,7 +221,7 @@ describe("HLS-6 acquisition: preflight, then fragments, and nothing else", () =>
     let acquireCalls = 0;
     await refusal(
       () =>
-        acquireSelectedClearHlsTs(
+        acquireSelectedClearHlsMedia(
           order(),
           primitives({
             preflight: async () => {
@@ -213,7 +240,7 @@ describe("HLS-6 acquisition: preflight, then fragments, and nothing else", () =>
 
   it("passes HLS-3's truthful progress through untouched", async () => {
     const reported: ClearHlsAcquisitionProgress[] = [];
-    await acquireSelectedClearHlsTs(
+    await acquireSelectedClearHlsMedia(
       order({ onProgress: (p: ClearHlsAcquisitionProgress) => reported.push(p) }),
       primitives({
         acquire: async (request) => {
@@ -243,7 +270,7 @@ describe("HLS-6 acquisition: preflight, then fragments, and nothing else", () =>
 
   it("gives HLS-3 no progress callback when the caller asked for none", async () => {
     let hadCallback: boolean | null = null;
-    await acquireSelectedClearHlsTs(
+    await acquireSelectedClearHlsMedia(
       order(),
       primitives({
         acquire: async (request) => {
@@ -254,6 +281,144 @@ describe("HLS-6 acquisition: preflight, then fragments, and nothing else", () =>
     );
     assert.equal(hadCallback, false);
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A2. HLS v2: THE FAMILY THE FRESH PLAYLIST DECLARED DECIDES THE PRIMITIVE
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("HLS v2 acquisition: one primitive per segment family, no fallback", () => {
+  it("hands an fMP4 plan, whole and unrebuilt, to the fMP4 primitive only", async () => {
+    const seen: unknown[] = [];
+    let tsCalls = 0;
+    const acquired = await acquireSelectedClearHlsMedia(
+      order({ workDir: "/work/job-9" }),
+      primitives({
+        preflight: async () => FMP4_ACQUISITION_PLAN,
+        acquire: async () => {
+          tsCalls += 1;
+          return ARTIFACT;
+        },
+        acquireFmp4: async (request) => {
+          seen.push(request);
+          return FMP4_ARTIFACT;
+        },
+      }),
+    );
+    assert.equal(tsCalls, 0, "the MPEG-TS primitive never sees an fMP4 plan");
+    assert.equal(seen.length, 1);
+    const request = seen[0] as { plan: unknown; workDir: string };
+    assert.equal(request.plan, FMP4_ACQUISITION_PLAN, "the same object, not a rebuild");
+    assert.equal(request.workDir, "/work/job-9");
+    assert.equal(acquired, FMP4_ARTIFACT, "the committed artifact, identically");
+  });
+
+  it("hands an MPEG-TS plan to the MPEG-TS primitive only", async () => {
+    let fmp4Calls = 0;
+    const acquired = await acquireSelectedClearHlsMedia(
+      order(),
+      primitives({
+        acquireFmp4: async () => {
+          fmp4Calls += 1;
+          return FMP4_ARTIFACT;
+        },
+      }),
+    );
+    assert.equal(fmp4Calls, 0);
+    assert.equal(acquired, ARTIFACT);
+  });
+
+  it("refuses a plan of neither family before either acquisition primitive runs", async () => {
+    let calls = 0;
+    const count = async () => {
+      calls += 1;
+      return ARTIFACT;
+    };
+    const err = await refusal(
+      () =>
+        acquireSelectedClearHlsMedia(
+          order(),
+          primitives({
+            preflight: async () =>
+              Object.freeze({ segmentType: "webm", fragments: [], fragmentCount: 0 }) as unknown as ClearHlsAcquisitionPlan,
+            acquire: count,
+            acquireFmp4: count as never,
+          }),
+        ),
+      "a plan of no family",
+    );
+    assert.equal(err.code, "PROCESSING_FAILED");
+    assert.equal(calls, 0);
+  });
+
+  it("maps every fMP4 acquisition refusal through the SAME reviewed table", async () => {
+    for (const reason of ACQUISITION_FAILURES) {
+      const err = await refusal(
+        () =>
+          acquireSelectedClearHlsMedia(
+            order(),
+            primitives({
+              preflight: async () => FMP4_ACQUISITION_PLAN,
+              acquireFmp4: async () => {
+                throw new ClearHlsAcquisitionError(reason);
+              },
+            }),
+          ),
+        reason,
+      );
+      assert.equal(err.code, CLEAR_HLS_ACQUISITION_ERROR_CODES[reason], reason);
+    }
+  });
+});
+
+describe("HLS v2 processing: the artifact's family decides the HLS-4 primitive", () => {
+  const order = (source: unknown) => ({
+    source: source as ClearHlsAcquiredTs,
+    workDir: "/work/job-1",
+    timeoutMs: 1000,
+    maxOutputBytes: 1000,
+    signal: new AbortController().signal,
+  });
+
+  it("hands an fMP4 artifact, identically, to the fMP4 processor only", async () => {
+    let seen: unknown;
+    const out = await processAcquiredClearHlsMedia(
+      order(FMP4_ARTIFACT),
+      processors({
+        fmp4: (async (request: { source: unknown }) => {
+          seen = request.source;
+          return PROCESSED_V2;
+        }) as never,
+      }),
+    );
+    assert.equal(out, PROCESSED_V2);
+    assert.equal(seen, FMP4_ARTIFACT, "the exact HLS-3 artifact, never a rebuild");
+  });
+
+  it("hands an MPEG-TS artifact to the MPEG-TS processor only", async () => {
+    const out = await processAcquiredClearHlsMedia(
+      order(ARTIFACT),
+      processors({ mpegts: (async () => PROCESSED_V2) as never }),
+    );
+    assert.equal(out, PROCESSED_V2);
+  });
+
+  it("refuses an artifact of neither family before either processor runs", async () => {
+    for (const source of [
+      Object.freeze({ filePath: "/work/job-1/x", segmentType: "webm", fileSize: 1 }),
+      Object.freeze({ filePath: "/work/job-1/x", fileSize: 1 }),
+      null,
+    ]) {
+      const err = await refusal(() => processAcquiredClearHlsMedia(order(source), processors({})), "no family");
+      assert.equal(err.code, "PROCESSING_FAILED");
+    }
+  });
+});
+
+const PROCESSED_V2: ClearHlsProcessedMp4 = Object.freeze({
+  filePath: "/work/job-1/hls-output.mp4",
+  container: "mp4",
+  fileSize: 4096,
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -277,6 +442,8 @@ describe("HLS-6 mapping: every private HLS-2 reason has an explicit public code"
       playlist_invalid_utf8: "FORMAT_UNAVAILABLE",
       playlist_rejected: "FORMAT_UNAVAILABLE",
       fragment_url_invalid: "FORMAT_UNAVAILABLE",
+      // HLS v2: an fMP4 initialization map location that will not be requested.
+      initialization_map_url_invalid: "FORMAT_UNAVAILABLE",
       // The request or the destination failed.
       destination_rejected: "NETWORK_ERROR",
       network_error: "NETWORK_ERROR",
@@ -290,7 +457,7 @@ describe("HLS-6 mapping: every private HLS-2 reason has an explicit public code"
     it(`maps ${reason} to ${CLEAR_HLS_PREFLIGHT_ERROR_CODES[reason]}`, async () => {
       const err = await refusal(
         () =>
-          acquireSelectedClearHlsTs(
+          acquireSelectedClearHlsMedia(
             order(),
             primitives({
               preflight: async () => {
@@ -308,7 +475,7 @@ describe("HLS-6 mapping: every private HLS-2 reason has an explicit public code"
   it("collapses an unexpected non-HLS error to PROCESSING_FAILED, message dropped", async () => {
     const err = await refusal(
       () =>
-        acquireSelectedClearHlsTs(
+        acquireSelectedClearHlsMedia(
           order(),
           primitives({
             preflight: async () => {
@@ -328,7 +495,7 @@ describe("HLS-6 mapping: every private HLS-2 reason has an explicit public code"
     (forged as { reason: string }).reason = "not_a_member";
     const err = await refusal(
       () =>
-        acquireSelectedClearHlsTs(
+        acquireSelectedClearHlsMedia(
           order(),
           primitives({
             preflight: async () => {
@@ -390,7 +557,7 @@ describe("HLS-6 mapping: every private HLS-3 reason has an explicit public code"
     it(`maps ${reason} to ${CLEAR_HLS_ACQUISITION_ERROR_CODES[reason]}`, async () => {
       const err = await refusal(
         () =>
-          acquireSelectedClearHlsTs(
+          acquireSelectedClearHlsMedia(
             order(),
             primitives({
               acquire: async () => {
@@ -408,7 +575,7 @@ describe("HLS-6 mapping: every private HLS-3 reason has an explicit public code"
   it("collapses an unexpected acquisition error to PROCESSING_FAILED", async () => {
     const err = await refusal(
       () =>
-        acquireSelectedClearHlsTs(
+        acquireSelectedClearHlsMedia(
           order(),
           primitives({
             acquire: async () => {
@@ -428,7 +595,7 @@ describe("HLS-6 mapping: no private detail escapes", () => {
     for (const reason of PREFLIGHT_FAILURES) {
       const err = await refusal(
         () =>
-          acquireSelectedClearHlsTs(
+          acquireSelectedClearHlsMedia(
             order(),
             primitives({
               preflight: async () => {
@@ -461,7 +628,7 @@ describe("HLS-6 processing: HLS-4 verbatim, with its canonical errors preserved"
   it("hands HLS-4 exactly the request it was given, and returns its result", async () => {
     const controller = new AbortController();
     let seen: unknown;
-    const out = await processAcquiredClearHlsTs(
+    const out = await processAcquiredClearHlsMedia(
       {
         source: ARTIFACT,
         workDir: "/work/job-1",
@@ -469,10 +636,12 @@ describe("HLS-6 processing: HLS-4 verbatim, with its canonical errors preserved"
         maxOutputBytes: 4_294_967_296,
         signal: controller.signal,
       },
-      (async (request: unknown) => {
-        seen = request;
-        return PROCESSED;
-      }) as never,
+      processors({
+        mpegts: (async (request: unknown) => {
+          seen = request;
+          return PROCESSED;
+        }) as never,
+      }),
     );
     assert.equal(out, PROCESSED);
     const request = seen as { source: unknown; workDir: string; timeoutMs: number; maxOutputBytes: number; signal: AbortSignal };
@@ -488,7 +657,7 @@ describe("HLS-6 processing: HLS-4 verbatim, with its canonical errors preserved"
       const original = new AppError(code);
       const err = await refusal(
         () =>
-          processAcquiredClearHlsTs(
+          processAcquiredClearHlsMedia(
             {
               source: ARTIFACT,
               workDir: "/work/job-1",
@@ -496,9 +665,11 @@ describe("HLS-6 processing: HLS-4 verbatim, with its canonical errors preserved"
               maxOutputBytes: 1000,
               signal: new AbortController().signal,
             },
-            (async () => {
-              throw original;
-            }) as never,
+            processors({
+              mpegts: (async () => {
+                throw original;
+              }) as never,
+            }),
           ),
         code,
       );
@@ -510,7 +681,7 @@ describe("HLS-6 processing: HLS-4 verbatim, with its canonical errors preserved"
   it("collapses a non-AppError to PROCESSING_FAILED with its message dropped", async () => {
     const err = await refusal(
       () =>
-        processAcquiredClearHlsTs(
+        processAcquiredClearHlsMedia(
           {
             source: ARTIFACT,
             workDir: "/work/job-1",
@@ -518,9 +689,11 @@ describe("HLS-6 processing: HLS-4 verbatim, with its canonical errors preserved"
             maxOutputBytes: 1000,
             signal: new AbortController().signal,
           },
-          (async () => {
-            throw new RangeError(`ffmpeg died at /work/job-1 ${VERY_PRIVATE_HLS_TOKEN}`);
-          }) as never,
+          processors({
+            mpegts: (async () => {
+              throw new RangeError(`ffmpeg died at /work/job-1 ${VERY_PRIVATE_HLS_TOKEN}`);
+            }) as never,
+          }),
         ),
       "an unexpected processing error",
     );
@@ -554,7 +727,7 @@ describe("HLS-6 orchestration module: a seam, not a second implementation", () =
   const code = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
   it("strips prose without destroying the module under test", () => {
-    assert.ok(code.includes("export async function acquireSelectedClearHlsTs"));
+    assert.ok(code.includes("export async function acquireSelectedClearHlsMedia"));
     assert.equal(code.includes("Privacy"), false, "comments should be gone");
   });
 
