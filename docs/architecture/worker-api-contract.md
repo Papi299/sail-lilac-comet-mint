@@ -710,6 +710,7 @@ a row failed by an older Worker, which still holds its last progress label.
 | Anything unclassifiable (local capacity, job directory, unexpected exception) | `PROCESSING_FAILED` | the phase it ran in |
 | Worker unreachable or failing at the transport level | `WORKER_UNAVAILABLE` (control plane only) | — |
 | Worker response outside the contract (unknown code, malformed view) | `PROCESSING_FAILED` (HTTP 500 from the status route) | — |
+| Unexpected failure inside the status route itself | `PROCESSING_FAILED` (HTTP 500; formerly a fabricated `NOT_FOUND`) | — |
 
 The canonical `PROCESSING_FAILED` message is `VideoFetch couldn't complete this
 download.`. It gives no advice, because nothing known about such a failure says
@@ -726,4 +727,23 @@ newer control plane maps an older Worker's failed-row label to `Failed`.
 **Browser.** The error card shows the message, and a heading from a closed table
 keyed by the stage: `Download failed`, `Processing failed`, `Upload failed`, or
 `Download interrupted` for a restart. For anything else it shows
-`We hit a snag`, including analysis errors and failed status polls.
+`We hit a snag`, including analysis errors and definitive status answers.
+
+### Browser status polling (`BROWSER-JOB-STATUS-POLL-RESILIENCE-001`)
+
+A failed status read is not a job outcome. The browser classifies it by
+structure — no response, the allowlisted `error.code`, the HTTP status — never
+by message text:
+
+- **Stops** on `NOT_FOUND`, `EXPIRED`, `ACCESS_REQUIRED`,
+  `ACCESS_NOT_CONFIGURED`, `FORBIDDEN`, and any other 4xx.
+- **Retries** with no response, `WORKER_UNAVAILABLE`, any other 5xx, 408, 429,
+  and a 2xx whose body is not a job status. It keeps the job in `processing`
+  with its last known progress and a "Reconnecting…" notice.
+
+Retries back off 800 ms → 1.5 s → 3 s → 5 s (cap) with one request in flight
+at a time. After 120 s of continuous failure the browser stops and offers
+**Retry status** for the same job id; it never resubmits the job. A `failed` or
+`cancelled` job status is terminal exactly as above. The status route must
+therefore answer `NOT_FOUND` only for a job id that is malformed or unknown to
+the Worker; an unexpected failure is a 500. Runbook §4l has the details.

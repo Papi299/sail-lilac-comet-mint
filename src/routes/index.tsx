@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { UrlInput } from "@/components/video/url-input";
@@ -10,6 +10,7 @@ import { CompleteCard } from "@/components/video/complete-card";
 import { DownloadHistory } from "@/components/video/history";
 import { PrivateAccessGate } from "@/components/video/private-access-gate";
 import { ErrorCard } from "@/components/video/error-card";
+import { StatusConnectionNotice } from "@/components/video/status-connection-notice";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -22,9 +23,16 @@ import {
   type HistoryItem,
 } from "@/lib/client-api";
 import { hasDownloadOptions, initialSelectionId } from "@/lib/download-options";
-import { errorCardHeading, terminalJobMessage } from "@/lib/job-failure-ui";
+import {
+  downloaderReducer,
+  finishedJobForHistory,
+  historyEntryForJob,
+  initialDownloaderState,
+  startStatusPollSession,
+  statusPollTarget,
+} from "@/lib/downloader-state";
+import { errorCardHeading } from "@/lib/job-failure-ui";
 import type { VideoMetadata } from "@/types/media";
-import type { JobProgress } from "@/types/job";
 
 export const Route = createFileRoute("/")({ component: Home });
 
@@ -36,97 +44,72 @@ function Home() {
   );
 }
 
-type Phase = "idle" | "analyzing" | "ready" | "processing" | "complete" | "error";
-
 function Downloader() {
   const [url, setUrl] = useState("");
-  const [phase, setPhase] = useState<Phase>("idle");
+  const [state, dispatch] = useReducer(downloaderReducer, initialDownloaderState);
+  const { phase, job, error, connectivity } = state;
   const [video, setVideo] = useState<VideoMetadata | null>(null);
   const [simpleMode, setSimpleMode] = useState(true);
   const [selectedId, setSelectedId] = useState("");
-  const [job, setJob] = useState<(JobProgress & { jobId?: string }) | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [starting, setStarting] = useState(false);
+  const videoRef = useRef<VideoMetadata | null>(null);
 
   useEffect(() => {
     setHistory(loadHistory());
   }, []);
 
   useEffect(() => {
-    if (phase !== "processing" || !job || !("jobId" in job) || !job.jobId) return;
-    const jobId = job.jobId;
-    let cancelled = false;
-    const timer = window.setInterval(() => {
-      void getJobStatus(jobId)
-        .then((next) => {
-          if (cancelled) return;
-          setJob(next);
-          if (next.status === "ready") {
-            setPhase("complete");
-            saveHistoryItem({
-              jobId,
-              title: next.title || video?.title || "Video",
-              thumbnail: next.thumbnail || video?.thumbnail || null,
-              status: "ready",
-              format: next.container,
-              quality: next.quality,
-              completedAt: Date.now(),
-            });
-            setHistory(loadHistory());
-          } else if (next.status === "failed" || next.status === "cancelled") {
-            // `cancelled` is terminal: polling stops here and the job renders
-            // through the existing terminal/error card with a canonical
-            // message. No cancellation UI is introduced in this phase.
-            setPhase("error");
-            setError(terminalJobMessage(next));
-            saveHistoryItem({
-              jobId,
-              title: next.title || video?.title || "Video",
-              thumbnail: next.thumbnail || video?.thumbnail || null,
-              status: next.status,
-              format: next.container,
-              quality: next.quality,
-              completedAt: Date.now(),
-            });
-            setHistory(loadHistory());
-          }
-        })
-        .catch((err: Error) => {
-          if (cancelled) return;
-          setPhase("error");
-          setError(err.message);
-        });
-    }, 800);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [phase, job, video]);
+    videoRef.current = video;
+  }, [video]);
+
+  // One single-flight polling loop per session. The session changes only when
+  // a new job starts or the person asks to retry the status, so progress
+  // updates never restart the loop; reset, a new job and unmount all stop it.
+  // A transient failure keeps the job in `processing` (see downloader-state).
+  const pollTarget = statusPollTarget(state);
+  const pollJobId = pollTarget?.jobId ?? null;
+  const pollSession = pollTarget?.session ?? null;
+  useEffect(() => {
+    if (!pollJobId || !pollSession) return;
+    const poller = startStatusPollSession(
+      { jobId: pollJobId, session: pollSession },
+      dispatch,
+      (id, signal) => getJobStatus(id, { signal }),
+    );
+    return () => poller.stop();
+  }, [pollJobId, pollSession]);
+
+  // History records how a job ended — `ready`, `failed` or `cancelled` — and is
+  // derived from accepted state, never from a lost connection.
+  const finishedJob = finishedJobForHistory(state);
+  useEffect(() => {
+    if (!finishedJob) return;
+    saveHistoryItem(historyEntryForJob(finishedJob, videoRef.current, Date.now()));
+    setHistory(loadHistory());
+  }, [finishedJob]);
 
   async function handleAnalyze(nextUrl: string) {
     setUrl(nextUrl);
-    setPhase("analyzing");
-    setError(null);
-    setJob(null);
+    dispatch({ type: "analyze_started" });
     setVideo(null);
     rememberUrl(nextUrl);
     try {
       const result = await analyzeVideo(nextUrl);
       setVideo(result);
       setSelectedId(initialSelectionId(result));
-      setPhase("ready");
+      dispatch({ type: "analyze_succeeded" });
     } catch (err) {
-      setPhase("error");
-      setError(err instanceof Error ? err.message : "We couldn't analyze this video.");
-      toast.error(err instanceof Error ? err.message : "We couldn't analyze this video.");
+      const message = err instanceof Error ? err.message : "We couldn't analyze this video.";
+      dispatch({ type: "analyze_failed", message });
+      toast.error(message);
     }
   }
 
   async function handleDownload() {
     if (!video || !selectedId) return;
     setStarting(true);
-    setError(null);
+    dispatch({ type: "download_requested" });
     try {
       const created = await startDownload({
         url: video.webpageUrl || url,
@@ -135,11 +118,10 @@ function Downloader() {
         thumbnail: video.thumbnail,
         source: video.source,
       });
-      setJob(created);
-      setPhase("processing");
+      dispatch({ type: "download_started", job: created });
     } catch (err) {
       const message = err instanceof Error ? err.message : "We couldn't process this video.";
-      setError(message);
+      dispatch({ type: "download_failed", message });
       toast.error(message);
     } finally {
       setStarting(false);
@@ -147,11 +129,13 @@ function Downloader() {
   }
 
   function reset() {
-    setPhase("idle");
+    dispatch({ type: "reset" });
     setVideo(null);
-    setJob(null);
-    setError(null);
     setSelectedId("");
+  }
+
+  function retryStatus() {
+    dispatch({ type: "retry_status" });
   }
 
   // Unlike `reset`, clears the URL: analyzing the same link again would yield
@@ -201,8 +185,9 @@ function Downloader() {
 
         {phase === "error" && error ? (
           // Only a FAILED job's closed stage label can change the heading; an
-          // analysis error or a failed poll has no job stage and keeps the
-          // generic one.
+          // analysis error or a definitive status answer (NOT_FOUND, EXPIRED,
+          // an access failure) has no job stage and keeps the generic one. A
+          // transient status failure never reaches this card.
           <ErrorCard heading={errorCardHeading(job)} message={error} onReset={reset} />
         ) : null}
 
@@ -228,7 +213,16 @@ function Downloader() {
                   />
                 )
               ) : null}
-              {phase === "processing" && job ? <ProgressCard job={job} /> : null}
+              {phase === "processing" && job ? (
+                <>
+                  <ProgressCard job={job} />
+                  <StatusConnectionNotice
+                    connectivity={connectivity}
+                    onRetryStatus={retryStatus}
+                    onReset={reset}
+                  />
+                </>
+              ) : null}
               {phase === "complete" && job ? <CompleteCard job={job} onReset={reset} /> : null}
             </CardContent>
           </Card>
