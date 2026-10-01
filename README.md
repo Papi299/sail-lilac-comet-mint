@@ -2,7 +2,7 @@
 
 A polished video downloader. Paste a link, pick a quality, and download the file.
 
-VideoFetch analyzes direct media URLs and eligible public video pages, offers application-owned quality presets, and runs each download as a durable background job on a standalone Worker; the finished file is kept briefly in private object storage and delivered through a short-lived signed link. Generic pages are handled by a deliberately narrow path: yt-dlp analyzes them and downloads only progressive HTTP(S) media, and it never merges, remuxes or post-processes anything (see *Generic v1 scope* below).
+VideoFetch analyzes direct media URLs and eligible public video pages, offers application-owned quality presets, and runs each download as a durable background job on a standalone Worker; the finished file is kept briefly in private object storage and delivered through a short-lived signed link. Generic pages are handled by a deliberately narrow path: yt-dlp analyzes them and acquires only approved progressive HTTP(S) media or approved segmented-DASH (`http_dash_segments`) split-pair halves. Clear HLS is discovered by yt-dlp during analysis but acquired by VideoFetch itself. yt-dlp never performs the application's merge, remux or post-processing; where a preset needs that, the Worker's own FFmpeg does it (see *Generic v1 scope* below).
 
 ## Features
 
@@ -34,10 +34,10 @@ The control plane never runs media work: when the Worker is unreachable it fails
 **Generic v1 scope.** Generic extraction covers public, single-item, non-live sources. It offers only application-owned presets (`preset:best`, `preset:1080`, `preset:720`, …) — never raw upstream format ids, and there is no HLS-specific public format vocabulary. Current source can back a generic video preset in three ways:
 
 - **progressive HTTP(S)** — one format, downloaded by yt-dlp;
-- an approved **split pair** — a video-only + an audio-only stream, each over progressive HTTP(S), downloaded by yt-dlp and merged locally by the Worker's own FFmpeg;
+- an approved **split pair** — a video-only + an audio-only stream, each half downloaded by yt-dlp over progressive HTTP(S) or as approved segmented DASH (`http_dash_segments`), and merged locally by the Worker's own FFmpeg;
 - **clear-HLS v1** — a deliberately narrow HLS path: exactly yt-dlp's `m3u8_native` protocol, a clear (unencrypted), finite VOD media playlist of MPEG-TS segments, and video with proven audio in one rendition. yt-dlp only *discovers* such a rendition during analysis. **VideoFetch itself** preflights the playlist and fetches the segments, and the Worker remuxes TS → MP4 (stream copy) only after the job has entered `processing`.
 
-A split pair's halves may also be segmented DASH (`http_dash_segments`), acquired by yt-dlp's native `DashSegmentsFD` (deployed 2026-09-30, runbook §4k).
+Segmented DASH is admitted only as a split-pair half — either half, or both — and never as the single source of a preset (video, audio or MP3); it is acquired by yt-dlp's native `DashSegmentsFD` (deployed 2026-09-30, runbook §4k).
 
 yt-dlp's own download allowlist is exactly `http`, `https` and `http_dash_segments`; clear HLS was added without widening it. Everything else is unsupported and fails closed. HLS outside the deployed clear-HLS v1 subset — live, encrypted or DRM-protected, fMP4, byte-range, with discontinuities, or relying on a separate audio rendition — is either never offered or, when only the media playlist reveals it, refused at download time before any segment is fetched. Renditions that are not offered can still be reported as withheld (`unsupported_protocol`) in the informational `sourceQuality`.
 
