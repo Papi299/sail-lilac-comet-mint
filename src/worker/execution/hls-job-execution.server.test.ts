@@ -673,7 +673,7 @@ describe("HLS-6 failure matrix: each stage stops the ones after it", () => {
     assert.equal(final?.errorCode, "PROCESSING_FAILED");
   });
 
-  it("refuses an acquisition result that is not an MPEG-TS aggregate", async () => {
+  it("refuses an acquisition result that is not an approved (MPEG-TS or fMP4) aggregate", async () => {
     const job = claimJob(h.store, "preset:1080");
     let processings = 0;
     const executor = new JobExecutor(

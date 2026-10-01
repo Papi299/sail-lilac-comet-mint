@@ -12,20 +12,23 @@ import {
 } from "./hls-media-playlist.ts";
 
 /**
- * Worker-owned CLEAR-HLS v1 BOUNDED PREFLIGHT (HLS-2).
+ * Worker-owned CLEAR-HLS BOUNDED PREFLIGHT (HLS-2, widened by HLS v2).
  *
  * ─── What this module is ────────────────────────────────────────────────────
  *
  * One narrow operation: fetch ONE candidate media playlist under a hard byte,
  * redirect and time bound, hand the strictly decoded text to the HLS-1 parser,
- * resolve every approved fragment reference against the FINAL validated
- * response URL, and return a small immutable acquisition plan.
+ * resolve every approved reference — every fragment, and for an fMP4 playlist
+ * its one initialization map — against the FINAL validated response URL, and
+ * return a small immutable acquisition plan.
  *
  * It makes exactly one logical request — a GET of the playlist, through the
  * existing hardened `safeGet()`, which may follow a bounded redirect chain.
  * Everything after the body arrives is pure: parsing, URL resolution and static
- * URL policy. No fragment, key, map, variant or rendition is ever requested,
- * and no fragment host is ever looked up.
+ * URL policy. No fragment, key, map, variant or rendition is ever requested
+ * here, and no fragment or map host is ever looked up: the initialization map
+ * is resolved and statically approved exactly like a fragment, and is fetched
+ * by HLS-3 through the same safe-HTTP path, never by this module.
  *
  * ─── What this module is NOT ────────────────────────────────────────────────
  *
@@ -93,22 +96,36 @@ export type ClearHlsAcquisitionFragment = {
 };
 
 /**
- * The closed, immutable, Worker-private v1 acquisition plan.
+ * The closed, immutable, Worker-private acquisition plan: one member per
+ * approved segment family, mirroring HLS-1's model.
  *
- * SENSITIVE: fragment URLs may be signed. The plan exists in memory only. It
- * must never be logged, serialised into job metadata, persisted, written to
- * disk, returned by any API, or placed in an error.
+ * SENSITIVE: fragment and map URLs may be signed. The plan exists in memory
+ * only. It must never be logged, serialised into job metadata, persisted,
+ * written to disk, returned by any API, or placed in an error.
  *
  * Deliberately absent: the playlist text, the unresolved references, every tag,
  * any key material, titles, format ids, request or response headers, cookies,
  * the redirect chain, and the final playlist URL itself — that URL is used as
  * the resolution base and then discarded.
+ *
+ *   mpegts  the v1 plan, EXACTLY as before.
+ *   fmp4    the same, plus `initializationMap`: the ONE map, resolved and
+ *           statically approved exactly as a fragment is, in the same wrapper.
  */
-export type ClearHlsAcquisitionPlan = {
+export type ClearHlsMpegTsAcquisitionPlan = {
   readonly segmentType: "mpegts";
   readonly fragments: readonly ClearHlsAcquisitionFragment[];
   readonly fragmentCount: number;
 };
+
+export type ClearHlsFmp4AcquisitionPlan = {
+  readonly segmentType: "fmp4";
+  readonly initializationMap: ClearHlsAcquisitionFragment;
+  readonly fragments: readonly ClearHlsAcquisitionFragment[];
+  readonly fragmentCount: number;
+};
+
+export type ClearHlsAcquisitionPlan = ClearHlsMpegTsAcquisitionPlan | ClearHlsFmp4AcquisitionPlan;
 
 /**
  * The whole input surface. There is deliberately no way to pass headers,
@@ -148,6 +165,10 @@ export type ClearHlsPreflightRequest = {
  *   playlist_rejected      HLS-1 refused the document (see `playlistRejection`)
  *   fragment_url_invalid   a fragment reference did not resolve to an
  *                          acceptable URL; the WHOLE plan is refused
+ *   initialization_map_url_invalid
+ *                          (HLS v2) the fMP4 initialization map reference did
+ *                          not resolve to an acceptable URL; the WHOLE plan is
+ *                          refused, before any fragment is resolved
  */
 export type ClearHlsPreflightFailure =
   | "invalid_playlist_url"
@@ -160,7 +181,8 @@ export type ClearHlsPreflightFailure =
   | "playlist_too_large"
   | "playlist_invalid_utf8"
   | "playlist_rejected"
-  | "fragment_url_invalid";
+  | "fragment_url_invalid"
+  | "initialization_map_url_invalid";
 
 /**
  * A FIXED message per failure, as in HLS-1: with no interpolation site, no URL,
@@ -179,6 +201,7 @@ const FAILURE_MESSAGES: Record<ClearHlsPreflightFailure, string> = {
   playlist_invalid_utf8: "playlist response is not valid UTF-8",
   playlist_rejected: "playlist is not a supported clear VOD media playlist",
   fragment_url_invalid: "playlist has an unacceptable fragment location",
+  initialization_map_url_invalid: "playlist has an unacceptable initialization map location",
 };
 
 /**
@@ -398,22 +421,43 @@ function parsePlaylist(text: string): ClearHlsMediaPlaylist {
 
 /**
  * Resolve every approved reference, in order and with duplicates kept. ONE
- * unacceptable fragment refuses the whole plan: there is no partial plan.
+ * unacceptable fragment — or, for fMP4, an unacceptable initialization map —
+ * refuses the whole plan: there is no partial plan.
+ *
+ * The map is resolved FIRST, against the same final URL and through the same
+ * static policy and URL-length bound a fragment gets; it is a media resource
+ * like any other, and nothing about it is trusted more or less.
  */
 function resolveAcquisitionPlan(
   playlist: ClearHlsMediaPlaylist,
   finalPlaylistUrl: string,
 ): ClearHlsAcquisitionPlan {
+  let initializationMap: ClearHlsAcquisitionFragment | null = null;
+  if (playlist.segmentType === "fmp4") {
+    const url = approvedFragmentUrl(playlist.initializationMap.reference, finalPlaylistUrl);
+    if (url === null) refuse("initialization_map_url_invalid");
+    initializationMap = Object.freeze({ url });
+  }
+
   const fragments: ClearHlsAcquisitionFragment[] = [];
   for (const { reference } of playlist.fragments) {
     const url = approvedFragmentUrl(reference, finalPlaylistUrl);
     if (url === null) refuse("fragment_url_invalid");
     fragments.push(Object.freeze({ url }));
   }
-  // The plan, its fragment collection and every entry are frozen, so no caller
-  // can replace or rewrite an approved URL between preflight and acquisition.
+  // The plan, its fragment collection, the map and every entry are frozen, so
+  // no caller can replace or rewrite an approved URL between preflight and
+  // acquisition.
+  if (initializationMap === null) {
+    return Object.freeze({
+      segmentType: "mpegts",
+      fragments: Object.freeze(fragments),
+      fragmentCount: fragments.length,
+    });
+  }
   return Object.freeze({
-    segmentType: playlist.segmentType,
+    segmentType: "fmp4",
+    initializationMap,
     fragments: Object.freeze(fragments),
     fragmentCount: fragments.length,
   });
@@ -451,8 +495,9 @@ function classify(err: unknown, signal: AbortSignal): ClearHlsPreflightError {
 // ── The preflight ────────────────────────────────────────────────────────────
 
 /**
- * Fetch, bound, decode, parse and resolve ONE clear-VOD media playlist into an
- * immutable acquisition plan. Throws `ClearHlsPreflightError` otherwise.
+ * Fetch, bound, decode, parse and resolve ONE clear-VOD media playlist — MPEG-TS
+ * or fMP4 — into an immutable acquisition plan. Throws `ClearHlsPreflightError`
+ * otherwise.
  *
  * Lifetime: one local controller carries both stop causes into `safeGet()` and
  * the body read. The function returns no later than the deadline even if an

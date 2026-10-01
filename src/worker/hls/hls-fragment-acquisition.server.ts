@@ -5,21 +5,46 @@ import { config } from "@/lib/config";
 import { AppError } from "@/lib/errors";
 import { disposeHttpBody, safeGet, type SafeHttpResponse } from "@/lib/security/safe-http.server";
 import { DEFAULT_MAX_FILE_SIZE_BYTES } from "@/shared/media-limits";
-import { HLS_V1_MAX_FRAGMENTS } from "./hls-media-playlist.ts";
+import { HLS_V1_MAX_FRAGMENTS, type ClearHlsSegmentType } from "./hls-media-playlist.ts";
 import {
   HLS_V1_MAX_FRAGMENT_URL_BYTES,
   type ClearHlsAcquisitionPlan,
+  type ClearHlsFmp4AcquisitionPlan,
+  type ClearHlsMpegTsAcquisitionPlan,
 } from "./hls-preflight.server.ts";
 
 /**
- * Worker-owned CLEAR-HLS v1 SEQUENTIAL FRAGMENT ACQUISITION (HLS-3).
+ * Worker-owned CLEAR-HLS SEQUENTIAL FRAGMENT ACQUISITION (HLS-3, widened by
+ * HLS v2).
  *
  * ─── What this module is ────────────────────────────────────────────────────
  *
  * The first HLS component permitted to move media bytes. It consumes ONE
- * already-approved HLS-2 acquisition plan and downloads its MPEG-TS fragments
- * one at a time into exactly ONE local aggregate artifact — the byte-exact
- * concatenation of every fragment, in plan order.
+ * already-approved HLS-2 acquisition plan and downloads its fragments one at a
+ * time into exactly ONE local aggregate artifact — the byte-exact
+ * concatenation of every resource, in plan order.
+ *
+ * ─── Two entry points, one transfer core ────────────────────────────────────
+ *
+ *   `acquireClearHlsTs()`    an MPEG-TS plan: the fragments, in order, into
+ *                            `hls-source.ts`. This is the v1 path, and its
+ *                            requests, bounds, names and lifecycle are exactly
+ *                            what they were before HLS v2.
+ *   `acquireClearHlsFmp4()`  an fMP4 plan (HLS v2): the ONE initialization map
+ *                            FIRST, then the fragments, in order, into
+ *                            `hls-source.fmp4` — one fragmented-MP4 input.
+ *
+ * Both run the same private core: the same `safeGet()` per resource, the same
+ * per-resource and aggregate bounds, the same deadline, cancellation,
+ * finalization barrier and commit point. The initialization map is a media
+ * resource like any fragment: it is fetched through the same primitive, held to
+ * the same per-resource ceiling, and its actual bytes count against the same
+ * aggregate limit. It is NOT a fragment for progress, which stays truthful
+ * fragment-count progress over the playlist's media fragments.
+ *
+ * Neither entry point accepts the other family's plan. Each family's artifact
+ * has its own fixed name, and HLS-4 checks the name against the family it is
+ * told it was handed.
  *
  * Every fragment is fetched through the existing hardened `safeGet()`, so DNS
  * resolution, private-answer rejection, address pinning and per-hop redirect
@@ -29,17 +54,19 @@ import {
  *
  * ─── What this module is NOT ────────────────────────────────────────────────
  *
- * It is not a media component. It does not parse TS packets, rewrite
- * timestamps, repair discontinuities, inspect codecs, remux, or run FFmpeg,
- * ffprobe or yt-dlp — HLS-4 owns validation and TS → MP4 after
- * `beginProcessing()`. The artifact this module produces is raw MPEG-TS and is
- * never described as MP4.
+ * It is not a media component. It does not parse TS packets or ISO-BMFF boxes,
+ * rewrite timestamps, repair discontinuities, inspect codecs, remux, or run
+ * FFmpeg, ffprobe or yt-dlp — HLS-4 owns validation and → MP4 after
+ * `beginProcessing()`. The artifact this module produces is raw MPEG-TS or a
+ * raw init + fragment concatenation, and is never described as the delivered
+ * MP4.
  *
- * It is not a resilience layer either. v1 performs ZERO retries: one approved
- * fragment gets one logical `safeGet()`, and one failed fragment fails the
- * whole acquisition. That is deliberate — a retry would have to reason about
- * how much of the failed fragment had already been appended, and v1 discards
- * the whole partial artifact instead of carrying rollback semantics.
+ * It is not a resilience layer either. It performs ZERO retries: one approved
+ * resource gets one logical `safeGet()`, and one failed resource — the
+ * initialization map included — fails the whole acquisition. That is
+ * deliberate — a retry would have to reason about how much of the failed
+ * resource had already been appended, and the whole partial artifact is
+ * discarded instead of carrying rollback semantics.
  *
  * ─── Reachability ───────────────────────────────────────────────────────────
  *
@@ -69,6 +96,9 @@ import {
  * malformed or hostile source, not a segment. Bounding each fragment as well
  * as the total keeps a single runaway response from consuming the whole
  * delivered-media budget before the aggregate bound would notice.
+ *
+ * HLS v2 applies the same ceiling to an fMP4 initialization map: it is one more
+ * media resource of one response, and a real one is a few kilobytes.
  */
 export const HLS_V1_MAX_FRAGMENT_BYTES = 64 * 1024 * 1024;
 
@@ -135,6 +165,20 @@ function fragmentRedirectCeiling(): number {
 export const AGGREGATE_FILE_NAME = "hls-source.ts";
 const PARTIAL_FILE_NAME = "hls-source.ts.part";
 
+/**
+ * The fMP4 aggregate (HLS v2) and its partial: the initialization map followed
+ * by every fragment, byte for byte. Exported for HLS-4's identity check on the
+ * same terms as `AGGREGATE_FILE_NAME`.
+ *
+ * A distinct name, not a reuse of the TS one, so neither family's artifact can
+ * be mistaken for the other's by name: HLS-4 requires the name that belongs to
+ * the family it was told it is processing, and probes it through that family's
+ * explicit demuxer. The extension decides nothing — FFmpeg is never asked to
+ * infer a format from it.
+ */
+export const FMP4_AGGREGATE_FILE_NAME = "hls-source.fmp4";
+const FMP4_PARTIAL_FILE_NAME = "hls-source.fmp4.part";
+
 // ── The acquired artifact ────────────────────────────────────────────────────
 
 /**
@@ -149,6 +193,21 @@ export type ClearHlsAcquiredTs = {
   readonly segmentType: "mpegts";
   readonly fileSize: number;
 };
+
+/**
+ * What a successful fMP4 acquisition produced (HLS v2): the same three fields,
+ * with `segmentType` `fmp4`. It is a fragmented-MP4 INPUT — an initialization
+ * segment followed by media fragments — and still not the delivered MP4: only
+ * HLS-4's remux and validation make one of those.
+ */
+export type ClearHlsAcquiredFmp4 = {
+  readonly filePath: string;
+  readonly segmentType: "fmp4";
+  readonly fileSize: number;
+};
+
+/** Either family's committed artifact. */
+export type ClearHlsAcquiredMedia = ClearHlsAcquiredTs | ClearHlsAcquiredFmp4;
 
 /**
  * Truthful fragment-count progress.
@@ -183,9 +242,12 @@ export type ClearHlsAcquisitionProgress = {
  * `workDir` is the server-owned per-job directory; it must already exist and
  * must be absolute. `signal` is REQUIRED so no caller can start an
  * uncancellable acquisition. `timeoutMs` may only NARROW the download budget.
+ *
+ * `P` names the plan family an entry point accepts. It is a TYPE statement
+ * only: each entry point also refuses the other family's plan at run time.
  */
-export type ClearHlsAcquisitionRequest = {
-  readonly plan: ClearHlsAcquisitionPlan;
+export type ClearHlsAcquisitionRequest<P extends ClearHlsAcquisitionPlan = ClearHlsAcquisitionPlan> = {
+  readonly plan: P;
   readonly workDir: string;
   readonly signal: AbortSignal;
   readonly timeoutMs?: number;
@@ -219,6 +281,11 @@ export type ClearHlsAcquisitionRequest = {
  *   aggregate_too_large    the delivered total would pass the effective limit
  *   output_error           the local aggregate could not be created, written,
  *                          verified or finalized
+ *
+ * HLS v2 adds no reason: an fMP4 initialization map is fetched through the same
+ * per-resource primitive as a fragment, so its transport, status, coding and
+ * size refusals are these same reasons, and a plan whose map fails the
+ * structural gate is `invalid_plan`.
  */
 export type ClearHlsAcquisitionFailure =
   | "invalid_plan"
@@ -284,34 +351,99 @@ function refuse(reason: ClearHlsAcquisitionFailure): never {
  *
  * Every actual request still goes through `safeGet()`, which is what decides
  * whether a URL may be contacted.
+ *
+ * HLS v2 made the gate family-specific and exact. Each admission returns the
+ * resources to transfer, in order, or `null`:
+ *
+ *   mpegts  the v1 rules, unchanged, plus one: the plan's own key set must be
+ *           exactly `segmentType`, `fragments`, `fragmentCount`. An MPEG-TS
+ *           plan that also carries an `initializationMap` is refused rather
+ *           than acquired without it.
+ *   fmp4    the same fragment rules, plus exactly one frozen
+ *           `initializationMap` entry held to the same entry rule as a
+ *           fragment, and the exact key set with that member added.
  */
-function isApprovedPlan(plan: unknown): plan is ClearHlsAcquisitionPlan {
-  if (typeof plan !== "object" || plan === null) return false;
-  if (!Object.isFrozen(plan)) return false;
+type AdmittedResources = {
+  /** The fMP4 initialization map, fetched FIRST; `null` for MPEG-TS. */
+  readonly initializationUrl: string | null;
+  /** The media fragments, in plan order. */
+  readonly fragmentUrls: readonly string[];
+};
 
+/** One frozen `{ url }` entry, as HLS-2 builds it, or `null`. */
+function approvedEntryUrl(entry: unknown): string | null {
+  if (typeof entry !== "object" || entry === null) return null;
+  if (!Object.isFrozen(entry)) return null;
+  const keys = Object.keys(entry);
+  if (keys.length !== 1 || keys[0] !== "url") return null;
+  const { url } = entry as { url: unknown };
+  if (typeof url !== "string" || url.length === 0) return null;
+  if (Buffer.byteLength(url, "utf8") > HLS_V1_MAX_FRAGMENT_URL_BYTES) return null;
+  return url;
+}
+
+/** The frozen fragment collection and its count, as HLS-2 builds them, or `null`. */
+function approvedFragmentUrls(candidate: {
+  fragments?: unknown;
+  fragmentCount?: unknown;
+}): string[] | null {
+  const { fragments, fragmentCount } = candidate;
+  if (!Array.isArray(fragments) || !Object.isFrozen(fragments)) return null;
+  if (typeof fragmentCount !== "number" || !Number.isSafeInteger(fragmentCount)) return null;
+  if (fragmentCount <= 0 || fragmentCount > HLS_V1_MAX_FRAGMENTS) return null;
+  if (fragmentCount !== fragments.length) return null;
+
+  const urls: string[] = [];
+  for (const entry of fragments) {
+    const url = approvedEntryUrl(entry);
+    if (url === null) return null;
+    urls.push(url);
+  }
+  return urls;
+}
+
+/** Whether `plan` has EXACTLY these own enumerable keys. */
+function hasExactKeys(plan: object, expected: readonly string[]): boolean {
+  const keys = Object.keys(plan).sort();
+  const want = [...expected].sort();
+  return keys.length === want.length && keys.every((key, index) => key === want[index]);
+}
+
+const MPEGTS_PLAN_KEYS = Object.freeze(["segmentType", "fragments", "fragmentCount"]);
+const FMP4_PLAN_KEYS = Object.freeze([
+  "segmentType",
+  "initializationMap",
+  "fragments",
+  "fragmentCount",
+]);
+
+function admitMpegTsPlan(plan: unknown): AdmittedResources | null {
+  if (typeof plan !== "object" || plan === null) return null;
+  if (!Object.isFrozen(plan)) return null;
+  const candidate = plan as { segmentType?: unknown; fragments?: unknown; fragmentCount?: unknown };
+  if (candidate.segmentType !== "mpegts") return null;
+  if (!hasExactKeys(plan, MPEGTS_PLAN_KEYS)) return null;
+  const fragmentUrls = approvedFragmentUrls(candidate);
+  if (fragmentUrls === null) return null;
+  return { initializationUrl: null, fragmentUrls };
+}
+
+function admitFmp4Plan(plan: unknown): AdmittedResources | null {
+  if (typeof plan !== "object" || plan === null) return null;
+  if (!Object.isFrozen(plan)) return null;
   const candidate = plan as {
     segmentType?: unknown;
+    initializationMap?: unknown;
     fragments?: unknown;
     fragmentCount?: unknown;
   };
-  if (candidate.segmentType !== "mpegts") return false;
-
-  const { fragments, fragmentCount } = candidate;
-  if (!Array.isArray(fragments) || !Object.isFrozen(fragments)) return false;
-  if (typeof fragmentCount !== "number" || !Number.isSafeInteger(fragmentCount)) return false;
-  if (fragmentCount <= 0 || fragmentCount > HLS_V1_MAX_FRAGMENTS) return false;
-  if (fragmentCount !== fragments.length) return false;
-
-  for (const entry of fragments) {
-    if (typeof entry !== "object" || entry === null) return false;
-    if (!Object.isFrozen(entry)) return false;
-    const keys = Object.keys(entry);
-    if (keys.length !== 1 || keys[0] !== "url") return false;
-    const { url } = entry as { url: unknown };
-    if (typeof url !== "string" || url.length === 0) return false;
-    if (Buffer.byteLength(url, "utf8") > HLS_V1_MAX_FRAGMENT_URL_BYTES) return false;
-  }
-  return true;
+  if (candidate.segmentType !== "fmp4") return null;
+  if (!hasExactKeys(plan, FMP4_PLAN_KEYS)) return null;
+  const initializationUrl = approvedEntryUrl(candidate.initializationMap);
+  if (initializationUrl === null) return null;
+  const fragmentUrls = approvedFragmentUrls(candidate);
+  if (fragmentUrls === null) return null;
+  return { initializationUrl, fragmentUrls };
 }
 
 // ── Output paths ─────────────────────────────────────────────────────────────
@@ -326,16 +458,20 @@ type AcquisitionPaths = {
  * not a usable absolute directory reference.
  *
  * The only variable component is the workDir the Worker itself owns. Both file
- * names are module constants, so no upstream string participates in path
- * construction and no directory is ever created here.
+ * names are module constants — the family's pair, chosen by the entry point —
+ * so no upstream string participates in path construction and no directory is
+ * ever created here.
  */
-function acquisitionPaths(workDir: unknown): AcquisitionPaths | null {
+function acquisitionPaths(
+  workDir: unknown,
+  family: AcquisitionFamily<ClearHlsSegmentType>,
+): AcquisitionPaths | null {
   if (typeof workDir !== "string" || workDir.length === 0) return null;
   if (!isAbsolute(workDir)) return null;
   const base = resolve(workDir);
   return {
-    partialPath: join(base, PARTIAL_FILE_NAME),
-    aggregatePath: join(base, AGGREGATE_FILE_NAME),
+    partialPath: join(base, family.partialFileName),
+    aggregatePath: join(base, family.aggregateFileName),
   };
 }
 
@@ -516,21 +652,26 @@ async function acquireFragment(
 // ── The sequential transfer ──────────────────────────────────────────────────
 
 /**
- * Every fragment, strictly in plan order, into one open aggregate handle.
+ * Every resource, strictly in plan order, into one open aggregate handle: the
+ * fMP4 initialization map first when the plan has one, then every fragment.
  *
- * ONE request at a time: fragment N's body is fully consumed and disposed
- * before fragment N+1 is even resolved. There is no concurrency, no prefetch
+ * ONE request at a time: resource N's body is fully consumed and disposed
+ * before resource N+1 is even resolved. There is no concurrency, no prefetch
  * and no speculative request, which is what makes the byte accounting and the
  * output ordering deterministic.
  *
  * Duplicate URLs are positions, not identities: a plan that lists the same
  * fragment twice is fetched twice and appended twice, in order.
  *
- * The aggregate counter is established once, before the first fragment, and is
- * never reset — not between fragments, and not across a redirect.
+ * The aggregate counter is established once, before the first resource, and is
+ * never reset — not between fragments, not after the initialization map, and
+ * not across a redirect. The map's actual bytes are media bytes: they count
+ * against the aggregate limit exactly as a fragment's do. It does NOT advance
+ * fragment-count progress; the 0 report is emitted before it, and the next
+ * report is the first completed media fragment.
  */
-async function transferFragments(
-  plan: ClearHlsAcquisitionPlan,
+async function transferResources(
+  resources: AdmittedResources,
   handle: FileHandle,
   signal: AbortSignal,
   budgetMs: number,
@@ -538,20 +679,25 @@ async function transferFragments(
 ): Promise<number> {
   const aggregateLimit = hlsV1EffectiveAggregateLimitBytes();
   const ctx: FragmentContext = { handle, signal, budgetMs, aggregateLimit };
+  const fragmentCount = resources.fragmentUrls.length;
   let aggregateBytes = 0;
   let completed = 0;
-  reportSafely(onProgress, completed, aggregateBytes, plan.fragmentCount);
-  for (const fragment of plan.fragments) {
+  reportSafely(onProgress, completed, aggregateBytes, fragmentCount);
+  if (resources.initializationUrl !== null) {
+    signal.throwIfAborted();
+    aggregateBytes = await acquireFragment(resources.initializationUrl, aggregateBytes, ctx);
+  }
+  for (const url of resources.fragmentUrls) {
     // No next fragment begins once the operation has been stopped.
     signal.throwIfAborted();
-    aggregateBytes = await acquireFragment(fragment.url, aggregateBytes, ctx);
+    aggregateBytes = await acquireFragment(url, aggregateBytes, ctx);
     completed += 1;
     // Only a fragment whose whole body was accepted AND written counts, and
     // the LAST one is deliberately withheld here: 100 belongs to a finalized
     // artifact, not to a transfer that still has to be verified, renamed and
-    // re-verified. `acquireClearHlsTs` emits it once all of that has succeeded.
-    if (completed < plan.fragmentCount) {
-      reportSafely(onProgress, completed, aggregateBytes, plan.fragmentCount);
+    // re-verified. The acquisition core emits it once all of that succeeded.
+    if (completed < fragmentCount) {
+      reportSafely(onProgress, completed, aggregateBytes, fragmentCount);
     }
   }
   return aggregateBytes;
@@ -656,19 +802,71 @@ function atFinalizationStep(step: FinalizationStep): Promise<void> | void {
   return finalizationBarrier(step);
 }
 
+// ── The two families ─────────────────────────────────────────────────────────
+
+/**
+ * Everything that differs between the two families, and nothing else: the
+ * literal the artifact states, its two fixed names, and the plan admission.
+ * The transfer, the bounds, the deadline and finalization are shared.
+ */
+type AcquisitionFamily<S extends ClearHlsSegmentType> = {
+  readonly segmentType: S;
+  readonly aggregateFileName: string;
+  readonly partialFileName: string;
+  readonly admit: (plan: unknown) => AdmittedResources | null;
+};
+
+const MPEGTS_FAMILY: AcquisitionFamily<"mpegts"> = Object.freeze({
+  segmentType: "mpegts",
+  aggregateFileName: AGGREGATE_FILE_NAME,
+  partialFileName: PARTIAL_FILE_NAME,
+  admit: admitMpegTsPlan,
+});
+
+const FMP4_FAMILY: AcquisitionFamily<"fmp4"> = Object.freeze({
+  segmentType: "fmp4",
+  aggregateFileName: FMP4_AGGREGATE_FILE_NAME,
+  partialFileName: FMP4_PARTIAL_FILE_NAME,
+  admit: admitFmp4Plan,
+});
+
 // ── The acquisition ──────────────────────────────────────────────────────────
 
 /**
- * Download one approved plan's MPEG-TS fragments into one local aggregate.
- * Throws `ClearHlsAcquisitionError` otherwise; there is no partial success.
+ * Download one approved MPEG-TS plan's fragments into one local aggregate,
+ * `hls-source.ts`. The v1 entry point, unchanged in behaviour: it refuses an
+ * fMP4 plan as `invalid_plan`. See `acquireAggregate` for the lifecycle.
+ */
+export async function acquireClearHlsTs(
+  request: ClearHlsAcquisitionRequest<ClearHlsMpegTsAcquisitionPlan>,
+): Promise<ClearHlsAcquiredTs> {
+  return acquireAggregate(request, MPEGTS_FAMILY);
+}
+
+/**
+ * Download one approved fMP4 plan (HLS v2) — its initialization map first,
+ * then its fragments — into one local fragmented-MP4 input, `hls-source.fmp4`.
+ * It refuses an MPEG-TS plan as `invalid_plan`. See `acquireAggregate` for the
+ * lifecycle, which is the MPEG-TS one with the map fetched before fragment 1.
+ */
+export async function acquireClearHlsFmp4(
+  request: ClearHlsAcquisitionRequest<ClearHlsFmp4AcquisitionPlan>,
+): Promise<ClearHlsAcquiredFmp4> {
+  return acquireAggregate(request, FMP4_FAMILY);
+}
+
+/**
+ * Download one approved plan's resources into one local aggregate. Throws
+ * `ClearHlsAcquisitionError` otherwise; there is no partial success.
  *
  * Lifecycle:
  *
- *   1. structurally validate the plan, before ANY I/O;
- *   2. resolve the two fixed output paths and require both to be absent;
+ *   1. structurally validate the plan for THIS family, before ANY I/O;
+ *   2. resolve the family's two fixed output paths and require both absent;
  *   3. create the partial exclusively (`wx`, 0o600), so a pre-existing
  *      artifact fails closed instead of being silently overwritten;
- *   4. download and append every fragment, sequentially;
+ *   4. download and append the initialization map (fMP4 only), then every
+ *      fragment, sequentially;
  *   5. verify the open handle's size equals the streamed counter, then close;
  *   6. require the operation not to have been stopped;
  *   7. rename the partial onto the aggregate name and verify its size, with a
@@ -721,17 +919,22 @@ function atFinalizationStep(step: FinalizationStep): Promise<void> | void {
  * a request is built: a late answer produces no request object, no socket and
  * no request byte. Cancelling DNS itself is not claimed.
  */
-export async function acquireClearHlsTs(
+async function acquireAggregate<S extends ClearHlsSegmentType>(
   request: ClearHlsAcquisitionRequest,
-): Promise<ClearHlsAcquiredTs> {
+  family: AcquisitionFamily<S>,
+): Promise<{ readonly filePath: string; readonly segmentType: S; readonly fileSize: number }> {
   const { plan, workDir, signal, timeoutMs, onProgress } = request;
 
   // Nothing starts for a caller that has already gone: no plan work, no
   // lookup, no request and no file.
   if (signal.aborted) throw new ClearHlsAcquisitionError("cancelled");
-  if (!isApprovedPlan(plan)) throw new ClearHlsAcquisitionError("invalid_plan");
+  // The admitted resources are a snapshot: past this line the supplied plan is
+  // not read again.
+  const resources = family.admit(plan);
+  if (resources === null) throw new ClearHlsAcquisitionError("invalid_plan");
+  const fragmentCount = resources.fragmentUrls.length;
 
-  const paths = acquisitionPaths(workDir);
+  const paths = acquisitionPaths(workDir, family);
   if (paths === null) throw new ClearHlsAcquisitionError("output_error");
 
   const budgetMs = acquisitionBudgetMs(timeoutMs);
@@ -796,8 +999,8 @@ export async function acquireClearHlsTs(
 
     let aggregateBytes: number;
     try {
-      aggregateBytes = await transferFragments(
-        plan,
+      aggregateBytes = await transferResources(
+        resources,
         handle,
         controller.signal,
         budgetMs,
@@ -854,7 +1057,7 @@ export async function acquireClearHlsTs(
     // ── THE COMMIT POINT ────────────────────────────────────────────────────
     //
     // Everything that defines a successful acquisition has now happened: all
-    // fragment bytes were transferred, the source size was verified against
+    // resource bytes were transferred, the source size was verified against
     // the streamed counter, the partial was closed, the no-clobber check
     // passed, the rename completed, the final artifact became this call's, its
     // size was verified, and the final stop gate passed. From here the media
@@ -871,13 +1074,13 @@ export async function acquireClearHlsTs(
     // Built BEFORE the observer runs, so the result cannot depend on it.
     const result = Object.freeze({
       filePath: paths.aggregatePath,
-      segmentType: "mpegts" as const,
+      segmentType: family.segmentType,
       fileSize,
     });
 
     // 100 means exactly one thing: a finalized, verified, committed artifact.
     // Observer-only — a reporter that throws cannot take it back.
-    reportSafely(onProgress, plan.fragmentCount, aggregateBytes, plan.fragmentCount);
+    reportSafely(onProgress, fragmentCount, aggregateBytes, fragmentCount);
     return result;
   } catch (err) {
     const failure = classify(err);

@@ -1,7 +1,10 @@
 import { AppError } from "@/lib/errors";
 import {
   ClearHlsAcquisitionError,
+  acquireClearHlsFmp4,
   acquireClearHlsTs,
+  type ClearHlsAcquiredFmp4,
+  type ClearHlsAcquiredMedia,
   type ClearHlsAcquiredTs,
   type ClearHlsAcquisitionFailure,
   type ClearHlsAcquisitionProgress,
@@ -9,16 +12,18 @@ import {
 import {
   ClearHlsPreflightError,
   preflightClearHlsMediaPlaylist,
+  type ClearHlsAcquisitionPlan,
   type ClearHlsPreflightFailure,
 } from "./hls-preflight.server.ts";
 import {
+  processClearHlsFmp4ToMp4,
   processClearHlsTsToMp4,
   type ClearHlsProcessedMp4,
 } from "./hls-processing.server.ts";
 import type { WorkerErrorCode } from "@/shared/worker/errors";
 
 /**
- * Worker-owned CLEAR-HLS v1 EXECUTION ORCHESTRATION (HLS-6).
+ * Worker-owned CLEAR-HLS EXECUTION ORCHESTRATION (HLS-6, widened by HLS v2).
  *
  * ─── What this module is ────────────────────────────────────────────────────
  *
@@ -30,11 +35,23 @@ import type { WorkerErrorCode } from "@/shared/worker/errors";
  *
  * Two entry points, one per durable phase, and deliberately not one:
  *
- *   downloading   `acquireSelectedClearHlsTs()` — HLS-2 preflight, then HLS-3
- *                 fragment acquisition. NO local media work of any kind: no
- *                 ffprobe, no FFmpeg, no container inspection.
+ *   downloading   `acquireSelectedClearHlsMedia()` — HLS-2 preflight, then
+ *                 HLS-3 acquisition of the family the playlist declared. NO
+ *                 local media work of any kind: no ffprobe, no FFmpeg, no
+ *                 container inspection.
  *
- *   processing    `processAcquiredClearHlsTs()` — HLS-4, and nothing else.
+ *   processing    `processAcquiredClearHlsMedia()` — HLS-4 for the family the
+ *                 artifact states, and nothing else.
+ *
+ * ─── The segment family (HLS v2) ────────────────────────────────────────────
+ *
+ * The family is NOT a plan field and is not known at analysis: the public
+ * analysis never fetches a media playlist. It is learned exactly once, from the
+ * FRESH playlist HLS-2 fetched for this job, and it then travels only as the
+ * `segmentType` of the plan and of the artifact. This module dispatches on it —
+ * MPEG-TS to the unchanged v1 primitives, fMP4 to their v2 siblings — and every
+ * primitive re-checks the family it was handed, so a dispatch mistake refuses
+ * rather than processes.
  *
  * Keeping them apart is what makes "the processing boundary is the durable
  * `beginProcessing()` transition" enforceable. A single combined call could not
@@ -101,21 +118,26 @@ export type ClearHlsAcquisitionOrder = {
 };
 
 /**
- * The two primitives this seam composes, injectable as ONE object.
+ * The acquisition primitives this seam composes, injectable as ONE object: the
+ * preflight, and one acquisition primitive per segment family.
  *
- * Production always uses the real pair. The seam exists so a lifecycle test can
+ * Production always uses the real set. The seam exists so a lifecycle test can
  * observe the durable job status at the EXACT instant each primitive is
  * entered — which is the principal HLS-6 invariant — without a network, a DNS
  * lookup or a filesystem write.
  */
 export type ClearHlsAcquisitionPrimitives = {
   readonly preflight: typeof preflightClearHlsMediaPlaylist;
+  /** MPEG-TS acquisition: the v1 primitive, under its v1 name. */
   readonly acquire: typeof acquireClearHlsTs;
+  /** fMP4 acquisition (HLS v2). */
+  readonly acquireFmp4: typeof acquireClearHlsFmp4;
 };
 
 const PRODUCTION_ACQUISITION_PRIMITIVES: ClearHlsAcquisitionPrimitives = {
   preflight: preflightClearHlsMediaPlaylist,
   acquire: acquireClearHlsTs,
+  acquireFmp4: acquireClearHlsFmp4,
 };
 
 /**
@@ -126,11 +148,13 @@ const PRODUCTION_ACQUISITION_PRIMITIVES: ClearHlsAcquisitionPrimitives = {
  * reason can fall through to a guessed default.
  *
  *   FORMAT_UNAVAILABLE   the selected HLS source cannot satisfy the supported
- *                        v1 format contract — a location v1 will not request, a
- *                        body it cannot read, or a playlist outside the
- *                        accepted clear-VOD subset. `playlist_rejected` is the
- *                        HLS-1 rejection vocabulary arriving here, and HLS-1's
- *                        accepted contract already maps it this way.
+ *                        format contract — a location that will not be
+ *                        requested (a fragment's, or since HLS v2 an fMP4
+ *                        initialization map's), a body that cannot be read, or
+ *                        a playlist outside the accepted clear-VOD grammar.
+ *                        `playlist_rejected` is the HLS-1 rejection vocabulary
+ *                        arriving here, and HLS-1's accepted contract already
+ *                        maps it this way.
  *
  *   NETWORK_ERROR        the request or the destination failed: a hop the
  *                        destination policy refused, a transport failure, or a
@@ -153,6 +177,7 @@ export const CLEAR_HLS_PREFLIGHT_ERROR_CODES: Readonly<
   playlist_invalid_utf8: "FORMAT_UNAVAILABLE",
   playlist_rejected: "FORMAT_UNAVAILABLE",
   fragment_url_invalid: "FORMAT_UNAVAILABLE",
+  initialization_map_url_invalid: "FORMAT_UNAVAILABLE",
   destination_rejected: "NETWORK_ERROR",
   network_error: "NETWORK_ERROR",
   playlist_http_status: "NETWORK_ERROR",
@@ -241,12 +266,18 @@ function acquisitionAppError(err: unknown): AppError {
 
 /**
  * The whole DOWNLOADING phase of a clear-HLS job: one bounded media-playlist
- * preflight, then sequential fragment acquisition into one local MPEG-TS
- * aggregate.
+ * preflight, then sequential acquisition into one local aggregate of the family
+ * the playlist declared — MPEG-TS fragments, or (HLS v2) an fMP4
+ * initialization map followed by its fragments.
  *
  * Runs entirely while the durable job says `downloading`. It performs no local
  * media work whatsoever — this module names neither ffprobe nor FFmpeg, and
- * neither primitive it calls spawns anything.
+ * none of the primitives it calls spawns anything.
+ *
+ * The family is read from the plan HLS-2 returned — the ONE fresh playlist —
+ * and the plan goes, whole and unrebuilt, to that family's primitive, which
+ * re-admits it on its own terms. There is no fallback between families and no
+ * second preflight: a plan that is neither family is an internal fault.
  *
  * Progress is HLS-3's own, passed straight through: truthful fragment-count
  * progress with `totalBytes`, `speed` and `eta` genuinely null, because a
@@ -260,29 +291,38 @@ function acquisitionAppError(err: unknown): AppError {
  *          rebuilds it nor copies it, so what HLS-4 later validates is the same
  *          object HLS-3 committed.
  */
-export async function acquireSelectedClearHlsTs(
+export async function acquireSelectedClearHlsMedia(
   order: ClearHlsAcquisitionOrder,
   primitives: ClearHlsAcquisitionPrimitives = PRODUCTION_ACQUISITION_PRIMITIVES,
-): Promise<ClearHlsAcquiredTs> {
+): Promise<ClearHlsAcquiredMedia> {
   const { plan, workDir, signal, acquisitionTimeoutMs, onProgress } = order;
   // The sensitive value is read ONCE, here, and the plan is not consulted again.
   const playlistUrl = plan.source.playlistUrl;
 
-  let acquisitionPlan;
+  let acquisitionPlan: ClearHlsAcquisitionPlan;
   try {
     acquisitionPlan = await primitives.preflight({ playlistUrl, signal });
   } catch (err) {
     throw preflightAppError(err);
   }
 
+  const common = {
+    workDir,
+    signal,
+    ...(acquisitionTimeoutMs !== undefined ? { timeoutMs: acquisitionTimeoutMs } : {}),
+    ...(onProgress ? { onProgress } : {}),
+  };
   try {
-    return await primitives.acquire({
-      plan: acquisitionPlan,
-      workDir,
-      signal,
-      ...(acquisitionTimeoutMs !== undefined ? { timeoutMs: acquisitionTimeoutMs } : {}),
-      ...(onProgress ? { onProgress } : {}),
-    });
+    switch (acquisitionPlan.segmentType) {
+      case "mpegts":
+        return await primitives.acquire({ plan: acquisitionPlan, ...common });
+      case "fmp4":
+        return await primitives.acquireFmp4({ plan: acquisitionPlan, ...common });
+      default:
+        // Unreachable through the type system; a plan from past it is refused
+        // before any request, as an internal fault rather than a source one.
+        throw new AppError("PROCESSING_FAILED");
+    }
   } catch (err) {
     throw acquisitionAppError(err);
   }
@@ -294,26 +334,42 @@ export async function acquireSelectedClearHlsTs(
  * What one clear-HLS remux needs. Structurally HLS-4's own request, restated so
  * the executor depends on this seam rather than on the primitive directly.
  *
- * `source` must be the EXACT artifact `acquireSelectedClearHlsTs()` returned.
- * HLS-4 independently re-validates it against the fixed HLS-3 artifact identity,
- * and that defence in depth is preserved rather than short-circuited here.
+ * `source` must be the EXACT artifact `acquireSelectedClearHlsMedia()`
+ * returned. HLS-4 independently re-validates it against the fixed HLS-3
+ * artifact identity of its family, and that defence in depth is preserved
+ * rather than short-circuited here.
  */
 export type ClearHlsProcessingOrder = {
-  readonly source: ClearHlsAcquiredTs;
+  readonly source: ClearHlsAcquiredMedia;
   readonly workDir: string;
   readonly timeoutMs: number;
   readonly maxOutputBytes: number;
   readonly signal: AbortSignal;
 };
 
+/** One HLS-4 primitive per segment family, injectable as ONE object. */
+export type ClearHlsProcessingPrimitives = {
+  readonly mpegts: typeof processClearHlsTsToMp4;
+  readonly fmp4: typeof processClearHlsFmp4ToMp4;
+};
+
+const PRODUCTION_PROCESSING_PRIMITIVES: ClearHlsProcessingPrimitives = {
+  mpegts: processClearHlsTsToMp4,
+  fmp4: processClearHlsFmp4ToMp4,
+};
+
 /**
  * The whole PROCESSING phase: HLS-4's explicit ffprobe, fixed stream-copy remux
- * and output validation. Reached only after the durable `beginProcessing()`
- * transition has committed.
+ * and output validation, for the family the acquired artifact states. Reached
+ * only after the durable `beginProcessing()` transition has committed.
  *
  * There is no generic `convertMedia()` fallback, no second FFmpeg path and no
- * re-encode fallback: a transport stream that cannot be copied into MP4 is a
- * failure, not something to silently re-encode.
+ * re-encode fallback: a transport stream or an fMP4 input that cannot be
+ * copied into MP4 is a failure, not something to silently re-encode.
+ *
+ * The family is read from the artifact once, to choose the primitive; the
+ * primitive then parses the artifact itself and refuses a family other than its
+ * own, so a mismatched dispatch fails closed before any I/O.
  *
  * HLS-4 already throws the existing canonical semantics — `PROCESSING_FAILED`,
  * `TOO_LARGE`, `TIMEOUT` — and those are preserved verbatim rather than
@@ -321,16 +377,30 @@ export type ClearHlsProcessingOrder = {
  * and it collapses to `PROCESSING_FAILED` with its message dropped, because an
  * unexpected error's text is exactly the kind that names a path or a host.
  */
-export async function processAcquiredClearHlsTs(
+export async function processAcquiredClearHlsMedia(
   order: ClearHlsProcessingOrder,
-  run: typeof processClearHlsTsToMp4 = processClearHlsTsToMp4,
+  primitives: ClearHlsProcessingPrimitives = PRODUCTION_PROCESSING_PRIMITIVES,
 ): Promise<ClearHlsProcessedMp4> {
   try {
-    return await run(order);
+    const segmentType: unknown = (order.source as { segmentType?: unknown } | null)?.segmentType;
+    switch (segmentType) {
+      case "mpegts":
+        return await primitives.mpegts({ ...order, source: order.source as ClearHlsAcquiredTs });
+      case "fmp4":
+        return await primitives.fmp4({ ...order, source: order.source as ClearHlsAcquiredFmp4 });
+      default:
+        throw new AppError("PROCESSING_FAILED");
+    }
   } catch (err) {
     if (err instanceof AppError) throw err;
     throw new AppError("PROCESSING_FAILED");
   }
 }
 
-export type { ClearHlsAcquiredTs, ClearHlsAcquisitionProgress, ClearHlsProcessedMp4 };
+export type {
+  ClearHlsAcquiredFmp4,
+  ClearHlsAcquiredMedia,
+  ClearHlsAcquiredTs,
+  ClearHlsAcquisitionProgress,
+  ClearHlsProcessedMp4,
+};

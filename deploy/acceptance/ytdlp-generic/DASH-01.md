@@ -2,7 +2,8 @@
 
 **Test tooling only.** Nothing here runs during Worker startup, and none of it
 ships in the Worker image. DASH-01 runs **only** as a child of the SPLIT-07
-release-image gate (`split07-release-image-candidate-05` and later), inside the
+release-image gate (`split07-release-image-candidate-05` and later — since `-06`
+beside the HLS-11 clear-HLS v2 child), inside the
 exact candidate image, offline. It never deploys anything.
 
 DASH-01 answers the question the review of `GENERIC-SEGMENTED-DASH-EXECUTION-001`

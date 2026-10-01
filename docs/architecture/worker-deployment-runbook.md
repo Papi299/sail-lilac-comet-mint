@@ -435,6 +435,7 @@ records are in §11 and §11a–§11h.
 | Size-integer release candidate — promoted | `sha256:6ececc018029f1d984be980c35b73c5b6e2e09f17b80408bc674ab6ff020b93b` as `videofetch-worker:rc-53bb32b64045-6ececc018029` (source `53bb32b6…`): SPLIT-07 `-03` PASS 47/47, with mp4 (141/141), webm (141/141) and clear-HLS (146/146) children passing. An in-image discriminator passed 34/34, with `sha256:629ec04b…` offline as the negative control. In-image tests passed 1275/1275 across 22 suites under recorded test-environment preconditions (§11h). Its runtime/package inventory is byte-identical to `sha256:629ec04b…`. Promoted 2026-09-28 at 17:34:09Z and `videofetch-worker:latest` until the coordinated-rollout promotion at 2026-09-30 17:06:33Z — now the **immediate Worker rollback** (below) | operator-measured — §11h |
 | Media-execution failure classification (`MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001`) | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED — 2026-09-30.** PR #101 (merge `9de75a57…`). A failed job reaches the browser as its most specific allowlisted code, that code's canonical message and a closed failure stage; the control plane no longer forwards the Worker's `safeErrorMessage` (the Worker-restart pair is the one exact exception). The Worker's `failJob()` writes `Download failed` / `Processing failed` / `Upload failed` from the status it leaves, and a direct mid-body source failure is `NETWORK_ERROR`. No public error code was added. Both halves are live: the control plane in `dpl_DrDdgct3…`, the Worker in `sha256:db11b5ba…`. Live proof: exact-source provenance of both layers, the new canonical copy in the served browser bundle, canonical missing-job and malformed-job status answers, and an ordinary successful 1080p job. No failure was induced in Production: the individual failure-code mappings are proven by the deterministic source tests, not live | source GitHub-verifiable; deployment provenance and Production acceptance operator-measured — `worker-api-contract.md`, §11, §11h |
 | Segmented DASH (`GENERIC-SEGMENTED-DASH-EXECUTION-001`) | **CLOSED / DEPLOYED / RELEASE-IMAGE QUALIFIED / PRODUCTION HEALTH ACCEPTED — 2026-09-30 — live public DASH source not separately exercised.** PR #102 (merge `c8dfe9a9…`). A proven video-only or audio-only `http_dash_segments` half of a `merge-split` pair is acquired by yt-dlp's pinned native `DashSegmentsFD`; single-source, muxed or unknown-audio segmented renditions stay withheld. The exact promoted image passed the real-media DASH-01 child (142/142) in SPLIT-07 `-05`, and Production health, egress, workspace and broker were accepted after promotion. The mandatory YouTube source used `https` halves, so no live segmented-DASH download was exercised | source GitHub-verifiable; DASH-01 qualification and Production health operator-measured — §4k, §11h |
+| Clear-HLS v2 (`HLS-V2-ADAPTIVE-VOD-EXPANSION-001`) | **IMPLEMENTED IN SOURCE — PRODUCTION DEPLOYMENT / ACCEPTANCE PENDING.** Draft PR on branch `feat/hls-v2-adaptive-vod-expansion-001` (base `main` `7f1ecdaa…`); not merged, not in a retained release candidate, not deployed. It adds ONE shape to clear HLS: a muxed **fMP4** media playlist with exactly one `EXT-X-MAP:URI="…"` initialization map and a declared `EXT-X-VERSION` of at least 6 (the exact no-value `EXT-X-INDEPENDENT-SEGMENTS` is admitted and discarded), acquired map-first by VideoFetch and stream-copied to MP4 after `beginProcessing()`. Separate HLS audio (split TS or split fMP4) was **not** implemented — **BLOCKED: HLS audio pairing provenance insufficient** (the pinned yt-dlp removes its internal audio-group id before `-J`). No public schema change and no Vercel deployment are needed. Release-image qualification is the new mandatory HLS-11 child in SPLIT-07 `-06` | source GitHub-verifiable once merged; qualification executor-local, not CI — §4m |
 | Browser status-poll resilience (`BROWSER-JOB-STATUS-POLL-RESILIENCE-001`) | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED — 2026-09-30 — live browser-only reconnect accepted.** PR #103 (merge `0f8bff3a…`), Vercel/browser only. One status request in flight at a time, transient failures retried with backoff for up to 120 s of continuous outage with the job kept, and **Retry status** for the same job id; definitive answers still stop. Live: on the 1080p job polling stayed single-flight, with exactly one download request and one durable job; with only the test browser taken offline for about 12 s, the reconnect notice appeared, polling resumed on the same job id with no resubmission, and the job reached `ready`. A controlled browser-only interruption, not a tunnel outage | source GitHub-verifiable; Production acceptance operator-measured — §4l, §11h |
 | YouTube regression `S_XfAWeXRFQ` | **CURRENT PRODUCTION ACCEPTED — HISTORICAL FAILURE NOT REPRODUCED — 2026-09-30.** After the coordinated rollout, one normal-UI `preset:1080` job ran `queued → analyzing → downloading → processing → uploading → ready` in about 60 s through `https` + `https` → merge-split → mp4 (no DASH) and delivered 393,827,511 bytes: H.264 1920×1080 with AAC audio, fully decoded. The historical "We hit a snag" is consistent with the confirmed status-poll defect and observed tunnel interruptions, but that causal chain was never directly captured | operator-measured — §4k, §11h |
 | Coordinated-rollout release candidate — promoted | `sha256:db11b5ba547fe52a79614d6874651cc4792e4bf9537549c5b7007fd37818c23b` as `videofetch-worker:rc-0f8bff3aad27-db11b5ba547f` (source `0f8bff3a…`): SPLIT-07 `-05` PASS 52/52, with mp4 (141/141), webm (141/141), clear-HLS (146/146) and DASH-01 (142/142) children passing, and all candidate runs on the same immutable id with no network. Its runtime/package inventory is byte-identical to `sha256:6ececc01…` (inventory SHA-256 `6916a953741ac85ad9625b594f650c813c17eb6072f49c9a214eb5fe83729028`). Promoted 2026-09-30 at 17:06:33.640Z and now also `videofetch-worker:latest` | operator-measured — §11h |
@@ -3364,6 +3365,10 @@ vocabulary and still no HLS spelling; PR #101 changes only how a failure is
 classified and labelled. Clear HLS was not reimplemented, and HLS-10 below
 still remains its Production acceptance.*
 
+*This section describes the DEPLOYED clear-HLS **v1** subset. The clear-HLS
+**v2** source capability — muxed fMP4 — is implemented in source only and is
+not deployed; see §4m.*
+
 Three separate states apply, and clear HLS has now reached all three:
 
 | State | Clear-HLS v1 |
@@ -3459,11 +3464,13 @@ analysis never fetches — is refused by the job-time HLS-2 preflight
 - encrypted HLS: any `EXT-X-KEY` or `EXT-X-SESSION-KEY` line, `METHOD=NONE`
   included;
 - DRM;
-- fMP4 / `EXT-X-MAP`;
+- fMP4 / `EXT-X-MAP` — in Production. `HLS-V2-ADAPTIVE-VOD-EXPANSION-001` adds
+  one muxed-fMP4 shape in source only, not deployed (§4m);
 - byte-range HLS (`EXT-X-BYTERANGE`);
 - discontinuities: v1 accepts no `EXT-X-DISCONTINUITY` or
   `EXT-X-DISCONTINUITY-SEQUENCE` at all;
-- separate HLS audio-rendition pairing;
+- separate HLS audio-rendition pairing — still unsupported in source too: the
+  pinned yt-dlp exposes no video→audio relationship to pair on (§4m);
 - HLS subtitles;
 - any HLS protocol spelling other than exactly `m3u8_native`;
 - **segmented DASH** — not an HLS concern. It was inventory-only here; since
@@ -4224,6 +4231,188 @@ job through the real UI:
   outage-budget and retry-exhausted paths.
 
 ---
+
+### 4m. Clear-HLS v2 (muxed fMP4) — IMPLEMENTED IN SOURCE — PRODUCTION DEPLOYMENT / ACCEPTANCE PENDING
+
+*Recorded by `HLS-V2-ADAPTIVE-VOD-EXPANSION-001` (Draft PR, branch
+`feat/hls-v2-adaptive-vod-expansion-001`, base `main` `7f1ecdaa…`). Nothing
+here is deployed. No Production VM, Worker image, Vercel deployment, tunnel,
+R2 or other provider state was touched. Every qualification fact below is
+executor-local, measured on an isolated Docker host, and is not CI (this
+repository has no CI).*
+
+| State | Clear-HLS v2 |
+| :--- | :--- |
+| Implemented in source | **yes** — this Draft PR, not merged |
+| Qualified in a retained release candidate | **no** — SPLIT-07 `-06` (with the HLS-11 child) is run against the PR head on an isolated host and its evidence is recorded in the PR description; no candidate is retained |
+| Deployed in Production | **no** — Production still refuses fMP4 at the HLS-2 preflight (§4j) |
+
+#### What v2 adds — and the one thing it deliberately does not
+
+Clear-HLS v1 (§4j) accepted one muxed MPEG-TS rendition. v2 admits exactly
+**one** further shape:
+
+- **muxed fMP4** — a finite, clear VOD media playlist whose one
+  `#EXT-X-MAP:URI="…"` initialization map precedes every fragment, that
+  declares `#EXT-X-VERSION` 6 or higher, with ordinary full-resource fMP4
+  fragments, where the rendition itself carries the video and the audio.
+
+It does **not** add separate HLS audio — a video-only rendition plus an
+audio-only rendition, in MPEG-TS or fMP4. That is **BLOCKED — HLS AUDIO
+PAIRING PROVENANCE INSUFFICIENT**. The pinned yt-dlp `2026.08.19`
+(`sha256:1fa6733c…`) records a variant's `AUDIO` group only in an internal
+`_audio_group_id`. `_parse_m3u8_formats_and_subtitles` pops that field from
+every format before `-J` prints. So a video variant that references an audio
+group and a video-only variant that references none are identical in every
+field `-J` carries: both have `acodec: "none"` and the same key set. The only
+association-like signals left are the audio format-id text
+(`hls-<group>-<NAME>`), NAME/LANGUAGE labels and bitrate ranks
+(`source_preference`). This task forbids every one of them as a pairing rule.
+The finding was measured on deterministic masters with the exact Production
+analysis argv, and the HLS-11 release child re-proves it inside the candidate
+image. Such renditions still back no preset, and they are reported as
+`unsupported_protocol` in `sourceQuality`. A future design would need either an
+upstream relationship or an approved master-playlist seam.
+
+#### The v2 media-playlist grammar (`hls-media-playlist.ts`)
+
+The v1 allowlist is unchanged (`HLS_V1_ALLOWED_TAGS`, seven tags). The v2
+grammar (`HLS_V2_ALLOWED_TAGS`) adds exactly two tags. The parser holds every
+playlist, MPEG-TS included, to it.
+
+`#EXT-X-MAP` is admitted only as:
+
+- exactly `URI="<reference>"`, a quoted string and no other attribute;
+- at most once, and before the first `#EXTINF`, so one map applies to every
+  fragment;
+- a reference held to the fragment-reference grammar and its 2 KiB bound;
+- in a playlist that declares exactly one `#EXT-X-VERSION` of **6 or higher**
+  (RFC 8216 §7: `EXT-X-MAP` outside an I-frame playlist, and I-frame playlists
+  are refused). A missing version or a lower one is refused as
+  `incompatible_version`, a private reason with a fixed message, mapped to
+  `FORMAT_UNAVAILABLE` at HLS-2. The version is never inferred, repaired or
+  retained, and the existing 1–10 bound is unchanged. A playlist without a map
+  keeps the v1 rule: any bounded version, or none.
+
+`#EXT-X-INDEPENDENT-SEGMENTS` is admitted only as exactly that line — no colon,
+no value, no attribute — at most once (`duplicate_tag`); any value-bearing
+spelling is `malformed_tag_value`. It names no resource, range, key or order,
+so it is validated and discarded: it is not retained in the model or the plan,
+changes no request, ordering, acquisition or processing decision, and is not
+read as evidence of a segment family, codec, keyframe structure or stream.
+Common packagers emit it in fMP4 media playlists; the pinned FFmpeg `hls`
+muxer writes `#EXT-X-VERSION:7` and `#EXT-X-INDEPENDENT-SEGMENTS` for
+`-hls_flags independent_segments`. Because the grammar is shared, an MPEG-TS
+playlist carrying the same exact line is admitted too (v1 refused it as an
+unknown tag); it still parses to the unchanged v1 `mpegts` model, and nothing
+else about the MPEG-TS path changes.
+
+A `BYTERANGE` map attribute is refused as `byte_range`. Any other attribute, an
+unquoted or empty URI, a second map (`duplicate_tag`) and a map after a
+fragment has begun (`initialization_map_position`) are refused too. A playlist
+without a map is the unchanged `mpegts` model, and one with a map is the
+`fmp4` model: `{ segmentType, initializationMap: { reference }, fragments,
+fragmentCount }`. Everything v1 refused is still refused: keys and session
+keys, live/EVENT, missing `ENDLIST`, `EXT-X-BYTERANGE`, discontinuities, master
+constructs, subtitles, I-frame playlists, `EXT-X-START`, `EXT-X-DATERANGE`,
+`EXT-X-GAP`, the low-latency tags and every other unknown tag.
+
+#### Acquisition, processing and the lifecycle boundary
+
+- **HLS-2** resolves the map against the final (post-redirect) playlist URL
+  through the same static policy and 4 KiB bound as a fragment. An
+  unacceptable map is `initialization_map_url_invalid` → `FORMAT_UNAVAILABLE`,
+  before any fragment is resolved. The map is not fetched here.
+- **HLS-3** (`acquireClearHlsFmp4`) fetches the map FIRST, through the same
+  one-logical-`safeGet()`-per-resource primitive, then each fragment
+  sequentially, into one file, `hls-source.fmp4`. The map is held to the same
+  64 MiB per-resource ceiling and counts against the ONE actual-byte aggregate
+  limit. It is not a fragment for progress. The v1 MPEG-TS path keeps its
+  exact requests, names and bounds; each entry point refuses the other
+  family's plan (`invalid_plan`). The same deadline, cancellation,
+  finalization barrier and commit point apply.
+- **HLS-4** (`processClearHlsFmp4ToMp4`) probes the source with the explicit
+  `mov` demuxer and requires exactly one video and one audio stream. It
+  remuxes with the v1 argv, token for token, except `-f mov` for `-f mpegts`,
+  and validates the produced and final MP4 as in v1. A video-only fMP4
+  rendition is refused by the real ffprobe before any FFmpeg run. No encoder
+  is ever named: the pinned FFmpeg `5.1.9` stream-copied a real
+  `styp`/`sidx`/`moof`/`mdat` CMAF concatenation into a faststart MP4 with every
+  packet byte-identical.
+- The **execution seam** (`hls-execution.server.ts`) learns the family only
+  from the fresh playlist HLS-2 fetched. It dispatches without fallback, and
+  every primitive re-checks the family it was handed. Downloading remains
+  network acquisition only. No ffprobe or FFmpeg runs until the durable job
+  is `processing` — pinned by `hls-v2-execution-boundary.server.test.ts`
+  through the production composition, and measured again in the release
+  image.
+
+#### Workspace, public contract, `sourceQuality`
+
+- **Workspace.** Unchanged at `2 × maxFileSize`. The fMP4 aggregate is ONE
+  input file whose map is counted inside the same actual-byte bound, so input
+  ≤ max, output ≤ max and input + output ≤ 2 × max.
+- **Public contract.** Unchanged. An HLS-backed preset is still an ordinary
+  `mp4` preset with video and audio. The browser never learns the segment
+  family, and no schema, error code or Vercel change is involved.
+- **`sourceQuality`.** Analysis never fetches a media playlist, so it cannot
+  tell MPEG-TS from fMP4. A muxed m3u8_native rendition with proven video and
+  audio was already advertised and counted as deliverable under v1. v2 changes
+  what happens at job time: such an fMP4 rendition used to fail the HLS-2
+  preflight with `FORMAT_UNAVAILABLE`, and it now completes. Unsupported shapes
+  keep the existing generic browser copy.
+
+#### Release-image qualification: HLS-11 and SPLIT-07 `-06`
+
+`deploy/acceptance/ytdlp-generic/hls11-full-path.mjs`
+(`hls11-release-image-full-path-01`, 159 mandatory checks) runs inside the
+candidate image, offline, with its own `--add-host`
+(`hls11-fixture.example.invalid`). It is a new mandatory child beside the
+unchanged HLS-09. It covers:
+
+- a 1920x1080 MPEG-TS control and a 1920x1080 fMP4 rendition (4 × 1 s,
+  bit-exact recipes) from real pinned-yt-dlp analysis to `ready`. The fMP4
+  playlist is the pinned FFmpeg's own `-hls_flags independent_segments`
+  output, served verbatim: `#EXT-X-VERSION:7` and the no-value
+  `#EXT-X-INDEPENDENT-SEGMENTS`;
+- the v2 grammar measured with the candidate's parser on that text: the
+  declaration derives no state (the model equals the model without it),
+  version 6 is admitted into the same model, and versions 5, 1 and none are
+  refused;
+- the durable status at every playlist, map and fragment request
+  (`downloading`), every ffprobe/FFmpeg (`processing`) and the upload
+  (`uploading`);
+- the delivered MP4's streams, geometry, duration, faststart layout and packet
+  preservation;
+- eight fail-closed negatives — a byte-range map, an encrypted playlist, a 404
+  map, a budget that is exceeded only because the map counts, a video-only
+  rendition whose master claims audio, and three grammar refusals before the
+  map is requested: version 5, no version, and a valued
+  `EXT-X-INDEPENDENT-SEGMENTS`;
+- the split-master pairing case.
+
+SPLIT-07 moves to `split07-release-image-candidate-06`; `-05` is historical and
+stays valid for the images it qualified. Mutation controls showed the gate
+catches:
+
+- skipping the map fetch;
+- admitting an audio-less rendition;
+- running FFmpeg while `downloading`;
+- excluding the map from the byte budget;
+- dropping audio from the output;
+- removing the fMP4 version gate (M6: the version-5 and no-version negatives
+  reach `ready`);
+- removing the independent-segments admission (M7: the fMP4 positive fails at
+  HLS-2).
+
+#### Deployment and follow-ups
+
+Worker-only when promoted, with no Vercel step. A promotion needs its own
+authorization: merge, a retained release candidate passing SPLIT-07 `-06`,
+promotion, and a real-source regression that includes the accepted clear-HLS
+v1 source. Tracked in §11: separate HLS audio pairing (blocked). The earlier
+`EXT-X-INDEPENDENT-SEGMENTS` follow-up was folded into this PR at independent
+review: the exact no-value tag is now admitted and discarded (above).
 
 ## 5. Object storage (R2)
 
@@ -6184,6 +6373,8 @@ authorization.
 | `BROWSER-JOB-STATUS-POLL-RESILIENCE-001` | **CLOSED / DEPLOYED / PRODUCTION ACCEPTED** (2026-09-30) — live browser-only reconnect accepted | *Source (GitHub-verifiable):* PR #103, merge `0f8bff3aad27389ef6120955b6dc68df49dada0b`; Vercel/browser only (§4l). *Live (operator-measured):* polling stayed single-flight, with exactly one download request and one durable job. A controlled offline window of about 12 s on the test browser only showed the reconnect notice and resumed polling on the same job id with no resubmission, and the job reached `ready`. It was not a tunnel outage; the outage-budget and retry-exhausted paths rest on the deterministic tests. Full record: §4l, §11h. |
 | `PR101-102-103-COORDINATED-PRODUCTION-ROLLOUT-001` | **PRODUCTION ACCEPTED — PR #101 + #102 + #103** (2026-09-30; first attempt, no rollback) | Candidate qualification → Vercel deployment → Vercel + old-Worker smoke → Worker promotion → Production acceptance. Worker `sha256:db11b5ba…` (immediate rollback `sha256:6ececc01…`); Vercel `dpl_DrDdgct3…` (immediate rollback `dpl_8k6e59…`). `worker.env`, the units and cloudflared unchanged; VM Stopped → Stopped. Full record: §11h. |
 | `CLOUDFLARED-QUIC-VS-HTTP2-EXTENDED-SOAK-001` | **NON-BLOCKING RELIABILITY FOLLOW-UP — not started** | Awake-host all-connection QUIC outages of the named tunnel remain intermittent, with an unresolved origin; most earlier drops coincided with host sleep, which is expected on-demand downtime. A controlled 6-hour QUIC-versus-HTTP/2 comparison on 2026-09-30 captured no outage, with both protocols stable, so no evidence justifies changing the Production transport, which stays auto → QUIC. Only a longer awake soak could discriminate between the protocols; it blocks no Product release. *Operator-measured* diagnostics; nothing was changed. |
+| `HLS-V2-ADAPTIVE-VOD-EXPANSION-001` | **IMPLEMENTED IN SOURCE — PRODUCTION DEPLOYMENT / ACCEPTANCE PENDING** | Muxed fMP4 clear HLS (§4m). Next: independent review, merge, a retained release candidate passing SPLIT-07 `-06` (HLS-11 included), Worker-only promotion and a real-source regression that includes the accepted clear-HLS v1 source. No Vercel step. |
+| `HLS-SEPARATE-AUDIO-PAIRING-001` | **BLOCKED — HLS AUDIO PAIRING PROVENANCE INSUFFICIENT** | Separate HLS audio (split TS / split fMP4) was not implemented by `HLS-V2-ADAPTIVE-VOD-EXPANSION-001`: the pinned yt-dlp `2026.08.19` pops its internal `_audio_group_id` from every HLS format before `-J`, so a grouped video variant and an ungrouped video-only variant are indistinguishable (§4m). Unblocking needs an upstream relationship field or a separately approved master-playlist seam, never a label/order/bitrate heuristic. |
 
 ---
 

@@ -21,6 +21,16 @@ import { validatePublicHttpUrl } from "@/lib/validation/url";
  * It performs NO I/O of any kind: no network, no DNS, no filesystem, no
  * subprocess, no clock, no randomness. Give it candidates, get a frozen map.
  *
+ * HLS-V2-ADAPTIVE-VOD-EXPANSION-001 left this module UNCHANGED, and that is a
+ * finding rather than an omission. A selection is still ONE media playlist of a
+ * self-contained muxed rendition. fMP4 needed no selection change, because the
+ * segment family is declared by the media playlist, which only HLS-2 reads. A
+ * split video + separate-audio selection was NOT added: pinned yt-dlp
+ * 2026.08.19 pops its internal `_audio_group_id` from every HLS format before
+ * `-J` prints, so no application-usable video→audio relationship survives into
+ * analysis, and pairing on anything left (format-id text, NAME/LANGUAGE labels,
+ * ordering or bitrate) would be a guess. Such renditions stay unselected.
+ *
  * ─── What this module is NOT ────────────────────────────────────────────────
  *
  *   - It is not a capability decision. A placement on the shadow ladder does

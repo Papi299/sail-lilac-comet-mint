@@ -2251,7 +2251,10 @@ function withheldReasonFor(cause: WithheldCause): SourceQualityWithheldReason {
 // ── Clear-HLS admission (HLS-5) ──────────────────────────────────────────────
 
 /**
- * Judges ONE raw format for the clear-HLS v1 channel.
+ * Judges ONE raw format for the clear-HLS channel. HLS v2 left admission
+ * unchanged: the segment family of a rendition (MPEG-TS or fMP4) is decided by
+ * its media playlist, which analysis never fetches, so the same admitted
+ * rendition may be acquired either way at execution time.
  *
  * This runs entirely beside the progressive path and changes nothing about its
  * eligibility. An HLS format is still refused by `evaluateRawFormat` as
@@ -2285,8 +2288,10 @@ function withheldReasonFor(cause: WithheldCause): SourceQualityWithheldReason {
  *              acquired, so it fails closed here too.
  *
  *   AUDIO      PROVEN present: `classifyCodecState(acodec) === "present"`.
- *              Unknown is not enough and absent is not enough. HLS v1 has no
- *              audio pairing, and HLS-4's approved local media shape is
+ *              Unknown is not enough and absent is not enough. Clear HLS has
+ *              no audio pairing — HLS v2 did not add one, because the pinned
+ *              yt-dlp exposes no video→audio rendition relationship to pair
+ *              on — and HLS-4's approved local media shape is
  *              exactly one video plus exactly one audio — so a rendition whose
  *              audio nothing establishes has no viable path through the rest
  *              of the chain. This is a metadata screen, not a claim that
