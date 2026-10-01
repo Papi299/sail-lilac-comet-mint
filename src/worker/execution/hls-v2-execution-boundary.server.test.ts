@@ -326,6 +326,32 @@ describe("HLS v2 boundary: an fMP4 job through the production composition", () =
     assert.ok(workDirGone, "the job workDir is removed");
   });
 
+  it("runs version 6 with the exact independent-segments declaration exactly as it runs version 7 without it", async () => {
+    const runOnce = async (playlistText: string) => {
+      world.puts.length = 0;
+      const requests = network({ ...fmp4Routes(), [PLAYLIST_URL]: () => body(playlistText) });
+      const spawned = processes();
+      const { final } = await runJob();
+      return {
+        status: final?.status,
+        requests: requests.map((r) => `${r.url}@${r.status}`),
+        spawns: spawned.map((s) => `${s.tool}@${s.status}:${s.args[s.args.indexOf("-f") + 1]}`),
+        aggregate: spawned[0]?.inputBytes ?? null,
+        uploaded: world.puts.map((p) => `${p.input.contentLength}@${p.status}`),
+      };
+    };
+    const declared = await runOnce(
+      fmp4Playlist().replace("#EXT-X-VERSION:7", "#EXT-X-VERSION:6\n#EXT-X-INDEPENDENT-SEGMENTS"),
+    );
+    const plain = await runOnce(fmp4Playlist());
+    assert.equal(declared.status, "ready");
+    assert.deepEqual(declared.requests, [PLAYLIST_URL, INIT_URL, ...FRAGMENTS].map((url) => `${url}@downloading`));
+    assert.deepEqual(declared.aggregate, Buffer.concat([INIT_BYTES, ...FRAGMENT_BYTES]));
+    // The declaration changed nothing the job did: same requests, same order,
+    // same processes on the same demuxer, same upload.
+    assert.deepEqual(declared, plain);
+  });
+
   it("keeps the v1 MPEG-TS path on the MPEG-TS demuxer and the unchanged argv", async () => {
     const requests = network({
       [PLAYLIST_URL]: () => body(tsPlaylist()),
@@ -363,6 +389,40 @@ describe("HLS v2 boundary: every fMP4 failure fails closed before any media tool
   it("refuses a drifted playlist with a byte-range map, requesting neither map nor fragment", async () => {
     const requests = network({
       [PLAYLIST_URL]: () => body(fmp4Playlist('#EXT-X-MAP:URI="init.mp4",BYTERANGE="720@0"')),
+    });
+    const spawned = processes();
+    await failsClosed("FORMAT_UNAVAILABLE");
+    assert.deepEqual(requests.map((r) => r.url), [PLAYLIST_URL]);
+    assert.equal(spawned.length, 0);
+  });
+
+  it("refuses an fMP4 playlist with no compatible version before the map is requested", async () => {
+    for (const drift of [
+      (text: string) => text.replace("#EXT-X-VERSION:7\n", ""),
+      (text: string) => text.replace("#EXT-X-VERSION:7", "#EXT-X-VERSION:1"),
+      (text: string) => text.replace("#EXT-X-VERSION:7", "#EXT-X-VERSION:5"),
+    ]) {
+      world.puts.length = 0;
+      const requests = network({ ...fmp4Routes(), [PLAYLIST_URL]: () => body(drift(fmp4Playlist())) });
+      const spawned = processes();
+      const { final } = await runJob();
+      assert.equal(final?.status, "failed");
+      assert.equal(final?.errorCode, "FORMAT_UNAVAILABLE");
+      assert.deepEqual(requests.map((r) => r.url), [PLAYLIST_URL], "no map and no fragment request");
+      assert.equal(spawned.length, 0);
+      assert.equal(world.puts.length, 0);
+      // The private HLS-1 reason stays private: nothing of it is persisted.
+      const row = JSON.stringify(world.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?").get(world.jobId));
+      for (const needle of ["incompatible", "VERSION", "version", "EXT-X", "init.mp4", "PRIVATE_V2_TOKEN"]) {
+        assert.equal(row.includes(needle), false, needle);
+      }
+    }
+  });
+
+  it("refuses a value-bearing independent-segments declaration before the map is requested", async () => {
+    const requests = network({
+      ...fmp4Routes(),
+      [PLAYLIST_URL]: () => body(fmp4Playlist().replace("#EXT-X-VERSION:7", "#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS:YES")),
     });
     const spawned = processes();
     await failsClosed("FORMAT_UNAVAILABLE");

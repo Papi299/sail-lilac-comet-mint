@@ -61,10 +61,13 @@ import { Buffer } from "node:buffer";
  * lines only.
  *
  * The approved v2 grammar is that subset plus the ONE initialization map
- * described above (HLS-V2-ADAPTIVE-VOD-EXPANSION-001 §15–§17). Everything else
- * the v1 subset refused is still refused: byte ranges — including a
- * `BYTERANGE` attribute on the map itself — discontinuities, keys, live and
- * event shapes, master constructs, subtitles and every unknown tag.
+ * described above (HLS-V2-ADAPTIVE-VOD-EXPANSION-001 §15–§17), plus the exact
+ * no-value `#EXT-X-INDEPENDENT-SEGMENTS` declaration, which is validated and
+ * then discarded. A playlist that declares the map must also declare a
+ * compatibility version of at least 6, as RFC 8216 §7 requires of it.
+ * Everything else the v1 subset refused is still refused: byte ranges —
+ * including a `BYTERANGE` attribute on the map itself — discontinuities, keys,
+ * live and event shapes, master constructs, subtitles and every unknown tag.
  */
 
 // ── Input bounds (§7, §17) ───────────────────────────────────────────────────
@@ -110,11 +113,12 @@ export const HLS_V1_MAX_FRAGMENT_REFERENCE_BYTES = 2048;
  *
  *   #EXTM3U               the mandatory first line; proves the document is a
  *                         playlist at all
- *   #EXT-X-VERSION        bounded sanity only; the transport never branches on
- *                         the value. v1 could say every version-gated feature
- *                         was refused outright; v2 admits the initialization
- *                         map on its own closed terms (see `HLS_V2_ALLOWED_TAGS`)
- *                         and still does not consult the version to do so
+ *   #EXT-X-VERSION        bounded sanity, and never retained; the transport
+ *                         never branches on the value. v1 could say every
+ *                         version-gated feature was refused outright. v2
+ *                         consults it once: a playlist carrying the
+ *                         initialization map must declare at least version 6
+ *                         (see `HLS_V2_ALLOWED_TAGS`)
  *   #EXT-X-TARGETDURATION RFC-required in a media playlist; its presence is
  *                         part of what distinguishes one from a master playlist
  *   #EXT-X-MEDIA-SEQUENCE structural validation only, and NOT retained: the
@@ -139,7 +143,7 @@ export const HLS_V1_ALLOWED_TAGS = Object.freeze([
 
 /**
  * The ONLY tags the v2 grammar admits: the v1 vocabulary above, unchanged, plus
- * exactly one more.
+ * exactly two more.
  *
  *   #EXT-X-MAP            the fMP4 initialization map, admitted ONLY as
  *                         `#EXT-X-MAP:URI="<reference>"` — one quoted URI and
@@ -149,13 +153,32 @@ export const HLS_V1_ALLOWED_TAGS = Object.freeze([
  *                         range; any other attribute, an unquoted or empty URI,
  *                         a second map, or a map after a fragment has begun is
  *                         refused as well. The reference is held to the SAME
- *                         grammar and bound as a fragment reference.
+ *                         grammar and bound as a fragment reference. A playlist
+ *                         carrying it must declare `#EXT-X-VERSION` 6 or higher
+ *                         (RFC 8216 §7: the map outside an I-frame playlist,
+ *                         and I-frame playlists are refused); a missing or
+ *                         lower version is refused, never inferred or repaired.
+ *   #EXT-X-INDEPENDENT-SEGMENTS
+ *                         admitted ONLY as exactly that line — no colon, no
+ *                         value, no attribute — at most once. It is a
+ *                         playlist-wide statement about how the media was
+ *                         encoded and names no resource, range, key or order,
+ *                         so the transport has no use for it: it is validated
+ *                         and discarded. It is not evidence of a segment
+ *                         family, a codec, a keyframe structure or a stream,
+ *                         and it leaves no trace in the parsed model. Common
+ *                         packagers (FFmpeg's `hls` muxer among them) emit it
+ *                         in fMP4 media playlists.
  *
  * `HLS_V1_ALLOWED_TAGS` stays exported, unchanged, as the historical v1 subset:
- * the accepted HLS-08/HLS-09 acceptance fixtures are checked against it, and an
- * MPEG-TS playlist still uses nothing outside it.
+ * the accepted HLS-08/HLS-09 acceptance fixtures are checked against it. The
+ * parser holds every playlist, MPEG-TS included, to the v2 vocabulary.
  */
-export const HLS_V2_ALLOWED_TAGS = Object.freeze([...HLS_V1_ALLOWED_TAGS, "#EXT-X-MAP"] as const);
+export const HLS_V2_ALLOWED_TAGS = Object.freeze([
+  ...HLS_V1_ALLOWED_TAGS,
+  "#EXT-X-MAP",
+  "#EXT-X-INDEPENDENT-SEGMENTS",
+] as const);
 
 const ALLOWED_TAGS = new Set<string>(HLS_V2_ALLOWED_TAGS);
 
@@ -219,6 +242,7 @@ export type ClearHlsPlaylistRejection =
   | "malformed_initialization_map"
   | "initialization_map_position"
   | "initialization_map_reference_too_long"
+  | "incompatible_version"
   | "byte_range"
   | "discontinuity"
   | "live_or_event"
@@ -258,6 +282,7 @@ const REJECTION_MESSAGES: Record<ClearHlsPlaylistRejection, string> = {
   malformed_initialization_map: "playlist declares an unsupported initialization map",
   initialization_map_position: "playlist declares its initialization map after a fragment",
   initialization_map_reference_too_long: "playlist has an overlong initialization map reference",
+  incompatible_version: "playlist declares no version compatible with its initialization map",
   byte_range: "playlist declares a byte range",
   discontinuity: "playlist declares a discontinuity",
   live_or_event: "playlist is not a finite VOD playlist",
@@ -318,6 +343,8 @@ export type ClearHlsFragmentReference = {
  * Intentionally tiny. No raw manifest text, no tag map, no key material, no
  * arbitrary metadata, no selector strings — nothing that would let a later
  * stage re-interpret the manifest instead of using what was approved here.
+ * Neither the declared version nor an independent-segments declaration
+ * survives: both are validation evidence only.
  *
  * `segmentType` is a private literal, not an upstream value, and it is the
  * discriminant: it keeps each downstream stage honest about which explicit
@@ -413,11 +440,24 @@ const MAX_INTEGER_DIGITS = 15;
  * `#EXT-X-VERSION` values v1 will tolerate.
  *
  * The transport never branches on the version. The bound exists only so an
- * absurd or non-numeric value fails closed; every feature a high version would
- * signal is already refused on its own terms.
+ * absurd or non-numeric value fails closed. The one version-gated feature v2
+ * admits, the initialization map, is held to `MIN_FMP4_PLAYLIST_VERSION`
+ * below; every other feature a high version would signal is refused on its own
+ * terms.
  */
 const MIN_PLAYLIST_VERSION = 1;
 const MAX_PLAYLIST_VERSION = 10;
+
+/**
+ * The lowest `#EXT-X-VERSION` a playlist carrying an initialization map may
+ * declare (RFC 8216 §7: `EXT-X-MAP` in a media playlist without
+ * `EXT-X-I-FRAMES-ONLY` needs version 6; I-frame playlists are refused here).
+ *
+ * This is the one place the parser consults the version, and only as a
+ * validation gate: the value is read, compared and dropped. It is never part
+ * of the model, so nothing downstream can branch on it.
+ */
+const MIN_FMP4_PLAYLIST_VERSION = 6;
 
 /** A target duration, in seconds, beyond which the document is not credible. */
 const MAX_TARGET_DURATION_SECONDS = 86_400;
@@ -593,6 +633,8 @@ export function parseClearHlsMediaPlaylist(input: string): ClearHlsMediaPlaylist
   let sawEndList = false;
   let pendingExtinf = false;
   let initializationMap: string | null = null;
+  // Validation evidence only: compared once below, never returned.
+  let version: number | null = null;
 
   for (let index = 1; index < lines.length; index += 1) {
     const line = lines[index] ?? "";
@@ -633,7 +675,7 @@ export function parseClearHlsMediaPlaylist(input: string): ClearHlsMediaPlaylist
       // already refused by the duplicate guard above.
       switch (name) {
         case "#EXT-X-VERSION":
-          requireBoundedInteger(value, MIN_PLAYLIST_VERSION, MAX_PLAYLIST_VERSION);
+          version = requireBoundedInteger(value, MIN_PLAYLIST_VERSION, MAX_PLAYLIST_VERSION);
           break;
         case "#EXT-X-TARGETDURATION":
           requireBoundedInteger(value, 1, MAX_TARGET_DURATION_SECONDS);
@@ -667,6 +709,12 @@ export function parseClearHlsMediaPlaylist(input: string): ClearHlsMediaPlaylist
           if (pendingExtinf || fragments.length > 0) refuse("initialization_map_position");
           initializationMap = readInitializationMap(value);
           break;
+        case "#EXT-X-INDEPENDENT-SEGMENTS":
+          // The exact no-value spelling only; a repeat was refused above. The
+          // declaration changes nothing the transport does, so it is
+          // validated and discarded: no flag, no field, no branch.
+          if (value !== null) refuse("malformed_tag_value");
+          break;
         default:
           refuse("unknown_tag");
       }
@@ -685,6 +733,15 @@ export function parseClearHlsMediaPlaylist(input: string): ClearHlsMediaPlaylist
   if (!sawTargetDuration) refuse("missing_targetduration");
   if (!sawEndList) refuse("missing_endlist");
   if (fragments.length === 0) refuse("no_fragments");
+
+  // RFC 8216 §7, checked once the whole document is structurally sound: a map
+  // needs a declared version of 6 or higher. An absent version declares
+  // nothing, so it is refused, never inferred; a low one is refused, never
+  // repaired. An MPEG-TS playlist keeps the v1 rule — any bounded version, or
+  // none.
+  if (initializationMap !== null && (version === null || version < MIN_FMP4_PLAYLIST_VERSION)) {
+    refuse("incompatible_version");
+  }
 
   // §23 — the plan, its fragment collection, the map reference and every entry
   // are frozen, so a later stage cannot edit the approved set between approval

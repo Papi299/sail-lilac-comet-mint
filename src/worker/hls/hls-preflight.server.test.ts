@@ -62,11 +62,12 @@ afterEach(() => {
 /** A minimal valid clear VOD TS playlist with one EXTINF per reference. */
 function playlist(
   references: readonly string[],
-  opts: { readonly extra?: readonly string[]; readonly title?: string } = {},
+  opts: { readonly extra?: readonly string[]; readonly title?: string; readonly version?: number | null } = {},
 ): string {
+  const version = opts.version === undefined ? 3 : opts.version;
   const lines = [
     "#EXTM3U",
-    "#EXT-X-VERSION:3",
+    ...(version === null ? [] : [`#EXT-X-VERSION:${version}`]),
     "#EXT-X-TARGETDURATION:10",
     ...(opts.extra ?? []),
   ];
@@ -781,18 +782,33 @@ describe("clear-HLS preflight: HLS-1 is the semantic authority (§20)", () => {
     ],
     [
       "a byte-range initialization map (HLS v2 keeps it refused)",
-      playlist(["a.m4s"], { extra: ['#EXT-X-MAP:URI="init.mp4",BYTERANGE="720@0"'] }),
+      playlist(["a.m4s"], { version: 7, extra: ['#EXT-X-MAP:URI="init.mp4",BYTERANGE="720@0"'] }),
       "byte_range",
     ],
     [
       "an initialization map with an attribute outside the v2 grammar",
-      playlist(["a.m4s"], { extra: ['#EXT-X-MAP:URI="init.mp4",IV=0x1'] }),
+      playlist(["a.m4s"], { version: 7, extra: ['#EXT-X-MAP:URI="init.mp4",IV=0x1'] }),
       "malformed_initialization_map",
     ],
     [
       "a second initialization map",
-      playlist(["a.m4s"], { extra: ['#EXT-X-MAP:URI="init.mp4"', '#EXT-X-MAP:URI="init2.mp4"'] }),
+      playlist(["a.m4s"], { version: 7, extra: ['#EXT-X-MAP:URI="init.mp4"', '#EXT-X-MAP:URI="init2.mp4"'] }),
       "duplicate_tag",
+    ],
+    [
+      "an initialization map with no declared version",
+      playlist(["a.m4s"], { version: null, extra: ['#EXT-X-MAP:URI="init.mp4"'] }),
+      "incompatible_version",
+    ],
+    [
+      "an initialization map under version 5",
+      playlist(["a.m4s"], { version: 5, extra: ['#EXT-X-MAP:URI="init.mp4"'] }),
+      "incompatible_version",
+    ],
+    [
+      "a value-bearing independent-segments declaration",
+      playlist(["a.m4s"], { version: 7, extra: ["#EXT-X-INDEPENDENT-SEGMENTS:YES", '#EXT-X-MAP:URI="init.mp4"'] }),
+      "malformed_tag_value",
     ],
     ["an empty body", "", "empty"],
   ];
@@ -874,7 +890,7 @@ describe("clear-HLS preflight: every fragment URL passes the static policy (§23
 
 describe("clear-HLS preflight: an fMP4 playlist becomes an fmp4 plan", () => {
   const fmp4 = (references: readonly string[], map = "init.mp4", extra: readonly string[] = []) =>
-    playlist(references, { extra: [...extra, `#EXT-X-MAP:URI="${map}"`] });
+    playlist(references, { version: 7, extra: [...extra, `#EXT-X-MAP:URI="${map}"`] });
 
   it("resolves the map and every fragment into the closed fmp4 plan", async () => {
     const net = fakeNetwork({ [PLAYLIST_URL]: serve(fmp4(["seg-0.m4s", "seg-1.m4s"])) });
@@ -964,8 +980,26 @@ describe("clear-HLS preflight: an fMP4 playlist becomes an fmp4 plan", () => {
     await refusedWith(preflight(), "fragment_url_invalid");
   });
 
+  it("admits version 6 and the exact independent-segments declaration into the same plan", async () => {
+    const plain = fakeNetwork({ [PLAYLIST_URL]: serve(fmp4(["seg-0.m4s", "seg-1.m4s"])) });
+    const reference = await preflight();
+    assert.deepEqual(plain.requests.map((r) => r.url), [PLAYLIST_URL]);
+    for (const source of [
+      playlist(["seg-0.m4s", "seg-1.m4s"], { version: 6, extra: ['#EXT-X-MAP:URI="init.mp4"'] }),
+      fmp4(["seg-0.m4s", "seg-1.m4s"], "init.mp4", ["#EXT-X-INDEPENDENT-SEGMENTS"]),
+    ]) {
+      const net = fakeNetwork({ [PLAYLIST_URL]: serve(source) });
+      assert.deepEqual(await preflight(), reference);
+      assert.deepEqual(net.requests.map((r) => r.url), [PLAYLIST_URL]);
+    }
+  });
+
   it("maps every v2 rejection through the HLS-1 reason, never fetching the map", async () => {
     for (const [source, rejection] of [
+      [playlist(["a.m4s"], { version: null, extra: ['#EXT-X-MAP:URI="init.mp4"'] }), "incompatible_version"],
+      [playlist(["a.m4s"], { version: 1, extra: ['#EXT-X-MAP:URI="init.mp4"'] }), "incompatible_version"],
+      [playlist(["a.m4s"], { version: 5, extra: ['#EXT-X-MAP:URI="init.mp4"'] }), "incompatible_version"],
+      [fmp4(["a.m4s"], "init.mp4", ["#EXT-X-INDEPENDENT-SEGMENTS:YES"]), "malformed_tag_value"],
       [fmp4(["a.m4s"], "init.mp4", ["#EXT-X-DISCONTINUITY"]), "discontinuity"],
       [fmp4(["a.m4s"], "init.mp4", ['#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://k"']), "encrypted"],
       [fmp4(["a.m4s"], "init.mp4", ["#EXT-X-PLAYLIST-TYPE:EVENT"]), "live_or_event"],

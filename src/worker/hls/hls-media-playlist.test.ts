@@ -267,8 +267,11 @@ describe("clear-HLS playlist parser: the closed tag vocabulary", () => {
     );
   });
 
-  it("admits exactly one tag beyond the v1 subset in the v2 grammar: the initialization map", () => {
-    assert.deepEqual([...HLS_V2_ALLOWED_TAGS], [...HLS_V1_ALLOWED_TAGS, "#EXT-X-MAP"]);
+  it("admits exactly two tags beyond the v1 subset in the v2 grammar: the map and independent segments", () => {
+    assert.deepEqual(
+      [...HLS_V2_ALLOWED_TAGS],
+      [...HLS_V1_ALLOWED_TAGS, "#EXT-X-MAP", "#EXT-X-INDEPENDENT-SEGMENTS"],
+    );
     assert.deepEqual([...CLEAR_HLS_SEGMENT_TYPES], ["mpegts", "fmp4"]);
   });
 
@@ -288,7 +291,9 @@ describe("clear-HLS playlist parser: the closed tag vocabulary", () => {
       "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\"",
       "#EXT-X-SESSION-DATA:DATA-ID=\"d\"",
       "#EXT-X-I-FRAMES-ONLY",
-      "#EXT-X-INDEPENDENT-SEGMENTS",
+      // `#EXT-X-INDEPENDENT-SEGMENTS` left this list in the v2 correction; only
+      // its exact no-value spelling is admitted, pinned in its own block below.
+      "#EXT-X-INDEPENDENT-SEGMENTS:YES",
       "#EXT-X-START:TIME-OFFSET=0",
       "#EXT-X-DATERANGE:ID=\"d\"",
       "#EXT-X-GAP",
@@ -687,11 +692,143 @@ describe("clear-HLS playlist parser: every v2 map outside the closed grammar fai
     refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-DISCONTINUITY-SEQUENCE:1"] }), "discontinuity");
     refusedWith(fmp4Playlist(1).replace("#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-PLAYLIST-TYPE:EVENT"), "live_or_event");
     refusedWith(fmp4Playlist(1).replace("#EXT-X-ENDLIST\n", ""), "missing_endlist");
-    refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-INDEPENDENT-SEGMENTS"] }), "unknown_tag");
     refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"s\",NAME=\"n\",URI=\"s.m3u8\""] }), "master_playlist");
     refusedWith(fmp4Playlist(1, { extra: ["#EXT-X-I-FRAMES-ONLY"] }), "unknown_tag");
     refusedWith(`${fmp4Playlist(1)}#EXT-X-MAP:URI="late.mp4"\n`, "content_after_endlist");
     refusedWith(fmp4Playlist(HLS_V1_MAX_FRAGMENTS + 1), "too_many_fragments");
+  });
+});
+
+describe("clear-HLS playlist parser: an fMP4 playlist must declare a compatible version (RFC 8216 §7)", () => {
+  /** The fMP4 fixture with its version line replaced, or removed when `line` is null. */
+  const withVersion = (line: string | null, opts: Parameters<typeof fmp4Playlist>[1] = {}) =>
+    fmp4Playlist(1, opts).replace("#EXT-X-VERSION:7\n", line === null ? "" : `${line}\n`);
+
+  it("admits a map with version 6, 7 or 10, into one identical model with no version in it", () => {
+    const models = ["#EXT-X-VERSION:6", "#EXT-X-VERSION:7", "#EXT-X-VERSION:10"].map((line) =>
+      parseClearHlsMediaPlaylist(withVersion(line)),
+    );
+    for (const plan of models) {
+      assert.equal(plan.segmentType, "fmp4");
+      assert.deepEqual(Object.keys(plan).sort(), ["fragmentCount", "fragments", "initializationMap", "segmentType"]);
+    }
+    assert.deepEqual(models[0], models[1]);
+    assert.deepEqual(models[0], models[2]);
+  });
+
+  it("refuses a map with no version, or with version 1 or 5, without echoing anything", () => {
+    for (const line of [null, "#EXT-X-VERSION:1", "#EXT-X-VERSION:5"]) {
+      const err = refusedWith(
+        withVersion(line, { mapLine: '#EXT-X-MAP:URI="init-VERSENTINEL.mp4"' }),
+        "incompatible_version",
+      );
+      leaksNothing(err, "VERSENTINEL", "init-", "EXT-X-VERSION", "#EXT");
+      // A fixed message: no version value, declared or required, is in it.
+      assert.equal(/\d/.test(err.message), false, err.message);
+    }
+  });
+
+  it("refuses every version from 1 to 5 and admits every version from 6 to 10", () => {
+    for (let version = 1; version <= 10; version += 1) {
+      const source = withVersion(`#EXT-X-VERSION:${version}`);
+      if (version < 6) refusedWith(source, "incompatible_version");
+      else assert.equal(parseClearHlsMediaPlaylist(source).segmentType, "fmp4", `version ${version}`);
+    }
+  });
+
+  it("keeps the existing version bound and the one-version rule", () => {
+    refusedWith(withVersion("#EXT-X-VERSION:11"), "malformed_tag_value");
+    refusedWith(withVersion("#EXT-X-VERSION:6.0"), "malformed_tag_value");
+    refusedWith(withVersion("#EXT-X-VERSION:6\n#EXT-X-VERSION:6"), "duplicate_tag");
+    refusedWith(withVersion("#EXT-X-VERSION:5\n#EXT-X-VERSION:7"), "duplicate_tag");
+  });
+
+  it("decides only once the document is structurally sound", () => {
+    // A low version on an otherwise broken document reports the structure.
+    refusedWith(withVersion("#EXT-X-VERSION:3").replace("#EXT-X-ENDLIST\n", ""), "missing_endlist");
+    refusedWith(withVersion(null, { mapLine: '#EXT-X-MAP:URI="init.mp4",BYTERANGE="720@0"' }), "byte_range");
+    // A version declared AFTER the map still counts: it is one playlist-wide fact.
+    const late = withVersion(null).replace("#EXT-X-ENDLIST\n", "#EXT-X-VERSION:6\n#EXT-X-ENDLIST\n");
+    assert.equal(parseClearHlsMediaPlaylist(late).segmentType, "fmp4");
+  });
+
+  it("leaves MPEG-TS exactly as v1 had it: any bounded version, or none", () => {
+    const none = ["#EXTM3U", "#EXT-X-TARGETDURATION:10", "#EXTINF:10.0,", "a.ts", "#EXT-X-ENDLIST", ""].join("\n");
+    const reference = parseClearHlsMediaPlaylist(none);
+    assert.equal(reference.segmentType, "mpegts");
+    assert.deepEqual(Object.keys(reference).sort(), ["fragmentCount", "fragments", "segmentType"]);
+    for (let version = 1; version <= 10; version += 1) {
+      const source = none.replace("#EXT-X-TARGETDURATION:10", `#EXT-X-VERSION:${version}\n#EXT-X-TARGETDURATION:10`);
+      assert.deepEqual(parseClearHlsMediaPlaylist(source), reference, `version ${version}`);
+    }
+  });
+});
+
+describe("clear-HLS playlist parser: the exact no-value EXT-X-INDEPENDENT-SEGMENTS", () => {
+  const TAG = "#EXT-X-INDEPENDENT-SEGMENTS";
+
+  it("accepts FFmpeg 5.1.9's own fMP4 output with -hls_flags independent_segments, verbatim", () => {
+    // Captured from the pinned ffmpeg 5.1.9-0+deb12u1 hls muxer.
+    const source = [
+      "#EXTM3U",
+      "#EXT-X-VERSION:7",
+      "#EXT-X-TARGETDURATION:1",
+      "#EXT-X-MEDIA-SEQUENCE:0",
+      "#EXT-X-PLAYLIST-TYPE:VOD",
+      TAG,
+      '#EXT-X-MAP:URI="init.mp4"',
+      "#EXTINF:1.000000,",
+      "seg-0.m4s",
+      "#EXTINF:1.000000,",
+      "seg-1.m4s",
+      "#EXT-X-ENDLIST",
+      "",
+    ].join("\n");
+    const plan = parseClearHlsMediaPlaylist(source);
+    assert.ok(plan.segmentType === "fmp4");
+    assert.equal(plan.initializationMap.reference, "init.mp4");
+    assert.deepEqual(plan.fragments.map((f) => f.reference), ["seg-0.m4s", "seg-1.m4s"]);
+  });
+
+  it("derives no state from it: the model is identical with and without the declaration", () => {
+    const fmp4Without = fmp4Playlist(3);
+    for (const fmp4With of [
+      fmp4Playlist(3, { extra: [TAG] }),
+      fmp4Without.replace('#EXT-X-MAP:URI="init.mp4"\n', `#EXT-X-MAP:URI="init.mp4"\n${TAG}\n`),
+      fmp4Without.replace("#EXT-X-ENDLIST\n", `${TAG}\n#EXT-X-ENDLIST\n`),
+    ]) {
+      const plan = parseClearHlsMediaPlaylist(fmp4With);
+      assert.deepEqual(plan, parseClearHlsMediaPlaylist(fmp4Without));
+      assert.deepEqual(Object.keys(plan).sort(), ["fragmentCount", "fragments", "initializationMap", "segmentType"]);
+    }
+    // The shared grammar admits it on MPEG-TS too, where it is equally inert:
+    // it does not make a playlist fMP4, nor change the v1 model.
+    const ts = parseClearHlsMediaPlaylist(validPlaylist(2, { extra: [TAG] }));
+    assert.deepEqual(ts, parseClearHlsMediaPlaylist(validPlaylist(2)));
+    assert.equal(ts.segmentType, "mpegts");
+    assert.deepEqual(Object.keys(ts).sort(), ["fragmentCount", "fragments", "segmentType"]);
+  });
+
+  it("does not stand in for the version an fMP4 playlist must declare", () => {
+    refusedWith(fmp4Playlist(1, { extra: [TAG] }).replace("#EXT-X-VERSION:7", "#EXT-X-VERSION:5"), "incompatible_version");
+  });
+
+  it("refuses every value-bearing spelling, without echoing it", () => {
+    for (const line of [`${TAG}:`, `${TAG}:YES`, `${TAG}:NO`, `${TAG}:INDSENTINEL`, `${TAG}:URI="INDSENTINEL"`]) {
+      leaksNothing(refusedWith(fmp4Playlist(1, { extra: [line] }), "malformed_tag_value"), "INDSENTINEL");
+      refusedWith(validPlaylist(1, { extra: [line] }), "malformed_tag_value");
+    }
+  });
+
+  it("refuses any other spelling as an unsupported tag", () => {
+    for (const line of [`${TAG} `, "#ext-x-independent-segments", "#EXT-X-INDEPENDENT-SEGMENT", `${TAG}S`]) {
+      refusedWith(fmp4Playlist(1, { extra: [line] }), "unknown_tag");
+    }
+  });
+
+  it("refuses a repeat as a duplicate", () => {
+    refusedWith(fmp4Playlist(1, { extra: [TAG, TAG] }), "duplicate_tag");
+    refusedWith(validPlaylist(1, { extra: [TAG, TAG] }), "duplicate_tag");
   });
 });
 
