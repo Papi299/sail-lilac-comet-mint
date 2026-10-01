@@ -20,11 +20,16 @@ import {
 } from "../deploy/acceptance/ytdlp-generic/lib/hls11-fixture-url.mjs";
 import {
   HLS11_FIXTURE_SPEC,
+  HLS11_INDEPENDENT_SEGMENTS_TAG,
   hls11ByteRangePlaylist,
+  hls11DeclaredVersions,
   hls11EncryptedPlaylist,
   hls11FfmpegArgs,
   hls11Master,
   hls11SplitMaster,
+  hls11ValuedIndependentSegmentsPlaylist,
+  hls11VersionPlaylist,
+  hls11WithoutIndependentSegments,
   topLevelBoxTypes,
 } from "../deploy/acceptance/ytdlp-generic/fixtures/hls11-media.mjs";
 import {
@@ -34,6 +39,7 @@ import {
 } from "../deploy/acceptance/ytdlp-generic/lib/hls11-observers.mjs";
 import {
   HLS11_FORBIDDEN_EVIDENCE_SUBSTRINGS,
+  HLS11_GRAMMAR_CHECKS,
   HLS11_MANDATORY_CHECKS,
   HLS11_NON_CLAIMS,
   HLS11_POSITIVE_CASES,
@@ -135,6 +141,11 @@ describe("HLS-11 fixture recipes", () => {
     assert.equal(value(hls11FfmpegArgs("ts", "/out"), "-hls_segment_type"), "mpegts");
     assert.equal(value(hls11FfmpegArgs("fmp4", "/out"), "-hls_segment_type"), "fmp4");
     assert.equal(value(hls11FfmpegArgs("fmp4", "/out"), "-hls_fmp4_init_filename"), "init.mp4");
+    // The fMP4 renditions carry FFmpeg's own independent-segments declaration;
+    // the MPEG-TS control stays the historical v1 subset.
+    assert.equal(value(hls11FfmpegArgs("fmp4", "/out"), "-hls_flags"), "independent_segments");
+    assert.equal(value(hls11FfmpegArgs("fmp4-video", "/out"), "-hls_flags"), "independent_segments");
+    assert.ok(!hls11FfmpegArgs("ts", "/out").includes("-hls_flags"));
     assert.ok(hls11FfmpegArgs("fmp4-video", "/out").includes("-an"));
     assert.ok(!hls11FfmpegArgs("fmp4-video", "/out").includes("sine=frequency=440:sample_rate=48000:duration=4"));
     assert.throws(() => hls11FfmpegArgs("webm", "/out"), /unknown HLS-11 rendition/);
@@ -166,6 +177,28 @@ describe("HLS-11 fixture recipes", () => {
     const encrypted = hls11EncryptedPlaylist(fmp4).split("\n");
     assert.equal(encrypted[2], '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"');
     assert.throws(() => hls11ByteRangePlaylist("#EXTM3U\n", 1), /no map line/);
+  });
+
+  it("derives the version and independent-segments negatives from the packager's exact fMP4 text", () => {
+    // The pinned ffmpeg 5.1.9 hls muxer's output with -hls_flags independent_segments.
+    const fmp4 = [
+      "#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-TARGETDURATION:1", "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD",
+      HLS11_INDEPENDENT_SEGMENTS_TAG, '#EXT-X-MAP:URI="init.mp4"', "#EXTINF:1.000000,", "seg-0.m4s", "#EXT-X-ENDLIST", "",
+    ].join("\n");
+    assert.equal(HLS11_INDEPENDENT_SEGMENTS_TAG, "#EXT-X-INDEPENDENT-SEGMENTS");
+    assert.deepEqual(hls11DeclaredVersions(fmp4), ["7"]);
+    assert.deepEqual(hls11DeclaredVersions(hls11VersionPlaylist(fmp4, 5)), ["5"]);
+    assert.deepEqual(hls11DeclaredVersions(hls11VersionPlaylist(fmp4, 6)), ["6"]);
+    const missing = hls11VersionPlaylist(fmp4, null);
+    assert.deepEqual(hls11DeclaredVersions(missing), []);
+    assert.equal(missing, fmp4.replace("#EXT-X-VERSION:7\n", ""), "only the version line is removed");
+    const without = hls11WithoutIndependentSegments(fmp4);
+    assert.equal(without, fmp4.replace(`${HLS11_INDEPENDENT_SEGMENTS_TAG}\n`, ""), "only the declaration is removed");
+    const valued = hls11ValuedIndependentSegmentsPlaylist(fmp4).split("\n");
+    assert.equal(valued[5], `${HLS11_INDEPENDENT_SEGMENTS_TAG}:YES`);
+    assert.throws(() => hls11VersionPlaylist(missing, 5), /no single version line/);
+    assert.throws(() => hls11WithoutIndependentSegments(without), /no single independent-segments line/);
+    assert.throws(() => hls11ValuedIndependentSegmentsPlaylist(without), /no independent-segments line/);
   });
 
   it("reads ISO-BMFF top-level boxes strictly", () => {
@@ -261,7 +294,23 @@ describe("HLS-11 evidence", () => {
   it("names its schema and requires both families, every negative and the split master", () => {
     assert.equal(HLS11_RELEASE_EVIDENCE_SCHEMA, "hls11-release-image-full-path-01");
     assert.deepEqual([...HLS11_POSITIVE_CASES], ["v1-ts", "v2-fmp4"]);
-    assert.equal(HLS11_MANDATORY_CHECKS.length, 137);
+    assert.equal(HLS11_MANDATORY_CHECKS.length, 159);
+    assert.equal(new Set(HLS11_MANDATORY_CHECKS).size, HLS11_MANDATORY_CHECKS.length);
+    for (const name of [
+      ...HLS11_GRAMMAR_CHECKS,
+      "invariants/v2-grammar-admits-exactly-the-map-and-independent-segments",
+      "v2-fmp4/acquisition/consumed-the-independent-segments-playlist",
+      "v2-fmp4/acquisition/playlist-then-map-then-fragments-in-order",
+      "v2-fmp4/ready/final-status-ready-with-matching-metadata",
+      "neg-version-5/format-unavailable",
+      "neg-version-5/refused-before-the-map-request",
+      "neg-version-missing/refused-before-the-map-request",
+      "neg-independent-segments-value/refused-before-the-map-request",
+    ]) {
+      assert.ok(HLS11_MANDATORY_CHECKS.includes(name), name);
+    }
+    // The fMP4-only consumption check is not asked of the MPEG-TS control.
+    assert.ok(!HLS11_MANDATORY_CHECKS.includes("v1-ts/acquisition/consumed-the-independent-segments-playlist"));
     assert.deepEqual(HLS11_MANDATORY_CHECKS.slice(0, 6), [...HLS09_RELEASE_IDENTITY_CHECKS]);
     assert.ok(HLS11_NON_CLAIMS[0].includes("separate HLS audio"));
   });

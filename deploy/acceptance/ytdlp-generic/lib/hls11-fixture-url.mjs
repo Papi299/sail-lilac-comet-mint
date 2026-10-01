@@ -43,6 +43,12 @@ export const HLS11_SYNTHETIC_PUBLIC_ADDRESS = "8.8.8.8";
  *   neg-init-404    a valid fMP4 playlist whose map answers 404
  *   neg-budget      a valid fMP4 playlist whose bytes exceed a lowered limit
  *   neg-video-only  a master that CLAIMS audio for a video-only fMP4 rendition
+ *   neg-version-5   an fMP4 playlist declaring EXT-X-VERSION:5 (refused: < 6)
+ *   neg-version-missing
+ *                   an fMP4 playlist declaring no EXT-X-VERSION (refused)
+ *   neg-independent-segments-value
+ *                   an fMP4 playlist whose independent-segments line carries
+ *                   a value (refused: only the no-value spelling is admitted)
  *   split-master    a video-only rendition + separate HLS audio group, which
  *                   the pinned yt-dlp exposes with no pairing relationship
  */
@@ -54,6 +60,9 @@ export const HLS11_CASES = Object.freeze([
   "neg-init-404",
   "neg-budget",
   "neg-video-only",
+  "neg-version-5",
+  "neg-version-missing",
+  "neg-independent-segments-value",
   "split-master",
 ]);
 

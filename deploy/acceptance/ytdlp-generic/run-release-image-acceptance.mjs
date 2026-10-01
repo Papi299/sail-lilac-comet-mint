@@ -828,9 +828,10 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
     //
     // Real 1920x1080 MPEG-TS and fMP4 (init + fragments) HLS renditions through
     // the candidate's own analysis, planner, HLS-2/3/4 chain, ffprobe and
-    // FFmpeg, plus five fail-closed negatives and the split-master pairing
-    // case. The clear-HLS child's hardening with its OWN single `--add-host`;
-    // the posture is re-derived from the argv before it runs.
+    // FFmpeg, plus the v2 grammar checks, eight fail-closed negatives and the
+    // split-master pairing case. The clear-HLS child's hardening with its OWN
+    // single `--add-host`; the posture is re-derived from the argv before it
+    // runs.
     await verifyHarnessAt("before-hls11-clear-hls-v2");
     await admitMediaWorkspace("before-hls11-clear-hls-v2");
     const hls11EvidenceName = `hls11-clear-hls-v2-${now()}.json`;

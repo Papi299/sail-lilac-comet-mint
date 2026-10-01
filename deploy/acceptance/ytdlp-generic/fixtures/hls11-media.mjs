@@ -6,6 +6,12 @@
 //   fmp4       1920x1080 H.264 + AAC, init + fMP4 fragments  (HLS-V2-MUXED-FMP4)
 //   fmp4-video 1920x1080 H.264 only, init + fMP4 fragments   (the lying-master negative)
 //
+// The fMP4 renditions are packaged with `-hls_flags independent_segments`, so
+// their playlists carry the common packager spelling exactly as the pinned
+// FFmpeg writes it: `#EXT-X-VERSION:7` and the no-value
+// `#EXT-X-INDEPENDENT-SEGMENTS`. The MPEG-TS control is packaged as before and
+// stays inside the historical v1 subset.
+//
 // Every recipe pins x264 to one thread and asks for bit-exact muxing, so a
 // second generation is byte-identical; the orchestrator measures that.
 //
@@ -73,7 +79,9 @@ export function hls11FfmpegArgs(kind, dir) {
     "-hls_time", String(spec.segmentSeconds),
     "-hls_playlist_type", "vod",
     "-hls_segment_type", segmentType,
-    ...(segmentType === "fmp4" ? ["-hls_fmp4_init_filename", "init.mp4"] : []),
+    ...(segmentType === "fmp4"
+      ? ["-hls_fmp4_init_filename", "init.mp4", "-hls_flags", "independent_segments"]
+      : []),
     "-hls_segment_filename", join(dir, `seg-%d.${rendition.extension}`),
     join(dir, "media.m3u8"),
   ];
@@ -184,6 +192,50 @@ export function hls11ByteRangePlaylist(fmp4PlaylistText, initByteLength) {
   const map = '#EXT-X-MAP:URI="init.mp4"';
   if (!fmp4PlaylistText.includes(map)) throw new Error("the fMP4 playlist carries no map line");
   return fmp4PlaylistText.replace(map, `${map},BYTERANGE="${initByteLength}@0"`);
+}
+
+/** The exact no-value declaration the v2 grammar admits and then discards. */
+export const HLS11_INDEPENDENT_SEGMENTS_TAG = "#EXT-X-INDEPENDENT-SEGMENTS";
+
+/** The `#EXT-X-VERSION` values a playlist's lines declare, in order. */
+export function hls11DeclaredVersions(playlistText) {
+  return playlistText
+    .split("\n")
+    .filter((line) => line.startsWith("#EXT-X-VERSION:"))
+    .map((line) => line.slice("#EXT-X-VERSION:".length));
+}
+
+/**
+ * The fMP4 playlist with its one version line rewritten to `version`, or
+ * removed when `version` is null (refused below 6 by the v2 grammar).
+ */
+export function hls11VersionPlaylist(fmp4PlaylistText, version) {
+  const lines = fmp4PlaylistText.split("\n");
+  const at = lines.findIndex((line) => line.startsWith("#EXT-X-VERSION:"));
+  if (at < 0 || lines.filter((line) => line.startsWith("#EXT-X-VERSION:")).length !== 1) {
+    throw new Error("the fMP4 playlist carries no single version line");
+  }
+  if (version === null) lines.splice(at, 1);
+  else lines[at] = `#EXT-X-VERSION:${version}`;
+  return lines.join("\n");
+}
+
+/** The fMP4 playlist without its independent-segments line (the M7 comparison). */
+export function hls11WithoutIndependentSegments(fmp4PlaylistText) {
+  const lines = fmp4PlaylistText.split("\n");
+  if (lines.filter((line) => line === HLS11_INDEPENDENT_SEGMENTS_TAG).length !== 1) {
+    throw new Error("the fMP4 playlist carries no single independent-segments line");
+  }
+  return lines.filter((line) => line !== HLS11_INDEPENDENT_SEGMENTS_TAG).join("\n");
+}
+
+/** The fMP4 playlist with its independent-segments line given a value (refused). */
+export function hls11ValuedIndependentSegmentsPlaylist(fmp4PlaylistText) {
+  const lines = fmp4PlaylistText.split("\n");
+  const at = lines.indexOf(HLS11_INDEPENDENT_SEGMENTS_TAG);
+  if (at < 0) throw new Error("the fMP4 playlist carries no independent-segments line");
+  lines[at] = `${HLS11_INDEPENDENT_SEGMENTS_TAG}:YES`;
+  return lines.join("\n");
 }
 
 /** The fMP4 playlist with an EXT-X-KEY line (refused by the grammar, never fetched). */

@@ -19,10 +19,15 @@
 // happened while the job said `downloading` and every ffprobe/FFmpeg process
 // while it said `processing`; the delivered MP4 is one H.264 1920x1080 video
 // and one AAC audio stream, faststart, of the fixture's duration, within the
-// limit, with its packets preserved. Five bounded negatives failed closed
-// before any upload, and a split master proved — against the candidate's own
-// pinned yt-dlp — that separate HLS audio is exposed with no pairing
-// relationship and is therefore not advertised.
+// limit, with its packets preserved. The fMP4 playlist was the pinned
+// packager's own `#EXT-X-VERSION:7` + `#EXT-X-INDEPENDENT-SEGMENTS` output, and
+// the candidate's parser admitted it into the same model as without that
+// declaration. Eight bounded negatives failed closed before any upload —
+// three of them grammar refusals (version 5, no version, a valued
+// independent-segments line) before the map was requested — and a split
+// master proved, against the candidate's own pinned yt-dlp, that separate HLS
+// audio is exposed with no pairing relationship and is therefore not
+// advertised.
 //
 // Import-free apart from the harness's own import-free modules, so the parent
 // validates a record on an older Node.
@@ -38,9 +43,16 @@ import { isFullGitSha } from "./split-provenance.mjs";
  * rewrite an older record.
  *
  *   -01  the first clear-HLS v2 release child: the v1 MPEG-TS control and the
- *        v2 muxed-fMP4 positive, five fail-closed negatives, and the split-master
- *        pairing-provenance case. Split HLS audio is NOT a positive case: it was
- *        not implemented, because pairing provenance is insufficient.
+ *        v2 muxed-fMP4 positive (version 7 + independent segments, as the
+ *        pinned packager writes them), the grammar checks, eight fail-closed
+ *        negatives, and the split-master pairing-provenance case. Split HLS
+ *        audio is NOT a positive case: it was not implemented, because pairing
+ *        provenance is insufficient.
+ *
+ *        Its mandatory set was corrected inside unmerged PR #105 (the fMP4
+ *        version gate and the independent-segments admission) without a bump:
+ *        no merged or deployed release had consumed an `-01` record, and every
+ *        record names the exact source commit and tree it ran.
  */
 export const HLS11_RELEASE_EVIDENCE_SCHEMA = "hls11-release-image-full-path-01";
 
@@ -59,7 +71,7 @@ export const HLS11_PREFLIGHT_CHECKS = Object.freeze([
 
 export const HLS11_INVARIANT_CHECKS = Object.freeze([
   "invariants/generic-source-protocols-reviewed-vocabulary",
-  "invariants/v2-grammar-admits-exactly-one-more-tag",
+  "invariants/v2-grammar-admits-exactly-the-map-and-independent-segments",
   "invariants/harness-file-names-match-the-product",
   "invariants/remux-argvs-differ-only-in-the-demuxer",
 ]);
@@ -79,6 +91,20 @@ export const HLS11_FIXTURE_CHECKS = Object.freeze([
   "transport/no-refused-request",
   "fixture/no-unexpected-route",
   "fixture/no-range-request",
+]);
+
+/**
+ * The v2 grammar, measured on the served fMP4 text with the candidate's own
+ * parser: the packager's declarations, the independent-segments declaration
+ * deriving nothing, and the version gate on both sides of 6.
+ */
+export const HLS11_GRAMMAR_CHECKS = Object.freeze([
+  "grammar/fmp4-fixture-declares-one-version-at-least-6",
+  "grammar/fmp4-fixture-declares-independent-segments-once",
+  "grammar/independent-segments-derives-no-state",
+  "grammar/version-6-admitted-into-the-same-model",
+  "grammar/incompatible-versions-refused",
+  "grammar/valued-independent-segments-refused",
 ]);
 
 /** Every check each positive case records, un-prefixed. */
@@ -122,6 +148,11 @@ export const HLS11_CASE_CHECKS = Object.freeze([
   "cleanup/job-workdir-removed",
 ]);
 
+/** The fMP4 positive's own extra check: the job consumed the declaration-bearing playlist. */
+export const HLS11_FMP4_CASE_CHECKS = Object.freeze([
+  "v2-fmp4/acquisition/consumed-the-independent-segments-playlist",
+]);
+
 /** The bounded negatives and what each must record. */
 export const HLS11_NEGATIVE_CHECKS = Object.freeze([
   "neg-byterange/format-unavailable",
@@ -149,6 +180,21 @@ export const HLS11_NEGATIVE_CHECKS = Object.freeze([
   "neg-video-only/no-upload-never-ready",
   "neg-video-only/workdir-removed",
   "neg-video-only/refused-by-the-real-source-probe-before-any-ffmpeg",
+  "neg-version-5/format-unavailable",
+  "neg-version-5/no-upload-never-ready",
+  "neg-version-5/workdir-removed",
+  "neg-version-5/refused-before-the-map-request",
+  "neg-version-5/never-processing-no-media-tool",
+  "neg-version-missing/format-unavailable",
+  "neg-version-missing/no-upload-never-ready",
+  "neg-version-missing/workdir-removed",
+  "neg-version-missing/refused-before-the-map-request",
+  "neg-version-missing/never-processing-no-media-tool",
+  "neg-independent-segments-value/format-unavailable",
+  "neg-independent-segments-value/no-upload-never-ready",
+  "neg-independent-segments-value/workdir-removed",
+  "neg-independent-segments-value/refused-before-the-map-request",
+  "neg-independent-segments-value/never-processing-no-media-tool",
 ]);
 
 /** The split-master pairing-provenance case. */
@@ -171,7 +217,9 @@ export const HLS11_MANDATORY_CHECKS = Object.freeze([
   ...HLS11_PREFLIGHT_CHECKS,
   ...HLS11_INVARIANT_CHECKS,
   ...HLS11_FIXTURE_CHECKS,
+  ...HLS11_GRAMMAR_CHECKS,
   ...HLS11_POSITIVE_CASES.flatMap((caseName) => HLS11_CASE_CHECKS.map((name) => `${caseName}/${name}`)),
+  ...HLS11_FMP4_CASE_CHECKS,
   ...HLS11_NEGATIVE_CHECKS,
   ...HLS11_SPLIT_MASTER_CHECKS,
 ]);

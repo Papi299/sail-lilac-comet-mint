@@ -25,13 +25,19 @@
 // faststart, packet preservation) and the durable status at EVERY request and
 // EVERY subprocess.
 //
-// Five bounded negatives fail closed before any upload — a byte-range map, an
-// encrypted playlist, a 404 map, the one byte budget, and a master that claims
+// The fMP4 fixture is FFmpeg's own `-hls_flags independent_segments` output:
+// `#EXT-X-VERSION:7` and the no-value `#EXT-X-INDEPENDENT-SEGMENTS`, served
+// verbatim, so the v2 job runs the common packager spelling end to end.
+//
+// Eight bounded negatives fail closed before any upload — a byte-range map, an
+// encrypted playlist, a 404 map, the one byte budget, a master that claims
 // audio for a video-only fMP4 rendition (refused by the REAL ffprobe after
-// acquisition, before any FFmpeg run). A split-master case re-proves, against
-// the candidate's own pinned yt-dlp, the HLS v2 finding that separate HLS audio
-// cannot be paired: no relationship survives into `-J`, so the Product
-// advertises nothing for it.
+// acquisition, before any FFmpeg run), an fMP4 playlist declaring version 5,
+// one declaring no version, and one giving the independent-segments
+// declaration a value (each refused before the map is requested). A
+// split-master case re-proves, against the candidate's own pinned yt-dlp, the
+// HLS v2 finding that separate HLS audio cannot be paired: no relationship
+// survives into `-J`, so the Product advertises nothing for it.
 //
 // ── The only substitutions ─────────────────────────────────────────────────
 //
@@ -52,6 +58,7 @@ import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { networkInterfaces, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 // ── Production modules. Imported, never re-implemented. ────────────────────
 import { config } from "../../../src/lib/config.ts";
@@ -92,16 +99,22 @@ import { SQLiteJobStore } from "../../../src/worker/state/sqlite-job-store.serve
 import { createAnalysisPolicy, createChecks } from "./split-full-path.mjs";
 import {
   HLS11_FIXTURE_SPEC,
+  HLS11_INDEPENDENT_SEGMENTS_TAG,
   generateHls11Rendition,
   hls11ByteRangePlaylist,
+  hls11DeclaredVersions,
   hls11EncryptedPlaylist,
   hls11Master,
   hls11Page,
   hls11SplitMaster,
+  hls11ValuedIndependentSegmentsPlaylist,
+  hls11VersionPlaylist,
+  hls11WithoutIndependentSegments,
   topLevelBoxTypes,
 } from "./fixtures/hls11-media.mjs";
 import { createHls11FixtureService } from "./fixtures/hls11-server.mjs";
 import {
+  HLS11_CASES,
   HLS11_FIXTURE_HOSTNAME,
   HLS11_FIXTURE_LOOPBACK,
   classifyHls11FixturePath,
@@ -270,9 +283,10 @@ function checkInvariants(checks) {
     sameList(generic, ["http", "https", "http_dash_segments"]) && generic.every((p) => !p.includes("m3u8")),
     generic.join(","),
   );
-  checks.require(
-    "invariants/v2-grammar-admits-exactly-one-more-tag",
-    sameList([...HLS_V2_ALLOWED_TAGS], [...HLS_V1_ALLOWED_TAGS, "#EXT-X-MAP"]),
+  checks.record(
+    "invariants/v2-grammar-admits-exactly-the-map-and-independent-segments",
+    sameList([...HLS_V2_ALLOWED_TAGS], [...HLS_V1_ALLOWED_TAGS, "#EXT-X-MAP", HLS11_INDEPENDENT_SEGMENTS_TAG]),
+    [...HLS_V2_ALLOWED_TAGS].slice(HLS_V1_ALLOWED_TAGS.length).join(","),
   );
   checks.require(
     "invariants/harness-file-names-match-the-product",
@@ -306,10 +320,9 @@ async function prepareFixtures(checks, runTool, toolchain, workRoot) {
     await writeFile(renditions[kind].aggregatePath, aggregate);
   }
   const { ts, fmp4 } = renditions;
-  const fmp4Video = renditions["fmp4-video"];
   const tsProbe = await probeMedia(runTool, toolchain.ffprobePath, ts.aggregatePath, "mpegts");
   const fmp4Probe = await probeMedia(runTool, toolchain.ffprobePath, fmp4.aggregatePath, "mov");
-  const videoProbe = await probeMedia(runTool, toolchain.ffprobePath, fmp4Video.aggregatePath, "mov");
+  const videoProbe = await probeMedia(runTool, toolchain.ffprobePath, renditions["fmp4-video"].aggregatePath, "mov");
   checks.require("fixture/ts-is-1920x1080-h264-aac-mpegts", isMuxed1080(tsProbe, "mpegts"), JSON.stringify(tsProbe.streams));
   checks.require("fixture/fmp4-is-1920x1080-h264-aac-iso-bmff", isMuxed1080(fmp4Probe, ISO_BMFF_FORMAT_NAME), JSON.stringify(fmp4Probe.streams));
   checks.require(
@@ -348,15 +361,65 @@ async function prepareFixtures(checks, runTool, toolchain, workRoot) {
     tsParsed.segmentType === "mpegts" && tsParsed.fragmentCount === ts.segments.length &&
       tsTags.every((t) => HLS_V1_ALLOWED_TAGS.includes(t)),
   );
-  const fmp4Parsed = parsed(fmp4.playlistText);
+  // What the pinned packager declared, measured on the served text itself: one
+  // compatible version and one exact independent-segments line, in both fMP4
+  // renditions; none in the MPEG-TS control. These are fixture preconditions.
+  const fmp4Video = renditions["fmp4-video"];
+  const compatibleVersion = (text) => {
+    const versions = hls11DeclaredVersions(text);
+    return versions.length === 1 && /^\d{1,2}$/.test(versions[0]) && Number(versions[0]) >= 6;
+  };
   checks.require(
+    "grammar/fmp4-fixture-declares-one-version-at-least-6",
+    compatibleVersion(fmp4.playlistText) && compatibleVersion(fmp4Video.playlistText),
+    `${hls11DeclaredVersions(fmp4.playlistText).join(",")} / ${hls11DeclaredVersions(fmp4Video.playlistText).join(",")}`,
+  );
+  const independentLines = (text) => text.split("\n").filter((line) => line.startsWith("#EXT-X-INDEPENDENT-SEGMENTS"));
+  checks.require(
+    "grammar/fmp4-fixture-declares-independent-segments-once",
+    sameList(independentLines(fmp4.playlistText), [HLS11_INDEPENDENT_SEGMENTS_TAG]) &&
+      sameList(independentLines(fmp4Video.playlistText), [HLS11_INDEPENDENT_SEGMENTS_TAG]) &&
+      independentLines(ts.playlistText).length === 0,
+  );
+
+  // The Product's own parser on that text. Recorded, not required: a grammar
+  // regression must also show in the jobs below, so the run continues.
+  const fmp4Parsed = parsed(fmp4.playlistText);
+  checks.record(
     "fixture/fmp4-playlist-is-the-v2-grammar",
     fmp4Parsed.segmentType === "fmp4" && fmp4Parsed.initializationMap?.reference === "init.mp4" &&
       fmp4Parsed.fragmentCount === fmp4.segments.length,
+    String(fmp4Parsed.refused ?? fmp4Parsed.segmentType),
+  );
+  // No execution state comes from the declaration: the model of the served
+  // playlist equals the model of the same text with that one line removed.
+  const withoutDeclaration = parsed(hls11WithoutIndependentSegments(fmp4.playlistText));
+  checks.record(
+    "grammar/independent-segments-derives-no-state",
+    fmp4Parsed.segmentType === "fmp4" && isDeepStrictEqual(fmp4Parsed, withoutDeclaration) &&
+      sameList(Object.keys(fmp4Parsed).sort(), ["fragmentCount", "fragments", "initializationMap", "segmentType"]),
+  );
+  checks.record(
+    "grammar/version-6-admitted-into-the-same-model",
+    isDeepStrictEqual(parsed(hls11VersionPlaylist(fmp4.playlistText, 6)), fmp4Parsed) && fmp4Parsed.segmentType === "fmp4",
+  );
+  const version5 = hls11VersionPlaylist(fmp4.playlistText, 5);
+  const versionMissing = hls11VersionPlaylist(fmp4.playlistText, null);
+  const version1 = hls11VersionPlaylist(fmp4.playlistText, 1);
+  checks.record(
+    "grammar/incompatible-versions-refused",
+    [version5, versionMissing, version1].every((text) => parsed(text).refused === "incompatible_version"),
+    [version5, versionMissing, version1].map((text) => parsed(text).refused ?? "admitted").join(","),
+  );
+  const valuedIndependent = hls11ValuedIndependentSegmentsPlaylist(fmp4.playlistText);
+  checks.record(
+    "grammar/valued-independent-segments-refused",
+    parsed(valuedIndependent).refused === "malformed_tag_value",
+    String(parsed(valuedIndependent).refused ?? "admitted"),
   );
   const byteRange = hls11ByteRangePlaylist(fmp4.playlistText, fmp4.init.byteLength);
   const encrypted = hls11EncryptedPlaylist(fmp4.playlistText);
-  checks.require(
+  checks.record(
     "fixture/negative-playlists-are-refused-by-the-parser",
     parsed(byteRange).refused === "byte_range" && parsed(encrypted).refused === "encrypted",
     `${parsed(byteRange).refused} ${parsed(encrypted).refused}`,
@@ -372,12 +435,20 @@ async function prepareFixtures(checks, runTool, toolchain, workRoot) {
   });
   return {
     renditions,
-    playlists: { byteRange, encrypted },
+    playlists: { byteRange, encrypted, version5, versionMissing, valuedIndependent },
     summary: {
-      recipe: "FFmpeg lavfi testsrc2 + sine -> libx264 (1 thread, bit-exact) + AAC-LC -> FFmpeg hls muxer, served verbatim",
+      recipe:
+        "FFmpeg lavfi testsrc2 + sine -> libx264 (1 thread, bit-exact) + AAC-LC -> FFmpeg hls muxer " +
+        "(fMP4: -hls_flags independent_segments), served verbatim",
       spec: { ...HLS11_FIXTURE_SPEC },
       ts: facts(ts),
-      fmp4: { ...facts(fmp4), initTopLevelBoxes: initBoxes, fragmentTopLevelBoxes: segmentBoxes[0] ?? [] },
+      fmp4: {
+        ...facts(fmp4),
+        initTopLevelBoxes: initBoxes,
+        fragmentTopLevelBoxes: segmentBoxes[0] ?? [],
+        declaredVersions: hls11DeclaredVersions(fmp4.playlistText),
+        declaresIndependentSegments: independentLines(fmp4.playlistText).length === 1,
+      },
       fmp4VideoOnly: facts(fmp4Video),
       deterministic: again.aggregateSha256 === fmp4.aggregateSha256,
     },
@@ -396,7 +467,7 @@ function routeTable(prepared) {
   };
   const { ts, fmp4 } = prepared.renditions;
   const fmp4Video = prepared.renditions["fmp4-video"];
-  for (const caseName of ["v1-ts", "v2-fmp4", "neg-byterange", "neg-encrypted", "neg-init-404", "neg-budget", "neg-video-only"]) {
+  for (const caseName of HLS11_CASES.filter((name) => name !== "split-master")) {
     add(caseName, "watch.html", "page", hls11Page(caseName));
     add(caseName, "master.m3u8", "master", hls11Master(caseName));
   }
@@ -414,6 +485,14 @@ function routeTable(prepared) {
   rendition("neg-budget", fmp4);
   media("neg-video-only", fmp4Video.playlistText);
   rendition("neg-video-only", fmp4Video);
+  // Each grammar negative still serves the whole valid rendition, so a Product
+  // that admitted its playlist would acquire, process and reach `ready`.
+  media("neg-version-5", prepared.playlists.version5);
+  rendition("neg-version-5", fmp4);
+  media("neg-version-missing", prepared.playlists.versionMissing);
+  rendition("neg-version-missing", fmp4);
+  media("neg-independent-segments-value", prepared.playlists.valuedIndependent);
+  rendition("neg-independent-segments-value", fmp4);
   add("split-master", "watch.html", "page", hls11Page("split-master"));
   add("split-master", "master.m3u8", "master", hls11SplitMaster());
   for (const leaf of ["video-1080.m3u8", "video-720.m3u8", "audio-main.m3u8", "audio-alt.m3u8"]) {
@@ -645,6 +724,19 @@ async function runPositiveCase(ctx, caseName) {
       http.every((e) => e.headerNamesExact && e.userAgentIsProduct && e.acceptIsProduct && e.forbiddenHeadersPresent.length === 0) &&
       fixtureAcq.every((r) => !r.hasCookie && !r.hasAuthorization && !r.hasReferer && !r.hasRange),
   );
+  if (fixture.segmentType === "fmp4") {
+    // The playlist the job fetched was the packager's text, declaration and
+    // all: the one media response carried exactly its bytes.
+    const mediaServed = fixtureAcq.filter((r) => r.kind === "media");
+    checks.record(
+      C("acquisition/consumed-the-independent-segments-playlist"),
+      mediaServed.length === 1 && mediaServed[0].status === 200 &&
+        mediaServed[0].bytes === Buffer.byteLength(fixture.playlistText, "utf8") &&
+        fixture.playlistText.split("\n").includes(HLS11_INDEPENDENT_SEGMENTS_TAG) &&
+        hls11DeclaredVersions(fixture.playlistText).every((v) => Number(v) >= 6),
+      `${mediaServed.length} media / ${mediaServed[0]?.bytes ?? 0} B`,
+    );
+  }
   const agg = ctx.aggregates.get(caseName) ?? null;
   checks.record(
     C("acquisition/aggregate-is-the-exact-concatenation"),
@@ -963,12 +1055,36 @@ async function runNegatives(ctx) {
     voMedia.map((s) => `${s.tool}@${s.status}`).join(","),
   );
 
+  // The grammar negatives: an fMP4 playlist declaring version 5, one declaring
+  // no version (RFC 8216 §7 requires 6 for the map), and one giving the
+  // independent-segments declaration a value. Each is refused at HLS-2, from
+  // the playlist alone: the map is never requested.
+  const refusedBeforeMap = (caseName, run) =>
+    checks.record(
+      `${caseName}/refused-before-the-map-request`,
+      sameList(run.job.http.map((e) => e.kind), ["media"]) &&
+        ctx.service.requests().filter((r) => r.caseName === caseName && (r.kind === "init" || r.kind === "fragment")).length === 0,
+      run.job.http.map((e) => e.kind).join(","),
+    );
+  const version5 = await runNegative(ctx, "neg-version-5", { expectedCode: "FORMAT_UNAVAILABLE" });
+  refusedBeforeMap("neg-version-5", version5);
+  neverProcessed("neg-version-5", version5);
+  const versionMissing = await runNegative(ctx, "neg-version-missing", { expectedCode: "FORMAT_UNAVAILABLE" });
+  refusedBeforeMap("neg-version-missing", versionMissing);
+  neverProcessed("neg-version-missing", versionMissing);
+  const valued = await runNegative(ctx, "neg-independent-segments-value", { expectedCode: "FORMAT_UNAVAILABLE" });
+  refusedBeforeMap("neg-independent-segments-value", valued);
+  neverProcessed("neg-independent-segments-value", valued);
+
   return {
     byteRangeMap: summary(byteRange.job, { expected: "FORMAT_UNAVAILABLE" }),
     encryptedPlaylist: summary(encrypted.job, { expected: "FORMAT_UNAVAILABLE", keyRequests: keyRequests.length }),
     initializationMap404: summary(init404.job, { expected: "NETWORK_ERROR" }),
     byteBudget: summary(budgetRun.job, { expected: "TOO_LARGE", allowanceBytes: budget, fragmentBytes, aggregateBytes: fmp4.aggregateBytes }),
     videoOnlyRenditionClaimingAudio: summary(videoOnly.job, { expected: "PROCESSING_FAILED" }),
+    fmp4Version5: summary(version5.job, { expected: "FORMAT_UNAVAILABLE" }),
+    fmp4VersionMissing: summary(versionMissing.job, { expected: "FORMAT_UNAVAILABLE" }),
+    valuedIndependentSegments: summary(valued.job, { expected: "FORMAT_UNAVAILABLE" }),
   };
 }
 
@@ -1091,7 +1207,7 @@ async function main(argv) {
     const validateUrl = createHls11PageUrlValidator({ port: bound.port, AppError });
     checks.require(
       "validator/admits-exactly-the-case-pages",
-      validateUrl.admitted.length === 8 &&
+      validateUrl.admitted.length === HLS11_CASES.length &&
         (await Promise.all(validateUrl.admitted.map(async (u) => (await validateUrl(u)).url === u))).every(Boolean),
     );
     let refused = 0;

@@ -3508,6 +3508,10 @@ describe("SPLIT-07 -06 clear-HLS v2 child validation", () => {
       "neg-byterange/format-unavailable",
       "neg-budget/refused-only-because-the-map-counts",
       "neg-video-only/refused-by-the-real-source-probe-before-any-ffmpeg",
+      "neg-version-5/refused-before-the-map-request",
+      "neg-version-missing/refused-before-the-map-request",
+      "grammar/independent-segments-derives-no-state",
+      "v2-fmp4/acquisition/consumed-the-independent-segments-playlist",
       "split-master/pinned-ytdlp-exposes-no-pairing-relationship",
     ]) {
       assert.ok(HLS11_MANDATORY_CHECKS.includes(name), name);

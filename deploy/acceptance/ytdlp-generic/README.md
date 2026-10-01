@@ -176,8 +176,8 @@ not an overlay. It does the following, and deploys nothing and never touches
   FFmpeg stream copy and real output validation, plus three bounded negatives;
 - (since `-06`) runs the HLS-11 clear-HLS v2 real-media child against it — a
   1080p MPEG-TS control and a 1080p fMP4 rendition through the real HLS-2/3/4
-  chain, real ffprobe and FFmpeg, five fail-closed negatives and the
-  split-master pairing case;
+  chain, real ffprobe and FFmpeg, the v2 grammar checks, eight fail-closed
+  negatives and the split-master pairing case;
 - creates its record exclusively, and reads it back.
 
 See [`SPLIT-07.md`](SPLIT-07.md), for the clear-HLS child [`HLS-09.md`](HLS-09.md),
@@ -198,7 +198,7 @@ child [`HLS-11.md`](HLS-11.md).
 | `fixtures/dash-media.mjs` | — | The deterministic 1920x1080 fragmented-MP4 recipes, the init/segment splitter, the closed route grammar and the two MPDs. |
 | `fixtures/dash-server.mjs` | inside the release candidate, loopback only | The closed-route fixture service with its sanitized ledger and its pace/hold/failing behaviours. |
 | `hls11-full-path.mjs` | inside the release candidate | The HLS-11 clear-HLS v2 real-media orchestrator, launched by SPLIT-07 with the parent's identity flags. |
-| `lib/hls11-evidence.mjs` | — | The `hls11-release-image-full-path-01` record, its 137 mandatory checks, PASS and privacy gates, and the parent-side validator. |
+| `lib/hls11-evidence.mjs` | — | The `hls11-release-image-full-path-01` record, its 159 mandatory checks, PASS and privacy gates, and the parent-side validator. |
 | `lib/hls11-fixture-url.mjs` | — | The HLS-11 hostname, `--add-host` mapping, closed per-case routes and exact page validator. Import-free. |
 | `lib/hls11-observers.mjs` | — | The HLS spawn observer (durable status, input, demuxer), the HLS workspace sampler and the `-J` pairing-fact reducer. |
 | `fixtures/hls11-media.mjs` | — | The bit-exact 1080p MPEG-TS/fMP4 recipes, the masters (including the split master) and the negative playlists. |

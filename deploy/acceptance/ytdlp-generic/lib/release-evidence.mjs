@@ -47,7 +47,7 @@
 // playlists executable. The HLS-11 child (`hls11-release-image-full-path-01`)
 // is the real-media proof in the candidate image: a 1920x1080 MPEG-TS control
 // and a 1920x1080 fMP4 rendition through the real HLS-2/3/4 chain, the real
-// ffprobe and FFmpeg, five fail-closed negatives, and the split-master case
+// ffprobe and FFmpeg, eight fail-closed negatives, and the split-master case
 // that re-proves separate HLS audio is not pairable. It has its own
 // `hls11Acceptance` block. The HLS-09 child stays, unchanged, beside it.
 
