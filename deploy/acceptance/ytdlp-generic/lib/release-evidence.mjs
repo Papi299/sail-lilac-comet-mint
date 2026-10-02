@@ -44,12 +44,14 @@
 // ── The clear-HLS v2 child (since -06) ──────────────────────────────────────
 //
 // HLS-V2-ADAPTIVE-VOD-EXPANSION-001 made fMP4 (init + fragment) HLS media
-// playlists executable. The HLS-11 child (`hls11-release-image-full-path-01`)
-// is the real-media proof in the candidate image: a 1920x1080 MPEG-TS control
-// and a 1920x1080 fMP4 rendition through the real HLS-2/3/4 chain, the real
-// ffprobe and FFmpeg, eight fail-closed negatives, and the split-master case
-// that re-proves separate HLS audio is not pairable. It has its own
-// `hls11Acceptance` block. The HLS-09 child stays, unchanged, beside it.
+// playlists executable. The HLS-11 child (`hls11-release-image-full-path-01`;
+// `-02` since -08) is the real-media proof in the candidate image: a 1920x1080
+// MPEG-TS control and a 1920x1080 fMP4 rendition through the real HLS-2/3/4
+// chain, the real ffprobe and FFmpeg, eight fail-closed negatives, and the
+// split-master case that re-proves the pinned yt-dlp exposes no audio pairing
+// (and, since its `-02`, that the Product's own master proof refuses that
+// master). It has its own `hls11Acceptance` block. The HLS-09 child stays,
+// unchanged, beside it.
 //
 // ── The timestamp-aware children (since -07) ───────────────────────────────
 //
@@ -62,6 +64,20 @@
 // and the new SYNC-01 child (`sync01-release-image-merge-timing-01`): the
 // maintained timing matrix through the candidate's own merge, with its own
 // `syncAcceptance` block.
+//
+// ── The separate-audio child (since -08) ────────────────────────────────────
+//
+// HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001 made ONE further HLS family
+// executable: a video-only fMP4 rendition plus the single audio-only fMP4
+// rendition of the AUDIO group its variant names, proven from a Master
+// Playlist the Product fetches itself, acquired as two halves and merged by
+// the shared split merge. The HLS-12 child
+// (`hls12-release-image-separate-audio-01`) is its real-media proof in the
+// candidate image — an audio-late, a video-late and a zero-aligned pair to
+// `ready` with the source timing preserved, four master-proof negatives and
+// five execution negatives — with its own `hls12Acceptance` block. The HLS-11
+// child moves to `hls11-release-image-full-path-02`, because the Product now
+// consults its split master too.
 
 import { createHash } from "node:crypto";
 
@@ -69,6 +85,7 @@ import { DASH01_RELEASE_EVIDENCE_SCHEMA, validateDashReleaseChildRecord } from "
 import { SPLIT06_EVIDENCE_SCHEMA, unmetSplit06SyncChecks } from "./split-evidence.mjs";
 import { SYNC01_RELEASE_EVIDENCE_SCHEMA, validateSyncReleaseChildRecord } from "./sync-evidence.mjs";
 import { HLS11_RELEASE_EVIDENCE_SCHEMA, validateHls11ReleaseChildRecord } from "./hls11-evidence.mjs";
+import { HLS12_RELEASE_EVIDENCE_SCHEMA, validateHls12ReleaseChildRecord } from "./hls12-evidence.mjs";
 import { FORBIDDEN_EVIDENCE_KEYS, stripForbiddenKeys } from "./evidence.mjs";
 import {
   HLS09_RELEASE_EVIDENCE_SCHEMA,
@@ -159,13 +176,26 @@ import {
  *        (`sync01-release-image-merge-timing-01`) PASS, executed by the SAME
  *        immutable candidate image id, naming the same release source, offline;
  *        the harness re-verified before that child and again after it;
- *        `sync01:merge-timing` in the candidate run ledger. The current
- *        release-image qualification: mp4 + webm + clear-HLS + segmented DASH +
- *        clear-HLS v2 (fMP4) + split-merge timing.
+ *        `sync01:merge-timing` in the candidate run ledger. mp4 + webm +
+ *        clear-HLS + segmented DASH + clear-HLS v2 (fMP4) + split-merge timing.
+ *        -07 records stay VALID for exactly the candidates they qualified (RC
+ *        2efb85da, Production since 2026-10-02) and are never re-read under
+ *        -08: that source has no separate-audio HLS family to qualify.
+ *   -08  everything -07 means, with the clear-HLS v2 child at
+ *        `hls11-release-image-full-path-02` (its split master is now consulted
+ *        by the Product's own master proof, and refused), PLUS a validated,
+ *        byte-hashed HLS-12 separate-audio clear-HLS child
+ *        (`hls12-release-image-separate-audio-01`) PASS, executed by the SAME
+ *        immutable candidate image id, naming the same release source, offline;
+ *        the harness re-verified before that child and again after it;
+ *        `hls12:clear-hls-separate-audio` in the candidate run ledger. The
+ *        current release-image qualification: mp4 + webm + clear-HLS +
+ *        segmented DASH + clear-HLS v2 (fMP4) + split-merge timing +
+ *        separate-audio clear HLS (fMP4 + fMP4).
  */
-export const SPLIT07_EVIDENCE_SCHEMA = "split07-release-image-candidate-07";
+export const SPLIT07_EVIDENCE_SCHEMA = "split07-release-image-candidate-08";
 
-/** The historical parent schemas. Never rewritten, and never read as -07. */
+/** The historical parent schemas. Never rewritten, and never read as -08. */
 export const HISTORICAL_SPLIT07_SCHEMAS = Object.freeze([
   "split07-release-image-candidate-01",
   "split07-release-image-candidate-02",
@@ -173,6 +203,7 @@ export const HISTORICAL_SPLIT07_SCHEMAS = Object.freeze([
   "split07-release-image-candidate-04",
   "split07-release-image-candidate-05",
   "split07-release-image-candidate-06",
+  "split07-release-image-candidate-07",
 ]);
 
 /** The exact SPLIT-06 schema a SPLIT-07 PASS accepts as a child (`-05` since -07). */
@@ -193,7 +224,7 @@ export const REQUIRED_DASH_CHILD_SCHEMA = DASH01_RELEASE_EVIDENCE_SCHEMA;
 /** The candidate-run purpose of the segmented-DASH release child. */
 export const DASH_CANDIDATE_RUN_PURPOSE = "dash01:segmented-dash";
 
-/** The exact clear-HLS v2 child schema a PASS accepts (since -06). */
+/** The exact clear-HLS v2 child schema a PASS accepts (a child since -06; its `-02` since -08). */
 export const REQUIRED_HLS11_CHILD_SCHEMA = HLS11_RELEASE_EVIDENCE_SCHEMA;
 
 /** The candidate-run purpose of the clear-HLS v2 release child. */
@@ -205,12 +236,20 @@ export const REQUIRED_SYNC_CHILD_SCHEMA = SYNC01_RELEASE_EVIDENCE_SCHEMA;
 /** The candidate-run purpose of the split-merge timing release child. */
 export const SYNC_CANDIDATE_RUN_PURPOSE = "sync01:merge-timing";
 
+/** The exact separate-audio clear-HLS child schema a PASS accepts (since -08). */
+export const REQUIRED_HLS12_CHILD_SCHEMA = HLS12_RELEASE_EVIDENCE_SCHEMA;
+
+/** The candidate-run purpose of the separate-audio clear-HLS release child. */
+export const HLS12_CANDIDATE_RUN_PURPOSE = "hls12:clear-hls-separate-audio";
+
 /**
  * Every candidate container a PASS requires, by purpose: four image probes,
  * two policy verifiers, SPLIT-06 mp4 and webm, (since -03) the HLS-09
- * clear-HLS child, (since -05) the DASH-01 segmented-DASH child and (since -06)
- * the HLS-11 clear-HLS v2 child. Each one must have executed the immutable image ID; a
- * purpose missing from the record is a characterization that never ran.
+ * clear-HLS child, (since -05) the DASH-01 segmented-DASH child, (since -06)
+ * the HLS-11 clear-HLS v2 child, (since -07) the SYNC-01 split-merge timing
+ * child and (since -08) the HLS-12 separate-audio child. Each one must have
+ * executed the immutable image ID; a purpose missing from the record is a
+ * characterization that never ran.
  */
 export const REQUIRED_CANDIDATE_RUN_PURPOSES = Object.freeze([
   "probe:manifest",
@@ -223,13 +262,14 @@ export const REQUIRED_CANDIDATE_RUN_PURPOSES = Object.freeze([
   DASH_CANDIDATE_RUN_PURPOSE,
   HLS11_CANDIDATE_RUN_PURPOSE,
   SYNC_CANDIDATE_RUN_PURPOSE,
+  HLS12_CANDIDATE_RUN_PURPOSE,
 ]);
 
 /**
  * Where the harness is re-verified, in order (exactly). The harness is consumed
  * by every child, so it is verified before any Docker command, after the
- * build, before EACH child, and once more after the last child — since -06 the
- * clear-HLS v2 one — before the parent record is assembled.
+ * build, before EACH child, and once more after the last child — since -08 the
+ * separate-audio clear-HLS one — before the parent record is assembled.
  */
 export const HARNESS_VERIFICATION_POINTS = Object.freeze([
   "before-docker",
@@ -239,6 +279,7 @@ export const HARNESS_VERIFICATION_POINTS = Object.freeze([
   "before-dash01-segmented-dash",
   "before-hls11-clear-hls-v2",
   "before-sync01-merge-timing",
+  "before-hls12-clear-hls-separate-audio",
   "after-children",
 ]);
 
@@ -414,6 +455,11 @@ export const REQUIRED_PASS_CHECKS = Object.freeze([
   "sync/child-names-the-release-source",
   "sync/child-ran-in-the-candidate-image",
   "sync/child-evidence-unchanged-before-assembly",
+  "hls12/separate-audio-child-executed",
+  "hls12/separate-audio-child-passed",
+  "hls12/child-names-the-release-source",
+  "hls12/child-ran-in-the-candidate-image",
+  "hls12/child-evidence-unchanged-before-assembly",
   "production/latest-image-id-unchanged",
   "production/worker-container-unchanged",
 ]);
@@ -734,6 +780,55 @@ export function emptySyncChildObservation(reason = null) {
 }
 
 /**
+ * Validates the HLS-12 separate-audio clear-HLS child record read from disk
+ * (since -08), with exactly the HLS-11 child's discipline: the exact bytes
+ * hashed and parsed; the exact HLS-12 schema, a `PASS` verdict, every
+ * mandatory check present once and every recorded check passing, the release
+ * source commit AND tree, the immutable id as candidate image and run subject,
+ * the parent's build label, `--network none` and no private fixture material.
+ */
+export function validateHls12ChildRecord({ bytes, expected }) {
+  if (!Buffer.isBuffer(bytes)) {
+    throw new ReleaseEvidenceError("the HLS-12 child record must be validated from its exact bytes");
+  }
+  const digest = sha256Hex(bytes);
+  let record;
+  try {
+    record = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return {
+      ...emptyHls12ChildObservation(),
+      sha256: digest, bytes: bytes.length, reason: "the HLS-12 child record is not parseable JSON",
+    };
+  }
+  const problems = validateHls12ReleaseChildRecord(record, expected);
+  const checks = Array.isArray(record?.checks) ? record.checks : [];
+  return {
+    ok: problems.length === 0,
+    schema: typeof record?.schema === "string" && /^[a-z0-9-]{1,80}$/.test(record.schema) ? record.schema : null,
+    verdict: ["PASS", "FAIL", "BLOCKED"].includes(record?.verdict) ? record.verdict : null,
+    sha256: digest,
+    bytes: bytes.length,
+    checkCount: checks.length,
+    failedCheckCount: checks.filter((check) => check?.ok !== true).length,
+    sourceCommit: isFullGitSha(record?.source?.commit) ? record.source.commit : null,
+    sourceTree: isFullGitSha(record?.source?.tree) ? record.source.tree : null,
+    candidateTag: isCandidateReference(record?.image?.candidateTag) ? record.image.candidateTag : null,
+    candidateImageId: imageIdOrNull(record?.image?.imageId),
+    runImageId: imageIdOrNull(record?.image?.runSubject),
+    networkMode: typeof record?.network?.mode === "string" && /^[a-z]{1,16}$/.test(record.network.mode)
+      ? record.network.mode
+      : null,
+    reason: problems.length > 0 ? problems.join("; ") : null,
+  };
+}
+
+/** The observation for an HLS-12 child that never produced readable bytes. */
+export function emptyHls12ChildObservation(reason = null) {
+  return emptyHlsChildObservation(reason);
+}
+
+/**
  * Assembles the record from an ALLOWLIST.
  *
  * Every field is named here. Nothing is spread in from an observation object,
@@ -852,6 +947,10 @@ export function buildReleaseEvidence(input) {
     // only — never the child document itself.
     syncAcceptance: syncAcceptanceBlock(input.syncAcceptance),
 
+    // Since -08: the separate-audio clear-HLS child. Sanitized facts and a
+    // digest only — never the child document itself.
+    hls12Acceptance: hls12AcceptanceBlock(input.hls12Acceptance),
+
     production: input.production,
 
     checks: input.checks,
@@ -884,7 +983,8 @@ export function buildReleaseEvidence(input) {
  * validated PASS records of the exact SPLIT-06 schema, (since -03) the
  * clear-HLS child must be a validated PASS of the exact HLS-09 schema naming
  * this source and this image, (since -05) so must the DASH-01 segmented-DASH
- * child, and (since -06) so must the HLS-11 clear-HLS v2 child.
+ * child, (since -06) the HLS-11 clear-HLS v2 child, (since -07) the SYNC-01
+ * split-merge timing child and (since -08) the HLS-12 separate-audio child.
  */
 function assertPassEarned(record) {
   const checks = Array.isArray(record.checks) ? record.checks : [];
@@ -1068,6 +1168,36 @@ function assertPassEarned(record) {
   if (sync.child.networkMode !== "none") {
     throw new ReleaseEvidenceError("refusing to emit a PASS record whose split-merge timing child was not offline");
   }
+
+  // -08: the separate-audio clear-HLS child executed, passed, and names exactly
+  // this release source and this candidate image, offline.
+  const hls12 = record.hls12Acceptance;
+  if (hls12?.executed !== true || hls12.child === null || typeof hls12.child !== "object") {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record without an executed HLS-12 separate-audio child");
+  }
+  if (hls12.child.schema !== REQUIRED_HLS12_CHILD_SCHEMA) {
+    throw new ReleaseEvidenceError(
+      `refusing to emit a PASS record whose separate-audio child is ${String(hls12.child.schema)}, not ${REQUIRED_HLS12_CHILD_SCHEMA}`,
+    );
+  }
+  if (
+    hls12.child.verdict !== "PASS" || hls12.child.ok !== true ||
+    !(hls12.child.checkCount > 0) || hls12.child.failedCheckCount !== 0
+  ) {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record whose separate-audio child did not pass");
+  }
+  if (typeof hls12.child.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(hls12.child.sha256)) {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record whose separate-audio child has no content digest");
+  }
+  if (hls12.child.sourceCommit !== record.source?.commit || hls12.child.sourceTree !== record.source?.tree) {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record whose separate-audio child names another source");
+  }
+  if (hls12.child.candidateImageId !== imageId || hls12.child.runImageId !== imageId) {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record whose separate-audio child names another image");
+  }
+  if (hls12.child.networkMode !== "none") {
+    throw new ReleaseEvidenceError("refusing to emit a PASS record whose separate-audio child was not offline");
+  }
   const runs = Array.isArray(record.image?.candidateRuns) ? record.image.candidateRuns : [];
   const purposes = runs.map((entry) => String(entry?.purpose)).sort();
   const expectedPurposes = [...REQUIRED_CANDIDATE_RUN_PURPOSES].sort();
@@ -1164,8 +1294,9 @@ function verifiedHarness(harness) {
     typeof harness.worktreeIsReleaseContext === "boolean" &&
     typeof harness.commitIsReleaseSource === "boolean" &&
     // EXACTLY every checkpoint, in order — including the ones before the
-    // clear-HLS (-03), segmented-DASH (-05), clear-HLS v2 (-06) and split-merge
-    // timing (-07) children — and the last one after all six children.
+    // clear-HLS (-03), segmented-DASH (-05), clear-HLS v2 (-06), split-merge
+    // timing (-07) and separate-audio (-08) children — and the last one after
+    // all seven children.
     Array.isArray(harness.verificationPoints) &&
     harness.verificationPoints.length === HARNESS_VERIFICATION_POINTS.length &&
     harness.verificationPoints.every((point, i) => point === HARNESS_VERIFICATION_POINTS[i]);
@@ -1190,8 +1321,8 @@ function verifiedHarness(harness) {
     commitIsReleaseSource: harness.commitIsReleaseSource,
     verifiedBy:
       "run-release-image-acceptance.mjs: git against --harness, before any Docker command and at every checkpoint " +
-      "to the end of all six children (SPLIT-06 mp4, SPLIT-06 webm, HLS-09 clear-HLS, DASH-01 segmented DASH, " +
-      "HLS-11 clear-HLS v2, SYNC-01 split-merge timing)",
+      "to the end of all seven children (SPLIT-06 mp4, SPLIT-06 webm, HLS-09 clear-HLS, DASH-01 segmented DASH, " +
+      "HLS-11 clear-HLS v2, SYNC-01 split-merge timing, HLS-12 separate-audio clear HLS)",
   };
 }
 
@@ -1248,27 +1379,34 @@ function syncAcceptanceBlock(input) {
   return { ...block, requiredChildSchema: REQUIRED_SYNC_CHILD_SCHEMA };
 }
 
+/** The `hls12Acceptance` block (since -08), on the same terms. */
+function hls12AcceptanceBlock(input) {
+  const block = hlsAcceptanceBlock(input);
+  return { ...block, requiredChildSchema: REQUIRED_HLS12_CHILD_SCHEMA };
+}
+
 /**
  * Reads a parent record back under the CURRENT schema's rules.
  *
- * Returns the problems; an empty list means the record is a `-07` record for
+ * Returns the problems; an empty list means the record is a `-08` record for
  * exactly `expected` (`{ sourceCommit, imageId }`) and, when it says PASS,
- * that it earns PASS under -07 rules. A historical `-01`..`-06` record is never
- * silently read as `-07`: it is named as historical, because a `-02` PASS
+ * that it earns PASS under -08 rules. A historical `-01`..`-07` record is never
+ * silently read as `-08`: it is named as historical, because a `-02` PASS
  * proves mp4 + webm and nothing about clear HLS, a `-03` PASS proves clear HLS
  * under the protocol invariant `-04` restated, a `-04` PASS carries no
  * real-media segmented-DASH child, a `-05` PASS carries no clear-HLS v2 (fMP4)
- * child, and a `-06` PASS carries no split-merge timing measurement.
+ * child, a `-06` PASS carries no split-merge timing measurement, and a `-07`
+ * PASS carries no separate-audio clear-HLS child.
  */
 export function validateReleaseParentRecord(record, expected = {}) {
   if (record === null || typeof record !== "object" || Array.isArray(record)) return ["the record is not an object"];
   const problems = [];
   if (HISTORICAL_SPLIT07_SCHEMAS.includes(record.schema)) {
-    // True of all six: none of them carries the split-merge timing children
-    // -07 requires; -01..-05 also lack the clear-HLS v2 child, -01..-04 the
-    // segmented-DASH child.
+    // True of all seven: none of them carries the separate-audio clear-HLS
+    // child -08 requires; -01..-06 also lack the split-merge timing children,
+    // -01..-05 the clear-HLS v2 child, -01..-04 the segmented-DASH child.
     problems.push(
-      `${record.schema} is a historical schema, not ${SPLIT07_EVIDENCE_SCHEMA}; it does not carry the split-merge timing children`,
+      `${record.schema} is a historical schema, not ${SPLIT07_EVIDENCE_SCHEMA}; it does not carry the separate-audio clear-HLS child`,
     );
     return problems;
   }

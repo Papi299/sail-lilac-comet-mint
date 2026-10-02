@@ -179,11 +179,13 @@ offered `preset:best` and `preset:1080` with exactly the HLS public facts above,
 and a `preset:1080` job delivered an MP4 through the ordinary job and download
 contract. That proves the supported muxed-fMP4 shape over the real Production
 path, not general third-party HLS/CMAF compatibility. Separate HLS audio
-renditions stay unsupported and keep being reported as `unsupported_protocol`
-— **HLS AUDIO PAIRING PROVENANCE INSUFFICIENT**: the pinned yt-dlp exposes no
-video→audio relationship to pair on. No Vercel deployment was required, and no
-deployment-order constraint follows: the HLS-v2 rollout was Worker-only, and
-the current control plane accepted the new Worker unchanged.
+renditions were not part of it: they stayed unsupported and kept being reported
+as `unsupported_protocol` — **HLS AUDIO PAIRING PROVENANCE INSUFFICIENT**: the
+pinned yt-dlp exposes no video→audio relationship to pair on (separate-audio
+clear HLS, below, pairs from the Master Playlist instead). No Vercel deployment
+was required, and no deployment-order constraint follows: the HLS-v2 rollout
+was Worker-only, and the current control plane accepted the new Worker
+unchanged.
 
 **Split-merge timestamp preservation changes no contract either**
 (`SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001`, PR #107 — **CLOSED /
@@ -197,6 +199,24 @@ never reach a browser response; the 2026-10-02 Production acceptance found none
 of them in any analysis, job-creation or status response. No Vercel deployment
 was required, and no deployment-order constraint follows: the rollout was
 Worker-only, and the current control plane accepted the new Worker unchanged.
+
+**Separate-audio clear HLS changes no contract either**
+(`HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001` — **SOURCE IMPLEMENTED —
+RELEASE QUALIFICATION / PRODUCTION ACCEPTANCE PENDING**; deployment runbook
+§4o). It lets ONE further pair fulfil the same ordinary presets with the same
+public HLS facts: a video-only fMP4 HLS rendition plus the single audio-only
+fMP4 rendition of the `AUDIO` group its variant names. VideoFetch proves that
+pair from a Master Playlist it fetches itself during analysis, with one bounded
+request and no redirect followed. There is still no public schema change, and
+no HLS-specific or separate-audio format id, field, status or error code:
+`src/shared` is unchanged. A pair the master does not prove is not offered and
+keeps being reported as `unsupported_protocol` in `sourceQuality`. The master
+location, its body, any group name, label or language, both media-playlist
+URLs and the private operation stay Worker-private: they are never persisted
+and never returned. A browser sees only the ordinary presets, job states and
+error codes. The Production Worker does not carry this source until a
+separately authorized release qualification and promotion; no Vercel
+deployment is needed for it.
 
 **Deployment order — VERCEL FIRST.** `VideoMetadataSchema` is strict, so a
 control plane that predates this field REJECTS a Worker response that carries it

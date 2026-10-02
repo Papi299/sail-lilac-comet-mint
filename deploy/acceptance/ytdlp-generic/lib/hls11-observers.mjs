@@ -62,9 +62,11 @@ export function describeHlsSpawn(command, args) {
  * Installs the observer over `child_process.spawn` for THIS process (the same
  * mechanism as DASH-01's: `syncBuiltinESMExports` reaches the product's
  * `import { spawn }` binding). `beforeDelegate(record, command, args)` runs
- * synchronously before the real spawn and must not throw.
+ * synchronously before the real spawn and must not throw. `describe` reduces
+ * one call to its closed facts: this module's HLS-11 reducer by default; HLS-12
+ * passes its own, for its own product file names.
  */
-export function installHlsSpawnObserver({ context, beforeDelegate = null }) {
+export function installHlsSpawnObserver({ context, beforeDelegate = null, describe = describeHlsSpawn }) {
   if (typeof context !== "function") throw new Error("the spawn observer needs a context reader");
   const childProcess = require("node:child_process");
   const originalSpawn = childProcess.spawn;
@@ -77,7 +79,7 @@ export function installHlsSpawnObserver({ context, beforeDelegate = null }) {
     } catch {
       // An unreadable status is recorded as such; it never blocks the spawn.
     }
-    const record = { seq: (seq += 1), status: String(ctx.status), phase: String(ctx.phase), ...describeHlsSpawn(command, args) };
+    const record = { seq: (seq += 1), status: String(ctx.status), phase: String(ctx.phase), ...describe(command, args) };
     records.push(record);
     if (beforeDelegate !== null) {
       try {
@@ -116,9 +118,10 @@ export function classifyHlsWorkspaceEntry(name) {
 /**
  * Samples one job directory while the job runs: per phase, the peak of all
  * bytes and every entry class seen. A peak is a LOWER bound on the true peak —
- * corroboration, never the guard itself.
+ * corroboration, never the guard itself. `classify` is the artifact grammar:
+ * HLS-11's by default; HLS-12 passes its own.
  */
-export function createHlsWorkspaceSampler({ intervalMs = 3 } = {}) {
+export function createHlsWorkspaceSampler({ intervalMs = 3, classify = classifyHlsWorkspaceEntry } = {}) {
   let directory = null;
   let phase = "idle";
   let timer = null;
@@ -142,7 +145,7 @@ export function createHlsWorkspaceSampler({ intervalMs = 3 } = {}) {
       let total = 0;
       const classes = new Set();
       for (const name of names) {
-        classes.add(classifyHlsWorkspaceEntry(name));
+        classes.add(classify(name));
         try {
           const info = await lstat(join(directory, name));
           if (info.isFile()) total += info.size;

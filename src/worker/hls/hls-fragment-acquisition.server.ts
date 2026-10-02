@@ -33,8 +33,15 @@ import {
  *   `acquireClearHlsFmp4()`  an fMP4 plan (HLS v2): the ONE initialization map
  *                            FIRST, then the fragments, in order, into
  *                            `hls-source.fmp4` — one fragmented-MP4 input.
+ *   `acquireClearHlsSeparateVideoFmp4()` / `acquireClearHlsSeparateAudioFmp4()`
+ *                            the two halves of a separate-audio pair
+ *                            (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001):
+ *                            the fMP4 path exactly, into `hls-video.fmp4` and
+ *                            `hls-audio.fmp4`. The caller keeps ONE combined
+ *                            byte counter by narrowing the audio half's limit
+ *                            (`maxAggregateBytes`) to what the video half left.
  *
- * Both run the same private core: the same `safeGet()` per resource, the same
+ * All of them run the same private core: the same `safeGet()` per resource, the same
  * per-resource and aggregate bounds, the same deadline, cancellation,
  * finalization barrier and commit point. The initialization map is a media
  * resource like any fragment: it is fetched through the same primitive, held to
@@ -179,6 +186,20 @@ const PARTIAL_FILE_NAME = "hls-source.ts.part";
 export const FMP4_AGGREGATE_FILE_NAME = "hls-source.fmp4";
 const FMP4_PARTIAL_FILE_NAME = "hls-source.fmp4.part";
 
+/**
+ * The two fMP4 aggregates of a SEPARATE-AUDIO pair
+ * (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001): the video-only half and the
+ * audio-only half, each its own initialization map followed by its own
+ * fragments, and their partials. Distinct names from each other and from the
+ * muxed fMP4 aggregate, so no half can be mistaken for the other or for a
+ * muxed rendition by name; the separate-audio processing seam checks each half
+ * against exactly its own name. Exported for that identity check only.
+ */
+export const SEPARATE_VIDEO_FMP4_FILE_NAME = "hls-video.fmp4";
+const SEPARATE_VIDEO_FMP4_PARTIAL_FILE_NAME = "hls-video.fmp4.part";
+export const SEPARATE_AUDIO_FMP4_FILE_NAME = "hls-audio.fmp4";
+const SEPARATE_AUDIO_FMP4_PARTIAL_FILE_NAME = "hls-audio.fmp4.part";
+
 // ── The acquired artifact ────────────────────────────────────────────────────
 
 /**
@@ -243,6 +264,15 @@ export type ClearHlsAcquisitionProgress = {
  * must be absolute. `signal` is REQUIRED so no caller can start an
  * uncancellable acquisition. `timeoutMs` may only NARROW the download budget.
  *
+ * `maxAggregateBytes` (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001) may only
+ * NARROW the aggregate limit, exactly as `timeoutMs` narrows the budget: the
+ * effective limit is the smaller of it and `hlsV1EffectiveAggregateLimitBytes()`.
+ * It is how a separate-audio pair keeps ONE combined byte counter — the audio
+ * half is handed the Product limit minus the video half's actual bytes — so
+ * neither half can consume the full ceiling on its own. When present it must
+ * be a positive safe integer; anything else is refused before any I/O. Omitted,
+ * the limit is exactly what it always was.
+ *
  * `P` names the plan family an entry point accepts. It is a TYPE statement
  * only: each entry point also refuses the other family's plan at run time.
  */
@@ -251,6 +281,7 @@ export type ClearHlsAcquisitionRequest<P extends ClearHlsAcquisitionPlan = Clear
   readonly workDir: string;
   readonly signal: AbortSignal;
   readonly timeoutMs?: number;
+  readonly maxAggregateBytes?: number;
   readonly onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
 };
 
@@ -675,9 +706,9 @@ async function transferResources(
   handle: FileHandle,
   signal: AbortSignal,
   budgetMs: number,
+  aggregateLimit: number,
   onProgress: ClearHlsAcquisitionRequest["onProgress"],
 ): Promise<number> {
-  const aggregateLimit = hlsV1EffectiveAggregateLimitBytes();
   const ctx: FragmentContext = { handle, signal, budgetMs, aggregateLimit };
   const fragmentCount = resources.fragmentUrls.length;
   let aggregateBytes = 0;
@@ -764,6 +795,18 @@ function acquisitionBudgetMs(requested: number | undefined): number | null {
   return Number.isFinite(budget) && budget > 0 ? budget : null;
 }
 
+/**
+ * The aggregate limit this acquisition enforces: the effective Product limit,
+ * narrowed — never widened — by a caller allowance. `null` refuses a malformed
+ * allowance (not a positive safe integer) before any I/O.
+ */
+function acquisitionAggregateLimit(allowance: number | undefined): number | null {
+  const effective = hlsV1EffectiveAggregateLimitBytes();
+  if (allowance === undefined) return effective;
+  if (typeof allowance !== "number" || !Number.isSafeInteger(allowance) || allowance <= 0) return null;
+  return Math.min(effective, allowance);
+}
+
 // ── The finalization barrier ─────────────────────────────────────────────────
 
 /**
@@ -830,6 +873,25 @@ const FMP4_FAMILY: AcquisitionFamily<"fmp4"> = Object.freeze({
   admit: admitFmp4Plan,
 });
 
+/**
+ * The two separate-audio halves: the fMP4 family's own admission and artifact
+ * shape, under each half's own fixed names. Nothing about the transfer, the
+ * bounds or the lifecycle differs from a muxed fMP4 acquisition.
+ */
+const SEPARATE_VIDEO_FMP4_FAMILY: AcquisitionFamily<"fmp4"> = Object.freeze({
+  segmentType: "fmp4",
+  aggregateFileName: SEPARATE_VIDEO_FMP4_FILE_NAME,
+  partialFileName: SEPARATE_VIDEO_FMP4_PARTIAL_FILE_NAME,
+  admit: admitFmp4Plan,
+});
+
+const SEPARATE_AUDIO_FMP4_FAMILY: AcquisitionFamily<"fmp4"> = Object.freeze({
+  segmentType: "fmp4",
+  aggregateFileName: SEPARATE_AUDIO_FMP4_FILE_NAME,
+  partialFileName: SEPARATE_AUDIO_FMP4_PARTIAL_FILE_NAME,
+  admit: admitFmp4Plan,
+});
+
 // ── The acquisition ──────────────────────────────────────────────────────────
 
 /**
@@ -853,6 +915,28 @@ export async function acquireClearHlsFmp4(
   request: ClearHlsAcquisitionRequest<ClearHlsFmp4AcquisitionPlan>,
 ): Promise<ClearHlsAcquiredFmp4> {
   return acquireAggregate(request, FMP4_FAMILY);
+}
+
+/**
+ * Download the VIDEO half of a separate-audio pair — one approved fMP4 plan,
+ * map first — into `hls-video.fmp4`. The fMP4 lifecycle exactly; it refuses an
+ * MPEG-TS plan as `invalid_plan`.
+ */
+export async function acquireClearHlsSeparateVideoFmp4(
+  request: ClearHlsAcquisitionRequest<ClearHlsFmp4AcquisitionPlan>,
+): Promise<ClearHlsAcquiredFmp4> {
+  return acquireAggregate(request, SEPARATE_VIDEO_FMP4_FAMILY);
+}
+
+/**
+ * Download the AUDIO half of a separate-audio pair into `hls-audio.fmp4`. The
+ * caller narrows its aggregate limit (`maxAggregateBytes`) to what the video
+ * half left of the one combined budget.
+ */
+export async function acquireClearHlsSeparateAudioFmp4(
+  request: ClearHlsAcquisitionRequest<ClearHlsFmp4AcquisitionPlan>,
+): Promise<ClearHlsAcquiredFmp4> {
+  return acquireAggregate(request, SEPARATE_AUDIO_FMP4_FAMILY);
 }
 
 /**
@@ -923,7 +1007,7 @@ async function acquireAggregate<S extends ClearHlsSegmentType>(
   request: ClearHlsAcquisitionRequest,
   family: AcquisitionFamily<S>,
 ): Promise<{ readonly filePath: string; readonly segmentType: S; readonly fileSize: number }> {
-  const { plan, workDir, signal, timeoutMs, onProgress } = request;
+  const { plan, workDir, signal, timeoutMs, maxAggregateBytes, onProgress } = request;
 
   // Nothing starts for a caller that has already gone: no plan work, no
   // lookup, no request and no file.
@@ -933,6 +1017,9 @@ async function acquireAggregate<S extends ClearHlsSegmentType>(
   const resources = family.admit(plan);
   if (resources === null) throw new ClearHlsAcquisitionError("invalid_plan");
   const fragmentCount = resources.fragmentUrls.length;
+  // Fixed once, before any I/O: the allowance can only narrow the Product limit.
+  const aggregateLimit = acquisitionAggregateLimit(maxAggregateBytes);
+  if (aggregateLimit === null) throw new ClearHlsAcquisitionError("invalid_plan");
 
   const paths = acquisitionPaths(workDir, family);
   if (paths === null) throw new ClearHlsAcquisitionError("output_error");
@@ -1004,6 +1091,7 @@ async function acquireAggregate<S extends ClearHlsSegmentType>(
         handle,
         controller.signal,
         budgetMs,
+        aggregateLimit,
         onProgress,
       );
       let written: number;

@@ -20,10 +20,10 @@ verified clean release source
   → SPLIT-06 mp4 child     (split06-deterministic-full-path-05; -04 before -07)
   → SPLIT-06 webm child    (split06-deterministic-full-path-05; -04 before -07)
   → HLS-09 clear-HLS child (hls09-release-image-full-path-02; -01 before GENERIC-SEGMENTED-DASH-EXECUTION-001)
-  → ONE HLS-aware SPLIT-07 parent PASS (split07-release-image-candidate-07, which
+  → ONE HLS-aware SPLIT-07 parent PASS (split07-release-image-candidate-08, which
     also requires the DASH-01 segmented-DASH child, the HLS-11 clear-HLS v2
-    child and the SYNC-01 split-merge timing child; -06, -05, -04 and -03
-    before it)
+    child, the SYNC-01 split-merge timing child and the HLS-12 separate-audio
+    clear-HLS child; -07, -06, -05, -04 and -03 before it)
 ```
 
 Every candidate container — the clear-HLS child included — executes the same
@@ -228,7 +228,7 @@ clear-HLS chain offline.
 | `hls08-deterministic-full-path-02` | **accepted**, historical | Overlay / source-runtime deterministic HLS evidence (PR #78 head `6296b0db…`, tree `677c5a24…`, PASS 144/144). Never re-read under `-03`. |
 | `hls09-release-image-full-path-01` | **accepted**, historical | The same clear-HLS full path and negatives, executed by a real `Dockerfile.worker` release candidate, with release identity; carried by every `split07-release-image-candidate-03` PASS. Never re-read under `-02`. |
 | `hls08-deterministic-full-path-03` | current overlay schema | `-02` with the protocol invariant restated by `GENERIC-SEGMENTED-DASH-EXECUTION-001` (no HLS spelling in the one yt-dlp vocabulary, which is exactly `http`/`https`/`http_dash_segments`). No record produced yet. |
-| `hls09-release-image-full-path-02` | current release schema | `-01` over the same restated behavioral checks. Records produced as the HLS-09 child of SPLIT-07 `-05`, `-06` and `-07` release qualifications — for example the `-07` qualification of 2026-10-02, 146/146 (deployment runbook §4n). |
+| `hls09-release-image-full-path-02` | current release schema | `-01` over the same restated behavioral checks. Records produced as the HLS-09 child of SPLIT-07 `-05`, `-06` and `-07` release qualifications — for example the `-07` qualification of 2026-10-02, 146/146 (deployment runbook §4n). SPLIT-07 `-08` requires it unchanged: its single muxed variant names no audio group, so the Product's separate-audio master proof never fetches its master. |
 
 These scopes are not interchangeable: an overlay PASS is not release-image
 evidence, and a release child is never read as overlay evidence. HLS-8 remains a

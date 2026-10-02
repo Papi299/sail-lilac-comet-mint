@@ -21,6 +21,7 @@ import {
   executionPlanRequestedFormatId,
   executionPlanTargetContainer,
   type ClearHlsExecutionPlan,
+  type ClearHlsSeparateAudioExecutionPlan,
   type DirectExecutionPlan,
   type ExecutionPlan,
   type GenericSingleSourceExecutionPlan,
@@ -33,6 +34,11 @@ import {
   type ClearHlsAcquisitionProgress,
   type ClearHlsProcessedMp4,
 } from "../hls/hls-execution.server.ts";
+import {
+  acquireSelectedSeparateHlsMedia,
+  processAcquiredSeparateHlsMedia,
+  type ClearHlsSeparateAudioAcquired,
+} from "../hls/hls-separate-audio-execution.server.ts";
 import {
   downloadGenericOriginal,
   downloadGenericSplitSources,
@@ -189,6 +195,38 @@ export type ProcessClearHlsFn = (opts: {
 }) => Promise<ClearHlsProcessedMp4>;
 
 /**
+ * HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: acquires BOTH halves a
+ * `clear-hls-separate-audio-remux` plan names — two HLS-2 preflights, then the
+ * video and audio fMP4 acquisitions under one byte budget and one deadline.
+ *
+ * Typed on its OWN plan partition, the exact complement of the other three
+ * acquisition seams, and like the muxed HLS seam it takes no page URL: the only
+ * locations it may contact are the two media playlists the fresh analysis
+ * proved. No local media work of any kind.
+ */
+export type AcquireSeparateHlsFn = (
+  plan: ClearHlsSeparateAudioExecutionPlan,
+  workDir: string,
+  ctx: {
+    signal: AbortSignal;
+    onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
+  },
+) => Promise<ClearHlsSeparateAudioAcquired>;
+
+/**
+ * HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: the timestamp-aware
+ * stream-copy merge of the two acquired halves into MP4, injectable so a
+ * lifecycle test can observe the durable status at the moment it is reached.
+ */
+export type ProcessSeparateHlsFn = (opts: {
+  source: ClearHlsSeparateAudioAcquired;
+  workDir: string;
+  timeoutMs: number;
+  maxOutputBytes: number;
+  signal: AbortSignal;
+}) => Promise<ClearHlsProcessedMp4>;
+
+/**
  * HLS-6 §24: the execution plan derivation, as an INTERNAL seam.
  *
  * Production is always `deriveExecutionPlan`, and `runtime.server.ts` never
@@ -282,6 +320,16 @@ type AcquiredExecutionMedia =
       readonly kind: "clear-hls";
       readonly plan: ClearHlsExecutionPlan;
       readonly source: ClearHlsAcquiredMedia;
+    }
+  /**
+   * HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: the two acquired fMP4 halves
+   * of a proven separate-audio pair, bound to their plan. Its own member for the
+   * reason the clear-HLS one is: neither half is a deliverable source.
+   */
+  | {
+      readonly kind: "clear-hls-separate-audio";
+      readonly plan: ClearHlsSeparateAudioExecutionPlan;
+      readonly source: ClearHlsSeparateAudioAcquired;
     };
 
 export type JobExecutorDeps = {
@@ -313,6 +361,13 @@ export type JobExecutorDeps = {
   /** HLS-6: the clear-HLS remux. Production: HLS-4 through the same seam. */
   processClearHls?: ProcessClearHlsFn;
   /**
+   * Separate-audio clear-HLS acquisition. Production: two HLS-2 preflights and
+   * two HLS-3 fMP4 acquisitions through the `worker/hls` separate-audio seam.
+   */
+  acquireSeparateHls?: AcquireSeparateHlsFn;
+  /** Separate-audio clear-HLS merge. Production: the shared timestamp-aware merge, same seam. */
+  processSeparateHls?: ProcessSeparateHlsFn;
+  /**
    * HLS-6 §24: plan derivation. Production: `deriveExecutionPlan` — the default,
    * which `runtime.server.ts` never overrides.
    */
@@ -343,6 +398,7 @@ function asDirectExecutionAnalysis(fn: AnalyzeDirectMediaFn): AnalyzeForExecutio
     video: await fn(url, signal),
     selections: {},
     hlsSelections: {},
+    separateHlsSelections: {},
   });
 }
 
@@ -390,6 +446,8 @@ export class JobExecutor {
   private readonly mergeSplit: MergeSplitMediaFn;
   private readonly acquireClearHls: AcquireClearHlsFn;
   private readonly processClearHls: ProcessClearHlsFn;
+  private readonly acquireSeparateHls: AcquireSeparateHlsFn;
+  private readonly processSeparateHls: ProcessSeparateHlsFn;
   private readonly derivePlanForExecution: DerivePlanForExecutionFn;
   private readonly availableWorkDirBytes: AvailableWorkDirBytesFn;
   private readonly genericLimits: GenericDownloadLimits;
@@ -449,6 +507,19 @@ export class JobExecutor {
           ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
         }));
     this.processClearHls = deps.processClearHls ?? ((opts) => processAcquiredClearHlsMedia(opts));
+    // HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: the separate-audio seams
+    // default to their own `worker/hls` orchestration module, which reuses the
+    // muxed module's failure tables and the shared timestamp-aware merge.
+    this.acquireSeparateHls =
+      deps.acquireSeparateHls ??
+      ((plan, workDir, ctx) =>
+        acquireSelectedSeparateHlsMedia({
+          plan,
+          workDir,
+          signal: ctx.signal,
+          ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
+        }));
+    this.processSeparateHls = deps.processSeparateHls ?? ((opts) => processAcquiredSeparateHlsMedia(opts));
     // HLS-6 §24: the ordinary Product planner, and nothing else, by default.
     this.derivePlanForExecution = deps.derivePlanForExecution ?? deriveExecutionPlan;
     this.availableWorkDirBytes = deps.availableWorkDirBytes ?? availableBytesOnWorkDirFilesystem;
@@ -643,7 +714,9 @@ export class JobExecutor {
         ? await this.executeSplitPlan(acquired.plan, acquired.sources, workDir, signal)
         : acquired.kind === "clear-hls"
           ? await this.executeClearHlsPlan(acquired.plan, acquired.source, workDir, signal)
-          : await this.executePlan(acquired.plan, acquired.original, workDir, signal);
+          : acquired.kind === "clear-hls-separate-audio"
+            ? await this.executeSeparateHlsPlan(acquired.plan, acquired.source, workDir, signal)
+            : await this.executePlan(acquired.plan, acquired.original, workDir, signal);
 
     const validOut = await validateLocalOutput(workDir, producedPath);
 
@@ -730,6 +803,33 @@ export class JobExecutor {
     }
 
     const generic = plan.generic;
+
+    // ── HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: one proven pair ──────
+    //
+    // Checked FIRST and by equality, like the muxed branch below. The two media
+    // playlists the fresh analysis proved are the only locations contacted, and
+    // the executor's own progress gate makes a late callback from any
+    // implementation inert once the call has settled.
+    if (generic.operation === "clear-hls-separate-audio-remux") {
+      const report = this.makeProgressReporter(jobId);
+      let acquisitionLive = true;
+      let source: ClearHlsSeparateAudioAcquired;
+      try {
+        source = await this.acquireSeparateHls(generic, workDir, {
+          signal,
+          onProgress: (update) => {
+            if (acquisitionLive) report(update);
+          },
+        });
+      } finally {
+        acquisitionLive = false;
+      }
+      return {
+        kind: "clear-hls-separate-audio",
+        plan: generic,
+        source: assertAcquiredSeparateHlsMedia(source, this.genericLimits.maxFileSizeBytes),
+      };
+    }
 
     // ── HLS-6: one clear-HLS rendition ──────────────────────────────────────
     //
@@ -945,6 +1045,44 @@ export class JobExecutor {
   }
 
   /**
+   * HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: executes a
+   * `clear-hls-separate-audio-remux` plan — the shared timestamp-aware
+   * stream-copy merge of the two acquired halves into MP4, over the EXACT
+   * acquisition result. Reached only after `beginProcessing()` committed, with
+   * the same application-owned processing timeout and ONE product ceiling every
+   * other path uses.
+   *
+   * The delivered artifact must be the merge's OWN MP4: never either half
+   * handed back as if it had been merged.
+   */
+  private async executeSeparateHlsPlan(
+    plan: ClearHlsSeparateAudioExecutionPlan,
+    source: ClearHlsSeparateAudioAcquired,
+    workDir: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const produced = await this.processSeparateHls({
+      source,
+      workDir,
+      timeoutMs: config.downloadTimeoutMs,
+      maxOutputBytes: this.genericLimits.maxFileSizeBytes,
+      signal,
+    });
+
+    const container: unknown = (produced as { container?: unknown } | null)?.container;
+    if (container !== plan.targetContainer) throw new AppError("PROCESSING_FAILED");
+    const filePath: unknown = (produced as { filePath?: unknown } | null)?.filePath;
+    if (typeof filePath !== "string" || filePath.length === 0) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    if (filePath === source.video.filePath || filePath === source.audio.filePath) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    if (!filePath.endsWith(`.${plan.targetContainer}`)) throw new AppError("PROCESSING_FAILED");
+    return filePath;
+  }
+
+  /**
    * §9 + §10: executes exactly the derived plan. `plan.targetContainer` is a
    * closed union, so no user-supplied string ever becomes an FFmpeg target,
    * an output extension, or a path segment.
@@ -1140,6 +1278,46 @@ function assertAcquiredClearHlsMedia(raw: ClearHlsAcquiredMedia): ClearHlsAcquir
   if (typeof fileSize !== "number" || !Number.isSafeInteger(fileSize) || fileSize <= 0) {
     throw new AppError("PROCESSING_FAILED");
   }
+  return raw;
+}
+
+/**
+ * HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: the executor's own proof that
+ * a separate-audio acquisition handed back two fMP4 halves and their exact
+ * combined size, within the ONE product budget.
+ *
+ * The orchestration seam and the merge seam re-prove all of it far more
+ * strictly; this is the module boundary, where an injected implementation is
+ * not trusted merely because the production one is correct. The SAME object is
+ * returned, so the merge seam still validates exactly what acquisition
+ * committed. A total over the budget is `TOO_LARGE`, as the split boundary
+ * classifies the same condition.
+ */
+function assertAcquiredSeparateHlsMedia(
+  raw: ClearHlsSeparateAudioAcquired,
+  maxFileSizeBytes: number,
+): ClearHlsSeparateAudioAcquired {
+  const candidate = raw as { video?: unknown; audio?: unknown; totalFileSize?: unknown } | null;
+  if (typeof candidate !== "object" || candidate === null) throw new AppError("PROCESSING_FAILED");
+  const half = (value: unknown): { filePath: string; fileSize: number } => {
+    const entry = value as { filePath?: unknown; segmentType?: unknown; fileSize?: unknown } | null;
+    if (typeof entry !== "object" || entry === null) throw new AppError("PROCESSING_FAILED");
+    if (entry.segmentType !== "fmp4") throw new AppError("PROCESSING_FAILED");
+    if (typeof entry.filePath !== "string" || entry.filePath.length === 0) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    const size = entry.fileSize;
+    if (typeof size !== "number" || !Number.isSafeInteger(size) || size <= 0) {
+      throw new AppError("PROCESSING_FAILED");
+    }
+    return { filePath: entry.filePath, fileSize: size };
+  };
+  const video = half(candidate.video);
+  const audio = half(candidate.audio);
+  if (video.filePath === audio.filePath) throw new AppError("PROCESSING_FAILED");
+  const sum = video.fileSize + audio.fileSize;
+  if (!Number.isSafeInteger(sum) || candidate.totalFileSize !== sum) throw new AppError("PROCESSING_FAILED");
+  if (sum > maxFileSizeBytes) throw new AppError("TOO_LARGE");
   return raw;
 }
 

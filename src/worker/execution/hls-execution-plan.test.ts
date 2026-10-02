@@ -617,6 +617,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
       video: genericMeta([hlsPublic("preset:best"), hlsPublic("preset:1080")]),
       selections: {},
       hlsSelections: shadow({ "preset:best": selection(), "preset:1080": selection() }),
+      separateHlsSelections: {},
     };
     for (const id of ["preset:best", "preset:1080"] as const) {
       const plan = deriveExecutionPlan(analysis, id);
@@ -647,6 +648,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
         "preset:best": selection("https://media.example.invalid/hls/2160.m3u8", 2160),
         "preset:2160": selection("https://media.example.invalid/hls/2160.m3u8", 2160),
       }),
+      separateHlsSelections: {},
     };
     const progressivePlan = deriveExecutionPlan(analysis, "preset:1080");
     assert.equal(operationOf(progressivePlan), "keep-original");
@@ -665,6 +667,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
       video: genericMeta([progressive("preset:1080")]),
       selections: {},
       hlsSelections: shadow({ "preset:1080": selection() }),
+      separateHlsSelections: {},
     };
     assert.equal(
       operationOf({ strategy: "yt-dlp", generic: deriveClearHlsExecutionPlan(analysis.hlsSelections, "preset:1080") }),
@@ -690,6 +693,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
       video: genericMeta([hlsPublic("preset:1080")]),
       selections: progressiveSelections,
       hlsSelections: shadow({}),
+      separateHlsSelections: {},
     };
     expectFormatUnavailable(() => deriveExecutionPlan(sameId, "preset:1080"), "no progressive fallback");
 
@@ -699,6 +703,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
       video: genericMeta([hlsPublic("preset:2160"), progressive("preset:1080")]),
       selections: progressiveSelections,
       hlsSelections: shadow({}),
+      separateHlsSelections: {},
     };
     expectFormatUnavailable(() => deriveExecutionPlan(otherRungs, "preset:2160"), "no other rung");
     assert.equal(operationOf(deriveExecutionPlan(otherRungs, "preset:1080")), "keep-original");
@@ -714,6 +719,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
         video: genericMeta([hlsPublic("preset:2160"), progressive("preset:1080")]),
         selections: progressiveSelections,
         hlsSelections: { "preset:2160": value as ClearHlsMediaPlaylistSelection },
+        separateHlsSelections: {},
       };
       expectFormatUnavailable(() => deriveExecutionPlan(analysis, "preset:2160"), label);
     }
@@ -727,6 +733,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
         video: genericMeta([shape]),
         selections: progressiveSelections,
         hlsSelections: shadow({ "preset:1080": selection() }),
+        separateHlsSelections: {},
       };
       expectFormatUnavailable(() => deriveExecutionPlan(analysis, "preset:1080"), JSON.stringify(shape));
     }
@@ -754,7 +761,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
     assert.equal(
       operationOf(
         deriveExecutionPlan(
-          { strategy: "yt-dlp", video, selections: progressiveSelections, hlsSelections: shadow({}) },
+          { strategy: "yt-dlp", video, selections: progressiveSelections, hlsSelections: shadow({}), separateHlsSelections: {} },
           "preset:1080",
         ),
       ),
@@ -770,7 +777,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
     expectFormatUnavailable(
       () =>
         deriveExecutionPlan(
-          { strategy: "yt-dlp", video, selections, hlsSelections: shadow({}) },
+          { strategy: "yt-dlp", video, selections, hlsSelections: shadow({}), separateHlsSelections: {} },
           "preset:1080",
         ),
       "an inherited progressive entry owns nothing",
@@ -786,6 +793,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
         video: genericMeta([progressive("preset:1080")]),
         selections: progressiveSelections,
         hlsSelections,
+        separateHlsSelections: {},
       },
       "preset:1080",
     );
@@ -801,6 +809,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
       video: genericMeta([hlsPublic("preset:1080")]),
       selections,
       hlsSelections: shadow({ "preset:1080": selection() }),
+      separateHlsSelections: {},
     };
     const plan = deriveExecutionPlan(analysis, "preset:1080");
     assert.equal(operationOf(plan), "clear-hls-remux");
@@ -819,6 +828,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
             video: genericMeta([hlsPublic("preset:1080")]),
             selections: {},
             hlsSelections: inheritedHls(),
+            separateHlsSelections: {},
           },
           "preset:1080",
         ),
@@ -834,6 +844,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
               video: genericMeta([shape]),
               selections: inheritedProgressive(),
               hlsSelections: inheritedHls(),
+              separateHlsSelections: {},
             },
             "preset:1080",
           ),
@@ -862,6 +873,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
             video: genericMeta([hlsPublic("preset:1080")]),
             selections: {},
             hlsSelections: accessorMap(selection()),
+            separateHlsSelections: {},
           },
           "preset:1080",
         ),
@@ -877,6 +889,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
             video: genericMeta([progressive("preset:1080")]),
             selections: progressiveSelections,
             hlsSelections: accessorMap(selection()),
+            separateHlsSelections: {},
           },
           "preset:1080",
         ),
@@ -890,6 +903,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
             video: genericMeta([hlsPublic("preset:1080")]),
             selections: accessorMap(progressiveSource),
             hlsSelections: shadow({ "preset:1080": selection() }),
+            separateHlsSelections: {},
           },
           "preset:1080",
         ),
@@ -913,6 +927,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
             video: genericMeta([hlsPublic("preset:1080")]),
             selections: {},
             hlsSelections: hidden,
+            separateHlsSelections: {},
           },
           "preset:1080",
         ),
@@ -927,6 +942,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
             video: genericMeta([progressive("preset:1080")]),
             selections: progressiveSelections,
             hlsSelections: hidden,
+            separateHlsSelections: {},
           },
           "preset:1080",
         ),
@@ -949,6 +965,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
             video: genericMeta([progressive("preset:1080")]),
             selections: bareProgressive,
             hlsSelections: shadow({}),
+            separateHlsSelections: {},
           },
           "preset:1080",
         ),
@@ -963,6 +980,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
             video: genericMeta([hlsPublic("preset:1080")]),
             selections: {},
             hlsSelections: bareHls,
+            separateHlsSelections: {},
           },
           "preset:1080",
         ),
@@ -981,6 +999,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
         "preset:best": selection(),
         "preset:144": selection("https://media.example.invalid/hls/144.m3u8", 144),
       }),
+      separateHlsSelections: {},
     };
     for (const id of ["preset:best", "preset:144", "preset:2160"]) {
       expectFormatUnavailable(() => deriveExecutionPlan(analysis, id), id);
@@ -996,7 +1015,13 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
     expectFormatUnavailable(
       () =>
         deriveExecutionPlan(
-          { strategy: "yt-dlp", video: tampered, selections: {}, hlsSelections: shadow({ "preset:1080": selection() }) },
+          {
+            strategy: "yt-dlp",
+            video: tampered,
+            selections: {},
+            hlsSelections: shadow({ "preset:1080": selection() }),
+            separateHlsSelections: {},
+          },
           "preset:1080",
         ),
       "formatId mismatch",
@@ -1014,6 +1039,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
         ]),
         selections: {},
         hlsSelections: { [id]: selection() } as ClearHlsMediaPlaylistSelections,
+        separateHlsSelections: {},
       };
       expectFormatUnavailable(() => deriveExecutionPlan(analysis, id), id);
     }
@@ -1051,6 +1077,7 @@ describe("HLS-7 activation: ordinary derivation reaches clear HLS for an HLS-own
       }),
       selections: {},
       hlsSelections: shadow({ "preset:1080": selection(), "direct-original": selection() }),
+      separateHlsSelections: {},
     };
     const plan = deriveExecutionPlan(analysis, "direct-original");
     assert.equal(plan.strategy, "direct");

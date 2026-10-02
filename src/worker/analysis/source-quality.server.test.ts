@@ -403,7 +403,7 @@ describe("P1 rendition inventory: the corpus", () => {
         const golden = withEstimateOnlySizesSuppressed(scenario, GOLDEN[scenario.name]!);
         assert.equal(golden.ok, true, "every corpus scenario analyzed successfully before P1");
 
-        const { video, selections, hlsSelections } = await analyzeScenario(scenario);
+        const { video, selections, hlsSelections, separateHlsSelections } = await analyzeScenario(scenario);
         const { sourceQuality, ...identity } = video;
         assert.ok(sourceQuality, "the new field exists...");
 
@@ -427,7 +427,7 @@ describe("P1 rendition inventory: the corpus", () => {
         const plans: Record<string, unknown> = {};
         const selectors: Record<string, string[]> = {};
         for (const preset of video.presets) {
-          const plan = deriveExecutionPlan({ strategy: "yt-dlp", video, selections, hlsSelections }, preset.id);
+          const plan = deriveExecutionPlan({ strategy: "yt-dlp", video, selections, hlsSelections, separateHlsSelections }, preset.id);
           if (hlsIds.has(preset.id)) {
             // HLS-owned: VideoFetch's own acquisition, so there is no yt-dlp
             // selector to compare — and none may exist.
@@ -526,7 +526,7 @@ describe("P1 rendition inventory: non-admitted HLS stays inventory-only", () => 
   for (const name of manifestScenarios) {
     it(`${name}: manifest renditions are counted but never executable`, async () => {
       const scenario = CORPUS.find((s) => s.name === name)!;
-      const { video, selections, hlsSelections } = await analyzeScenario(scenario);
+      const { video, selections, hlsSelections, separateHlsSelections } = await analyzeScenario(scenario);
       assert.deepEqual(hlsSelections, {}, "no clear-HLS ownership either");
 
       // Which upstream ids belong to a manifest protocol, per the document.
@@ -553,7 +553,7 @@ describe("P1 rendition inventory: non-admitted HLS stays inventory-only", () => 
 
       // Every preset is still derivable; none of them acquires a manifest.
       for (const preset of video.presets) {
-        const plan = deriveExecutionPlan({ strategy: "yt-dlp", video, selections, hlsSelections }, preset.id);
+        const plan = deriveExecutionPlan({ strategy: "yt-dlp", video, selections, hlsSelections, separateHlsSelections }, preset.id);
         assert.notEqual(plan.strategy === "yt-dlp" ? plan.generic.operation : null, "clear-hls-remux");
       }
 

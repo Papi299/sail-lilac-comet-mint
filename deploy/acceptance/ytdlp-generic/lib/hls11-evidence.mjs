@@ -26,8 +26,9 @@
 // three of them grammar refusals (version 5, no version, a valued
 // independent-segments line) before the map was requested — and a split
 // master proved, against the candidate's own pinned yt-dlp, that separate HLS
-// audio is exposed with no pairing relationship and is therefore not
-// advertised.
+// audio is exposed with no pairing relationship, and (since `-02`) that the
+// Product's OWN master proof — one unredirected master request, no media
+// request — refuses both of its video variants, so nothing is advertised.
 //
 // Import-free apart from the harness's own import-free modules, so the parent
 // validates a record on an older Node.
@@ -53,8 +54,21 @@ import { isFullGitSha } from "./split-provenance.mjs";
  *        version gate and the independent-segments admission) without a bump:
  *        no merged or deployed release had consumed an `-01` record, and every
  *        record names the exact source commit and tree it ran.
+ *
+ *  -02  HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: the Product now fetches
+ *        a Master Playlist ITSELF during analysis whenever the pinned yt-dlp
+ *        exposes a video-only HLS rendition — the only pairing authority for
+ *        separate HLS audio. The split master is such a document, so the
+ *        Product's master request is admitted by the transport, and the case
+ *        records that it was the ONE Product request (unredirected, while
+ *        analysis ran), that no media playlist, map or fragment was requested,
+ *        and that both video variants were refused (161 mandatory checks).
+ *        An `-01` record stays a valid historical record of what it proved.
  */
-export const HLS11_RELEASE_EVIDENCE_SCHEMA = "hls11-release-image-full-path-01";
+export const HLS11_RELEASE_EVIDENCE_SCHEMA = "hls11-release-image-full-path-02";
+
+/** Older schemas: valid historical records, never re-read as the current one. */
+export const HLS11_HISTORICAL_SCHEMAS = Object.freeze(["hls11-release-image-full-path-01"]);
 
 /** The two positive cases, in run order. */
 export const HLS11_POSITIVE_CASES = Object.freeze(["v1-ts", "v2-fmp4"]);
@@ -197,14 +211,21 @@ export const HLS11_NEGATIVE_CHECKS = Object.freeze([
   "neg-independent-segments-value/never-processing-no-media-tool",
 ]);
 
-/** The split-master pairing-provenance case. */
+/**
+ * The split-master pairing-provenance case. Since `-02` the Product consults
+ * the master itself: exactly one unredirected master request, still no media
+ * playlist, map or fragment request, and no separate-audio selection — the
+ * grouped variant's group holds TWO URI renditions and the control names none.
+ */
 export const HLS11_SPLIT_MASTER_CHECKS = Object.freeze([
   "split-master/pinned-ytdlp-exposes-separate-audio-renditions",
   "split-master/pinned-ytdlp-exposes-no-pairing-relationship",
   "split-master/no-hls-video-preset-advertised",
   "split-master/hls-selections-empty",
+  "split-master/separate-hls-selections-empty",
   "split-master/source-quality-withholds-unsupported-protocol-at-1080",
   "split-master/plan-refuses-preset-1080",
+  "split-master/product-fetched-the-master-once-with-zero-redirects",
   "split-master/no-product-media-request",
 ]);
 
@@ -226,7 +247,7 @@ export const HLS11_MANDATORY_CHECKS = Object.freeze([
 
 /** What a PASS does not prove. Recorded verbatim in every record. */
 export const HLS11_NON_CLAIMS = Object.freeze([
-  "separate HLS audio (split TS or split fMP4) is NOT supported and NOT exercised as a positive: pairing provenance is insufficient",
+  "separate HLS audio is NOT exercised as a positive here (the HLS-12 child is its release evidence): this child's split master is one the Product's own master proof refuses",
   "no real public HLS source, real CDN, signed-URL lifetime or public fMP4 packager compatibility",
   "Production SSRF/DNS/egress policy is NOT re-proven (the acceptance transport answers a synthetic public address)",
   "no real Cloudflare Tunnel/Access, Vercel, Cloudflare R2 or R2 credential broker",

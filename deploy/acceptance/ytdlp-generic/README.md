@@ -180,25 +180,33 @@ not an overlay. It does the following, and deploys nothing and never touches
 - (since `-06`) runs the HLS-11 clear-HLS v2 real-media child against it — a
   1080p MPEG-TS control and a 1080p fMP4 rendition through the real HLS-2/3/4
   chain, real ffprobe and FFmpeg, the v2 grammar checks, eight fail-closed
-  negatives and the split-master pairing case;
+  negatives and the split-master pairing case (since `-08`, HLS-11 `-02`: the
+  Product's own master proof consults that master and refuses it);
 - (since `-07`) runs the SYNC-01 split-merge timing child against it — the
   candidate's own `mergeSplitMedia` across a 19-case MP4/WebM timing matrix
   against a pre-job oracle, historical identity of every zero-aligned control,
   and the oracle-sensitivity control;
+- (since `-08`) runs the HLS-12 separate-audio clear-HLS real-media child
+  against it — audio-late, video-late and zero-aligned video-only + audio-only
+  fMP4 pairs, each proven from a Master Playlist the Product fetches itself,
+  acquired as two halves under one byte budget and merged by the shared split
+  merge with their timing preserved, plus four master negatives and five
+  execution negatives;
 - creates its record exclusively, and reads it back.
 
 See [`SPLIT-07.md`](SPLIT-07.md), for the clear-HLS child [`HLS-09.md`](HLS-09.md),
 for the segmented-DASH child [`DASH-01.md`](DASH-01.md), for the clear-HLS v2
-child [`HLS-11.md`](HLS-11.md), and for the split-merge timing child
-[`SYNC-01.md`](SYNC-01.md).
+child [`HLS-11.md`](HLS-11.md), for the split-merge timing child
+[`SYNC-01.md`](SYNC-01.md), and for the separate-audio clear-HLS child
+[`HLS-12.md`](HLS-12.md).
 
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
-| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, the clear-HLS child once, the segmented-DASH child once, the clear-HLS v2 child once and the split-merge timing child once, writes the `split07-release-image-candidate-07` record (`-06` is valid release qualification for exactly the candidates it qualified — its SPLIT-06 and DASH-01 children could not see per-input timestamp zeroing, and it ran no split-merge timing child; `-05` is valid release qualification for exactly the candidates it qualified — it ran no clear-HLS v2 child; `-04` is historical — it ran no real-media segmented-DASH child and no `-04` record was ever produced; `-03` is valid HLS-aware qualification under the pre-`GENERIC-SEGMENTED-DASH-EXECUTION-001` protocol invariant; `-02` is valid split-stream-only qualification and does not qualify clear HLS; `-01` is historical). Requires `--media-workspace`: an existing, EMPTY, uid-1000-writable directory on disk, never the report directory or a Production path — admitted before any Docker command and cleared after each child. |
+| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, the clear-HLS child once, the segmented-DASH child once, the clear-HLS v2 child once, the split-merge timing child once and the separate-audio clear-HLS child once, writes the `split07-release-image-candidate-08` record (`-07` is valid release qualification for exactly the candidates it qualified — its source has no separate-audio HLS family; `-06` is valid release qualification for exactly the candidates it qualified — its SPLIT-06 and DASH-01 children could not see per-input timestamp zeroing, and it ran no split-merge timing child; `-05` is valid release qualification for exactly the candidates it qualified — it ran no clear-HLS v2 child; `-04` is historical — it ran no real-media segmented-DASH child and no `-04` record was ever produced; `-03` is valid HLS-aware qualification under the pre-`GENERIC-SEGMENTED-DASH-EXECUTION-001` protocol invariant; `-02` is valid split-stream-only qualification and does not qualify clear HLS; `-01` is historical). Requires `--media-workspace`: an existing, EMPTY, uid-1000-writable directory on disk, never the report directory or a Production path — admitted before any Docker command and cleared after each child. |
 | `lib/release-provenance.mjs` | — | The clean-worktree gate for the release context and the harness, and the `/app` source manifest from Git objects. |
-| `lib/release-container.mjs` | — | Every `docker` argv: non-deployable tags, immutable-id run subjects, hardening, the Product media workspace bound in Production's exact `--mount type=bind` form (the 2 GiB tmpfs is retired, `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`), the forbidden-mount guard, and the clear-HLS, segmented-DASH, clear-HLS v2 and split-merge timing children's argv and structural posture checks. |
+| `lib/release-container.mjs` | — | Every `docker` argv: non-deployable tags, immutable-id run subjects, hardening, the Product media workspace bound in Production's exact `--mount type=bind` form (the 2 GiB tmpfs is retired, `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`), the forbidden-mount guard, and the clear-HLS, segmented-DASH, clear-HLS v2, split-merge timing and separate-audio clear-HLS children's argv and structural posture checks. |
 | `lib/release-image-probe.mjs` | inside the candidate, at `/verify` | Import-free observer: manifest, forbidden tools, env names, runtime identity. |
-| `lib/release-evidence.mjs` | — | The parent record, SPLIT-06, clear-HLS, segmented-DASH, clear-HLS v2 and split-merge timing child validation and re-hashing, the PASS gate, and the read-back validator. |
+| `lib/release-evidence.mjs` | — | The parent record, SPLIT-06, clear-HLS, segmented-DASH, clear-HLS v2, split-merge timing and separate-audio clear-HLS child validation and re-hashing, the PASS gate, and the read-back validator. |
 | `dash-full-path.mjs` | inside the release candidate | The DASH-01 real-media orchestrator (release-image mode only), launched by SPLIT-07. |
 | `lib/dash-argv.mjs` | — | Its command line: exactly the parent's identity flags. |
 | `lib/dash-evidence.mjs` | — | The `dash01-release-image-full-path-02` record (`-01` is historical: no timing oracle), its mandatory checks, PASS and privacy gates, and the parent-side validator. |
@@ -206,18 +214,25 @@ child [`HLS-11.md`](HLS-11.md), and for the split-merge timing child
 | `fixtures/dash-media.mjs` | — | The deterministic 1920x1080 fragmented-MP4 recipes, the init/segment splitter, the closed route grammar and the two MPDs. |
 | `fixtures/dash-server.mjs` | inside the release candidate, loopback only | The closed-route fixture service with its sanitized ledger and its pace/hold/failing behaviours. |
 | `hls11-full-path.mjs` | inside the release candidate | The HLS-11 clear-HLS v2 real-media orchestrator, launched by SPLIT-07 with the parent's identity flags. |
-| `lib/hls11-evidence.mjs` | — | The `hls11-release-image-full-path-01` record, its 159 mandatory checks, PASS and privacy gates, and the parent-side validator. |
+| `lib/hls11-evidence.mjs` | — | The `hls11-release-image-full-path-02` record (`-01` historical), its 161 mandatory checks, PASS and privacy gates, and the parent-side validator. |
 | `lib/hls11-fixture-url.mjs` | — | The HLS-11 hostname, `--add-host` mapping, closed per-case routes and exact page validator. Import-free. |
-| `lib/hls11-observers.mjs` | — | The HLS spawn observer (durable status, input, demuxer), the HLS workspace sampler and the `-J` pairing-fact reducer. |
+| `lib/hls11-observers.mjs` | — | The HLS spawn observer (durable status, input, demuxer), the HLS workspace sampler and the `-J` pairing-fact reducer; HLS-12 runs the observer and sampler with its own reducers. |
 | `fixtures/hls11-media.mjs` | — | The bit-exact 1080p MPEG-TS/fMP4 recipes, the masters (including the split master) and the negative playlists. |
 | `fixtures/hls11-server.mjs` | inside the release candidate, loopback only | The closed-route fixture service and its sanitized ledger. |
 | `sync-matrix.mjs` | inside the release candidate | The SYNC-01 split-merge timing orchestrator, launched by SPLIT-07 with the parent's identity flags. |
 | `lib/sync-evidence.mjs` | — | The `sync01-release-image-merge-timing-01` record, its 281 mandatory checks, PASS and privacy gates, and the parent-side validator. |
 | `fixtures/sync-media.mjs` | — | The 19 timing cases, their exact recipes and the frozen historical merge argv. |
+| `hls12-full-path.mjs` | inside the release candidate | The HLS-12 separate-audio clear-HLS real-media orchestrator, launched by SPLIT-07 with the parent's identity flags. |
+| `lib/hls12-evidence.mjs` | — | The `hls12-release-image-separate-audio-01` record, its 206 mandatory checks, PASS and privacy gates, and the parent-side validator. |
+| `lib/hls12-fixture-url.mjs` | — | The HLS-12 hostname, `--add-host` mapping, closed per-case routes and exact page validator. Import-free. |
+| `lib/hls12-observers.mjs` | — | The separate-audio spawn reducer (each input, demuxer, output and the merge's sync tokens), workspace grammar and `-J` reducer. |
+| `fixtures/hls12-media.mjs` | — | The bit-exact separate-audio recipes (audio-late, video-late, zero-aligned, and the negatives' renditions), the page and the four master shapes. |
+| `fixtures/hls12-server.mjs` | inside the release candidate, loopback only | The closed-route fixture service, its sanitized ledger and the Product-only answers (a redirect, a re-signed master). |
 
 Self-tests: `scripts/ytdlp-release-image-acceptance.test.mjs`,
-`scripts/ytdlp-dash-acceptance.test.mjs`, `scripts/ytdlp-hls11-acceptance.test.mjs`
-and `scripts/ytdlp-sync-acceptance.test.mjs` — no Docker, no network.
+`scripts/ytdlp-dash-acceptance.test.mjs`, `scripts/ytdlp-hls11-acceptance.test.mjs`,
+`scripts/ytdlp-sync-acceptance.test.mjs` and `scripts/ytdlp-hls12-acceptance.test.mjs`
+— no Docker, no network.
 
 ### HLS-08 — the deterministic clear-HLS full-path harness
 

@@ -48,6 +48,19 @@ import {
   type ClearHlsShadowPlacements,
 } from "../hls/hls-source-selection.ts";
 import {
+  placeClearHlsSeparateAudioPairs,
+  projectClearHlsSeparateAudioPlacements,
+  type ClearHlsSeparateAudioCandidate,
+  type ClearHlsSeparateAudioPlacements,
+  type ClearHlsSeparateAudioSelections,
+} from "../hls/hls-separate-audio-selection.ts";
+import {
+  acceptClearHlsMasterUrl,
+  proveSeparateHlsAudioPairs,
+  type SeparateHlsProvenPair,
+  type SeparateHlsVideoCandidate,
+} from "../hls/hls-master-pairing.server.ts";
+import {
   YTDLP_PROBE_TIMEOUT_MS,
   YTDLP_RUNTIME,
   buildYtdlpEnvironment,
@@ -502,6 +515,24 @@ const RawFormatSchema = z.object({
    * an error, and never re-read from a previous attempt.
    */
   url: z.unknown().optional(),
+  /**
+   * The raw per-format Master Playlist location
+   * (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001).
+   *
+   * SENSITIVE, PRIVATE, TRANSIENT and UNTRUSTED. It is read for exactly one
+   * purpose: to LOCATE the master whose own `EXT-X-STREAM-INF` → `AUDIO` →
+   * `EXT-X-MEDIA` relationship may prove a separate-audio pair for a video-only
+   * `m3u8_native` row. It is not pairing evidence by itself, and nothing else
+   * reads it — not the progressive path, not the muxed clear-HLS path.
+   *
+   * `unknown` for the same reason as `url`: one rendition's junk must not make
+   * the document invalid, and `acceptClearHlsMasterUrl` establishes the type.
+   * It never leaves the analysis pass that read it: the separate-audio
+   * selection carries only the two proven media-playlist URLs, so no master
+   * location survives into a plan. Never browser-facing, durable, logged, or
+   * part of an error.
+   */
+  manifest_url: z.unknown().optional(),
 });
 type RawFormat = z.infer<typeof RawFormatSchema>;
 
@@ -1829,7 +1860,10 @@ function constructGenericPresets(
  * pre-HLS-7 contract.
  */
 export function assertGenericPresetBuild(
-  build: GenericPresetBuild & { readonly hlsSelections?: ClearHlsMediaPlaylistSelections },
+  build: GenericPresetBuild & {
+    readonly hlsSelections?: ClearHlsMediaPlaylistSelections;
+    readonly separateHlsSelections?: ClearHlsSeparateAudioSelections;
+  },
   context: {
     readonly candidates: readonly Candidate[];
     readonly ffmpegAvailable: boolean;
@@ -1838,6 +1872,7 @@ export function assertGenericPresetBuild(
 ): void {
   const { presets, selections } = build;
   const hlsSelections = build.hlsSelections ?? {};
+  const separateHlsSelections = build.separateHlsSelections ?? {};
   const fail = (): never => {
     throw new AppError("EXTRACTION_FAILED");
   };
@@ -1852,10 +1887,15 @@ export function assertGenericPresetBuild(
     // chosen it; a preset with two would leave execution a choice to make.
     const progressive = owns(selections, preset.id) && Boolean(selections[preset.id]);
     const hls = owns(hlsSelections, preset.id);
-    if (progressive === hls) fail();
+    const separate = owns(separateHlsSelections, preset.id);
+    if ([progressive, hls, separate].filter(Boolean).length !== 1) fail();
   }
   // ...and nothing may be selectable that was never advertised.
-  for (const id of [...Object.keys(selections), ...Object.keys(hlsSelections)]) {
+  for (const id of [
+    ...Object.keys(selections),
+    ...Object.keys(hlsSelections),
+    ...Object.keys(separateHlsSelections),
+  ]) {
     if (!presets.some((p) => p.id === id)) fail();
   }
 
@@ -1871,6 +1911,23 @@ export function assertGenericPresetBuild(
       const selection = hlsSelections[preset.id];
       if (selection === undefined || !Object.isFrozen(selection)) fail();
       if (acceptClearHlsPlaylistUrl(selection!.playlistUrl) !== selection!.playlistUrl) fail();
+      continue;
+    }
+
+    // ── SEPARATE-AUDIO CLEAR-HLS (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001)
+    //
+    // The same public facts as muxed clear HLS — nothing tells the browser
+    // which HLS family backs a preset — two accepted, different media
+    // playlists, and Worker FFmpeg for the merge.
+    if (owns(separateHlsSelections, preset.id)) {
+      if (!CLEAR_HLS_SHADOW_PRESET_ID_PATTERN.test(preset.id)) fail();
+      if (!hasClearHlsPublicPresetFacts(preset)) fail();
+      if (!context.ffmpegAvailable) fail();
+      const pair = separateHlsSelections[preset.id];
+      if (pair === undefined || !Object.isFrozen(pair)) fail();
+      if (acceptClearHlsPlaylistUrl(pair!.videoPlaylistUrl) !== pair!.videoPlaylistUrl) fail();
+      if (acceptClearHlsPlaylistUrl(pair!.audioPlaylistUrl) !== pair!.audioPlaylistUrl) fail();
+      if (pair!.videoPlaylistUrl === pair!.audioPlaylistUrl) fail();
       continue;
     }
 
@@ -1982,6 +2039,21 @@ export function assertGenericPresetBuild(
       const best = hlsSelections[CLEAR_HLS_SHADOW_BEST_PRESET_ID]!;
       const rung = hlsSelections[topRung.id]!;
       if (best.playlistUrl !== rung.playlistUrl || best.height !== rung.height) fail();
+    }
+    // The same rule for the separate-audio family: `preset:best` is the very
+    // pair behind the tallest rung, or not separate-audio at all.
+    const bestIsSeparate = owns(separateHlsSelections, CLEAR_HLS_SHADOW_BEST_PRESET_ID);
+    if (bestIsSeparate !== owns(separateHlsSelections, topRung.id)) fail();
+    if (bestIsSeparate) {
+      const best = separateHlsSelections[CLEAR_HLS_SHADOW_BEST_PRESET_ID]!;
+      const rung = separateHlsSelections[topRung.id]!;
+      if (
+        best.videoPlaylistUrl !== rung.videoPlaylistUrl ||
+        best.audioPlaylistUrl !== rung.audioPlaylistUrl ||
+        best.height !== rung.height
+      ) {
+        fail();
+      }
     }
   }
 }
@@ -2201,6 +2273,14 @@ function dispositionOf(
   if (ownership.hlsParticipates && ownership.admittedHlsIndexes.has(index)) {
     return ownership.deliverableHlsIndexes.has(index) ? "deliverable" : "not-selected";
   }
+  // A separate-audio video row whose pair the master PROVED: deliverable when a
+  // final preset is backed by it, otherwise a rendition that lost its rung.
+  // An unproven or unconsidered row falls through to its progressive
+  // evaluation, which refuses it on protocol — the `unsupported_protocol` it
+  // was always reported as.
+  if (ownership.provenSeparateIndexes.has(index)) {
+    return ownership.deliverableSeparateIndexes.has(index) ? "deliverable" : "not-selected";
+  }
   if (!evaluation.ok) return evaluation.rejection;
   const c = evaluation.candidate;
   if (ownership.advertisedVideo.has(c)) return "deliverable";
@@ -2301,15 +2381,18 @@ function withheldReasonFor(cause: WithheldCause): SourceQualityWithheldReason {
  *              acquired, so it fails closed here too.
  *
  *   AUDIO      PROVEN present: `classifyCodecState(acodec) === "present"`.
- *              Unknown is not enough and absent is not enough. Clear HLS has
- *              no audio pairing — HLS v2 did not add one, because the pinned
- *              yt-dlp exposes no video→audio rendition relationship to pair
- *              on — and HLS-4's approved local media shape is
+ *              Unknown is not enough and absent is not enough. The MUXED
+ *              family has no audio pairing — HLS v2 did not add one, because
+ *              the pinned yt-dlp exposes no video→audio rendition relationship
+ *              to pair on — and HLS-4's approved local media shape is
  *              exactly one video plus exactly one audio — so a rendition whose
  *              audio nothing establishes has no viable path through the rest
- *              of the chain. This is a metadata screen, not a claim that
- *              metadata proves segment stream shape; HLS-2 and HLS-4 remain
- *              the semantic authorities at their own boundaries.
+ *              of the muxed chain. A video-only row is the separate-audio
+ *              family's business instead (`separateHlsVideoCandidate`), and
+ *              only a fetched Master Playlist can pair it. This is a metadata
+ *              screen, not a claim that metadata proves segment stream shape;
+ *              HLS-2 and HLS-4 remain the semantic authorities at their own
+ *              boundaries.
  *
  *   SIZE       a KNOWN size already over the ceiling is not shadow-selected.
  *              Unknown size stays permissible because HLS-3 enforces actual
@@ -2351,6 +2434,88 @@ function clearHlsShadowCandidate(
   return { playlistUrl, height: observed.height, index };
 }
 
+// ── Separate-audio clear-HLS admission (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001)
+
+/**
+ * Raw row dimensions for the separate-audio master consistency check: BOTH
+ * absent, or BOTH whole numbers on the observed-height contract. Anything else
+ * (one missing, a fraction, out of bounds) is `undefined` — not a candidate.
+ */
+function separateHlsDimensions(raw: RawFormat): { width: number | null; height: number | null } | undefined {
+  const width = raw.width ?? null;
+  const height = raw.height ?? null;
+  if (width === null && height === null) return { width: null, height: null };
+  const bounded = (value: number | null) =>
+    value !== null && Number.isSafeInteger(value) && value >= 1 && value <= SOURCE_QUALITY_MAX_HEIGHT;
+  return bounded(width) && bounded(height) ? { width, height } : undefined;
+}
+
+/**
+ * Judges ONE raw format as a separate-audio VIDEO candidate — a metadata screen
+ * that runs beside the progressive and muxed clear-HLS paths and feeds neither.
+ * It fetches nothing and pairs nothing: a candidate is only something the
+ * master proof may consider. Every gate is conservative:
+ *
+ *   PROTOCOL   exactly `m3u8_native`, the muxed family's admitted protocol.
+ *   VIDEO      a NAMED video codec (the grouped variant's `CODECS`), with no
+ *              `video_ext: "none"` contradiction, by the same observation rule.
+ *   AUDIO      PROVEN ABSENT (`acodec: "none"`) — the row is explicitly NOT
+ *              audio-bearing. Unknown audio is not a separate-audio candidate.
+ *   SIZE       a known size already over the ceiling is refused.
+ *   DIMENSIONS both absent, or both whole numbers in bounds (the master's
+ *              `RESOLUTION` is checked against them).
+ *   URL        statically accepted AND already canonical — the raw string is
+ *              exactly the retained serialisation — because the proof compares
+ *              it, as is, with the master-resolved variant URL.
+ *   UNIQUE     no other row of this document reports the same accepted URL:
+ *              the -J side of the identity guard, so one URL can never stand
+ *              for two different rows.
+ *   MASTER     `manifest_url` accepted by `acceptClearHlsMasterUrl` (absolute
+ *              canonical join-stable public http(s)). A locator only.
+ *
+ * Any failed gate is `null`: there is no candidate, and the row keeps whatever
+ * disposition it already had.
+ */
+function separateHlsVideoCandidate(
+  raw: RawFormat,
+  index: number,
+  limits: { readonly maxFileSizeBytes: number },
+  acceptedUrlCounts: ReadonlyMap<string, number>,
+): SeparateHlsVideoCandidate | null {
+  if (!isClearHlsShadowProtocol(raw.protocol)) return null;
+  const observed = observeVideoRendition(raw, index);
+  if (observed === null || observed.videoEvidence !== "codec") return null;
+  if (normalizeExtField(raw.video_ext) === "none") return null;
+  if (observed.audio !== "absent") return null;
+
+  const size = knownFileSize(raw);
+  if (size !== null && size > limits.maxFileSizeBytes) return null;
+
+  const dimensions = separateHlsDimensions(raw);
+  if (dimensions === undefined) return null;
+
+  const videoPlaylistUrl = acceptClearHlsPlaylistUrl(raw.url);
+  if (videoPlaylistUrl === null || videoPlaylistUrl !== raw.url) return null;
+  if (acceptedUrlCounts.get(videoPlaylistUrl) !== 1) return null;
+
+  const masterUrl = acceptClearHlsMasterUrl(raw.manifest_url);
+  if (masterUrl === null) return null;
+
+  return Object.freeze({
+    videoPlaylistUrl,
+    masterUrl,
+    width: dimensions.width,
+    height: dimensions.height,
+    index,
+  });
+}
+
+/** The application rung a height falls on — tallest first — or `null`. */
+function rungFor(height: number | null): string | null {
+  if (height === null) return null;
+  return RESOLUTION_STEPS.find((step) => height >= step.minHeight)?.id ?? null;
+}
+
 // ── Family ownership: progressive/split + clear HLS (HLS-7) ──────────────────
 
 /**
@@ -2368,6 +2533,13 @@ function clearHlsShadowCandidate(
  *   deliverableHlsIndexes  upstream index of every row behind a FINAL HLS-owned
  *                          preset. Each index is one raw rendition, however
  *                          many presets it backs.
+ *   separateHlsSelections  (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001) the
+ *                          third private map: the proven pair behind each FINAL
+ *                          separate-audio-owned preset. Disjoint from both.
+ *   provenSeparateIndexes  upstream index of every video row whose pair the
+ *                          master proof established.
+ *   deliverableSeparateIndexes
+ *                          those behind a FINAL separate-audio-owned preset.
  *
  * PRIVATE and transient. No index leaves analysis.
  */
@@ -2375,11 +2547,25 @@ type GenericVideoOwnership = {
   readonly presets: WorkerQualityPreset[];
   readonly selections: GenericSourceSelections;
   readonly hlsSelections: ClearHlsMediaPlaylistSelections;
+  readonly separateHlsSelections: ClearHlsSeparateAudioSelections;
   readonly advertisedVideo: ReadonlySet<Candidate>;
   readonly hlsParticipates: boolean;
   readonly admittedHlsIndexes: ReadonlySet<number>;
   readonly deliverableHlsIndexes: ReadonlySet<number>;
+  readonly provenSeparateIndexes: ReadonlySet<number>;
+  readonly deliverableSeparateIndexes: ReadonlySet<number>;
 };
+
+/** Proven separate-audio pairs placed on the ladder, and every proven row's index. */
+type SeparateHlsOwnershipInput = {
+  readonly placements: ClearHlsSeparateAudioPlacements;
+  readonly provenIndexes: ReadonlySet<number>;
+};
+
+const NO_SEPARATE_HLS: SeparateHlsOwnershipInput = Object.freeze({
+  placements: Object.freeze({}),
+  provenIndexes: new Set<number>(),
+});
 
 /** The public preset a clear-HLS-owned rung advertises. No field is upstream data. */
 function clearHlsPublicPreset(
@@ -2433,74 +2619,103 @@ function clearHlsPublicPreset(
  *
  * The ladder is the ranking vocabulary. No upstream format id, codec, bitrate
  * or size is compared across families, and no decision is left to execution:
- * the planner reads ownership off the two maps and never chooses a family.
+ * the planner reads ownership off the maps and never chooses a family.
  *
- * A progressive-only document (no admitted HLS candidate) returns the
- * construction's own presets and selections, so its output is byte-for-byte
- * what it was before HLS-7.
+ * SEPARATE-AUDIO CLEAR HLS (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001) is
+ * the third family and the LAST resort per rung: progressive, then muxed clear
+ * HLS, then a PROVEN separate-audio pair. It only ever fills a rung neither
+ * mature family fulfils, and it takes `preset:best` on exactly the muxed
+ * family's terms — when its rung is the tallest final rung, or, with no named
+ * rung at all, as the last unknown-height fallback.
+ *
+ * A progressive-only document (no admitted HLS candidate and no proven pair)
+ * returns the construction's own presets and selections, so its output is
+ * byte-for-byte what it was before HLS-7.
  */
 function composeGenericVideoOwnership(
   construction: GenericPresetConstruction,
   placements: ClearHlsShadowPlacements,
   admittedHlsIndexes: ReadonlySet<number>,
+  separate: SeparateHlsOwnershipInput,
   opts: { readonly ffmpegAvailable: boolean },
 ): GenericVideoOwnership {
   const progressiveOnly: GenericVideoOwnership = {
     presets: construction.presets,
     selections: construction.selections,
     hlsSelections: Object.freeze({}),
+    separateHlsSelections: Object.freeze({}),
     advertisedVideo: construction.advertisedVideo,
     hlsParticipates: opts.ffmpegAvailable,
     admittedHlsIndexes,
     deliverableHlsIndexes: new Set<number>(),
+    provenSeparateIndexes: opts.ffmpegAvailable ? separate.provenIndexes : new Set<number>(),
+    deliverableSeparateIndexes: new Set<number>(),
   };
-  if (!opts.ffmpegAvailable || Object.keys(placements).length === 0) return progressiveOnly;
+  if (
+    !opts.ffmpegAvailable ||
+    (Object.keys(placements).length === 0 && Object.keys(separate.placements).length === 0)
+  ) {
+    return progressiveOnly;
+  }
 
   const progressive = new Map(construction.presets.map((p) => [p.id, p] as const));
   type Owned =
     | { readonly owner: "progressive"; readonly preset: WorkerQualityPreset }
-    | { readonly owner: "clear-hls"; readonly preset: WorkerQualityPreset; readonly placed: ClearHlsShadowCandidate };
+    | { readonly owner: "clear-hls"; readonly preset: WorkerQualityPreset; readonly placed: ClearHlsShadowCandidate }
+    | {
+        readonly owner: "clear-hls-separate-audio";
+        readonly preset: WorkerQualityPreset;
+        readonly pair: ClearHlsSeparateAudioCandidate;
+      };
 
-  // Named rungs, tallest first: progressive wins its own rung; HLS fills a gap.
+  // Named rungs, tallest first: progressive wins its own rung; muxed HLS fills
+  // a gap; a proven separate-audio pair fills a gap muxed HLS left.
   const rungs: Owned[] = [];
   let tallest: { readonly step: (typeof RESOLUTION_STEPS)[number]; readonly owned: Owned } | null = null;
   for (const step of RESOLUTION_STEPS) {
     const own = progressive.get(step.id);
     const placed = placements[step.id];
+    const pair = separate.placements[step.id];
     const owned: Owned | null = own
       ? { owner: "progressive", preset: own }
       : placed
         ? { owner: "clear-hls", preset: clearHlsPublicPreset(step.id, step.label, step.resolution), placed }
-        : null;
+        : pair
+          ? {
+              owner: "clear-hls-separate-audio",
+              preset: clearHlsPublicPreset(step.id, step.label, step.resolution),
+              pair,
+            }
+          : null;
     if (owned === null) continue;
     rungs.push(owned);
     tallest ??= { step, owned };
   }
 
   // `preset:best`: the tallest final rung's family and fulfilment.
+  const bestPreset = (resolution: string | null) =>
+    clearHlsPublicPreset(CLEAR_HLS_SHADOW_BEST_PRESET_ID, "Best available", resolution);
   let best: Owned | null = null;
   const progressiveBest = progressive.get(CLEAR_HLS_SHADOW_BEST_PRESET_ID);
   if (tallest !== null) {
-    if (tallest.owned.owner === "progressive") {
+    const top = tallest.owned;
+    if (top.owner === "progressive") {
       best = progressiveBest ? { owner: "progressive", preset: progressiveBest } : null;
+    } else if (top.owner === "clear-hls") {
+      best = { owner: "clear-hls", preset: bestPreset(tallest.step.resolution), placed: top.placed };
     } else {
-      best = {
-        owner: "clear-hls",
-        preset: clearHlsPublicPreset(CLEAR_HLS_SHADOW_BEST_PRESET_ID, "Best available", tallest.step.resolution),
-        placed: tallest.owned.placed,
-      };
+      best = { owner: "clear-hls-separate-audio", preset: bestPreset(tallest.step.resolution), pair: top.pair };
     }
   } else if (progressiveBest) {
     best = { owner: "progressive", preset: progressiveBest };
   } else {
     const placed = placements[CLEAR_HLS_SHADOW_BEST_PRESET_ID];
+    const pair = separate.placements[CLEAR_HLS_SHADOW_BEST_PRESET_ID];
     best = placed
-      ? {
-          owner: "clear-hls",
-          preset: clearHlsPublicPreset(CLEAR_HLS_SHADOW_BEST_PRESET_ID, "Best available", null),
-          placed,
-        }
-      : null;
+      ? { owner: "clear-hls", preset: bestPreset(null), placed }
+      : pair
+        ? { owner: "clear-hls-separate-audio", preset: bestPreset(null), pair }
+        : null;
   }
 
   const video = best === null ? rungs : [best, ...rungs];
@@ -2518,7 +2733,11 @@ function composeGenericVideoOwnership(
     if (progressiveIds.has(id)) selections[id] = value;
   }
   const hlsOwned: Record<string, ClearHlsShadowCandidate> = {};
-  for (const o of video) if (o.owner === "clear-hls") hlsOwned[o.preset.id] = o.placed;
+  const separateOwned: Record<string, ClearHlsSeparateAudioCandidate> = {};
+  for (const o of video) {
+    if (o.owner === "clear-hls") hlsOwned[o.preset.id] = o.placed;
+    if (o.owner === "clear-hls-separate-audio") separateOwned[o.preset.id] = o.pair;
+  }
 
   const advertisedVideo = new Set<Candidate>();
   for (const o of video) {
@@ -2531,44 +2750,55 @@ function composeGenericVideoOwnership(
     presets: [...video.map((o) => o.preset), ...audio],
     selections,
     hlsSelections: projectClearHlsPlacements(hlsOwned),
+    separateHlsSelections: projectClearHlsSeparateAudioPlacements(separateOwned),
     advertisedVideo,
     hlsParticipates: true,
     admittedHlsIndexes,
     deliverableHlsIndexes: new Set(Object.values(hlsOwned).map((c) => c.index)),
+    provenSeparateIndexes: separate.provenIndexes,
+    deliverableSeparateIndexes: new Set(Object.values(separateOwned).map((c) => c.index)),
   };
 }
 
+type GenericFormatOptions = {
+  readonly ffmpegAvailable: boolean;
+  readonly maxFileSizeBytes: number;
+  /** The document's top-level `_has_drm`, uninterpreted. */
+  readonly protectionSignal?: unknown;
+};
+
 /**
- * The generic eligibility → construction → ownership → inventory pass for ONE
- * document.
- *
- * Pure, and exactly what `analyzeGenericMediaInternal` runs. Progressive
- * eligibility and construction are exactly what `selectCandidates` +
- * `buildGenericPresets` produce; clear-HLS admission runs beside them and never
- * feeds them; `composeGenericVideoOwnership` then decides, once, which family
- * owns each advertised video preset; and the inventory reads every rendition's
- * outcome off that FINAL result.
- *
- * `build.selections` and `hlsSelections` are the two PRIVATE maps, disjoint:
- * together they own every advertised preset exactly once. `hlsSelections`
- * carries only the rungs the final result gives to clear HLS — not every rung
- * HLS could have filled. For a document with no admitted HLS candidate every
- * value here is bit-for-bit what it was before HLS-7.
+ * Everything the synchronous half of one document's pass decides, kept so the
+ * separate-audio master proof can run between it and the final composition.
+ * PRIVATE and transient.
  */
-export function analyzeGenericFormats(
-  formats: readonly RawFormat[],
-  opts: {
-    readonly ffmpegAvailable: boolean;
-    readonly maxFileSizeBytes: number;
-    /** The document's top-level `_has_drm`, uninterpreted. */
-    readonly protectionSignal?: unknown;
-  },
-): {
+type GenericFormatPlan = {
+  readonly formats: readonly RawFormat[];
+  readonly opts: GenericFormatOptions;
+  readonly evaluations: readonly FormatEvaluation[];
   readonly candidates: readonly Candidate[];
-  readonly build: GenericPresetBuild;
-  readonly inventory: RenditionInventory;
-  readonly hlsSelections: ClearHlsMediaPlaylistSelections;
-} {
+  readonly construction: GenericPresetConstruction;
+  readonly hasProvenAudioOnly: boolean;
+  readonly hlsPlacements: ClearHlsShadowPlacements;
+  readonly admittedHlsIndexes: ReadonlySet<number>;
+  /**
+   * The separate-audio candidates WORTH a master proof: admitted rows whose
+   * rung neither mature family fulfils (or, when the ladder would otherwise be
+   * empty, unknown-height rows for `preset:best`). Empty without Worker FFmpeg.
+   */
+  readonly separateHlsCandidates: readonly SeparateHlsVideoCandidate[];
+};
+
+/**
+ * The SYNCHRONOUS half: eligibility, construction, muxed clear-HLS placement,
+ * and the separate-audio candidates that could fill an otherwise unavailable
+ * rung. No I/O.
+ *
+ * Relevance is decided against the progressive + muxed composition itself, so
+ * a source whose rungs those families already fulfil — every muxed-HLS-only
+ * source among them — gains no master request at all.
+ */
+function planGenericFormats(formats: readonly RawFormat[], opts: GenericFormatOptions): GenericFormatPlan {
   const evaluations = evaluateRawFormats(formats, opts);
   const candidates = acceptedCandidates(evaluations);
   const construction = constructGenericPresets(candidates, opts);
@@ -2579,13 +2809,87 @@ export function analyzeGenericFormats(
     const hls = clearHlsShadowCandidate(raw, index, opts);
     if (hls !== null) hlsCandidates.push(hls);
   });
-
   // The SAME rung boundaries the public video presets are built from, passed
   // rather than restated, so the two ladders cannot drift apart.
+  const hlsPlacements = placeClearHlsShadowCandidates(hlsCandidates, RESOLUTION_STEPS);
+  const admittedHlsIndexes = new Set(hlsCandidates.map((c) => c.index));
+
+  const separateHlsCandidates: SeparateHlsVideoCandidate[] = [];
+  if (opts.ffmpegAvailable) {
+    const base = composeGenericVideoOwnership(construction, hlsPlacements, admittedHlsIndexes, NO_SEPARATE_HLS, opts);
+    const owned = new Set(base.presets.map((p) => p.id));
+    const ladderEmpty =
+      !owned.has(CLEAR_HLS_SHADOW_BEST_PRESET_ID) && RESOLUTION_STEPS.every((step) => !owned.has(step.id));
+
+    // The -J side of the identity guard counts EVERY row's accepted URL.
+    const acceptedUrlCounts = new Map<string, number>();
+    for (const raw of formats) {
+      const url = acceptClearHlsPlaylistUrl(raw.url);
+      if (url !== null) acceptedUrlCounts.set(url, (acceptedUrlCounts.get(url) ?? 0) + 1);
+    }
+    formats.forEach((raw, index) => {
+      const candidate = separateHlsVideoCandidate(raw, index, opts, acceptedUrlCounts);
+      if (candidate === null) return;
+      const rung = rungFor(candidate.height);
+      if (rung !== null ? !owned.has(rung) : ladderEmpty) separateHlsCandidates.push(candidate);
+    });
+  }
+
+  return {
+    formats,
+    opts,
+    evaluations,
+    candidates,
+    construction,
+    hasProvenAudioOnly,
+    hlsPlacements,
+    admittedHlsIndexes,
+    separateHlsCandidates: Object.freeze(separateHlsCandidates),
+  };
+}
+
+/**
+ * The second half: compose the final ladder with whatever pairs the master
+ * proof established, then read the inventory off it. Pure.
+ *
+ * A proven pair is admitted only for a candidate THIS plan offered — same
+ * upstream index, same video playlist — so nothing else can inject a pair.
+ */
+function completeGenericFormats(
+  plan: GenericFormatPlan,
+  provenPairs: readonly SeparateHlsProvenPair[],
+): {
+  readonly candidates: readonly Candidate[];
+  readonly build: GenericPresetBuild;
+  readonly inventory: RenditionInventory;
+  readonly hlsSelections: ClearHlsMediaPlaylistSelections;
+  readonly separateHlsSelections: ClearHlsSeparateAudioSelections;
+} {
+  const { formats, opts, evaluations, construction, hasProvenAudioOnly } = plan;
+  const offered = new Map(plan.separateHlsCandidates.map((c) => [c.index, c] as const));
+  const proven: ClearHlsSeparateAudioCandidate[] = [];
+  for (const pair of provenPairs) {
+    const candidate = offered.get(pair.index);
+    if (candidate === undefined || candidate.videoPlaylistUrl !== pair.videoPlaylistUrl) continue;
+    if (pair.height !== candidate.height) continue;
+    proven.push(
+      Object.freeze({
+        videoPlaylistUrl: pair.videoPlaylistUrl,
+        audioPlaylistUrl: pair.audioPlaylistUrl,
+        height: pair.height,
+        index: pair.index,
+      }),
+    );
+  }
+
   const ownership = composeGenericVideoOwnership(
     construction,
-    placeClearHlsShadowCandidates(hlsCandidates, RESOLUTION_STEPS),
-    new Set(hlsCandidates.map((c) => c.index)),
+    plan.hlsPlacements,
+    plan.admittedHlsIndexes,
+    {
+      placements: placeClearHlsSeparateAudioPairs(proven, RESOLUTION_STEPS),
+      provenIndexes: new Set(proven.map((pair) => pair.index)),
+    },
     opts,
   );
 
@@ -2600,7 +2904,7 @@ export function analyzeGenericFormats(
   });
 
   return {
-    candidates,
+    candidates: plan.candidates,
     build: { presets: ownership.presets, selections: ownership.selections },
     inventory: {
       renditions,
@@ -2608,7 +2912,57 @@ export function analyzeGenericFormats(
       maybeProtectedObserved: formats.some((raw) => raw.has_drm === "maybe"),
     },
     hlsSelections: ownership.hlsSelections,
+    separateHlsSelections: ownership.separateHlsSelections,
   };
+}
+
+/**
+ * The separate-audio candidates one document would offer the master proof —
+ * exactly what `analyzeGenericMediaInternal` passes it. Pure; exported so the
+ * relevance rule can be pinned without a network.
+ */
+export function separateHlsProofCandidates(
+  formats: readonly RawFormat[],
+  opts: GenericFormatOptions,
+): readonly SeparateHlsVideoCandidate[] {
+  return planGenericFormats(formats, opts).separateHlsCandidates;
+}
+
+/**
+ * The generic eligibility → construction → ownership → inventory pass for ONE
+ * document.
+ *
+ * Pure, and exactly what `analyzeGenericMediaInternal` runs around its one
+ * asynchronous step. Progressive eligibility and construction are exactly what
+ * `selectCandidates` + `buildGenericPresets` produce; clear-HLS admission runs
+ * beside them and never feeds them; `composeGenericVideoOwnership` then
+ * decides, once, which family owns each advertised video preset; and the
+ * inventory reads every rendition's outcome off that FINAL result.
+ *
+ * `build.selections`, `hlsSelections` and `separateHlsSelections` are the three
+ * PRIVATE maps, disjoint: together they own every advertised preset exactly
+ * once. Each carries only the rungs the final result gives its family — not
+ * every rung that family could have filled. For a document with no admitted HLS
+ * candidate and no proven separate-audio pair every value here is bit-for-bit
+ * what it was before HLS-7.
+ */
+export function analyzeGenericFormats(
+  formats: readonly RawFormat[],
+  opts: GenericFormatOptions,
+  /**
+   * Pairs the separate-audio master proof established for this document's
+   * candidates (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001). Omitted — the
+   * synchronous, network-free reading — no separate-audio preset exists.
+   */
+  provenSeparatePairs: readonly SeparateHlsProvenPair[] = [],
+): {
+  readonly candidates: readonly Candidate[];
+  readonly build: GenericPresetBuild;
+  readonly inventory: RenditionInventory;
+  readonly hlsSelections: ClearHlsMediaPlaylistSelections;
+  readonly separateHlsSelections: ClearHlsSeparateAudioSelections;
+} {
+  return completeGenericFormats(planGenericFormats(formats, opts), provenSeparatePairs);
 }
 
 /**
@@ -2770,6 +3124,12 @@ export type GenericAnalysisDeps = {
    * Injectable so budget arithmetic can be tested without real sleeps.
    */
   readonly clock?: () => number;
+  /**
+   * The separate-audio master proof (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001).
+   * Production: `proveSeparateHlsAudioPairs`, the zero-redirect safe-HTTP
+   * master seam. A test seam only, like the three above.
+   */
+  readonly proveSeparateHlsPairs?: typeof proveSeparateHlsAudioPairs;
 };
 
 /**
@@ -2787,16 +3147,22 @@ export type GenericAnalysisDeps = {
  * they name different things: a yt-dlp-selectable source versus a playlist
  * VideoFetch fetches itself.
  *
+ * `separateHlsSelections` (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001) is the
+ * THIRD private map: the video + audio media-playlist pair behind each preset
+ * the final result gives to separate-audio clear HLS — a pair the fetched
+ * Master Playlist itself proved. Disjoint from the other two.
+ *
  * This type is returned by `analyzeGenericMediaInternal` and by nothing else.
- * Neither private map may cross Worker HTTP, enter `WorkerVideoMetadata`, enter
+ * No private map may cross Worker HTTP, enter `WorkerVideoMetadata`, enter
  * SQLite, reach Vercel or the browser, be logged, or appear in an error — and
- * `hlsSelections` additionally may not be persisted or reused across attempts,
- * because a signed playlist URL expires.
+ * the two HLS maps additionally may not be persisted or reused across
+ * attempts, because a signed playlist URL expires.
  */
 export type GenericInternalAnalysis = {
   readonly video: WorkerVideoMetadata;
   readonly selections: GenericSourceSelections;
   readonly hlsSelections: ClearHlsMediaPlaylistSelections;
+  readonly separateHlsSelections: ClearHlsSeparateAudioSelections;
 };
 
 /**
@@ -2940,16 +3306,45 @@ export async function analyzeGenericMediaInternal(
 
   const ffmpegAvailable = deps.ffmpegAvailable ?? false;
   // Eligibility, preset construction, family ownership and the rendition
-  // inventory, in one pass: progressive presets and selections are exactly what
-  // `selectCandidates` + `buildGenericPresets` produce, clear HLS only fills
-  // rungs they leave empty, and the inventory reads the final result.
-  const { candidates, build, inventory, hlsSelections } = analyzeGenericFormats(info.formats ?? [], {
+  // inventory: progressive presets and selections are exactly what
+  // `selectCandidates` + `buildGenericPresets` produce, the clear-HLS families
+  // only fill rungs they leave empty, and the inventory reads the final result.
+  const plan = planGenericFormats(info.formats ?? [], {
     ffmpegAvailable,
     // The per-format size gate, and the PAIR-level combined-size budget
     // (§13/§16) — one ceiling for both.
     maxFileSizeBytes: deps.limits.maxFileSizeBytes,
     protectionSignal: info._has_drm,
   });
+
+  // 6. The ONE bounded network step analysis itself performs
+  //    (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001): the separate-audio
+  //    MASTER proof, and only for candidates that could fill an otherwise
+  //    unavailable rung. It shares this analysis's single deadline, requests
+  //    only master documents (zero redirects, deduplicated, capped), and never
+  //    a media playlist, map or segment; yt-dlp above stayed metadata-only and
+  //    no FFmpeg was involved. A pair it cannot prove simply does not exist —
+  //    the analysis itself never fails for it — but a cancelled analysis is
+  //    still cancelled.
+  let provenPairs: readonly SeparateHlsProvenPair[] = [];
+  if (plan.separateHlsCandidates.length > 0) {
+    const proofBudgetMs = deadline - clock();
+    if (proofBudgetMs > 0) {
+      provenPairs = await (deps.proveSeparateHlsPairs ?? proveSeparateHlsAudioPairs)({
+        candidates: plan.separateHlsCandidates,
+        timeoutMs: proofBudgetMs,
+        ...(deps.signal ? { signal: deps.signal } : {}),
+      });
+    }
+    if (deps.signal?.aborted) {
+      throw new AppError("PROCESSING_FAILED", "Download was cancelled.");
+    }
+  }
+
+  const { candidates, build, inventory, hlsSelections, separateHlsSelections } = completeGenericFormats(
+    plan,
+    provenPairs,
+  );
   const { presets, selections } = build;
 
   // Structural, ownership and shape-aware audio assertions on this module's OWN
@@ -2957,7 +3352,7 @@ export async function analyzeGenericMediaInternal(
   // Any violation is one canonical EXTRACTION_FAILED; see
   // `assertGenericPresetBuild`.
   assertGenericPresetBuild(
-    { presets, selections, hlsSelections },
+    { presets, selections, hlsSelections, separateHlsSelections },
     { candidates, ffmpegAvailable, maxFileSizeBytes: deps.limits.maxFileSizeBytes },
   );
 
@@ -2999,6 +3394,11 @@ export async function analyzeGenericMediaInternal(
       // sets nothing. That map holds only progressive/split-owned presets, so a
       // clear-HLS preset never sets it either: its local FFmpeg work is a
       // single-input remux, not the split merge this flag has always meant.
+      // A separate-audio clear-HLS preset (HLS-SEPARATE-AUDIO-PAIRING-
+      // IMPLEMENTATION-001) does not set it either, deliberately: it is a
+      // clear-HLS preset whose public facts are exactly the muxed family's, and
+      // no public value — this flag included — may reveal which HLS family, or
+      // that a master-proven audio pairing, backs a preset.
       //
       // The `ffmpegAvailable` conjunction is redundant at runtime — split
       // construction is already gated on it, and the loop above re-asserts that
@@ -3014,10 +3414,10 @@ export async function analyzeGenericMediaInternal(
   });
 
   // `video` was built by `VideoMetadataSchema.parse`, whose closed schema has
-  // no place for either private map, so the public half cannot carry one even
-  // by accident. The two private maps ride beside it and go no further than
-  // the execution analysis that requested them.
-  return { video, selections, hlsSelections };
+  // no place for any private map, so the public half cannot carry one even by
+  // accident. The three private maps ride beside it and go no further than the
+  // execution analysis that requested them.
+  return { video, selections, hlsSelections, separateHlsSelections };
 }
 
 /**

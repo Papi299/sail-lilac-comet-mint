@@ -93,6 +93,16 @@ const ADMITTED_KINDS = new Set(["media", "fragment"]);
  */
 export const HLS_V2_ADMITTED_KINDS = Object.freeze(["media", "init", "fragment"]);
 
+/**
+ * HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: the Product now fetches a
+ * Master Playlist ITSELF, during analysis, as the only pairing authority for
+ * separate HLS audio — whenever the pinned yt-dlp exposes a video-only HLS
+ * rendition. HLS-11 (`-02`, its split master) and HLS-12 pass this set.
+ * HLS-08/HLS-09 keep theirs: their one variant is muxed and names no audio
+ * group, so the Product never asks for their master.
+ */
+export const HLS_MASTER_PROOF_ADMITTED_KINDS = Object.freeze(["master", "media", "init", "fragment"]);
+
 /** A refusal. It never names a URL, a header value or a marker. */
 export class HlsTransportRefusal extends Error {
   constructor(reason) {

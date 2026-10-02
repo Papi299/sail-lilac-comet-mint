@@ -4,9 +4,10 @@
 // `Dockerfile.worker` image, characterize it, and run the existing SPLIT-06
 // deterministic full path against it — mp4 AND webm — (since -03) the HLS-09
 // clear-HLS release child, (since -05) the DASH-01 segmented-DASH real-media
-// child, (since -06) the HLS-11 clear-HLS v2 real-media child and (since -07)
-// the SYNC-01 split-merge timing child, before emitting one release-image
-// candidate record. Every child runs the same immutable candidate image id.
+// child, (since -06) the HLS-11 clear-HLS v2 real-media child, (since -07)
+// the SYNC-01 split-merge timing child and (since -08) the HLS-12
+// separate-audio clear-HLS child, before emitting one release-image candidate
+// record. Every child runs the same immutable candidate image id.
 //
 // ── Child order (deterministic) ────────────────────────────────────────────
 //
@@ -14,7 +15,8 @@
 //   → clear workspace → HLS-09 clear-HLS → clear workspace
 //   → DASH-01 segmented DASH → clear workspace
 //   → HLS-11 clear-HLS v2 → clear workspace
-//   → SYNC-01 split-merge timing → clear workspace → parent
+//   → SYNC-01 split-merge timing → clear workspace
+//   → HLS-12 separate-audio clear HLS → clear workspace → parent
 //
 // Before each child the harness is re-verified and the Product media workspace
 // must be empty; after each child the workspace is cleared and re-proven empty.
@@ -104,6 +106,8 @@ import {
   releaseDashRunPostureViolations,
   releaseHls11AcceptanceRunArgs,
   releaseHls11RunPostureViolations,
+  releaseHls12AcceptanceRunArgs,
+  releaseHls12RunPostureViolations,
   releaseSyncAcceptanceRunArgs,
   releaseSyncRunPostureViolations,
   releaseHlsAcceptanceRunArgs,
@@ -126,6 +130,7 @@ import {
   DASH_CANDIDATE_RUN_PURPOSE,
   emptyDashChildObservation,
   emptyHls11ChildObservation,
+  emptyHls12ChildObservation,
   emptySyncChildObservation,
   emptyHlsChildObservation,
   ENTRYPOINT_SHIM_PATH,
@@ -134,6 +139,7 @@ import {
   EXPECTED_YTDLP_RUNTIME,
   FORBIDDEN_IMAGE_ENVIRONMENT_NAMES,
   HLS11_CANDIDATE_RUN_PURPOSE,
+  HLS12_CANDIDATE_RUN_PURPOSE,
   HLS_CANDIDATE_RUN_PURPOSE,
   REQUIRED_CANDIDATE_RUN_PURPOSES,
   REQUIRED_SPLIT_FAMILIES,
@@ -143,6 +149,7 @@ import {
   validateChildRecord,
   validateDashChildRecord,
   validateHls11ChildRecord,
+  validateHls12ChildRecord,
   validateSyncChildRecord,
   validateHlsChildRecord,
   validateReleaseParentRecord,
@@ -931,6 +938,57 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       `${syncChild.checkCount} checks sha256=${syncChild.sha256 ?? "n/a"}\n`);
     await clearMediaWorkspace("sync01-merge-timing");
 
+    // ── 6f. The HLS-12 separate-audio clear-HLS child (since -08) ──────────
+    //
+    // HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: a video-only fMP4
+    // rendition plus the one audio-only fMP4 rendition its variant's AUDIO
+    // group names, proven from a Master Playlist the Product fetches itself,
+    // acquired as two halves and merged by the shared split merge — real media,
+    // offline. The HLS-11 hardening with its OWN single `--add-host`; the
+    // posture is re-derived from the argv before it runs.
+    await verifyHarnessAt("before-hls12-clear-hls-separate-audio");
+    await admitMediaWorkspace("before-hls12-clear-hls-separate-audio");
+    const hls12EvidenceName = `hls12-clear-hls-separate-audio-${now()}.json`;
+    await admitEvidencePath(join(opts.report, hls12EvidenceName), deps);
+    const hls12Args = releaseHls12AcceptanceRunArgs({
+      imageId: runSubject,
+      harnessDir,
+      reportDir: opts.report,
+      mediaWorkspaceDir: opts.mediaWorkspace,
+      evidenceName: hls12EvidenceName,
+      sourceCommit: provenance.source,
+      sourceTree: provenance.tree,
+      candidateTag: image,
+    });
+    const hls12Violations = releaseHls12RunPostureViolations(hls12Args, {
+      reportDir: opts.report,
+      harnessDir,
+      mediaWorkspaceDir: opts.mediaWorkspace,
+    });
+    if (hls12Violations.length > 0) {
+      throw new Error(`refusing a separate-audio clear-HLS child with posture violations: ${hls12Violations.join("; ")}`);
+    }
+    log(`[split07] HLS-12 separate-audio clear HLS against the release candidate\n`);
+    const hls12Result = await runCandidate(HLS12_CANDIDATE_RUN_PURPOSE, hls12Args);
+    let hls12Child;
+    try {
+      hls12Child = validateHls12ChildRecord({
+        bytes: await readFileBytes(join(opts.report, hls12EvidenceName)),
+        expected: {
+          sourceCommit: provenance.source,
+          sourceTree: provenance.tree,
+          candidateTag: image,
+          candidateImageId: imageId,
+        },
+      });
+    } catch {
+      hls12Child = emptyHls12ChildObservation("the separate-audio clear-HLS child record is unreadable");
+    }
+    hls12Child = { ...hls12Child, path: hls12EvidenceName, exitCode: hls12Result.code };
+    log(`[split07] HLS-12 separate-audio clear HLS: ${hls12Child.verdict ?? "UNREADABLE"} ` +
+      `${hls12Child.checkCount} checks sha256=${hls12Child.sha256 ?? "n/a"}\n`);
+    await clearMediaWorkspace("hls12-clear-hls-separate-audio");
+
     // The children are re-read and re-hashed here, so the digests the parent
     // records describe bytes that were still identical at assembly time.
     const children = [];
@@ -980,8 +1038,17 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       });
       syncChildReverified = true;
     }
+    let hls12ChildReverified = false;
+    if (hls12Child.sha256 !== null) {
+      assertChildUnchanged({
+        family: "separate-audio-clear-HLS",
+        expectedSha256: hls12Child.sha256,
+        bytes: await readFileBytes(join(opts.report, hls12Child.path)),
+      });
+      hls12ChildReverified = true;
+    }
 
-    // The harness must STILL be exactly what was verified, now that all six
+    // The harness must STILL be exactly what was verified, now that all seven
     // children have consumed it. A harness modified at any point in the run
     // makes the run's own measurements untrustworthy, so the record is refused
     // outright rather than emitted as a FAIL.
@@ -1133,6 +1200,32 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       "sync/child-evidence-unchanged-before-assembly",
       syncChildReverified,
       syncChild.sha256 ?? "no bytes to re-verify",
+    );
+
+    // The separate-audio clear-HLS child (since -08): it ran, its record is a
+    // validated HLS-12 PASS, it names this release source, and it ran as the
+    // immutable id this driver told Docker to execute for it, offline.
+    const hls12Run = candidateRuns.find((entry) => entry.purpose === HLS12_CANDIDATE_RUN_PURPOSE);
+    checks.record("hls12/separate-audio-child-executed", hls12Run !== undefined, HLS12_CANDIDATE_RUN_PURPOSE);
+    checks.record("hls12/separate-audio-child-passed", hls12Child.ok === true, hls12Child.reason);
+    checks.record(
+      "hls12/child-names-the-release-source",
+      hls12Child.sourceCommit === provenance.source && hls12Child.sourceTree === provenance.tree,
+      `${String(hls12Child.sourceCommit)} ${String(hls12Child.sourceTree)}`,
+    );
+    checks.record(
+      "hls12/child-ran-in-the-candidate-image",
+      hls12Run?.subject === imageId &&
+        hls12Child.candidateImageId === imageId &&
+        hls12Child.runImageId === imageId &&
+        hls12Child.candidateTag === image &&
+        hls12Child.networkMode === "none",
+      imageId,
+    );
+    checks.record(
+      "hls12/child-evidence-unchanged-before-assembly",
+      hls12ChildReverified,
+      hls12Child.sha256 ?? "no bytes to re-verify",
     );
 
     // ── 7. Production identity, AFTER ──────────────────────────────────────
@@ -1339,6 +1432,26 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
           runImageId: syncChild.runImageId,
           networkMode: syncChild.networkMode,
           reason: syncChild.reason,
+        },
+      },
+      hls12Acceptance: {
+        executed: hls12Run !== undefined,
+        child: {
+          schema: hls12Child.schema,
+          verdict: hls12Child.verdict,
+          ok: hls12Child.ok,
+          sha256: hls12Child.sha256,
+          bytes: hls12Child.bytes,
+          checkCount: hls12Child.checkCount,
+          failedCheckCount: hls12Child.failedCheckCount,
+          evidenceFile: hls12Child.path,
+          sourceCommit: hls12Child.sourceCommit,
+          sourceTree: hls12Child.sourceTree,
+          candidateTag: hls12Child.candidateTag,
+          candidateImageId: hls12Child.candidateImageId,
+          runImageId: hls12Child.runImageId,
+          networkMode: hls12Child.networkMode,
+          reason: hls12Child.reason,
         },
       },
       production: {

@@ -1168,7 +1168,26 @@ describe("clear-HLS playlist parser: the module is inert", () => {
     //     an HLS execution primitive. It exists so the JobExecutor never names
     //     HLS-2, HLS-3 or HLS-4 and never learns a private HLS failure enum.
     //
-    // Both allowlists are EXACT, in both directions: only these files may name
+    // HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001 adds three more, each as
+    // narrow as the HLS-5/HLS-6 ones:
+    //
+    // (3) `hls-separate-audio-selection`: the separate-audio family's pure
+    //     selection vocabulary — the SOURCE end of its channel, like (1).
+    //     Analysis builds selections with it; the router and the planner name
+    //     its TYPE only.
+    //
+    // (4) `hls-master-pairing.server`: the master-proof seam, named by generic
+    //     ANALYSIS alone. It requests Master Playlists only (zero redirects)
+    //     and imports no media-playlist preflight, acquisition or processing
+    //     primitive — pinned in `hls-master-pairing.server.test.ts`.
+    //
+    // (5) `hls-separate-audio-execution.server`: the separate-audio
+    //     orchestration seam, named by the JobExecutor alone, exactly as (2).
+    //
+    // The master PARSER, `hls-master-playlist`, gets no exception: only its
+    // sibling, the pairing seam, may name it.
+    //
+    // Every allowlist is EXACT, in both directions: only these files may name
     // these stems, and these files may name NOTHING else from this directory.
     // Reachability from the executor is expected since HLS-6, and from ordinary
     // plan derivation since HLS-7 (pinned in `hls-execution-plan.test.ts`) —
@@ -1180,6 +1199,10 @@ describe("clear-HLS playlist parser: the module is inert", () => {
     assert.ok(dormantModules.includes("hls-media-playlist"));
     assert.ok(dormantModules.includes("hls-source-selection"));
     assert.ok(dormantModules.includes("hls-execution.server"));
+    assert.ok(dormantModules.includes("hls-master-playlist"));
+    assert.ok(dormantModules.includes("hls-master-pairing.server"));
+    assert.ok(dormantModules.includes("hls-separate-audio-selection"));
+    assert.ok(dormantModules.includes("hls-separate-audio-execution.server"));
 
     /** stem -> the only production modules permitted to name it. */
     const ALLOWED_IMPORTERS = new Map<string, ReadonlySet<string>>([
@@ -1192,6 +1215,16 @@ describe("clear-HLS playlist parser: the module is inert", () => {
         ]),
       ],
       ["hls-execution.server", new Set(["src/worker/execution/job-executor.server.ts"])],
+      [
+        "hls-separate-audio-selection",
+        new Set([
+          "src/worker/analysis/ytdlp-analysis.server.ts",
+          "src/worker/analysis/media-analyzer.server.ts",
+          "src/worker/execution/format-plan.ts",
+        ]),
+      ],
+      ["hls-master-pairing.server", new Set(["src/worker/analysis/ytdlp-analysis.server.ts"])],
+      ["hls-separate-audio-execution.server", new Set(["src/worker/execution/job-executor.server.ts"])],
     ]);
 
     for (const file of productionSourceFiles()) {
@@ -1224,6 +1257,16 @@ describe("clear-HLS playlist parser: the module is inert", () => {
       readFileSync(join(ROOT, "src/worker/analysis/media-analyzer.server.ts"), "utf8"),
       /import type \{ ClearHlsMediaPlaylistSelections \} from "\.\.\/hls\/hls-source-selection\.ts";/,
       "the router's HLS edge must be type-only",
+    );
+    assert.match(
+      readFileSync(join(ROOT, "src/worker/analysis/media-analyzer.server.ts"), "utf8"),
+      /import type \{ ClearHlsSeparateAudioSelections \} from "\.\.\/hls\/hls-separate-audio-selection\.ts";/,
+      "the router's separate-audio edge must be type-only",
+    );
+    assert.match(
+      readFileSync(join(ROOT, "src/worker/execution/format-plan.ts"), "utf8"),
+      /import type \{ ClearHlsSeparateAudioSelections \} from "\.\.\/hls\/hls-separate-audio-selection\.ts";/,
+      "the planner's separate-audio edge must be type-only",
     );
   });
 

@@ -25,11 +25,18 @@ import { validatePublicHttpUrl } from "@/lib/validation/url";
  * finding rather than an omission. A selection is still ONE media playlist of a
  * self-contained muxed rendition. fMP4 needed no selection change, because the
  * segment family is declared by the media playlist, which only HLS-2 reads. A
- * split video + separate-audio selection was NOT added: pinned yt-dlp
+ * split video + separate-audio selection was NOT added here: pinned yt-dlp
  * 2026.08.19 pops its internal `_audio_group_id` from every HLS format before
  * `-J` prints, so no application-usable video→audio relationship survives into
  * analysis, and pairing on anything left (format-id text, NAME/LANGUAGE labels,
- * ordering or bitrate) would be a guess. Such renditions stay unselected.
+ * ordering or bitrate) would be a guess.
+ *
+ * HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001 added that family in its OWN
+ * vocabulary (`hls-separate-audio-selection.ts`), and with a different
+ * authority: the Master Playlist VideoFetch fetches itself, whose own
+ * `EXT-X-STREAM-INF` → `AUDIO` → `EXT-X-MEDIA` relationship proves the pair —
+ * never yt-dlp output. This module, its map and its muxed-only admission are
+ * unchanged by that.
  *
  * ─── What this module is NOT ────────────────────────────────────────────────
  *
