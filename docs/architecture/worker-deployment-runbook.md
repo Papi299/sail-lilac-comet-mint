@@ -4836,8 +4836,8 @@ manifest SHA-256
 
 *Recorded by `SPLIT-TIMESTAMP-PRODUCTION-STATE-OF-RECORD-RECONCILIATION-001`
 (documentation only; it re-measured nothing). The Production facts are accepted
-operator-measured evidence held outside this repository, not CI: 107 files,
-SHA-256 manifest
+operator-measured evidence held outside this repository, not CI: 107 evidence
+files plus the `SHA256SUMS` manifest (108 files total); manifest SHA-256
 `bc66fdbbf6d73befd26a864e3ceaf56a9b7f892bcd4ec40b6b3c8352b28be768`,
 privacy-scanned. The image identity is the operator's measurement, not a
 provider attestation. The Vercel facts are provider-observed (read-only).*
@@ -10822,7 +10822,8 @@ claim boundary, are at the end of §4n.
   evidence files plus the `SHA256SUMS` manifest itself, 51 files total),
   rollout
   `bc66fdbbf6d73befd26a864e3ceaf56a9b7f892bcd4ec40b6b3c8352b28be768` (107
-  files, privacy-scanned). The Production image identity is the operator's
+  evidence files plus the `SHA256SUMS` manifest itself, 108 files total;
+  privacy-scanned). The Production image identity is the operator's
   measurement; no provider attests it.
 
 | | |
