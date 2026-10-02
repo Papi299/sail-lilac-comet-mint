@@ -4590,22 +4590,25 @@ qualification remain the evidence. Separate HLS audio stays **BLOCKED — HLS
 AUDIO PAIRING PROVENANCE INSUFFICIENT**: no heuristic pairing was implemented
 or accepted.
 
-### 4n. Split-merge timestamp preservation — SOURCE CORRECTION IN DRAFT PR — NOT MERGED, NOT QUALIFIED, NOT DEPLOYED
+### 4n. Split-merge timestamp preservation — SOURCE CORRECTION IMPLEMENTED — RELEASE QUALIFICATION / PRODUCTION RE-ACCEPTANCE PENDING
 
-*Recorded 2026-10-02 by `SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001`,
-in the Draft PR (branch `fix/split-merge-timestamp-preservation-001`, base
-`main` `73176b20…`) that carries the source correction. Source facts are
-GitHub-verifiable once merged. Audit and trial facts are operator-measured
-evidence held outside this repository; they are not CI (this repository has no
-CI).*
+*Recorded 2026-10-02 by `SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001`.
+This record was written during the review of PR #107 (branch
+`fix/split-merge-timestamp-preservation-001`, from base `main` `73176b20…`),
+the PR that carries the source correction. The source facts are
+GitHub-verifiable in that PR, and wherever this section appears on `main`, the
+correction it describes was merged with it. Release qualification and
+Production acceptance are separate, later, operator-measured stages; this
+record attests neither. Audit and trial facts are operator-measured evidence
+held outside this repository; they are not CI (this repository has no CI).*
 
 | State | |
 | :--- | :--- |
 | Defect | **CONFIRMED** by `SPLIT-MERGE-TIMESTAMP-PRESERVATION-AUDIT-001` (2026-10-02, read-only) |
-| Source correction | **implemented in the Draft PR — not merged** |
+| Source correction | **IMPLEMENTED** by PR #107. Review and merge are the repository stage, distinct from release qualification and Production deployment |
 | Release image | **not qualified**: no SPLIT-07 `-07` record has been produced |
 | Production Worker | **unchanged**: still `sha256:99ddf3d8…` (§4m), which carries the defect |
-| Production re-acceptance | **pending**; needs its own authorization after merge, qualification and promotion |
+| Production re-acceptance | **pending**: needs a separately authorized promotion of a qualified Worker image that contains the correction, then Production acceptance |
 
 **The defect.** `buildSplitMergeArgs()` named both halves as separate inputs
 and nothing else about time. The pinned FFmpeg 5.1.9 gives each input its own
@@ -4675,10 +4678,17 @@ processor is authorized, it should reuse this MP4 synchronization policy (a
 lower-level local-media seam, not the split-plan types), **not** the
 `-copyts -avoid_negative_ts make_zero` command its design investigation used.
 
-**Rollout, not authorized here:** independent review and merge; a release
-candidate built from the merged `main` and qualified by SPLIT-07 `-07`;
-Worker-only promotion; Production re-acceptance on a real split job. Until
-then, Production split and segmented-DASH merges keep the defect.
+**Rollout.** This record authorizes no step of it. The stages, in order:
+
+1. source review and merge (PR #107);
+2. a release candidate built from a `main` that contains the correction, and
+   qualified by SPLIT-07 `-07`;
+3. Worker-only promotion;
+4. Production re-acceptance on a real split job.
+
+Merging PR #107 alone does not change the running Worker. Production split and
+segmented-DASH merges keep the defect until a newly qualified Worker image that
+contains the correction is promoted.
 
 ## 5. Object storage (R2)
 
@@ -6688,7 +6698,7 @@ authorization.
 | `HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002` | **HLS-V2 PRODUCTION ACCEPTED — MUXED fMP4 CLEAR-HLS LIVE** (2026-10-01; no rollback) | Retained-candidate re-validation → fixture preflight inside the Production Worker → Worker-only promotion → Stage-A, generic and clear-HLS v1 regressions → controlled public-fixture HLS-v2 acceptance → stability. Worker `sha256:99ddf3d8…` (immediate rollback `sha256:db11b5ba…`); Vercel unchanged (`dpl_DrDdgct3…`, rollback `dpl_8k6e59…`). Preceded by `HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-001`, which stopped before any Production action because no public muxed-fMP4 source satisfied the shape, and by `HLS-V2-PUBLIC-ACCEPTANCE-FIXTURE-001`, which published the controlled fixture (`Papi299/videofetch-hls-v2-acceptance-fixture`, `9c84f33b…`). The fixture claim is narrow (§4m), and real-public segmented DASH was not re-proven. `worker.env`, the units and cloudflared unchanged; VM Stopped → Stopped. Full record: §4m, §11h. |
 | `HLS-SEPARATE-AUDIO-PAIRING-001` | **BLOCKED — HLS AUDIO PAIRING PROVENANCE INSUFFICIENT** | Separate HLS audio (split TS / split fMP4) was not implemented by `HLS-V2-ADAPTIVE-VOD-EXPANSION-001`: the pinned yt-dlp `2026.08.19` pops its internal `_audio_group_id` from every HLS format before `-J`, so a grouped video variant and an ungrouped video-only variant are indistinguishable (§4m). Unblocking needs an upstream relationship field or a separately approved master-playlist seam, never a label/order/bitrate heuristic. The 2026-10-01 Production rollout did not change this. Its eventual fMP4 + fMP4 merge should reuse the split merge's MP4 synchronization policy, not `-copyts -avoid_negative_ts make_zero` (§4n). |
 | `SPLIT-MERGE-TIMESTAMP-PRESERVATION-AUDIT-001` | **COMPLETE — DEFECT CONFIRMED** (2026-10-02) | Read-only, at `main` `73176b20…`. The split merge re-based each input to zero on its own, erasing legitimate relative A/V offsets in MP4 and WebM pairs; the accepted SPLIT-06/DASH-01 evidence could not see it (§4n). The fix needed separate authorization. |
-| `SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001` | **SOURCE CORRECTION IN DRAFT PR — NOT MERGED, NOT QUALIFIED, NOT DEPLOYED** | Closed per-job synchronization policy (MP4 `-isync` toward the earlier input; WebM `-isync 0` plus Opus `CodecDelay` `-itsoffset` from a bounded header reader), strict start-time parsing that fails closed only for the merge's input probes, and acceptance at SPLIT-06 `-05`, DASH-01 `-02`, SYNC-01 `-01` and SPLIT-07 `-07` (§4n). Production Worker still `sha256:99ddf3d8…`; release qualification and Production re-acceptance pending. |
+| `SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001` | **SOURCE CORRECTION IMPLEMENTED — RELEASE QUALIFICATION / PRODUCTION RE-ACCEPTANCE PENDING** | PR #107 implements the correction. It adds a closed per-job synchronization policy: MP4 uses `-isync` toward the earlier input; WebM uses `-isync 0`, plus an Opus `CodecDelay` `-itsoffset` read by a bounded header reader. Strict start-time parsing fails closed, only for the merge's input probes. Acceptance moves to SPLIT-06 `-05`, DASH-01 `-02`, SYNC-01 `-01` and SPLIT-07 `-07` (§4n). No release image containing the correction has been qualified yet. The Production Worker `sha256:99ddf3d8…` still carries the defect; Production rollout and re-acceptance are pending. Not deployed, not Production accepted. |
 
 ---
 
