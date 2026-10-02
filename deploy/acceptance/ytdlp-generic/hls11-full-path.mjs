@@ -36,8 +36,10 @@
 // one declaring no version, and one giving the independent-segments
 // declaration a value (each refused before the map is requested). A
 // split-master case re-proves, against the candidate's own pinned yt-dlp, the
-// HLS v2 finding that separate HLS audio cannot be paired: no relationship
-// survives into `-J`, so the Product advertises nothing for it.
+// HLS v2 finding that no audio relationship survives into `-J`; since `-02` it
+// also records the Product's own master proof (HLS-SEPARATE-AUDIO-PAIRING-
+// IMPLEMENTATION-001) consulting that master — one unredirected request, no
+// media request — and refusing both video variants, so nothing is advertised.
 //
 // ── The only substitutions ─────────────────────────────────────────────────
 //
@@ -77,6 +79,7 @@ import {
   HLS_V2_ALLOWED_TAGS,
   parseClearHlsMediaPlaylist,
 } from "../../../src/worker/hls/hls-media-playlist.ts";
+import { parseClearHlsMasterPlaylist } from "../../../src/worker/hls/hls-master-playlist.ts";
 import {
   AGGREGATE_FILE_NAME,
   FMP4_AGGREGATE_FILE_NAME,
@@ -126,7 +129,7 @@ import {
   hls11PageUrl,
 } from "./lib/hls11-fixture-url.mjs";
 import {
-  HLS_V2_ADMITTED_KINDS,
+  HLS_MASTER_PROOF_ADMITTED_KINDS,
   createEventClock,
   createHlsSafeHttpTransport,
   withHlsSafeHttpTransport,
@@ -1122,6 +1125,25 @@ async function runSplitMaster(ctx) {
   );
   checks.record(C("no-hls-video-preset-advertised"), videoPresetIds.length === 0, videoPresetIds.join(","));
   checks.record(C("hls-selections-empty"), Object.keys(result.hlsSelections ?? {}).length === 0);
+  // The Product's own master parser on the served text: the grouped variant's
+  // group holds TWO URI renditions (no preference policy exists) and the
+  // control names no group — the separate-audio proof refuses both.
+  let model = null;
+  try {
+    model = parseClearHlsMasterPlaylist(hls11SplitMaster());
+  } catch {
+    model = null;
+  }
+  const refusesBoth =
+    model !== null && model.variants.length === 2 &&
+    model.variants[0].audioGroup !== null && model.audioGroups[model.variants[0].audioGroup].length === 2 &&
+    model.audioGroups[model.variants[0].audioGroup].every((member) => typeof member.reference === "string") &&
+    model.variants[1].audioGroup === null;
+  checks.record(
+    C("separate-hls-selections-empty"),
+    Object.keys(result.separateHlsSelections ?? {}).length === 0 && refusesBoth,
+    model === null ? "the candidate parser refused the split master" : `${model.variants.length} variants, ${model.audioGroups.length} audio group`,
+  );
   checks.record(
     C("source-quality-withholds-unsupported-protocol-at-1080"),
     q !== null && q.observedMaxHeight === 1080 && q.deliverableMaxHeight === null &&
@@ -1129,10 +1151,19 @@ async function runSplitMaster(ctx) {
     JSON.stringify(q),
   );
   checks.record(C("plan-refuses-preset-1080"), planError === "FORMAT_UNAVAILABLE", String(planError));
+  const fetched = ctx.transport.ledger().slice(transportMark);
+  const phaseRequests = service.requests("split-master:analysis");
+  const productRequests = phaseRequests.filter((r) => r.userAgentClass === "product");
+  checks.record(
+    C("product-fetched-the-master-once-with-zero-redirects"),
+    fetched.length === 1 && fetched[0].kind === "master" && fetched[0].responseStatus === 200 &&
+      productRequests.length === 1 && productRequests[0].kind === "master" && productRequests[0].status === 200,
+    fetched.map((e) => `${e.kind}:${e.responseStatus}`).join(",") || "no Product request",
+  );
   checks.record(
     C("no-product-media-request"),
-    ctx.transport.ledger().length === transportMark &&
-      service.requests("split-master:analysis").every((r) => r.kind === "page" || r.kind === "master"),
+    fetched.every((e) => e.kind === "master") &&
+      phaseRequests.every((r) => r.kind === "page" || r.kind === "master"),
   );
   return {
     document: {
@@ -1146,9 +1177,14 @@ async function runSplitMaster(ctx) {
     },
     videoPresetIds,
     hlsSelections: Object.keys(result.hlsSelections ?? {}).length,
+    separateHlsSelections: Object.keys(result.separateHlsSelections ?? {}).length,
+    productRequests: fetched.map((e) => ({ kind: e.kind, responseStatus: e.responseStatus })),
     sourceQuality: q ? { observedMaxHeight: q.observedMaxHeight, deliverableMaxHeight: q.deliverableMaxHeight, unsupportedProtocolMaxHeight: unsupported?.maxObservedHeight ?? null } : null,
     planErrorCode: planError,
-    finding: "HLS AUDIO PAIRING PROVENANCE INSUFFICIENT: the pinned runtime removes its internal audio-group id before -J, so a grouped video variant and an ungrouped video-only variant are indistinguishable",
+    finding:
+      "the pinned runtime still removes its internal audio-group id before -J, so a grouped video variant and an " +
+      "ungrouped video-only variant are indistinguishable there; the Product's own master proof is the pairing " +
+      "authority, and it refuses this master: the grouped variant's group has two URI renditions and the control names none",
   };
 }
 
@@ -1277,7 +1313,7 @@ async function main(argv) {
       realRequest: http.request.bind(http),
       hostname: HLS11_FIXTURE_HOSTNAME,
       classify: classifyHls11FixturePath,
-      admittedKinds: HLS_V2_ADMITTED_KINDS,
+      admittedKinds: HLS_MASTER_PROOF_ADMITTED_KINDS,
     });
 
     await withHlsSafeHttpTransport({ setSafeHttpTestHooks, setPinnedRequestFactoryForTests }, ctx.transport, async () => {

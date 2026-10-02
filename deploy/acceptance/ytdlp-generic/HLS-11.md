@@ -33,7 +33,7 @@ real pinned-yt-dlp analysis (HTML5 <video> → master → m3u8_native, 1080p)
   → ONE real FFmpeg stream copy → real output probes  (durable: processing)
   → beginUploading() → local object writer → ready
 + the v2 grammar checks + eight fail-closed negatives + the split-master case
-  → HLS-11 PASS (hls11-release-image-full-path-01)
+  → HLS-11 PASS (hls11-release-image-full-path-02)
 ```
 
 Nothing of the Product is replaced. The executor receives exactly one seam, a
@@ -156,7 +156,27 @@ proves:
 - the planner refuses `preset:1080`, and no product media request was made.
 
 This is the release-image form of the HLS v2 finding **HLS AUDIO PAIRING
-PROVENANCE INSUFFICIENT**.
+PROVENANCE INSUFFICIENT** — still true of the pinned yt-dlp.
+
+**Since `-02`** (`HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001`), yt-dlp is
+not the pairing authority: when it exposes a video-only HLS rendition, the
+Product fetches the Master Playlist itself during analysis (runbook §4o). The
+split master is such a document, so the case also proves:
+
+- the Product made exactly ONE request — the master, answered 200, no redirect
+  followed — and no media playlist, map or fragment request
+  (`product-fetched-the-master-once-with-zero-redirects`,
+  `no-product-media-request`);
+- the separate-audio selections are empty: the candidate's own master parser
+  models the grouped variant's group as holding TWO URI renditions (no
+  preference policy exists) and the control as naming none, so the proof
+  refuses both (`separate-hls-selections-empty`).
+
+The transport therefore admits the `master` kind for this child
+(`HLS_MASTER_PROOF_ADMITTED_KINDS`). Under `-01`'s kinds the Product's master
+request would be refused (`transport/no-refused-request`), which is why the
+schema moved; an `-01` record stays a valid historical record of what it
+proved. The separate-audio positive itself is HLS-12's (`HLS-12.md`).
 
 ## Identity and evidence
 
@@ -165,15 +185,16 @@ the verified source commit and tree, the non-deployable build label and the
 immutable image id as candidate and run subject. The child records them and
 the loopback-only interfaces it observes. The record
 (`lib/hls11-evidence.mjs`) is built from an allowlist. It refuses a PASS that
-any of the 159 mandatory checks does not earn, and it refuses to emit any
+any of the 161 mandatory checks does not earn, and it refuses to emit any
 fixture marker, raw id, hostname, route, URL, loopback address or Product
 temp path. The parent re-reads the exact bytes, validates them
 (`validateHls11ChildRecord`) and re-hashes them immediately before assembly.
 
 ## What a PASS does not prove
 
-`HLS11_NON_CLAIMS`: no separate HLS audio (not implemented), no real public
-HLS source or CDN, no Production SSRF/DNS/egress re-proof, no Cloudflare,
+`HLS11_NON_CLAIMS`: no separate HLS audio positive (that is HLS-12; this
+child's split master is one the Product's own master proof refuses), no real
+public HLS source or CDN, no Production SSRF/DNS/egress re-proof, no Cloudflare,
 Vercel or R2, and no Production startup, promotion or uptime claim.
 
 ## Mutation controls (HLS-V2-ADAPTIVE-VOD-EXPANSION-001)
@@ -196,10 +217,10 @@ and run through this child:
 | File | Where it runs | What it is |
 | :--- | :--- | :--- |
 | `hls11-full-path.mjs` | inside the release candidate | The orchestrator; launched by SPLIT-07 with the parent's identity flags. |
-| `lib/hls11-evidence.mjs` | — | The `hls11-release-image-full-path-01` record, its 159 mandatory checks, PASS and privacy gates, and the parent-side validator. |
+| `lib/hls11-evidence.mjs` | — | The `hls11-release-image-full-path-02` record (`-01` historical), its 161 mandatory checks, PASS and privacy gates, and the parent-side validator. |
 | `lib/hls11-fixture-url.mjs` | — | The hostname, `--add-host` mapping, closed per-case routes and the exact page validator. Import-free. |
-| `lib/hls11-observers.mjs` | — | The spawn observer (durable status, input, demuxer), the HLS workspace sampler and the `-J` pairing-fact reducer. |
+| `lib/hls11-observers.mjs` | — | The spawn observer (durable status, input, demuxer), the HLS workspace sampler and the `-J` pairing-fact reducer. HLS-12 reuses the observer and the sampler with its own reducers. |
 | `fixtures/hls11-media.mjs` | — | The bit-exact recipes, masters (including the split master), the negative playlists and the version / independent-segments rewrites. |
 | `fixtures/hls11-server.mjs` | inside the release candidate, loopback only | The closed-route fixture service and its sanitized ledger. |
-| `lib/hls-safe-http-transport.mjs` | — | Shared with HLS-08; HLS-11 passes its own classifier and `HLS_V2_ADMITTED_KINDS` (map included). HLS-08's defaults are unchanged. |
+| `lib/hls-safe-http-transport.mjs` | — | Shared with HLS-08 and HLS-12; HLS-11 passes its own classifier and, since `-02`, `HLS_MASTER_PROOF_ADMITTED_KINDS` (master and map included; `-01` passed `HLS_V2_ADMITTED_KINDS`). HLS-08's defaults are unchanged. |
 | `scripts/ytdlp-hls11-acceptance.test.mjs` | `npm test` | Self-tests of the pure modules. No Docker, no network. |

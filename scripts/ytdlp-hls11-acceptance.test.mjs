@@ -40,14 +40,17 @@ import {
 import {
   HLS11_FORBIDDEN_EVIDENCE_SUBSTRINGS,
   HLS11_GRAMMAR_CHECKS,
+  HLS11_HISTORICAL_SCHEMAS,
   HLS11_MANDATORY_CHECKS,
   HLS11_NON_CLAIMS,
   HLS11_POSITIVE_CASES,
   HLS11_RELEASE_EVIDENCE_SCHEMA,
+  HLS11_SPLIT_MASTER_CHECKS,
   buildHls11ReleaseEvidence,
   validateHls11ReleaseChildRecord,
 } from "../deploy/acceptance/ytdlp-generic/lib/hls11-evidence.mjs";
 import {
+  HLS_MASTER_PROOF_ADMITTED_KINDS,
   HLS_V2_ADMITTED_KINDS,
   createEventClock,
   createHlsSafeHttpTransport,
@@ -292,9 +295,12 @@ describe("HLS-11 evidence", () => {
   });
 
   it("names its schema and requires both families, every negative and the split master", () => {
-    assert.equal(HLS11_RELEASE_EVIDENCE_SCHEMA, "hls11-release-image-full-path-01");
+    // -02 (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001): the Product now
+    // consults the split master itself; -01 stays a valid historical record.
+    assert.equal(HLS11_RELEASE_EVIDENCE_SCHEMA, "hls11-release-image-full-path-02");
+    assert.deepEqual([...HLS11_HISTORICAL_SCHEMAS], ["hls11-release-image-full-path-01"]);
     assert.deepEqual([...HLS11_POSITIVE_CASES], ["v1-ts", "v2-fmp4"]);
-    assert.equal(HLS11_MANDATORY_CHECKS.length, 159);
+    assert.equal(HLS11_MANDATORY_CHECKS.length, 161);
     assert.equal(new Set(HLS11_MANDATORY_CHECKS).size, HLS11_MANDATORY_CHECKS.length);
     for (const name of [
       ...HLS11_GRAMMAR_CHECKS,
@@ -306,9 +312,13 @@ describe("HLS-11 evidence", () => {
       "neg-version-5/refused-before-the-map-request",
       "neg-version-missing/refused-before-the-map-request",
       "neg-independent-segments-value/refused-before-the-map-request",
+      "split-master/separate-hls-selections-empty",
+      "split-master/product-fetched-the-master-once-with-zero-redirects",
+      "split-master/no-product-media-request",
     ]) {
       assert.ok(HLS11_MANDATORY_CHECKS.includes(name), name);
     }
+    assert.equal(HLS11_SPLIT_MASTER_CHECKS.length, 9);
     // The fMP4-only consumption check is not asked of the MPEG-TS control.
     assert.ok(!HLS11_MANDATORY_CHECKS.includes("v1-ts/acquisition/consumed-the-independent-segments-playlist"));
     assert.deepEqual(HLS11_MANDATORY_CHECKS.slice(0, 6), [...HLS09_RELEASE_IDENTITY_CHECKS]);
@@ -373,6 +383,22 @@ describe("HLS-11 use of the shared safe-HTTP acceptance transport", () => {
     v2.requestFactory(request("/hls11/v2-fmp4/seg-0.m4s", HLS11_FIXTURE_HOSTNAME));
     assert.deepEqual(v2.ledger().map((e) => [e.kind, e.ordinal]), [["init", null], ["fragment", 1]]);
     assert.throws(() => v2.requestFactory(request("/hls11/v2-fmp4/key.bin", HLS11_FIXTURE_HOSTNAME)), /route kind key/);
+  });
+
+  it("admits the Product's own master request only with the master-proof kinds (-02)", () => {
+    assert.deepEqual([...HLS_MASTER_PROOF_ADMITTED_KINDS], ["master", "media", "init", "fragment"]);
+    const proof = createHlsSafeHttpTransport({
+      ...base, hostname: HLS11_FIXTURE_HOSTNAME, classify: classifyHls11FixturePath, admittedKinds: HLS_MASTER_PROOF_ADMITTED_KINDS,
+    });
+    proof.requestFactory(request("/hls11/split-master/master.m3u8", HLS11_FIXTURE_HOSTNAME));
+    assert.deepEqual(proof.ledger().map((e) => e.kind), ["master"]);
+    assert.throws(() => proof.requestFactory(request("/hls11/v2-fmp4/key.bin", HLS11_FIXTURE_HOSTNAME)), /route kind key/);
+    // The -01 kind set would refuse it: the reason HLS-11 moved to -02.
+    const v2 = createHlsSafeHttpTransport({
+      ...base, hostname: HLS11_FIXTURE_HOSTNAME, classify: classifyHls11FixturePath, admittedKinds: HLS_V2_ADMITTED_KINDS,
+    });
+    assert.throws(() => v2.requestFactory(request("/hls11/split-master/master.m3u8", HLS11_FIXTURE_HOSTNAME)), /route kind master/);
+    assert.equal(v2.refusals().length, 1);
   });
 
   it("keeps HLS-08's defaults: its classifier and media + fragment only", () => {
