@@ -17,6 +17,7 @@
 //                            closed tags and one integer.
 
 import { createRequire, syncBuiltinESMExports } from "node:module";
+import { describeMergeSync } from "./merge-timing.mjs";
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -65,7 +66,11 @@ export function describeSpawn(command, args) {
 
   let streamCopy = null;
   let refusesOverwrite = null;
+  // SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001: the merge's closed
+  // synchronization tokens (input options, forbidden timestamp flags).
+  let sync = null;
   if (tool === "ffmpeg" && role === "media") {
+    sync = describeMergeSync(argv);
     const valuesOf = (flag) => argv.flatMap((arg, i) => (arg === flag ? [argv[i + 1]] : []));
     const codecFlags = argv.filter((arg) => /^-(c|codec|vcodec|acodec)(:[a-z0-9]+)*$/.test(arg));
     streamCopy =
@@ -74,7 +79,7 @@ export function describeSpawn(command, args) {
       codecFlags.length === 2;
     refusesOverwrite = argv.includes("-n") && !argv.includes("-y");
   }
-  return { tool, role, touched, streamCopy, refusesOverwrite };
+  return { tool, role, touched, streamCopy, refusesOverwrite, sync };
 }
 
 /**

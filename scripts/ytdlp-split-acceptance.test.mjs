@@ -40,6 +40,7 @@ import {
   generateSplitFixtures,
   splitDockerArgs,
   splitFfmpegArgs,
+  SPLIT_OFFSET_AUDIO_START_SECONDS,
   splitIncompatibleManifest,
   splitManifest,
 } from "../deploy/acceptance/ytdlp-generic/fixtures/split-media.mjs";
@@ -76,6 +77,9 @@ import {
   renderSplitEvidence,
   SPLIT06_EVIDENCE_SCHEMA,
   SPLIT06_FORBIDDEN_EVIDENCE_SUBSTRINGS,
+  SPLIT06_MANDATORY_SYNC_CHECKS,
+  SPLIT06_SYNC_CHECKS,
+  unmetSplit06SyncChecks,
 } from "../deploy/acceptance/ytdlp-generic/lib/split-evidence.mjs";
 import {
   createRunnerLedger,
@@ -95,6 +99,8 @@ function splitSet() {
     "/split-mp4.mpd": Buffer.from(splitManifest("mp4"), "utf8"),
     "/split-webm.mpd": Buffer.from(splitManifest("webm"), "utf8"),
     "/split-incompatible.mpd": Buffer.from(splitIncompatibleManifest(), "utf8"),
+    "/split-mp4-offset.mpd": Buffer.from(splitManifest("mp4", { offset: true }), "utf8"),
+    "/split-webm-offset.mpd": Buffer.from(splitManifest("webm", { offset: true }), "utf8"),
   };
   const artifacts = {};
   for (const route of SPLIT_MEDIA_ROUTES) artifacts[route] = bodyFor(route);
@@ -116,14 +122,52 @@ after(async () => {
 // -- fixture recipes --------------------------------------------------------
 
 describe("split fixture: generation recipes", () => {
-  it("declares four artifacts, one per family and role", () => {
+  it("declares four halves, one per family and role, plus one OFFSET audio half per family (-05)", () => {
     assert.deepEqual(Object.keys(SPLIT_FIXTURE_ARTIFACTS).sort(), [
       "mp4:audio",
+      "mp4:audio-offset",
       "mp4:video",
       "webm:audio",
+      "webm:audio-offset",
       "webm:video",
     ]);
     assert.deepEqual([...SPLIT_FAMILIES], ["mp4", "webm"]);
+    for (const family of SPLIT_FAMILIES) {
+      const offset = SPLIT_FIXTURE_ARTIFACTS[`${family}:audio-offset`];
+      const control = SPLIT_FIXTURE_ARTIFACTS[`${family}:audio`];
+      assert.equal(offset.role, "audio");
+      assert.equal(offset.variant, "offset");
+      assert.equal(offset.container, control.container);
+      assert.equal(offset.contentType, control.contentType);
+      assert.notEqual(offset.basename, control.basename);
+    }
+  });
+
+  it("builds the OFFSET audio recipe as the control audio recipe plus one container start offset", () => {
+    for (const family of SPLIT_FAMILIES) {
+      const control = splitFfmpegArgs(family, "audio", "/out/a");
+      const offset = splitFfmpegArgs(family, "audio", "/out/a", "offset");
+      const at = control.lastIndexOf("-f");
+      assert.deepEqual(offset, [...control.slice(0, at), "-output_ts_offset", SPLIT_OFFSET_AUDIO_START_SECONDS, ...control.slice(at)]);
+      assert.equal(SPLIT_OFFSET_AUDIO_START_SECONDS, "0.5");
+    }
+    assert.throws(() => splitFfmpegArgs("mp4", "video", "/out/v", "offset"), /only an audio half/);
+    assert.throws(() => splitFfmpegArgs("mp4", "audio", "/out/a", "late"), /unknown split fixture variant/);
+    assert.throws(() => splitFfmpegArgs("mp4", "audio-offset", "/out/a"), /unknown split fixture role/);
+  });
+
+  it("drives the OFFSET pair from its own manifest: same video, same ids, the offset audio half", () => {
+    for (const family of SPLIT_FAMILIES) {
+      const control = splitManifest(family);
+      const offset = splitManifest(family, { offset: true });
+      const audioBase = (doc) => [...doc.matchAll(/<BaseURL>([^<]+)<\/BaseURL>/g)].map((m) => m[1]);
+      assert.deepEqual(audioBase(offset), [
+        SPLIT_FIXTURE_ARTIFACTS[`${family}:video`].basename,
+        SPLIT_FIXTURE_ARTIFACTS[`${family}:audio-offset`].basename,
+      ]);
+      assert.equal(offset.replace(SPLIT_FIXTURE_ARTIFACTS[`${family}:audio-offset`].basename, "X"),
+        control.replace(SPLIT_FIXTURE_ARTIFACTS[`${family}:audio`].basename, "X"));
+    }
   });
 
   it("gives every half exactly ONE declared stream", () => {
@@ -966,14 +1010,15 @@ describe("split acceptance: evidence record", () => {
     maxFilesizeRefusal: passingRefusal(),
     maxFilesizeChunkedRefusal: passingChunkedRefusal(),
     ffmpegOverwriteRefusal: {},
-    checks: [],
+    // -05: a PASS carries the synchronization oracle on both full-path pairs.
+    checks: SPLIT06_MANDATORY_SYNC_CHECKS.map((name) => ({ name, ok: true, detail: null })),
     ...overrides,
   });
 
   it("stamps its own schema and states the network mode", () => {
     const record = buildSplitEvidence(minimal());
     assert.equal(record.schema, SPLIT06_EVIDENCE_SCHEMA);
-    assert.equal(record.schema, "split06-deterministic-full-path-04");
+    assert.equal(record.schema, "split06-deterministic-full-path-05");
     assert.equal(record.network.mode, "none");
     assert.equal(record.network.publicHostsContacted, 0);
     assert.equal(record.network.dnsLookups, 0);
@@ -1051,6 +1096,7 @@ describe("split acceptance: evidence record", () => {
       "maxFilesizeRefusal",
       "negativeCases",
       "network",
+      "offsetFullPath",
       "plan",
       "privacy",
       "processing",
@@ -1059,10 +1105,30 @@ describe("split acceptance: evidence record", () => {
       "sourceDiscovery",
       "startedAt",
       "streamIdentity",
+      "synchronization",
       "toolchain",
       "upload",
       "verdict",
     ]);
+  });
+
+  // -05: no PASS without the synchronization oracle on BOTH pairs.
+  it("refuses a PASS missing, duplicating or failing a mandatory synchronization check", () => {
+    assert.deepEqual(SPLIT06_SYNC_CHECKS.length, 6);
+    assert.ok(SPLIT06_MANDATORY_SYNC_CHECKS.includes("offset/sync/offset-pair-carries-a-discriminating-av-offset"));
+    assert.equal(new Set(SPLIT06_MANDATORY_SYNC_CHECKS).size, SPLIT06_MANDATORY_SYNC_CHECKS.length);
+    const all = SPLIT06_MANDATORY_SYNC_CHECKS.map((name) => ({ name, ok: true, detail: null }));
+    assert.deepEqual(unmetSplit06SyncChecks(all), []);
+    for (const name of ["sync/relative-offset-preserved", "offset/sync/relative-offset-preserved", "offset/lifecycle/final-status-ready"]) {
+      const without = all.filter((check) => check.name !== name);
+      assert.throws(() => buildSplitEvidence(minimal({ checks: without })), new RegExp(`${name}: absent`));
+      const duplicated = [...all, { name, ok: true, detail: null }];
+      assert.throws(() => buildSplitEvidence(minimal({ checks: duplicated })), new RegExp(`${name}: duplicated`));
+      const failed = all.map((check) => (check.name === name ? { ...check, ok: false } : check));
+      assert.throws(() => buildSplitEvidence(minimal({ checks: failed })), new RegExp(`${name}: failed`));
+      // A FAIL record stays emittable, so the failure is reportable.
+      assert.equal(buildSplitEvidence(minimal({ verdict: "FAIL", checks: without })).verdict, "FAIL");
+    }
   });
 
   it("renders as reviewable JSON", () => {

@@ -102,7 +102,30 @@ export const SPLIT_FIXTURE_ARTIFACTS = Object.freeze({
     streams: Object.freeze({ video: 0, audio: 1 }),
     durationSeconds: 2, width: null, height: null, fps: null,
   }),
+  // SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001 (SPLIT-06 -05): the same
+  // audio recipe, its container timeline starting SPLIT_OFFSET_AUDIO_START_SECONDS
+  // later. Paired with the unchanged video half it is a legitimate audio-late
+  // pair — the shape a merge that zeroes each input independently corrupts.
+  "mp4:audio-offset": Object.freeze({
+    family: "mp4", role: "audio", variant: "offset", basename: "split-audio-offset.m4a",
+    container: "m4a", probeFamily: "iso-bmff", contentType: "audio/mp4",
+    streams: Object.freeze({ video: 0, audio: 1 }),
+    durationSeconds: 2, width: null, height: null, fps: null,
+  }),
+  "webm:audio-offset": Object.freeze({
+    family: "webm", role: "audio", variant: "offset", basename: "split-audio-offset.webm",
+    container: "webm", probeFamily: "webm", contentType: "audio/webm",
+    streams: Object.freeze({ video: 0, audio: 1 }),
+    durationSeconds: 2, width: null, height: null, fps: null,
+  }),
 });
+
+/**
+ * The container start of the OFFSET audio halves, in seconds (an
+ * `-output_ts_offset` on the unchanged audio recipe). Half a second: far
+ * outside every rounding tolerance, inside every duration bound.
+ */
+export const SPLIT_OFFSET_AUDIO_START_SECONDS = "0.5";
 
 /** The container the closed product table must derive for each family. */
 export const SPLIT_TARGET_CONTAINER = Object.freeze({ mp4: "mp4", webm: "webm" });
@@ -126,7 +149,18 @@ export const SPLIT_FIXTURE_MAX_BYTES = 2 * 1024 * 1024;
  * pinned by a test that spawns nothing. Every input is a `lavfi` generator:
  * nothing is fetched, and no external media is involved.
  */
-export function splitFfmpegArgs(family, role, outPath) {
+export function splitFfmpegArgs(family, role, outPath, variant = "control") {
+  if (variant === "offset") {
+    // The offset variant is the control AUDIO recipe, token for token, with the
+    // container timeline started later: `-output_ts_offset` is placed
+    // immediately before the explicit output muxer.
+    if (role !== "audio") throw new Error("only an audio half has an offset variant");
+    const control = splitFfmpegArgs(family, "audio", outPath);
+    const muxerAt = control.lastIndexOf("-f");
+    return [...control.slice(0, muxerAt), "-output_ts_offset", SPLIT_OFFSET_AUDIO_START_SECONDS, ...control.slice(muxerAt)];
+  }
+  if (variant !== "control") throw new Error(`unknown split fixture variant ${String(variant)}`);
+  if (role !== "video" && role !== "audio") throw new Error(`unknown split fixture role ${String(role)}`);
   const key = `${family}:${role}`;
   if (!Object.hasOwn(SPLIT_FIXTURE_ARTIFACTS, key)) {
     throw new Error(`unknown split fixture ${key}`);
@@ -205,6 +239,7 @@ export function splitFfmpegArgs(family, role, outPath) {
  * optional here either.
  */
 export function splitDockerArgs({ image, outDir, family, role }) {
+  // `role` is the artifact key's suffix: `video`, `audio` or `audio-offset`.
   const artifact = SPLIT_FIXTURE_ARTIFACTS[`${family}:${role}`];
   if (!artifact) throw new Error(`unknown split fixture ${family}:${role}`);
   return [
@@ -212,7 +247,7 @@ export function splitDockerArgs({ image, outDir, family, role }) {
     "-v", `${outDir}:/out`,
     "--entrypoint", "/usr/bin/ffmpeg",
     image,
-    ...splitFfmpegArgs(family, role, `/out/${artifact.basename}`),
+    ...splitFfmpegArgs(artifact.family, artifact.role, `/out/${artifact.basename}`, artifact.variant ?? "control"),
   ];
 }
 
@@ -298,10 +333,13 @@ const AUDIO_SAMPLE_RATE = Object.freeze({ mp4: 44100, webm: 48000 });
  * request input) into an absolute media URL would make the fixture's media
  * destination a function of untrusted input.
  */
-export function splitManifest(family) {
+export function splitManifest(family, { offset = false } = {}) {
   if (!SPLIT_FAMILIES.includes(family)) throw new Error(`unknown split family ${family}`);
   const video = SPLIT_FIXTURE_ARTIFACTS[`${family}:video`];
-  const audio = SPLIT_FIXTURE_ARTIFACTS[`${family}:audio`];
+  // SPLIT-06 -05: the OFFSET manifest is the same document with the offset
+  // audio half's BaseURL. Same representation ids, codecs and shapes, so the
+  // product analyzes and plans the two pairs identically.
+  const audio = SPLIT_FIXTURE_ARTIFACTS[offset ? `${family}:audio-offset` : `${family}:audio`];
   return manifestDocument(
     {
       mimeType: video.contentType,
@@ -400,7 +438,7 @@ export async function generateSplitFixtures({ ffmpegPath, outDir, run = runOnce 
   for (const key of Object.keys(SPLIT_FIXTURE_ARTIFACTS)) {
     const artifact = SPLIT_FIXTURE_ARTIFACTS[key];
     const path = join(outDir, artifact.basename);
-    await run(ffmpegPath, splitFfmpegArgs(artifact.family, artifact.role, path));
+    await run(ffmpegPath, splitFfmpegArgs(artifact.family, artifact.role, path, artifact.variant ?? "control"));
     const bytes = await readFile(path);
     if (bytes.byteLength === 0) throw new Error(`${artifact.basename} is empty`);
     if (bytes.byteLength > SPLIT_FIXTURE_MAX_BYTES) {

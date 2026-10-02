@@ -7,9 +7,16 @@ import {
   assertWorkDirRealPath,
   hasExactStreamShape,
   probeLocalMedia,
+  probeLocalMediaWithStartTime,
   regularFileSize,
   type LocalMediaFamily,
 } from "@/services/processing/ffprobe.server";
+import { readLocalWebmAudioTrackTiming } from "@/services/processing/matroska-codec-delay.server";
+import {
+  decideMergeSync,
+  mergeSyncInputOptions,
+  type MergeSyncDecision,
+} from "@/services/processing/merge-sync";
 import { runProcess } from "@/services/processing/process-runner.server";
 
 export function assertLocalMediaPath(inputPath: string): void {
@@ -215,15 +222,24 @@ export async function generateSampleClip(workDir: string, timeoutMs: number): Pr
  *
  * ─── Reachability ───────────────────────────────────────────────────────────
  *
- * Since SPLIT-04 the JobExecutor calls this for a `merge-split` plan, strictly
- * after `beginProcessing()` commits, on the two halves SPLIT-03 acquired. But
- * no analysis path builds a split preset source yet, so no `merge-split` plan
- * exists in Production and no real download job reaches this function.
- * Executor support exists; product reachability does not.
+ * PRODUCT-REACHABLE. Since SPLIT-05 generic analysis builds split preset
+ * sources, so an ordinary `merge-split` plan exists, and the JobExecutor calls
+ * this on the two halves SPLIT-03 acquired (progressive or, since
+ * GENERIC-SEGMENTED-DASH-EXECUTION-001, segmented-DASH), strictly after
+ * `beginProcessing()` commits. Production jobs reach it.
+ *
+ * ─── Timestamps (SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001) ─────────
+ *
+ * The two halves are separate files with their own timelines, and their
+ * relative A/V offset is part of the media. The merge therefore carries a
+ * closed cross-input synchronization decision (`merge-sync.ts`) derived from
+ * each validated local file's own container start time — and, for WebM, the
+ * audio track's own `CodecDelay` — so the pinned FFmpeg does not re-base each
+ * input to zero independently.
  *
  * ─── Lifecycle ──────────────────────────────────────────────────────────────
  *
- * When it IS wired up, this runs in `processing`, never in `downloading`.
+ * This runs in `processing`, never in `downloading`.
  * `downloading` is network acquisition; this primitive touches no network at
  * all and refuses to be pointed at one (see the protocol whitelist below).
  *
@@ -293,16 +309,29 @@ const MERGE_MAX_STDERR_BYTES = 256_000;
  * The exact merge argv. Pure and exported so an argv-policy test can pin every
  * security-relevant flag without spawning anything.
  *
- * Fixed per target. There is no path by which a caller, a source, or a codec
- * string can add, remove or reorder an argument.
+ * Fixed per target and per closed synchronization state. The ONLY variable
+ * tokens are the paths and the input options `mergeSyncInputOptions()` derives
+ * from a validated `MergeSyncDecision` — `-isync` with a literal reference
+ * index, and for WebM Opus an application-formatted `-itsoffset`. There is no
+ * path by which a caller, a source, or a codec string can add, remove or
+ * reorder an argument.
  */
 export function buildSplitMergeArgs(opts: {
   target: SplitMergeTarget;
   videoPath: string;
   audioPath: string;
   outputPath: string;
+  sync: MergeSyncDecision;
 }): string[] {
   const inputFormat = SPLIT_INPUT_FORMAT[opts.target];
+  // The decision must be for THIS target: it chooses demuxer-specific options.
+  if (opts.sync?.target !== opts.target) throw new AppError("PROCESSING_FAILED");
+  let sync: ReturnType<typeof mergeSyncInputOptions>;
+  try {
+    sync = mergeSyncInputOptions(opts.sync);
+  } catch {
+    throw new AppError("PROCESSING_FAILED");
+  }
   return [
     // SPLIT-04: NEVER overwrite. `mergeSplitMedia` refuses an existing output
     // entry before spawning; `-n` makes FFmpeg refuse one that appeared between
@@ -314,7 +343,9 @@ export function buildSplitMergeArgs(opts: {
     "-v",
     "error",
 
-    // INPUT 0 — the video-only half.
+    // INPUT 0 — the video-only half. Its synchronization option, when the
+    // audio is the reference, precedes it: `-isync 1`, an input option.
+    ...sync.input0,
     //
     // `-protocol_whitelist file` is a per-input demuxer option and is the
     // control that stops a crafted local container from inducing a SECONDARY
@@ -332,7 +363,10 @@ export function buildSplitMergeArgs(opts: {
     opts.videoPath,
 
     // INPUT 1 — the audio-only half. Same policy; the whitelist is per-input,
-    // so it must be repeated rather than stated once.
+    // so it must be repeated rather than stated once. Its synchronization
+    // options, when the video is the reference, precede it: `-isync 0`, and
+    // for WebM Opus first `-itsoffset <CodecDelay>`.
+    ...sync.input1,
     "-protocol_whitelist",
     "file",
     "-f",
@@ -367,6 +401,11 @@ export function buildSplitMergeArgs(opts: {
     // Deliberately absent: `-shortest`. A slightly shorter audio track must
     // not truncate the video the user actually asked for; natural duration
     // mismatch is preserved. Changing that is a semantic decision, not a flag.
+    //
+    // Deliberately absent too: `-copyts`, `-start_at_zero` and
+    // `-avoid_negative_ts`. Measured against the pinned runtime, the first two
+    // reproduce the per-input zeroing, and `make_zero` shifts by the lowest
+    // DTS, un-hiding edit-list-trimmed media in the MP4 output.
 
     // MP4 only. `+faststart` was verified compatible with this exact
     // stream-copy command in the pinned runtime; it is an ISO-BMFF concept and
@@ -469,10 +508,13 @@ export async function mergeSplitMedia(opts: {
   // after FFmpeg exits.
   if (await pathEntryExists(outputPath)) throw new AppError("PROCESSING_FAILED");
 
-  // 3. Input stream shapes. Ambiguous media is refused, never disambiguated:
-  //    a muxed file used as the video half would make the job acquire audio
-  //    twice and then discard the source's own track.
-  const videoProbe = await probeLocalMedia({
+  // 3. Input stream shapes and timing. Ambiguous media is refused, never
+  //    disambiguated: a muxed file used as the video half would make the job
+  //    acquire audio twice and then discard the source's own track. The SAME
+  //    single probe of each half also yields its container start time; a half
+  //    whose start time is missing or invalid cannot be synchronized and is
+  //    refused here, before any merge.
+  const videoProbe = await probeLocalMediaWithStartTime({
     inputPath: videoPath,
     workDir: workDirReal,
     family,
@@ -483,7 +525,7 @@ export async function mergeSplitMedia(opts: {
     throw new AppError("PROCESSING_FAILED");
   }
 
-  const audioProbe = await probeLocalMedia({
+  const audioProbe = await probeLocalMediaWithStartTime({
     inputPath: audioPath,
     workDir: workDirReal,
     family,
@@ -491,6 +533,33 @@ export async function mergeSplitMedia(opts: {
     signal: opts.signal,
   });
   if (!hasExactStreamShape(audioProbe, { family, video: 0, audio: 1 })) {
+    throw new AppError("PROCESSING_FAILED");
+  }
+
+  // 3b. The closed synchronization decision, from the validated local facts
+  //     only. For WebM, the audio half's own `CodecDelay` is read by the
+  //     bounded single-purpose reader — after the half was proven a contained
+  //     regular file (stage 1) and an exactly-one-audio-stream WebM (above).
+  //     No caller value, duration or upstream metadata participates.
+  let sync: MergeSyncDecision;
+  try {
+    sync = decideMergeSync({
+      target: opts.target,
+      videoStartUs: videoProbe.startTimeUs,
+      audioStartUs: audioProbe.startTimeUs,
+      webmAudio:
+        opts.target === "webm"
+          ? await readLocalWebmAudioTrackTiming({
+              workDir: workDirReal,
+              inputPath: audioPath,
+              signal: opts.signal,
+            })
+          : undefined,
+    });
+  } catch (err) {
+    // A MergeSyncError, or anything else, is the canonical refusal; no detail
+    // about the facts that failed reaches the error.
+    if (err instanceof AppError) throw err;
     throw new AppError("PROCESSING_FAILED");
   }
 
@@ -504,6 +573,7 @@ export async function mergeSplitMedia(opts: {
       videoPath,
       audioPath,
       outputPath,
+      sync,
     }),
     timeoutMs: opts.timeoutMs,
     cwd: workDirReal,

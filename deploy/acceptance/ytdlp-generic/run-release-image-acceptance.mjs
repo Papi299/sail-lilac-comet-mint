@@ -4,16 +4,17 @@
 // `Dockerfile.worker` image, characterize it, and run the existing SPLIT-06
 // deterministic full path against it — mp4 AND webm — (since -03) the HLS-09
 // clear-HLS release child, (since -05) the DASH-01 segmented-DASH real-media
-// child and (since -06) the HLS-11 clear-HLS v2 real-media child, before
-// emitting one release-image candidate record. Every child runs the same
-// immutable candidate image id.
+// child, (since -06) the HLS-11 clear-HLS v2 real-media child and (since -07)
+// the SYNC-01 split-merge timing child, before emitting one release-image
+// candidate record. Every child runs the same immutable candidate image id.
 //
 // ── Child order (deterministic) ────────────────────────────────────────────
 //
 //   characterization → SPLIT-06 mp4 → clear workspace → SPLIT-06 webm
 //   → clear workspace → HLS-09 clear-HLS → clear workspace
 //   → DASH-01 segmented DASH → clear workspace
-//   → HLS-11 clear-HLS v2 → clear workspace → parent
+//   → HLS-11 clear-HLS v2 → clear workspace
+//   → SYNC-01 split-merge timing → clear workspace → parent
 //
 // Before each child the harness is re-verified and the Product media workspace
 // must be empty; after each child the workspace is cleared and re-proven empty.
@@ -103,6 +104,8 @@ import {
   releaseDashRunPostureViolations,
   releaseHls11AcceptanceRunArgs,
   releaseHls11RunPostureViolations,
+  releaseSyncAcceptanceRunArgs,
+  releaseSyncRunPostureViolations,
   releaseHlsAcceptanceRunArgs,
   releaseHlsRunPostureViolations,
 } from "./lib/release-container.mjs";
@@ -123,6 +126,7 @@ import {
   DASH_CANDIDATE_RUN_PURPOSE,
   emptyDashChildObservation,
   emptyHls11ChildObservation,
+  emptySyncChildObservation,
   emptyHlsChildObservation,
   ENTRYPOINT_SHIM_PATH,
   EXPECTED_IMAGE_CONFIG,
@@ -135,9 +139,11 @@ import {
   REQUIRED_SPLIT_FAMILIES,
   renderReleaseEvidence,
   SPLIT07_EVIDENCE_SCHEMA,
+  SYNC_CANDIDATE_RUN_PURPOSE,
   validateChildRecord,
   validateDashChildRecord,
   validateHls11ChildRecord,
+  validateSyncChildRecord,
   validateHlsChildRecord,
   validateReleaseParentRecord,
 } from "./lib/release-evidence.mjs";
@@ -875,6 +881,56 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       `${hls11Child.checkCount} checks sha256=${hls11Child.sha256 ?? "n/a"}\n`);
     await clearMediaWorkspace("hls11-clear-hls-v2");
 
+    // ── 6e. The SYNC-01 split-merge timing child (since -07) ───────────────
+    //
+    // SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001: the deterministic
+    // timing matrix through the candidate's own `mergeSplitMedia`, against a
+    // packet-timestamp and decoded-event oracle established before each merge.
+    // The DASH-01 hardening, with no `--add-host` (it serves nothing); the
+    // posture is re-derived from the argv before it runs.
+    await verifyHarnessAt("before-sync01-merge-timing");
+    await admitMediaWorkspace("before-sync01-merge-timing");
+    const syncEvidenceName = `sync01-merge-timing-${now()}.json`;
+    await admitEvidencePath(join(opts.report, syncEvidenceName), deps);
+    const syncArgs = releaseSyncAcceptanceRunArgs({
+      imageId: runSubject,
+      harnessDir,
+      reportDir: opts.report,
+      mediaWorkspaceDir: opts.mediaWorkspace,
+      evidenceName: syncEvidenceName,
+      sourceCommit: provenance.source,
+      sourceTree: provenance.tree,
+      candidateTag: image,
+    });
+    const syncViolations = releaseSyncRunPostureViolations(syncArgs, {
+      reportDir: opts.report,
+      harnessDir,
+      mediaWorkspaceDir: opts.mediaWorkspace,
+    });
+    if (syncViolations.length > 0) {
+      throw new Error(`refusing a split-merge timing child with posture violations: ${syncViolations.join("; ")}`);
+    }
+    log(`[split07] SYNC-01 split-merge timing against the release candidate\n`);
+    const syncResult = await runCandidate(SYNC_CANDIDATE_RUN_PURPOSE, syncArgs);
+    let syncChild;
+    try {
+      syncChild = validateSyncChildRecord({
+        bytes: await readFileBytes(join(opts.report, syncEvidenceName)),
+        expected: {
+          sourceCommit: provenance.source,
+          sourceTree: provenance.tree,
+          candidateTag: image,
+          candidateImageId: imageId,
+        },
+      });
+    } catch {
+      syncChild = emptySyncChildObservation("the split-merge timing child record is unreadable");
+    }
+    syncChild = { ...syncChild, path: syncEvidenceName, exitCode: syncResult.code };
+    log(`[split07] SYNC-01 split-merge timing: ${syncChild.verdict ?? "UNREADABLE"} ` +
+      `${syncChild.checkCount} checks sha256=${syncChild.sha256 ?? "n/a"}\n`);
+    await clearMediaWorkspace("sync01-merge-timing");
+
     // The children are re-read and re-hashed here, so the digests the parent
     // records describe bytes that were still identical at assembly time.
     const children = [];
@@ -915,8 +971,17 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       });
       hls11ChildReverified = true;
     }
+    let syncChildReverified = false;
+    if (syncChild.sha256 !== null) {
+      assertChildUnchanged({
+        family: "split-merge-timing",
+        expectedSha256: syncChild.sha256,
+        bytes: await readFileBytes(join(opts.report, syncChild.path)),
+      });
+      syncChildReverified = true;
+    }
 
-    // The harness must STILL be exactly what was verified, now that all five
+    // The harness must STILL be exactly what was verified, now that all six
     // children have consumed it. A harness modified at any point in the run
     // makes the run's own measurements untrustworthy, so the record is refused
     // outright rather than emitted as a FAIL.
@@ -1042,6 +1107,32 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
       "hls11/child-evidence-unchanged-before-assembly",
       hls11ChildReverified,
       hls11Child.sha256 ?? "no bytes to re-verify",
+    );
+
+    // The split-merge timing child (since -07): it ran, its record is a
+    // validated SYNC-01 PASS, it names this release source, and it ran as the
+    // immutable id this driver told Docker to execute for it, offline.
+    const syncRun = candidateRuns.find((entry) => entry.purpose === SYNC_CANDIDATE_RUN_PURPOSE);
+    checks.record("sync/merge-timing-child-executed", syncRun !== undefined, SYNC_CANDIDATE_RUN_PURPOSE);
+    checks.record("sync/merge-timing-child-passed", syncChild.ok === true, syncChild.reason);
+    checks.record(
+      "sync/child-names-the-release-source",
+      syncChild.sourceCommit === provenance.source && syncChild.sourceTree === provenance.tree,
+      `${String(syncChild.sourceCommit)} ${String(syncChild.sourceTree)}`,
+    );
+    checks.record(
+      "sync/child-ran-in-the-candidate-image",
+      syncRun?.subject === imageId &&
+        syncChild.candidateImageId === imageId &&
+        syncChild.runImageId === imageId &&
+        syncChild.candidateTag === image &&
+        syncChild.networkMode === "none",
+      imageId,
+    );
+    checks.record(
+      "sync/child-evidence-unchanged-before-assembly",
+      syncChildReverified,
+      syncChild.sha256 ?? "no bytes to re-verify",
     );
 
     // ── 7. Production identity, AFTER ──────────────────────────────────────
@@ -1228,6 +1319,26 @@ export async function runReleaseImageAcceptance(opts, deps = {}) {
           runImageId: hls11Child.runImageId,
           networkMode: hls11Child.networkMode,
           reason: hls11Child.reason,
+        },
+      },
+      syncAcceptance: {
+        executed: syncRun !== undefined,
+        child: {
+          schema: syncChild.schema,
+          verdict: syncChild.verdict,
+          ok: syncChild.ok,
+          sha256: syncChild.sha256,
+          bytes: syncChild.bytes,
+          checkCount: syncChild.checkCount,
+          failedCheckCount: syncChild.failedCheckCount,
+          evidenceFile: syncChild.path,
+          sourceCommit: syncChild.sourceCommit,
+          sourceTree: syncChild.sourceTree,
+          candidateTag: syncChild.candidateTag,
+          candidateImageId: syncChild.candidateImageId,
+          runImageId: syncChild.runImageId,
+          networkMode: syncChild.networkMode,
+          reason: syncChild.reason,
         },
       },
       production: {

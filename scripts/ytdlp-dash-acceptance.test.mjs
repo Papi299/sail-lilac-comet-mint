@@ -362,7 +362,7 @@ describe("DASH-01 evidence", () => {
   });
 
   it("requires every case check for BOTH pairings, the negatives, preflight, fixture and identity", () => {
-    assert.equal(DASH01_RELEASE_EVIDENCE_SCHEMA, "dash01-release-image-full-path-01");
+    assert.equal(DASH01_RELEASE_EVIDENCE_SCHEMA, "dash01-release-image-full-path-02");
     for (const caseName of DASH_CASES) {
       for (const name of DASH01_CASE_CHECKS) assert.ok(DASH01_MANDATORY_CHECKS.includes(`${caseName}/${name}`));
     }
@@ -379,6 +379,16 @@ describe("DASH-01 evidence", () => {
       "negative/missing-fragment/aborted-not-skipped",
       "release/run-subject-is-candidate-image-id",
       "preflight/pinned-dash-fragment-downloader-is-dashsegments",
+      // -02: the synchronization oracle (SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001).
+      "fixture/timing-oracle-established-before-the-job",
+      "fixture/both-pairings-carry-a-discriminating-av-offset",
+      "dash-dash/merge/sync-policy-is-the-pre-job-decision",
+      "dash-dash/sync/relative-offset-preserved",
+      "dash-progressive/sync/relative-offset-preserved",
+      "dash-progressive/sync/no-media-hidden-or-unhidden",
+      "dash-dash/sync/each-stream-shifted-by-one-constant",
+      "dash-dash/sync/no-leading-gap",
+      "dash-progressive/sync/stream-spans-preserved",
     ]) {
       assert.ok(DASH01_MANDATORY_CHECKS.includes(name), name);
     }
@@ -390,6 +400,10 @@ describe("DASH-01 evidence", () => {
     const without = input();
     without.checks = without.checks.filter((c) => c.name !== "dash-dash/output/resolution-is-1920x1080");
     assert.throws(() => buildDashReleaseEvidence(without), /refusing to emit a PASS/);
+    // -02: a merge that erased the 83.3 ms offset cannot PASS.
+    const desynced = input();
+    desynced.checks = desynced.checks.map((c) => (c.name === "dash-progressive/sync/relative-offset-preserved" ? { ...c, ok: false } : c));
+    assert.throws(() => buildDashReleaseEvidence(desynced), /refusing to emit a PASS/);
     const failing = input();
     failing.checks = failing.checks.map((c) => (c.name === "dash-progressive/output/exactly-one-audio-stream" ? { ...c, ok: false } : c));
     assert.throws(() => buildDashReleaseEvidence(failing), /refusing to emit a PASS/);

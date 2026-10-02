@@ -17,12 +17,13 @@ It is not a new framework. It extends the existing SPLIT-07 release-image gate
 verified clean release source
   → real Dockerfile.worker build → immutable candidate image id
   → image / config / runtime / hardening qualification, policy verifiers
-  → SPLIT-06 mp4 child     (split06-deterministic-full-path-04)
-  → SPLIT-06 webm child    (split06-deterministic-full-path-04)
+  → SPLIT-06 mp4 child     (split06-deterministic-full-path-05; -04 before -07)
+  → SPLIT-06 webm child    (split06-deterministic-full-path-05; -04 before -07)
   → HLS-09 clear-HLS child (hls09-release-image-full-path-02; -01 before GENERIC-SEGMENTED-DASH-EXECUTION-001)
-  → ONE HLS-aware SPLIT-07 parent PASS (split07-release-image-candidate-06, which
-    also requires the DASH-01 segmented-DASH child and the HLS-11 clear-HLS v2
-    child; -05, -04 and -03 before it)
+  → ONE HLS-aware SPLIT-07 parent PASS (split07-release-image-candidate-07, which
+    also requires the DASH-01 segmented-DASH child, the HLS-11 clear-HLS v2
+    child and the SYNC-01 split-merge timing child; -06, -05, -04 and -03
+    before it)
 ```
 
 Every candidate container — the clear-HLS child included — executes the same

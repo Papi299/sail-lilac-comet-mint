@@ -30,11 +30,16 @@ through durable `ready`, using:
 | `SQLiteJobStore` on a real temporary database, real transitions | real |
 | `downloadGenericSplitSources` (SPLIT-03) | real |
 | the pinned yt-dlp 2026.08.19 executable | real |
-| `probeLocalMedia` and `/usr/bin/ffprobe` | real |
-| `mergeSplitMedia` and `/usr/bin/ffmpeg` | real |
+| `probeLocalMediaWithStartTime`, `probeLocalMedia` and `/usr/bin/ffprobe` | real |
+| `mergeSplitMedia`, its closed synchronization policy and `/usr/bin/ffmpeg` | real |
 | `validateLocalOutput`, `beginUploading`, `finalizeJobUpload` | real |
 | the object-storage **provider** | **substituted** |
 | the submitted-URL **validator** | **substituted** |
+
+Since `-05`, the same PASS also proves the merge kept the source's relative
+A/V timing — on the zero-aligned pair and on a second pair whose audio starts
+half a second later — measured against an oracle taken **before** the job (see
+[Synchronization](#synchronization--required-since--05)).
 
 ## What one PASS does NOT prove
 
@@ -341,10 +346,55 @@ sizes and outcomes.
 
 ---
 
+## Synchronization — required since `-05`
+
+`SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001`. Up to `-04` the full path
+proved the merged streams **were** the source streams, by hashing packet
+payloads, and checked duration to ±0.25 s. Both fixture halves start at zero,
+so a merge that re-based each input to zero on its own was invisible. That is
+exactly the defect the hardening corrected.
+
+A `-05` run therefore executes the full path **twice**:
+
+| Pair | Video half | Audio half | Checks |
+| :--- | :--- | :--- | :--- |
+| control | the unchanged video fixture | the unchanged audio fixture | un-prefixed, every `-04` check included |
+| offset | the same video fixture | `split-audio-offset.{m4a,webm}`: the same tone, its container timeline starting 0.5 s later (`-output_ts_offset 0.5`) | under `offset/` |
+
+The offset pair is served from its own manifest (`/split-{mp4,webm}-offset.mpd`)
+and goes through the same analysis, pairing, preset, execution plan, acquisition,
+merge, validation and upload as the control pair.
+
+Before each job, the harness probes both fixture halves with ffprobe (packet
+`pts`, `dts`, `duration`, the discard flag and a payload SHA-256 per packet) and
+fixes the source's relative A/V offset. After `ready`, it probes the delivered
+object the same way and aligns its packets to the source by payload:
+
+| Check (per pair) | Meaning |
+| :--- | :--- |
+| `sync/source-timing-established-before-the-job` | the oracle was taken from the fixture halves before the job ran |
+| `offset/sync/offset-pair-carries-a-discriminating-av-offset` | the offset pair's relative offset is larger than the rounding tolerance, so it can tell a correct merge from a zeroing one |
+| `sync/relative-offset-preserved` | the delivered audio-minus-video offset equals the source's, within one tick of each output time base plus (MP4) one tick of the movie timescale |
+| `sync/each-stream-shifted-by-one-constant` | every packet of a stream moved by the same amount |
+| `sync/no-media-hidden-or-unhidden` | the same packets, and the same discard flags, as the source |
+| `sync/no-leading-gap` | the artifact's earliest presented media starts no later than one tolerance after zero |
+| `sync/stream-spans-preserved` | each stream's presented span is unchanged |
+
+The synchronization checks are measured before the duration and
+packet-identity requirements. A merge that erased the offset is therefore
+reported by the oracle itself, not only by the shortened duration. Their
+mutation controls are recorded in [`SYNC-01.md`](SYNC-01.md#mutation-controls).
+The offset pair's duration expectation is taken from the oracle rather than
+the control pair's fixed 2 s. The record carries the measured values under
+`synchronization` (both pairs, µs) and `offsetFullPath`. The checks are built
+by `lib/merge-timing.mjs`, which is shared with DASH-01 and SYNC-01.
+
+---
+
 ## Evidence
 
 Every run writes one machine-readable record, schema
-`split06-deterministic-full-path-04` (`lib/split-evidence.mjs`), to the
+`split06-deterministic-full-path-05` (`lib/split-evidence.mjs`), to the
 `--evidence` path. Following the harness's existing rule, that path must be
 **present and unoccupied**: an existing artifact is refused, never replaced.
 
@@ -371,6 +421,14 @@ new rule would misstate it. A `-04` record adds `maxFilesizeChunkedRefusal`.
 The builder refuses to emit a PASS unless both `evaluateMaxFilesizeRefusal`
 (unchanged) and `evaluateChunkedMaxFilesizeRefusal` are satisfied. `-01`,
 `-02` and `-03` records stay historical.
+
+`-05` makes synchronization part of a PASS (see
+[Synchronization](#synchronization--required-since--05)). A `-04` PASS could
+not see per-input zeroing, and every `-04` record was produced against a merge
+that had it. Re-reading one under the new rule would misstate it. A `-05`
+record adds `synchronization` and `offsetFullPath`. The builder refuses to
+emit a PASS unless every `SPLIT06_MANDATORY_SYNC_CHECKS` entry is present
+exactly once and passing. `-01` … `-04` records stay historical.
 
 The record is assembled from an allowlist and refuses to be written if it would
 carry a forbidden field (`stderr`, `argv`, anything credential-shaped) or a raw
@@ -412,7 +470,8 @@ DNS or nftables, and no Production credential is read.
 | `lib/split-fixture-url.mjs` | — | The exact-fixture URL validator. Test-only, and narrow by construction. |
 | `lib/local-object-writer.mjs` | — | The deterministic local `ObjectStoreWriter`. |
 | `lib/split-observers.mjs` | — | Spawn ledger, `/proc` media-tool sampler, SQLite status-audit trigger. |
-| `lib/split-evidence.mjs` | — | The `split06-…-04` record, its verified-provenance gate, its two `--max-filesize` PASS gates and its privacy refusals. |
-| `fixtures/split-media.mjs` | — | The four bit-exact fixture recipes and the DASH manifests. |
-| `fixtures/server.mjs` | loopback only | Extended with the optional, closed SPLIT-06 route set; an instance built with `ranges: true` also answers single byte ranges on its media routes. |
+| `lib/split-evidence.mjs` | — | The `split06-…-05` record, its verified-provenance gate, its two `--max-filesize` PASS gates, its synchronization PASS gate and its privacy refusals. |
+| `lib/merge-timing.mjs` | — | The pre-job packet-timestamp oracle and its verdicts. Shared with DASH-01 and SYNC-01. |
+| `fixtures/split-media.mjs` | — | The six bit-exact fixture recipes (four control halves, two offset audio halves) and the control and offset DASH manifests. |
+| `fixtures/server.mjs` | loopback only | Extended with the optional, closed SPLIT-06 route set (control and offset); an instance built with `ranges: true` also answers single byte ranges on its media routes. |
 | `scripts/ytdlp-split-acceptance.test.mjs` | `npm test` | Harness self-tests. No Docker, no FFmpeg, no network. |

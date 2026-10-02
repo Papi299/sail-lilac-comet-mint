@@ -55,6 +55,14 @@ const PAIR_SHAPE = {
 
 const VIDEO_BYTES = "VIDEO-HALF-BYTES";
 const AUDIO_BYTES = "AUDIO-HALF";
+/**
+ * SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001: a WebM audio half is read
+ * by the merge itself (its own CodecDelay), so it is a REAL FFmpeg-written Opus
+ * header prefix rather than opaque bytes. See the processing testdata README.
+ */
+const WEBM_AUDIO_BYTES = fs.readFileSync(
+  path.join(import.meta.dirname, "../../services/processing/testdata/pinned-matroska-header-opus-audio.bin"),
+);
 const mergedBytes = (target: string) => `MERGED-${target.toUpperCase()}-ARTIFACT`;
 
 function splitAnalysis(target: SplitTarget): ExecutionAnalysis {
@@ -206,7 +214,10 @@ function realSplitDownload(
         runs.push(run);
         await beforeWrite?.(run);
         const container = PAIR_SHAPE[target][role];
-        fs.writeFileSync(template.replace("%(ext)s", container), role === "video" ? VIDEO_BYTES : AUDIO_BYTES);
+        fs.writeFileSync(
+          template.replace("%(ext)s", container),
+          role === "video" ? VIDEO_BYTES : target === "webm" ? WEBM_AUDIO_BYTES : AUDIO_BYTES,
+        );
         return { code: 0, stdout: "", stderr: "" };
       },
     });
@@ -257,11 +268,15 @@ function hookSubprocesses(
             : base.startsWith("audio-source")
               ? ["audio"]
               : ["video", "audio"];
+          // Like the real ffprobe, `start_time` is printed only when the argv
+          // asks for it (the merge's two timed INPUT probes).
+          const timed = args[args.indexOf("-show_entries") + 1]?.includes("start_time") === true;
+          const format_name = target === "mp4" ? ISO : WEBM;
           child.stdout.write(
             JSON.stringify({
               programs: [],
               streams: kinds.map((codec_type) => ({ codec_type })),
-              format: { format_name: target === "mp4" ? ISO : WEBM },
+              format: timed ? { format_name, start_time: "0.000000" } : { format_name },
             }),
           );
         }

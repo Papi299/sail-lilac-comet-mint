@@ -4101,7 +4101,8 @@ vocabulary names no HLS spelling and equals exactly the reviewed
 `hls08-deterministic-full-path-03` and `hls09-release-image-full-path-02`.
 
 **Real-media qualification: DASH-01** (`deploy/acceptance/ytdlp-generic/DASH-01.md`,
-schema `dash01-release-image-full-path-01`). A mandatory child of every SPLIT-07
+schema `dash01-release-image-full-path-01`; `-02`, which adds a timing oracle,
+from SPLIT-07 `-07` — see §4n). A mandatory child of every SPLIT-07
 release-image run since `split07-release-image-candidate-05` (`-04` is historical:
 it never ran real fragmented DASH and no `-04` record was ever produced). Inside the
 candidate image, offline, with NO faked yt-dlp, FFmpeg or ffprobe, it drives a
@@ -4588,6 +4589,96 @@ rollout; the deployed segmented-DASH scope and the candidate's DASH-01 release
 qualification remain the evidence. Separate HLS audio stays **BLOCKED — HLS
 AUDIO PAIRING PROVENANCE INSUFFICIENT**: no heuristic pairing was implemented
 or accepted.
+
+### 4n. Split-merge timestamp preservation — SOURCE CORRECTION IN DRAFT PR — NOT MERGED, NOT QUALIFIED, NOT DEPLOYED
+
+*Recorded 2026-10-02 by `SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001`,
+in the Draft PR (branch `fix/split-merge-timestamp-preservation-001`, base
+`main` `73176b20…`) that carries the source correction. Source facts are
+GitHub-verifiable once merged. Audit and trial facts are operator-measured
+evidence held outside this repository; they are not CI (this repository has no
+CI).*
+
+| State | |
+| :--- | :--- |
+| Defect | **CONFIRMED** by `SPLIT-MERGE-TIMESTAMP-PRESERVATION-AUDIT-001` (2026-10-02, read-only) |
+| Source correction | **implemented in the Draft PR — not merged** |
+| Release image | **not qualified**: no SPLIT-07 `-07` record has been produced |
+| Production Worker | **unchanged**: still `sha256:99ddf3d8…` (§4m), which carries the defect |
+| Production re-acceptance | **pending**; needs its own authorization after merge, qualification and promotion |
+
+**The defect.** `buildSplitMergeArgs()` named both halves as separate inputs
+and nothing else about time. The pinned FFmpeg 5.1.9 gives each input its own
+`ts_offset = -start_time`, so each half was re-based to zero on its own and any
+relative A/V offset the source carried was erased. The audit measured 400–471 ms
+offsets destroyed in MP4 and WebM pairs. `-copyts -start_at_zero` uses the
+same per-input formula and does not help. `-copyts -avoid_negative_ts
+make_zero` keeps the offset but shifts by the lowest DTS and un-hides
+edit-list-trimmed media (AAC priming, video pre-roll). The merge has been
+product-reachable since SPLIT-05 (progressive split pairs) and segmented DASH
+(§4k). The accepted evidence could not see it: SPLIT-06 (`-04`) and DASH-01
+(`-01`) hashed packet payloads and checked duration to ±0.25 s. The DASH-01
+fixture's own 83.3 ms offset (B-frame composition delay, video late) was
+erased in every accepted run, including the SPLIT-07 `-06` qualification of the
+current Production image.
+
+**The correction** (`src/services/processing/merge-sync.ts`,
+`matroska-codec-delay.server.ts`, `ffprobe.server.ts`, `ffmpeg.server.ts`):
+
+- The merge's two INPUT probes also read `format.start_time`
+  (`probeLocalMediaWithStartTime`), parsed strictly from ffprobe's six-decimal
+  `%f` text into integer microseconds and bounded at |t| < 2³¹ s. A missing,
+  `N/A`, malformed or out-of-bound start is `PROCESSING_FAILED` before the
+  merge, because `-isync` silently does nothing for an unknown start. Every
+  other `probeLocalMedia()` caller — clear-HLS processing (MPEG-TS and fMP4:
+  its source, produced and final probes) and the merge's own output probe —
+  keeps the byte-identical untimed command and result, so a muxed job never
+  fails for timing metadata it does not need.
+- A closed decision type, not argument strings. **MP4:** the half that starts
+  first is the reference — `-isync 0` before the audio input when the video
+  starts first or both start together, `-isync 1` before the video input when
+  the audio starts first. **WebM:** the audio is synced to the video
+  (`-isync 0`). For Opus it is preceded by `-itsoffset <CodecDelay>`, because
+  the pinned Matroska demuxer subtracts `CodecDelay` and the pinned muxer does
+  not add it back. The value is read from the half's own header by a bounded,
+  single-purpose reader (1 MiB, 1,024 elements, depth 3, exactly one audio
+  TrackEntry, allowlisted elements, `O_NOFOLLOW`, fail-closed, no detail in
+  errors), quantized through the 48 kHz Opus clock and printed with six
+  decimals. A Vorbis track declaring a `CodecDelay` is refused.
+- Every earlier merge protection is unchanged: `-n`, `-nostdin`, explicit
+  demuxers, per-input `-protocol_whitelist file`, explicit maps, `-c copy`,
+  metadata and chapter stripping, no `-shortest`, MP4 `+faststart`,
+  containment, no-clobber, the size gate, shape validation, cancellation,
+  timeout and sanitized errors. `-copyts`, `-start_at_zero`,
+  `-avoid_negative_ts` and `-shortest` stay absent, and no caller value,
+  duration or upstream metadata participates.
+- No change to the lifecycle (every ffprobe/FFmpeg still runs at
+  `processing`), the `merge-split` workspace footprint (2), acquisition, the
+  execution-plan vocabulary or the browser/public API.
+
+**Acceptance.** SPLIT-06 moves to `split06-deterministic-full-path-05` (a
+zero-aligned and a 0.5 s-offset pair, each through the full path, measured
+against a pre-job packet-timestamp oracle). DASH-01 moves to
+`dash01-release-image-full-path-02` (the same oracle, plus the pre-job merge
+policy). The new SYNC-01 child (`sync01-release-image-merge-timing-01`) runs a
+19-case MP4/WebM timing matrix with decoded flash/click events, checks that
+zero-aligned controls are identical to the historical merge, and runs an
+oracle-sensitivity control. SPLIT-07 moves to
+`split07-release-image-candidate-07`, which requires all of them. `-06` stays
+valid for exactly what it proved. Mutation controls (`SYNC-01.md`) show the
+children fail, for the intended reason, against each of eleven bad
+implementations, including the exact current Production argv.
+
+**HLS separate-audio dependency.** `HLS-SEPARATE-AUDIO-PAIRING-001` stays
+blocked and is not implemented here. When a separate fMP4 + fMP4 clear-HLS
+processor is authorized, it should reuse this MP4 synchronization policy (a
+lower-level local-media seam, not the split-plan types), **not** the
+`-copyts -avoid_negative_ts make_zero` command its design investigation used.
+
+**Rollout, not authorized here:** independent review and merge; a release
+candidate built from the merged `main` and qualified by SPLIT-07 `-07`;
+Worker-only promotion; Production re-acceptance on a real split job. Until
+then, Production split and segmented-DASH merges keep the defect.
 
 ## 5. Object storage (R2)
 
@@ -6595,7 +6686,9 @@ authorization.
 | `CLOUDFLARED-QUIC-VS-HTTP2-EXTENDED-SOAK-001` | **NON-BLOCKING RELIABILITY FOLLOW-UP — not started** | Awake-host all-connection QUIC outages of the named tunnel remain intermittent, with an unresolved origin; most earlier drops coincided with host sleep, which is expected on-demand downtime. A controlled 6-hour QUIC-versus-HTTP/2 comparison on 2026-09-30 captured no outage, with both protocols stable, so no evidence justifies changing the Production transport, which stays auto → QUIC. Only a longer awake soak could discriminate between the protocols; it blocks no Product release. *Operator-measured* diagnostics; nothing was changed. |
 | `HLS-V2-ADAPTIVE-VOD-EXPANSION-001` | **CLOSED / QUALIFIED / DEPLOYED / PRODUCTION ACCEPTED** (2026-10-01) | Muxed fMP4 clear HLS (§4m). PR #105, merge `88f26318…`; retained candidate `sha256:99ddf3d8…` (SPLIT-07 `-06` PASS 57/57, HLS-11 included); Worker-only promotion and acceptance by `HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002` (next row). No Vercel step. |
 | `HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002` | **HLS-V2 PRODUCTION ACCEPTED — MUXED fMP4 CLEAR-HLS LIVE** (2026-10-01; no rollback) | Retained-candidate re-validation → fixture preflight inside the Production Worker → Worker-only promotion → Stage-A, generic and clear-HLS v1 regressions → controlled public-fixture HLS-v2 acceptance → stability. Worker `sha256:99ddf3d8…` (immediate rollback `sha256:db11b5ba…`); Vercel unchanged (`dpl_DrDdgct3…`, rollback `dpl_8k6e59…`). Preceded by `HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-001`, which stopped before any Production action because no public muxed-fMP4 source satisfied the shape, and by `HLS-V2-PUBLIC-ACCEPTANCE-FIXTURE-001`, which published the controlled fixture (`Papi299/videofetch-hls-v2-acceptance-fixture`, `9c84f33b…`). The fixture claim is narrow (§4m), and real-public segmented DASH was not re-proven. `worker.env`, the units and cloudflared unchanged; VM Stopped → Stopped. Full record: §4m, §11h. |
-| `HLS-SEPARATE-AUDIO-PAIRING-001` | **BLOCKED — HLS AUDIO PAIRING PROVENANCE INSUFFICIENT** | Separate HLS audio (split TS / split fMP4) was not implemented by `HLS-V2-ADAPTIVE-VOD-EXPANSION-001`: the pinned yt-dlp `2026.08.19` pops its internal `_audio_group_id` from every HLS format before `-J`, so a grouped video variant and an ungrouped video-only variant are indistinguishable (§4m). Unblocking needs an upstream relationship field or a separately approved master-playlist seam, never a label/order/bitrate heuristic. The 2026-10-01 Production rollout did not change this. |
+| `HLS-SEPARATE-AUDIO-PAIRING-001` | **BLOCKED — HLS AUDIO PAIRING PROVENANCE INSUFFICIENT** | Separate HLS audio (split TS / split fMP4) was not implemented by `HLS-V2-ADAPTIVE-VOD-EXPANSION-001`: the pinned yt-dlp `2026.08.19` pops its internal `_audio_group_id` from every HLS format before `-J`, so a grouped video variant and an ungrouped video-only variant are indistinguishable (§4m). Unblocking needs an upstream relationship field or a separately approved master-playlist seam, never a label/order/bitrate heuristic. The 2026-10-01 Production rollout did not change this. Its eventual fMP4 + fMP4 merge should reuse the split merge's MP4 synchronization policy, not `-copyts -avoid_negative_ts make_zero` (§4n). |
+| `SPLIT-MERGE-TIMESTAMP-PRESERVATION-AUDIT-001` | **COMPLETE — DEFECT CONFIRMED** (2026-10-02) | Read-only, at `main` `73176b20…`. The split merge re-based each input to zero on its own, erasing legitimate relative A/V offsets in MP4 and WebM pairs; the accepted SPLIT-06/DASH-01 evidence could not see it (§4n). The fix needed separate authorization. |
+| `SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001` | **SOURCE CORRECTION IN DRAFT PR — NOT MERGED, NOT QUALIFIED, NOT DEPLOYED** | Closed per-job synchronization policy (MP4 `-isync` toward the earlier input; WebM `-isync 0` plus Opus `CodecDelay` `-itsoffset` from a bounded header reader), strict start-time parsing that fails closed only for the merge's input probes, and acceptance at SPLIT-06 `-05`, DASH-01 `-02`, SYNC-01 `-01` and SPLIT-07 `-07` (§4n). Production Worker still `sha256:99ddf3d8…`; release qualification and Production re-acceptance pending. |
 
 ---
 
