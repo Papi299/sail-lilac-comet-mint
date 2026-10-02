@@ -472,6 +472,10 @@ export const SPLIT_MANIFEST_ROUTES = Object.freeze([
   "/split-mp4.mpd",
   "/split-webm.mpd",
   "/split-incompatible.mpd",
+  // SPLIT-06 -05 (SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001): the
+  // offset pair — the same video beside an audio half starting 0.5 s later.
+  "/split-mp4-offset.mpd",
+  "/split-webm-offset.mpd",
 ]);
 
 export const SPLIT_MEDIA_ROUTES = Object.freeze([
@@ -479,6 +483,8 @@ export const SPLIT_MEDIA_ROUTES = Object.freeze([
   "/split-audio.m4a",
   "/split-video.webm",
   "/split-audio.webm",
+  "/split-audio-offset.m4a",
+  "/split-audio-offset.webm",
 ]);
 
 /** The exact `Content-Type` each split route answers with. Fixed in source. */
@@ -486,10 +492,14 @@ export const SPLIT_ROUTE_CONTENT_TYPES = Object.freeze({
   "/split-mp4.mpd": "application/dash+xml",
   "/split-webm.mpd": "application/dash+xml",
   "/split-incompatible.mpd": "application/dash+xml",
+  "/split-mp4-offset.mpd": "application/dash+xml",
+  "/split-webm-offset.mpd": "application/dash+xml",
   "/split-video.mp4": "video/mp4",
   "/split-audio.m4a": "audio/mp4",
   "/split-video.webm": "video/webm",
   "/split-audio.webm": "audio/webm",
+  "/split-audio-offset.m4a": "audio/mp4",
+  "/split-audio-offset.webm": "audio/webm",
 });
 
 /** The Phase-10D route set, named positively so it can be gated as a whole. */

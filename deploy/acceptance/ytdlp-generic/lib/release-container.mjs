@@ -690,6 +690,9 @@ export const DASH01_ORCHESTRATOR = "deploy/acceptance/ytdlp-generic/dash-full-pa
 /** The HLS-11 clear-HLS v2 release child, at its repository-relative path. */
 export const HLS11_ORCHESTRATOR = "deploy/acceptance/ytdlp-generic/hls11-full-path.mjs";
 
+/** The SYNC-01 split-merge timing release child, at its repository-relative path. */
+export const SYNC01_ORCHESTRATOR = "deploy/acceptance/ytdlp-generic/sync-matrix.mjs";
+
 /**
  * The DASH-01 segmented-DASH release child `docker run` argv, against the
  * RELEASE image (since SPLIT-07 `-05`).
@@ -860,6 +863,87 @@ export function releaseHls11AcceptanceRunArgs({
 }
 
 /**
+ * The SYNC-01 split-merge timing release child `docker run` argv, against the
+ * RELEASE image (since SPLIT-07 `-07`, SPLIT-MERGE-TIMESTAMP-PRESERVATION-
+ * HARDENING-001).
+ *
+ * The DASH-01 child's container shape exactly — `--network none`,
+ * `--cap-drop=ALL`, `no-new-privileges`, `--read-only`, the Product media
+ * workspace at `/tmp/videofetch` in Production's `--mount type=bind` form, the
+ * harness scratch tmpfs with `TMPDIR`, the harness read-only, the report
+ * directory — with NO `--add-host` (it serves nothing: its media is generated
+ * in the container and handed to the merge primitive) and the identity flags.
+ */
+export function releaseSyncAcceptanceRunArgs({
+  imageId,
+  harnessDir,
+  reportDir,
+  mediaWorkspaceDir,
+  evidenceName,
+  sourceCommit,
+  sourceTree,
+  candidateTag,
+  containerReportDir = REPORT_MOUNT_TARGET,
+}) {
+  assertImmutableImageId(imageId);
+  requireAbsoluteHostPath("the harness directory", harnessDir);
+  requireAbsoluteHostPath("the report directory", reportDir);
+  const productMediaMount = productMediaWorkspaceMount(mediaWorkspaceDir);
+  if (hostPathsOverlap(mediaWorkspaceDir, reportDir)) {
+    throw new Error("the Product media workspace must not overlap the report directory");
+  }
+  if (hostPathsOverlap(mediaWorkspaceDir, harnessDir)) {
+    throw new Error("the Product media workspace must not overlap the harness directory");
+  }
+  if (typeof evidenceName !== "string" || !/^[A-Za-z0-9._-]+$/.test(evidenceName)) {
+    throw new Error("the evidence filename must be a plain basename");
+  }
+  for (const [label, value] of [["source commit", sourceCommit], ["source tree", sourceTree]]) {
+    if (typeof value !== "string" || !/^[0-9a-f]{40}$/.test(value)) {
+      throw new Error(`the release ${label} must be a full 40-hex SHA`);
+    }
+  }
+  assertCandidateReference(candidateTag);
+  return assertNoForbiddenMounts([
+    "run",
+    "--rm",
+    ...RELEASE_HARDENING_ARGS,
+    "--read-only",
+    "--mount",
+    productMediaMount,
+    "--tmpfs",
+    HARNESS_SCRATCH_TMPFS,
+    ...RELEASE_RUN_ENVIRONMENT.flatMap((entry) => ["-e", entry]),
+    "-v",
+    `${harnessDir}:${HARNESS_MOUNT_TARGET}:ro`,
+    "-v",
+    `${reportDir}:${containerReportDir}`,
+    "-w",
+    "/app",
+    "--entrypoint",
+    "/usr/local/bin/node",
+    imageId,
+    "--import",
+    "./scripts/register-ts-aliases.mjs",
+    "--experimental-strip-types",
+    SYNC01_ORCHESTRATOR,
+    "--evidence",
+    `${containerReportDir}/${evidenceName}`,
+    "--source-commit",
+    sourceCommit,
+    "--source-tree",
+    sourceTree,
+    "--source-context-clean",
+    "--candidate-tag",
+    candidateTag,
+    "--candidate-image-id",
+    imageId,
+    "--run-image-id",
+    imageId,
+  ]);
+}
+
+/**
  * The docker-run options the HLS-09 release child may carry, with whether each
  * takes a value. Anything else — `--privileged`, `--user`, `--env-file`,
  * `--env`, `--cap-add`, `--pull`, `-p`, … — is a violation by construction.
@@ -916,6 +1000,15 @@ export function releaseHls11RunPostureViolations(args, { reportDir, harnessDir, 
   return releaseChildRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }, RELEASE_HLS11_CHILD_MODEL);
 }
 
+/**
+ * The SYNC-01 release child's run posture (since SPLIT-07 `-07`): the DASH-01
+ * shape — no `--add-host` — with the SYNC-01 orchestrator exactly once and the
+ * child told the immutable id it runs as.
+ */
+export function releaseSyncRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }) {
+  return releaseChildRunPostureViolations(args, { reportDir, harnessDir, mediaWorkspaceDir }, RELEASE_SYNC_CHILD_MODEL);
+}
+
 const RELEASE_HLS_CHILD_MODEL = Object.freeze({
   addHost: HLS08_FIXTURE_HOST_MAPPING,
   orchestrator: HLS08_ORCHESTRATOR,
@@ -936,6 +1029,14 @@ const RELEASE_DASH_CHILD_MODEL = Object.freeze({
   addHost: null,
   orchestrator: DASH01_ORCHESTRATOR,
   orchestratorMessage: "the segmented-DASH orchestrator must run exactly once",
+  mode: null,
+  identityFlags: true,
+});
+
+const RELEASE_SYNC_CHILD_MODEL = Object.freeze({
+  addHost: null,
+  orchestrator: SYNC01_ORCHESTRATOR,
+  orchestratorMessage: "the split-merge timing orchestrator must run exactly once",
   mode: null,
   identityFlags: true,
 });

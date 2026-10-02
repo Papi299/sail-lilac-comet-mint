@@ -641,11 +641,11 @@ export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
    * PAIR, merged LOCALLY by the Worker's own FFmpeg after `beginProcessing()`
    * commits.
    *
-   * NOT REACHABLE YET. Nothing constructs a split preset source, so
-   * `deriveGenericExecutionPlan` can never produce this variant today. It
-   * exists so the representation, its invariants and its refusals can be
-   * reviewed before anything can build one — and so that every later task has
-   * exactly one shape to target.
+   * PRODUCT-REACHABLE since SPLIT-05: generic analysis builds split preset
+   * sources, so `deriveGenericExecutionPlan` produces this variant for an
+   * ordinary job, and Production executes it. It was introduced (SPLIT-01)
+   * before anything could build one, so its invariants and refusals were
+   * reviewed first; every later task targets exactly this one shape.
    *
    * `pair` carries TWO raw upstream identifiers. They are private to exactly
    * the same extent the single-source `source` is: never browser-facing, never
@@ -924,10 +924,11 @@ function buildGenericCandidate(
 /**
  * SPLIT-01: builds the candidate plan for a preset fulfilled by a PAIR.
  *
- * NOT REACHABLE YET — no analysis path produces a split preset source, so
- * nothing calls this today. It is written now so the refusals are reviewable
- * before anything can construct a pair, and so the later analysis task has one
- * fixed contract to satisfy rather than one to invent.
+ * PRODUCT-REACHABLE since SPLIT-05: generic analysis produces split preset
+ * sources, so an ordinary job calls this. It was written (SPLIT-01) before
+ * anything could construct a pair, so its refusals were reviewable first and
+ * the analysis task had one fixed contract to satisfy rather than one to
+ * invent.
  *
  * Every refusal below is a `FORMAT_UNAVAILABLE`, deliberately: a preset whose
  * pair cannot be honoured EXACTLY must fail, never be substituted with a

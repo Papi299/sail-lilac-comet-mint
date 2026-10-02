@@ -15,7 +15,10 @@ import {
   hasExactStreamShape,
   normalizeProbeFormatFamily,
   parseProbeDocument,
+  parseProbeStartTimeUs,
+  parseTimedProbeDocument,
   probeLocalMedia,
+  probeLocalMediaWithStartTime,
   resolveFfprobePath,
 } from "./ffprobe.server.ts";
 
@@ -825,5 +828,194 @@ describe("probe subprocess failure handling", () => {
       );
     }
     assert.equal(calls.length, 0, "a remote input must never reach a subprocess");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001 — the timed input probe.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("probed start time parsing (split merge timing)", () => {
+  it("parses the pinned %f form exactly into integer microseconds", () => {
+    const cases: ReadonlyArray<readonly [string, number]> = [
+      ["0.000000", 0],
+      ["0.000001", 1],
+      ["0.453991", 453_991],
+      ["0.400000", 400_000],
+      ["10.100000", 10_100_000],
+      ["-0.007000", -7_000],
+      ["-0.000001", -1],
+      ["-10.564000", -10_564_000],
+      ["1789000000.123456", 1_789_000_000_123_456], // a Unix-epoch-anchored tfdt
+      ["2147483647.999999", 2_147_483_647_999_999], // the last admitted value
+      ["-2147483647.999999", -2_147_483_647_999_999],
+    ];
+    for (const [text, expected] of cases) {
+      const value = parseProbeStartTimeUs(text);
+      assert.equal(value, expected, text);
+      assert.ok(Number.isSafeInteger(value), `${text} must be a safe integer`);
+    }
+  });
+
+  it("normalizes a negative zero to plain 0", () => {
+    assert.ok(Object.is(parseProbeStartTimeUs("-0.000000"), 0));
+  });
+
+  it("refuses every text outside the exact pinned form", () => {
+    const refused = [
+      "", " ", "N/A", "nan", "NaN", "-nan", "inf", "-inf", "Infinity",
+      "1e3", "1.0e-3", "1.000000e0", "1E6",
+      "+1.000000", " 1.000000", "1.000000 ", "1.000000\n", "\t0.000000",
+      "1", "1.", ".500000", "-.500000", "1.00000", "1.0000000", "1.5",
+      "01.000000", "00.000000", "-01.000000",
+      "1,000000", "1.000_000", "0x10.000000", "1.00000a", "1.000000abc",
+      "\u0661.000000", // a non-ASCII digit
+      "--1.000000", "1-.000000",
+      "12345678901.000000", // eleven integer digits
+      "2147483648.000000", // 2^31 seconds: out of bound
+      "-2147483648.000000",
+      "9999999999.999999",
+    ];
+    for (const text of refused) assert.equal(parseProbeStartTimeUs(text), null, JSON.stringify(text));
+  });
+
+  it("refuses every non-string value, never coercing a number or an object", () => {
+    for (const value of [0, 1.5, -7, Number.NaN, null, undefined, true, {}, [], ["0.000000"], 10n]) {
+      assert.equal(parseProbeStartTimeUs(value), null, String(value));
+    }
+  });
+});
+
+describe("timed probe argv and parse (split merge timing)", () => {
+  let workDir: string;
+  let file: string;
+
+  beforeEach(async () => {
+    workDir = await mkdtemp(join(tmpdir(), "vf-timed-"));
+    file = join(workDir, "v.mp4");
+    await writeFile(file, "x");
+  });
+
+  afterEach(async () => {
+    setProcessRunnerTestHooks(null);
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  const untimed = (family: "iso-bmff" | "webm" | "mpegts", demuxer: string, path: string) => [
+    "-v", "error", "-protocol_whitelist", "file", "-f", demuxer, "-print_format", "json",
+    "-show_entries", "format=format_name:stream=codec_type", "-i", path,
+  ];
+
+  it("leaves the default probe argv token-for-token unchanged for every family", () => {
+    for (const [family, demuxer] of [["iso-bmff", "mov"], ["webm", "matroska"], ["mpegts", "mpegts"]] as const) {
+      assert.deepEqual(buildProbeArgs({ family, inputPath: "/w/x" }), untimed(family, demuxer, "/w/x"));
+      assert.deepEqual(buildProbeArgs({ family, inputPath: "/w/x", startTime: false }), untimed(family, demuxer, "/w/x"));
+    }
+  });
+
+  it("adds exactly format.start_time, and nothing else, for the timed variant", () => {
+    const args = buildProbeArgs({ family: "iso-bmff", inputPath: "/w/v.mp4", startTime: true });
+    assert.deepEqual(args, [
+      "-v", "error", "-protocol_whitelist", "file", "-f", "mov", "-print_format", "json",
+      "-show_entries", "format=format_name,start_time:stream=codec_type", "-i", "/w/v.mp4",
+    ]);
+    const entries = args[args.indexOf("-show_entries") + 1];
+    for (const forbidden of ["tags", "title", "comment", "codec_name", "duration", "filename", "packet", "frame"]) {
+      assert.ok(!entries.includes(forbidden), `the timed probe must not request ${forbidden}`);
+    }
+  });
+
+  it("parses the pinned timed captures into shape plus integer-microsecond start", async () => {
+    const cases: ReadonlyArray<readonly [string, string, readonly string[], number]> = [
+      ["timed-iso-bmff-video-only", "iso-bmff", ["video"], 0],
+      ["timed-iso-bmff-video-only-late", "iso-bmff", ["video"], 400_000],
+      ["timed-iso-bmff-audio-only", "iso-bmff", ["audio"], 0],
+      ["timed-iso-bmff-audio-only-late", "iso-bmff", ["audio"], 453_991],
+      ["timed-webm-video-only", "webm", ["video"], 0],
+      ["timed-webm-audio-only-opus", "webm", ["audio"], -7_000],
+      ["timed-webm-audio-only-vorbis", "webm", ["audio"], 0],
+    ];
+    for (const [name, family, streams, start] of cases) {
+      const probe = parseTimedProbeDocument(await pinned(name));
+      assert.deepEqual(probe, { family, streams, startTimeUs: start }, name);
+      // The untimed parser accepts the same document and ignores the field.
+      assert.deepEqual(parseProbeDocument(await pinned(name)), { family, streams }, name);
+    }
+  });
+
+  it("refuses a timed document whose start time is missing, N/A or malformed", async () => {
+    const base = JSON.parse(await pinned("timed-iso-bmff-video-only")) as { format: Record<string, unknown> };
+    const variants: ReadonlyArray<readonly [string, unknown]> = [
+      ["missing", undefined],
+      ["N/A", "N/A"],
+      ["exponent", "1e3"],
+      ["number", 0],
+      ["null", null],
+      ["out of bound", "2147483648.000000"],
+      ["partial", "0.000000x"],
+    ];
+    for (const [label, value] of variants) {
+      const format = { ...base.format };
+      if (value === undefined) delete format.start_time;
+      else format.start_time = value;
+      const raw = JSON.stringify({ ...base, format });
+      await assertProcessingFailed(() => parseTimedProbeDocument(raw));
+      // Compatibility: the untimed parser never looks at the field.
+      assert.deepEqual(parseProbeDocument(raw), { family: "iso-bmff", streams: ["video"] }, label);
+    }
+  });
+
+  it("an untimed caller is unaffected by a missing or garbage start time (clear-HLS compatibility)", async () => {
+    for (const name of ["mpegts-muxed", "iso-bmff-merged", "webm-merged"]) {
+      const doc = JSON.parse(await pinned(name)) as { format: Record<string, unknown> };
+      assert.equal("start_time" in doc.format, false, `${name} is an untimed capture`);
+      parseProbeDocument(JSON.stringify(doc));
+      doc.format.start_time = "garbage";
+      parseProbeDocument(JSON.stringify(doc));
+    }
+  });
+
+  it("probeLocalMediaWithStartTime runs ONE bounded probe with the timed argv", async () => {
+    const { calls } = captureSpawn(async (child) => {
+      respond(child, await pinned("timed-iso-bmff-video-only-late"));
+    });
+    const probe = await probeLocalMediaWithStartTime({ inputPath: file, workDir, family: "iso-bmff", timeoutMs: 5_000 });
+    assert.deepEqual(probe, { family: "iso-bmff", streams: ["video"], startTimeUs: 400_000 });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.shell, false);
+    assert.equal(calls[0].command, resolveFfprobePath());
+    assert.equal(calls[0].args[calls[0].args.indexOf("-show_entries") + 1], "format=format_name,start_time:stream=codec_type");
+    assert.equal(calls[0].args[calls[0].args.indexOf("-protocol_whitelist") + 1], "file");
+  });
+
+  it("probeLocalMedia keeps the untimed argv and never fails on timing", async () => {
+    const { calls } = captureSpawn(async (child) => {
+      // Even a capture WITHOUT start_time is a valid untimed probe.
+      respond(child, await pinned("iso-bmff-video-only"));
+    });
+    assert.deepEqual(
+      await probeLocalMedia({ inputPath: file, workDir, family: "iso-bmff", timeoutMs: 5_000 }),
+      { family: "iso-bmff", streams: ["video"] },
+    );
+    assert.equal(calls[0].args[calls[0].args.indexOf("-show_entries") + 1], "format=format_name:stream=codec_type");
+  });
+
+  it("the timed probe fails closed, with the canonical code, when the start time is absent", async () => {
+    captureSpawn(async (child) => respond(child, await pinned("iso-bmff-video-only")));
+    await assertProcessingFailed(() =>
+      probeLocalMediaWithStartTime({ inputPath: file, workDir, family: "iso-bmff", timeoutMs: 5_000 }),
+    );
+  });
+
+  it("the timed probe keeps containment: a remote or escaping input never spawns", async () => {
+    const { calls } = captureSpawn(() => {});
+    const escape = join(workDir, "escape.mp4");
+    await symlink("/etc/hosts", escape);
+    for (const inputPath of ["http://example.com/v.mp4", "//cdn.example/v.mp4", escape]) {
+      await assertProcessingFailed(() =>
+        probeLocalMediaWithStartTime({ inputPath, workDir, family: "iso-bmff", timeoutMs: 5_000 }),
+      );
+    }
+    assert.equal(calls.length, 0);
   });
 });

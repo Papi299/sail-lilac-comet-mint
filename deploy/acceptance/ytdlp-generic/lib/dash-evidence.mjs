@@ -43,9 +43,19 @@ import { isFullGitSha } from "./split-provenance.mjs";
  *        EXECUTION-001 review corrections): two positive pairings — segmented
  *        video + segmented audio, and segmented video + progressive audio —
  *        and three bounded negatives, all executed by the candidate image's own
- *        source and media runtime.
+ *        source and media runtime. Historical: it hashed packet PAYLOADS only
+ *        and checked duration to ±0.25 s, so it could not see that the merge
+ *        erased the fixture's own 83.3 ms A/V offset.
+ *   -02  everything in -01, plus the synchronization oracle
+ *        (SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001): before any job the
+ *        harness measures each pairing's source relative A/V offset from packet
+ *        timestamps and requires it to be discriminating; after the merge the
+ *        delivered artifact must preserve it within the time-base tolerance,
+ *        shift each stream by one constant, hide and un-hide nothing, open with
+ *        no leading gap, keep each stream's span, and carry exactly the closed
+ *        synchronization policy the pre-job oracle derived.
  */
-export const DASH01_RELEASE_EVIDENCE_SCHEMA = "dash01-release-image-full-path-01";
+export const DASH01_RELEASE_EVIDENCE_SCHEMA = "dash01-release-image-full-path-02";
 
 /** The two positive pairings. Mirrors `DASH_CASES` in `fixtures/dash-media.mjs`. */
 export const DASH01_CASES = Object.freeze(["dash-dash", "dash-progressive"]);
@@ -69,6 +79,8 @@ export const DASH01_FIXTURE_CHECKS = Object.freeze([
   "fixture/audio-has-an-init-and-media-segments",
   "fixture/recipes-are-bit-exact",
   "fixture/service-binds-loopback-only",
+  "fixture/timing-oracle-established-before-the-job",
+  "fixture/both-pairings-carry-a-discriminating-av-offset",
 ]);
 
 /** Every check each positive case must record, un-prefixed. */
@@ -101,6 +113,7 @@ export const DASH01_CASE_CHECKS = Object.freeze([
   "input/audio-ffprobe-audio-only",
   "input/product-probed-both-inputs-before-the-merge",
   "merge/one-real-ffmpeg-stream-copy",
+  "merge/sync-policy-is-the-pre-job-decision",
   "merge/merge-split-media-returned-the-merged-artifact",
   "output/container-is-mp4",
   "output/exactly-one-video-stream",
@@ -111,6 +124,11 @@ export const DASH01_CASE_CHECKS = Object.freeze([
   "output/size-positive-and-within-the-limit",
   "output/stream-copy-packet-identity",
   "output/product-validated-the-output-after-the-merge",
+  "sync/relative-offset-preserved",
+  "sync/each-stream-shifted-by-one-constant",
+  "sync/no-media-hidden-or-unhidden",
+  "sync/no-leading-gap",
+  "sync/stream-spans-preserved",
   "lifecycle/durable-trace",
   "lifecycle/acquisition-only-while-downloading",
   "lifecycle/no-media-tool-while-downloading",

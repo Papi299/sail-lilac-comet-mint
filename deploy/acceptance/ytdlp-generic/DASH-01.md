@@ -35,7 +35,7 @@ real analysis → preset:1080 → fresh execution analysis → merge-split plan
   → real ffprobe of the merged output                 (durable: processing)
   → beginUploading() → local object writer → ready
 + three bounded negatives
-  → DASH-01 PASS (dash01-release-image-full-path-01)
+  → DASH-01 PASS (dash01-release-image-full-path-02)
 ```
 
 No yt-dlp, FFmpeg or ffprobe is faked, stubbed or replaced. The substitutions
@@ -83,7 +83,8 @@ For each pairing, measured, with every expectation stated before the observation
 | **Segmented acquisition happened** | The fixture ledger shows the init and every segment fetched exactly once, in order, each finished. The job directory was observed holding `.part-FragN.part`, `-FragN`, `.ytdl` and the `.part` aggregate during acquisition. |
 | **The raw artifact** | The acquired video is byte-for-byte `init + segments`, and the audio is byte-for-byte its fixture. At processing entry the directory holds exactly `audio-source.m4a` and `video-source.mp4`, with no `.part`, `.ytdl`, `-Frag…` or other entry. |
 | **Real input validation** | The image's ffprobe reads the acquired video as `mov,mp4,m4a,3gp,3g2,mj2`, one h264 stream at 1920×1080 and no audio. It reads the acquired audio as one aac stream and no video. The product itself probed video, then audio, before the merge. |
-| **Real merge** | Exactly one FFmpeg run: stream copy (`-c:v copy -c:a copy`, no encoder), `-n`. `mergeSplitMedia` returned `merged.mp4`. |
+| **Real merge** | Exactly one FFmpeg run: stream copy (`-c:v copy -c:a copy`, no encoder), `-n`. `mergeSplitMedia` returned `merged.mp4`. Since `-02`, its input options are exactly the closed synchronization policy the pre-job oracle derived, and it carries no forbidden timestamp flag (`merge/sync-policy-is-the-pre-job-decision`). |
+| **Synchronization** (since `-02`) | Before any job the harness probes each pairing's fixture halves (packet `pts`/`dts`/`duration`, discard flag, payload SHA-256). It requires the source's relative A/V offset to be larger than the rounding tolerance. It is: the fragmented muxer leaves x264's B-frame composition delay in the video's first presented PTS (measured 83,333 µs, two frames at 24 fps) while both audio fixtures start at 0, so the expected policy syncs the video to the audio (`-isync 1` on input 0). After `ready`, the delivered object must keep that offset within one tick of each output time base plus one movie-timescale tick, shift each stream by one constant, hide and un-hide nothing, open with no leading gap, and keep each stream's span. |
 | **Real output** | ffprobe of the delivered object: ISO-BMFF, exactly one video and one audio stream, 1920×1080, 2 s ± 0.25 s, size within `MAX_FILE_SIZE`. Compressed-packet identity with the acquired inputs, so it is a copy and not a transcode. The product probed the output after the merge. |
 | **Lifecycle** | Durable trace `queued → analyzing → downloading → processing → uploading → ready`. The durable status is read at the instant of **every** Worker subprocess spawn: yt-dlp acquisition and the runtime probe at `downloading`; the 3 ffprobes and 1 FFmpeg at `processing`; no FFmpeg or ffprobe while `downloading`. A `/proc` sampler corroborates. `downloadedBytes` rises monotonically and never past the real artifacts, and progress ends at 100. |
 | **Workspace** | Acquisition peak ≤ the allowance and ≤ artifacts + one fragment. Processing peak ≤ inputs + output ≤ 2 × `MAX_FILE_SIZE`. |
@@ -121,7 +122,12 @@ flight, bounded as the runbook §4k workspace paragraph states.
 
 ## The evidence
 
-**Schema: `dash01-release-image-full-path-01`** (`lib/dash-evidence.mjs`).
+**Schema: `dash01-release-image-full-path-02`** (`lib/dash-evidence.mjs`).
+
+`-01` is historical. A `-01` PASS hashed packet payloads and checked duration to
+±0.25 s, so it could not see that the merge it accepted erased the fixture's
+own 83.3 ms A/V offset. `-02` adds the synchronization oracle (above). `-01`
+records are never rewritten, and never re-read under `-02` rules.
 
 - **Identity** is the release identity the SPLIT-07 parent observed, exactly as
   HLS-09 records it: source commit and tree (clean), candidate build label,
@@ -129,8 +135,9 @@ flight, bounded as the runbook §4k workspace paragraph states.
   interfaces.
 - **A PASS requires every one of `DASH01_MANDATORY_CHECKS` present exactly once
   and passing**, and no other check failing. The list covers the identity,
-  preflight, fixture, all 54 case checks for **both** pairings, and the 13 negative
-  checks: 142 in all. Removing an assertion from the orchestrator therefore
+  preflight, fixture (including the two pre-job timing checks), all 60 case
+  checks for **both** pairings (including the merge-policy check and the five
+  synchronization checks), and the 13 negative checks: 156 in all (`-01`: 142). Removing an assertion from the orchestrator therefore
   cannot produce a PASS. The builder refuses, and the parent's validator refuses
   independently.
 - **Privacy.** The record is an allowlist. No key named `argv`, `stderr` or any
@@ -180,6 +187,12 @@ image:
 The unmutated control, run the same way, PASSed 142 of 142, and the parent
 validator accepts it.
 
+The `-02` synchronization oracle has its own mutation controls, recorded with
+SYNC-01's for `SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001` in
+[`SYNC-01.md`](SYNC-01.md#mutation-controls). The exact current Production
+merge argv fails DASH-01 `-02` on the merge-policy check and on the 83.3 ms
+offset in both pairings.
+
 ## Files
 
 | File | Runs on | Purpose |
@@ -187,7 +200,8 @@ validator accepts it.
 | `dash-full-path.mjs` | inside the candidate | The orchestrator (release-image mode only). |
 | `lib/dash-argv.mjs` | — | Its command line: exactly the parent's identity flags. |
 | `lib/dash-evidence.mjs` | — | Schema, mandatory checks, PASS and privacy gates, the parent-side validator. |
-| `lib/dash-observers.mjs` | — | Spawn observer, workspace sampler (independent FragmentFD grammar), downloader identity, yt-dlp runner ledger. |
+| `lib/dash-observers.mjs` | — | Spawn observer (including the closed description of each merge's synchronization options), workspace sampler (independent FragmentFD grammar), downloader identity, yt-dlp runner ledger. |
+| `lib/merge-timing.mjs` | — | The pre-job packet-timestamp oracle, its verdicts and the expected synchronization policy. Shared with SPLIT-06 and SYNC-01. |
 | `fixtures/dash-media.mjs` | — | Recipes, the fragmented-MP4 splitter, the closed route grammar, the MPDs. |
 | `fixtures/dash-server.mjs` | inside the candidate, loopback only | The closed-route fixture service, with a sanitized ledger and pace/hold/failing behaviours. |
 | `scripts/ytdlp-dash-acceptance.test.mjs` | `npm test` | The pure parts, pinned without Docker, FFmpeg or yt-dlp. |

@@ -105,6 +105,12 @@ import {
   renderSplitEvidence,
 } from "./lib/split-evidence.mjs";
 import { isFullGitSha } from "./lib/split-provenance.mjs";
+import {
+  evaluateMergeTiming,
+  mp4MovieTimescale,
+  pairSourceTiming,
+  probePacketTimeline,
+} from "./lib/merge-timing.mjs";
 
 // ── Bounds ─────────────────────────────────────────────────────────────────
 
@@ -117,6 +123,46 @@ const MEDIA_ROUTE = Object.freeze({
   mp4: { video: "/split-video.mp4", audio: "/split-audio.m4a" },
   webm: { video: "/split-video.webm", audio: "/split-audio.webm" },
 });
+
+/**
+ * SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001 (-05): the OFFSET pair — the
+ * same video half beside an audio half whose container timeline starts
+ * `SPLIT_OFFSET_AUDIO_START_SECONDS` later — driven from its own manifest.
+ */
+const OFFSET_MANIFEST_ROUTE = Object.freeze({ mp4: "/split-mp4-offset.mpd", webm: "/split-webm-offset.mpd" });
+const OFFSET_AUDIO_ROUTE = Object.freeze({ mp4: "/split-audio-offset.m4a", webm: "/split-audio-offset.webm" });
+
+/**
+ * The two full-path pairs. The CONTROL is the historical zero-aligned pair,
+ * unchanged, with unprefixed check names; the OFFSET pair runs the identical
+ * full path with every check name under `offset/`.
+ */
+function fullPathPair(family, kind) {
+  if (kind === "control") {
+    return Object.freeze({
+      kind, prefix: "", manifestRoute: MANIFEST_ROUTE[family], audioKey: `${family}:audio`,
+      audioRoute: MEDIA_ROUTE[family].audio,
+    });
+  }
+  if (kind === "offset") {
+    return Object.freeze({
+      kind, prefix: "offset/", manifestRoute: OFFSET_MANIFEST_ROUTE[family], audioKey: `${family}:audio-offset`,
+      audioRoute: OFFSET_AUDIO_ROUTE[family],
+    });
+  }
+  throw new Error(`unknown full-path pair ${String(kind)}`);
+}
+
+/** A view of the ledger that records every name under `prefix`. */
+function prefixedChecks(checks, prefix) {
+  return {
+    record: (name, ok, detail) => checks.record(`${prefix}${name}`, ok, detail),
+    require: (name, ok, detail) => checks.require(`${prefix}${name}`, ok, detail),
+    all: () => checks.all(),
+    failed: () => checks.failed(),
+    passed: () => checks.passed(),
+  };
+}
 
 /** The expected upstream resolution rung for the fixture's 360-line video. */
 const EXPECTED_RUNG = "preset:360";
@@ -390,6 +436,8 @@ async function startFixtureService(artifacts, { ranges = false } = {}) {
     "/split-mp4.mpd": Buffer.from(splitManifest("mp4"), "utf8"),
     "/split-webm.mpd": Buffer.from(splitManifest("webm"), "utf8"),
     "/split-incompatible.mpd": Buffer.from(splitIncompatibleManifest(), "utf8"),
+    "/split-mp4-offset.mpd": Buffer.from(splitManifest("mp4", { offset: true }), "utf8"),
+    "/split-webm-offset.mpd": Buffer.from(splitManifest("webm", { offset: true }), "utf8"),
   };
   const media = {};
   for (const artifact of Object.values(artifacts)) {
@@ -465,13 +513,43 @@ function createAnalysisPolicy({ validateUrl, ledger, limits, ffmpegAvailableFn }
  * Reads top to bottom in the order the product executes, and every expectation
  * is stated before the observation it is compared against.
  */
-async function runFullPath(ctx) {
+async function runFullPath(ctx, pair = fullPathPair(ctx.family, "control")) {
   const {
-    checks, family, fixtures, service, port, toolchain, limits, workRoot,
+    family, fixtures, service, port, toolchain, limits, workRoot,
   } = ctx;
+  const checks = pair.prefix ? prefixedChecks(ctx.checks, pair.prefix) : ctx.checks;
+  // This job's own fixture requests only: the service is shared by every case.
+  const requestsBefore = service.splitRequests().length;
+
+  // ── the TIMING oracle, established BEFORE the job (-05) ─────────────────
+  //
+  // SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001. The harness's own
+  // packet-level reading of the two fixture halves — the bytes acquisition must
+  // reproduce exactly (checked below) — fixes the pair's source relative A/V
+  // offset before the product runs. The delivered artifact is held to it.
+  const timingDemuxer = FFPROBE_DEMUXER[fixtures[`${family}:video`].probeFamily];
+  const sourceTimelines = {
+    video: await probePacketTimeline(runTool, toolchain.ffprobePath, timingDemuxer, fixtures[`${family}:video`].path),
+    audio: await probePacketTimeline(runTool, toolchain.ffprobePath, timingDemuxer, fixtures[pair.audioKey].path),
+  };
+  const sourceTiming = pairSourceTiming(sourceTimelines.video, sourceTimelines.audio);
+  checks.require(
+    "sync/source-timing-established-before-the-job",
+    sourceTiming.measurable === true,
+    `audio-video ${sourceTiming.relativeUs}us`,
+  );
+  if (pair.kind === "offset") {
+    // The offset pair must be able to tell a timestamp-preserving merge from
+    // one that zeroes each input: audio later than video, beyond rounding.
+    checks.require(
+      "sync/offset-pair-carries-a-discriminating-av-offset",
+      sourceTiming.discriminating === true && sourceTiming.relativeUs > 0,
+      `audio-video ${sourceTiming.relativeUs}us`,
+    );
+  }
 
   const validateUrl = createExactFixtureUrlValidator({ port, routes: ctx.routes });
-  const manifestUrl = validateUrl.urlFor(MANIFEST_ROUTE[family]);
+  const manifestUrl = validateUrl.urlFor(pair.manifestRoute);
 
   // ── the exact-fixture validator's own policy (§22/§23) ──────────────────
   //
@@ -889,13 +967,13 @@ async function runFullPath(ctx) {
   );
 
   // ── fixture request accounting (§48) ─────────────────────────────────────
-  const requests = service.splitRequests();
+  const requests = service.splitRequests().slice(requestsBefore);
   const getsOf = (route) =>
     requests.filter((r) => r.route === route && r.method === "GET").length;
   checks.require(
     "fixture/manifest-was-read",
-    getsOf(MANIFEST_ROUTE[family]) >= 1,
-    String(getsOf(MANIFEST_ROUTE[family])),
+    getsOf(pair.manifestRoute) >= 1,
+    String(getsOf(pair.manifestRoute)),
   );
   checks.require(
     "fixture/video-route-was-acquired",
@@ -904,14 +982,14 @@ async function runFullPath(ctx) {
   );
   checks.require(
     "fixture/audio-route-was-acquired",
-    getsOf(MEDIA_ROUTE[family].audio) === 1,
-    String(getsOf(MEDIA_ROUTE[family].audio)),
+    getsOf(pair.audioRoute) === 1,
+    String(getsOf(pair.audioRoute)),
   );
   const unexpectedMedia = requests.filter(
     (r) =>
-      r.route !== MANIFEST_ROUTE[family] &&
+      r.route !== pair.manifestRoute &&
       r.route !== MEDIA_ROUTE[family].video &&
-      r.route !== MEDIA_ROUTE[family].audio,
+      r.route !== pair.audioRoute,
   );
   checks.require(
     "fixture/no-unexpected-route-was-requested",
@@ -921,7 +999,7 @@ async function runFullPath(ctx) {
 
   // ── acquired bytes match the pre-run fixtures ────────────────────────────
   const videoFixture = fixtures[`${family}:video`];
-  const audioFixture = fixtures[`${family}:audio`];
+  const audioFixture = fixtures[pair.audioKey];
   checks.require(
     "acquisition/video-bytes-equal-the-fixture",
     observed.acquiredVideoBytes === videoFixture.byteLength,
@@ -1052,11 +1130,45 @@ async function runFullPath(ctx) {
     outputProbe.streams.length === 2,
     String(outputProbe.streams.length),
   );
+
+  // ── synchronization: the delivered artifact against the PRE-JOB oracle ───
+  //
+  // Recorded rather than required, so every timing property is measured and
+  // reported even when one fails; a PASS still needs all of them. Measured
+  // BEFORE the duration and packet-identity requirements below, so a merge that
+  // erased the offset is reported by the oracle itself, not only by the
+  // duration it shortened.
+  const timing = evaluateMergeTiming({
+    videoInput: sourceTimelines.video,
+    audioInput: sourceTimelines.audio,
+    output: await probePacketTimeline(runTool, toolchain.ffprobePath, timingDemuxer, object.path),
+    movieTimescale: family === "mp4" ? mp4MovieTimescale(await readFile(object.path)) : null,
+  });
+  checks.record(
+    "sync/relative-offset-preserved",
+    timing.measurable === true && timing.relativeTimingPreserved,
+    `source ${timing.sourceRelativeUs}us -> output ${timing.outputRelativeUs}us; ` +
+      `shift delta ${timing.packetShiftDeltaUs}us; tolerance ${timing.toleranceUs}us`,
+  );
+  checks.record("sync/each-stream-shifted-by-one-constant", timing.measurable === true && timing.shiftsConstant);
+  checks.record(
+    "sync/no-media-hidden-or-unhidden",
+    timing.measurable === true && timing.noMediaHiddenOrUnhidden,
+    JSON.stringify(timing.packets ?? null),
+  );
+  checks.record("sync/no-leading-gap", timing.measurable === true && timing.noLeadingGap, `${timing.outputEarliestPresentedUs}us`);
+  checks.record("sync/stream-spans-preserved", timing.measurable === true && timing.streamSpansPreserved);
+
+  // The control pair is held to the recipe's 2 s, exactly as before -05. The
+  // OFFSET pair, merged with its timing preserved, presents the audio half's
+  // later span too, so it is held to the span the PRE-JOB oracle measured.
+  const expectedDurationSeconds =
+    pair.kind === "offset" ? sourceTiming.spanUs / 1_000_000 : videoFixture.durationSeconds;
   checks.require(
     "output/duration-matches-the-fixtures",
     outputProbe.duration !== null &&
-      Math.abs(outputProbe.duration - videoFixture.durationSeconds) <= DURATION_TOLERANCE_SECONDS,
-    `${outputProbe.duration}s vs ${videoFixture.durationSeconds}s`,
+      Math.abs(outputProbe.duration - expectedDurationSeconds) <= DURATION_TOLERANCE_SECONDS,
+    `${outputProbe.duration}s vs ${expectedDurationSeconds}s`,
   );
 
   // Compressed packet identity: the merged streams ARE the source streams.
@@ -1100,7 +1212,22 @@ async function runFullPath(ctx) {
 
   return {
     jobId,
-    manifestRoute: MANIFEST_ROUTE[family],
+    pair: pair.kind,
+    manifestRoute: pair.manifestRoute,
+    timing: timing.measurable
+      ? {
+          oracle: "harness ffprobe packet timestamps of the fixture halves, measured before the job",
+          sourceRelativeUs: timing.sourceRelativeUs,
+          outputRelativeUs: timing.outputRelativeUs,
+          relativeDeltaUs: timing.relativeDeltaUs,
+          videoShiftUs: timing.videoShiftUs,
+          audioShiftUs: timing.audioShiftUs,
+          packetShiftDeltaUs: timing.packetShiftDeltaUs,
+          toleranceUs: timing.toleranceUs,
+          outputEarliestPresentedUs: timing.outputEarliestPresentedUs,
+          packets: timing.packets,
+        }
+      : null,
     statusTrace,
     trace,
     observed,
@@ -1708,6 +1835,7 @@ async function main(argv) {
   let service = null;
   let verdict = "BLOCKED";
   let full = null;
+  let offsetFull = null;
   let incompatible = null;
   let noFfmpeg = null;
   let maxFilesize = null;
@@ -1788,6 +1916,7 @@ async function main(argv) {
     };
     const routes = [
       ...Object.values(MANIFEST_ROUTE),
+      ...Object.values(OFFSET_MANIFEST_ROUTE),
       INCOMPATIBLE_ROUTE,
       ...Object.values(SPLIT_FIXTURE_ARTIFACTS).map((a) => `/${a.basename}`),
     ];
@@ -1795,7 +1924,9 @@ async function main(argv) {
       checks, family: opts.family, fixtures, service, port, toolchain, limits, workRoot, routes,
     };
 
-    full = await runFullPath(ctx);
+    full = await runFullPath(ctx, fullPathPair(opts.family, "control"));
+    // -05: the identical full path on the OFFSET pair (checks under `offset/`).
+    offsetFull = await runFullPath(ctx, fullPathPair(opts.family, "offset"));
     incompatible = await runIncompatibleCase(ctx);
     noFfmpeg = await runNoFfmpegCase(ctx);
     maxFilesize = await acceptMaxFilesizeRefusal(ctx);
@@ -1906,6 +2037,26 @@ async function main(argv) {
     negativeCases: { incompatiblePair: incompatible, ffmpegUnavailableAtAnalysis: noFfmpeg },
     maxFilesizeRefusal: maxFilesize,
     maxFilesizeChunkedRefusal: maxFilesizeChunked,
+    // -05: the pre-job timing oracle's verdict on both full-path pairs.
+    synchronization: {
+      oracle: "harness ffprobe packet timestamps (pts, discard flag, payload SHA-256) of each input " +
+        "fixture before the job and of the delivered artifact after it",
+      control: full?.timing ?? null,
+      offset: offsetFull?.timing ?? null,
+    },
+    offsetFullPath: offsetFull
+      ? {
+          statusTrace: offsetFull.statusTrace,
+          mergedBytes: offsetFull.observed.mergedSize,
+          outputDurationSeconds: offsetFull.outputProbe.duration,
+          outputStreams: offsetFull.outputProbe.streams,
+          videoPacketCount: offsetFull.packets.outputVideo.packetCount,
+          audioPacketCount: offsetFull.packets.outputAudio.packetCount,
+          packetIdentityWithTheFixtures:
+            offsetFull.packets.outputVideo.digest === offsetFull.packets.sourceVideo.digest &&
+            offsetFull.packets.outputAudio.digest === offsetFull.packets.sourceAudio.digest,
+        }
+      : null,
     ffmpegOverwriteRefusal: overwrite,
     checks: checks.all(),
   });

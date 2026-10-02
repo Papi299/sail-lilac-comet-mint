@@ -96,6 +96,14 @@ import {
 } from "./lib/dash-observers.mjs";
 import { releaseIdentityChecks } from "./lib/hls-release-evidence.mjs";
 import {
+  evaluateMergeTiming,
+  expectedMergeSync,
+  mergeSyncMatches,
+  mp4MovieTimescale,
+  pairSourceTiming,
+  probePacketTimeline,
+} from "./lib/merge-timing.mjs";
+import {
   DASH01_RELEASE_EVIDENCE_SCHEMA,
   buildDashReleaseEvidence,
   findDashForbiddenSubstring,
@@ -306,6 +314,41 @@ async function prepareFixture(checks, runTool, toolchain, workRoot) {
     );
   }
 
+  // ── The TIMING oracle, established BEFORE any job ────────────────────────
+  //
+  // SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001. The harness's own
+  // packet-level reading of each fixture file — the exact bytes a correct
+  // acquisition reproduces (checked per case) — fixes what correct timing means
+  // before the product is run: each pairing's source relative A/V offset, and
+  // the closed synchronization policy a correct merge must therefore carry.
+  // The fragmented video is H.264 with B-frames and no edit list, so its first
+  // presented frame is its composition delay after its audio — the very offset
+  // a per-input-zeroing merge erases.
+  const timelines = {
+    video: await probePacketTimeline(runTool, toolchain.ffprobePath, "mov", fixtures.video.path),
+    audio: await probePacketTimeline(runTool, toolchain.ffprobePath, "mov", fixtures.audio.path),
+    progressiveAudio: await probePacketTimeline(runTool, toolchain.ffprobePath, "mov", fixtures.progressiveAudio.path),
+  };
+  const sourceTiming = {
+    "dash-dash": pairSourceTiming(timelines.video, timelines.audio),
+    "dash-progressive": pairSourceTiming(timelines.video, timelines.progressiveAudio),
+  };
+  const expectedSync = {
+    "dash-dash": expectedMergeSync({ target: "mp4", videoInput: timelines.video, audioInput: timelines.audio }),
+    "dash-progressive": expectedMergeSync({ target: "mp4", videoInput: timelines.video, audioInput: timelines.progressiveAudio }),
+  };
+  checks.require(
+    "fixture/timing-oracle-established-before-the-job",
+    Object.values(sourceTiming).every((t) => t.measurable) &&
+      timelines.video.streamCount === 1 && timelines.audio.streamCount === 1 && timelines.progressiveAudio.streamCount === 1,
+    Object.entries(sourceTiming).map(([k, t]) => `${k}: ${t.relativeUs}us`).join("; "),
+  );
+  checks.require(
+    "fixture/both-pairings-carry-a-discriminating-av-offset",
+    Object.values(sourceTiming).every((t) => t.discriminating && t.relativeUs < 0),
+    Object.entries(sourceTiming).map(([k, t]) => `${k}: audio-video ${t.relativeUs}us`).join("; "),
+  );
+
   // Determinism, measured: the fragmented video recipe again, byte-identical.
   const again = join(outDir, "regenerated-video.mp4");
   const regen = await runTool(toolchain.ffmpegPath, dashFfmpegArgs("video-fragmented", again));
@@ -315,7 +358,20 @@ async function prepareFixture(checks, runTool, toolchain, workRoot) {
 
   return {
     fixtures,
+    timelines,
+    expectedSync,
     summary: {
+      timing: {
+        oracle: "harness ffprobe packet timestamps of the fixture files, measured before any job",
+        videoFirstPresentedUs: sourceTiming["dash-dash"].videoFirstPresentedUs,
+        segmentedAudioFirstPresentedUs: sourceTiming["dash-dash"].audioFirstPresentedUs,
+        progressiveAudioFirstPresentedUs: sourceTiming["dash-progressive"].audioFirstPresentedUs,
+        sourceRelativeUs: {
+          "dash-dash": sourceTiming["dash-dash"].relativeUs,
+          "dash-progressive": sourceTiming["dash-progressive"].relativeUs,
+        },
+        expectedSync,
+      },
       video: {
         width: video.streams[0]?.width ?? null,
         height: video.streams[0]?.height ?? null,
@@ -756,6 +812,16 @@ async function runPositiveCase(ctx, caseName) {
       sig[2] === "ffmpeg:audio-source.m4a+merged.mp4+video-source.mp4",
     sig[2] ?? "no ffmpeg",
   );
+  // SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001: the merge carried exactly
+  // the closed synchronization policy the PRE-JOB oracle derived for this pair.
+  // Recorded rather than required, so a wrong policy still lets the job reach
+  // `ready` and the timing oracle below MEASURES what it did to the media; a
+  // PASS still requires this check (it is mandatory).
+  checks.record(
+    C("merge/sync-policy-is-the-pre-job-decision"),
+    ffmpegRuns.length === 1 && mergeSyncMatches(ffmpegRuns[0].sync, ctx.expectedSync[caseName]),
+    JSON.stringify(ffmpegRuns[0]?.sync ?? null),
+  );
   checks.require(
     C("merge/merge-split-media-returned-the-merged-artifact"),
     observed.mergeReturned === true && observed.mergedName === `merged.${DASH_TARGET_CONTAINER}`,
@@ -895,10 +961,46 @@ async function runPositiveCase(ctx, caseName) {
     `${outVideoPackets.packetCount} video + ${outAudioPackets.packetCount} audio packets`,
   );
 
+  // ── synchronization: the delivered artifact against the PRE-JOB oracle ───
+  const audioTimeline = caseName === "dash-dash" ? ctx.timelines.audio : ctx.timelines.progressiveAudio;
+  const timing = evaluateMergeTiming({
+    videoInput: ctx.timelines.video,
+    audioInput: audioTimeline,
+    output: await probePacketTimeline(runTool, toolchain.ffprobePath, "mov", object.path),
+    movieTimescale: mp4MovieTimescale(await readFile(object.path)),
+  });
+  const timingDetail =
+    `source ${timing.sourceRelativeUs}us -> output ${timing.outputRelativeUs}us; ` +
+    `shift delta ${timing.packetShiftDeltaUs}us; tolerance ${timing.toleranceUs}us`;
+  checks.record(C("sync/relative-offset-preserved"), timing.measurable === true && timing.relativeTimingPreserved, timingDetail);
+  checks.record(C("sync/each-stream-shifted-by-one-constant"), timing.measurable === true && timing.shiftsConstant);
+  checks.record(
+    C("sync/no-media-hidden-or-unhidden"),
+    timing.measurable === true && timing.noMediaHiddenOrUnhidden,
+    JSON.stringify(timing.packets ?? null),
+  );
+  checks.record(C("sync/no-leading-gap"), timing.measurable === true && timing.noLeadingGap, `${timing.outputEarliestPresentedUs}us`);
+  checks.record(C("sync/stream-spans-preserved"), timing.measurable === true && timing.streamSpansPreserved);
+
   checks.require(C("cleanup/job-workdir-removed"), job.workDirGone);
 
   return {
     requestedPreset: DASH_REQUESTED_PRESET,
+    timing: timing.measurable
+      ? {
+          sourceRelativeUs: timing.sourceRelativeUs,
+          outputRelativeUs: timing.outputRelativeUs,
+          relativeDeltaUs: timing.relativeDeltaUs,
+          videoShiftUs: timing.videoShiftUs,
+          audioShiftUs: timing.audioShiftUs,
+          packetShiftDeltaUs: timing.packetShiftDeltaUs,
+          toleranceUs: timing.toleranceUs,
+          outputEarliestPresentedUs: timing.outputEarliestPresentedUs,
+          packets: timing.packets,
+          observedSync: ffmpegRuns[0]?.sync ?? null,
+          expectedSync: ctx.expectedSync[caseName],
+        }
+      : null,
     analysis: {
       presetIds: meta.presets.map((p) => p.id),
       preset1080: { resolution: preset.resolution, container: preset.container, hasVideo: preset.hasVideo, hasAudio: preset.hasAudio },
@@ -1176,6 +1278,8 @@ async function main(argv) {
 
     const ctx = {
       checks, service, validateUrl, fixtures, toolchain, workRoot, runTool, spawnObserver, spawnContext,
+      timelines: prepared.timelines,
+      expectedSync: prepared.expectedSync,
       analysisLimits: {
         analysisTimeoutSeconds: Math.max(1, Math.floor(config.analysisTimeoutMs / 1000)),
         maxVideoDurationSeconds: config.maxVideoDuration,

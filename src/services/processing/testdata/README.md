@@ -1,6 +1,8 @@
-# Pinned ffprobe output (SPLIT-02, HLS-4)
+# Pinned ffprobe output (SPLIT-02, HLS-4, split-merge timing)
 
-These nine documents are **verbatim ffprobe stdout**, not invented fixtures.
+These sixteen documents are **verbatim ffprobe stdout**, not invented fixtures.
+The two `pinned-matroska-header-*.bin` files are verbatim FFmpeg-written bytes
+(see [Timed captures](#timed-captures-and-matroska-header-prefixes-split-merge-timing)).
 
 The six `iso-bmff-*` and `webm-*` documents were captured for SPLIT-02:
 
@@ -100,13 +102,80 @@ initialization segment exits 1 (`trun track id unknown, no tfhd was found`,
 `error reading header`) — so an acquisition that skipped the map could not be
 mistaken for a valid input.
 
+## Timed captures and Matroska header prefixes (split-merge timing)
+
+`SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001` gives the split merge's two
+INPUT probes one more entry, `format.start_time`, through the timed variant of
+`buildProbeArgs()` (`probeLocalMediaWithStartTime`). Every other caller keeps
+the untimed command above, unchanged. Seven `pinned-ffprobe-timed-*` documents
+pin what the pinned ffprobe prints for it:
+
+| Document | Input | `start_time` |
+| --- | --- | --- |
+| `pinned-ffprobe-timed-iso-bmff-video-only.json` | H.264 MP4, zero-aligned | `0.000000` |
+| `pinned-ffprobe-timed-iso-bmff-video-only-late.json` | the same, `-output_ts_offset 0.4` | `0.400000` |
+| `pinned-ffprobe-timed-iso-bmff-audio-only.json` | AAC m4a, zero-aligned (priming hidden by its edit list) | `0.000000` |
+| `pinned-ffprobe-timed-iso-bmff-audio-only-late.json` | the same, `-output_ts_offset 0.478` | `0.453991` |
+| `pinned-ffprobe-timed-webm-video-only.json` | VP9 WebM, zero-aligned | `0.000000` |
+| `pinned-ffprobe-timed-webm-audio-only-opus.json` | Opus WebM, zero-aligned | `-0.007000` |
+| `pinned-ffprobe-timed-webm-audio-only-vorbis.json` | Vorbis WebM, zero-aligned | `0.000000` |
+
+They pin three facts the parser relies on: the value is `%f` text with exactly
+six decimals; an AAC half's reported start is not the offset it was written
+with (0.478 s requested, `0.453991` reported), so nothing may assume round
+values; and an Opus WebM half reports a NEGATIVE start, `-0.007000`, for a
+`CodecDelay` of 6.5 ms.
+
+The two header prefixes are every byte of an FFmpeg-written WebM audio file
+before its first Cluster's data (the Cluster header itself is kept):
+`pinned-matroska-header-opus-audio.bin` (499 B; `CodecDelay` 6,500,000 ns) and
+`pinned-matroska-header-vorbis-audio.bin` (3,762 B; no `CodecDelay`). They are
+the real inputs of the bounded `CodecDelay` reader
+(`matroska-codec-delay.server.ts`) in its tests and in the split-execution
+tests.
+
+| Provenance | Value |
+| --- | --- |
+| Image | `vf-hls2-fixture-tool:local` (a local tooling image, not a Worker image) |
+| Image id | `sha256:2af23cbd8ede584ce19ec64dabdb46126b9b5b1f5886816382fee8bb667ae447` (arm64) |
+| ffprobe | `ffprobe version 5.1.9-0+deb12u1` — the SAME Debian Bookworm package (`ffmpeg 7:5.1.9-0+deb12u1`, `libavformat59 7:5.1.9-0+deb12u1`) the Worker image installs |
+| Capture | `docker run --rm --network none`, synthetic lavfi media only |
+
+As with the HLS-4 row, the image is provenance and the pinned FFmpeg build is
+the thing under test. As a control, the same run re-captured
+`pinned-ffprobe-iso-bmff-video-only.json` through the UNTIMED command, and the
+result was byte-identical to the committed file.
+
+The timed command:
+
+```
+/usr/bin/ffprobe -v error -protocol_whitelist file -f <mov|matroska> \
+  -print_format json -show_entries format=format_name,start_time:stream=codec_type -i <file>
+```
+
+The inputs (`F` = `ffmpeg -hide_banner -nostdin -v error -y -fflags +bitexact`;
+`V` = `-f lavfi -i testsrc=duration=2:size=320x180:rate=15`;
+`A` = `-f lavfi -i sine=frequency=440:duration=2`):
+
+```
+F V -c:v libx264 -pix_fmt yuv420p -flags:v +bitexact -map_metadata -1 [-output_ts_offset 0.4] -movflags +faststart -f mp4 …
+F A -c:a aac -ac 1 -flags:a +bitexact -map_metadata -1 [-output_ts_offset 0.478] -movflags +faststart -f ipod …
+F V -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -threads 1 -pix_fmt yuv420p -flags:v +bitexact -map_metadata -1 -f webm …
+F A -ar 48000 -c:a libopus -ac 1 -flags:a +bitexact -map_metadata -1 -f webm …
+F A -ar 48000 -c:a libvorbis -ac 1 -flags:a +bitexact -map_metadata -1 -f webm …
+```
+
 ## Sanitization
 
 Nothing was removed. The capture used `-show_entries` limited to
-`format=format_name` and `stream=codec_type`, so the documents never contained a
-filename, a path, a URL, a tag, a title, a codec name or a duration in the first
-place. The synthetic inputs were `testsrc` and `sine` generated inside the
-offline container.
+`format=format_name` (plus `format=start_time` for the timed documents) and
+`stream=codec_type`, so the documents never contained a filename, a path, a
+URL, a tag, a title, a codec name or a duration in the first place. The
+synthetic inputs were `testsrc` and `sine` generated inside the offline
+container. The two header prefixes contain only what FFmpeg itself writes into
+a synthetic file's header: the muxer and encoder names (`Lavf59.27.100`,
+`Lavc libopus`, the libVorbis vendor string), the codec private data and a
+`DURATION` tag.
 
 ## Regenerating
 

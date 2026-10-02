@@ -236,7 +236,11 @@ function hookSubprocesses(h: Harness, jobId: string) {
         } else {
           const base = path.basename(last);
           const kinds = base.startsWith("video-source") ? ["video"] : base.startsWith("audio-source") ? ["audio"] : ["video", "audio"];
-          child.stdout.write(JSON.stringify({ programs: [], streams: kinds.map((codec_type) => ({ codec_type })), format: { format_name: ISO } }));
+          // Like the real ffprobe, `start_time` is printed only when the argv
+          // asks for it (the merge's two timed INPUT probes).
+          const timed = args[args.indexOf("-show_entries") + 1]?.includes("start_time") === true;
+          const format = timed ? { format_name: ISO, start_time: "0.000000" } : { format_name: ISO };
+          child.stdout.write(JSON.stringify({ programs: [], streams: kinds.map((codec_type) => ({ codec_type })), format }));
         }
         setImmediate(() => child.emit("close", 0));
       });

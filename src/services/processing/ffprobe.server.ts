@@ -61,6 +61,23 @@ export type LocalMediaProbe = {
 };
 
 /**
+ * SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001: a probe result that also
+ * carries the file's container start time, for the split merge's cross-input
+ * synchronization decision ONLY.
+ *
+ * A separate, opt-in projection of the SAME single ffprobe execution, rather
+ * than a field every probe now carries: the clear-HLS processing primitive and
+ * the merge's output check do not need timing, so their argv, their parse and
+ * their failure modes are exactly what they were. The value is an
+ * application-owned integer (microseconds); the raw ffprobe text never
+ * survives the parse.
+ */
+export type LocalMediaTimedProbe = LocalMediaProbe & {
+  /** ffprobe `format.start_time` — the demuxer's `start_time` — in integer microseconds. */
+  readonly startTimeUs: number;
+};
+
+/**
  * The EXACT `-f` input format name used for each family, proven against the
  * accepted Worker image (ffmpeg/ffprobe 5.1.9-0+deb12u1, Debian Bookworm).
  *
@@ -153,9 +170,38 @@ const MAX_PROBE_STREAMS = 16;
  * outage. Only the two fields below are ever READ, so extra keys are inert.
  */
 const FfprobeDocumentSchema = z.object({
-  format: z.object({ format_name: z.string() }),
+  format: z.object({ format_name: z.string(), start_time: z.unknown().optional() }),
   streams: z.array(z.object({ codec_type: z.string() })),
 });
+
+/**
+ * The exclusive bound on a probed start time, in microseconds: 2^31 seconds.
+ * Kept equal to the merge policy's own bound (see `merge-sync.ts`).
+ */
+const MAX_ABS_PROBE_START_TIME_US = 2_147_483_648_000_000n;
+
+/**
+ * Parse ffprobe's `format.start_time` text into integer microseconds, or
+ * `null` when it is not a usable start time.
+ *
+ * The pinned ffprobe prints this field with C `%f` — an optional minus sign,
+ * a decimal integer part with no padding, a point, and EXACTLY six fractional
+ * digits (`"0.000000"`, `"-0.007000"`, `"10.100000"`) — and omits the key
+ * entirely when the start is unknown (`"N/A"` appears only under
+ * `-show_optional_fields always`). Only that form is accepted: no exponent,
+ * no `NaN`/`inf`, no `+`, no padding, no fewer or more fractional digits, no
+ * partial match. The digits are converted exactly with BigInt, so no
+ * floating-point parse can round or truncate them, and the result is bounded.
+ */
+export function parseProbeStartTimeUs(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const match = /^(-?)(0|[1-9][0-9]{0,9})\.([0-9]{6})$/.exec(value);
+  if (match === null) return null;
+  const magnitude = BigInt(match[2]) * 1_000_000n + BigInt(match[3]);
+  if (magnitude >= MAX_ABS_PROBE_START_TIME_US) return null;
+  if (magnitude === 0n) return 0;
+  return Number(match[1] === "-" ? -magnitude : magnitude);
+}
 
 /**
  * The absolute, operator-controlled ffprobe binary.
@@ -352,6 +398,26 @@ export function normalizeProbeFormatFamily(formatName: string): LocalMediaFamily
  * exercised through a subprocess.
  */
 export function parseProbeDocument(raw: string): LocalMediaProbe {
+  return parseProbeDocumentWithFormat(raw).probe;
+}
+
+/**
+ * The timed variant: the same closed result, plus the container start time,
+ * which must be present and valid. Missing, `N/A`, malformed or out-of-bound
+ * is `PROCESSING_FAILED` — the split merge cannot synchronize what it cannot
+ * time.
+ */
+export function parseTimedProbeDocument(raw: string): LocalMediaTimedProbe {
+  const { probe, startTime } = parseProbeDocumentWithFormat(raw);
+  const startTimeUs = parseProbeStartTimeUs(startTime);
+  if (startTimeUs === null) throw new AppError("PROCESSING_FAILED");
+  return { ...probe, startTimeUs };
+}
+
+function parseProbeDocumentWithFormat(raw: string): {
+  probe: LocalMediaProbe;
+  startTime: unknown;
+} {
   let json: unknown;
   try {
     json = JSON.parse(raw);
@@ -381,7 +447,7 @@ export function parseProbeDocument(raw: string): LocalMediaProbe {
     }
     streams.push(entry.codec_type);
   }
-  return { family, streams };
+  return { probe: { family, streams }, startTime: parsed.data.format.start_time };
 }
 
 /**
@@ -391,6 +457,12 @@ export function parseProbeDocument(raw: string): LocalMediaProbe {
 export function buildProbeArgs(opts: {
   family: LocalMediaFamily;
   inputPath: string;
+  /**
+   * SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001: also request
+   * `format.start_time`, for the split merge's timed input probes only. Every
+   * other probe's argv is unchanged, token for token.
+   */
+  startTime?: boolean;
 }): string[] {
   return [
     // Diagnostics only; a successful probe prints nothing on stderr.
@@ -408,10 +480,14 @@ export function buildProbeArgs(opts: {
     FFPROBE_INPUT_FORMAT[opts.family],
     "-print_format",
     "json",
-    // EXACTLY the two fields this primitive needs. No tags, no titles, no
-    // comments, no source URLs, no codec names, no durations.
+    // EXACTLY the fields this primitive needs: the two shape fields, plus the
+    // container start time when the caller is the split merge's timed probe.
+    // No tags, no titles, no comments, no source URLs, no codec names, no
+    // durations.
     "-show_entries",
-    "format=format_name:stream=codec_type",
+    opts.startTime === true
+      ? "format=format_name,start_time:stream=codec_type"
+      : "format=format_name:stream=codec_type",
     "-i",
     opts.inputPath,
   ];
@@ -425,13 +501,34 @@ export function buildProbeArgs(opts: {
  * caller: the demuxer refuses cross-family input at the FFmpeg layer, and the
  * normalized `format_name` refuses it again at the application layer.
  */
-export async function probeLocalMedia(opts: {
+export async function probeLocalMedia(opts: LocalProbeOptions): Promise<LocalMediaProbe> {
+  return parseProbeDocument(await runLocalProbe(opts, false));
+}
+
+/**
+ * Probe ONE already-local split-merge input: the same single, bounded,
+ * whitelisted, explicit-demuxer ffprobe execution as `probeLocalMedia`, with
+ * `format.start_time` added to the requested entries.
+ *
+ * Fails closed with `PROCESSING_FAILED` when the start time is missing or not
+ * a valid value. Used by the split merge for its two INPUTS only.
+ */
+export async function probeLocalMediaWithStartTime(
+  opts: LocalProbeOptions,
+): Promise<LocalMediaTimedProbe> {
+  return parseTimedProbeDocument(await runLocalProbe(opts, true));
+}
+
+type LocalProbeOptions = {
   inputPath: string;
   workDir: string;
   family: LocalMediaFamily;
   timeoutMs: number;
   signal?: AbortSignal;
-}): Promise<LocalMediaProbe> {
+};
+
+/** The one ffprobe execution both probe entry points share. Returns its stdout. */
+async function runLocalProbe(opts: LocalProbeOptions, startTime: boolean): Promise<string> {
   // An already-cancelled caller gets no subprocess at all.
   if (opts.signal?.aborted) {
     throw new AppError("PROCESSING_FAILED", "Download was cancelled.");
@@ -450,7 +547,7 @@ export async function probeLocalMedia(opts: {
 
   const result = await runProcess({
     command: ffprobePath,
-    args: buildProbeArgs({ family: opts.family, inputPath }),
+    args: buildProbeArgs({ family: opts.family, inputPath, startTime }),
     timeoutMs: opts.timeoutMs,
     cwd: opts.workDir,
     signal: opts.signal,
@@ -464,7 +561,7 @@ export async function probeLocalMedia(opts: {
   // empty document is never even offered to the parser.
   if (result.code !== 0) throw new AppError("PROCESSING_FAILED");
 
-  return parseProbeDocument(result.stdout);
+  return result.stdout;
 }
 
 /**

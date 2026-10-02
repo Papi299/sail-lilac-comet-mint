@@ -39,8 +39,63 @@ import { OVERLAY_RUNTIME_COMPATIBILITY_FILES, isFullGitSha } from "./split-prove
  *        `evaluateChunkedMaxFilesizeRefusal` besides the unchanged -03
  *        condition. -01, -02 and -03 records are historical: never
  *        rewritten, and never re-read under -04 rules.
+ *   -05  the merge's SYNCHRONIZATION is an acceptance condition
+ *        (SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001). A -04 record
+ *        proved the merged streams were the source streams by hashing packet
+ *        PAYLOADS, and checked duration to ±0.25 s; both fixture halves start at
+ *        zero, so it could not see a merge that re-bases each input to zero
+ *        independently. A -05 run keeps every -04 condition on the unchanged
+ *        zero-aligned pair (the CONTROL), runs the identical full path a second
+ *        time on an OFFSET pair (the same video beside an audio half whose
+ *        timeline starts half a second later; checks under `offset/`), and on
+ *        both measures the delivered artifact against a PRE-JOB packet-
+ *        timestamp oracle: relative A/V offset preserved within the time-base
+ *        tolerance, each stream shifted by one constant, nothing hidden or
+ *        un-hidden, no leading gap, each stream's span kept. A PASS requires
+ *        every `SPLIT06_MANDATORY_SYNC_CHECKS` entry present exactly once and
+ *        passing. -01 … -04 records are historical: never rewritten, and never
+ *        re-read under -05 rules.
  */
-export const SPLIT06_EVIDENCE_SCHEMA = "split06-deterministic-full-path-04";
+export const SPLIT06_EVIDENCE_SCHEMA = "split06-deterministic-full-path-05";
+
+/** The synchronization checks each full-path pair records (-05). */
+export const SPLIT06_SYNC_CHECKS = Object.freeze([
+  "sync/source-timing-established-before-the-job",
+  "sync/relative-offset-preserved",
+  "sync/each-stream-shifted-by-one-constant",
+  "sync/no-media-hidden-or-unhidden",
+  "sync/no-leading-gap",
+  "sync/stream-spans-preserved",
+]);
+
+/**
+ * Every check a -05 PASS requires, present EXACTLY once and passing: the
+ * synchronization checks on the CONTROL pair and on the OFFSET pair, the
+ * offset pair's pre-job proof that it can discriminate, and the proof that the
+ * offset pair's full path itself completed.
+ */
+export const SPLIT06_MANDATORY_SYNC_CHECKS = Object.freeze([
+  ...SPLIT06_SYNC_CHECKS,
+  "offset/sync/offset-pair-carries-a-discriminating-av-offset",
+  ...SPLIT06_SYNC_CHECKS.map((name) => `offset/${name}`),
+  "offset/lifecycle/durable-trace",
+  "offset/lifecycle/final-status-ready",
+  "offset/stream-identity/video-packets-came-from-the-video-fixture",
+  "offset/stream-identity/audio-packets-came-from-the-audio-fixture",
+]);
+
+/** Why `checks` does not satisfy the -05 mandatory set: absent, duplicated or failed names. */
+export function unmetSplit06SyncChecks(checks) {
+  const list = Array.isArray(checks) ? checks : [];
+  const unmet = [];
+  for (const name of SPLIT06_MANDATORY_SYNC_CHECKS) {
+    const hits = list.filter((check) => check?.name === name);
+    if (hits.length === 0) unmet.push(`${name}: absent`);
+    else if (hits.length > 1) unmet.push(`${name}: duplicated`);
+    else if (hits[0].ok !== true) unmet.push(`${name}: failed`);
+  }
+  return unmet;
+}
 
 /**
  * Values that must not appear ANYWHERE in a serialized record.
@@ -288,6 +343,8 @@ export function buildSplitEvidence(input) {
     maxFilesizeRefusal: input.maxFilesizeRefusal,
     maxFilesizeChunkedRefusal: input.maxFilesizeChunkedRefusal,
     ffmpegOverwriteRefusal: input.ffmpegOverwriteRefusal,
+    synchronization: input.synchronization ?? null,
+    offsetFullPath: input.offsetFullPath ?? null,
     checks: input.checks,
   };
 
@@ -307,6 +364,11 @@ export function buildSplitEvidence(input) {
             unmet.map((c) => c.name).join(", "),
         );
       }
+    }
+    // -05: no PASS without the synchronization oracle on both pairs.
+    const unmetSync = unmetSplit06SyncChecks(record.checks);
+    if (unmetSync.length > 0) {
+      throw new Error(`refusing to emit a PASS ${SPLIT06_EVIDENCE_SCHEMA} record: ${unmetSync.join("; ")}`);
     }
   }
 

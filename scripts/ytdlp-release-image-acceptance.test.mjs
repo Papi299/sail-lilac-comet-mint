@@ -65,6 +65,9 @@ import {
   releaseHls11RunPostureViolations,
   releaseHlsAcceptanceRunArgs,
   releaseHlsRunPostureViolations,
+  releaseSyncAcceptanceRunArgs,
+  releaseSyncRunPostureViolations,
+  SYNC01_ORCHESTRATOR,
   REPORT_MOUNT_TARGET,
   VERIFY_MOUNT_TARGET,
 } from "../deploy/acceptance/ytdlp-generic/lib/release-container.mjs";
@@ -85,6 +88,15 @@ import {
   HLS11_RELEASE_EVIDENCE_SCHEMA,
 } from "../deploy/acceptance/ytdlp-generic/lib/hls11-evidence.mjs";
 import { HLS11_FIXTURE_HOST_MAPPING } from "../deploy/acceptance/ytdlp-generic/lib/hls11-fixture-url.mjs";
+import {
+  buildSyncReleaseEvidence,
+  SYNC01_MANDATORY_CHECKS,
+  SYNC01_RELEASE_EVIDENCE_SCHEMA,
+} from "../deploy/acceptance/ytdlp-generic/lib/sync-evidence.mjs";
+import {
+  SPLIT06_EVIDENCE_SCHEMA,
+  SPLIT06_MANDATORY_SYNC_CHECKS,
+} from "../deploy/acceptance/ytdlp-generic/lib/split-evidence.mjs";
 import {
   buildExpectedSourceManifest,
   compareSourceManifests,
@@ -118,6 +130,10 @@ import {
   emptyHls11ChildObservation,
   REQUIRED_HLS11_CHILD_SCHEMA,
   validateHls11ChildRecord,
+  SYNC_CANDIDATE_RUN_PURPOSE,
+  emptySyncChildObservation,
+  REQUIRED_SYNC_CHILD_SCHEMA,
+  validateSyncChildRecord,
   ReleaseEvidenceError,
   REQUIRED_CANDIDATE_RUN_PURPOSES,
   REQUIRED_CHILD_SCHEMA,
@@ -156,7 +172,7 @@ const STATUS_TRACKED = "status --porcelain=v1 --untracked-files=all --ignored=no
 const STATUS_IGNORED = "status --porcelain=v1 --untracked-files=all --ignored=matching --ignore-submodules=none";
 const HARNESS_POINTS = [
   "before-docker", "after-build", "before-split06-mp4", "before-split06-webm", "before-hls09-clear-hls",
-  "before-dash01-segmented-dash", "before-hls11-clear-hls-v2", "after-children",
+  "before-dash01-segmented-dash", "before-hls11-clear-hls-v2", "before-sync01-merge-timing", "after-children",
 ];
 const HARNESS_DIR = `${HARNESS}/deploy/acceptance/ytdlp-generic`;
 
@@ -262,6 +278,8 @@ function passingChild(family, overrides = {}, flags = null) {
     checks: [
       { name: "full-path/ready", ok: true, detail: null },
       { name: "processing/merged", ok: true, detail: null },
+      // -05: the synchronization oracle on the control and offset pairs.
+      ...SPLIT06_MANDATORY_SYNC_CHECKS.map((name) => ({ name, ok: true, detail: null })),
     ],
     ...overrides,
   };
@@ -353,6 +371,31 @@ function passingHls11Child(flags = null, overrides = {}) {
   return deepMerge(record, overrides);
 }
 
+/**
+ * A PASS split-merge timing release child, built by the REAL SYNC-01 builder
+ * (so its privacy and PASS gates apply), recording the identity flags it was
+ * GIVEN. `overrides` are deep-merged AFTER the builder.
+ */
+function passingSyncChild(flags = null, overrides = {}) {
+  const f = flags ?? {
+    sourceCommit: SOURCE, sourceTree: TREE, sourceContextClean: true,
+    candidateTag: TAG, candidateImageId: IMAGE_ID, runImageId: IMAGE_ID,
+  };
+  const record = buildSyncReleaseEvidence({
+    verdict: "PASS",
+    startedAt: "2026-10-02T00:00:00.000Z",
+    finishedAt: "2026-10-02T00:00:23.000Z",
+    source: { commit: f.sourceCommit, tree: f.sourceTree, contextClean: f.sourceContextClean },
+    image: { candidateTag: f.candidateTag, imageId: f.candidateImageId, runSubject: f.runImageId },
+    network: { observedInterfaceNames: ["lo"] },
+    toolchain: { node: "v22.23.2" },
+    cases: { "mp4-prog-audio-late": {} },
+    sensitivity: {},
+    checks: SYNC01_MANDATORY_CHECKS.map((name) => ({ name, ok: true, detail: null })),
+  });
+  return deepMerge(record, overrides);
+}
+
 /** A child record's exact on-disk bytes. */
 function recordBytes(record) {
   return Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8");
@@ -375,6 +418,7 @@ function recordBytes(record) {
  *                           or `{ raw: "<bytes>" }` for unparseable bytes)
  *   dash                    segmented-DASH child overrides, the same shapes as `hls`
  *   hls11                   clear-HLS v2 child overrides, the same shapes as `hls`
+ *   sync                    split-merge timing child overrides, the same shapes as `hls`
  *   verifiers               per-verifier exit code
  *   production / productionAfter             Production observations
  *   files                   [path, bytes] entries already on the fake filesystem
@@ -623,6 +667,26 @@ function createWorld(spec = {}) {
       const name = evidenceArg.slice(evidenceArg.lastIndexOf("/") + 1);
       const reportMount = args.find((arg) => String(arg).endsWith(":/report"));
       const hostReport = reportMount ? String(reportMount).slice(0, -":/report".length) : REPORT;
+      if (args.includes(SYNC01_ORCHESTRATOR)) {
+        // The split-merge timing child: echoes the identity flags it was given.
+        const sync = Object.prototype.hasOwnProperty.call(spec, "sync") ? spec.sync : {};
+        if (sync !== null) {
+          const flags = {
+            sourceCommit: flagValue(args, "--source-commit"),
+            sourceTree: flagValue(args, "--source-tree"),
+            sourceContextClean: args.includes("--source-context-clean"),
+            candidateTag: flagValue(args, "--candidate-tag"),
+            candidateImageId: flagValue(args, "--candidate-image-id"),
+            runImageId: flagValue(args, "--run-image-id"),
+          };
+          files.set(
+            `${hostReport}/${name}`,
+            typeof sync.raw === "string" ? Buffer.from(sync.raw, "utf8") : recordBytes(passingSyncChild(flags, sync)),
+          );
+        }
+        events.add(SYNC_CANDIDATE_RUN_PURPOSE);
+        return ok("", spec.syncExit ?? 0);
+      }
       if (args.includes(HLS11_ORCHESTRATOR)) {
         // The clear-HLS v2 child: echoes the identity flags it was given.
         const hls11 = Object.prototype.hasOwnProperty.call(spec, "hls11") ? spec.hls11 : {};
@@ -908,6 +972,15 @@ function evidenceInput(overrides = {}) {
       child: {
         schema: REQUIRED_HLS11_CHILD_SCHEMA, verdict: "PASS", ok: true, sha256: sha256("clear-hls-v2"), bytes: 100,
         checkCount: HLS11_MANDATORY_CHECKS.length, failedCheckCount: 0, evidenceFile: "hls11-clear-hls-v2.json",
+        sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG, candidateImageId: IMAGE_ID, runImageId: IMAGE_ID,
+        networkMode: "none", reason: null,
+      },
+    },
+    syncAcceptance: {
+      executed: true,
+      child: {
+        schema: REQUIRED_SYNC_CHILD_SCHEMA, verdict: "PASS", ok: true, sha256: sha256("merge-timing"), bytes: 100,
+        checkCount: SYNC01_MANDATORY_CHECKS.length, failedCheckCount: 0, evidenceFile: "sync01-merge-timing.json",
         sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG, candidateImageId: IMAGE_ID, runImageId: IMAGE_ID,
         networkMode: "none", reason: null,
       },
@@ -1427,18 +1500,36 @@ describe("SPLIT-07 child record validation", () => {
     assert.equal(child.ok, true);
     assert.equal(child.schema, REQUIRED_CHILD_SCHEMA);
     assert.equal(child.verdict, "PASS");
-    assert.equal(child.checkCount, 2);
+    assert.equal(child.checkCount, 2 + SPLIT06_MANDATORY_SYNC_CHECKS.length);
     assert.equal(child.sha256, createHash("sha256").update(bytes).digest("hex"));
     assert.equal(child.networkMode, "none");
   });
 
   // §22.23 — a child of the wrong SPLIT-06 schema cannot pass.
   it("rejects a child carrying a different SPLIT-06 schema", () => {
-    for (const schema of ["split06-deterministic-full-path-03", "split06-deterministic-full-path-05", "10d-remediation-03"]) {
+    for (const schema of ["split06-deterministic-full-path-03", "split06-deterministic-full-path-04", "10d-remediation-03"]) {
       const child = validateChildRecord({ family: "mp4", bytes: bytesOf(passingChild("mp4", { schema })) });
       assert.equal(child.ok, false, `${schema} must not be accepted`);
       assert.match(child.reason, /schema is/);
     }
+  });
+
+  // -07: a -05 child must CARRY its synchronization oracle, each mandatory
+  // check exactly once — an all-green ledger without it is not enough.
+  it("rejects a -05 child missing, or duplicating, a mandatory synchronization check", () => {
+    for (const name of [SPLIT06_MANDATORY_SYNC_CHECKS[0], "offset/sync/relative-offset-preserved", "offset/lifecycle/final-status-ready"]) {
+      const missing = passingChild("mp4");
+      missing.checks = missing.checks.filter((check) => check.name !== name);
+      const result = validateChildRecord({ family: "mp4", bytes: bytesOf(missing) });
+      assert.equal(result.ok, false, `${name} absent`);
+      assert.match(result.reason, /synchronization checks absent or duplicated/);
+      const duplicated = passingChild("mp4");
+      duplicated.checks = [...duplicated.checks, { name, ok: true, detail: null }];
+      assert.equal(validateChildRecord({ family: "mp4", bytes: bytesOf(duplicated) }).ok, false, `${name} duplicated`);
+    }
+    const failed = passingChild("mp4");
+    failed.checks = failed.checks.map((check) => (check.name === "offset/sync/relative-offset-preserved" ? { ...check, ok: false } : check));
+    assert.equal(validateChildRecord({ family: "mp4", bytes: bytesOf(failed) }).ok, false);
   });
 
   it("rejects a non-PASS verdict, a mismatched family and a failed check", () => {
@@ -1627,12 +1718,15 @@ describe("SPLIT-07 evidence builder", () => {
   });
 
   it("names a NEW schema, and never reuses or bumps SPLIT-06's", () => {
-    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-06");
-    assert.equal(REQUIRED_CHILD_SCHEMA, "split06-deterministic-full-path-04");
+    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-07");
+    assert.equal(REQUIRED_CHILD_SCHEMA, "split06-deterministic-full-path-05");
+    assert.equal(REQUIRED_CHILD_SCHEMA, SPLIT06_EVIDENCE_SCHEMA);
+    assert.equal(REQUIRED_SYNC_CHILD_SCHEMA, "sync01-release-image-merge-timing-01");
+    assert.equal(REQUIRED_SYNC_CHILD_SCHEMA, SYNC01_RELEASE_EVIDENCE_SCHEMA);
     assert.equal(REQUIRED_HLS11_CHILD_SCHEMA, "hls11-release-image-full-path-01");
     assert.equal(REQUIRED_HLS11_CHILD_SCHEMA, HLS11_RELEASE_EVIDENCE_SCHEMA);
     assert.equal(REQUIRED_HLS_CHILD_SCHEMA, "hls09-release-image-full-path-02");
-    assert.equal(REQUIRED_DASH_CHILD_SCHEMA, "dash01-release-image-full-path-01");
+    assert.equal(REQUIRED_DASH_CHILD_SCHEMA, "dash01-release-image-full-path-02");
     assert.equal(REQUIRED_DASH_CHILD_SCHEMA, DASH01_RELEASE_EVIDENCE_SCHEMA);
     assert.notEqual(SPLIT07_EVIDENCE_SCHEMA, REQUIRED_CHILD_SCHEMA);
     assert.notEqual(REQUIRED_HLS_CHILD_SCHEMA, "hls08-deterministic-full-path-03", "HLS-08 overlay evidence is not a release child");
@@ -2416,12 +2510,22 @@ describe("SPLIT-07 harness provenance (driver)", () => {
     }
   });
 
-  it("refuses the record when the harness changes while the last child — clear-HLS v2 — runs", async () => {
+  it("refuses the record when the harness changes while the last child — split-merge timing — runs", async () => {
     for (const kind of ["modified", "staged", "ignored", "hidden", "moved"]) {
-      const { result, error, world } = await drive({ harnessChange: { after: HLS11_CANDIDATE_RUN_PURPOSE, kind } });
+      const { result, error, world } = await drive({ harnessChange: { after: SYNC_CANDIDATE_RUN_PURPOSE, kind } });
       assert.equal(result, null, `${kind} must be refused`);
       assert.match(String(error?.message), /\(after-children\)/);
       assert.equal(world.writeCalls.length, 0, "no parent evidence may be written");
+    }
+  });
+
+  it("refuses the record when the harness changes while the clear-HLS v2 child runs, before the timing child", async () => {
+    for (const kind of ["modified", "staged"]) {
+      const { result, error, world } = await drive({ harnessChange: { after: HLS11_CANDIDATE_RUN_PURPOSE, kind } });
+      assert.equal(result, null, `${kind} must be refused`);
+      assert.match(String(error?.message), /\(before-sync01-merge-timing\)/);
+      assert.equal(world.writeCalls.length, 0, "no parent evidence may be written");
+      assert.ok(!world.dockerCalls.some((call) => call.args.includes(SYNC01_ORCHESTRATOR)), "the timing child never ran");
     }
   });
 
@@ -2465,7 +2569,7 @@ describe("SPLIT-07 parent evidence is created exclusively", () => {
   it("A1: with the pre-flight blind, the exclusive create itself refuses and leaves the file untouched", async () => {
     const { result, error, world } = await drive({ files: [[PARENT, PRIOR]] }, {}, { readdir: async () => [] });
     assert.equal(result, null);
-    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-06 verdict/);
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-07 verdict/);
     assert.ok(world.files.get(PARENT).equals(PRIOR), "the existing bytes must be unchanged");
     assert.deepEqual(world.writeCalls.map((call) => call.options), [{ encoding: "utf8", flag: "wx" }]);
   });
@@ -2476,7 +2580,7 @@ describe("SPLIT-07 parent evidence is created exclusively", () => {
     const lines = [];
     const { result, error, world } = await drive({ competitorAtWrite: competitor }, {}, { log: (line) => lines.push(line) });
     assert.equal(result, null, "a lost race returns no result, and so no PASS");
-    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-06 verdict/);
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-07 verdict/);
     assert.match(String(error?.message), /has NOT been modified/);
     assert.equal(world.files.get(PARENT).toString("utf8"), competitor, "the competing record must be byte-identical");
     assert.deepEqual(
@@ -2555,14 +2659,15 @@ describe("SPLIT-07 -02 evidence gates", () => {
     assert.equal(record.harness.commitIsReleaseSource, true);
   });
 
-  it("treats -01 through -05 as historical: the builder emits only -06", () => {
-    assert.equal(buildReleaseEvidence(evidenceInput()).schema, "split07-release-image-candidate-06");
+  it("treats -01 through -06 as historical: the builder emits only -07", () => {
+    assert.equal(buildReleaseEvidence(evidenceInput()).schema, "split07-release-image-candidate-07");
     assert.deepEqual([...HISTORICAL_SPLIT07_SCHEMAS], [
       "split07-release-image-candidate-01",
       "split07-release-image-candidate-02",
       "split07-release-image-candidate-03",
       "split07-release-image-candidate-04",
       "split07-release-image-candidate-05",
+      "split07-release-image-candidate-06",
     ]);
     assert.ok(!HISTORICAL_SPLIT07_SCHEMAS.includes(SPLIT07_EVIDENCE_SCHEMA));
   });
@@ -2804,14 +2909,18 @@ describe("SPLIT-07 -03 clear-HLS child record validation", () => {
 });
 
 describe("SPLIT-07 -03 evidence gates", () => {
-  it("emits a -06 PASS with mp4 + webm + the clear-HLS, segmented-DASH and clear-HLS v2 children", () => {
+  it("emits a -07 PASS with mp4 + webm + the clear-HLS, segmented-DASH, clear-HLS v2 and split-merge timing children", () => {
     const record = buildReleaseEvidence(evidenceInput());
-    assert.equal(record.schema, "split07-release-image-candidate-06");
+    assert.equal(record.schema, "split07-release-image-candidate-07");
+    assert.equal(record.syncAcceptance.requiredChildSchema, "sync01-release-image-merge-timing-01");
+    assert.equal(record.syncAcceptance.executed, true);
+    assert.equal(record.syncAcceptance.child.candidateImageId, IMAGE_ID);
+    assert.equal(record.syncAcceptance.child.runImageId, IMAGE_ID);
     assert.equal(record.hls11Acceptance.requiredChildSchema, "hls11-release-image-full-path-01");
     assert.equal(record.hls11Acceptance.executed, true);
     assert.equal(record.hls11Acceptance.child.candidateImageId, IMAGE_ID);
     assert.equal(record.hls11Acceptance.child.runImageId, IMAGE_ID);
-    assert.equal(record.dashAcceptance.requiredChildSchema, "dash01-release-image-full-path-01");
+    assert.equal(record.dashAcceptance.requiredChildSchema, "dash01-release-image-full-path-02");
     assert.equal(record.dashAcceptance.executed, true);
     assert.equal(record.dashAcceptance.child.candidateImageId, IMAGE_ID);
     assert.equal(record.dashAcceptance.child.runImageId, IMAGE_ID);
@@ -2836,11 +2945,12 @@ describe("SPLIT-07 -03 evidence gates", () => {
     ]);
   });
 
-  it("requires the HLS, DASH and HLS v2 run purposes in the candidate ledger: eleven runs, every one by the immutable id", () => {
+  it("requires the HLS, DASH, HLS v2 and timing run purposes in the candidate ledger: twelve runs, every one by the immutable id", () => {
     assert.deepEqual([...REQUIRED_CANDIDATE_RUN_PURPOSES], [
       "probe:manifest", "probe:tools", "probe:env", "probe:runtime",
       "verifier:verify-selector.py", "verifier:verify-download-policy.py",
       "split06:mp4", "split06:webm", "hls09:clear-hls", "dash01:segmented-dash", "hls11:clear-hls-v2",
+      "sync01:merge-timing",
     ]);
     const missing = evidenceInput();
     missing.image.candidateRuns = missing.image.candidateRuns.filter((entry) => entry.purpose !== HLS_CANDIDATE_RUN_PURPOSE);
@@ -2893,7 +3003,7 @@ describe("SPLIT-07 -03 evidence gates", () => {
     }
   });
 
-  it("reads a -06 record back, and never silently reads a historical -01..-05 record as -06", () => {
+  it("reads a -07 record back, and never silently reads a historical -01..-06 record as -07", () => {
     const current = JSON.parse(renderReleaseEvidence(buildReleaseEvidence(evidenceInput())));
     assert.deepEqual(validateReleaseParentRecord(current, { sourceCommit: SOURCE, imageId: IMAGE_ID }), []);
     for (const schema of HISTORICAL_SPLIT07_SCHEMAS) {
@@ -2901,7 +3011,7 @@ describe("SPLIT-07 -03 evidence gates", () => {
       // in, is named historical — never read under -03 rules as a PASS.
       const problems = validateReleaseParentRecord({ ...current, schema }, { sourceCommit: SOURCE, imageId: IMAGE_ID });
       assert.equal(problems.length, 1, schema);
-      assert.match(problems[0], /historical schema.*does not carry the real-media clear-HLS v2 child/, schema);
+      assert.match(problems[0], /historical schema.*does not carry the split-merge timing children/, schema);
     }
     // A -02-shaped record relabelled -03: no HLS child, so no -03 PASS.
     const relabelled = JSON.parse(JSON.stringify(current));
@@ -2909,7 +3019,7 @@ describe("SPLIT-07 -03 evidence gates", () => {
     relabelled.checks = relabelled.checks.filter((check) => !check.name.startsWith("hls/"));
     relabelled.image.candidateRuns = relabelled.image.candidateRuns.filter((entry) => entry.purpose !== HLS_CANDIDATE_RUN_PURPOSE);
     assert.ok(validateReleaseParentRecord(relabelled).some((problem) => /missing required checks/.test(problem)));
-    assert.ok(validateReleaseParentRecord({ ...current, schema: "split07-release-image-candidate-07" }).length > 0);
+    assert.ok(validateReleaseParentRecord({ ...current, schema: "split07-release-image-candidate-08" }).length > 0);
     // A -04-shaped record relabelled -05: no DASH child, so no -05 PASS.
     const noDash = JSON.parse(JSON.stringify(current));
     delete noDash.dashAcceptance;
@@ -2922,6 +3032,12 @@ describe("SPLIT-07 -03 evidence gates", () => {
     noHls11.checks = noHls11.checks.filter((check) => !check.name.startsWith("hls11/"));
     noHls11.image.candidateRuns = noHls11.image.candidateRuns.filter((entry) => entry.purpose !== HLS11_CANDIDATE_RUN_PURPOSE);
     assert.ok(validateReleaseParentRecord(noHls11).some((problem) => /missing required checks/.test(problem)));
+    // A -06-shaped record relabelled -07: no split-merge timing child, so no -07 PASS.
+    const noSync = JSON.parse(JSON.stringify(current));
+    delete noSync.syncAcceptance;
+    noSync.checks = noSync.checks.filter((check) => !check.name.startsWith("sync/"));
+    noSync.image.candidateRuns = noSync.image.candidateRuns.filter((entry) => entry.purpose !== SYNC_CANDIDATE_RUN_PURPOSE);
+    assert.ok(validateReleaseParentRecord(noSync).some((problem) => /missing required checks/.test(problem)));
     assert.ok(validateReleaseParentRecord(current, { sourceCommit: "f".repeat(40) }).includes("source commit mismatch"));
     assert.ok(validateReleaseParentRecord(current, { imageId: IMAGE_B }).includes("image id mismatch"));
     assert.ok(validateReleaseParentRecord({ ...current, harness: { ...current.harness, verifiedAfterRun: false } }).length > 0);
@@ -2932,29 +3048,31 @@ describe("SPLIT-07 -03 evidence gates", () => {
 describe("SPLIT-07 -03 driver: the clear-HLS child", () => {
   const hlsCalls = (world) => world.dockerCalls.filter((call) => call.args.includes("--acceptance-mode"));
 
-  it("runs mp4, webm, clear-HLS, segmented DASH, then clear-HLS v2 — all by the immutable id — and PASSes with a bound -06 record", async () => {
+  it("runs mp4, webm, clear-HLS, segmented DASH, clear-HLS v2, then split-merge timing — all by the immutable id — and PASSes with a bound -07 record", async () => {
     const { result, error, world } = await drive();
     assert.equal(error, null, error ? String(error.message) : undefined);
     assert.equal(result.verdict, "PASS");
-    assert.equal(result.record.schema, "split07-release-image-candidate-06");
+    assert.equal(result.record.schema, "split07-release-image-candidate-07");
     const childOrder = world.dockerCalls
       .filter((call) =>
         call.args[0] === "run" &&
         (call.args.includes("--family") || call.args.includes("--acceptance-mode") ||
-          call.args.includes(DASH01_ORCHESTRATOR) || call.args.includes(HLS11_ORCHESTRATOR)))
+          call.args.includes(DASH01_ORCHESTRATOR) || call.args.includes(HLS11_ORCHESTRATOR) ||
+          call.args.includes(SYNC01_ORCHESTRATOR)))
       .map((call) => {
         if (call.args.includes("--family")) return call.args[call.args.indexOf("--family") + 1];
+        if (call.args.includes(SYNC01_ORCHESTRATOR)) return "merge-timing";
         if (call.args.includes(HLS11_ORCHESTRATOR)) return "clear-hls-v2";
         return call.args.includes(DASH01_ORCHESTRATOR) ? "segmented-dash" : "clear-hls";
       });
-    assert.deepEqual(childOrder, ["mp4", "webm", "clear-hls", "segmented-dash", "clear-hls-v2"]);
+    assert.deepEqual(childOrder, ["mp4", "webm", "clear-hls", "segmented-dash", "clear-hls-v2", "merge-timing"]);
     const [hlsCall] = hlsCalls(world);
     assert.equal(dockerRunSubject(hlsCall.args), IMAGE_ID);
     assert.deepEqual(
       releaseHlsRunPostureViolations(hlsCall.args, { reportDir: REPORT, harnessDir: HARNESS_DIR, mediaWorkspaceDir: MEDIA_WORKSPACE }),
       [],
     );
-    assert.equal(world.executed.length, 11);
+    assert.equal(world.executed.length, 12);
     assert.ok(world.executed.every((id) => id === IMAGE_ID));
     const hls = result.record.hlsAcceptance;
     assert.equal(hls.executed, true);
@@ -3230,7 +3348,7 @@ describe("SPLIT-07 -05 segmented-DASH child validation", () => {
   it("accepts a real DASH-01 PASS naming this source and image", () => {
     const observation = validate(passingDashChild());
     assert.equal(observation.ok, true, observation.reason);
-    assert.equal(observation.schema, "dash01-release-image-full-path-01");
+    assert.equal(observation.schema, "dash01-release-image-full-path-02");
     assert.equal(observation.checkCount, DASH01_MANDATORY_CHECKS.length);
     assert.deepEqual([observation.candidateImageId, observation.runImageId, observation.networkMode], [IMAGE_ID, IMAGE_ID, "none"]);
   });
@@ -3238,13 +3356,17 @@ describe("SPLIT-07 -05 segmented-DASH child validation", () => {
   it("refuses each way a DASH child can fall short", () => {
     const dropped = passingDashChild();
     dropped.checks = dropped.checks.filter((check) => check.name !== "dash-dash/output/resolution-is-1920x1080");
+    const noSync = passingDashChild();
+    noSync.checks = noSync.checks.filter((check) => check.name !== "dash-progressive/sync/relative-offset-preserved");
     const failing = passingDashChild();
     failing.checks = failing.checks.map((check) =>
       check.name === "dash-progressive/output/exactly-one-audio-stream" ? { ...check, ok: false } : check);
     for (const [label, record, reason] of [
-      ["a future schema", passingDashChild(null, { schema: "dash01-release-image-full-path-02" }), /schema is/],
+      ["a future schema", passingDashChild(null, { schema: "dash01-release-image-full-path-03" }), /schema is/],
+      ["the historical pre-timing schema", passingDashChild(null, { schema: "dash01-release-image-full-path-01" }), /schema is/],
       ["a FAIL verdict", passingDashChild(null, { verdict: "FAIL" }), /verdict is FAIL/],
       ["the resolution check removed", dropped, /mandatory checks absent/],
+      ["the synchronization check removed", noSync, /mandatory checks absent/],
       ["the audio-stream check failed", failing, /did not pass/],
       ["another source commit", passingDashChild(null, { source: { commit: "d".repeat(40) } }), /source commit/],
       ["another source tree", passingDashChild(null, { source: { tree: "e".repeat(40) } }), /source tree/],
@@ -3576,7 +3698,7 @@ describe("SPLIT-07 -06 clear-HLS v2 child validation", () => {
 describe("SPLIT-07 -06 driver: the clear-HLS v2 child", () => {
   const hls11Calls = (world) => world.dockerCalls.filter((call) => call.args.includes(HLS11_ORCHESTRATOR));
 
-  it("runs it last, by the immutable id, in the model posture, and binds its validated, hashed record", async () => {
+  it("runs it after DASH and before the timing child, by the immutable id, in the model posture, and binds its validated, hashed record", async () => {
     const { result, error, world } = await drive();
     assert.equal(error, null, error ? String(error.message) : undefined);
     assert.equal(result.verdict, "PASS");
@@ -3587,7 +3709,8 @@ describe("SPLIT-07 -06 driver: the clear-HLS v2 child", () => {
       [],
     );
     const runs = world.dockerCalls.filter((c) => c.args[0] === "run");
-    assert.equal(runs.at(-1), call, "the clear-HLS v2 child is the last candidate container");
+    assert.equal(runs.at(-2), call, "the clear-HLS v2 child is the last but one candidate container");
+    assert.ok(runs.at(-1).args.includes(SYNC01_ORCHESTRATOR), "the split-merge timing child runs last");
     const hls11 = result.record.hls11Acceptance;
     assert.equal(hls11.executed, true);
     assert.equal(hls11.child.schema, HLS11_RELEASE_EVIDENCE_SCHEMA);
@@ -3668,6 +3791,269 @@ describe("SPLIT-07 -06 driver: the clear-HLS v2 child", () => {
     };
     await assert.rejects(runReleaseImageAcceptance(world.options, deps), /is not empty \(before-hls11-clear-hls-v2\)/);
     assert.equal(hls11Calls(world).length, 0);
+    assert.equal(world.writeCalls.length, 0);
+  });
+});
+
+// ── 12. The -07 split-merge timing release child ───────────────────────────
+
+describe("SPLIT-07 -07 split-merge timing release child invocation (container model)", () => {
+  const syncArgs = (overrides = {}) =>
+    releaseSyncAcceptanceRunArgs({
+      imageId: IMAGE_ID, harnessDir: HARNESS_DIR, reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE,
+      evidenceName: "sync01-merge-timing-1.json", sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG,
+      ...overrides,
+    });
+  const dirs = { reportDir: REPORT, harnessDir: HARNESS_DIR, mediaWorkspaceDir: MEDIA_WORKSPACE };
+  const posture = (args) => releaseSyncRunPostureViolations(args, dirs);
+  const values = (args, flag) => args.flatMap((arg, i) => (arg === flag ? [args[i + 1]] : []));
+
+  it("has the release posture with NO --add-host, by immutable id", () => {
+    const args = syncArgs();
+    assert.deepEqual(posture(args), []);
+    assert.equal(dockerRunSubject(args), IMAGE_ID);
+    assert.deepEqual(values(args, "--network"), ["none"]);
+    assert.deepEqual(values(args, "--add-host"), [], "it serves nothing, so it resolves nothing");
+    assert.equal(args.filter((arg) => arg === "--cap-drop=ALL").length, 1);
+    assert.deepEqual(values(args, "--security-opt"), ["no-new-privileges"]);
+    assert.equal(args.filter((arg) => arg === "--read-only").length, 1);
+    assert.deepEqual(values(args, "--mount"), [`type=bind,source=${MEDIA_WORKSPACE},target=/tmp/videofetch`]);
+    assert.deepEqual(values(args, "--tmpfs"), [HARNESS_SCRATCH_TMPFS]);
+    assert.deepEqual(values(args, "-e"), [...RELEASE_RUN_ENVIRONMENT]);
+    assert.deepEqual(mountTargets(args), [PRODUCT_MEDIA_TARGET, HARNESS_SCRATCH_TARGET, HARNESS_MOUNT_TARGET, "/report"]);
+    const tail = args.slice(args.indexOf(IMAGE_ID) + 1);
+    assert.deepEqual(tail.slice(0, 4), [
+      "--import", "./scripts/register-ts-aliases.mjs", "--experimental-strip-types", SYNC01_ORCHESTRATOR,
+    ]);
+    assert.equal(SYNC01_ORCHESTRATOR, "deploy/acceptance/ytdlp-generic/sync-matrix.mjs");
+    const flag = (name) => tail[tail.indexOf(name) + 1];
+    assert.equal(flag("--evidence"), "/report/sync01-merge-timing-1.json");
+    assert.equal(flag("--source-commit"), SOURCE);
+    assert.equal(flag("--source-tree"), TREE);
+    assert.ok(tail.includes("--source-context-clean"));
+    assert.equal(flag("--candidate-tag"), TAG);
+    assert.equal(flag("--candidate-image-id"), IMAGE_ID);
+    assert.equal(flag("--run-image-id"), IMAGE_ID);
+  });
+
+  it("refuses inputs it cannot place faithfully", () => {
+    assert.throws(() => syncArgs({ imageId: TAG }), /immutable/);
+    assert.throws(() => syncArgs({ sourceCommit: "abc" }), /full 40-hex SHA/);
+    assert.throws(() => syncArgs({ candidateTag: "videofetch-worker:latest" }), /latest/);
+    assert.throws(() => syncArgs({ evidenceName: "../x.json" }), /plain basename/);
+    assert.throws(() => syncArgs({ mediaWorkspaceDir: REPORT }), /overlap/);
+  });
+
+  it("treats every departure from the model as a posture violation", () => {
+    const base = syncArgs();
+    const imageAt = base.indexOf(IMAGE_ID);
+    const inject = (...extra) => [...base.slice(0, imageAt), ...extra, ...base.slice(imageAt)];
+    const replaced = (from, to) => base.map((arg) => (arg === from ? to : arg));
+    const cases = {
+      "an --add-host": inject("--add-host", HLS11_FIXTURE_HOST_MAPPING),
+      "host networking": replaced("none", "host"),
+      "a privileged container": inject("--privileged"),
+      "an extra bind": inject("-v", "/var/run/docker.sock:/var/run/docker.sock"),
+      "no read-only root": base.filter((arg) => arg !== "--read-only"),
+      "the DASH orchestrator instead": replaced(SYNC01_ORCHESTRATOR, DASH01_ORCHESTRATOR),
+      "a tag as the run subject": replaced(IMAGE_ID, TAG),
+      "told another run id": (() => {
+        const args = [...base];
+        args[args.indexOf("--run-image-id") + 1] = IMAGE_B;
+        return args;
+      })(),
+    };
+    for (const [label, args] of Object.entries(cases)) {
+      assert.ok(posture(args).length > 0, `${label} must be a posture violation`);
+    }
+  });
+
+  it("is a violation under the DASH and HLS-11 models, and they under its", () => {
+    const dash = releaseDashAcceptanceRunArgs({
+      imageId: IMAGE_ID, harnessDir: HARNESS_DIR, reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE,
+      evidenceName: "dash01-segmented-dash-1.json", sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG,
+    });
+    const hls11 = releaseHls11AcceptanceRunArgs({
+      imageId: IMAGE_ID, harnessDir: HARNESS_DIR, reportDir: REPORT, mediaWorkspaceDir: MEDIA_WORKSPACE,
+      evidenceName: "hls11-clear-hls-v2-1.json", sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG,
+    });
+    assert.ok(posture(dash).length > 0);
+    assert.ok(posture(hls11).length > 0);
+    assert.ok(releaseDashRunPostureViolations(syncArgs(), dirs).length > 0);
+    assert.ok(releaseHls11RunPostureViolations(syncArgs(), dirs).length > 0);
+  });
+});
+
+describe("SPLIT-07 -07 split-merge timing child validation", () => {
+  const expected = { sourceCommit: SOURCE, sourceTree: TREE, candidateTag: TAG, candidateImageId: IMAGE_ID };
+  const validate = (record) => validateSyncChildRecord({ bytes: recordBytes(record), expected });
+
+  it("accepts a real SYNC-01 PASS naming this source and image", () => {
+    const observation = validate(passingSyncChild());
+    assert.equal(observation.ok, true, observation.reason);
+    assert.equal(observation.schema, "sync01-release-image-merge-timing-01");
+    assert.equal(observation.checkCount, SYNC01_MANDATORY_CHECKS.length);
+    assert.deepEqual([observation.candidateImageId, observation.runImageId, observation.networkMode], [IMAGE_ID, IMAGE_ID, "none"]);
+  });
+
+  it("refuses each way a SYNC-01 child can fall short", () => {
+    const dropped = passingSyncChild();
+    dropped.checks = dropped.checks.filter((check) => check.name !== "mp4-frag-dashlike-bframes/sync/relative-offset-preserved");
+    const noSensitivity = passingSyncChild();
+    noSensitivity.checks = noSensitivity.checks.filter((check) => !check.name.startsWith("oracle/"));
+    const failing = passingSyncChild();
+    failing.checks = failing.checks.map((check) =>
+      check.name === "webm-opus-audio-late/sync/relative-offset-preserved" ? { ...check, ok: false } : check);
+    for (const [label, record, reason] of [
+      ["a future schema", passingSyncChild(null, { schema: "sync01-release-image-merge-timing-02" }), /schema is/],
+      ["a FAIL verdict", passingSyncChild(null, { verdict: "FAIL" }), /verdict is FAIL/],
+      ["a case's timing check removed", dropped, /mandatory checks absent/],
+      ["the oracle-sensitivity control removed", noSensitivity, /mandatory checks absent/],
+      ["the WebM Opus timing check failed", failing, /did not pass/],
+      ["another source commit", passingSyncChild(null, { source: { commit: "d".repeat(40) } }), /source commit/],
+      ["another candidate image", passingSyncChild(null, { image: { imageId: IMAGE_B } }), /candidate image id/],
+      ["another run image", passingSyncChild(null, { image: { runSubject: IMAGE_B } }), /run image id/],
+      ["a network", passingSyncChild(null, { network: { mode: "bridge" } }), /network mode/],
+      ["a leaked workspace path", passingSyncChild(null, { cases: { note: "/tmp/videofetch/sync01/x" } }), /forbidden material/],
+    ]) {
+      const observation = validate(record);
+      assert.equal(observation.ok, false, label);
+      assert.match(String(observation.reason), reason, label);
+    }
+    assert.match(validateSyncChildRecord({ bytes: Buffer.from("{nope"), expected }).reason, /not parseable JSON/);
+    assert.equal(emptySyncChildObservation("gone").ok, false);
+  });
+
+  it("refuses a PASS parent for each way the SYNC-01 child can fall short, and still emits the FAIL", () => {
+    const child = (overrides) => ({ syncAcceptance: { child: overrides } });
+    for (const [label, overrides, reason] of [
+      ["SYNC child missing", { syncAcceptance: { executed: false, child: null } }, /without an executed SYNC-01 split-merge timing child/],
+      ["SYNC child absent entirely", null, /without an executed SYNC-01 split-merge timing child/],
+      ["SYNC schema wrong", child({ schema: "dash01-release-image-full-path-02" }), /split-merge timing child is dash01/],
+      ["SYNC verdict FAIL", child({ verdict: "FAIL", ok: false }), /split-merge timing child did not pass/],
+      ["one SYNC check failed", child({ failedCheckCount: 1 }), /split-merge timing child did not pass/],
+      ["no SYNC digest", child({ sha256: null }), /split-merge timing child has no content digest/],
+      ["SYNC source wrong", child({ sourceCommit: "e".repeat(40) }), /split-merge timing child names another source/],
+      ["SYNC image wrong", child({ runImageId: IMAGE_B }), /split-merge timing child names another image/],
+      ["SYNC network not none", child({ networkMode: "bridge" }), /split-merge timing child was not offline/],
+    ]) {
+      const input = evidenceInput(overrides ?? {});
+      if (overrides === null) delete input.syncAcceptance;
+      assert.throws(() => buildReleaseEvidence(input), reason, label);
+      assert.equal(buildReleaseEvidence({ ...input, verdict: "FAIL" }).verdict, "FAIL", label);
+    }
+    assert.deepEqual(REQUIRED_PASS_CHECKS.filter((name) => name.startsWith("sync/")), [
+      "sync/merge-timing-child-executed",
+      "sync/merge-timing-child-passed",
+      "sync/child-names-the-release-source",
+      "sync/child-ran-in-the-candidate-image",
+      "sync/child-evidence-unchanged-before-assembly",
+    ]);
+  });
+});
+
+describe("SPLIT-07 -07 driver: the split-merge timing child", () => {
+  const syncCalls = (world) => world.dockerCalls.filter((call) => call.args.includes(SYNC01_ORCHESTRATOR));
+
+  it("runs it last, by the immutable id, in the model posture, and binds its validated, hashed record", async () => {
+    const { result, error, world } = await drive();
+    assert.equal(error, null, error ? String(error.message) : undefined);
+    assert.equal(result.verdict, "PASS");
+    const [call] = syncCalls(world);
+    assert.equal(dockerRunSubject(call.args), IMAGE_ID);
+    assert.deepEqual(
+      releaseSyncRunPostureViolations(call.args, { reportDir: REPORT, harnessDir: HARNESS_DIR, mediaWorkspaceDir: MEDIA_WORKSPACE }),
+      [],
+    );
+    const runs = world.dockerCalls.filter((c) => c.args[0] === "run");
+    assert.equal(runs.at(-1), call, "the split-merge timing child is the last candidate container");
+    const sync = result.record.syncAcceptance;
+    assert.equal(sync.executed, true);
+    assert.equal(sync.child.schema, SYNC01_RELEASE_EVIDENCE_SCHEMA);
+    assert.deepEqual([sync.child.candidateImageId, sync.child.runImageId, sync.child.candidateTag], [IMAGE_ID, IMAGE_ID, TAG]);
+    const childBytes = world.files.get(`${REPORT}/${sync.child.evidenceFile}`);
+    assert.equal(sync.child.sha256, createHash("sha256").update(childBytes).digest("hex"));
+    assert.equal(sync.child.checks, undefined, "the parent never embeds the child document");
+    for (const name of REQUIRED_PASS_CHECKS.filter((check) => check.startsWith("sync/"))) {
+      assert.equal(result.checks.find((c) => c.name === name)?.ok, true, name);
+    }
+    assert.deepEqual(result.record.harness.verificationPoints, HARNESS_POINTS);
+  });
+
+  for (const [label, sync, check, reason] of [
+    ["the SYNC child record is missing", null, "sync/merge-timing-child-passed", /unreadable/],
+    ["the SYNC child bytes are unparseable", { raw: "{not json" }, "sync/merge-timing-child-passed", /not parseable JSON/],
+    ["the SYNC child verdict is FAIL", { verdict: "FAIL" }, "sync/merge-timing-child-passed", /verdict is FAIL/],
+    ["the SYNC child names another source tree", { source: { tree: "e".repeat(40) } }, "sync/child-names-the-release-source", null],
+    ["the SYNC child names another candidate image", { image: { imageId: IMAGE_B } }, "sync/child-ran-in-the-candidate-image", null],
+    ["the SYNC child ran with a network", { network: { mode: "bridge" } }, "sync/child-ran-in-the-candidate-image", null],
+  ]) {
+    it(`FAILs — never PASSes — when ${label}`, async () => {
+      const { result, error } = await drive({ sync });
+      assert.equal(error, null, error ? String(error.message) : undefined);
+      assert.equal(result.verdict, "FAIL");
+      assert.equal(result.record.verdict, "FAIL");
+      const failed = result.checks.find((c) => c.name === check);
+      assert.equal(failed.ok, false, check);
+      if (reason) assert.match(String(failed.detail), reason);
+      assert.equal(result.checks.find((c) => c.name === "sync/merge-timing-child-passed").ok, false);
+    });
+  }
+
+  it("FAILs when the matrix recorded a failed timing check (the corrected merge regressed)", async () => {
+    const checks = SYNC01_MANDATORY_CHECKS.map((name) => ({
+      name, ok: name !== "mp4-prog-audio-late/sync/relative-offset-preserved", detail: null,
+    }));
+    const { result } = await drive({ sync: { verdict: "FAIL", checks } });
+    assert.equal(result.verdict, "FAIL");
+    assert.match(result.checks.find((c) => c.name === "sync/merge-timing-child-passed").detail, /did not pass/);
+  });
+
+  it("FAILs when a SPLIT-06 child carries no synchronization oracle", async () => {
+    const { result } = await drive({
+      children: { webm: { checks: [{ name: "full-path/ready", ok: true, detail: null }] } },
+    });
+    assert.equal(result.verdict, "FAIL");
+    assert.equal(result.checks.find((c) => c.name === "split/webm-child-passed").ok, false);
+  });
+
+  it("refuses the record when the SYNC child's bytes change before the parent is assembled", async () => {
+    const world = createWorld();
+    const reads = new Map();
+    const deps = {
+      ...world.deps,
+      readFile: async (path) => {
+        const key = String(path);
+        const bytes = await world.deps.readFile(path);
+        if (!/\/sync01-merge-timing-/.test(key)) return bytes;
+        reads.set(key, (reads.get(key) ?? 0) + 1);
+        return reads.get(key) === 1 ? bytes : Buffer.concat([bytes, Buffer.from(" ", "utf8")]);
+      },
+    };
+    await assert.rejects(runReleaseImageAcceptance(world.options, deps), /split-merge-timing child evidence changed after it was observed/);
+    assert.equal(world.writeCalls.length, 0, "no parent record may be written");
+  });
+
+  it("refuses to run the SYNC child when its evidence path already exists, or on a non-empty workspace", async () => {
+    const taken = `${REPORT}/sync01-merge-timing-1700000000000.json`;
+    const occupied = await drive({ files: [[taken, recordBytes(passingSyncChild())]] });
+    assert.equal(occupied.result, null);
+    assert.match(String(occupied.error?.message), /refusing to replace an existing evidence artifact/);
+    assert.equal(syncCalls(occupied.world).length, 0);
+
+    const world = createWorld();
+    let listings = 0;
+    const deps = {
+      ...world.deps,
+      // …before-hls11 is the 14th listing, clear-hls11 the 15th and 16th, so
+      // before-sync01 is the 17th.
+      listMediaWorkspace: async () => {
+        listings += 1;
+        return listings === 17 ? ["stray"] : [];
+      },
+    };
+    await assert.rejects(runReleaseImageAcceptance(world.options, deps), /is not empty \(before-sync01-merge-timing\)/);
+    assert.equal(syncCalls(world).length, 0);
     assert.equal(world.writeCalls.length, 0);
   });
 });

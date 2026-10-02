@@ -20,6 +20,7 @@ import {
   mergeSplitMedia,
 } from "./ffmpeg.server.ts";
 import { resolveFfprobePath } from "./ffprobe.server.ts";
+import type { MergeSyncDecision } from "./merge-sync.ts";
 
 describe("ffmpeg local-path guard", () => {
   it("rejects remote URLs and protocol-relative inputs", () => {
@@ -345,24 +346,50 @@ describe("m4a audio extraction (worker Phase-6 plan target)", () => {
 });
 
 describe("split merge argv policy (SPLIT-02)", () => {
-  const mp4 = () =>
+  // SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001: every command carries one
+  // closed synchronization decision. These are the four states it can take.
+  const MP4_VIDEO_REF: MergeSyncDecision = { target: "mp4", reference: "video" };
+  const MP4_AUDIO_REF: MergeSyncDecision = { target: "mp4", reference: "audio" };
+  const WEBM_OPUS: MergeSyncDecision = { target: "webm", reference: "video", audioCodecDelayCompensationUs: 6_500 };
+  const WEBM_PLAIN: MergeSyncDecision = { target: "webm", reference: "video", audioCodecDelayCompensationUs: 0 };
+
+  const mp4 = (sync: MergeSyncDecision = MP4_VIDEO_REF) =>
     buildSplitMergeArgs({
       target: "mp4",
       videoPath: "/w/v.mp4",
       audioPath: "/w/a.m4a",
       outputPath: "/w/merged.mp4",
+      sync,
     });
-  const webm = () =>
+  const webm = (sync: MergeSyncDecision = WEBM_OPUS) =>
     buildSplitMergeArgs({
       target: "webm",
       videoPath: "/w/v.webm",
       audioPath: "/w/a.webm",
       outputPath: "/w/merged.webm",
+      sync,
     });
+  /** Every command the builder can produce. */
+  const all = () => [mp4(MP4_VIDEO_REF), mp4(MP4_AUDIO_REF), webm(WEBM_OPUS), webm(WEBM_PLAIN)];
 
-  it("builds the exact MP4 command family", () => {
-    assert.deepEqual(mp4(), [
+  it("builds the exact MP4 command family — audio synced to video", () => {
+    assert.deepEqual(mp4(MP4_VIDEO_REF), [
       "-n", "-nostdin", "-v", "error",
+      "-protocol_whitelist", "file", "-f", "mov", "-i", "/w/v.mp4",
+      "-isync", "0",
+      "-protocol_whitelist", "file", "-f", "mov", "-i", "/w/a.m4a",
+      "-map", "0:v:0", "-map", "1:a:0",
+      "-c:v", "copy", "-c:a", "copy",
+      "-map_metadata", "-1", "-map_chapters", "-1",
+      "-movflags", "+faststart",
+      "-f", "mp4", "/w/merged.mp4",
+    ]);
+  });
+
+  it("builds the exact MP4 command family — video synced to audio", () => {
+    assert.deepEqual(mp4(MP4_AUDIO_REF), [
+      "-n", "-nostdin", "-v", "error",
+      "-isync", "1",
       "-protocol_whitelist", "file", "-f", "mov", "-i", "/w/v.mp4",
       "-protocol_whitelist", "file", "-f", "mov", "-i", "/w/a.m4a",
       "-map", "0:v:0", "-map", "1:a:0",
@@ -373,10 +400,11 @@ describe("split merge argv policy (SPLIT-02)", () => {
     ]);
   });
 
-  it("builds the exact WebM command family", () => {
-    assert.deepEqual(webm(), [
+  it("builds the exact WebM command family — Opus CodecDelay compensated", () => {
+    assert.deepEqual(webm(WEBM_OPUS), [
       "-n", "-nostdin", "-v", "error",
       "-protocol_whitelist", "file", "-f", "matroska", "-i", "/w/v.webm",
+      "-itsoffset", "0.006500", "-isync", "0",
       "-protocol_whitelist", "file", "-f", "matroska", "-i", "/w/a.webm",
       "-map", "0:v:0", "-map", "1:a:0",
       "-c:v", "copy", "-c:a", "copy",
@@ -385,12 +413,84 @@ describe("split merge argv policy (SPLIT-02)", () => {
     ]);
   });
 
+  it("builds the exact WebM command family — no compensation", () => {
+    assert.deepEqual(webm(WEBM_PLAIN), [
+      "-n", "-nostdin", "-v", "error",
+      "-protocol_whitelist", "file", "-f", "matroska", "-i", "/w/v.webm",
+      "-isync", "0",
+      "-protocol_whitelist", "file", "-f", "matroska", "-i", "/w/a.webm",
+      "-map", "0:v:0", "-map", "1:a:0",
+      "-c:v", "copy", "-c:a", "copy",
+      "-map_metadata", "-1", "-map_chapters", "-1",
+      "-f", "webm", "/w/merged.webm",
+    ]);
+  });
+
+  it("places each sync option as an INPUT option of exactly its target input, with a fixed reference", () => {
+    // `-isync N` must sit among the options of the input it re-bases: before
+    // that input's `-i`, after the previous input's `-i`.
+    const placements: ReadonlyArray<readonly [string[], number, string]> = [
+      [mp4(MP4_VIDEO_REF), 1, "0"],
+      [mp4(MP4_AUDIO_REF), 0, "1"],
+      [webm(WEBM_OPUS), 1, "0"],
+      [webm(WEBM_PLAIN), 1, "0"],
+    ];
+    for (const [args, targetInput, reference] of placements) {
+      const isync = args.flatMap((arg, index) => (arg === "-isync" ? [index] : []));
+      assert.equal(isync.length, 1, "exactly one -isync");
+      assert.equal(args[isync[0] + 1], reference);
+      const inputs = args.flatMap((arg, index) => (arg === "-i" ? [index] : []));
+      const owner = inputs.findIndex((at) => at > isync[0]);
+      assert.equal(owner, targetInput, "the -isync belongs to its intended input");
+      assert.ok(targetInput === 0 || isync[0] > inputs[0], "never before an earlier input's -i");
+    }
+    // The Opus compensation belongs to the AUDIO input only.
+    const opus = webm(WEBM_OPUS);
+    const at = opus.indexOf("-itsoffset");
+    const audioInput = opus.lastIndexOf("-i");
+    assert.ok(at > opus.indexOf("-i") && at < audioInput);
+  });
+
+  it("refuses a decision for the other target, or a malformed decision, with the canonical code", () => {
+    const bad: unknown[] = [
+      undefined,
+      null,
+      WEBM_OPUS, // a WebM decision on an MP4 command
+      { target: "mp4", reference: "both" },
+      { target: "mp4", reference: 1 },
+      { target: "mp4" },
+    ];
+    for (const sync of bad) {
+      assert.throws(
+        () => buildSplitMergeArgs({ target: "mp4", videoPath: "/w/v.mp4", audioPath: "/w/a.m4a", outputPath: "/w/merged.mp4", sync: sync as MergeSyncDecision }),
+        (err: unknown) => err instanceof AppError && err.code === "PROCESSING_FAILED",
+        JSON.stringify(sync),
+      );
+    }
+  });
+
+  it("ignores any extra property smuggled onto a valid decision", () => {
+    const smuggled = { target: "mp4", reference: "video", args: ["-copyts"], index: 7 } as unknown as MergeSyncDecision;
+    assert.deepEqual(mp4(smuggled), mp4(MP4_VIDEO_REF));
+  });
+
+  it("never uses a forbidden timestamp policy", () => {
+    for (const args of all()) {
+      for (const flag of ["-copyts", "-start_at_zero", "-avoid_negative_ts", "-output_ts_offset", "-ss", "-t", "-to"]) {
+        assert.ok(!args.includes(flag), `no ${flag}`);
+      }
+    }
+    for (const args of [mp4(MP4_VIDEO_REF), mp4(MP4_AUDIO_REF), webm(WEBM_PLAIN)]) assert.ok(!args.includes("-itsoffset"));
+  });
+
   it("restricts EACH input to local file access with an explicit demuxer", () => {
     // M1 guard. The whitelist is a per-input option, so it must precede both
     // `-i` flags, not just the first.
     for (const [args, demuxer] of [
-      [mp4(), "mov"],
-      [webm(), "matroska"],
+      [mp4(MP4_VIDEO_REF), "mov"],
+      [mp4(MP4_AUDIO_REF), "mov"],
+      [webm(WEBM_OPUS), "matroska"],
+      [webm(WEBM_PLAIN), "matroska"],
     ] as const) {
       const inputs = args.flatMap((arg, index) => (arg === "-i" ? [index] : []));
       assert.equal(inputs.length, 2, "exactly two inputs");
@@ -402,7 +502,7 @@ describe("split merge argv policy (SPLIT-02)", () => {
 
   it("maps exactly one video stream from input 0 and one audio stream from input 1", () => {
     // M3 guard.
-    for (const args of [mp4(), webm()]) {
+    for (const args of all()) {
       const maps = args.flatMap((arg, index) => (arg === "-map" ? [args[index + 1]] : []));
       assert.deepEqual(maps, ["0:v:0", "1:a:0"]);
     }
@@ -415,7 +515,7 @@ describe("split merge argv policy (SPLIT-02)", () => {
       "aac", "libmp3lame", "libaom-av1", "libsvtav1", "h264", "vp9", "opus",
     ];
     const flags = ["-c", "-codec", "-vcodec", "-acodec", "-vf", "-af", "-filter_complex", "-crf", "-b:v", "-b:a"];
-    for (const args of [mp4(), webm()]) {
+    for (const args of all()) {
       assert.equal(args[args.indexOf("-c:v") + 1], "copy");
       assert.equal(args[args.indexOf("-c:a") + 1], "copy");
       for (const encoder of encoders) assert.ok(!args.includes(encoder), `no ${encoder}`);
@@ -424,31 +524,33 @@ describe("split merge argv policy (SPLIT-02)", () => {
   });
 
   it("never truncates the video with -shortest", () => {
-    for (const args of [mp4(), webm()]) assert.ok(!args.includes("-shortest"));
+    for (const args of all()) assert.ok(!args.includes("-shortest"));
   });
 
   it("forces the output muxer from the closed target, not the extension", () => {
-    assert.deepEqual(mp4().slice(-3), ["-f", "mp4", "/w/merged.mp4"]);
-    assert.deepEqual(webm().slice(-3), ["-f", "webm", "/w/merged.webm"]);
+    for (const sync of [MP4_VIDEO_REF, MP4_AUDIO_REF]) assert.deepEqual(mp4(sync).slice(-3), ["-f", "mp4", "/w/merged.mp4"]);
+    for (const sync of [WEBM_OPUS, WEBM_PLAIN]) assert.deepEqual(webm(sync).slice(-3), ["-f", "webm", "/w/merged.webm"]);
   });
 
   it("drops upstream metadata and chapters", () => {
-    for (const args of [mp4(), webm()]) {
+    for (const args of all()) {
       assert.equal(args[args.indexOf("-map_metadata") + 1], "-1");
       assert.equal(args[args.indexOf("-map_chapters") + 1], "-1");
     }
   });
 
   it("uses +faststart for MP4 only and injects no MP4 option into WebM", () => {
-    assert.equal(mp4()[mp4().indexOf("-movflags") + 1], "+faststart");
-    assert.ok(!webm().includes("-movflags"));
-    assert.ok(!webm().includes("+faststart"));
+    for (const sync of [MP4_VIDEO_REF, MP4_AUDIO_REF]) assert.equal(mp4(sync)[mp4(sync).indexOf("-movflags") + 1], "+faststart");
+    for (const sync of [WEBM_OPUS, WEBM_PLAIN]) {
+      assert.ok(!webm(sync).includes("-movflags"));
+      assert.ok(!webm(sync).includes("+faststart"));
+    }
   });
 
   it("never overwrites: -n leads BOTH command families and -y appears nowhere (SPLIT-04)", () => {
     // M9 guard. `-y` would let FFmpeg truncate an output entry that appeared
     // after `mergeSplitMedia`'s own existence check.
-    for (const args of [mp4(), webm()]) {
+    for (const args of all()) {
       assert.equal(args[0], "-n");
       assert.equal(args.filter((arg) => arg === "-n").length, 1);
       assert.ok(!args.includes("-y"), "no -y anywhere in the split merge");
@@ -491,6 +593,7 @@ describe("split merge execution (SPLIT-02)", () => {
 
   afterEach(async () => {
     setProcessRunnerTestHooks(null);
+    webmAudioBytes = null;
     await rm(workDir, { recursive: true, force: true });
   });
 
@@ -499,13 +602,22 @@ describe("split merge execution (SPLIT-02)", () => {
     return readFile(join(import.meta.dirname, "testdata", `pinned-ffprobe-${name}.json`), "utf8");
   }
 
-  /** A probe document of an arbitrary shape, for the rejection cases. */
-  function doc(formatName: string, kinds: readonly string[]): string {
+  /**
+   * A probe document of an arbitrary shape, for the rejection cases. Carries a
+   * `start_time` (the pinned `%f` form) unless `startTime` is `null`; the
+   * merge's input probes require it, its output probe ignores it.
+   */
+  function doc(formatName: string, kinds: readonly string[], startTime: unknown = "0.000000"): string {
     return JSON.stringify({
       programs: [],
       streams: kinds.map((codec_type) => ({ codec_type })),
-      format: { format_name: formatName },
+      format: startTime === null ? { format_name: formatName } : { format_name: formatName, start_time: startTime },
     });
+  }
+
+  /** A real FFmpeg-written WebM audio header prefix (see testdata/README.md). */
+  function pinnedMatroska(codec: "opus" | "vorbis"): Promise<Buffer> {
+    return readFile(join(import.meta.dirname, "testdata", `pinned-matroska-header-${codec}-audio.bin`));
   }
 
   async function defaultOutput(outputPath: string): Promise<void> {
@@ -578,11 +690,17 @@ describe("split merge execution (SPLIT-02)", () => {
     return { calls, children, groupKills, ffmpegCalls };
   }
 
+  /**
+   * The two halves. A WebM audio half is a REAL Opus header prefix, because the
+   * merge reads its CodecDelay from the file itself; everything else is opaque
+   * bytes, since only the (scripted) probes look at it.
+   */
+  let webmAudioBytes: Buffer | string | null = null;
   async function inputs(target: string) {
     const videoPath = join(workDir, target === "mp4" ? "v.mp4" : "v.webm");
     const audioPath = join(workDir, target === "mp4" ? "a.m4a" : "a.webm");
     await writeFile(videoPath, "video-bytes");
-    await writeFile(audioPath, "audio-bytes");
+    await writeFile(audioPath, target === "webm" ? (webmAudioBytes ?? (await pinnedMatroska("opus"))) : "audio-bytes");
     return { videoPath, audioPath };
   }
 
@@ -614,8 +732,8 @@ describe("split merge execution (SPLIT-02)", () => {
 
   it("merges an ISO-BMFF video-only + audio-only pair into a validated MP4", async () => {
     const { calls, ffmpegCalls } = harness([
-      { kind: "probe", stdout: await pinned("iso-bmff-video-only") },
-      { kind: "probe", stdout: await pinned("iso-bmff-audio-only") },
+      { kind: "probe", stdout: await pinned("timed-iso-bmff-video-only") },
+      { kind: "probe", stdout: await pinned("timed-iso-bmff-audio-only") },
       { kind: "ffmpeg" },
       { kind: "probe", stdout: await pinned("iso-bmff-merged") },
     ]);
@@ -640,6 +758,15 @@ describe("split merge execution (SPLIT-02)", () => {
       assert.equal(calls[index].args[calls[index].args.length - 1], path);
       assert.equal(calls[index].args[calls[index].args.indexOf("-f") + 1], "mov");
     }
+    // The two INPUT probes are timed; the artifact probe is the untimed one.
+    for (const [index, entries] of [
+      [0, "format=format_name,start_time:stream=codec_type"],
+      [1, "format=format_name,start_time:stream=codec_type"],
+      [3, "format=format_name:stream=codec_type"],
+    ] as const) {
+      assert.equal(calls[index].args[calls[index].args.indexOf("-show_entries") + 1], entries);
+    }
+    // Equal starts (0.000000 / 0.000000): the audio is synced to the video.
     assert.deepEqual(
       ffmpegCalls()[0].args,
       buildSplitMergeArgs({
@@ -647,14 +774,15 @@ describe("split merge execution (SPLIT-02)", () => {
         videoPath: join(real, "v.mp4"),
         audioPath: join(real, "a.m4a"),
         outputPath: expectedOut,
+        sync: { target: "mp4", reference: "video" },
       }),
     );
   });
 
   it("merges a WebM video-only + audio-only pair into a validated WebM", async () => {
     const { calls, ffmpegCalls } = harness([
-      { kind: "probe", stdout: await pinned("webm-video-only") },
-      { kind: "probe", stdout: await pinned("webm-audio-only") },
+      { kind: "probe", stdout: await pinned("timed-webm-video-only") },
+      { kind: "probe", stdout: await pinned("timed-webm-audio-only-opus") },
       { kind: "ffmpeg" },
       { kind: "probe", stdout: await pinned("webm-merged") },
     ]);
@@ -673,6 +801,8 @@ describe("split merge execution (SPLIT-02)", () => {
         videoPath: join(real, "v.webm"),
         audioPath: join(real, "a.webm"),
         outputPath: join(real, "merged.webm"),
+        // The audio half's own CodecDelay (6,500,000 ns) is compensated.
+        sync: { target: "webm", reference: "video", audioCodecDelayCompensationUs: 6_500 },
       }),
     );
   });
@@ -1045,5 +1175,145 @@ describe("split merge execution (SPLIT-02)", () => {
     } finally {
       await rm(outside, { recursive: true, force: true });
     }
+  });
+  // ── SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001 ─────────────────────
+
+  /** The merge argv's sync tokens: everything between `-v error` and the audio input's `-protocol_whitelist`, minus the video input. */
+  function syncTokens(args: readonly string[]): { input0: string[]; input1: string[] } {
+    const inputs = args.flatMap((arg, index) => (arg === "-i" ? [index] : []));
+    const firstInputOptions = args.indexOf("-protocol_whitelist");
+    const secondInputOptions = args.indexOf("-protocol_whitelist", inputs[0]);
+    return {
+      input0: args.slice(4, firstInputOptions),
+      input1: args.slice(inputs[0] + 2, secondInputOptions),
+    };
+  }
+
+  it("selects the MP4 sync direction from the two probed local start times", async () => {
+    // [label, video start, audio start, expected input-0 / input-1 tokens]
+    const cases: ReadonlyArray<readonly [string, string, string, string[], string[]]> = [
+      ["video first", "0.000000", "0.453991", [], ["-isync", "0"]],
+      ["audio first", "0.400000", "0.000000", ["-isync", "1"], []],
+      ["equal starts", "0.000000", "0.000000", [], ["-isync", "0"]],
+      ["shared non-zero base, video first", "10.100000", "10.556000", [], ["-isync", "0"]],
+      ["shared non-zero base, audio first", "10.500000", "10.078000", ["-isync", "1"], []],
+      ["negative audio start (priming)", "0.000000", "-0.021333", ["-isync", "1"], []],
+      ["one microsecond apart", "0.000001", "0.000000", ["-isync", "1"], []],
+    ];
+    for (const [label, videoStart, audioStart, input0, input1] of cases) {
+      await rm(join(workDir, "merged.mp4"), { force: true });
+      const { ffmpegCalls } = harness([
+        { kind: "probe", stdout: doc(ISO, ["video"], videoStart) },
+        { kind: "probe", stdout: doc(ISO, ["audio"], audioStart) },
+        { kind: "ffmpeg" },
+        { kind: "probe", stdout: doc(ISO, ["video", "audio"], null) },
+      ]);
+      await merge({ target: "mp4" });
+      assert.deepEqual(syncTokens(ffmpegCalls()[0].args), { input0, input1 }, label);
+    }
+  });
+
+  it("uses the pinned captures' real start-time text to choose the direction", async () => {
+    const { ffmpegCalls } = harness([
+      { kind: "probe", stdout: await pinned("timed-iso-bmff-video-only-late") },
+      { kind: "probe", stdout: await pinned("timed-iso-bmff-audio-only") },
+      { kind: "ffmpeg" },
+      { kind: "probe", stdout: await pinned("iso-bmff-merged") },
+    ]);
+    await merge({ target: "mp4" });
+    assert.deepEqual(syncTokens(ffmpegCalls()[0].args), { input0: ["-isync", "1"], input1: [] });
+  });
+
+  it("fails before the merge subprocess when an input's start time is missing or invalid", async () => {
+    const invalid: unknown[] = [null, "N/A", "1e3", "nan", "+0.000000", "0.0", "2147483648.000000", 0, ""];
+    for (const value of invalid) {
+      for (const half of ["video", "audio"] as const) {
+        const steps: Step[] =
+          half === "video"
+            ? [{ kind: "probe", stdout: doc(ISO, ["video"], value) }]
+            : [
+                { kind: "probe", stdout: doc(ISO, ["video"]) },
+                { kind: "probe", stdout: doc(ISO, ["audio"], value) },
+              ];
+        const { calls, ffmpegCalls } = harness(steps);
+        await rejectsWith("PROCESSING_FAILED", () => merge({ target: "mp4" }));
+        assert.equal(ffmpegCalls().length, 0, `${half} ${JSON.stringify(value)}: FFmpeg must not run`);
+        assert.equal(calls.length, steps.length, `${half} ${JSON.stringify(value)}: no further spawn`);
+      }
+    }
+  });
+
+  it("compensates the WebM audio half's own Opus CodecDelay, and nothing for Vorbis", async () => {
+    for (const [codec, input1] of [
+      ["opus", ["-itsoffset", "0.006500", "-isync", "0"]],
+      ["vorbis", ["-isync", "0"]],
+    ] as const) {
+      await rm(join(workDir, "merged.webm"), { force: true });
+      webmAudioBytes = await pinnedMatroska(codec);
+      const { ffmpegCalls } = harness([
+        { kind: "probe", stdout: doc(WEBM, ["video"], "0.400000") },
+        { kind: "probe", stdout: doc(WEBM, ["audio"], codec === "opus" ? "-0.007000" : "0.000000") },
+        { kind: "ffmpeg" },
+        { kind: "probe", stdout: doc(WEBM, ["video", "audio"], null) },
+      ]);
+      await merge({ target: "webm" });
+      assert.deepEqual(syncTokens(ffmpegCalls()[0].args), { input0: [], input1: [...input1] }, codec);
+    }
+  });
+
+  it("refuses a WebM audio half whose own header is not readable, after both probes and before FFmpeg", async () => {
+    const opus = await pinnedMatroska("opus");
+    const codecAt = opus.indexOf(Buffer.from("A_OPUS", "latin1"));
+    const unknownCodec = Buffer.from(opus);
+    unknownCodec.write("A_OPUZ", codecAt, "latin1");
+    for (const bytes of ["audio-bytes", opus.subarray(0, codecAt), unknownCodec]) {
+      await rm(join(workDir, "merged.webm"), { force: true });
+      webmAudioBytes = bytes;
+      const { calls, ffmpegCalls } = harness([
+        { kind: "probe", stdout: doc(WEBM, ["video"]) },
+        { kind: "probe", stdout: doc(WEBM, ["audio"]) },
+      ]);
+      await rejectsWith("PROCESSING_FAILED", () => merge({ target: "webm" }));
+      // The local read happens only after both halves were validated (two
+      // probes ran), and nothing is merged.
+      assert.equal(calls.length, 2);
+      assert.equal(ffmpegCalls().length, 0);
+    }
+  });
+
+  it("never reads a WebM audio half that failed containment or regular-file validation", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "vf-mkv-outside-"));
+    try {
+      const target = join(outside, "a.webm");
+      await writeFile(target, await pinnedMatroska("opus"));
+      const linked = join(workDir, "linked.webm");
+      await symlink(target, linked);
+      const { calls } = harness([]);
+      await rejectsWith("PROCESSING_FAILED", () => merge({ target: "webm", audioPath: linked }));
+      assert.equal(calls.length, 0, "refused at stage 1: no probe, no read, no merge");
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("gives a caller no way to inject FFmpeg options or a sync decision", async () => {
+    const { ffmpegCalls } = harness([
+      { kind: "probe", stdout: doc(ISO, ["video"], "0.400000") },
+      { kind: "probe", stdout: doc(ISO, ["audio"], "0.000000") },
+      { kind: "ffmpeg" },
+      { kind: "probe", stdout: doc(ISO, ["video", "audio"]) },
+    ]);
+    const smuggled = {
+      sync: { target: "mp4", reference: "video" },
+      args: ["-copyts"],
+      extraArgs: ["-shortest"],
+      reference: "video",
+      videoStartUs: 0,
+    } as unknown as Partial<MergeOptions>;
+    await merge({ target: "mp4", ...smuggled });
+    const args = ffmpegCalls()[0].args;
+    // The decision came from the files (video starts later), not the caller.
+    assert.deepEqual(syncTokens(args), { input0: ["-isync", "1"], input1: [] });
+    for (const flag of ["-copyts", "-shortest"]) assert.ok(!args.includes(flag), flag);
   });
 });
