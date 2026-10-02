@@ -4536,7 +4536,13 @@ describe("SOURCE-FILESIZE-ESTIMATE-DRIFT-001: declared vs approximate sizes", ()
     assert.equal(Object.hasOwn(result.hlsSelections, "preset:720"), false);
     assert.equal(singleSource(result.selections["preset:720"]).formatId, "prog-720");
     const plan = deriveExecutionPlan(
-      { strategy: "yt-dlp", video: result.video, selections: result.selections, hlsSelections: result.hlsSelections },
+      {
+        strategy: "yt-dlp",
+        video: result.video,
+        selections: result.selections,
+        hlsSelections: result.hlsSelections,
+        separateHlsSelections: result.separateHlsSelections,
+      },
       "preset:720",
     );
     assert.equal(plan.strategy === "yt-dlp" ? plan.generic.operation : null, "keep-original");

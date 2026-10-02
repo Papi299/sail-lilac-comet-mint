@@ -53,7 +53,16 @@ function planSource(plan: GenericExecutionPlan): GenericSourceSelection {
     "clear-hls-remux",
     "ordinary generic derivation must never produce a clear-HLS plan",
   );
-  if (plan.operation === "merge-split" || plan.operation === "clear-hls-remux") {
+  assert.notEqual(
+    plan.operation,
+    "clear-hls-separate-audio-remux",
+    "ordinary generic derivation must never produce a separate-audio clear-HLS plan",
+  );
+  if (
+    plan.operation === "merge-split" ||
+    plan.operation === "clear-hls-remux" ||
+    plan.operation === "clear-hls-separate-audio-remux"
+  ) {
     throw new Error("unreachable");
   }
   return plan.source;
@@ -667,7 +676,7 @@ describe("strategy-aware plan wrapper (§19)", () => {
     });
 
     const plan = deriveExecutionPlan(
-      { strategy: "direct", video: meta, selections: {}, hlsSelections: {} },
+      { strategy: "direct", video: meta, selections: {}, hlsSelections: {}, separateHlsSelections: {} },
       "direct-original",
     );
     assert.equal(plan.strategy, "direct");
@@ -682,7 +691,7 @@ describe("strategy-aware plan wrapper (§19)", () => {
     assert.throws(
       () =>
         deriveExecutionPlan(
-          { strategy: "direct", video: {} as never, selections: {}, hlsSelections: {} },
+          { strategy: "direct", video: {} as never, selections: {}, hlsSelections: {}, separateHlsSelections: {} },
           "bv+ba",
         ),
       (err: unknown) => err instanceof AppError && err.code === "FORMAT_UNAVAILABLE",
@@ -792,6 +801,7 @@ describe("generic SPLIT execution plan (SPLIT-01)", () => {
         video: meta([{ id: "preset:1080", container: "mp4", hasVideo: true }]),
         selections: { "preset:1080": splitSource() },
         hlsSelections: {},
+        separateHlsSelections: {},
       },
       "preset:1080",
     );
@@ -1153,6 +1163,8 @@ describe("generic SPLIT execution plan (SPLIT-01)", () => {
           assert.equal(plan.targetContainer, "mp4", id);
         } else if (plan.operation === "clear-hls-remux") {
           assert.fail(`${id}: ordinary derivation must never produce a clear-HLS plan`);
+        } else if (plan.operation === "clear-hls-separate-audio-remux") {
+          assert.fail(`${id}: ordinary derivation must never produce a separate-audio clear-HLS plan`);
         } else {
           assert.equal(plan.source.formatId, "720m", id);
         }

@@ -912,23 +912,29 @@ describe("HLS-5/HLS-7 structure: analysis produces the channel, the planner alon
     }
   });
 
-  it("is not read by the JobExecutor, whose only HLS edge is the HLS-6 seam", () => {
+  it("is not read by the JobExecutor, whose only HLS edges are the two orchestration seams", () => {
     const source = read("src/worker/execution/job-executor.server.ts");
-    // The direct path STATES an empty map — that is the contract — but nothing
+    // The direct path STATES empty maps — that is the contract — but nothing
     // reads one.
     assert.equal(source.includes("hlsSelections: {}"), true);
+    assert.equal(source.includes("separateHlsSelections: {}"), true);
     assert.equal(source.includes("analysis.hlsSelections"), false);
-    // The executor cannot even name the HLS-5 vocabulary, so it has no type with
-    // which to read a selection, let alone a map to read it from.
+    assert.equal(source.includes("analysis.separateHlsSelections"), false);
+    // The executor cannot even name either selection vocabulary, so it has no
+    // type with which to read a selection, let alone a map to read it from.
     assert.equal(source.includes("hls-source-selection"), false);
+    assert.equal(source.includes("hls-separate-audio-selection"), false);
 
-    // Exactly ONE HLS import: the HLS-6 orchestration seam. Every HLS-2/3/4
-    // primitive stays behind it — the case below proves that separately.
+    // Exactly TWO HLS imports: the HLS-6 orchestration seam and, since
+    // HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001, the separate-audio one.
+    // Every HLS-2/3/4 primitive stays behind them — the case below proves that
+    // separately — and no master-proof seam is reachable from execution.
     const imports = [...source.matchAll(/^import[^;]*?from\s+"([^"]+)"/gm)].map((m) => m[1]);
     assert.deepEqual(
       imports.filter((specifier) => specifier.includes("hls")),
-      ["../hls/hls-execution.server.ts"],
+      ["../hls/hls-execution.server.ts", "../hls/hls-separate-audio-execution.server.ts"],
     );
+    assert.equal(source.includes("hls-master-"), false, "execution never re-proves a master");
   });
 
   it("calls no HLS-2/3/4 primitive from Product execution", () => {
@@ -953,10 +959,59 @@ describe("HLS-5/HLS-7 structure: analysis produces the channel, the planner alon
     }
   });
 
-  it("performs no playlist fetch during analysis", () => {
+  /**
+   * HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001 REPLACES the HLS-5/HLS-7
+   * invariant "analysis performs no playlist fetch" with a narrower one, rather
+   * than deleting it: separate-audio presets must be provable before they are
+   * advertised, so analysis may now perform the bounded MASTER proof — and
+   * nothing else on the network of its own:
+   *
+   *   - the analysis module names no network or DNS facility itself;
+   *   - its one network-capable HLS edge is `proveSeparateHlsAudioPairs`, from
+   *     the master-pairing seam;
+   *   - that seam's only request is a zero-redirect `safeGet` of a master, and
+   *     it can reach no media-playlist preflight, fragment acquisition,
+   *     processing, FFmpeg, ffprobe or subprocess — so no media playlist, map or
+   *     segment, and no media byte, can be requested during analysis;
+   *   - yt-dlp analysis itself stays metadata-only (its argv is pinned
+   *     elsewhere: `--skip-download`, no FFmpeg location).
+   */
+  it("performs no media-playlist, map or segment fetch during analysis: only the bounded master proof", () => {
     const source = read("src/worker/analysis/ytdlp-analysis.server.ts");
-    for (const forbidden of ["safeGet", "safeHttpRequest", "lookupHost", "fetch("]) {
-      assert.equal(source.includes(forbidden), false, `analysis must not call ${forbidden}`);
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/.*$/gm, "$1");
+    assert.ok(code.includes("proveSeparateHlsAudioPairs"), "positive control: the one proof call");
+    for (const forbidden of ["safeGet", "safeHttpRequest", "lookupHost", "fetch(", "node:http", "node:dns"]) {
+      assert.equal(source.includes(forbidden), false, `analysis must not call ${forbidden} itself`);
+    }
+    const hlsImports = [...code.matchAll(/^import[^;]*?from\s+"([^"]+)"/gm)]
+      .map((m) => m[1]!)
+      .filter((specifier) => specifier.includes("/hls/"));
+    assert.deepEqual(hlsImports.sort(), [
+      "../hls/hls-master-pairing.server.ts",
+      "../hls/hls-separate-audio-selection.ts",
+      "../hls/hls-source-selection.ts",
+    ]);
+
+    const seam = read("src/worker/hls/hls-master-pairing.server.ts");
+    const seamCode = seam.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/.*$/gm, "$1");
+    // Exactly ONE request site, and it refuses every redirect.
+    assert.equal([...seamCode.matchAll(/\bsafeGet\(/g)].length, 1);
+    assert.match(seamCode, /safeGet\(masterUrl, \{ signal, timeoutMs: budgetMs, maxRedirects: 0 \}\)/);
+    for (const forbidden of [
+      "safeHttpRequest",
+      "safeHead",
+      "hls-preflight",
+      "hls-fragment-acquisition",
+      "hls-processing",
+      "hls-execution",
+      "preflightClearHlsMediaPlaylist",
+      "ffmpeg",
+      "ffprobe",
+      "process-runner",
+      "node:child_process",
+      "node:fs",
+    ]) {
+      assert.equal(seamCode.includes(forbidden), false, `the master seam must not reach ${forbidden}`);
     }
   });
 

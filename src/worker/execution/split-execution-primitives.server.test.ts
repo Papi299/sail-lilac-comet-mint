@@ -113,6 +113,7 @@ function splitAnalysis(target: SplitTarget): ExecutionAnalysis {
     // No preset here is owned by clear HLS, so the HLS half of the fresh
     // analysis is empty — which the ordinary planner reads since HLS-7.
     hlsSelections: {},
+    separateHlsSelections: {},
   };
 }
 

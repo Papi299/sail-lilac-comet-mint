@@ -12,6 +12,7 @@ import {
   hasClearHlsPublicPresetFacts,
   type ClearHlsMediaPlaylistSelections,
 } from "../hls/hls-source-selection.ts";
+import type { ClearHlsSeparateAudioSelections } from "../hls/hls-separate-audio-selection.ts";
 import {
   GenericPresetSourceSchema,
   GenericSourceContainerSchema,
@@ -418,10 +419,12 @@ function refineProgressiveSingleSource(
  * merging: the two operations share a vocabulary, not a capability.
  *
  * `preset:audio` and `preset:mp3` are not members, so an HLS audio product is
- * unrepresentable rather than merely refused — clear HLS has no audio pairing
- * (HLS v2 did not add one: the pinned yt-dlp exposes no video→audio rendition
- * relationship) and no independent HLS audio capability. `direct-original` is not a member either:
- * HLS analysis advertises no concrete formats.
+ * unrepresentable rather than merely refused — clear HLS has no independent
+ * audio capability. The separate-audio family
+ * (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001) pairs an audio playlist WITH
+ * a video one, proven from the fetched Master Playlist, and fulfils video
+ * presets only, from this same vocabulary. `direct-original` is not a member
+ * either: HLS analysis advertises no concrete formats.
  */
 export const ClearHlsVideoPresetIdSchema = z.enum(GENERIC_SPLIT_VIDEO_PRESET_IDS);
 export type ClearHlsVideoPresetId = z.infer<typeof ClearHlsVideoPresetIdSchema>;
@@ -558,6 +561,84 @@ export function snapshotClearHlsSelection(value: unknown): ClearHlsExecutionSour
 const ClearHlsExecutionSourceSchema = z
   .object({
     playlistUrl: z.string().min(1).max(CLEAR_HLS_V1_MAX_PLAYLIST_URL_BYTES),
+    height: z.number().int().min(1).max(SOURCE_QUALITY_MAX_HEIGHT).nullable(),
+  })
+  .strict();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SEPARATE-AUDIO CLEAR-HLS PLANNING — HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The EXECUTION-AUTHORITY view of one separate-audio selection: the two media
+ * playlists the fetched Master Playlist proved belong together, and the rung
+ * height. Structurally the analysis selection, deliberately a distinct type —
+ * holding one means holding values this module captured and validated.
+ *
+ * No master URL, group id, language, label or format id exists here: once the
+ * pair was proven, the two playlists ARE the provenance.
+ */
+export type ClearHlsSeparateAudioExecutionSource = {
+  readonly videoPlaylistUrl: string;
+  readonly audioPlaylistUrl: string;
+  readonly height: number | null;
+};
+
+/** The three fields a separate-audio selection carries, and the only three. */
+const CLEAR_HLS_SEPARATE_AUDIO_SELECTION_FIELDS = ["videoPlaylistUrl", "audioPlaylistUrl", "height"] as const;
+
+/**
+ * PARSE one separate-audio selection into a validated snapshot, or refuse it —
+ * `snapshotClearHlsSelection()`'s discipline exactly, for three fields:
+ *
+ *   - a frozen ordinary object whose COMPLETE own-property set is the three
+ *     fields, each an own DATA property (an accessor is refused without being
+ *     invoked), so a getter cannot answer one URL to validation and another to
+ *     acquisition;
+ *   - BOTH URLs returned UNCHANGED by the clear-HLS static acceptance (absolute
+ *     public http(s), no credentials, within the byte ceiling), and different
+ *     from each other — a pair whose halves are one playlist is no pair;
+ *   - `height` null or on the observed-height contract.
+ *
+ * Every refusal is `null`; nothing sensitive is echoed anywhere.
+ */
+export function snapshotClearHlsSeparateAudioSelection(
+  value: unknown,
+): ClearHlsSeparateAudioExecutionSource | null {
+  if (typeof value !== "object" || value === null) return null;
+  if (!Object.isFrozen(value)) return null;
+  if (Object.getPrototypeOf(value) !== Object.prototype) return null;
+  if (Reflect.ownKeys(value).length !== CLEAR_HLS_SEPARATE_AUDIO_SELECTION_FIELDS.length) return null;
+
+  const captured: Record<string, unknown> = {};
+  for (const field of CLEAR_HLS_SEPARATE_AUDIO_SELECTION_FIELDS) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, field);
+    if (descriptor === undefined) return null;
+    if (!("value" in descriptor)) return null;
+    captured[field] = descriptor.value;
+  }
+
+  const { videoPlaylistUrl, audioPlaylistUrl, height } = captured;
+  if (typeof videoPlaylistUrl !== "string" || videoPlaylistUrl.length === 0) return null;
+  if (typeof audioPlaylistUrl !== "string" || audioPlaylistUrl.length === 0) return null;
+  if (acceptClearHlsPlaylistUrl(videoPlaylistUrl) !== videoPlaylistUrl) return null;
+  if (acceptClearHlsPlaylistUrl(audioPlaylistUrl) !== audioPlaylistUrl) return null;
+  if (videoPlaylistUrl === audioPlaylistUrl) return null;
+
+  if (height !== null) {
+    if (typeof height !== "number") return null;
+    if (!Number.isSafeInteger(height)) return null;
+    if (height < 1 || height > SOURCE_QUALITY_MAX_HEIGHT) return null;
+  }
+
+  return Object.freeze({ videoPlaylistUrl, audioPlaylistUrl, height });
+}
+
+/** The plan-shaped view of a validated separate-audio selection. */
+const ClearHlsSeparateAudioExecutionSourceSchema = z
+  .object({
+    videoPlaylistUrl: z.string().min(1).max(CLEAR_HLS_V1_MAX_PLAYLIST_URL_BYTES),
+    audioPlaylistUrl: z.string().min(1).max(CLEAR_HLS_V1_MAX_PLAYLIST_URL_BYTES),
     height: z.number().int().min(1).max(SOURCE_QUALITY_MAX_HEIGHT).nullable(),
   })
   .strict();
@@ -729,6 +810,41 @@ export const GenericExecutionPlanSchema = z.discriminatedUnion("operation", [
       targetContainer: z.literal(CLEAR_HLS_TARGET_CONTAINER),
     })
     .strict(),
+  /**
+   * HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: a video preset fulfilled by
+   * a video-only fMP4 media playlist plus the ONE audio-only fMP4 media
+   * playlist its fetched Master Playlist proved belongs to it. VideoFetch
+   * acquires both halves itself and merges them, by stream copy and with the
+   * shared timestamp policy, into MP4.
+   *
+   * A private, closed operation: the string never crosses the browser API. The
+   * plan carries the two proven playlist URLs and application-owned facts only —
+   * no master URL, group id, raw tag, format id, header or signed value beyond
+   * the two URLs themselves.
+   *
+   * REACHABLE FROM ORDINARY PRODUCT DERIVATION exactly one way: a requested
+   * preset the FRESH analysis's `separateHlsSelections` — and nothing else —
+   * owns. Never a fallback from another family's refusal.
+   */
+  z
+    .object({
+      strategy: z.literal("yt-dlp"),
+      operation: z.literal("clear-hls-separate-audio-remux"),
+      requestedFormatId: ClearHlsVideoPresetIdSchema,
+      source: ClearHlsSeparateAudioExecutionSourceSchema,
+      targetContainer: z.literal(CLEAR_HLS_TARGET_CONTAINER),
+    })
+    .strict()
+    .superRefine((plan, ctx) => {
+      // Two halves of ONE playlist are not a pair.
+      if (plan.source.videoPlaylistUrl === plan.source.audioPlaylistUrl) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["source", "audioPlaylistUrl"],
+          message: "a separate-audio plan requires two different media playlists",
+        });
+      }
+    }),
 ]);
 
 export type GenericExecutionPlan = z.infer<typeof GenericExecutionPlanSchema>;
@@ -750,7 +866,9 @@ export type GenericExecutionPlan = z.infer<typeof GenericExecutionPlanSchema>;
  */
 export type GenericSingleSourceExecutionPlan = Exclude<
   GenericExecutionPlan,
-  { operation: "merge-split" } | { operation: "clear-hls-remux" }
+  | { operation: "merge-split" }
+  | { operation: "clear-hls-remux" }
+  | { operation: "clear-hls-separate-audio-remux" }
 >;
 
 /**
@@ -779,6 +897,17 @@ export type GenericSplitExecutionPlan = Extract<
 export type ClearHlsExecutionPlan = Extract<
   GenericExecutionPlan,
   { operation: "clear-hls-remux" }
+>;
+
+/**
+ * HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: the ONE plan variant fulfilled
+ * by VideoFetch's own acquisition of a proven video + audio media-playlist pair
+ * — disjoint from the three partitions above, which together with it exactly
+ * cover `GenericExecutionPlan`.
+ */
+export type ClearHlsSeparateAudioExecutionPlan = Extract<
+  GenericExecutionPlan,
+  { operation: "clear-hls-separate-audio-remux" }
 >;
 
 /**
@@ -1036,6 +1165,45 @@ export function deriveClearHlsExecutionPlan(
   return Object.freeze({ ...parsed.data, source: Object.freeze(parsed.data.source) });
 }
 
+/**
+ * HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: derives the separate-audio
+ * plan for ONE requested video preset, `deriveClearHlsExecutionPlan()`'s steps
+ * exactly: the closed video vocabulary; exactly that key as an OWN DATA
+ * property of the FRESH separate-audio map; the selection parsed into a
+ * module-owned frozen snapshot; the fixed MP4 plan re-parsed by the plan
+ * schema. No substitution in any direction, and no sensitive value in any
+ * refusal.
+ */
+export function deriveClearHlsSeparateAudioExecutionPlan(
+  separateHlsSelections: ClearHlsSeparateAudioSelections,
+  requestedFormatId: string,
+): ClearHlsSeparateAudioExecutionPlan {
+  const requested = ClearHlsVideoPresetIdSchema.safeParse(requestedFormatId);
+  if (!requested.success) throw new AppError("FORMAT_UNAVAILABLE");
+  const id = requested.data;
+
+  if (typeof separateHlsSelections !== "object" || separateHlsSelections === null) {
+    throw new AppError("FORMAT_UNAVAILABLE");
+  }
+  const entry = Object.getOwnPropertyDescriptor(separateHlsSelections, id);
+  if (entry === undefined || !("value" in entry)) throw new AppError("FORMAT_UNAVAILABLE");
+
+  const source = snapshotClearHlsSeparateAudioSelection(entry.value);
+  if (source === null) throw new AppError("FORMAT_UNAVAILABLE");
+
+  const parsed = GenericExecutionPlanSchema.safeParse({
+    strategy: "yt-dlp",
+    operation: "clear-hls-separate-audio-remux",
+    requestedFormatId: id,
+    source,
+    targetContainer: CLEAR_HLS_TARGET_CONTAINER,
+  });
+  if (!parsed.success || parsed.data.operation !== "clear-hls-separate-audio-remux") {
+    throw new AppError("FORMAT_UNAVAILABLE");
+  }
+  return Object.freeze({ ...parsed.data, source: Object.freeze(parsed.data.source) });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // STRATEGY-AWARE WRAPPER — §19
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1072,8 +1240,12 @@ export function executionPlanRequiresProcessing(plan: ExecutionPlan): boolean {
     : plan.generic.operation !== "keep-original";
 }
 
-/** The two private families a generic preset can be owned by. */
-type GenericPresetOwner = "progressive" | "clear-hls";
+/**
+ * The three private families a generic preset can be owned by. The two
+ * clear-HLS families advertise the SAME public facts; which private map holds
+ * the key is the only thing that tells them apart.
+ */
+type GenericPresetOwner = "progressive" | "clear-hls" | "clear-hls-separate-audio";
 
 /**
  * Does this private map claim `id` as an OWN property? An inherited key is no
@@ -1093,40 +1265,42 @@ function claims(map: unknown, id: string): boolean {
  * Analysis made the family decision once, for this source, and encoded it as
  * WHICH private map holds the key. This reads that encoding and checks it:
  *
- *   1. exactly one map claims the id. Neither and both are both
- *      `FORMAT_UNAVAILABLE` — "both" is a malformed analysis, and resolving it
- *      here by precedence would be the third family decision analysis exists to
- *      prevent;
+ *   1. exactly one map claims the id. None, two or three are all
+ *      `FORMAT_UNAVAILABLE` — more than one is a malformed analysis, and
+ *      resolving it here by precedence would be the family decision analysis
+ *      exists to prevent;
  *   2. the preset is ADVERTISED, with `id === formatId`;
- *   3. its public facts agree with the family that claims it. A clear-HLS preset
- *      states exactly `CLEAR_HLS_PUBLIC_PRESET_FACTS`, and a progressive one
- *      never does (the analyzer asserts both). A disagreement means the private
- *      map and the preset the browser was shown describe different things, so
- *      it is refused rather than fulfilled by whichever map happened to hold
- *      the key.
+ *   3. its public facts agree with the family that claims it. A clear-HLS
+ *      preset — muxed or separate-audio — states exactly
+ *      `CLEAR_HLS_PUBLIC_PRESET_FACTS`, and a progressive one never does (the
+ *      analyzer asserts both). A disagreement means the private map and the
+ *      preset the browser was shown describe different things, so it is
+ *      refused rather than fulfilled by whichever map happened to hold the key.
  *
  * Each step can only REFUSE. Nothing here substitutes one family for another,
- * and nothing is retried with the other family after a refusal.
+ * and nothing is retried with another family after a refusal.
  */
 function genericPresetOwner(
   analysis: {
     readonly video: WorkerVideoMetadata;
     readonly selections: GenericSourceSelections;
     readonly hlsSelections: ClearHlsMediaPlaylistSelections;
+    readonly separateHlsSelections: ClearHlsSeparateAudioSelections;
   },
   requestedFormatId: string,
 ): GenericPresetOwner {
   const progressive = claims(analysis.selections, requestedFormatId);
   const hls = claims(analysis.hlsSelections, requestedFormatId);
-  if (progressive === hls) throw new AppError("FORMAT_UNAVAILABLE");
+  const separate = claims(analysis.separateHlsSelections, requestedFormatId);
+  if ([progressive, hls, separate].filter(Boolean).length !== 1) throw new AppError("FORMAT_UNAVAILABLE");
 
   const preset = analysis.video.presets.find(
     (p) => p.id === requestedFormatId && p.formatId === requestedFormatId,
   );
   if (!preset) throw new AppError("FORMAT_UNAVAILABLE");
-  if (hasClearHlsPublicPresetFacts(preset) !== hls) throw new AppError("FORMAT_UNAVAILABLE");
+  if (hasClearHlsPublicPresetFacts(preset) !== (hls || separate)) throw new AppError("FORMAT_UNAVAILABLE");
 
-  return hls ? "clear-hls" : "progressive";
+  return hls ? "clear-hls" : separate ? "clear-hls-separate-audio" : "progressive";
 }
 
 /**
@@ -1145,15 +1319,18 @@ function genericPresetOwner(
  *
  *   progressive/split owner   `deriveGenericExecutionPlan()`, unchanged;
  *   clear-HLS owner           `deriveClearHlsExecutionPlan()`, unchanged;
- *   neither, or both          `FORMAT_UNAVAILABLE`.
+ *   separate-audio owner      `deriveClearHlsSeparateAudioExecutionPlan()`
+ *                             (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001);
+ *   none, or more than one    `FORMAT_UNAVAILABLE`.
  *
  * There is no try-one-then-the-other. A progressive refusal is final, an HLS
  * refusal is final, and a preset whose owner the fresh analysis cannot name is
  * unavailable — the site may have changed since the browser chose it, and the
  * answer to that has always been `FORMAT_UNAVAILABLE`, never a substitution.
  *
- * `hlsSelections` is a REQUIRED input, so every caller states the HLS half of
- * the fresh analysis, if only as `{}`. The direct strategy never reads it.
+ * `hlsSelections` and `separateHlsSelections` are REQUIRED inputs, so every
+ * caller states both HLS halves of the fresh analysis, if only as `{}`. The
+ * direct strategy never reads them.
  */
 export function deriveExecutionPlan(
   analysis: {
@@ -1161,6 +1338,7 @@ export function deriveExecutionPlan(
     readonly video: WorkerVideoMetadata;
     readonly selections: GenericSourceSelections;
     readonly hlsSelections: ClearHlsMediaPlaylistSelections;
+    readonly separateHlsSelections: ClearHlsSeparateAudioSelections;
   },
   requestedFormatId: string,
 ): ExecutionPlan {
@@ -1179,7 +1357,8 @@ export function deriveExecutionPlan(
     };
   }
 
-  if (genericPresetOwner(analysis, requestedFormatId) === "clear-hls") {
+  const owner = genericPresetOwner(analysis, requestedFormatId);
+  if (owner === "clear-hls") {
     const hls = deriveClearHlsExecutionPlan(analysis.hlsSelections, requestedFormatId);
     // §10-equivalent: the container the browser was shown is the container
     // this plan delivers. The facts check above already pinned it to mp4; this
@@ -1189,6 +1368,17 @@ export function deriveExecutionPlan(
       throw new AppError("FORMAT_UNAVAILABLE");
     }
     return { strategy: "yt-dlp", generic: hls };
+  }
+  if (owner === "clear-hls-separate-audio") {
+    const separate = deriveClearHlsSeparateAudioExecutionPlan(
+      analysis.separateHlsSelections,
+      requestedFormatId,
+    );
+    const shown = analysis.video.presets.find((p) => p.id === requestedFormatId);
+    if (!shown || separate.targetContainer !== shown.container) {
+      throw new AppError("FORMAT_UNAVAILABLE");
+    }
+    return { strategy: "yt-dlp", generic: separate };
   }
   return {
     strategy: "yt-dlp",

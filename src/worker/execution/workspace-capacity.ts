@@ -34,6 +34,16 @@ import type { DirectExecutionPlan, ExecutionPlan, GenericExecutionPlan } from ".
  *                         makes the operation real, so the plan-aware policy is
  *                         now the right place for it.
  *
+ *   clear-hls-      2 × — TWO acquired aggregates, the video half and the
+ *   separate-             audio half, and the merged MP4 coexist until the
+ *   audio-remux           executor unwinds. The halves share ONE byte counter:
+ *                         the audio half is limited to what the video half's
+ *                         actual bytes left of the Product ceiling, so video +
+ *                         audio <= max COMBINED — never max each — and the MP4
+ *                         is <= max (the shared merge's own output bound). That
+ *                         is the merge-split shape, and the same 2 ×
+ *                         (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001).
+ *
  * These are the hard bounds of a SUCCESSFUL job. No padding is added: headroom
  * is a deployment property (the Production workspace verifier requires more),
  * not something this policy guesses.
@@ -99,6 +109,7 @@ export function workspaceFootprintForPlan(plan: WorkspacePlanShape): WorkspaceFo
     case "extract-mp3":
     case "merge-split":
     case "clear-hls-remux":
+    case "clear-hls-separate-audio-remux":
       return 2;
     default:
       return unknownOperation(operation);

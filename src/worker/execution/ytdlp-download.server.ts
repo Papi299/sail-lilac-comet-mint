@@ -355,7 +355,8 @@ export function buildYtdlpDownloadArgv(opts: {
    * than anywhere else — its `source` holds a SIGNED media-playlist URL, and
    * this function's whole job is to turn a source into yt-dlp argv. The
    * partition is what makes "the playlist URL can never become a subprocess
-   * argument" a compile-time fact.
+   * argument" a compile-time fact. The separate-audio operation, carrying two
+   * such URLs, is excluded by the same partition.
    */
   readonly plan: GenericSingleSourceExecutionPlan;
   readonly maxFileSizeBytes: number;
@@ -763,9 +764,14 @@ export async function downloadGenericOriginal(
   // that refusal lands BEFORE URL validation, before the runtime probe, and
   // therefore before any DNS, network or subprocess work. Tests exercise both
   // refusals through explicit test-only casts.
+  //
+  // HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001 adds the third refusal on
+  // exactly the same terms: a `clear-hls-separate-audio-remux` plan names TWO
+  // signed media playlists and is acquired by VideoFetch's own transport.
   if (
     checkedPlan.data.operation === "merge-split" ||
-    checkedPlan.data.operation === "clear-hls-remux"
+    checkedPlan.data.operation === "clear-hls-remux" ||
+    checkedPlan.data.operation === "clear-hls-separate-audio-remux"
   ) {
     throw new AppError("FORMAT_UNAVAILABLE");
   }

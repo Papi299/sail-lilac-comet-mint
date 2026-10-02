@@ -172,11 +172,13 @@ export const HLS_V1_MP4_STREAM_SHAPE = Object.freeze({
  * The ONLY fMP4 input shape HLS v2 will process: an ISO-BMFF file carrying
  * exactly one video and exactly one audio stream.
  *
- * The same rule as the MPEG-TS one, for the same reason. HLS v2 still delivers
- * only a SELF-CONTAINED muxed rendition: separate HLS audio pairing was not
- * admitted (pinned yt-dlp exposes no video→audio group relationship), so a
- * video-only or audio-only fMP4 rendition is refused here rather than
- * delivered silent or pictureless.
+ * The same rule as the MPEG-TS one, for the same reason. This primitive
+ * delivers only a SELF-CONTAINED muxed rendition, so a video-only or audio-only
+ * fMP4 rendition is refused HERE rather than delivered silent or pictureless.
+ * A master-proven separate-audio pair
+ * (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001) is never handed to this
+ * primitive: its two halves are merged by the shared two-input merge in their
+ * own seam.
  */
 export const HLS_V2_FMP4_STREAM_SHAPE = Object.freeze({
   family: "iso-bmff",

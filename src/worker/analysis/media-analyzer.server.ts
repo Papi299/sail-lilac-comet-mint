@@ -13,6 +13,8 @@ import type { GenericSourceSelections } from "../execution/generic-source.ts";
  * constant.
  */
 import type { ClearHlsMediaPlaylistSelections } from "../hls/hls-source-selection.ts";
+/** TYPE-ONLY, for the same reason: the separate-audio map is named, never read. */
+import type { ClearHlsSeparateAudioSelections } from "../hls/hls-separate-audio-selection.ts";
 import { analyzeDirectMedia } from "../execution/direct-media.server.ts";
 import {
   analyzeGenericMedia,
@@ -284,16 +286,23 @@ export async function analyzeMedia(
  * across attempts. The URL belongs to THIS fresh analysis. A restart or retry
  * must obtain a new one.
  *
- * Since HLS-7 the two maps are DISJOINT and together own every advertised
- * generic preset exactly once. Which one holds a requested id is the family
- * decision analysis already made; `deriveExecutionPlan()` reads it and makes
- * none of its own.
+ * `separateHlsSelections` (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001) is the
+ * third private map, generic-only too: the proven video + audio media-playlist
+ * pair behind each preset the analysis gave to separate-audio clear HLS. It is
+ * subject to every restriction `hlsSelections` is — both URLs are sensitive and
+ * belong to THIS fresh analysis alone.
+ *
+ * Since HLS-7 the maps are DISJOINT and together own every advertised generic
+ * preset exactly once. Which one holds a requested id is the family decision
+ * analysis already made; `deriveExecutionPlan()` reads it and makes none of its
+ * own.
  */
 export type ExecutionAnalysis = {
   readonly strategy: WorkerExtractorStrategy;
   readonly video: WorkerVideoMetadata;
   readonly selections: GenericSourceSelections;
   readonly hlsSelections: ClearHlsMediaPlaylistSelections;
+  readonly separateHlsSelections: ClearHlsSeparateAudioSelections;
 };
 
 /** The internal generic analyzer, injectable exactly like the public one. */
@@ -308,6 +317,7 @@ export type GenericExecutionAnalyzeFn = (
   readonly video: WorkerVideoMetadata;
   readonly selections: GenericSourceSelections;
   readonly hlsSelections: ClearHlsMediaPlaylistSelections;
+  readonly separateHlsSelections: ClearHlsSeparateAudioSelections;
 }>;
 
 export type ExecutionAnalyzerOptions = Omit<MediaAnalyzerOptions, "analyzeGeneric"> & {
@@ -348,13 +358,20 @@ export async function analyzeForExecution(
     // Direct advertises concrete formats and needs no private selection map.
     // It has no HLS shadow channel either: direct media is one already-known
     // file location, so there is no rendition ladder to shadow.
-    return { strategy: "direct", video: routed.video, selections: {}, hlsSelections: {} };
+    return {
+      strategy: "direct",
+      video: routed.video,
+      selections: {},
+      hlsSelections: {},
+      separateHlsSelections: {},
+    };
   }
   return {
     strategy: "yt-dlp",
     video: routed.generic.video,
     selections: routed.generic.selections,
     hlsSelections: routed.generic.hlsSelections,
+    separateHlsSelections: routed.generic.separateHlsSelections,
   };
 }
 

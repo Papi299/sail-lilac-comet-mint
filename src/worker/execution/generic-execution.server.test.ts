@@ -123,7 +123,7 @@ function genericAnalysis(
   // Every preset here is progressive-owned, so the HLS half of the fresh
   // analysis is empty. Since HLS-7 the ordinary planner reads it; the
   // executor itself still never does.
-  return { strategy: "yt-dlp", video: genericMeta(presets), selections, hlsSelections: {} };
+  return { strategy: "yt-dlp", video: genericMeta(presets), selections, hlsSelections: {}, separateHlsSelections: {} };
 }
 
 type Harness = {
@@ -558,6 +558,7 @@ describe("generic job: strategy authority (§17/§42)", () => {
         }),
         selections: {},
         hlsSelections: {},
+        separateHlsSelections: {},
       }),
       downloadOriginal: async (_url, ctx) => {
         directCalls += 1;
@@ -1315,7 +1316,7 @@ describe("generic job: unknown-audio progressive video (GENERIC-UNKNOWN-AUDIO-VI
   /** The executor's analysis seam: the REAL internal analyzer over a canned yt-dlp document. */
   function realAnalysis(stdout: string, ffmpegAvailable = true): JobExecutorDeps["analyzeForExecution"] {
     return async (url, signal) => {
-      const { video, selections, hlsSelections } = await analyzeGenericMediaInternal(url, {
+      const { video, selections, hlsSelections, separateHlsSelections } = await analyzeGenericMediaInternal(url, {
         limits: { analysisTimeoutSeconds: 45, maxVideoDurationSeconds: 7200, maxFileSizeBytes: MAX },
         ffmpegAvailable,
         runner: async () => ({ code: 0, stdout, stderr: "" }),
@@ -1323,7 +1324,7 @@ describe("generic job: unknown-audio progressive video (GENERIC-UNKNOWN-AUDIO-VI
         validateUrl: async (raw: string) => ({ url: raw, hostname: "example.invalid" }),
         ...(signal ? { signal } : {}),
       });
-      return { strategy: "yt-dlp", video, selections, hlsSelections };
+      return { strategy: "yt-dlp", video, selections, hlsSelections, separateHlsSelections };
     };
   }
 

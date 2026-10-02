@@ -176,6 +176,7 @@ function productionHlsDeps(): JobExecutorDeps {
     hlsSelections: Object.freeze({
       "preset:1080": Object.freeze({ playlistUrl: PLAYLIST_URL, height: 1080 }),
     }),
+    separateHlsSelections: {},
   };
   return {
     analyzeForExecution: async () => analysis,

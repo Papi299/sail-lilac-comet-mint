@@ -73,6 +73,7 @@ function hlsOnlyAnalysis(
     video: meta(),
     selections: {},
     hlsSelections,
+    separateHlsSelections: {},
   };
 }
 
@@ -1101,7 +1102,7 @@ const HLS_ONLY_DOCUMENT = JSON.stringify({
 /** The executor's analysis seam: the REAL generic analyzer, only yt-dlp canned. */
 function realHlsAnalysis(ffmpegAvailable = true): NonNullable<JobExecutorDeps["analyzeForExecution"]> {
   return async (url, signal) => {
-    const { video, selections, hlsSelections } = await analyzeGenericMediaInternal(url, {
+    const { video, selections, hlsSelections, separateHlsSelections } = await analyzeGenericMediaInternal(url, {
       limits: { analysisTimeoutSeconds: 45, maxVideoDurationSeconds: 7200, maxFileSizeBytes: 4 * 1024 ** 3 },
       ffmpegAvailable,
       runner: async () => ({ code: 0, stdout: HLS_ONLY_DOCUMENT, stderr: "" }),
@@ -1109,7 +1110,7 @@ function realHlsAnalysis(ffmpegAvailable = true): NonNullable<JobExecutorDeps["a
       validateUrl: async (raw: string) => ({ url: raw, hostname: new URL(raw).hostname }),
       ...(signal ? { signal } : {}),
     });
-    return { strategy: "yt-dlp", video, selections, hlsSelections };
+    return { strategy: "yt-dlp", video, selections, hlsSelections, separateHlsSelections };
   };
 }
 
