@@ -28,14 +28,15 @@ import {
 export type { GenericAnalysisLimits };
 
 /**
- * Worker-owned media analysis STRATEGY ROUTER (Phase 10C2).
+ * Worker-owned media analysis STRATEGY ROUTER (Phase 10C2; installed in
+ * Phase 10C3).
  *
- * This is the function that a later, separately authorized phase will install
- * as `WorkerService`'s analyzer. Today nothing in Production composition calls
- * it: `WorkerService` still defaults to `analyzeDirectMedia`, `JobExecutor`
- * has no generic branch, and `/api/analyze` is unchanged. It exists here so the
- * routing rules can be reviewed and tested in isolation BEFORE they become
- * reachable.
+ * The Worker composition root (`runtime.server.ts`) builds its one analysis
+ * policy from this module (`createMediaAnalysisPolicy`, below), so the Worker's
+ * HTTP analyze endpoint and the job executor's fresh execution analysis both
+ * route through it. It is the only way a user URL reaches the generic analyzer
+ * (`control-plane-boundary.test.ts`), and generic extraction is enabled in
+ * Production (the `YTDLP_ENABLED` switch, persistently on since Phase 10E).
  *
  * ─── The rule ───────────────────────────────────────────────────────────────
  *

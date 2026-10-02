@@ -228,7 +228,7 @@ clear-HLS chain offline.
 | `hls08-deterministic-full-path-02` | **accepted**, historical | Overlay / source-runtime deterministic HLS evidence (PR #78 head `6296b0db…`, tree `677c5a24…`, PASS 144/144). Never re-read under `-03`. |
 | `hls09-release-image-full-path-01` | **accepted**, historical | The same clear-HLS full path and negatives, executed by a real `Dockerfile.worker` release candidate, with release identity; carried by every `split07-release-image-candidate-03` PASS. Never re-read under `-02`. |
 | `hls08-deterministic-full-path-03` | current overlay schema | `-02` with the protocol invariant restated by `GENERIC-SEGMENTED-DASH-EXECUTION-001` (no HLS spelling in the one yt-dlp vocabulary, which is exactly `http`/`https`/`http_dash_segments`). No record produced yet. |
-| `hls09-release-image-full-path-02` | current release schema | `-01` over the same restated behavioral checks. No record produced yet. |
+| `hls09-release-image-full-path-02` | current release schema | `-01` over the same restated behavioral checks. Records produced as the HLS-09 child of SPLIT-07 `-05`, `-06` and `-07` release qualifications — for example the `-07` qualification of 2026-10-02, 146/146 (deployment runbook §4n). |
 
 These scopes are not interchangeable: an overlay PASS is not release-image
 evidence, and a release child is never read as overlay evidence. HLS-8 remains a

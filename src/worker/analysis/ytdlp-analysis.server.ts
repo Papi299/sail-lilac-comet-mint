@@ -58,22 +58,35 @@ import {
 } from "../runtime/ytdlp-runtime.server.ts";
 
 /**
- * Worker-owned GENERIC yt-dlp analysis (Phase 10C2).
+ * Worker-owned GENERIC yt-dlp analysis (Phase 10C2; connected in Phase 10C3).
  *
  * This module turns one submitted URL into at most one bounded, sanitized
  * `WorkerVideoMetadata` describing a single media item, using a fixed,
  * application-owned yt-dlp command line. It is the analysis half of generic
  * support and nothing more.
  *
+ * ─── How it is reached ──────────────────────────────────────────────────────
+ *
+ * It is Production-reachable, through the generic analysis/execution routing
+ * only. The Worker composition root (`runtime.server.ts`) builds its one
+ * analysis policy with `createMediaAnalysisPolicy` (`media-analyzer.server.ts`).
+ * That direct-first router calls this module, for browser analysis and for the
+ * job executor's fresh execution analysis, only when direct analysis answered
+ * `EXTRACTOR_UNAVAILABLE` and the operator enabled generic extraction (the
+ * `YTDLP_ENABLED` switch, persistently on in Production since Phase 10E).
+ * Nothing calls it around the router, and `control-plane-boundary.test.ts`
+ * asserts that routing structurally. The Vercel control plane never calls it.
+ *
  * ─── What this module is NOT, and must never become here ────────────────────
  *
- *   - It is not reachable from Production. Nothing in `WorkerService`,
- *     `runtime.server.ts`, `JobExecutor` or the Vercel control plane calls it,
- *     and `control-plane-boundary.test.ts` asserts that structurally.
  *   - It does not download media. `--skip-download` plus `-J`'s implied
- *     simulation means the process acquires metadata and exits.
- *   - It does not select a yt-dlp format. There is no `-f` anywhere on this
- *     path, and no upstream `format_id` is even parsed (see RawFormatSchema).
+ *     simulation means the process acquires metadata and exits. Media
+ *     acquisition is a later execution concern: the job executor acts on the
+ *     private selections returned here, after this process has exited.
+ *   - It does not select a yt-dlp format for download. There is no `-f`
+ *     anywhere on this path. An upstream `format_id` is parsed only into the
+ *     private Worker execution-analysis selections (see "`format_id` and the
+ *     Phase-10C3 change" below), never into the public result.
  *   - It does not reuse the legacy Vercel-era extractor
  *     (`src/services/extractors/ytdlp.server.ts`), its format selector, or its
  *     message mapper. Those carry a download path that runs FFmpeg and a

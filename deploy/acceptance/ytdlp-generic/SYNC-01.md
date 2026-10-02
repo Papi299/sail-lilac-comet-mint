@@ -176,13 +176,14 @@ was applied to a scratch copy of `src/`, never to this repository, mounted
 read-only over `/app/src` of a disposable, non-deployable local image built by
 `Dockerfile.worker` from the reviewed source (Product runtime identical), and
 run as the child alone, `--network none`. M1 is the `main` `73176b20` source
-itself, which is the current Production behaviour. An unmutated overlay run the
+itself — the Production merge behaviour until the corrected image was promoted
+on 2026-10-02 (deployment runbook §4n). An unmutated overlay run the
 same way PASSed SYNC-01 281/281, DASH-01 156/156 and SPLIT-06 mp4 and webm
 252/252 each, so the overlay itself fails nothing.
 
 | Mutation | SYNC-01 (281) | Intended reason, as recorded |
 | :--- | :--- | :--- |
-| **M1** the exact current Production argv (`73176b20`) | FAIL, 47 | `merge/one-ffmpeg-merge-with-the-pre-job-sync-policy` in all 19 cases (no synchronization option); `sync/relative-offset-preserved` and `sync/decoded-sync-event-preserved` in all 14 offset and duration cases (e.g. 456,000 µs → 0) |
+| **M1** the exact pre-correction Production argv (`73176b20`) | FAIL, 47 | `merge/one-ffmpeg-merge-with-the-pre-job-sync-policy` in all 19 cases (no synchronization option); `sync/relative-offset-preserved` and `sync/decoded-sync-event-preserved` in all 14 offset and duration cases (e.g. 456,000 µs → 0) |
 | **M2** `-copyts -start_at_zero` instead of the policy | FAIL, 47 | the policy check in all 19 (forbidden `-copyts`, `-start_at_zero`); the same 14 offset erasures as M1 |
 | **M3** `-copyts -avoid_negative_ts make_zero` instead of the policy | FAIL, 50 | the policy check in all 19 (forbidden flags); `sync/no-media-hidden-or-unhidden` and `sync/stream-spans-preserved` in 5 MP4 cases (AAC priming un-hidden); `compat/output-identical-to-the-historical-merge` in 4 controls; relative offset in 10; leading gap in 2 |
 | **M4** a fixed MP4 direction (always `-isync 1` on input 0) | FAIL, 28 | the policy check in the 8 video-first and tie cases; relative offset, hidden media (14 video packets hidden), spans and the decoded event in 5 |
@@ -198,7 +199,7 @@ The full-path children catch the shapes they carry:
 
 | Mutation | DASH-01 (156) | SPLIT-06 mp4 / webm (252) |
 | :--- | :--- | :--- |
-| **M1** current Production argv | FAIL, 4: `merge/sync-policy-is-the-pre-job-decision` and `sync/relative-offset-preserved` in both pairings (83,333 µs → 0; tolerance 1,104) | mp4 FAIL: `offset/sync/relative-offset-preserved` (476,009 µs → 0; tolerance 1,120), then the run stops at `offset/output/duration-matches-the-fixtures` (2.044 s vs 2.519 s). webm FAIL: the same check (486,000 → −7,000 µs), then the duration (2.021 s vs 2.507 s). Both control pairs pass: they are zero-aligned. |
+| **M1** pre-correction Production argv | FAIL, 4: `merge/sync-policy-is-the-pre-job-decision` and `sync/relative-offset-preserved` in both pairings (83,333 µs → 0; tolerance 1,104) | mp4 FAIL: `offset/sync/relative-offset-preserved` (476,009 µs → 0; tolerance 1,120), then the run stops at `offset/output/duration-matches-the-fixtures` (2.044 s vs 2.519 s). webm FAIL: the same check (486,000 → −7,000 µs), then the duration (2.021 s vs 2.507 s). Both control pairs pass: they are zero-aligned. |
 | **M2** `-copyts -start_at_zero` | FAIL, 4: as M1, with the forbidden flags named | — |
 | **M5** MP4 decision removed | FAIL, 8: the policy check, relative offset, hidden media and spans in both pairings | — |
 | **M6** WebM without compensation | — | webm FAIL, 2 of 252: `sync/relative-offset-preserved` on the control pair (−7,000 → −14,000 µs) and `offset/sync/relative-offset-preserved` (486,000 → 479,000 µs) |

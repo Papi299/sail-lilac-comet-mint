@@ -140,15 +140,15 @@ import {
  *        child and again after it; `dash01:segmented-dash` in the candidate run
  *        ledger. mp4 + webm + clear-HLS + segmented DASH. -05 records stay
  *        VALID for exactly the candidates they qualified (e.g. RC db11b5ba,
- *        now in Production) and are never re-read under -06.
+ *        Production 2026-09-30 -> 2026-10-01) and are never re-read under -06.
  *   -06  everything -05 means, PLUS a validated, byte-hashed HLS-11 clear-HLS v2
  *        real-media child (`hls11-release-image-full-path-01`) PASS, executed by
  *        the SAME immutable candidate image id, naming the same release source,
  *        offline; the harness re-verified before that child and again after it;
  *        `hls11:clear-hls-v2` in the candidate run ledger.
  *        mp4 + webm + clear-HLS + segmented DASH + clear-HLS v2 (fMP4). -06
- *        records stay VALID for exactly the candidates they qualified (the
- *        current Production image sha256:99ddf3d8…) and are never re-read
+ *        records stay VALID for exactly the candidates they qualified (RC
+ *        99ddf3d8, Production 2026-10-01 -> 2026-10-02) and are never re-read
  *        under -07: none of their children measured the merge's A/V timing.
  *   -07  everything -06 means, with the split-merge SYNCHRONIZATION oracle
  *        (SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001): both SPLIT-06
@@ -1164,8 +1164,8 @@ function verifiedHarness(harness) {
     typeof harness.worktreeIsReleaseContext === "boolean" &&
     typeof harness.commitIsReleaseSource === "boolean" &&
     // EXACTLY every checkpoint, in order — including the ones before the
-    // clear-HLS (-03), segmented-DASH (-05) and clear-HLS v2 (-06) children —
-    // and the last one after all five children.
+    // clear-HLS (-03), segmented-DASH (-05), clear-HLS v2 (-06) and split-merge
+    // timing (-07) children — and the last one after all six children.
     Array.isArray(harness.verificationPoints) &&
     harness.verificationPoints.length === HARNESS_VERIFICATION_POINTS.length &&
     harness.verificationPoints.every((point, i) => point === HARNESS_VERIFICATION_POINTS[i]);
@@ -1190,8 +1190,8 @@ function verifiedHarness(harness) {
     commitIsReleaseSource: harness.commitIsReleaseSource,
     verifiedBy:
       "run-release-image-acceptance.mjs: git against --harness, before any Docker command and at every checkpoint " +
-      "to the end of all five children (SPLIT-06 mp4, SPLIT-06 webm, HLS-09 clear-HLS, DASH-01 segmented DASH, " +
-      "HLS-11 clear-HLS v2)",
+      "to the end of all six children (SPLIT-06 mp4, SPLIT-06 webm, HLS-09 clear-HLS, DASH-01 segmented DASH, " +
+      "HLS-11 clear-HLS v2, SYNC-01 split-merge timing)",
   };
 }
 
