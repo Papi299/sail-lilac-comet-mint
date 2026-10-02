@@ -3670,8 +3670,12 @@ analysis never fetches — is refused by the job-time HLS-2 preflight
 - byte-range HLS (`EXT-X-BYTERANGE`);
 - discontinuities: v1 accepts no `EXT-X-DISCONTINUITY` or
   `EXT-X-DISCONTINUITY-SEQUENCE` at all;
-- separate HLS audio-rendition pairing — still unsupported in source too: the
-  pinned yt-dlp exposes no video→audio relationship to pair on (§4m);
+- separate HLS audio-rendition pairing — unsupported in the deployed source:
+  the pinned yt-dlp exposes no video→audio relationship to pair on (§4m).
+  `HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001` implements one narrow
+  fMP4 + fMP4 family in source only, paired from a Master Playlist that
+  VideoFetch fetches itself (§4o); every other separate-audio shape stays
+  unsupported in source too;
 - HLS subtitles;
 - any HLS protocol spelling other than exactly `m3u8_native`;
 - **segmented DASH** — not an HLS concern. It was inventory-only here; since
@@ -4791,10 +4795,12 @@ children fail, for the intended reason, against each of eleven bad
 implementations, including the exact pre-correction Production argv (the merge
 `sha256:99ddf3d8…` and every earlier Worker ran).
 
-**HLS separate-audio dependency.** `HLS-SEPARATE-AUDIO-PAIRING-001` stays
-blocked and is not implemented here. When a separate fMP4 + fMP4 clear-HLS
-processor is authorized, it should reuse this MP4 synchronization policy (a
-lower-level local-media seam, not the split-plan types), **not** the
+**HLS separate-audio dependency.** `HLS-SEPARATE-AUDIO-PAIRING-001` is not
+implemented here; it was blocked because yt-dlp exposes no pairing provenance
+(§4m). The separate fMP4 + fMP4 clear-HLS processor that
+`HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001` later implemented in source,
+pairing from a Master Playlist instead (§4o), reuses this MP4 synchronization
+policy (a lower-level local-media seam, not the split-plan types), **not** the
 `-copyts -avoid_negative_ts make_zero` command its design investigation used.
 
 **Rollout — complete.** The four stages ran in order on 2026-10-02, each under
@@ -4870,7 +4876,9 @@ rests on the qualification record above — the SPLIT-06 offset pairs, DASH-01's
 segmented-DASH job was run, so real-public segmented-DASH compatibility was not
 re-proven by this rollout. Separate HLS audio stays **BLOCKED — HLS AUDIO
 PAIRING PROVENANCE INSUFFICIENT**: this rollout deployed only the MP4
-synchronization policy that its eventual fMP4 + fMP4 merge should reuse.
+synchronization policy. The fMP4 + fMP4 merge that
+`HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001` later implemented in source
+reuses that policy (§4o); this rollout did not contain it.
 
 ### 4o. Separate-audio clear HLS — SOURCE IMPLEMENTED — RELEASE QUALIFICATION / PRODUCTION ACCEPTANCE PENDING
 
@@ -7131,7 +7139,7 @@ authorization.
 | `CLOUDFLARED-QUIC-VS-HTTP2-EXTENDED-SOAK-001` | **NON-BLOCKING RELIABILITY FOLLOW-UP — not started** | Awake-host all-connection QUIC outages of the named tunnel remain intermittent, with an unresolved origin; most earlier drops coincided with host sleep, which is expected on-demand downtime. A controlled 6-hour QUIC-versus-HTTP/2 comparison on 2026-09-30 captured no outage, with both protocols stable, so no evidence justifies changing the Production transport, which stays auto → QUIC. Only a longer awake soak could discriminate between the protocols; it blocks no Product release. *Operator-measured* diagnostics; nothing was changed. |
 | `HLS-V2-ADAPTIVE-VOD-EXPANSION-001` | **CLOSED / QUALIFIED / DEPLOYED / PRODUCTION ACCEPTED** (2026-10-01) | Muxed fMP4 clear HLS (§4m). PR #105, merge `88f26318…`; retained candidate `sha256:99ddf3d8…` (SPLIT-07 `-06` PASS 57/57, HLS-11 included); Worker-only promotion and acceptance by `HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002` (next row). No Vercel step. |
 | `HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002` | **HLS-V2 PRODUCTION ACCEPTED — MUXED fMP4 CLEAR-HLS LIVE** (2026-10-01; no rollback) | Retained-candidate re-validation → fixture preflight inside the Production Worker → Worker-only promotion → Stage-A, generic and clear-HLS v1 regressions → controlled public-fixture HLS-v2 acceptance → stability. Worker `sha256:99ddf3d8…` (immediate rollback `sha256:db11b5ba…`); Vercel unchanged (`dpl_DrDdgct3…`, rollback `dpl_8k6e59…`). Preceded by `HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-001`, which stopped before any Production action because no public muxed-fMP4 source satisfied the shape, and by `HLS-V2-PUBLIC-ACCEPTANCE-FIXTURE-001`, which published the controlled fixture (`Papi299/videofetch-hls-v2-acceptance-fixture`, `9c84f33b…`). The fixture claim is narrow (§4m), and real-public segmented DASH was not re-proven. `worker.env`, the units and cloudflared unchanged; VM Stopped → Stopped. Full record: §4m, §11h. |
-| `HLS-SEPARATE-AUDIO-PAIRING-001` | **BLOCKED — HLS AUDIO PAIRING PROVENANCE INSUFFICIENT** (as recorded on 2026-10-01; yt-dlp still lacks the relationship) — unblocked by the master-playlist seam: implemented in source by `HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001` (below, §4o) | Separate HLS audio (split TS / split fMP4) was not implemented by `HLS-V2-ADAPTIVE-VOD-EXPANSION-001`: the pinned yt-dlp `2026.08.19` pops its internal `_audio_group_id` from every HLS format before `-J`, so a grouped video variant and an ungrouped video-only variant are indistinguishable (§4m). Unblocking needs an upstream relationship field or a separately approved master-playlist seam, never a label/order/bitrate heuristic. `HLS-SEPARATE-AUDIO-PAIRING-DESIGN-001` found a viable standards-based master-playlist seam, but its implementation stays separately unauthorized. Neither the 2026-10-01 nor the 2026-10-02 Production rollout changed this. Its eventual fMP4 + fMP4 merge should reuse the split merge's MP4 synchronization policy, now deployed, not `-copyts -avoid_negative_ts make_zero` (§4n); that removed one processing prerequisite only. |
+| `HLS-SEPARATE-AUDIO-PAIRING-001` | **BLOCKED — HLS AUDIO PAIRING PROVENANCE INSUFFICIENT** (as recorded on 2026-10-01; yt-dlp still lacks the relationship) — unblocked by the master-playlist seam: implemented in source by `HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001` (below, §4o) | Separate HLS audio (split TS / split fMP4) was not implemented by `HLS-V2-ADAPTIVE-VOD-EXPANSION-001`: the pinned yt-dlp `2026.08.19` pops its internal `_audio_group_id` from every HLS format before `-J`, so a grouped video variant and an ungrouped video-only variant are indistinguishable (§4m). Unblocking needs an upstream relationship field or a separately approved master-playlist seam, never a label/order/bitrate heuristic. `HLS-SEPARATE-AUDIO-PAIRING-DESIGN-001` later established a viable standards-based master-playlist seam, and `HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001` implements that seam in source (next row, §4o). The yt-dlp-only finding above remains true: the implementation takes its pairing provenance from a Master Playlist that VideoFetch fetches itself, never from yt-dlp. Its release qualification (SPLIT-07 `-08`, a retained release candidate), Production promotion and Production acceptance remain separately pending: neither the 2026-10-01 nor the 2026-10-02 Production rollout contained this family, and the Production Worker `sha256:2efb85da…` does not carry it. The implemented fMP4 + fMP4 merge reuses the split merge's MP4 synchronization policy, deployed on 2026-10-02, not `-copyts -avoid_negative_ts make_zero` (§4n). |
 | `HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001` | **SOURCE IMPLEMENTED — RELEASE QUALIFICATION / PRODUCTION ACCEPTANCE PENDING** | Its PR implements ONE further clear-HLS family: a video-only fMP4 rendition plus the single URI-bearing audio-only fMP4 rendition of the `AUDIO` group its variant names. The pair is proven only from a Master Playlist that VideoFetch fetches itself during analysis (one bounded `safeGet`, `maxRedirects: 0`; at most 4 masters per analysis), and never from yt-dlp heuristics. The pair goes into a Worker-private `separateHlsSelections` map behind the private `clear-hls-separate-audio-remux` operation, is acquired as two halves under one byte budget, and is merged by the shared split merge with PR #107's MP4 synchronization. No public schema change. Acceptance: HLS-12 `-01` (new), HLS-11 `-02` and SPLIT-07 `-08` (seven children). The full `-08` qualification has not been run. No release image containing the implementation has been qualified yet; the Production Worker `sha256:2efb85da…` does not carry it. Not deployed, not Production accepted (§4o). |
 | `SPLIT-MERGE-TIMESTAMP-PRESERVATION-AUDIT-001` | **COMPLETE — DEFECT CONFIRMED** (2026-10-02) | Read-only, at `main` `73176b20…`. The split merge re-based each input to zero on its own, erasing legitimate relative A/V offsets in MP4 and WebM pairs; the accepted SPLIT-06/DASH-01 evidence could not see it (§4n). The fix needed separate authorization. |
 | `SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001` | **CLOSED / QUALIFIED / DEPLOYED / PRODUCTION ACCEPTED** (2026-10-02) | *Source (GitHub-verifiable):* PR #107, merge `8ab702002d70205e4c506559503e58414cb52540` (tree `79c79acf…`). A closed per-job synchronization policy: MP4 uses `-isync` toward the earlier input; WebM uses `-isync 0`, plus an Opus `CodecDelay` `-itsoffset` read by a bounded header reader. Strict start-time parsing fails closed, only for the merge's input probes. Acceptance moved to SPLIT-06 `-05`, DASH-01 `-02`, SYNC-01 `-01` and SPLIT-07 `-07` (§4n). *Qualification (operator-measured):* `sha256:2efb85da…`, SPLIT-07 `-07` PASS 62/62 (next row). *Production (operator-measured):* promoted Worker-only and accepted on one real split job (the row after next). Real-public segmented DASH was not re-proven. Full record: §4n, §11h. |
