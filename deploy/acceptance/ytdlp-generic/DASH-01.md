@@ -189,9 +189,10 @@ validator accepts it.
 
 The `-02` synchronization oracle has its own mutation controls, recorded with
 SYNC-01's for `SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001` in
-[`SYNC-01.md`](SYNC-01.md#mutation-controls). The exact current Production
-merge argv fails DASH-01 `-02` on the merge-policy check and on the 83.3 ms
-offset in both pairings.
+[`SYNC-01.md`](SYNC-01.md#mutation-controls). The exact pre-correction
+Production merge argv — the one Production ran until the corrected image was
+promoted on 2026-10-02 — fails DASH-01 `-02` on the merge-policy check and on
+the 83.3 ms offset in both pairings.
 
 ## Files
 

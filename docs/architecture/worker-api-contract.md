@@ -103,7 +103,7 @@ Safe for transmission to Vercel. When ready, it contains:
 | | |
 | :--- | :--- |
 | Source | `main` `593f47dfffe79f166d40af6575c6130668e56af0` (PR #63 merge) |
-| Production Worker (P1 rollout) | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest`, from 2026-09-18 21:00Z. Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`, on 2026-09-27 by `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5` (source `f9a8109b…`, `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`), later that day by `sha256:fd7cdbc9434a3193a797a92b3e669ad00526b79224e382662551903e1d3cf9bf` (source `8f087639…`, `GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`), then by `sha256:629ec04baf36a2a2ef523f3e4408174242f345d811795d9e34ce169ec9051a80` (source `083cbfcc…`, `DIRECT-PRESET-FILESIZE-PROVENANCE-001`), on 2026-09-28 by `sha256:6ececc018029f1d984be980c35b73c5b6e2e09f17b80408bc674ab6ff020b93b` (source `53bb32b6…`, `GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001`), on 2026-09-30 by `sha256:db11b5ba547fe52a79614d6874651cc4792e4bf9537549c5b7007fd37818c23b` (source `0f8bff3a…`, `PR101-102-103-COORDINATED-PRODUCTION-ROLLOUT-001`), and on 2026-10-01 by the current Worker `sha256:99ddf3d8c7a87e6e708a7aaa469524a234b14658473cdba77fdfbe993b9618b7` (source `88f26318…`, `HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002`). All seven still send the field. `db11b5ba…` is now the immediate Worker rollback, and `6ececc01…`, `629ec04b…`, `fd7cdbc9…`, `0a6e66b0…`, `e5b1144c…` and `5925515f…` deeper ones (deployment runbook §4j, §9, §11h) |
+| Production Worker (P1 rollout) | `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` as `videofetch-worker:latest`, from 2026-09-18 21:00Z. Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c0a7c5ceab23442cd33a6d6619899c6babd5cdca251b72ef4363c375a`, on 2026-09-27 by `sha256:0a6e66b0eb1f356892c149f41b548922a0dfd553b6a525f35924be4ad95f81f5` (source `f9a8109b…`, `SOURCE-FILESIZE-ESTIMATE-DRIFT-001`), later that day by `sha256:fd7cdbc9434a3193a797a92b3e669ad00526b79224e382662551903e1d3cf9bf` (source `8f087639…`, `GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`), then by `sha256:629ec04baf36a2a2ef523f3e4408174242f345d811795d9e34ce169ec9051a80` (source `083cbfcc…`, `DIRECT-PRESET-FILESIZE-PROVENANCE-001`), on 2026-09-28 by `sha256:6ececc018029f1d984be980c35b73c5b6e2e09f17b80408bc674ab6ff020b93b` (source `53bb32b6…`, `GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001`), on 2026-09-30 by `sha256:db11b5ba547fe52a79614d6874651cc4792e4bf9537549c5b7007fd37818c23b` (source `0f8bff3a…`, `PR101-102-103-COORDINATED-PRODUCTION-ROLLOUT-001`), on 2026-10-01 by `sha256:99ddf3d8c7a87e6e708a7aaa469524a234b14658473cdba77fdfbe993b9618b7` (source `88f26318…`, `HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002`), and on 2026-10-02 by the current Worker `sha256:2efb85da964644806e7c2d163f108ab2b5d20026c269b73c0677a162d37d7870` (source `8ab70200…`, `SPLIT-MERGE-TIMESTAMP-PRODUCTION-PROMOTION-REACCEPTANCE-001`). All eight still send the field. `99ddf3d8…` is now the immediate Worker rollback, and `db11b5ba…`, `6ececc01…`, `629ec04b…`, `fd7cdbc9…`, `0a6e66b0…`, `e5b1144c…` and `5925515f…` deeper ones (deployment runbook §4j, §4n, §9, §11h) |
 | Vercel (P1 rollout) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU`, from the same source. Superseded on 2026-09-19 by the P2 deployment below. Now a historical code-compatibility layer only: it is **not** reachable through Hobby Instant Rollback, and it carries a provider-assigned expiration (below; deployment runbook §9) |
 
 It was recorded here as "IMPLEMENTED IN SOURCE — NOT DEPLOYED" until then; that
@@ -185,6 +185,19 @@ video→audio relationship to pair on. No Vercel deployment was required, and no
 deployment-order constraint follows: the HLS-v2 rollout was Worker-only, and
 the current control plane accepted the new Worker unchanged.
 
+**Split-merge timestamp preservation changes no contract either**
+(`SPLIT-MERGE-TIMESTAMP-PRESERVATION-HARDENING-001`, PR #107 — **CLOSED /
+QUALIFIED / DEPLOYED / PRODUCTION ACCEPTED, 2026-10-02**; deployment runbook
+§4n). It changes Worker-internal processing only: the Worker's merge of a
+split pair now keeps the halves' relative A/V timing instead of re-basing each
+half to zero. No public field, preset, format id, error code or status
+vocabulary changed, and `src/shared` is unchanged. The halves' start times,
+the Opus `CodecDelay` and the synchronization decision stay Worker-private and
+never reach a browser response; the 2026-10-02 Production acceptance found none
+of them in any analysis, job-creation or status response. No Vercel deployment
+was required, and no deployment-order constraint follows: the rollout was
+Worker-only, and the current control plane accepted the new Worker unchanged.
+
 **Deployment order — VERCEL FIRST.** `VideoMetadataSchema` is strict, so a
 control plane that predates this field REJECTS a Worker response that carries it
 (`PROCESSING_FAILED`), while the new control plane accepts a Worker that omits
@@ -210,11 +223,13 @@ and the strict schema accepted it.
 
 **The ordering constraint still holds for rollback.**
 
-**Current Production** (as of 2026-10-01, recorded by
-`HLS-V2-PRODUCTION-STATE-OF-RECORD-RECONCILIATION-001`). Vercel Production is
-still `dpl_DrDdgct3EUJBBchAZvFAfwPk6LEF` (since 2026-09-30 17:02Z), observed
-read-only from the provider on 2026-09-30 and again on 2026-10-01. The
-2026-10-01 HLS-v2 rollout was Worker-only and deployed nothing to Vercel.
+**Current Production** (as of 2026-10-02, recorded by
+`SPLIT-TIMESTAMP-PRODUCTION-STATE-OF-RECORD-RECONCILIATION-001`). Vercel
+Production is still `dpl_DrDdgct3EUJBBchAZvFAfwPk6LEF` (since 2026-09-30
+17:02Z), observed read-only from the provider on 2026-09-30, 2026-10-01 and
+2026-10-02. The 2026-10-01 HLS-v2 and 2026-10-02 split-timestamp rollouts were
+Worker-only and deployed nothing to Vercel; the current Worker source
+`8ab70200…` is not deployed to Vercel.
 - **Deployment.** Target `production`, READY / PROMOTED, created
   2026-09-30T17:01:47Z, READY at 17:02:12Z, with both Production aliases. The
   provider's deployment-source field is `source: cli`.
@@ -255,24 +270,36 @@ observed read-only from the provider on 2026-09-28 and 2026-09-30. The
   and environment snapshots, not the accepted P2 API contract.
 
 **Current Production Worker.**
-`sha256:99ddf3d8c7a87e6e708a7aaa469524a234b14658473cdba77fdfbe993b9618b7`
+`sha256:2efb85da964644806e7c2d163f108ab2b5d20026c269b73c0677a162d37d7870`
 as `videofetch-worker:latest`, also retained as
-`videofetch-worker:rc-88f26318f5cf-99ddf3d8c7a8`, since 2026-10-01 22:20:05Z.
-Its source is `main` `88f26318f5cf0434091ebd1e093e1017b1717f2f` (the PR #105
-merge), and it was promoted Worker-only by
-`HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002` and accepted at 22:35:57Z
-(*accepted operator-measured*; deployment runbook §4m, §11h).
-- **What it contains.** It still sends `sourceQuality`. It contains clear-HLS
-  v1 (MPEG-TS) and clear-HLS v2 (muxed fMP4; above and deployment runbook §4m),
+`videofetch-worker:rc-8ab702002d70-2efb85da9646`, since 2026-10-02 12:23:52.407Z.
+Its source is `main` `8ab702002d70205e4c506559503e58414cb52540` (the PR #107
+merge, tree `79c79acf…`). It was qualified under SPLIT-07 `-07`, promoted
+Worker-only by `SPLIT-MERGE-TIMESTAMP-PRODUCTION-PROMOTION-REACCEPTANCE-001` and
+accepted at 12:39:15.633Z (*accepted operator-measured*; deployment runbook
+§4n, §11h).
+- **What it contains.** It still sends `sourceQuality`. It contains the
+  timestamp-preserving split merge (deployment runbook §4n), clear-HLS v1
+  (MPEG-TS) and clear-HLS v2 (muxed fMP4; above and deployment runbook §4m),
   split-half segmented DASH (deployment runbook §4k), PR #101's Worker-side
   failure classification ("Failed-job classification", below), the
   declared-only generic preset `fileSize` semantics read as positive-integer
   byte counts (item 4 below), own-property generic preset ownership and the
   plan-aware direct preset `fileSize` ("Direct analysis `fileSize`", below).
-- **What changed.** PR #105 changed no public schema, added no public error
-  code and left `src/shared` unchanged; it changes only what a clear-HLS job
-  can acquire. No Vercel deployment was required.
+- **What changed.** PR #107 changed Worker-internal processing only (above):
+  no public schema, no public error code, and `src/shared` unchanged. No
+  Vercel deployment was required.
 - **Predecessor — now the immediate Worker rollback.**
+  `sha256:99ddf3d8c7a87e6e708a7aaa469524a234b14658473cdba77fdfbe993b9618b7`,
+  retained as `videofetch-worker:rc-88f26318f5cf-99ddf3d8c7a8` (source
+  `88f26318…`, the PR #105 merge), Production from 2026-10-01 22:20:05Z until
+  2026-10-02 12:23:52Z (`HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002`). PR #105
+  changed no public schema, added no public error code and left `src/shared`
+  unchanged; it changes only what a clear-HLS job can acquire. A rollback to it
+  keeps every public schema; it restores the pre-correction split merge, which
+  erases a legitimate relative A/V offset between split halves. The current
+  control plane accepted exactly this Worker live on 2026-10-01.
+- **Next: the coordinated-rollout image.**
   `sha256:db11b5ba547fe52a79614d6874651cc4792e4bf9537549c5b7007fd37818c23b`,
   retained as `videofetch-worker:rc-0f8bff3aad27-db11b5ba547f` (source
   `0f8bff3a…`, the PR #103 merge, containing PR #101 and PR #102), Production
@@ -288,7 +315,7 @@ merge), and it was promoted Worker-only by
   clear-HLS v2, so a muxed-fMP4 rendition is still advertised but its job fails
   closed with `FORMAT_UNAVAILABLE`. The current control plane accepted exactly
   this Worker live on 2026-09-30.
-- **Next: the size-integer image.**
+- **Then: the size-integer image.**
   `sha256:6ececc018029f1d984be980c35b73c5b6e2e09f17b80408bc674ab6ff020b93b`,
   retained as `videofetch-worker:rc-53bb32b64045-6ececc018029` (source
   `53bb32b6…`, PR #97), Production from 2026-09-28 17:34:09Z until 2026-09-30
@@ -322,7 +349,8 @@ merge), and it was promoted Worker-only by
   `src/shared/worker/job-failure.ts`, and PR #102 changed
   `src/shared/worker/contracts.ts` in a comment only. No Worker request or
   response schema changed, so the ordering still holds
-  (*repository-verifiable*). PR #105 changed nothing under these paths either.
+  (*repository-verifiable*). PR #105 and PR #107 changed nothing under these
+  paths either.
 
 **Vercel rollback — current** (the procedure is in the deployment runbook §9).
 The project is on the Hobby plan, where Instant Rollback reaches only the single
@@ -386,7 +414,7 @@ PRODUCTION ACCEPTED (2026-09-19).**
 | Source | `main` `02b3f15f4e4838a64b4ec64c9dd9036145d88478` (PR #64 merge), tree `44abfe6e90c0d9ce5bd9eae8af6140e3f39e7ff9` |
 | P2 accepted Production deployment | `dpl_BcefWQBrtw7bJuubiQrTr9h38cvq`, from that source by chain of custody (the project has no Git integration, so Vercel does not attest the commit); accepted in Production on 2026-09-19. The same uploaded source continues through the provider-recorded redeploy chain `dpl_BJYRG7Vn2LCrhyU1qM2SmTHAJGWd` → `dpl_YrhkEQC4eMi2J46xFn7PUs7cpPE9` → `dpl_8k6e59juv1Z3Srb9NSNBmmVGh5Nb`, of which `dpl_8k6e59…` was Production until 2026-09-30 and is now the immediate Hobby rollback target; since then Production is `dpl_DrDdgct3…`, from `0f8bff3a…` (above) |
 | Immediate Vercel rollback at P2 (historical) | `dpl_AFFCLwLiWWfQt6zVbkg8gGC9ZtzU` — needed no Worker rollback. Now a code-compatibility layer only, **not** reachable through Hobby Instant Rollback (above) |
-| Production Worker at P2 | unchanged by P2: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`). Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c…` (deployment runbook §4j), on 2026-09-27 by `sha256:0a6e66b0…` (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, runbook §11h), later that day by `sha256:fd7cdbc9…` (`GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`, runbook §11h), then by `sha256:629ec04b…` (`DIRECT-PRESET-FILESIZE-PROVENANCE-001`, runbook §11h), on 2026-09-28 by `sha256:6ececc01…` (`GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001`, runbook §11h), on 2026-09-30 by `sha256:db11b5ba…` (`PR101-102-103-COORDINATED-PRODUCTION-ROLLOUT-001`, runbook §11h), and on 2026-10-01 by the current Worker `sha256:99ddf3d8…` (`HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002`, runbook §4m, §11h); P2 itself did not change |
+| Production Worker at P2 | unchanged by P2: `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e` (source `593f47df…`). Superseded on 2026-09-26 by the HLS-10 image `sha256:e5b1144c…` (deployment runbook §4j), on 2026-09-27 by `sha256:0a6e66b0…` (`SOURCE-FILESIZE-ESTIMATE-DRIFT-001`, runbook §11h), later that day by `sha256:fd7cdbc9…` (`GENERIC-PRESET-OWNER-OWN-PROPERTY-HARDENING-001`, runbook §11h), then by `sha256:629ec04b…` (`DIRECT-PRESET-FILESIZE-PROVENANCE-001`, runbook §11h), on 2026-09-28 by `sha256:6ececc01…` (`GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001`, runbook §11h), on 2026-09-30 by `sha256:db11b5ba…` (`PR101-102-103-COORDINATED-PRODUCTION-ROLLOUT-001`, runbook §11h), on 2026-10-01 by `sha256:99ddf3d8…` (`HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002`, runbook §4m, §11h), and on 2026-10-02 by the current Worker `sha256:2efb85da…` (`SPLIT-MERGE-TIMESTAMP-PRODUCTION-PROMOTION-REACCEPTANCE-001`, runbook §4n, §11h); P2 itself did not change |
 
 It was recorded here as "IMPLEMENTED IN SOURCE / NOT DEPLOYED" until then; that
 state is now history. The deployment and acceptance record is in the deployment
@@ -448,9 +476,10 @@ implemented in source (HLS-7), qualified in a retained release candidate (HLS-9B
 and, on 2026-09-26, **deployed to the Production Worker and accepted** by HLS-10
 on a real public source (deployment runbook §4j). The 2026-09-30 Worker image
 `sha256:db11b5ba…` still contained that same accepted clear-HLS runtime source.
-Since 2026-10-01 the current Worker image `sha256:99ddf3d8…` keeps that path and
-adds the narrow clear-HLS v2 muxed-fMP4 shape (above; deployment runbook §4m),
-with no schema change. Every HLS rendition outside those two narrow paths
+On 2026-10-01 the Worker image `sha256:99ddf3d8…` kept that path and added the
+narrow clear-HLS v2 muxed-fMP4 shape (above; deployment runbook §4m), and since
+2026-10-02 the current Worker image `sha256:2efb85da…` keeps both, with no
+schema change. Every HLS rendition outside those two narrow paths
 remains inventory-only. `observedMaxHeight` is still not a claim about a
 provider's absolute maximum, and protected renditions are still not
 downloadable.
@@ -467,10 +496,12 @@ downloadable.
   by `sha256:629ec04b…` (`DIRECT-PRESET-FILESIZE-PROVENANCE-001`), and on
   2026-09-28 by `sha256:6ececc01…` (`GENERIC-YTDLP-SIZE-INTEGER-HARDENING-001`),
   on 2026-09-30 by `sha256:db11b5ba…`
-  (`PR101-102-103-COORDINATED-PRODUCTION-ROLLOUT-001`), and on 2026-10-01 by
-  `sha256:99ddf3d8…` (`HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002`).
-  `0a6e66b0…` is now a deeper Worker rollback, behind `db11b5ba…`,
-  `6ececc01…`, `629ec04b…` and `fd7cdbc9…`. The
+  (`PR101-102-103-COORDINATED-PRODUCTION-ROLLOUT-001`), on 2026-10-01 by
+  `sha256:99ddf3d8…` (`HLS-V2-PRODUCTION-PROMOTION-ACCEPTANCE-002`), and on
+  2026-10-02 by `sha256:2efb85da…`
+  (`SPLIT-MERGE-TIMESTAMP-PRODUCTION-PROMOTION-REACCEPTANCE-001`).
+  `0a6e66b0…` is now a deeper Worker rollback, behind `99ddf3d8…`,
+  `db11b5ba…`, `6ececc01…`, `629ec04b…` and `fd7cdbc9…`. The
   same accepted generic `fileSize` semantics remain present in the current
   image, which applies them only to size fields that are positive integers
   (since 2026-09-28; "Positive-integer byte counts", below).
@@ -546,8 +577,8 @@ ACCEPTED — 2026-09-28.**
 - **Worker.** `sha256:6ececc01…`, promoted 2026-09-28 17:34:09Z and accepted
   17:43:33Z. It was the Production Worker until 2026-09-30 17:06:33Z and the
   immediate Worker rollback until 2026-10-01, and is now a deeper one, behind
-  `db11b5ba…`; the current Worker `sha256:99ddf3d8…` keeps these semantics
-  (above).
+  `99ddf3d8…` and `db11b5ba…`; the current Worker `sha256:2efb85da…` keeps
+  these semantics (above).
 - **Record.** Deployment runbook §11h.
 
 yt-dlp's `filesize` and `filesize_approx` are interpreted as byte counts only
@@ -620,10 +651,10 @@ ACCEPTED — 2026-09-27.**
 - **Source.** PR #92, `main` `083cbfcc14b98170385d1737c1a5f318e81a38f6`.
 - **Worker.** `sha256:629ec04b…`, promoted 2026-09-27 21:12:15Z. It was the
   Production Worker until 2026-09-28 17:34:09Z and is now a deeper Worker
-  rollback, behind `db11b5ba…` and `6ececc01…`. The current Worker
-  `sha256:99ddf3d8…` keeps these direct preset-size semantics unchanged:
-  PR #97 and PR #105 did not touch direct analysis, and PR #101 changed only
-  how a direct source failure is classified.
+  rollback, behind `99ddf3d8…`, `db11b5ba…` and `6ececc01…`. The current
+  Worker `sha256:2efb85da…` keeps these direct preset-size semantics
+  unchanged: PR #97, PR #105 and PR #107 did not touch direct analysis, and
+  PR #101 changed only how a direct source failure is classified.
 - **Record.** Deployment runbook §11h.
 
 It was recorded here as "IMPLEMENTED IN SOURCE — PRODUCTION DEPLOYMENT
@@ -760,8 +791,8 @@ ACCEPTED — 2026-09-30.**
 - **Deployed.** The control-plane half in Vercel `dpl_DrDdgct3…` and the
   Worker half in `sha256:db11b5ba…`, by
   `PR101-102-103-COORDINATED-PRODUCTION-ROLLOUT-001` (deployment runbook §11h).
-  The current Worker `sha256:99ddf3d8…` (2026-10-01) keeps the Worker half
-  unchanged.
+  `sha256:99ddf3d8…` (2026-10-01) and the current Worker `sha256:2efb85da…`
+  (2026-10-02) keep the Worker half unchanged.
 - **Live proof, and its limit.** Exact-source provenance of both layers, the
   new canonical `PROCESSING_FAILED` copy in the served browser bundle,
   canonical `NOT_FOUND` answers for a missing and a malformed job id, and an
