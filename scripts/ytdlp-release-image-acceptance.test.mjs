@@ -2444,6 +2444,14 @@ describe("SPLIT-07 harness provenance (driver)", () => {
     assert.equal(harness.verifiedBeforeRun, true);
     assert.equal(harness.verifiedAfterRun, true);
     assert.deepEqual(harness.verificationPoints, HARNESS_POINTS);
+    // The descriptive text names exactly the children the checkpoints gate:
+    // one per `before-<child>` point after the build.
+    const childPoints = HARNESS_POINTS.filter((point) => point.startsWith("before-") && point !== "before-docker");
+    const named = harness.verifiedBy.match(/to the end of all (\w+) children \(([^)]*)\)$/);
+    assert.ok(named, harness.verifiedBy);
+    assert.equal(named[1], "six");
+    assert.equal(named[2].split(", ").length, childPoints.length);
+    assert.match(named[2], /SYNC-01 split-merge timing/);
     assert.equal(harness.driverInsideHarness, true);
     assert.equal(harness.worktreeIsReleaseContext, false);
     assert.equal(harness.commitIsReleaseSource, false);
