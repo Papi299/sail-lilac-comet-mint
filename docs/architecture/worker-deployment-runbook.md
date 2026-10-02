@@ -4813,7 +4813,8 @@ below.
 
 *Recorded by `SPLIT-TIMESTAMP-PRODUCTION-STATE-OF-RECORD-RECONCILIATION-001`
 (documentation only). Operator-measured evidence held outside this repository,
-not CI: 50 files, SHA-256 manifest
+not CI: 50 evidence files plus the `SHA256SUMS` manifest (51 files total);
+manifest SHA-256
 `684ebb695689e8ea9444809aaab0606921ff00212d287d973c612d7037330b28`.*
 
 | | |
@@ -10818,7 +10819,8 @@ claim boundary, are at the end of §4n.
   state. That evidence is held outside the repository and is not GitHub CI:
   qualification SHA-256 manifest
   `684ebb695689e8ea9444809aaab0606921ff00212d287d973c612d7037330b28` (50
-  files), rollout
+  evidence files plus the `SHA256SUMS` manifest itself, 51 files total),
+  rollout
   `bc66fdbbf6d73befd26a864e3ceaf56a9b7f892bcd4ec40b6b3c8352b28be768` (107
   files, privacy-scanned). The Production image identity is the operator's
   measurement; no provider attests it.
