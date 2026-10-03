@@ -13,6 +13,13 @@
 // redirect, the other with a re-signed master — while yt-dlp keeps receiving
 // the ordinary master. The Product is recognised by its fixed request profile
 // (`VideoFetch/1.0`), which the transport independently verifies.
+//
+// And one thing for the shared-deadline negative (`neg-deadline`, since
+// `-02`): a route may be HELD — answered with exactly its own bytes, but only
+// at a fixed time after another route first arrived. A held answer is late,
+// never different. The ledger records every request's monotonic arrival and
+// finish time, and for a held one when it was released or, if the client went
+// away first, when it was abandoned.
 
 import { createServer } from "node:http";
 import {
@@ -36,10 +43,12 @@ export const HLS12_CONTENT_TYPES = Object.freeze({
  * @param {Map<string, {kind: string, body: Buffer, product?: {status: 200, body: Buffer} | {status: 302, location: string}}>} opts.routes
  *        exact path (with query) -> what it serves
  * @param {{next(): number}} opts.eventClock  shared with the acceptance transport
+ * @param {() => number} [opts.now]  the monotonic clock of the process the Product runs in
  */
-export function createHls12FixtureService({ routes, eventClock }) {
+export function createHls12FixtureService({ routes, eventClock, now = () => performance.now() }) {
   if (!(routes instanceof Map)) throw new Error("the HLS-12 route table is required");
   if (!eventClock || typeof eventClock.next !== "function") throw new Error("the event clock is required");
+  if (typeof now !== "function") throw new Error("the monotonic clock must be a function");
   for (const served of routes.values()) {
     const product = served.product;
     if (product === undefined) continue;
@@ -51,11 +60,16 @@ export function createHls12FixtureService({ routes, eventClock }) {
 
   const ledger = [];
   const failing = new Map();
+  const holds = new Map();
+  const firstArrival = new Map();
+  const pendingHolds = new Set();
   let phase = "setup";
   let port = null;
 
   const server = createServer((req, res) => {
     const path = req.url ?? "";
+    const arriveMs = now();
+    if (!firstArrival.has(path)) firstArrival.set(path, arriveMs);
     const route = classifyHls12FixturePath(path);
     const headers = req.headers;
     const ua = headers["user-agent"];
@@ -63,6 +77,11 @@ export function createHls12FixtureService({ routes, eventClock }) {
     const entry = {
       arriveSeq: eventClock.next(),
       finishSeq: null,
+      arriveMs,
+      finishMs: null,
+      held: false,
+      releasedMs: null,
+      abandonedMs: null,
       phase,
       method: req.method ?? null,
       kind: route.kind,
@@ -83,6 +102,7 @@ export function createHls12FixtureService({ routes, eventClock }) {
     ledger.push(entry);
     res.on("finish", () => {
       if (entry.finishSeq === null) entry.finishSeq = eventClock.next();
+      if (entry.finishMs === null) entry.finishMs = now();
     });
 
     const send = (status, type, body, extra = {}) => {
@@ -102,6 +122,28 @@ export function createHls12FixtureService({ routes, eventClock }) {
       entry.productAnswer = true;
       if (served.product.status === 302) return send(302, null, null, { location: served.product.location });
       return send(200, HLS12_CONTENT_TYPES[served.kind] ?? null, served.product.body);
+    }
+    const hold = holds.get(path);
+    if (hold !== undefined) {
+      entry.held = true;
+      const anchorMs = firstArrival.get(hold.anchorPath);
+      // Fail closed: a hold whose anchor never arrived has no defined release.
+      if (anchorMs === undefined) return send(500, null, null);
+      const answer = () => {
+        pendingHolds.delete(timer);
+        if (entry.abandonedMs !== null || res.destroyed) return;
+        entry.releasedMs = now();
+        send(200, HLS12_CONTENT_TYPES[served.kind] ?? null, served.body);
+      };
+      const timer = setTimeout(answer, Math.max(0, anchorMs + hold.releaseAfterMs - now()));
+      pendingHolds.add(timer);
+      res.on("close", () => {
+        if (entry.status !== null) return;
+        clearTimeout(timer);
+        pendingHolds.delete(timer);
+        entry.abandonedMs = now();
+      });
+      return undefined;
     }
     return send(200, HLS12_CONTENT_TYPES[served.kind] ?? null, served.body);
   });
@@ -123,6 +165,21 @@ export function createHls12FixtureService({ routes, eventClock }) {
     fail(path, status) {
       failing.set(path, status);
     },
+    /**
+     * Answer one exact route with its OWN bytes, but only `releaseAfterMs`
+     * after `anchorPath` first arrived (a negative case). Unanswered if the
+     * client goes away first; the ledger then records when it was abandoned.
+     */
+    hold(path, { anchorPath, releaseAfterMs }) {
+      if (!routes.has(path) || !routes.has(anchorPath) || path === anchorPath) {
+        throw new Error("a hold names two different routes of the table");
+      }
+      if (!Number.isSafeInteger(releaseAfterMs) || releaseAfterMs <= 0) {
+        throw new Error("a hold releases a positive whole number of milliseconds after its anchor");
+      }
+      if (routes.get(path).product !== undefined) throw new Error("a Product-only answer is never held");
+      holds.set(path, { anchorPath, releaseAfterMs });
+    },
     setPhase(next) {
       phase = String(next);
     },
@@ -131,6 +188,8 @@ export function createHls12FixtureService({ routes, eventClock }) {
       return filter === null ? all : all.filter((e) => e.phase === filter);
     },
     close() {
+      for (const timer of pendingHolds) clearTimeout(timer);
+      pendingHolds.clear();
       return new Promise((resolvePromise) => {
         server.closeAllConnections?.();
         server.close(() => resolvePromise());

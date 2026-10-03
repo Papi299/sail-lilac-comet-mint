@@ -93,6 +93,7 @@ import {
 import { HLS11_FIXTURE_HOST_MAPPING } from "../deploy/acceptance/ytdlp-generic/lib/hls11-fixture-url.mjs";
 import {
   buildHls12ReleaseEvidence,
+  HLS12_DEADLINE_CHECKS,
   HLS12_MANDATORY_CHECKS,
   HLS12_RELEASE_EVIDENCE_SCHEMA,
 } from "../deploy/acceptance/ytdlp-generic/lib/hls12-evidence.mjs";
@@ -437,6 +438,17 @@ function passingHls12Child(flags = null, overrides = {}) {
     checks: HLS12_MANDATORY_CHECKS.map((name) => ({ name, ok: true, detail: null })),
   });
   return deepMerge(record, overrides);
+}
+
+/**
+ * An HLS-12 `-01`-shaped PASS (SPLIT-07 `-08`): the 206 checks, none of the
+ * shared-deadline ones — under its own schema, or relabelled.
+ */
+function historicalHls12Child(schema = "hls12-release-image-separate-audio-01") {
+  const record = passingHls12Child(null, { schema });
+  record.checks = record.checks.filter((check) => !HLS12_DEADLINE_CHECKS.includes(check.name));
+  assert.equal(record.checks.length, 206);
+  return record;
 }
 
 /** A child record's exact on-disk bytes. */
@@ -1791,15 +1803,16 @@ describe("SPLIT-07 evidence builder", () => {
   });
 
   it("names a NEW schema, and never reuses or bumps SPLIT-06's", () => {
-    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-08");
+    assert.equal(SPLIT07_EVIDENCE_SCHEMA, "split07-release-image-candidate-09");
     assert.equal(REQUIRED_CHILD_SCHEMA, "split06-deterministic-full-path-05");
     assert.equal(REQUIRED_CHILD_SCHEMA, SPLIT06_EVIDENCE_SCHEMA);
     assert.equal(REQUIRED_SYNC_CHILD_SCHEMA, "sync01-release-image-merge-timing-01");
     assert.equal(REQUIRED_SYNC_CHILD_SCHEMA, SYNC01_RELEASE_EVIDENCE_SCHEMA);
     assert.equal(REQUIRED_HLS11_CHILD_SCHEMA, "hls11-release-image-full-path-02");
     assert.equal(REQUIRED_HLS11_CHILD_SCHEMA, HLS11_RELEASE_EVIDENCE_SCHEMA);
-    assert.equal(REQUIRED_HLS12_CHILD_SCHEMA, "hls12-release-image-separate-audio-01");
+    assert.equal(REQUIRED_HLS12_CHILD_SCHEMA, "hls12-release-image-separate-audio-02");
     assert.equal(REQUIRED_HLS12_CHILD_SCHEMA, HLS12_RELEASE_EVIDENCE_SCHEMA);
+    assert.notEqual(REQUIRED_HLS12_CHILD_SCHEMA, "hls12-release-image-separate-audio-01", "the deadline-blind HLS-12 child is historical");
     assert.equal(REQUIRED_HLS_CHILD_SCHEMA, "hls09-release-image-full-path-02");
     assert.equal(REQUIRED_DASH_CHILD_SCHEMA, "dash01-release-image-full-path-02");
     assert.equal(REQUIRED_DASH_CHILD_SCHEMA, DASH01_RELEASE_EVIDENCE_SCHEMA);
@@ -2663,7 +2676,7 @@ describe("SPLIT-07 parent evidence is created exclusively", () => {
   it("A1: with the pre-flight blind, the exclusive create itself refuses and leaves the file untouched", async () => {
     const { result, error, world } = await drive({ files: [[PARENT, PRIOR]] }, {}, { readdir: async () => [] });
     assert.equal(result, null);
-    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-08 verdict/);
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-09 verdict/);
     assert.ok(world.files.get(PARENT).equals(PRIOR), "the existing bytes must be unchanged");
     assert.deepEqual(world.writeCalls.map((call) => call.options), [{ encoding: "utf8", flag: "wx" }]);
   });
@@ -2674,7 +2687,7 @@ describe("SPLIT-07 parent evidence is created exclusively", () => {
     const lines = [];
     const { result, error, world } = await drive({ competitorAtWrite: competitor }, {}, { log: (line) => lines.push(line) });
     assert.equal(result, null, "a lost race returns no result, and so no PASS");
-    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-08 verdict/);
+    assert.match(String(error?.message), /refusing to claim a split07-release-image-candidate-09 verdict/);
     assert.match(String(error?.message), /has NOT been modified/);
     assert.equal(world.files.get(PARENT).toString("utf8"), competitor, "the competing record must be byte-identical");
     assert.deepEqual(
@@ -2753,8 +2766,8 @@ describe("SPLIT-07 -02 evidence gates", () => {
     assert.equal(record.harness.commitIsReleaseSource, true);
   });
 
-  it("treats -01 through -07 as historical: the builder emits only -08", () => {
-    assert.equal(buildReleaseEvidence(evidenceInput()).schema, "split07-release-image-candidate-08");
+  it("treats -01 through -08 as historical: the builder emits only -09", () => {
+    assert.equal(buildReleaseEvidence(evidenceInput()).schema, "split07-release-image-candidate-09");
     assert.deepEqual([...HISTORICAL_SPLIT07_SCHEMAS], [
       "split07-release-image-candidate-01",
       "split07-release-image-candidate-02",
@@ -2763,6 +2776,7 @@ describe("SPLIT-07 -02 evidence gates", () => {
       "split07-release-image-candidate-05",
       "split07-release-image-candidate-06",
       "split07-release-image-candidate-07",
+      "split07-release-image-candidate-08",
     ]);
     assert.ok(!HISTORICAL_SPLIT07_SCHEMAS.includes(SPLIT07_EVIDENCE_SCHEMA));
   });
@@ -3004,10 +3018,10 @@ describe("SPLIT-07 -03 clear-HLS child record validation", () => {
 });
 
 describe("SPLIT-07 -03 evidence gates", () => {
-  it("emits a -08 PASS with mp4 + webm + the clear-HLS, segmented-DASH, clear-HLS v2, split-merge timing and separate-audio children", () => {
+  it("emits a -09 PASS with mp4 + webm + the clear-HLS, segmented-DASH, clear-HLS v2, split-merge timing and separate-audio children", () => {
     const record = buildReleaseEvidence(evidenceInput());
-    assert.equal(record.schema, "split07-release-image-candidate-08");
-    assert.equal(record.hls12Acceptance.requiredChildSchema, "hls12-release-image-separate-audio-01");
+    assert.equal(record.schema, "split07-release-image-candidate-09");
+    assert.equal(record.hls12Acceptance.requiredChildSchema, "hls12-release-image-separate-audio-02");
     assert.equal(record.hls12Acceptance.executed, true);
     assert.equal(record.hls12Acceptance.child.candidateImageId, IMAGE_ID);
     assert.equal(record.hls12Acceptance.child.runImageId, IMAGE_ID);
@@ -3102,7 +3116,7 @@ describe("SPLIT-07 -03 evidence gates", () => {
     }
   });
 
-  it("reads a -08 record back, and never silently reads a historical -01..-07 record as -08", () => {
+  it("reads a -09 record back, and never silently reads a historical -01..-08 record as -09", () => {
     const current = JSON.parse(renderReleaseEvidence(buildReleaseEvidence(evidenceInput())));
     assert.deepEqual(validateReleaseParentRecord(current, { sourceCommit: SOURCE, imageId: IMAGE_ID }), []);
     for (const schema of HISTORICAL_SPLIT07_SCHEMAS) {
@@ -3110,15 +3124,28 @@ describe("SPLIT-07 -03 evidence gates", () => {
       // in, is named historical — never read under -03 rules as a PASS.
       const problems = validateReleaseParentRecord({ ...current, schema }, { sourceCommit: SOURCE, imageId: IMAGE_ID });
       assert.equal(problems.length, 1, schema);
-      assert.match(problems[0], /historical schema.*does not carry the separate-audio clear-HLS child/, schema);
+      assert.match(
+        problems[0],
+        schema === "split07-release-image-candidate-08"
+          ? /historical schema.*separate-audio clear-HLS child does not release-prove the shared acquisition deadline/
+          : /historical schema.*does not carry the separate-audio clear-HLS child/,
+        schema,
+      );
     }
+    // An -08-shaped record relabelled -09: its HLS-12 child is the deadline-blind -01, so no -09 PASS.
+    const deadlineBlind = JSON.parse(JSON.stringify(current));
+    deadlineBlind.hls12Acceptance.child.schema = "hls12-release-image-separate-audio-01";
+    assert.ok(
+      validateReleaseParentRecord(deadlineBlind).some((problem) =>
+        /separate-audio child is hls12-release-image-separate-audio-01, not hls12-release-image-separate-audio-02/.test(problem)),
+    );
     // A -02-shaped record relabelled -03: no HLS child, so no -03 PASS.
     const relabelled = JSON.parse(JSON.stringify(current));
     delete relabelled.hlsAcceptance;
     relabelled.checks = relabelled.checks.filter((check) => !check.name.startsWith("hls/"));
     relabelled.image.candidateRuns = relabelled.image.candidateRuns.filter((entry) => entry.purpose !== HLS_CANDIDATE_RUN_PURPOSE);
     assert.ok(validateReleaseParentRecord(relabelled).some((problem) => /missing required checks/.test(problem)));
-    assert.ok(validateReleaseParentRecord({ ...current, schema: "split07-release-image-candidate-09" }).length > 0);
+    assert.ok(validateReleaseParentRecord({ ...current, schema: "split07-release-image-candidate-10" }).length > 0);
     // A -04-shaped record relabelled -05: no DASH child, so no -05 PASS.
     const noDash = JSON.parse(JSON.stringify(current));
     delete noDash.dashAcceptance;
@@ -3157,7 +3184,7 @@ describe("SPLIT-07 -03 driver: the clear-HLS child", () => {
     const { result, error, world } = await drive();
     assert.equal(error, null, error ? String(error.message) : undefined);
     assert.equal(result.verdict, "PASS");
-    assert.equal(result.record.schema, "split07-release-image-candidate-08");
+    assert.equal(result.record.schema, "split07-release-image-candidate-09");
     const childOrder = world.dockerCalls
       .filter((call) =>
         call.args[0] === "run" &&
@@ -4274,7 +4301,7 @@ describe("SPLIT-07 -08 separate-audio clear-HLS child validation", () => {
   it("accepts a real HLS-12 PASS naming this source and image", () => {
     const observation = validate(passingHls12Child());
     assert.equal(observation.ok, true, observation.reason);
-    assert.equal(observation.schema, "hls12-release-image-separate-audio-01");
+    assert.equal(observation.schema, "hls12-release-image-separate-audio-02");
     assert.equal(observation.checkCount, HLS12_MANDATORY_CHECKS.length);
     assert.deepEqual([observation.candidateImageId, observation.runImageId, observation.networkMode], [IMAGE_ID, IMAGE_ID, "none"]);
   });
@@ -4288,7 +4315,9 @@ describe("SPLIT-07 -08 separate-audio clear-HLS child validation", () => {
     failing.checks = failing.checks.map((check) =>
       check.name === "neg-master-redirect/product-got-a-redirect-and-followed-nothing" ? { ...check, ok: false } : check);
     for (const [label, record, reason] of [
-      ["a future schema", passingHls12Child(null, { schema: "hls12-release-image-separate-audio-02" }), /schema is/],
+      ["a future schema", passingHls12Child(null, { schema: "hls12-release-image-separate-audio-03" }), /schema is/],
+      ["the historical deadline-blind -01", historicalHls12Child(), /schema is hls12-release-image-separate-audio-01/],
+      ["an -01 relabelled -02", historicalHls12Child("hls12-release-image-separate-audio-02"), /mandatory checks absent or duplicated: 8/],
       ["a FAIL verdict", passingHls12Child(null, { verdict: "FAIL" }), /verdict is FAIL/],
       ["the timing check removed", dropped, /mandatory checks absent/],
       ["the redirect negative failed", failing, /did not pass/],
@@ -4315,6 +4344,11 @@ describe("SPLIT-07 -08 separate-audio clear-HLS child validation", () => {
       ["HLS-12 child missing", { hls12Acceptance: { executed: false, child: null } }, /without an executed HLS-12 separate-audio child/],
       ["HLS-12 child absent entirely", null, /without an executed HLS-12 separate-audio child/],
       ["HLS-12 schema wrong", child({ schema: "hls11-release-image-full-path-02" }), /separate-audio child is hls11/],
+      [
+        "HLS-12 child is the deadline-blind -01",
+        child({ schema: "hls12-release-image-separate-audio-01" }),
+        /separate-audio child is hls12-release-image-separate-audio-01, not hls12-release-image-separate-audio-02/,
+      ],
       ["HLS-12 verdict FAIL", child({ verdict: "FAIL", ok: false }), /separate-audio child did not pass/],
       ["one HLS-12 check failed", child({ failedCheckCount: 1 }), /separate-audio child did not pass/],
       ["no HLS-12 digest", child({ sha256: null }), /separate-audio child has no content digest/],
