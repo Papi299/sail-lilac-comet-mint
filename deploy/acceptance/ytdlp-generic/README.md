@@ -191,7 +191,8 @@ not an overlay. It does the following, and deploys nothing and never touches
   fMP4 pairs, each proven from a Master Playlist the Product fetches itself,
   acquired as two halves under one byte budget and merged by the shared split
   merge with their timing preserved, plus four master negatives and five
-  execution negatives;
+  execution negatives (since `-09`, HLS-12 `-02`: a sixth, `neg-deadline`,
+  proves the two halves share ONE acquisition deadline);
 - creates its record exclusively, and reads it back.
 
 See [`SPLIT-07.md`](SPLIT-07.md), for the clear-HLS child [`HLS-09.md`](HLS-09.md),
@@ -202,7 +203,7 @@ child [`HLS-11.md`](HLS-11.md), for the split-merge timing child
 
 | File | Runs on | Purpose |
 | :--- | :--- | :--- |
-| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, the clear-HLS child once, the segmented-DASH child once, the clear-HLS v2 child once, the split-merge timing child once and the separate-audio clear-HLS child once, writes the `split07-release-image-candidate-08` record (`-07` is valid release qualification for exactly the candidates it qualified — its source has no separate-audio HLS family; `-06` is valid release qualification for exactly the candidates it qualified — its SPLIT-06 and DASH-01 children could not see per-input timestamp zeroing, and it ran no split-merge timing child; `-05` is valid release qualification for exactly the candidates it qualified — it ran no clear-HLS v2 child; `-04` is historical — it ran no real-media segmented-DASH child and no `-04` record was ever produced; `-03` is valid HLS-aware qualification under the pre-`GENERIC-SEGMENTED-DASH-EXECUTION-001` protocol invariant; `-02` is valid split-stream-only qualification and does not qualify clear HLS; `-01` is historical). Requires `--media-workspace`: an existing, EMPTY, uid-1000-writable directory on disk, never the report directory or a Production path — admitted before any Docker command and cleared after each child. |
+| `run-release-image-acceptance.mjs` | where Docker is | Verifies the release context, builds the real image, characterizes it, runs SPLIT-06 twice, the clear-HLS child once, the segmented-DASH child once, the clear-HLS v2 child once, the split-merge timing child once and the separate-audio clear-HLS child once, writes the `split07-release-image-candidate-09` record (`-08` is valid release qualification for exactly the candidate it qualified, but is not sufficient for promotion — its HLS-12 `-01` child never release-proved the separate-audio halves' shared acquisition deadline; `-07` is valid release qualification for exactly the candidates it qualified — its source has no separate-audio HLS family; `-06` is valid release qualification for exactly the candidates it qualified — its SPLIT-06 and DASH-01 children could not see per-input timestamp zeroing, and it ran no split-merge timing child; `-05` is valid release qualification for exactly the candidates it qualified — it ran no clear-HLS v2 child; `-04` is historical — it ran no real-media segmented-DASH child and no `-04` record was ever produced; `-03` is valid HLS-aware qualification under the pre-`GENERIC-SEGMENTED-DASH-EXECUTION-001` protocol invariant; `-02` is valid split-stream-only qualification and does not qualify clear HLS; `-01` is historical). Requires `--media-workspace`: an existing, EMPTY, uid-1000-writable directory on disk, never the report directory or a Production path — admitted before any Docker command and cleared after each child. |
 | `lib/release-provenance.mjs` | — | The clean-worktree gate for the release context and the harness, and the `/app` source manifest from Git objects. |
 | `lib/release-container.mjs` | — | Every `docker` argv: non-deployable tags, immutable-id run subjects, hardening, the Product media workspace bound in Production's exact `--mount type=bind` form (the 2 GiB tmpfs is retired, `MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001`), the forbidden-mount guard, and the clear-HLS, segmented-DASH, clear-HLS v2, split-merge timing and separate-audio clear-HLS children's argv and structural posture checks. |
 | `lib/release-image-probe.mjs` | inside the candidate, at `/verify` | Import-free observer: manifest, forbidden tools, env names, runtime identity. |
@@ -223,11 +224,12 @@ child [`HLS-11.md`](HLS-11.md), for the split-merge timing child
 | `lib/sync-evidence.mjs` | — | The `sync01-release-image-merge-timing-01` record, its 281 mandatory checks, PASS and privacy gates, and the parent-side validator. |
 | `fixtures/sync-media.mjs` | — | The 19 timing cases, their exact recipes and the frozen historical merge argv. |
 | `hls12-full-path.mjs` | inside the release candidate | The HLS-12 separate-audio clear-HLS real-media orchestrator, launched by SPLIT-07 with the parent's identity flags. |
-| `lib/hls12-evidence.mjs` | — | The `hls12-release-image-separate-audio-01` record, its 206 mandatory checks, PASS and privacy gates, and the parent-side validator. |
+| `lib/hls12-evidence.mjs` | — | The `hls12-release-image-separate-audio-02` record (`-01` historical: no shared-deadline negative), its 214 mandatory checks, PASS and privacy gates, and the parent-side validator. |
+| `lib/hls12-deadline.mjs` | — | The `neg-deadline` control, its margin inequalities and the pure evaluation of the fixture's timed ledger. Import-free. |
 | `lib/hls12-fixture-url.mjs` | — | The HLS-12 hostname, `--add-host` mapping, closed per-case routes and exact page validator. Import-free. |
 | `lib/hls12-observers.mjs` | — | The separate-audio spawn reducer (each input, demuxer, output and the merge's sync tokens), workspace grammar and `-J` reducer. |
 | `fixtures/hls12-media.mjs` | — | The bit-exact separate-audio recipes (audio-late, video-late, zero-aligned, and the negatives' renditions), the page and the four master shapes. |
-| `fixtures/hls12-server.mjs` | inside the release candidate, loopback only | The closed-route fixture service, its sanitized ledger and the Product-only answers (a redirect, a re-signed master). |
+| `fixtures/hls12-server.mjs` | inside the release candidate, loopback only | The closed-route fixture service, its sanitized and timed ledger, the Product-only answers (a redirect, a re-signed master) and the held answers of `neg-deadline` (late, never altered). |
 
 Self-tests: `scripts/ytdlp-release-image-acceptance.test.mjs`,
 `scripts/ytdlp-dash-acceptance.test.mjs`, `scripts/ytdlp-hls11-acceptance.test.mjs`,

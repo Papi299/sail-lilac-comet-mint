@@ -2,18 +2,19 @@
 
 **Test tooling only.** Nothing here runs during Worker startup, and none of it
 ships in the Worker image. HLS-12 runs **only** as a child of the SPLIT-07
-release-image gate (`split07-release-image-candidate-08` and later), inside the
-exact candidate image, offline. It never deploys anything.
+release-image gate, inside the exact candidate image, offline: its `-01` under
+`split07-release-image-candidate-08`, its `-02` under `-09` and later. It never
+deploys anything.
 
 HLS-12 answers the question `HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001`
 raises:
 
 > Does the exact candidate image prove a video-only fMP4 HLS rendition's ONE
 > audio rendition from a Master Playlist it fetches itself, acquire both halves
-> through VideoFetch's own safe transport under one byte budget, and merge them
-> into an MP4 that keeps their relative audio/video timing, strictly after the
-> job has entered `processing` — while refusing every pair the master does not
-> prove?
+> through VideoFetch's own safe transport under one byte budget and one
+> acquisition deadline, and merge them into an MP4 that keeps their relative
+> audio/video timing, strictly after the job has entered `processing` — while
+> refusing every pair the master does not prove?
 
 The unit tests of that task pin the master grammar, the pairing proof, the
 fetch bounds, the planner partition and the lifecycle ordering, and
@@ -38,8 +39,8 @@ real pinned-yt-dlp analysis (HTML5 <video> → signed master → m3u8_native row
   → the shared split merge: real ffprobe of each half,
     ONE real FFmpeg stream copy, -isync on the earlier input         (durable: processing)
   → beginUploading() → local object writer → ready
-+ four master negatives + five execution negatives
-  → HLS-12 PASS (hls12-release-image-separate-audio-01)
++ four master negatives + six execution negatives (the sixth: the ONE shared deadline)
+  → HLS-12 PASS (hls12-release-image-separate-audio-02)
 ```
 
 Nothing of the Product is replaced. The executor receives exactly one seam, a
@@ -58,7 +59,12 @@ the workspace-capacity reader are the executor's defaults. The substitutions
   yt-dlp's: a redirect, or a re-signed master. It recognises the Product by its
   fixed request profile, which the transport verifies independently;
 - a local object writer in place of R2;
-- a fresh temporary SQLite job store per job, with a status-audit trigger.
+- a fresh temporary SQLite job store per job, with a status-audit trigger;
+- two per-case controls, each applied to one job and restored after it:
+  `neg-budget` narrows the Product's configured byte limit
+  (`config.maxFileSize`), and `neg-deadline` narrows its configured download
+  budget (`config.downloadTimeoutMs`) and has the fixture hold two routes'
+  answers (below). No Product code, clock or timer is replaced.
 
 ---
 
@@ -204,6 +210,81 @@ the workDir removed:
 | `neg-audio-video` | `PROCESSING_FAILED` | the video half probes clean, and the real ffprobe of the "audio" half refuses it: no FFmpeg |
 | `neg-budget` | `TOO_LARGE` | the allowance is the two halves' sum minus one byte, so EACH half alone fits it. The video half is acquired whole, and the audio half is refused at its last fragment: the job fails **only because the halves share one budget**. The limit is restored |
 | `neg-audio-map-404` | `NETWORK_ERROR` | the video half is complete, the audio map answers 404, and no audio fragment is ever requested |
+| `neg-deadline` (since `-02`) | `TIMEOUT` | the ONE acquisition deadline: the video half completes inside a narrowed budget having used most of it, and the audio half is stopped, unanswered, **at that same deadline** — never given a fresh one. Nothing is probed or merged (next section) |
+
+## The shared deadline (`neg-deadline`, since `-02`)
+
+`acquireSelectedSeparateHlsMedia()` arms ONE acquisition deadline before the
+video half and hands the audio half only what is left of it. Every other
+HLS-12 case is local and fast, so none of them ever approaches a deadline:
+HLS-12 `-01` would have passed a candidate that handed the audio half a fresh
+budget. `neg-deadline` is the case that would not.
+
+It runs a full job through the candidate's real executor, HLS-2 preflights and
+HLS-3 acquisitions, with exactly two controls (`HLS12_DEADLINE_CONTROL`,
+`lib/hls12-deadline.mjs`):
+
+- **The budget.** For this one job, the Product's configured download budget
+  `config.downloadTimeoutMs` (the `DOWNLOAD_TIMEOUT` value every acquisition
+  already reads) is **10,000 ms**, and it is restored afterwards. The executor
+  passes no narrower one, so this is the one shared deadline.
+- **Two held answers.** The fixture holds two routes, answering them with
+  their own bytes, only later, never differently, and only if the Product is
+  still waiting. Each time is measured from the arrival of the video map, the
+  first acquisition request: the Product arms its deadline immediately before
+  that request.
+
+  | Route | Answer due after | Why |
+  | :--- | ---: | :--- |
+  | the video half's last fragment | 6,000 ms | the video half completes inside the budget, having used most of it |
+  | the audio map | 13,000 ms | after the shared deadline, but before any fresh one would end |
+
+| | One shared deadline (the Product) | A fresh deadline per half |
+| :--- | :--- | :--- |
+| Audio half's budget | ~4,000 ms: what the video half left | 10,000 ms, again |
+| Audio map | abandoned by the Product, unanswered, at ~10,000 ms | still open at 13,000 ms, so it is answered |
+| Outcome | `TIMEOUT` in `downloading`: no media tool, no upload | audio fragments, merge, upload, `ready` |
+
+**The margins are seconds.** No outcome depends on host scheduling.
+`hls12DeadlineControlProblems()` states them as inequalities, and the case
+refuses to run unless all three hold:
+
+- the video half finishes 1,500 ms or more inside the budget, leaving the audio
+  half at least 1,500 ms;
+- the shared deadline stops the audio map at least 1,500 ms before its late
+  answer;
+- a fresh deadline, armed even at the earliest admitted video completion,
+  would outlive that answer by at least 1,500 ms.
+
+No observed time is held to an exact millisecond: a timer that releases "at
+6,000 ms" can fire a fraction of a millisecond early on the monotonic clock.
+The video half must complete between 4,500 and 8,500 ms (the hold minus the
+slack, and the budget minus the slack). The audio map must be requested after
+that completion, which is a causal order rather than a time. It must then be
+abandoned within ±1,500 ms of the 10,000 ms deadline.
+
+The fixture ledger records each request's monotonic arrival and finish. For a
+held request it also records when it was released or, if the client went away
+first, when it was abandoned. `evaluateHls12SharedDeadline()` reduces that to
+relative times and two verdicts. The eight checks:
+
+| Check | What it requires |
+| :--- | :--- |
+| `neg-deadline/timeout` | the job failed `TIMEOUT` |
+| `neg-deadline/no-upload-never-ready` | no put; never `uploading` or `ready` |
+| `neg-deadline/workdir-removed` | the job's workDir is gone |
+| `neg-deadline/video-consumed-the-shared-deadline` | the video map and every fragment answered 200 exactly once; the held last fragment released, never abandoned; the half completed between 4,500 and 8,500 ms |
+| `neg-deadline/audio-did-not-receive-a-fresh-deadline` | ONE audio request, its map, made only after the video half completed; never answered; abandoned by the Product within ±1,500 ms of the 10,000 ms deadline, before the 13,000 ms answer |
+| `neg-deadline/requests-end-at-the-unanswered-audio-map` | the Product's requests were exactly master, both playlists, the video map and fragments, then the audio map, which received no response; no audio fragment was ever requested |
+| `neg-deadline/download-timeout-restored` | `config.downloadTimeoutMs` is back to its value before the case |
+| `neg-deadline/never-processing-no-media-tool` | the trace was `queued → analyzing → downloading → failed`, with no ffprobe and no FFmpeg |
+
+On a disposable development image (offline, Docker Desktop), the video half
+completed about 6.0 s after the video map arrived, leaving the audio half about
+4.0 s. The audio map, requested a few milliseconds later, was abandoned
+unanswered about 10.0 s after the video map, inside the ±1.5 s window around
+the 10 s deadline. A fresh deadline would have run past 16 s. The record keeps
+each run's exact values under `executionNegatives.sharedDeadline.observed`.
 
 **Process output.** A tap on the child's stdout and stderr covers every case,
 and proves itself live with one armed line. No sentinel, signed query,
@@ -215,8 +296,9 @@ The identity checks are HLS-09's `release/*` six. The parent hands the child
 the verified source commit and tree, the non-deployable build label and the
 immutable image id as candidate and run subject. The child records them and
 the loopback-only interfaces it observes. The record (`lib/hls12-evidence.mjs`)
-is built from an allowlist. It refuses a PASS that any of the 206 mandatory
-checks does not earn. It also refuses to emit any sentinel (`HLS12_PRIVATE_`,
+is built from an allowlist, and states both per-case controls under
+`substitutions`. It refuses a PASS that any of the 214 mandatory checks does not
+earn. It also refuses to emit any sentinel (`HLS12_PRIVATE_`,
 `HLS12_RAW_`, `HLS12_GROUP_`, `HLS12LANG`), the hostname or route, any
 master/media/init/fragment spelling, a URL, a loopback address or a Product
 temp path. The parent re-reads the exact bytes, validates them
@@ -232,9 +314,19 @@ temp path. The parent re-reads the exact bytes, validates them
   session keys, encryption or byte-range media;
 - no real public HLS source, CDN, signed-URL lifetime or public packager
   compatibility (the masters are hand-authored);
+- the shared deadline only at a narrowed 10 s configured budget, with fixture
+  answers delayed by whole seconds: not at the Production download budget, and
+  not for slow real networks;
 - no Production SSRF/DNS/egress re-proof;
 - no Cloudflare, Vercel or R2;
 - no Production startup, promotion or uptime claim.
+
+## Schema history
+
+| Schema | Status | What it proves |
+| :--- | :--- | :--- |
+| `hls12-release-image-separate-audio-01` | historical — valid for what it proved | The three pairs, four master negatives and five execution negatives, including the ONE shared byte budget (206 mandatory checks). It never approached a deadline, so it does **not** release-prove that the halves share one acquisition deadline. It is the HLS-12 child of the SPLIT-07 `-08` qualification of `sha256:262f5633…` (source `b095dfa1…`). Never re-read as `-02`, and insufficient for any later release qualification |
+| `hls12-release-image-separate-audio-02` | current — required by SPLIT-07 `-09` | Everything in `-01`, plus `neg-deadline`: the release-image proof that both halves share ONE acquisition deadline (214 mandatory checks) |
 
 ## Mutation controls (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001)
 
@@ -252,18 +344,28 @@ Desktop, offline:
 | ME2 — ME, plus that executor assertion removed | FAIL: `neg-budget/too-large`, `neg-budget/no-upload-never-ready` and `neg-budget/never-processing-no-media-tool`. The over-budget pair is merged and uploaded |
 | MF — the merge's synchronization decision ignores the halves' start times (always the video as reference) | FAIL: `pos-video-late`'s argv, sync-reference, duration and timing checks. The audio-late pair and the control pass, because the video is their correct reference |
 
-No other check failed under any mutation.
+No other check failed under any mutation. Those seven ran against `-01`.
+
+`HLS-SEPARATE-AUDIO-HLS12-SHARED-DEADLINE-HARDENING-001` ran `-02` the same
+way:
+
+| Mutation | HLS-12 `-02` result |
+| :--- | :--- |
+| M-DL — the audio half handed a fresh full `config.downloadTimeoutMs` instead of what is left of the shared deadline (`const audioTimeoutMs = config.downloadTimeoutMs;`) | FAIL: exactly `neg-deadline/timeout`, `neg-deadline/no-upload-never-ready`, `neg-deadline/audio-did-not-receive-a-fresh-deadline`, `neg-deadline/requests-end-at-the-unanswered-audio-map` and `neg-deadline/never-processing-no-media-tool`. The audio map was answered about 13 s after the video map arrived, all five audio fragments followed, and the job was merged, uploaded and reached `ready`. `neg-deadline/video-consumed-the-shared-deadline` passed, because the video half is the same either way |
+
+No other check failed.
 
 ## Files
 
 | File | Where it runs | What it is |
 | :--- | :--- | :--- |
 | `hls12-full-path.mjs` | inside the release candidate | The orchestrator; launched by SPLIT-07 with the parent's identity flags. |
-| `lib/hls12-evidence.mjs` | — | The `hls12-release-image-separate-audio-01` record, its 206 mandatory checks, PASS and privacy gates, and the parent-side validator. |
+| `lib/hls12-evidence.mjs` | — | The `hls12-release-image-separate-audio-02` record, its 214 mandatory checks, PASS and privacy gates, and the parent-side validator. |
+| `lib/hls12-deadline.mjs` | — | The `neg-deadline` control, its three margin inequalities and the pure evaluation of the fixture's timed ledger. Import-free. |
 | `lib/hls12-fixture-url.mjs` | — | The hostname, `--add-host` mapping, closed per-case routes (the role is the ledger family) and the exact page validator. Import-free. |
 | `lib/hls12-observers.mjs` | — | The spawn reducer (each input's product name and demuxer, the output, the merge's sync tokens), the separate-audio workspace grammar and the `-J` reducer. HLS-11's observer and sampler run them. |
 | `fixtures/hls12-media.mjs` | — | The bit-exact recipes, the page and the four master shapes. |
-| `fixtures/hls12-server.mjs` | inside the release candidate, loopback only | The closed-route fixture service, its sanitized ledger and the Product-only answers. |
+| `fixtures/hls12-server.mjs` | inside the release candidate, loopback only | The closed-route fixture service, its sanitized and timed ledger, the Product-only answers and the held (late, never altered) answers. |
 | `lib/hls-safe-http-transport.mjs` | — | Shared; HLS-12 passes its own classifier and `HLS_MASTER_PROOF_ADMITTED_KINDS`. |
 | `lib/merge-timing.mjs`, `fixtures/sync-media.mjs` | — | Shared with SPLIT-06, DASH-01 and SYNC-01: the packet oracle and the historical merge reference. |
 | `scripts/ytdlp-hls12-acceptance.test.mjs` | `npm test` | Self-tests of the pure modules. No Docker, no network. |

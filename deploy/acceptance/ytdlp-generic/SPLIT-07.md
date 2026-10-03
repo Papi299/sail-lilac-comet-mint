@@ -14,8 +14,9 @@ SPLIT-07 answers one question SPLIT-06 cannot:
 > webm — (since `-03`) the activated clear-HLS chain, (since `-05`) real
 > fragmented segmented-DASH media through the Worker's own FFmpeg, (since
 > `-06`) real clear-HLS v2 fMP4 media, (since `-07`) a split merge that
-> preserves the source's relative A/V timing, and (since `-08`) a separate-audio
-> fMP4 HLS pair proven from a Master Playlist the Product fetches itself,
+> preserves the source's relative A/V timing, (since `-08`) a separate-audio
+> fMP4 HLS pair proven from a Master Playlist the Product fetches itself, and
+> (since `-09`) the ONE acquisition deadline that pair's halves share,
 > deterministically?
 
 ```
@@ -29,8 +30,8 @@ acceptance harness (clean Git worktree, exact commit + tree, verified throughout
   → DASH-01 segmented-DASH PASS (dash01-release-image-full-path-02, validated, hashed)
   → HLS-11 clear-HLS v2 PASS (hls11-release-image-full-path-02, validated, hashed)
   → SYNC-01 split-merge timing PASS (sync01-release-image-merge-timing-01, validated, hashed)
-  → HLS-12 separate-audio clear HLS PASS (hls12-release-image-separate-audio-01, validated, hashed)
-  → SPLIT-07 PASS        (split07-release-image-candidate-08, created exclusively, read back)
+  → HLS-12 separate-audio clear HLS PASS (hls12-release-image-separate-audio-02, validated, hashed)
+  → SPLIT-07 PASS        (split07-release-image-candidate-09, created exclusively, read back)
 ```
 
 The clear-HLS child is HLS-09's; its own contract is in [`HLS-09.md`](HLS-09.md).
@@ -89,7 +90,7 @@ actual built image rather than asserted from the Dockerfile text:
 | **Segmented DASH** (since `-05`) | The DASH-01 real-media child PASSes (`dash01-release-image-full-path-02` since `-07`, adding the synchronization oracle and the pre-job merge-policy check; `-01` under `-05`/`-06`): a deterministic 1920×1080 fragmented-MP4 fixture served as an MPD `SegmentList` is acquired by the image's pinned native `DashSegmentsFD` (identity read from the child's own output, every fragment fetched once in order, the artifact byte-identical to init + fragments, no residue), validated by the image's real ffprobe, merged by the real `mergeSplitMedia` FFmpeg stream copy and validated again (one video + one audio stream, 1920×1080), with segmented and with progressive audio; every FFmpeg/ffprobe spawn at `processing` and none at `downloading`; and its three bounded negatives fail closed. Same image, same source, offline. |
 | **Clear-HLS v2** (since `-06`) | The HLS-11 real-media child PASSes (`hls11-release-image-full-path-02` since `-08`, whose split-master case also records the Product's own master proof — one unredirected request, no media request, both variants refused; `-01` under `-06`/`-07`): a deterministic 1920×1080 MPEG-TS control and a 1920×1080 fMP4 rendition (init + 4 fragments), from real pinned-yt-dlp analysis through the ordinary planner, the real HLS-2/3/4 chain (the map first for fMP4), the image's real ffprobe (family demuxer) and ONE real FFmpeg stream copy, to `ready`; every playlist, map and fragment request at `downloading` and every ffprobe/FFmpeg at `processing`; the delivered MP4 one H.264 1920×1080 + one AAC stream, faststart, packets preserved; the fMP4 playlist is the pinned packager's own `#EXT-X-VERSION:7` + `#EXT-X-INDEPENDENT-SEGMENTS` output; eight fail-closed negatives (three of them v2 grammar refusals before the map is requested) and the split-master pairing case. Same image, same source, offline. |
 | **Split-merge timing** (since `-07`) | The SYNC-01 child PASSes (`sync01-release-image-merge-timing-01`): for each of 19 deterministic cases (progressive and fragmented MP4, WebM with Opus and Vorbis; zero-aligned controls, legitimate offsets, shared non-zero bases, B-frame delay, absolute `tfdt`, edit-list pre-roll, duration discriminators), the candidate's own `mergeSplitMedia` carried exactly the synchronization policy a pre-job oracle derived and preserved the source's relative A/V timing, measured from packet timestamps and from a decoded flash/click event; every zero-aligned control is identical to the historical merge's output; and the oracle detects the historical merge's per-input zeroing. Same image, same source, offline. |
-| **Separate-audio clear HLS** (since `-08`) | The HLS-12 real-media child PASSes (`hls12-release-image-separate-audio-01`): three deterministic video-only + audio-only fMP4 pairs — audio ~0.48 s late, video ~0.52 s late, and a zero-aligned control — each proven by the candidate's own master proof (one Product master request, no redirect, while `analyzing`), planned as the private `clear-hls-separate-audio-remux`, acquired video half then audio half under ONE byte budget while `downloading`, and merged after `beginProcessing()` by ONE real FFmpeg stream copy whose `-isync` reference is the earlier-starting half, to `ready`; each pair's source timing measured before the job and preserved within the time-base tolerance with every packet payload identical, the control byte-identical to the historical merge, and the oracle shown sensitive to per-input zeroing; four master negatives (ambiguous group, no group beside a convenient one, a redirecting master, a re-signed master) advertise nothing, and five execution negatives (MPEG-TS audio, muxed "video", video "audio", the shared budget, a 404 audio map) fail closed. Same image, same source, offline. |
+| **Separate-audio clear HLS** (since `-08`) | The HLS-12 real-media child PASSes (`hls12-release-image-separate-audio-02` since `-09`, which adds the shared-deadline negative; `-01` under `-08`): three deterministic video-only + audio-only fMP4 pairs — audio ~0.48 s late, video ~0.52 s late, and a zero-aligned control — each proven by the candidate's own master proof (one Product master request, no redirect, while `analyzing`), planned as the private `clear-hls-separate-audio-remux`, acquired video half then audio half under ONE byte budget while `downloading`, and merged after `beginProcessing()` by ONE real FFmpeg stream copy whose `-isync` reference is the earlier-starting half, to `ready`; each pair's source timing measured before the job and preserved within the time-base tolerance with every packet payload identical, the control byte-identical to the historical merge, and the oracle shown sensitive to per-input zeroing; four master negatives (ambiguous group, no group beside a convenient one, a redirecting master, a re-signed master) advertise nothing, and six execution negatives (MPEG-TS audio, muxed "video", video "audio", the shared budget, a 404 audio map and, since `-09`, the shared deadline: under a narrowed configured budget the video half completes having used most of it and the audio half is stopped, unanswered, at that same deadline — `TIMEOUT`, no media tool, no upload) fail closed. Same image, same source, offline. |
 | **No disturbance** | `videofetch-worker:latest`'s image id, and the running Worker container's image id, start time and restart count, are identical before and after the run. |
 
 ### The inherited ENTRYPOINT
@@ -492,6 +493,19 @@ HLS-12 child (`HLS-12.md`) to PASS on the same immutable image, with its own
 `hls12Acceptance` block. The HLS-11 child moves to `-02` because the Product
 now consults its split master too.
 
+**Since `-09`, the child is HLS-12 `-02`.** The two halves share ONE
+acquisition deadline as well as one byte budget, and that invariant is
+implemented and unit-tested in source. HLS-12 `-01` never approached a
+deadline, so an `-08` PASS — including the first retained `-08` candidate —
+does not release-prove it: a candidate that handed the audio half a fresh
+budget would have passed `-01`. HLS-12 `-02` adds `neg-deadline`, which fails
+that candidate and passes only a shared deadline. Nothing else about the gate
+changes: the same seven children, the same thirteen candidate-run purposes, the
+same ten harness checkpoints and the same 66 required parent checks. The parent
+refuses an HLS-12 `-01` child under `-09` by its required schema, and
+`validateHls12ChildRecord` refuses one by its schema and by its eight missing
+mandatory checks.
+
 Child order is fixed and tested: characterization → mp4 → clear workspace →
 webm → clear workspace → clear-HLS → clear workspace → segmented DASH → clear
 workspace → clear-HLS v2 → clear workspace → split-merge timing → clear
@@ -500,7 +514,7 @@ verification → child re-hashing → parent.
 
 ## The evidence
 
-**Schema: `split07-release-image-candidate-08`.** SPLIT-07 has its own
+**Schema: `split07-release-image-candidate-09`.** SPLIT-07 has its own
 identifier, because its record claims something strictly larger and different
 in kind than a SPLIT-06 one. Bump it when the record's **meaning** changes;
 never rewrite an older record.
@@ -514,7 +528,8 @@ never rewrite an older record.
 | `-05` | valid release qualification, historical | Everything in `-04`. **Plus:** a validated, byte-hashed DASH-01 segmented-DASH real-media child (`dash01-release-image-full-path-01`) PASS, on the same immutable image id, naming the same release source, offline; the harness re-verified before that child and after it; `dash01:segmented-dash` in the candidate run ledger. mp4 + webm + clear-HLS + segmented DASH. The pinned DASH downloader contract is still also carried by the two policy verifiers (`verify-download-policy.py` §7, `verify-selector.py` §11). Valid for exactly the candidates it qualified (the image `sha256:db11b5ba…`, Production 2026-09-30 → 2026-10-01, the immediate Worker rollback until 2026-10-02 and now a deeper one); never re-read under `-06`. |
 | `-06` | valid release qualification, historical | Everything in `-05`. **Plus:** a validated, byte-hashed HLS-11 clear-HLS v2 real-media child (`hls11-release-image-full-path-01`) PASS, on the same immutable image id, naming the same release source, offline; the harness re-verified before that child and after it; `hls11:clear-hls-v2` in the candidate run ledger. mp4 + webm + clear-HLS + segmented DASH + clear-HLS v2 (fMP4). It qualified `sha256:99ddf3d8…` (retained from merged `main` `88f26318…`; Production 2026-10-01 → 2026-10-02, and now the immediate Worker rollback). Its SPLIT-06 (`-04`) and DASH-01 (`-01`) children could not see per-input timestamp zeroing, and that image carries it: valid for exactly what it proved, never re-read under `-07`. |
 | `-07` | valid release qualification, historical | Everything in `-06`, with the SPLIT-06 children moved to `split06-deterministic-full-path-05` (control + offset pair, synchronization oracle) and the DASH-01 child to `dash01-release-image-full-path-02` (synchronization oracle, pre-job merge policy). **Plus:** a validated, byte-hashed SYNC-01 split-merge timing child (`sync01-release-image-merge-timing-01`) PASS, on the same immutable image id, naming the same release source, offline; the harness re-verified before that child and after it; `sync01:merge-timing` in the candidate run ledger; 61 required parent checks (`-06`: 56). **First produced 2026-10-02:** it qualified `sha256:2efb85da…`, retained as `videofetch-worker:rc-8ab702002d70-2efb85da9646` from merged `main` `8ab70200…` — parent `e313e03c…`, PASS 62/62 (the 61 required checks plus the conditional accepted-Worker architecture check), with all six children passing on the same immutable id. That image was promoted Worker-only and Production accepted the same day (deployment runbook §4n). Its source has no separate-audio HLS family: valid for exactly what it proved, never re-read under `-08`. |
-| `-08` | current release qualification | Everything in `-07`, with the HLS-11 child moved to `hls11-release-image-full-path-02` (its split master now consulted by the Product's own master proof, and refused). **Plus:** a validated, byte-hashed HLS-12 separate-audio clear-HLS real-media child (`hls12-release-image-separate-audio-01`) PASS, on the same immutable image id, naming the same release source, offline; the harness re-verified before that child and after it; `hls12:clear-hls-separate-audio` in the candidate run ledger; 66 required parent checks (`-07`: 61) and seven children. **No `-08` record has been produced yet**: the full qualification is a separate, later stage (deployment runbook §4o). |
+| `-08` | valid release qualification for what it proved, historical — **not sufficient for promotion** | Everything in `-07`, with the HLS-11 child moved to `hls11-release-image-full-path-02` (its split master now consulted by the Product's own master proof, and refused). **Plus:** a validated, byte-hashed HLS-12 separate-audio clear-HLS real-media child (`hls12-release-image-separate-audio-01`) PASS, on the same immutable image id, naming the same release source, offline; the harness re-verified before that child and after it; `hls12:clear-hls-separate-audio` in the candidate run ledger; 66 required parent checks (`-07`: 61) and seven children. **Produced once:** it qualified `sha256:262f5633…`, retained as `videofetch-worker:rc-b095dfa12f62-262f5633bc38` from merged `main` `b095dfa1…` — parent `3cfe586e…`, PASS 67/67 (the 66 required checks plus the conditional accepted-Worker architecture check), all seven children passing on the same immutable id (deployment runbook §4o). Its HLS-12 `-01` child never approached a deadline, so it does **not** release-prove the separate-audio halves' ONE shared acquisition deadline. That candidate is retained as historical evidence and is **not** to be promoted; never re-read under `-09`. |
+| `-09` | current release qualification | Everything in `-08`, with the HLS-12 child moved to `hls12-release-image-separate-audio-02`: its `neg-deadline` case PASSes on the same immutable image (214 mandatory child checks; `-01`: 206). The seven children, the thirteen candidate-run purposes, the ten harness checkpoints and the 66 required parent checks are `-08`'s. **No `-09` record has been produced yet**: requalification is a separate, later stage, and it precedes any promotion of a separate-audio Worker (deployment runbook §4o). |
 
 `-01` records are **historical**. They are never rewritten, never re-read under
 later rules, and never sufficient to authorize SPLIT-07B. They stay useful as
@@ -522,8 +537,9 @@ debugging history. `-02` records remain **valid** for exactly what they proved
 — split-stream release qualification, mp4 + webm — and are not invalid
 globally; they are simply insufficient for clear-HLS release qualification
 (HLS-9). A `-02` record is never rewritten as `-03`, and
-`validateReleaseParentRecord` names a `-01`..`-07` record as historical rather
-than reading it under `-08` rules. SPLIT-06 children are
+`validateReleaseParentRecord` names a `-01`..`-08` record as historical rather
+than reading it under `-09` rules (an `-08` record as one whose separate-audio
+child does not release-prove the shared acquisition deadline). SPLIT-06 children are
 `split06-deterministic-full-path-05` since `-07`: a SPLIT-06 PASS now also
 means the merge preserved the source's relative A/V timing. `-02`..`-06`
 parents' children stay `-04`.
@@ -577,9 +593,9 @@ The split-merge timing child (since `-07`) is handled identically by
 grammar-checked fields.
 
 The separate-audio clear-HLS child (since `-08`) is handled identically by
-`validateHls12ChildRecord` against `hls12-release-image-separate-audio-01` and
-its 206 mandatory checks; the parent's `hls12Acceptance` block records the same
-grammar-checked fields.
+`validateHls12ChildRecord` against `hls12-release-image-separate-audio-02`
+(since `-09`; `-01` and its 206 checks before) and its 214 mandatory checks; the
+parent's `hls12Acceptance` block records the same grammar-checked fields.
 
 A PASS parent is refused unless **all** of the following hold:
 - every check in `REQUIRED_PASS_CHECKS` is present **and** passing, and no other
@@ -737,12 +753,12 @@ can support HLS-9B; a `-02` PASS proves nothing about clear HLS. See
 | `lib/release-provenance.mjs` | — | The shared clean-worktree gate, applied to the release context and to the harness; the release-input identities; the `/app` source manifest from Git objects. |
 | `lib/release-container.mjs` | — | Every `docker` argv. Non-deployable tags for build and cleanup; the immutable-id grammar for every run subject; `dockerRunSubject`'s closed grammar (with `--add-host`); the real Dockerfile; the hardening flags; the Product media workspace `--mount type=bind` (never a Production host path) and the harness scratch tmpfs; the forbidden-mount guard; `releaseHlsAcceptanceRunArgs`, `releaseDashAcceptanceRunArgs`, `releaseHls11AcceptanceRunArgs`, `releaseSyncAcceptanceRunArgs` and `releaseHls12AcceptanceRunArgs` and their structural posture checks. |
 | `lib/release-image-probe.mjs` | inside the candidate, at `/verify` | Import-free observer: `/app` manifest, forbidden tools, env names, runtime identity. Observes; never judges. |
-| `lib/release-evidence.mjs` | — | The `split07-release-image-candidate-08` record, SPLIT-06, clear-HLS, segmented-DASH, clear-HLS v2, split-merge timing and separate-audio clear-HLS child validation and re-verification, the verified-harness gate, the PASS gate (including the immutable-run-subject ledger), and the read-back validator. |
+| `lib/release-evidence.mjs` | — | The `split07-release-image-candidate-09` record, SPLIT-06, clear-HLS, segmented-DASH, clear-HLS v2, split-merge timing and separate-audio clear-HLS child validation and re-verification, the verified-harness gate, the PASS gate (including the immutable-run-subject ledger), and the read-back validator. |
 | `hls-full-path.mjs`, `lib/hls-acceptance-mode.mjs`, `lib/hls-release-evidence.mjs` | inside the candidate / — | The clear-HLS child in `release-image` mode and its `hls09-release-image-full-path-02` record — see `HLS-09.md`. |
 | `dash-full-path.mjs`, `lib/dash-argv.mjs`, `lib/dash-evidence.mjs`, `lib/dash-observers.mjs`, `fixtures/dash-media.mjs`, `fixtures/dash-server.mjs` | inside the candidate / — | The segmented-DASH real-media child and its `dash01-release-image-full-path-02` record — see `DASH-01.md`. |
 | `hls11-full-path.mjs`, `lib/hls11-evidence.mjs`, `lib/hls11-fixture-url.mjs`, `lib/hls11-observers.mjs`, `fixtures/hls11-media.mjs`, `fixtures/hls11-server.mjs` | inside the candidate / — | The clear-HLS v2 real-media child and its `hls11-release-image-full-path-02` record — see `HLS-11.md`. |
 | `sync-matrix.mjs`, `lib/sync-evidence.mjs`, `lib/merge-timing.mjs`, `fixtures/sync-media.mjs` | inside the candidate / — | The split-merge timing child and its `sync01-release-image-merge-timing-01` record — see `SYNC-01.md`. `lib/merge-timing.mjs` is also the SPLIT-06, DASH-01 and HLS-12 oracle. |
-| `hls12-full-path.mjs`, `lib/hls12-evidence.mjs`, `lib/hls12-fixture-url.mjs`, `lib/hls12-observers.mjs`, `fixtures/hls12-media.mjs`, `fixtures/hls12-server.mjs` | inside the candidate / — | The separate-audio clear-HLS real-media child and its `hls12-release-image-separate-audio-01` record — see `HLS-12.md`. |
+| `hls12-full-path.mjs`, `lib/hls12-evidence.mjs`, `lib/hls12-deadline.mjs`, `lib/hls12-fixture-url.mjs`, `lib/hls12-observers.mjs`, `fixtures/hls12-media.mjs`, `fixtures/hls12-server.mjs` | inside the candidate / — | The separate-audio clear-HLS real-media child and its `hls12-release-image-separate-audio-02` record — see `HLS-12.md`. |
 | `lib/provenance.mjs` | — | Shared with the Phase-10D harness; SPLIT-07 uses only its `writeEvidenceExclusive`, the `wx` exclusive-create writer. |
 | `scripts/ytdlp-release-image-acceptance.test.mjs`, `scripts/ytdlp-dash-acceptance.test.mjs`, `scripts/ytdlp-hls11-acceptance.test.mjs`, `scripts/ytdlp-sync-acceptance.test.mjs`, `scripts/ytdlp-hls12-acceptance.test.mjs` | `npm test` | Harness self-tests against a scripted Git/Docker fake and the DASH-01, HLS-11, SYNC-01 and HLS-12 modules' pure parts. No Docker, no network. |
 
