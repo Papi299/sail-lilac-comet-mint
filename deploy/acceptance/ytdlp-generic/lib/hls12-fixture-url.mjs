@@ -58,6 +58,9 @@ export const HLS12_SYNTHETIC_PUBLIC_ADDRESS = "8.8.8.8";
  *   neg-audio-video      the "audio" playlist serves a video-only rendition
  *   neg-budget           the ONE combined byte budget is one byte short
  *   neg-audio-map-404    the audio initialization map answers 404
+ *   neg-deadline         (since `-02`) the ONE acquisition deadline: the video
+ *                        half uses most of a narrowed budget, the audio map is
+ *                        answered only after that deadline (`lib/hls12-deadline.mjs`)
  */
 export const HLS12_POSITIVE_CASES = Object.freeze(["pos-audio-late", "pos-video-late", "ctl-aligned"]);
 export const HLS12_MASTER_NEGATIVE_CASES = Object.freeze([
@@ -72,6 +75,7 @@ export const HLS12_EXECUTION_NEGATIVE_CASES = Object.freeze([
   "neg-audio-video",
   "neg-budget",
   "neg-audio-map-404",
+  "neg-deadline",
 ]);
 export const HLS12_CASES = Object.freeze([
   ...HLS12_POSITIVE_CASES,

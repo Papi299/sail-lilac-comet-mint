@@ -29,14 +29,20 @@
 // the time-base tolerance, every packet payload identical, and — for the
 // control — byte-identical to the historical merge.
 //
-// Four master negatives (analysis only) and five execution negatives (full
+// Four master negatives (analysis only) and six execution negatives (full
 // jobs) fail closed through the same Product path; see `lib/hls12-evidence.mjs`.
+// The sixth (since `-02`), `neg-deadline`, is the release-image proof that both
+// halves share ONE acquisition deadline (`lib/hls12-deadline.mjs`).
 //
 // ── The only substitutions ─────────────────────────────────────────────────
 //
 //   submitted-page URL validator  `lib/hls12-fixture-url.mjs` (exact pages only)
 //   safe-HTTP DNS answer + socket `lib/hls-safe-http-transport.mjs`
 //   object-store provider         `lib/local-object-writer.mjs`
+//
+// and two per-case controls, each applied to ONE job and restored after it:
+// `neg-budget` narrows `config.maxFileSize`; `neg-deadline` narrows
+// `config.downloadTimeoutMs` and has the fixture hold two routes' answers.
 //
 // ── Where it runs ──────────────────────────────────────────────────────────
 //
@@ -150,6 +156,11 @@ import {
   rational,
 } from "./lib/merge-timing.mjs";
 import { createLocalObjectStoreWriter } from "./lib/local-object-writer.mjs";
+import {
+  HLS12_DEADLINE_CONTROL,
+  evaluateHls12SharedDeadline,
+  hls12DeadlineControlProblems,
+} from "./lib/hls12-deadline.mjs";
 import { installStatusAudit, readStatusTrace } from "./lib/split-observers.mjs";
 import { releaseIdentityChecks } from "./lib/hls-release-evidence.mjs";
 import {
@@ -190,6 +201,7 @@ const CASE_MEDIA = Object.freeze({
   "neg-audio-video": { video: ["aligned-video", "main"], audio: ["aligned-video", "main"], master: "paired" },
   "neg-budget": { video: ["aligned-video", "main"], audio: ["aligned-audio", "main"], master: "paired" },
   "neg-audio-map-404": { video: ["aligned-video", "main"], audio: ["aligned-audio", "main"], master: "paired" },
+  "neg-deadline": { video: ["aligned-video", "main"], audio: ["aligned-audio", "main"], master: "paired" },
 });
 
 // ── Small helpers ──────────────────────────────────────────────────────────
@@ -1469,12 +1481,81 @@ async function runExecutionNegatives(ctx) {
   );
   neverProcessed("neg-audio-map-404", map404);
 
+  // ONE acquisition deadline for both halves (since `-02`). The Product's own
+  // configured download budget is narrowed for this one job — the
+  // `DOWNLOAD_TIMEOUT` value every acquisition reads, exactly as `neg-budget`
+  // narrows the byte limit — and the fixture HOLDS two answers, late and never
+  // different: the video half's last fragment, so the video half completes
+  // inside the budget having used most of it, and the audio map, until after
+  // the shared deadline. One deadline stops the audio half unanswered: TIMEOUT. A
+  // fresh deadline per half would outlive the late answer, fetch the audio
+  // fragments, merge and reach `ready`. Margins are seconds; see the module.
+  const controlProblems = hls12DeadlineControlProblems(HLS12_DEADLINE_CONTROL);
+  if (controlProblems.length > 0) throw new Error(`the shared-deadline control cannot discriminate: ${controlProblems.join("; ")}`);
+  const deadlineCase = prepared.cases["neg-deadline"];
+  const videoMapPath = casePath("neg-deadline", `video/${deadlineCase.video.init.name}`);
+  service.hold(casePath("neg-deadline", `video/${deadlineCase.video.segments.at(-1).name}`), {
+    anchorPath: videoMapPath,
+    releaseAfterMs: HLS12_DEADLINE_CONTROL.videoHoldMs,
+  });
+  service.hold(casePath("neg-deadline", `audio/${deadlineCase.audio.init.name}`), {
+    anchorPath: videoMapPath,
+    releaseAfterMs: HLS12_DEADLINE_CONTROL.audioReleaseMs,
+  });
+  const savedTimeoutMs = config.downloadTimeoutMs;
+  const deadlineRun = await runExecutionNegative(ctx, "neg-deadline", {
+    expectedCode: "TIMEOUT",
+    before: () => Object.assign(config, { downloadTimeoutMs: HLS12_DEADLINE_CONTROL.budgetMs }),
+    after: () => Object.assign(config, { downloadTimeoutMs: savedTimeoutMs }),
+  });
+  const deadline = evaluateHls12SharedDeadline({
+    requests: service.requests("neg-deadline:acquisition").filter((r) => r.userAgentClass === "product"),
+    videoFragments: deadlineCase.video.segments.length,
+    control: HLS12_DEADLINE_CONTROL,
+  });
+  const seen = deadline.observed;
+  checks.record(
+    "neg-deadline/video-consumed-the-shared-deadline",
+    deadline.videoConsumedTheSharedDeadline,
+    `video half complete after ${seen.videoCompletedAfterMs} ms of a ${HLS12_DEADLINE_CONTROL.budgetMs} ms budget, ` +
+      `${seen.remainingForAudioMs} ms left for the audio half`,
+  );
+  checks.record(
+    "neg-deadline/audio-did-not-receive-a-fresh-deadline",
+    deadline.audioDidNotReceiveAFreshDeadline,
+    `audio map requested at ${seen.audioMapRequestedAfterMs} ms, abandoned unanswered at ${seen.audioMapAbandonedAfterMs} ms ` +
+      `(shared deadline ${HLS12_DEADLINE_CONTROL.budgetMs} ms, answer due at ${HLS12_DEADLINE_CONTROL.audioReleaseMs} ms; ` +
+      `a fresh deadline would run to at least ${seen.freshDeadlineEarliestAfterMs} ms)`,
+  );
+  const deadlineLabels = labels(deadlineRun.job);
+  checks.record(
+    "neg-deadline/requests-end-at-the-unanswered-audio-map",
+    sameList(deadlineLabels, [
+      "master", "media:video", "media:audio", "init:video",
+      ...deadlineCase.video.segments.map((s) => `fragment:video${s.ordinal}`),
+      "init:audio",
+    ]) &&
+      deadlineRun.job.http.slice(0, -1).every((e) => e.responseStatus === 200) &&
+      deadlineRun.job.http.at(-1)?.responseStatus === null &&
+      service.requests().filter((r) => r.caseName === "neg-deadline" && r.kind === "fragment" && r.role === "audio").length === 0,
+    deadlineRun.job.http.map((e) => `${requestLabel(e)}:${e.responseStatus}`).join(","),
+  );
+  checks.record("neg-deadline/download-timeout-restored", config.downloadTimeoutMs === savedTimeoutMs);
+  neverProcessed("neg-deadline", deadlineRun);
+
   return {
     audioHalfMpegTs: summary(ts.job, { expected: "FORMAT_UNAVAILABLE" }),
     videoHalfMuxed: summary(muxed.job, { expected: "PROCESSING_FAILED" }),
     audioHalfIsVideo: summary(swapped.job, { expected: "PROCESSING_FAILED" }),
     sharedByteBudget: summary(budgetRun.job, { expected: "TOO_LARGE", allowanceBytes: budget, videoBytes, audioBytes }),
     audioMap404: summary(map404.job, { expected: "NETWORK_ERROR" }),
+    sharedDeadline: summary(deadlineRun.job, {
+      expected: "TIMEOUT",
+      control: { ...HLS12_DEADLINE_CONTROL },
+      observed: { ...seen },
+      videoConsumedTheSharedDeadline: deadline.videoConsumedTheSharedDeadline,
+      audioDidNotReceiveAFreshDeadline: deadline.audioDidNotReceiveAFreshDeadline,
+    }),
   };
 }
 

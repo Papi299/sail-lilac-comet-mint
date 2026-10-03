@@ -78,6 +78,17 @@
 // five execution negatives — with its own `hls12Acceptance` block. The HLS-11
 // child moves to `hls11-release-image-full-path-02`, because the Product now
 // consults its split master too.
+//
+// ── The shared-deadline separate-audio child (since -09) ───────────────────
+//
+// HLS-SEPARATE-AUDIO-HLS12-SHARED-DEADLINE-HARDENING-001. The Product's two
+// separate-audio halves share ONE acquisition deadline, but HLS-12 `-01` never
+// approached a deadline, so an `-08` PASS did not release-prove it. The HLS-12
+// child moves to `hls12-release-image-separate-audio-02`, whose `neg-deadline`
+// case drives the candidate's real acquisition under a narrowed configured
+// budget and fails closed only if the audio half is stopped AT the shared
+// deadline. Same seven children, same candidate-run purposes, same harness
+// checkpoints: only the separate-audio child's required schema changes.
 
 import { createHash } from "node:crypto";
 
@@ -188,14 +199,31 @@ import {
  *        (`hls12-release-image-separate-audio-01`) PASS, executed by the SAME
  *        immutable candidate image id, naming the same release source, offline;
  *        the harness re-verified before that child and again after it;
- *        `hls12:clear-hls-separate-audio` in the candidate run ledger. The
- *        current release-image qualification: mp4 + webm + clear-HLS +
- *        segmented DASH + clear-HLS v2 (fMP4) + split-merge timing +
- *        separate-audio clear HLS (fMP4 + fMP4).
+ *        `hls12:clear-hls-separate-audio` in the candidate run ledger. mp4 +
+ *        webm + clear-HLS + segmented DASH + clear-HLS v2 (fMP4) + split-merge
+ *        timing + separate-audio clear HLS (fMP4 + fMP4). -08 records stay
+ *        VALID historical evidence for exactly the candidate they qualified (RC
+ *        `videofetch-worker:rc-b095dfa12f62-262f5633bc38`, `sha256:262f5633…`,
+ *        from source `b095dfa1`; never promoted) and for exactly what they
+ *        proved — including the separate-audio halves' ONE byte budget — and
+ *        are never re-read under -09: their HLS-12 `-01` child never approached
+ *        a deadline, so they do NOT release-prove that the two halves share ONE
+ *        acquisition deadline.
+ *   -09  everything -08 means, with the separate-audio child at
+ *        `hls12-release-image-separate-audio-02`: its `neg-deadline` case PASSes
+ *        in the SAME immutable candidate image — the video half completed
+ *        inside a narrowed configured download budget having used most of it,
+ *        and the audio half was stopped, unanswered, AT that same deadline
+ *        (`TIMEOUT`, no media tool, no upload) rather than given a fresh one.
+ *        The seven children, the candidate run ledger and the harness
+ *        checkpoints are -08's. The current release-image qualification: mp4 +
+ *        webm + clear-HLS + segmented DASH + clear-HLS v2 (fMP4) + split-merge
+ *        timing + separate-audio clear HLS (fMP4 + fMP4, one byte budget and
+ *        one acquisition deadline).
  */
-export const SPLIT07_EVIDENCE_SCHEMA = "split07-release-image-candidate-08";
+export const SPLIT07_EVIDENCE_SCHEMA = "split07-release-image-candidate-09";
 
-/** The historical parent schemas. Never rewritten, and never read as -08. */
+/** The historical parent schemas. Never rewritten, and never read as -09. */
 export const HISTORICAL_SPLIT07_SCHEMAS = Object.freeze([
   "split07-release-image-candidate-01",
   "split07-release-image-candidate-02",
@@ -204,6 +232,7 @@ export const HISTORICAL_SPLIT07_SCHEMAS = Object.freeze([
   "split07-release-image-candidate-05",
   "split07-release-image-candidate-06",
   "split07-release-image-candidate-07",
+  "split07-release-image-candidate-08",
 ]);
 
 /** The exact SPLIT-06 schema a SPLIT-07 PASS accepts as a child (`-05` since -07). */
@@ -236,7 +265,7 @@ export const REQUIRED_SYNC_CHILD_SCHEMA = SYNC01_RELEASE_EVIDENCE_SCHEMA;
 /** The candidate-run purpose of the split-merge timing release child. */
 export const SYNC_CANDIDATE_RUN_PURPOSE = "sync01:merge-timing";
 
-/** The exact separate-audio clear-HLS child schema a PASS accepts (since -08). */
+/** The exact separate-audio clear-HLS child schema a PASS accepts (a child since -08; its `-02` since -09). */
 export const REQUIRED_HLS12_CHILD_SCHEMA = HLS12_RELEASE_EVIDENCE_SCHEMA;
 
 /** The candidate-run purpose of the separate-audio clear-HLS release child. */
@@ -1388,26 +1417,29 @@ function hls12AcceptanceBlock(input) {
 /**
  * Reads a parent record back under the CURRENT schema's rules.
  *
- * Returns the problems; an empty list means the record is a `-08` record for
+ * Returns the problems; an empty list means the record is a `-09` record for
  * exactly `expected` (`{ sourceCommit, imageId }`) and, when it says PASS,
- * that it earns PASS under -08 rules. A historical `-01`..`-07` record is never
- * silently read as `-08`: it is named as historical, because a `-02` PASS
+ * that it earns PASS under -09 rules. A historical `-01`..`-08` record is never
+ * silently read as `-09`: it is named as historical, because a `-02` PASS
  * proves mp4 + webm and nothing about clear HLS, a `-03` PASS proves clear HLS
  * under the protocol invariant `-04` restated, a `-04` PASS carries no
  * real-media segmented-DASH child, a `-05` PASS carries no clear-HLS v2 (fMP4)
- * child, a `-06` PASS carries no split-merge timing measurement, and a `-07`
- * PASS carries no separate-audio clear-HLS child.
+ * child, a `-06` PASS carries no split-merge timing measurement, a `-07` PASS
+ * carries no separate-audio clear-HLS child, and an `-08` PASS carries one
+ * (HLS-12 `-01`) that never release-proved the ONE shared acquisition deadline.
  */
 export function validateReleaseParentRecord(record, expected = {}) {
   if (record === null || typeof record !== "object" || Array.isArray(record)) return ["the record is not an object"];
   const problems = [];
   if (HISTORICAL_SPLIT07_SCHEMAS.includes(record.schema)) {
-    // True of all seven: none of them carries the separate-audio clear-HLS
-    // child -08 requires; -01..-06 also lack the split-merge timing children,
-    // -01..-05 the clear-HLS v2 child, -01..-04 the segmented-DASH child.
-    problems.push(
-      `${record.schema} is a historical schema, not ${SPLIT07_EVIDENCE_SCHEMA}; it does not carry the separate-audio clear-HLS child`,
-    );
+    // -08 carries the separate-audio child at HLS-12 `-01`, which never
+    // approached a deadline. The other seven carry no separate-audio child at
+    // all; -01..-06 also lack the split-merge timing children, -01..-05 the
+    // clear-HLS v2 child, -01..-04 the segmented-DASH child.
+    const why = record.schema === "split07-release-image-candidate-08"
+      ? "its separate-audio clear-HLS child does not release-prove the shared acquisition deadline"
+      : "it does not carry the separate-audio clear-HLS child";
+    problems.push(`${record.schema} is a historical schema, not ${SPLIT07_EVIDENCE_SCHEMA}; ${why}`);
     return problems;
   }
   if (record.schema !== SPLIT07_EVIDENCE_SCHEMA) {

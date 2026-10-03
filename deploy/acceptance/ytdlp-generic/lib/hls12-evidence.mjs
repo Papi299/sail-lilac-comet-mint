@@ -28,9 +28,14 @@
 // the control equals the historical merge byte for byte. Four master negatives
 // (an ambiguous group, a variant naming no group beside a convenient one, a
 // redirecting master, a master that re-signed the video URL) advertised
-// nothing, and five execution negatives (an MPEG-TS audio half, a muxed
-// "video" half, a video "audio" half, the one shared byte budget, a 404 audio
-// map) failed closed before any upload.
+// nothing, and six execution negatives (an MPEG-TS audio half, a muxed "video"
+// half, a video "audio" half, the one shared byte budget, a 404 audio map and,
+// since `-02`, the one shared acquisition deadline) failed closed before any
+// upload. The deadline negative ran the candidate's real acquisition under a
+// narrowed configured budget: the video half completed inside it having used
+// most of it, and the audio half was stopped, unanswered, AT that same
+// deadline — not given a fresh one — so the job failed `TIMEOUT` before any
+// media tool.
 //
 // Import-free apart from the harness's own import-free modules, so the parent
 // validates a record on an older Node.
@@ -40,6 +45,7 @@ import { unmetPassConditions } from "./hls-evidence.mjs";
 import { HLS09_RELEASE_IDENTITY_CHECKS } from "./hls-release-evidence.mjs";
 import { RELEASE_DOCKERFILE } from "./release-container.mjs";
 import { isFullGitSha } from "./split-provenance.mjs";
+import { HLS12_DEADLINE_CONTROL } from "./hls12-deadline.mjs";
 import {
   HLS12_EXECUTION_NEGATIVE_CASES,
   HLS12_MASTER_NEGATIVE_CASES,
@@ -52,9 +58,29 @@ import {
  *
  *   -01  the first separate-audio release child: three positive pairs (audio
  *        late, video late, a zero-aligned control), four master-proof
- *        negatives and five execution negatives.
+ *        negatives and five execution negatives (206 mandatory checks). It
+ *        proved everything it measured — including the ONE shared byte
+ *        budget — but it never approached a deadline, so it did NOT
+ *        release-prove that the two halves share ONE acquisition deadline: a
+ *        candidate handing the audio half a fresh budget would have passed it.
+ *        `-01` records stay valid historical evidence of what they proved
+ *        (SPLIT-07 `-08`, RC `sha256:262f5633…` from source `b095dfa1`), and
+ *        are insufficient for any later release qualification.
+ *   -02  everything `-01` means, PLUS `neg-deadline`
+ *        (HLS-SEPARATE-AUDIO-HLS12-SHARED-DEADLINE-HARDENING-001): a sixth
+ *        execution negative that drives the candidate's real separate-HLS
+ *        acquisition under a narrowed configured download budget, with the
+ *        fixture answering the video half's last fragment late (the video half
+ *        completes inside the budget having used most of it) and the audio map
+ *        after the shared deadline. One shared deadline stops the audio half
+ *        unanswered at that deadline: `TIMEOUT`, no media tool, no upload, the
+ *        workDir removed. A fresh per-half deadline would outlive the late
+ *        answer and reach `ready` (`lib/hls12-deadline.mjs`).
  */
-export const HLS12_RELEASE_EVIDENCE_SCHEMA = "hls12-release-image-separate-audio-01";
+export const HLS12_RELEASE_EVIDENCE_SCHEMA = "hls12-release-image-separate-audio-02";
+
+/** Older schemas: valid historical records, never re-read as the current one. */
+export const HLS12_HISTORICAL_SCHEMAS = Object.freeze(["hls12-release-image-separate-audio-01"]);
 
 export { HLS12_EXECUTION_NEGATIVE_CASES, HLS12_MASTER_NEGATIVE_CASES, HLS12_POSITIVE_CASES };
 
@@ -167,6 +193,22 @@ export const HLS12_MASTER_NEGATIVE_CHECKS = Object.freeze([
   "neg-master-changed/product-master-names-only-a-re-signed-video-url",
 ]);
 
+/**
+ * The shared-deadline negative's checks (since `-02`): the outcome (`TIMEOUT`,
+ * no upload, never `processing`, workDir removed), what the fixture observed
+ * of each half's time, the exact request sequence, and the control restored.
+ */
+export const HLS12_DEADLINE_CHECKS = Object.freeze([
+  "neg-deadline/timeout",
+  "neg-deadline/no-upload-never-ready",
+  "neg-deadline/workdir-removed",
+  "neg-deadline/video-consumed-the-shared-deadline",
+  "neg-deadline/audio-did-not-receive-a-fresh-deadline",
+  "neg-deadline/requests-end-at-the-unanswered-audio-map",
+  "neg-deadline/download-timeout-restored",
+  "neg-deadline/never-processing-no-media-tool",
+]);
+
 /** The execution negatives and what each must record. */
 export const HLS12_EXECUTION_NEGATIVE_CHECKS = Object.freeze([
   "neg-audio-ts/format-unavailable",
@@ -193,6 +235,7 @@ export const HLS12_EXECUTION_NEGATIVE_CHECKS = Object.freeze([
   "neg-audio-map-404/workdir-removed",
   "neg-audio-map-404/video-half-complete-then-no-audio-fragment",
   "neg-audio-map-404/never-processing-no-media-tool",
+  ...HLS12_DEADLINE_CHECKS,
 ]);
 
 /**
@@ -216,6 +259,7 @@ export const HLS12_NON_CLAIMS = Object.freeze([
   "ONE separate-audio family only: a video-only fMP4 rendition plus the single URI-bearing audio-only fMP4 rendition of the AUDIO group its variant names, in a master the Product fetched itself with no redirect",
   "no MPEG-TS separate audio, no audio group with more than one rendition (no language or DEFAULT preference policy), no subtitles, I-frame playlists, content steering, session keys, encryption or byte-range media",
   "no real public HLS source, real CDN, signed-URL lifetime or public packager compatibility: the masters are hand-authored inside the candidate's closed master grammar",
+  `the ONE shared acquisition deadline is proven at a narrowed ${HLS12_DEADLINE_CONTROL.budgetMs / 1000} s configured budget with fixture answers delayed by whole seconds, not at the Production download budget, and not for slow real networks`,
   "Production SSRF/DNS/egress policy is NOT re-proven (the acceptance transport answers a synthetic public address)",
   "no real Cloudflare Tunnel/Access, Vercel, Cloudflare R2 or R2 credential broker",
   "no Production startup of this candidate, no promotion and no long-term uptime claim",
@@ -229,6 +273,14 @@ export const HLS12_SUBSTITUTIONS = Object.freeze({
     "in two master negatives the fixture answers the Product's own master request (recognised by its fixed request profile) with a redirect or a re-signed master, while the pinned yt-dlp receives the ordinary master",
   objectStore: "harness local ObjectStoreWriter in place of Cloudflare R2",
   database: "a fresh temporary SQLite job store per job with a harness status-audit trigger",
+  byteBudgetControl:
+    "neg-budget only: the Product's configured byte limit (config.maxFileSize) narrowed to the two halves' sum minus one byte for that one job, and restored",
+  deadlineControl:
+    `neg-deadline only: the Product's configured download budget (config.downloadTimeoutMs, the DOWNLOAD_TIMEOUT value) ` +
+    `narrowed to ${HLS12_DEADLINE_CONTROL.budgetMs} ms for that one job, and restored; the fixture held the video half's last ` +
+    `fragment until ${HLS12_DEADLINE_CONTROL.videoHoldMs} ms after the video map arrived, and would answer the audio map only at ` +
+    `${HLS12_DEADLINE_CONTROL.audioReleaseMs} ms after it, if the Product were still waiting (late, never altered; the observed ` +
+    `block records whether it was). No Product code, clock or timer is replaced`,
 });
 
 /** Strings no record may contain anywhere, key or value. */
