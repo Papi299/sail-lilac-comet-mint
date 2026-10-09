@@ -115,8 +115,18 @@ flight, bounded as the runbook §4k workspace paragraph states.
   manifests.
 - **YouTube or any other site.** The supplied YouTube regression
   (`https://youtu.be/S_XfAWeXRFQ?si=WAQXxhU-vUaD5PjB`) is NOT exercised or resolved
-  here. Its status is `UNRESOLVED — PRODUCTION EXECUTION FAILURE REQUIRES
-  DIAGNOSIS` (runbook §4k).
+  here. At PR #102 time its status was `UNRESOLVED — PRODUCTION EXECUTION
+  FAILURE REQUIRES DIAGNOSIS`. Its current status is **CURRENT PRODUCTION
+  ACCEPTED — HISTORICAL FAILURE NOT REPRODUCED** (runbook §4k, §11h): a
+  `preset:1080` job through the real Product reached `ready` in Production on
+  2026-09-30, and the same source succeeded again in the 2026-10-01 HLS-v2,
+  2026-10-02 split-timestamp and 2026-10-03 separate-audio rollouts. Those jobs
+  ran as `https` + `https` split halves, **not** `http_dash_segments` (recorded
+  for the 2026-09-30 job; each later delivery was byte-identical to it). So the
+  user-visible YouTube regression is resolved, but **real-public
+  segmented-DASH compatibility remains unproven**. The historical failure's
+  cause was never directly captured: it is only consistent with the confirmed
+  status-poll defect and observed tunnel interruptions.
 - Production SSRF/DNS/egress policy, Cloudflare, R2, Vercel, Production startup,
   promotion or uptime.
 
