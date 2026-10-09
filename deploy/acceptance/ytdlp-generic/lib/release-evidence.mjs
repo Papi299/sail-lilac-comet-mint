@@ -190,8 +190,9 @@ import {
  *        `sync01:merge-timing` in the candidate run ledger. mp4 + webm +
  *        clear-HLS + segmented DASH + clear-HLS v2 (fMP4) + split-merge timing.
  *        -07 records stay VALID for exactly the candidates they qualified (RC
- *        2efb85da, Production since 2026-10-02) and are never re-read under
- *        -08: that source has no separate-audio HLS family to qualify.
+ *        2efb85da, Production 2026-10-02 -> 2026-10-03, then retained as the
+ *        immediate rollback) and are never re-read under -08: that source has
+ *        no separate-audio HLS family to qualify.
  *   -08  everything -07 means, with the clear-HLS v2 child at
  *        `hls11-release-image-full-path-02` (its split master is now consulted
  *        by the Product's own master proof, and refused), PLUS a validated,
@@ -202,13 +203,19 @@ import {
  *        `hls12:clear-hls-separate-audio` in the candidate run ledger. mp4 +
  *        webm + clear-HLS + segmented DASH + clear-HLS v2 (fMP4) + split-merge
  *        timing + separate-audio clear HLS (fMP4 + fMP4). -08 records stay
- *        VALID historical evidence for exactly the candidate they qualified (RC
- *        `videofetch-worker:rc-b095dfa12f62-262f5633bc38`, `sha256:262f5633…`,
- *        from source `b095dfa1`; never promoted) and for exactly what they
+ *        VALID historical evidence for exactly the candidate they qualified
+ *        (historical RC `videofetch-worker:rc-b095dfa12f62-262f5633bc38`,
+ *        `sha256:262f5633…`, from source `b095dfa1`) and for exactly what they
  *        proved — including the separate-audio halves' ONE byte budget — and
  *        are never re-read under -09: their HLS-12 `-01` child never approached
  *        a deadline, so they do NOT release-prove that the two halves share ONE
- *        acquisition deadline.
+ *        acquisition deadline. The -08 qualification was therefore never
+ *        promotion authority. After the HLS-12 deadline hardening, a fresh
+ *        build from source `34c9567a` produced the same immutable image bytes,
+ *        which passed -09 (HLS-12 `-02`) as
+ *        `videofetch-worker:rc-34c9567abc12-262f5633bc38`; that -09
+ *        qualification, not the -08 record, authorized their 2026-10-03
+ *        Production promotion.
  *   -09  everything -08 means, with the separate-audio child at
  *        `hls12-release-image-separate-audio-02`: its `neg-deadline` case PASSes
  *        in the SAME immutable candidate image — the video half completed
