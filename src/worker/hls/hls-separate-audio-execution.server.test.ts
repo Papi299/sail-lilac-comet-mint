@@ -268,7 +268,7 @@ describe("separate-audio acquisition: ONE byte budget, ONE deadline", () => {
       const timed: ClearHlsSeparateAudioAcquisitionPrimitives = {
         ...impl,
         acquireVideo: async (request) => {
-          await new Promise((r) => setTimeout(r, 40));
+          await new Promise((r) => setTimeout(r, 60));
           return slowVideo(request);
         },
       };
@@ -279,8 +279,10 @@ describe("separate-audio acquisition: ONE byte budget, ONE deadline", () => {
       assert.equal(result.totalFileSize, 1100);
       const video = calls.find((c) => c.step === "acquire-video")!.timeoutMs!;
       const audio = calls.find((c) => c.step === "acquire-audio")!.timeoutMs!;
-      assert.ok(video <= 5_000 && video > 4_900, `video ${video}`);
-      assert.ok(audio <= video - 40, `audio ${audio} is what is left, never a fresh 5000`);
+      assert.ok(video <= 5_000 && video > 4_900, `video ${video}: the order's limit, not a 1 ms legacy cap`);
+      // A timer can measure a hair under its delay on the monotonic clock, so
+      // the margin is 50 of the 60 ms the video half took.
+      assert.ok(audio <= video - 50, `audio ${audio} is what is left of ${video}, never a fresh 5000`);
     } finally {
       Object.assign(config, { downloadTimeoutMs: saved });
     }
