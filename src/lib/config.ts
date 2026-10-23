@@ -2,11 +2,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MAX_FILE_SIZE_BYTES } from "@/shared/media-limits";
 
-function num(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
+/**
+ * This module's numeric rule, pure so it can be held against the strict Worker
+ * loader (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001).
+ *
+ * Unset, empty and whitespace-only all mean "use the fallback", exactly as the
+ * strict loader's `optional()` reads them. A whitespace-only value used to
+ * become `Number("  ") === 0` here — a zero byte ceiling, or a zero timeout,
+ * where the strict loader applied the default. Nothing else changed: any other
+ * value is `Number(raw)` when finite and non-negative, otherwise the fallback.
+ */
+export function parseLaxNumber(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim().length === 0) return fallback;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function num(name: string, fallback: number): number {
+  return parseLaxNumber(process.env[name], fallback);
 }
 
 function str(name: string, fallback: string): string {
@@ -25,6 +38,11 @@ export const config = {
   rateLimitPerMinute: num("RATE_LIMIT", 20),
   tempDirectory: str("TEMP_DIRECTORY", join(tmpdir(), "videofetch")),
   ffmpegPath: str("FFMPEG_PATH", "/usr/local/bin/ffmpeg"),
+  // The LEGACY in-process modules' download budget, and nothing else's. The
+  // Worker's acquisition and processing limits come only from its strict loader
+  // (`DOWNLOAD_TIME_LIMIT`, `PROCESSING_TIMEOUT`), which refuses
+  // `DOWNLOAD_TIMEOUT` by presence; `worker-time-limits-boundary.test.ts`
+  // keeps every Worker execution path off this value.
   downloadTimeoutMs: num("DOWNLOAD_TIMEOUT", 600) * 1000,
   analysisTimeoutMs: num("ANALYSIS_TIMEOUT", 45) * 1000,
   maxRedirects: num("MAX_REDIRECTS", 5),

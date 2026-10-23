@@ -212,6 +212,7 @@ describe("download → processing execution boundary", () => {
   it("the download primitive receives no format instruction of any kind", async () => {
     const job = claimJob(h.store, "preset:mp3");
     let observedCtxKeys: string[] = [];
+    let observedLimitMs: number | undefined;
     let downloadArgCount = 0;
 
     const deps: JobExecutorDeps = {
@@ -221,6 +222,7 @@ describe("download → processing execution boundary", () => {
       downloadOriginal: async function (_url, ctx) {
         downloadArgCount = arguments.length;
         observedCtxKeys = Object.keys(ctx).sort();
+        observedLimitMs = ctx.downloadTimeLimitMs;
         return {
           filePath: writeOriginal(ctx.workDir, "mp4"),
           container: "mp4",
@@ -239,7 +241,10 @@ describe("download → processing execution boundary", () => {
     await executor.execute(job);
 
     assert.equal(downloadArgCount, 2, "download takes only (url, ctx)");
-    assert.deepEqual(observedCtxKeys, ["onProgress", "signal", "workDir"]);
+    // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001 added exactly one key: the job's
+    // acquisition deadline. It is a time bound, not a format instruction.
+    assert.deepEqual(observedCtxKeys, ["downloadTimeLimitMs", "onProgress", "signal", "workDir"]);
+    assert.equal(observedLimitMs, 600_000, "the strict default acquisition limit, with no model injected");
   });
 
   it("§10: the advertised preset equals the produced artifact end-to-end", async () => {

@@ -1467,7 +1467,7 @@ mechanisms, and this correction changes neither:
 
 | | Starts | Owned by |
 | :--- | :--- | :--- |
-| Product acquisition deadline | inside the generic download, after queueing and job-time analysis | the Worker (`DOWNLOAD_TIMEOUT`, default 600 s) |
+| Product acquisition deadline | inside the generic download, after queueing and job-time analysis | the Worker (`DOWNLOAD_TIME_LIMIT`, default 600 s; it replaced `DOWNLOAD_TIMEOUT` in VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001) |
 | Harness observation window | when the harness creates the job | `pollTrace` (`DEFAULT_POLL_TIMEOUT_MS`) |
 
 Because the harness window starts first, it always closes **before** the

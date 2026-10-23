@@ -1482,7 +1482,7 @@ async function acceptMaxFilesizeRefusal(ctx) {
   let threw = false;
   try {
     await downloadGenericSplitSources(url, workDir, plan, {
-      limits: { maxFileSizeBytes: ceiling, downloadTimeoutSeconds: 60 },
+      limits: { maxFileSizeBytes: ceiling, downloadTimeLimitMs: 60_000 },
       validateUrl,
       runner,
     });
@@ -1662,7 +1662,7 @@ async function acceptChunkedMaxFilesizeRefusal(ctx) {
     let threw = false;
     try {
       await downloadGenericSplitSources(url, workDir, plan, {
-        limits: { maxFileSizeBytes: combinedLimit, downloadTimeoutSeconds: 60 },
+        limits: { maxFileSizeBytes: combinedLimit, downloadTimeLimitMs: 60_000 },
         validateUrl,
         runner,
       });

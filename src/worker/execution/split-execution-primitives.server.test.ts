@@ -43,7 +43,7 @@ import { YTDLP_RUNTIME } from "../runtime/ytdlp-runtime.server.ts";
  */
 
 const SPLIT_URL = "https://example.invalid/watch/split";
-const LIMITS = { maxFileSizeBytes: 1000, downloadTimeoutSeconds: 600 };
+const LIMITS = { maxFileSizeBytes: 1000 };
 const ISO = "mov,mp4,m4a,3gp,3g2,mj2";
 const WEBM = "matroska,webm";
 

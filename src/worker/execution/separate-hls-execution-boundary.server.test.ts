@@ -191,12 +191,15 @@ function productionDeps(): JobExecutorDeps {
   };
 }
 
-async function runJob(executorRef?: { executor?: JobExecutor }) {
+async function runJob(executorRef?: { executor?: JobExecutor }, extraDeps: JobExecutorDeps = {}) {
   world.store.createJob({ url: PAGE_URL, formatId: "preset:1080", principalId: "private-access-user" }, randomUUID());
   const job = world.store.claimNextQueuedJob();
   assert.ok(job);
   world.jobId = job.jobId;
-  const executor = new JobExecutor(world.store, world.writer, () => Date.now(), new Map(), productionDeps());
+  const executor = new JobExecutor(world.store, world.writer, () => Date.now(), new Map(), {
+    ...productionDeps(),
+    ...extraDeps,
+  });
   if (executorRef) executorRef.executor = executor;
   await executor.execute(job);
   const final = world.store.getJob(job.jobId);
@@ -390,8 +393,8 @@ describe("separate-audio boundary: a proven pair through the production composit
 });
 
 describe("separate-audio boundary: every failure fails closed before any media tool", () => {
-  const failsClosed = async (expectedCode: string) => {
-    const { final, workDirGone } = await runJob();
+  const failsClosed = async (expectedCode: string, extraDeps: JobExecutorDeps = {}) => {
+    const { final, workDirGone } = await runJob(undefined, extraDeps);
     assert.equal(final?.status, "failed", `status ${final?.status}`);
     assert.equal(final?.errorCode, expectedCode);
     assert.equal(world.puts.length, 0, "no upload");
@@ -497,20 +500,32 @@ describe("separate-audio boundary: every failure fails closed before any media t
   });
 
   it("times out on the ONE shared acquisition deadline", async () => {
+    // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: narrowed through the executor's
+    // injected model, which the production composition hands to this seam.
+    const requests = network({
+      ...routes(),
+      [A_FRAGS[1]!]: (args) =>
+        new Promise<Served>((_, reject) => {
+          args.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        }),
+    });
+    const spawned = processes();
+    await failsClosed("TIMEOUT", { timeLimits: { downloadTimeLimitMs: 60, processingMs: 600_000 } });
+    assert.ok(requests.length >= 1);
+    assert.equal(spawned.length, 0);
+  });
+
+  it("is no longer bounded by the legacy module budget (VIDEOFETCH-LD1)", async () => {
+    // A zero legacy budget used to refuse the pair after both preflights. The
+    // production composition now arms the executor's own limit instead.
     const saved = config.downloadTimeoutMs;
-    Object.assign(config, { downloadTimeoutMs: 60 });
+    Object.assign(config, { downloadTimeoutMs: 0 });
     try {
-      const requests = network({
-        ...routes(),
-        [A_FRAGS[1]!]: (args) =>
-          new Promise<Served>((_, reject) => {
-            args.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-          }),
-      });
-      const spawned = processes();
-      await failsClosed("TIMEOUT");
-      assert.ok(requests.length >= 1);
-      assert.equal(spawned.length, 0);
+      const requests = network(routes());
+      processes();
+      const { final } = await runJob();
+      assert.equal(final?.status, "ready", `final ${final?.status} ${final?.errorCode ?? ""}`);
+      assert.deepEqual(requests.map((r) => r.url), ALL_REQUESTS);
     } finally {
       Object.assign(config, { downloadTimeoutMs: saved });
     }

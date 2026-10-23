@@ -273,7 +273,7 @@ describe("the single-source yt-dlp downloader refuses the operation at run time"
     let thrown: unknown;
     try {
       await downloadGenericOriginal("https://example.com/watch", workDir, plan as unknown as GenericSingleSourceExecutionPlan, {
-        limits: { maxFileSizeBytes: 1024, downloadTimeoutSeconds: 10 },
+        limits: { maxFileSizeBytes: 1024, downloadTimeLimitMs: 10_000 },
         validateUrl: async (raw: string) => {
           validated += 1;
           return { url: raw, hostname: "example.com" };

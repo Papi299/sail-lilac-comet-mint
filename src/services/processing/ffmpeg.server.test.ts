@@ -18,6 +18,8 @@ import {
   buildSplitMergeArgs,
   convertMedia,
   mergeSplitMedia,
+  remainingSplitMergeBudgetMs,
+  setSplitMergeClockForTests,
 } from "./ffmpeg.server.ts";
 import { resolveFfprobePath } from "./ffprobe.server.ts";
 import type { MergeSyncDecision } from "./merge-sync.ts";
@@ -1315,5 +1317,174 @@ describe("split merge execution (SPLIT-02)", () => {
     // The decision came from the files (video starts later), not the caller.
     assert.deepEqual(syncTokens(args), { input0: ["-isync", "1"], input1: [] });
     for (const flag of ["-copyts", "-shortest"]) assert.ok(!args.includes(flag), flag);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: ONE budget for the whole merge stage
+  // ───────────────────────────────────────────────────────────────────────────
+
+  describe("ONE stage budget shared by the four subprocesses (VIDEOFETCH-LD1)", () => {
+    /** The controlled monotonic clock the stage deadline is measured on. */
+    let now = 0;
+
+    beforeEach(() => {
+      now = 1_000_000;
+      setSplitMergeClockForTests(() => now);
+    });
+
+    afterEach(() => {
+      setSplitMergeClockForTests(null);
+    });
+
+    /**
+     * Records the budget each subprocess's runner arms (its one kill timer),
+     * in spawn order. Restored before any assertion.
+     */
+    async function withRecordedBudgets<T>(run: () => Promise<T>): Promise<{ budgets: number[]; result: T | AppError }> {
+      const budgets: number[] = [];
+      const original = globalThis.setTimeout;
+      globalThis.setTimeout = ((handler: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+        budgets.push(ms ?? 0);
+        return original(handler, ms, ...rest);
+      }) as unknown as typeof setTimeout;
+      try {
+        return { budgets, result: await run() };
+      } catch (err) {
+        assert.ok(err instanceof AppError, String(err));
+        return { budgets, result: err };
+      } finally {
+        globalThis.setTimeout = original;
+      }
+    }
+
+    async function goodPairSteps(): Promise<Step[]> {
+      return [
+        { kind: "probe", stdout: await pinned("timed-iso-bmff-video-only") },
+        { kind: "probe", stdout: await pinned("timed-iso-bmff-audio-only") },
+        { kind: "ffmpeg" },
+        { kind: "probe", stdout: await pinned("iso-bmff-merged") },
+      ];
+    }
+
+    /** Each spawn "takes" its cost on the stage clock: subprocess i consumes costs[i]. */
+    const consuming = (costs: readonly number[]) => (index: number) => {
+      now += costs[index] ?? 0;
+    };
+
+    it("the pure remainder: floored, positive, and nothing once the deadline is reached", () => {
+      assert.equal(remainingSplitMergeBudgetMs(1_600_000, 1_000_000), 600_000);
+      assert.equal(remainingSplitMergeBudgetMs(1_000, 999), 1, "one millisecond left is a budget");
+      assert.equal(remainingSplitMergeBudgetMs(1_000, 999.5), null, "a sub-millisecond remainder is nothing");
+      assert.equal(remainingSplitMergeBudgetMs(1_000, 400.7), 599);
+      assert.equal(remainingSplitMergeBudgetMs(1_000, 1_000), null, "exactly at the deadline");
+      assert.equal(remainingSplitMergeBudgetMs(1_000, 1_001), null);
+      assert.equal(remainingSplitMergeBudgetMs(Number.NaN, 0), null);
+      assert.equal(remainingSplitMergeBudgetMs(Number.POSITIVE_INFINITY, 0), null);
+      assert.equal(remainingSplitMergeBudgetMs(1_000, Number.NaN), null);
+    });
+
+    it("hands each subprocess only what is left — earlier ones consume later ones' time", async () => {
+      const { calls } = harness(await goodPairSteps(), consuming([100_000, 50_000, 200_000, 0]));
+      const { budgets, result } = await withRecordedBudgets(() => merge({ target: "mp4", timeoutMs: 600_000 }));
+      assert.equal(result, join(real, "merged.mp4"), "success within the budget");
+      assert.equal(calls.length, 4);
+      // video probe, audio probe, FFmpeg, output probe. A fresh budget per
+      // subprocess would have been [600000, 600000, 600000, 600000].
+      assert.deepEqual(budgets, [600_000, 500_000, 450_000, 250_000]);
+    });
+
+    it("runs a subprocess with exactly 1 ms left", async () => {
+      // 300 000 + 299 000 + 999 consumed: the output probe starts with 1 ms.
+      const { calls } = harness(await goodPairSteps(), consuming([300_000, 299_000, 999, 0]));
+      const { budgets, result } = await withRecordedBudgets(() => merge({ target: "mp4", timeoutMs: 600_000 }));
+      assert.equal(result, join(real, "merged.mp4"));
+      assert.equal(calls.length, 4);
+      assert.deepEqual(budgets, [600_000, 300_000, 1_000, 1]);
+    });
+
+    it("never starts a subprocess at the deadline: 0 ms left is TIMEOUT before the spawn", async () => {
+      const { calls, ffmpegCalls } = harness(await goodPairSteps(), consuming([300_000, 299_000, 1_000, 0]));
+      const { budgets, result } = await withRecordedBudgets(() => merge({ target: "mp4", timeoutMs: 600_000 }));
+      assert.ok(result instanceof AppError);
+      assert.equal(result.code, "TIMEOUT");
+      assert.equal(calls.length, 3, "no output probe was spawned");
+      assert.equal(ffmpegCalls().length, 1);
+      assert.deepEqual(budgets, [600_000, 300_000, 1_000]);
+    });
+
+    it("an input probe that uses the whole budget stops the stage before the audio probe", async () => {
+      for (const cost of [600_000, 700_000]) {
+        const { calls, ffmpegCalls } = harness(await goodPairSteps(), consuming([cost, 0, 0, 0]));
+        const { result } = await withRecordedBudgets(() => merge({ target: "mp4", timeoutMs: 600_000 }));
+        assert.ok(result instanceof AppError && result.code === "TIMEOUT", String(cost));
+        assert.equal(calls.length, 1, `${cost}: only the video probe ran`);
+        assert.equal(ffmpegCalls().length, 0);
+        now = 1_000_000;
+      }
+    });
+
+    it("accepts NO artifact when the deadline passes during the merge, even if FFmpeg exits 0", async () => {
+      const { calls } = harness(await goodPairSteps(), consuming([0, 0, 600_000, 0]));
+      const { result } = await withRecordedBudgets(() => merge({ target: "mp4", timeoutMs: 600_000 }));
+      assert.ok(result instanceof AppError);
+      assert.equal(result.code, "TIMEOUT", "the merged file is never returned");
+      assert.equal(calls.length, 3, "the artifact was never probed, so never accepted");
+    });
+
+    it("kills the merge's process group at the REMAINDER, not at a fresh full budget", { timeout: 10_000 }, async () => {
+      // The probes leave 50 ms of a 600 s stage. A fresh budget would hang here
+      // for ten minutes; the shared one kills the merge after 50 ms.
+      const steps = (await goodPairSteps()).slice(0, 2).concat([{ kind: "hang" }]);
+      const { calls, children, groupKills } = harness(steps, consuming([299_975, 299_975, 0]));
+      const { budgets, result } = await withRecordedBudgets(() => merge({ target: "mp4", timeoutMs: 600_000 }));
+      assert.ok(result instanceof AppError);
+      assert.equal(result.code, "TIMEOUT");
+      assert.deepEqual(budgets, [600_000, 300_025, 50]);
+      assert.equal(calls.length, 3);
+      assert.deepEqual(groupKills, [-(children[2].pid as number)], "the merge's whole group, and only it");
+    });
+
+    for (const [index, name] of [
+      [0, "the video probe"],
+      [1, "the audio probe"],
+      [2, "FFmpeg"],
+      [3, "the output probe"],
+    ] as const) {
+      it(`cancellation during ${name} is a cancellation, kills that group, and starts nothing after it`, async () => {
+        const controller = new AbortController();
+        const steps: Step[] = (await goodPairSteps()).slice(0, index);
+        steps.push({ kind: "hang" });
+        const { calls, children, groupKills } = harness(steps, (spawned) => {
+          if (spawned === index) setTimeout(() => controller.abort(), 5);
+        });
+        await rejectsWith("PROCESSING_FAILED", () =>
+          merge({ target: "mp4", timeoutMs: 600_000, signal: controller.signal }),
+        );
+        assert.equal(calls.length, index + 1);
+        assert.deepEqual(groupKills, [-(children[index].pid as number)]);
+      });
+    }
+
+    it("measures the stage on the monotonic clock: a mid-stage wall-clock jump neither cuts nor extends it", async () => {
+      const wall = Date.now;
+      for (const jumpMs of [86_400_000, -86_400_000]) {
+        now = 1_000_000;
+        // The merge refuses an existing output, so each run starts clean.
+        await rm(join(real, "merged.mp4"), { force: true });
+        try {
+          const { calls } = harness(await goodPairSteps(), (index) => {
+            consuming([100_000, 0, 0, 0])(index);
+            // The wall clock jumps a day while the video probe runs.
+            if (index === 0) Date.now = () => wall() + jumpMs;
+          });
+          const { budgets, result } = await withRecordedBudgets(() => merge({ target: "mp4", timeoutMs: 600_000 }));
+          assert.equal(result, join(real, "merged.mp4"), String(jumpMs));
+          assert.equal(calls.length, 4);
+          assert.deepEqual(budgets, [600_000, 500_000, 500_000, 500_000], String(jumpMs));
+        } finally {
+          Date.now = wall;
+        }
+      }
+    });
   });
 });

@@ -4,6 +4,7 @@ import {
   loadWorkerRuntimeConfig,
   WORKER_DEFAULT_BIND_HOST,
   WORKER_DEFAULT_PORT,
+  WORKER_FORBIDDEN_TIME_LIMIT_VARIABLES,
   WORKER_FORBIDDEN_YTDLP_VARIABLES,
   WorkerRuntimeConfigError,
 } from "./config.server.ts";
@@ -437,7 +438,8 @@ describe("Worker runtime configuration", () => {
       assert.equal(media.maxFileSizeBytes, 4_294_967_296);
       assert.equal(media.maxVideoDurationSeconds, 7200);
       assert.equal(media.fileExpirationMinutes, 45);
-      assert.equal(media.downloadTimeoutSeconds, 600);
+      assert.equal(media.downloadTimeLimitSeconds, 600);
+      assert.equal(media.processingTimeoutSeconds, 600);
       assert.equal(media.analysisTimeoutSeconds, 45);
       assert.equal(media.maxRedirects, 5);
       assert.equal(media.tempDirectory, null);
@@ -450,7 +452,8 @@ describe("Worker runtime configuration", () => {
           MAX_FILE_SIZE: "1048576",
           MAX_VIDEO_DURATION: "60",
           FILE_EXPIRATION_MINUTES: "15",
-          DOWNLOAD_TIMEOUT: "120",
+          DOWNLOAD_TIME_LIMIT: "120",
+          PROCESSING_TIMEOUT: "90",
           ANALYSIS_TIMEOUT: "30",
           MAX_REDIRECTS: "0",
           TEMP_DIRECTORY: "/tmp/videofetch",
@@ -461,7 +464,8 @@ describe("Worker runtime configuration", () => {
       assert.equal(media.maxFileSizeBytes, 1048576);
       assert.equal(media.maxVideoDurationSeconds, 60);
       assert.equal(media.fileExpirationMinutes, 15);
-      assert.equal(media.downloadTimeoutSeconds, 120);
+      assert.equal(media.downloadTimeLimitSeconds, 120);
+      assert.equal(media.processingTimeoutSeconds, 90);
       assert.equal(media.analysisTimeoutSeconds, 30);
       assert.equal(media.maxRedirects, 0);
       assert.equal(media.tempDirectory, "/tmp/videofetch");
@@ -500,7 +504,8 @@ describe("Worker runtime configuration", () => {
       expectInvalid(baseEnv({ MAX_FILE_SIZE: "99999999999999999999" }), "MAX_FILE_SIZE");
       expectInvalid(baseEnv({ MAX_VIDEO_DURATION: "604801" }), "MAX_VIDEO_DURATION");
       expectInvalid(baseEnv({ FILE_EXPIRATION_MINUTES: "1441" }), "FILE_EXPIRATION_MINUTES");
-      expectInvalid(baseEnv({ DOWNLOAD_TIMEOUT: "0" }), "DOWNLOAD_TIMEOUT");
+      expectInvalid(baseEnv({ DOWNLOAD_TIME_LIMIT: "0" }), "DOWNLOAD_TIME_LIMIT");
+      expectInvalid(baseEnv({ PROCESSING_TIMEOUT: "0" }), "PROCESSING_TIMEOUT");
       expectInvalid(baseEnv({ ANALYSIS_TIMEOUT: "3601" }), "ANALYSIS_TIMEOUT");
       expectInvalid(baseEnv({ MAX_REDIRECTS: "21" }), "MAX_REDIRECTS");
       expectInvalid(baseEnv({ TEMP_DIRECTORY: "relative/tmp" }), "TEMP_DIRECTORY");
@@ -685,6 +690,164 @@ describe("Phase-10C1 yt-dlp configuration contract", () => {
       // parsed `true` is never evidence that anything can execute.
       const config = loadWorkerRuntimeConfig(baseEnv({ YTDLP_ENABLED: "true" }));
       assert.equal(config.media.ytdlp.enabled, true);
+    });
+  });
+});
+
+/**
+ * VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001 — the stage time limits.
+ *
+ * `DOWNLOAD_TIME_LIMIT` (60..21600 s, default 600) and `PROCESSING_TIMEOUT`
+ * (60..14400 s, default 600) follow the strict loader's existing grammar
+ * exactly: unset, empty and whitespace-only mean the default; anything else
+ * must be `^[0-9]{1,17}$` within range, or startup fails naming only the
+ * variable. The retired `DOWNLOAD_TIMEOUT` is refused by presence.
+ */
+describe("VIDEOFETCH-LD1 stage time limits", () => {
+  const VARIABLES = [
+    { name: "DOWNLOAD_TIME_LIMIT", field: "downloadTimeLimitSeconds", min: 60, max: 21_600 },
+    { name: "PROCESSING_TIMEOUT", field: "processingTimeoutSeconds", min: 60, max: 14_400 },
+  ] as const;
+
+  const read = (env: NodeJS.ProcessEnv, field: (typeof VARIABLES)[number]["field"]) =>
+    loadWorkerRuntimeConfig(env).media[field];
+
+  for (const v of VARIABLES) {
+    describe(v.name, () => {
+      it("defaults to 600 when absent", () => {
+        assert.equal(read(baseEnv(), v.field), 600);
+      });
+
+      for (const blank of ["", " ", "   ", "\t", " \n ", "\r\n"]) {
+        it(`treats ${JSON.stringify(blank)} as unset (the default), never as zero`, () => {
+          assert.equal(read(baseEnv({ [v.name]: blank }), v.field), 600);
+        });
+      }
+
+      it("accepts the range ends and the values just inside them", () => {
+        for (const n of [v.min, v.min + 1, 600, v.max - 1, v.max]) {
+          assert.equal(read(baseEnv({ [v.name]: String(n) }), v.field), n, String(n));
+        }
+      });
+
+      it("refuses the values just outside the range, zero and negatives", () => {
+        for (const raw of [String(v.min - 1), String(v.max + 1), "0", "1", "-1", "-600"]) {
+          expectInvalid(baseEnv({ [v.name]: raw }), v.name);
+        }
+      });
+
+      it("refuses decimals, exponents, signs, separators, hex and words", () => {
+        for (const raw of [
+          "600.0",
+          "600.5",
+          "60.1",
+          "6e2",
+          "6E2",
+          "1e3",
+          "+600",
+          "600_000",
+          "6 00",
+          "0x258",
+          "600s",
+          "10m",
+          "ten",
+          "Infinity",
+          "NaN",
+        ]) {
+          expectInvalid(baseEnv({ [v.name]: raw }), v.name);
+        }
+      });
+
+      it("refuses unsafe and oversized integers rather than rounding them", () => {
+        for (const raw of ["9007199254740992", "9007199254740993", "99999999999999999", "123456789012345678"]) {
+          expectInvalid(baseEnv({ [v.name]: raw }), v.name);
+        }
+      });
+
+      it("accepts leading zeros within the 17-digit grammar, and trims surrounding whitespace", () => {
+        assert.equal(read(baseEnv({ [v.name]: "0600" }), v.field), 600);
+        assert.equal(read(baseEnv({ [v.name]: "00000000000000600" }), v.field), 600);
+        assert.equal(read(baseEnv({ [v.name]: " 600 " }), v.field), 600);
+        // Eighteen digits break the grammar even when the value is in range.
+        expectInvalid(baseEnv({ [v.name]: "000000000000000600" }), v.name);
+      });
+
+      it("names only the variable, never the rejected value", () => {
+        assert.throws(
+          () => loadWorkerRuntimeConfig(baseEnv({ [v.name]: "SENTINEL-LIMIT-VALUE" })),
+          (err: unknown) => {
+            assert.ok(err instanceof WorkerRuntimeConfigError);
+            assert.deepEqual([...err.variables], [v.name]);
+            assert.equal(err.message.includes("SENTINEL-LIMIT-VALUE"), false);
+            return true;
+          },
+        );
+      });
+    });
+  }
+
+  it("keeps the two limits independent: setting one never moves the other", () => {
+    const a = loadWorkerRuntimeConfig(baseEnv({ DOWNLOAD_TIME_LIMIT: "9000" })).media;
+    assert.equal(a.downloadTimeLimitSeconds, 9000);
+    assert.equal(a.processingTimeoutSeconds, 600);
+    const b = loadWorkerRuntimeConfig(baseEnv({ PROCESSING_TIMEOUT: "14400" })).media;
+    assert.equal(b.downloadTimeLimitSeconds, 600);
+    assert.equal(b.processingTimeoutSeconds, 14400);
+  });
+
+  it("keeps the LD-1 acquisition default at 600 s; 9,000 s only by explicit configuration", () => {
+    assert.equal(loadWorkerRuntimeConfig(baseEnv()).media.downloadTimeLimitSeconds, 600);
+  });
+
+  it("no longer exposes the retired field", () => {
+    const media = loadWorkerRuntimeConfig(baseEnv()).media as Record<string, unknown>;
+    assert.equal(Object.hasOwn(media, "downloadTimeoutSeconds"), false);
+  });
+
+  describe("DOWNLOAD_TIMEOUT is retired and refused by presence", () => {
+    it("is the one retired stage-time variable", () => {
+      assert.deepEqual([...WORKER_FORBIDDEN_TIME_LIMIT_VARIABLES], ["DOWNLOAD_TIMEOUT"]);
+      assert.ok(Object.isFrozen(WORKER_FORBIDDEN_TIME_LIMIT_VARIABLES));
+    });
+
+    for (const value of ["600", "120", "9000", "0", "", " ", "   ", "\t", "not-a-number"]) {
+      it(`refuses DOWNLOAD_TIMEOUT=${JSON.stringify(value)}`, () => {
+        expectInvalid(baseEnv({ DOWNLOAD_TIMEOUT: value }), "DOWNLOAD_TIMEOUT");
+      });
+    }
+
+    it("is not an alias: even with both new variables set validly, it is refused", () => {
+      expectInvalid(
+        baseEnv({ DOWNLOAD_TIMEOUT: "600", DOWNLOAD_TIME_LIMIT: "600", PROCESSING_TIMEOUT: "600" }),
+        "DOWNLOAD_TIMEOUT",
+      );
+    });
+
+    it("is reported even when the rest of the environment is empty", () => {
+      assert.throws(
+        () => loadWorkerRuntimeConfig({ DOWNLOAD_TIMEOUT: "" }),
+        (err: unknown) => {
+          assert.ok(err instanceof WorkerRuntimeConfigError);
+          assert.ok(err.variables.includes("DOWNLOAD_TIMEOUT"));
+          return true;
+        },
+      );
+    });
+
+    it("never renders the rejected value", () => {
+      assert.throws(
+        () => loadWorkerRuntimeConfig(baseEnv({ DOWNLOAD_TIMEOUT: "SENTINEL-RETIRED-VALUE" })),
+        (err: unknown) => {
+          assert.ok(err instanceof WorkerRuntimeConfigError);
+          assert.deepEqual([...err.variables], ["DOWNLOAD_TIMEOUT"]);
+          assert.equal(`${err.message}\n${err.stack ?? ""}`.includes("SENTINEL-RETIRED-VALUE"), false);
+          return true;
+        },
+      );
+    });
+
+    it("accepts startup when it is absent", () => {
+      assert.doesNotThrow(() => loadWorkerRuntimeConfig(baseEnv()));
     });
   });
 });

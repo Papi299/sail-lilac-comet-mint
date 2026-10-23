@@ -436,11 +436,47 @@ async function pathEntryExists(path: string): Promise<boolean> {
 }
 
 /**
+ * The monotonic clock the merge's ONE stage deadline is measured on
+ * (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001). `performance.now()` rather than
+ * `Date.now()`, so a wall-clock step can neither extend nor cut the stage.
+ *
+ * A test seam, like the direct downloader's deadline timer: nothing in
+ * Production sets it, and while it is unset the clock is `performance.now()`.
+ */
+const MONOTONIC_CLOCK = (): number => performance.now();
+let splitMergeClock: () => number = MONOTONIC_CLOCK;
+
+export function setSplitMergeClockForTests(clock: (() => number) | null): void {
+  splitMergeClock = clock ?? MONOTONIC_CLOCK;
+}
+
+/**
+ * What is left of the merge stage's deadline, as a positive whole number of
+ * milliseconds, or `null` once nothing is left. Pure; floored because the
+ * probe and the process runner require a positive safe integer timeout. The
+ * same rule as the clear-HLS processing primitive's `remainingBudgetMs`.
+ */
+export function remainingSplitMergeBudgetMs(deadlineMs: number, nowMs: number): number | null {
+  if (!Number.isFinite(deadlineMs) || !Number.isFinite(nowMs)) return null;
+  const remaining = Math.floor(deadlineMs - nowMs);
+  return Number.isSafeInteger(remaining) && remaining > 0 ? remaining : null;
+}
+
+/**
  * Merge one already-downloaded video-only file with one already-downloaded
  * audio-only file, by stream copy, into a validated local artifact.
  *
  * Every input is local, every bound is caller-supplied and explicit, and every
  * stage fails closed. Returns the absolute output path.
+ *
+ * `timeoutMs` is the ONE budget for the whole merge stage
+ * (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001): the deadline is fixed once, at entry,
+ * and the video probe, the audio probe, FFmpeg and the output probe each
+ * receive only what is left of it — never a fresh full budget, so the stage
+ * cannot take four times what was configured. A subprocess that would start
+ * with nothing left does not start: the stage fails `TIMEOUT` and no artifact
+ * is accepted. No timer is added; each subprocess's own runner timer, set to
+ * the remainder, is what kills its process group.
  */
 export async function mergeSplitMedia(opts: {
   videoPath: string;
@@ -473,6 +509,23 @@ export async function mergeSplitMedia(opts: {
   if (!(SPLIT_MERGE_TARGETS as readonly string[]).includes(opts.target)) {
     throw new AppError("PROCESSING_FAILED");
   }
+
+  // ONE deadline for the whole stage, fixed here and never re-derived.
+  const clock = splitMergeClock;
+  const deadlineMs = clock() + opts.timeoutMs;
+  /**
+   * The budget the NEXT subprocess may use, or a refusal. Cancellation is
+   * checked first, exactly as the runner reports it, so a cancelled stage is
+   * never misreported as a timeout; then nothing starts once nothing is left.
+   */
+  const nextBudgetMs = (): number => {
+    if (opts.signal?.aborted) {
+      throw new AppError("PROCESSING_FAILED", "Download was cancelled.");
+    }
+    const remaining = remainingSplitMergeBudgetMs(deadlineMs, clock());
+    if (remaining === null) throw new AppError("TIMEOUT");
+    return remaining;
+  };
 
   const family = SPLIT_MERGE_FAMILY[opts.target];
 
@@ -518,7 +571,7 @@ export async function mergeSplitMedia(opts: {
     inputPath: videoPath,
     workDir: workDirReal,
     family,
-    timeoutMs: opts.timeoutMs,
+    timeoutMs: nextBudgetMs(),
     signal: opts.signal,
   });
   if (!hasExactStreamShape(videoProbe, { family, video: 1, audio: 0 })) {
@@ -529,7 +582,7 @@ export async function mergeSplitMedia(opts: {
     inputPath: audioPath,
     workDir: workDirReal,
     family,
-    timeoutMs: opts.timeoutMs,
+    timeoutMs: nextBudgetMs(),
     signal: opts.signal,
   });
   if (!hasExactStreamShape(audioProbe, { family, video: 0, audio: 1 })) {
@@ -565,7 +618,8 @@ export async function mergeSplitMedia(opts: {
 
   // 4. The merge itself. The caller's AbortSignal goes straight into
   //    `runProcess`, which owns a POSIX process group and kills the whole
-  //    group on abort or timeout.
+  //    group on abort or timeout — here, at what is left of the stage.
+  const mergeBudgetMs = nextBudgetMs();
   const result = await runProcess({
     command: config.ffmpegPath,
     args: buildSplitMergeArgs({
@@ -575,7 +629,7 @@ export async function mergeSplitMedia(opts: {
       outputPath,
       sync,
     }),
-    timeoutMs: opts.timeoutMs,
+    timeoutMs: mergeBudgetMs,
     cwd: workDirReal,
     signal: opts.signal,
     maxStdoutBytes: MERGE_MAX_STDOUT_BYTES,
@@ -595,11 +649,14 @@ export async function mergeSplitMedia(opts: {
   if (size <= 0) throw new AppError("PROCESSING_FAILED");
   if (size > opts.maxOutputBytes) throw new AppError("TOO_LARGE");
 
+  // The artifact is accepted only through this probe, so a stage whose
+  // deadline passed during the merge never yields a path: `nextBudgetMs()`
+  // refuses before the probe starts.
   const outputProbe = await probeLocalMedia({
     inputPath: producedPath,
     workDir: workDirReal,
     family,
-    timeoutMs: opts.timeoutMs,
+    timeoutMs: nextBudgetMs(),
     signal: opts.signal,
   });
   if (!hasExactStreamShape(outputProbe, { family, video: 1, audio: 1 })) {

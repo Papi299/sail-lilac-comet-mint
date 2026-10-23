@@ -514,7 +514,7 @@ describe("HLS-6 workspace: no playlist is fetched for a job the Worker cannot ho
       () => Date.now(),
       new Map(),
       hlsDeps({
-        genericLimits: { maxFileSizeBytes: 1_000, downloadTimeoutSeconds: 60 },
+        genericLimits: { maxFileSizeBytes: 1_000 },
         // One byte short of 2 x the ceiling.
         availableWorkDirBytes: async () => 1_999,
         acquireClearHls: async (_plan, workDir) => {
@@ -541,7 +541,7 @@ describe("HLS-6 workspace: no playlist is fetched for a job the Worker cannot ho
       () => Date.now(),
       new Map(),
       hlsDeps({
-        genericLimits: { maxFileSizeBytes: 1_000, downloadTimeoutSeconds: 60 },
+        genericLimits: { maxFileSizeBytes: 1_000 },
         availableWorkDirBytes: async () => 2_000,
       }),
     );

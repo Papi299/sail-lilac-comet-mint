@@ -59,7 +59,7 @@ const SECRET_URL = `https://example.invalid/v?token=${SENTINEL}`;
 const SAFE_URL = "https://example.invalid/watch/abc";
 
 const MAX = 1000;
-const LIMITS = { maxFileSizeBytes: MAX, downloadTimeoutSeconds: 600 };
+const LIMITS = { maxFileSizeBytes: MAX, downloadTimeLimitMs: 600_000 };
 
 const OK_RUNTIME: YtdlpRuntimeStatus = Object.freeze({
   available: true,
@@ -568,8 +568,8 @@ describe("split download: pre-flight ordering (§9/§10/§57)", () => {
   it("refuses a relative workDir and a malformed byte limit before anything runs", async () => {
     for (const [dir, limits] of [
       ["relative/work", LIMITS],
-      [workDir, { maxFileSizeBytes: 0, downloadTimeoutSeconds: 60 }],
-      [workDir, { maxFileSizeBytes: 1.5, downloadTimeoutSeconds: 60 }],
+      [workDir, { maxFileSizeBytes: 0, downloadTimeLimitMs: 60_000 }],
+      [workDir, { maxFileSizeBytes: 1.5, downloadTimeLimitMs: 60_000 }],
     ] as const) {
       const { runner, calls } = forbiddenRunner();
       const probe = countingProbe();
@@ -583,6 +583,27 @@ describe("split download: pre-flight ordering (§9/§10/§57)", () => {
       );
       assert.equal(calls.length, 0);
       assert.equal(probe.seen.length, 0);
+    }
+  });
+
+  it("refuses a missing or malformed acquisition limit before anything runs (VIDEOFETCH-LD1)", async () => {
+    for (const bad of [undefined, null, 0, -1, 1.5, Number.NaN, "60000"]) {
+      const { runner, calls } = forbiddenRunner();
+      const probe = countingProbe();
+      await rejectsWith("PROCESSING_FAILED", () =>
+        downloadGenericSplitSources(
+          SAFE_URL,
+          workDir,
+          mp4Plan(),
+          baseDeps({
+            runner,
+            limits: { maxFileSizeBytes: MAX, downloadTimeLimitMs: bad } as never,
+            probeRuntime: probe.probeRuntime,
+          }),
+        ),
+      );
+      assert.equal(calls.length, 0, String(bad));
+      assert.equal(probe.seen.length, 0, String(bad));
     }
   });
 });
@@ -928,7 +949,7 @@ describe("split download: ONE shared deadline (§11/§12/§58)", () => {
         baseDeps({
           runner,
           clock,
-          limits: { maxFileSizeBytes: MAX, downloadTimeoutSeconds: opts.budgetSeconds },
+          limits: { maxFileSizeBytes: MAX, downloadTimeLimitMs: opts.budgetSeconds * 1000 },
           probeRuntime: async (o) => {
             probeBudgets.push(o.timeoutMs ?? -1);
             now += opts.probeMs;
@@ -990,7 +1011,7 @@ describe("split download: ONE shared deadline (§11/§12/§58)", () => {
         },
         baseDeps({
           clock: () => 7,
-          limits: { maxFileSizeBytes: MAX, downloadTimeoutSeconds: 0.2 },
+          limits: { maxFileSizeBytes: MAX, downloadTimeLimitMs: 200 },
           runner: async (call) => {
             singleBudget = call.timeoutMs;
             writeFileSync(join(singleDir, "source.mp4"), "x");
@@ -1010,7 +1031,7 @@ describe("split download: ONE shared deadline (§11/§12/§58)", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("split download: ONE combined byte budget (§13-§15/§24-§27/§59/§60)", () => {
-  const limits = { maxFileSizeBytes: 1000, downloadTimeoutSeconds: 60 };
+  const limits = { maxFileSizeBytes: 1000, downloadTimeLimitMs: 60_000 };
   const run = (plan: GenericSplitExecutionPlan, runner: Deps["runner"], extra: Partial<Deps> = {}) =>
     downloadGenericSplitSources(SAFE_URL, workDir, plan, baseDeps({ runner, limits, ...extra }));
 
@@ -1133,7 +1154,7 @@ function refusesAt(declared: number, ceiling: number): Half {
 }
 
 describe("split download: the pinned --max-filesize refusal (YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001)", () => {
-  const limits = { maxFileSizeBytes: 1000, downloadTimeoutSeconds: 60 };
+  const limits = { maxFileSizeBytes: 1000, downloadTimeLimitMs: 60_000 };
 
   it("VIDEO refused: one probe, the video run only, TOO_LARGE, no pair", async () => {
     const plan = mp4Plan();
@@ -2088,7 +2109,7 @@ describe("split download: ONE first-cause latch across BOTH halves (§29/§66)",
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("split download: a failed half fails the whole call (§42-§44/§67)", () => {
-  const limits = { maxFileSizeBytes: 1000, downloadTimeoutSeconds: 60 };
+  const limits = { maxFileSizeBytes: 1000, downloadTimeLimitMs: 60_000 };
   const failures: Array<[string, (plan: GenericSplitExecutionPlan) => Half]> = [
     [
       "FORMAT_UNAVAILABLE",
@@ -2421,7 +2442,7 @@ describe("split download: no media processing during acquisition (§3/§49/§50/
 describe("split download: no residual timers (§31)", () => {
   it("leaves no timer behind on success, a failed audio half, or an audio overflow", async () => {
     const before = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
-    const limits = { maxFileSizeBytes: 1000, downloadTimeoutSeconds: 60 };
+    const limits = { maxFileSizeBytes: 1000, downloadTimeLimitMs: 60_000 };
 
     resetWorkDir();
     {

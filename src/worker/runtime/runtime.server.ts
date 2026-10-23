@@ -19,6 +19,7 @@ import type { R2CredentialProvider } from "../storage/credential-provider.ts";
 import { DelegatedR2ObjectStoreWriter } from "../storage/delegated-r2-writer.server.ts";
 import type { ObjectStoreWriter } from "../storage/writer.ts";
 import type { WorkerRuntimeConfig } from "./config.server.ts";
+import { buildWorkerTimeLimits, type WorkerTimeLimits } from "./time-limits.ts";
 import {
   WorkerMaintenance,
   type WorkerMaintenanceCategory,
@@ -81,7 +82,12 @@ export type WorkerRuntimeOverrides = {
   clock?: () => number;
   analyze?: AnalyzeFn;
   probeBinaries?: WorkerBinaryProbe;
-  executorDeps?: JobExecutorDeps;
+  /**
+   * Executor seams for tests. It cannot carry `timeLimits`: the strict
+   * configuration is the one owner of every stage time limit, so a test that
+   * needs different limits configures them, exactly as an operator would.
+   */
+  executorDeps?: Omit<JobExecutorDeps, "timeLimits">;
   jobTtlMs?: number;
   maintenanceIntervalMs?: number;
   maintenanceBatchSize?: number;
@@ -95,6 +101,8 @@ export type WorkerRuntimeOverrides = {
 
 export type WorkerRuntime = {
   readonly config: WorkerRuntimeConfig;
+  /** The stage time limits, built once from `config` and handed to the executor. */
+  readonly timeLimits: WorkerTimeLimits;
   readonly stateDirectory: string;
   readonly databasePath: string;
   readonly db: DatabaseSync;
@@ -121,8 +129,8 @@ export type WorkerRuntime = {
  * Mandatory initialization order (§11) — every step must succeed before the
  * next begins, and the caller must not `listen()` until this resolves:
  *
- *   validated config → persistent directory → openWorkerDatabase →
- *   applyMigrations → SQLiteJobStore → store.recover() →
+ *   validated config → stage time limits → persistent directory →
+ *   openWorkerDatabase → applyMigrations → SQLiteJobStore → store.recover() →
  *   SQLiteWorkerReplayStore → writer → executor → runner → pump →
  *   service → server → maintenance
  *
@@ -133,6 +141,17 @@ export async function createWorkerRuntime(
   config: WorkerRuntimeConfig,
   overrides: WorkerRuntimeOverrides = {},
 ): Promise<WorkerRuntime> {
+  // ── The stage time limits (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001) ──────────
+  //
+  // Built ONCE, here, from the strict loader's validated values, and handed to
+  // the executor as the single source of every acquisition deadline and
+  // processing budget. Built first, so a malformed configuration fails before
+  // any directory or database is touched. The builder re-checks the ranges.
+  const timeLimits = buildWorkerTimeLimits({
+    downloadTimeLimitSeconds: config.media.downloadTimeLimitSeconds,
+    processingTimeoutSeconds: config.media.processingTimeoutSeconds,
+  });
+
   const prepared = await prepareWorkerStateDirectory(config.dataDirectory);
 
   const db = openWorkerDatabase({ path: prepared.databasePath });
@@ -256,12 +275,14 @@ export async function createWorkerRuntime(
         ...(injectsOwnAnalysis
           ? {}
           : { analyzeForExecution: analysisPolicy.analyzeForExecution }),
-        // Generic acquisition is bounded by the same validated configuration.
-        genericLimits: {
-          maxFileSizeBytes: config.media.maxFileSizeBytes,
-          downloadTimeoutSeconds: config.media.downloadTimeoutSeconds,
-        },
+        // Every acquisition and processing seam is held to the same validated
+        // byte ceiling.
+        genericLimits: { maxFileSizeBytes: config.media.maxFileSizeBytes },
         ...executorDeps,
+        // AFTER the test seams: the strict configuration is the one owner of
+        // every stage time limit — direct, generic, split, clear-HLS and
+        // separate-audio acquisition, and every processing stage.
+        timeLimits,
       },
     );
 
@@ -324,6 +345,7 @@ export async function createWorkerRuntime(
 
     const runtime: WorkerRuntime = {
       config,
+      timeLimits,
       stateDirectory: prepared.directory,
       databasePath: prepared.databasePath,
       db,

@@ -1,5 +1,4 @@
 import { join } from "node:path";
-import { config } from "@/lib/config";
 import { AppError } from "@/lib/errors";
 import { mergeSplitMedia } from "@/services/processing/ffmpeg.server";
 import {
@@ -133,8 +132,12 @@ export type ClearHlsSeparateAudioAcquisitionOrder = {
   };
   readonly workDir: string;
   readonly signal: AbortSignal;
-  /** May only NARROW the one shared acquisition deadline. */
-  readonly acquisitionTimeoutMs?: number;
+  /**
+   * The job's ONE absolute acquisition deadline (VIDEOFETCH-LD1-STAGE-TIME-
+   * LIMITS-001), shared by both halves — the executor's `WorkerTimeLimits`.
+   * REQUIRED: this seam has no default and no ceiling of its own.
+   */
+  readonly downloadTimeLimitMs: number;
   readonly onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
 };
 
@@ -215,7 +218,16 @@ export async function acquireSelectedSeparateHlsMedia(
   order: ClearHlsSeparateAudioAcquisitionOrder,
   primitives: ClearHlsSeparateAudioAcquisitionPrimitives = PRODUCTION_ACQUISITION_PRIMITIVES,
 ): Promise<ClearHlsSeparateAudioAcquired> {
-  const { workDir, signal, acquisitionTimeoutMs, onProgress } = order;
+  const { workDir, signal, downloadTimeLimitMs, onProgress } = order;
+  // A missing or malformed limit is a composition fault: refused before either
+  // preflight, so no request is made under a deadline nobody configured.
+  if (
+    typeof downloadTimeLimitMs !== "number" ||
+    !Number.isSafeInteger(downloadTimeLimitMs) ||
+    downloadTimeLimitMs <= 0
+  ) {
+    throw new AppError("PROCESSING_FAILED");
+  }
   // The sensitive values are read ONCE; the plan is not consulted again.
   const { videoPlaylistUrl, audioPlaylistUrl } = order.plan.source;
 
@@ -233,12 +245,10 @@ export async function acquireSelectedSeparateHlsMedia(
     throw new AppError("FORMAT_UNAVAILABLE");
   }
 
-  // ONE deadline for both acquisitions, capped by the application download
-  // budget; each half receives only what is left of it.
-  const ceiling = config.downloadTimeoutMs;
-  const budgetMs = acquisitionTimeoutMs === undefined ? ceiling : Math.min(acquisitionTimeoutMs, ceiling);
-  if (!Number.isFinite(budgetMs) || budgetMs <= 0) throw new AppError("TIMEOUT");
-  const deadline = performance.now() + budgetMs;
+  // ONE deadline for both acquisitions — the job's configured acquisition limit,
+  // armed once, here, after both preflights — and each half receives only what
+  // is left of it.
+  const deadline = performance.now() + downloadTimeLimitMs;
   const remainingMs = (): number => {
     const left = Math.floor(deadline - performance.now());
     if (left <= 0) throw new AppError("TIMEOUT");

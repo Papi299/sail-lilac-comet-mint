@@ -67,6 +67,9 @@ function artifact(name: string, size: number): ClearHlsAcquiredFmp4 {
 
 type Call = { step: string; playlistUrl?: string; timeoutMs?: number; maxAggregateBytes?: number };
 
+/** The job's acquisition limit the executor hands this seam (VIDEOFETCH-LD1). */
+const DOWNLOAD_LIMIT_MS = 600_000;
+
 function primitives(opts: {
   videoPlan?: ClearHlsAcquisitionPlan;
   audioPlan?: ClearHlsAcquisitionPlan;
@@ -122,7 +125,7 @@ async function codeOf(run: Promise<unknown>): Promise<string> {
 describe("separate-audio acquisition: order and the fMP4 subset", () => {
   it("preflights BOTH playlists before acquiring the video half, then the audio half", async () => {
     const { impl, calls } = primitives({});
-    const result = await acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal }, impl);
+    const result = await acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: DOWNLOAD_LIMIT_MS }, impl);
     assert.deepEqual(calls.map((c) => c.step), ["preflight-video", "preflight-audio", "acquire-video", "acquire-audio"]);
     assert.deepEqual(calls.slice(0, 2).map((c) => c.playlistUrl), [VIDEO_URL, AUDIO_URL]);
     assert.equal(result.totalFileSize, 1100);
@@ -140,7 +143,7 @@ describe("separate-audio acquisition: order and the fMP4 subset", () => {
     ] as const) {
       const { impl, calls } = primitives({ videoPlan, audioPlan });
       assert.equal(
-        await codeOf(acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal }, impl)),
+        await codeOf(acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: DOWNLOAD_LIMIT_MS }, impl)),
         "FORMAT_UNAVAILABLE",
       );
       assert.deepEqual(calls.map((c) => c.step), ["preflight-video", "preflight-audio"]);
@@ -156,7 +159,7 @@ describe("separate-audio acquisition: order and the fMP4 subset", () => {
       ["preflight-audio", "cancelled", "PROCESSING_FAILED"],
     ] as const) {
       const { impl, calls } = primitives({ failAt, failWith: new ClearHlsPreflightError(reason) });
-      assert.equal(await codeOf(acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal }, impl)), code);
+      assert.equal(await codeOf(acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: DOWNLOAD_LIMIT_MS }, impl)), code);
       assert.equal(calls.some((c) => c.step.startsWith("acquire")), false, `${failAt}: no acquisition`);
     }
   });
@@ -170,7 +173,7 @@ describe("separate-audio acquisition: order and the fMP4 subset", () => {
       ["acquire-audio", "timeout", "TIMEOUT"],
     ] as const) {
       const { impl, calls } = primitives({ failAt, failWith: new ClearHlsAcquisitionError(reason) });
-      assert.equal(await codeOf(acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal }, impl)), code);
+      assert.equal(await codeOf(acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: DOWNLOAD_LIMIT_MS }, impl)), code);
       if (failAt === "acquire-video") assert.equal(calls.some((c) => c.step === "acquire-audio"), false);
     }
   });
@@ -178,7 +181,7 @@ describe("separate-audio acquisition: order and the fMP4 subset", () => {
   it("collapses an unexpected primitive error to PROCESSING_FAILED, dropping its text", async () => {
     const { impl } = primitives({ failAt: "acquire-audio", failWith: new Error(`boom ${AUDIO_URL}`) });
     try {
-      await acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal }, impl);
+      await acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: DOWNLOAD_LIMIT_MS }, impl);
       assert.fail("succeeded");
     } catch (err) {
       assert.ok(err instanceof AppError);
@@ -191,7 +194,7 @@ describe("separate-audio acquisition: order and the fMP4 subset", () => {
 describe("separate-audio acquisition: ONE byte budget, ONE deadline", () => {
   it("hands the audio half exactly what the video half's actual bytes left of the limit", async () => {
     const { impl, calls } = primitives({ videoSize: 1234 });
-    await acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal }, impl);
+    await acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: DOWNLOAD_LIMIT_MS }, impl);
     const video = calls.find((c) => c.step === "acquire-video")!;
     const audio = calls.find((c) => c.step === "acquire-audio")!;
     assert.equal(video.maxAggregateBytes, undefined, "the video half may use the whole limit");
@@ -200,56 +203,101 @@ describe("separate-audio acquisition: ONE byte budget, ONE deadline", () => {
 
   it("refuses with TOO_LARGE, before any audio request, when the video half used the whole budget", async () => {
     const { impl, calls } = primitives({ videoSize: hlsV1EffectiveAggregateLimitBytes() });
-    assert.equal(await codeOf(acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal }, impl)), "TOO_LARGE");
+    assert.equal(await codeOf(acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: DOWNLOAD_LIMIT_MS }, impl)), "TOO_LARGE");
     assert.equal(calls.some((c) => c.step === "acquire-audio"), false);
   });
 
   it("re-asserts the combined total, so an implementation that ignores the allowance still fails", async () => {
     const limit = hlsV1EffectiveAggregateLimitBytes();
     const { impl } = primitives({ videoSize: limit - 10, audioSize: 11 });
-    assert.equal(await codeOf(acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal }, impl)), "TOO_LARGE");
+    assert.equal(await codeOf(acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: DOWNLOAD_LIMIT_MS }, impl)), "TOO_LARGE");
   });
 
   it("shares one deadline: the audio half receives only what the video half left", async () => {
+    const { impl, calls } = primitives({});
+    const slowVideo = impl.acquireVideo;
+    const timed: ClearHlsSeparateAudioAcquisitionPrimitives = {
+      ...impl,
+      acquireVideo: async (request) => {
+        await new Promise((r) => setTimeout(r, 120));
+        return slowVideo(request);
+      },
+    };
+    await acquireSelectedSeparateHlsMedia(
+      { plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: 1_000 },
+      timed,
+    );
+    const video = calls.find((c) => c.step === "acquire-video")!.timeoutMs!;
+    const audio = calls.find((c) => c.step === "acquire-audio")!.timeoutMs!;
+    assert.ok(video <= 1_000 && video > 900, `video ${video}`);
+    assert.ok(audio <= video - 100, `audio ${audio} must be what is left of ${video}`);
+  });
+
+  it("refuses with TIMEOUT when nothing is left for the audio half", async () => {
+    const { impl, calls } = primitives({});
+    const slowVideo = impl.acquireVideo;
+    const timed: ClearHlsSeparateAudioAcquisitionPrimitives = {
+      ...impl,
+      acquireVideo: async (request) => {
+        await new Promise((r) => setTimeout(r, 80));
+        return slowVideo(request);
+      },
+    };
+    assert.equal(
+      await codeOf(
+        acquireSelectedSeparateHlsMedia(
+          { plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: 50 },
+          timed,
+        ),
+      ),
+      "TIMEOUT",
+    );
+    assert.equal(calls.some((c) => c.step === "acquire-audio"), false);
+  });
+
+  // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: the deadline is the order's, armed
+  // after both preflights, with no default and no legacy-module ceiling.
+
+  it("arms the order's limit, uncapped by the legacy module budget", async () => {
     const saved = config.downloadTimeoutMs;
-    Object.assign(config, { downloadTimeoutMs: 1_000 });
+    // Under the pre-LD-1 cap, a 1 ms module budget would have ended this at once.
+    Object.assign(config, { downloadTimeoutMs: 1 });
     try {
       const { impl, calls } = primitives({});
       const slowVideo = impl.acquireVideo;
       const timed: ClearHlsSeparateAudioAcquisitionPrimitives = {
         ...impl,
         acquireVideo: async (request) => {
-          await new Promise((r) => setTimeout(r, 120));
+          await new Promise((r) => setTimeout(r, 60));
           return slowVideo(request);
         },
       };
-      await acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal }, timed);
+      const result = await acquireSelectedSeparateHlsMedia(
+        { plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: 5_000 },
+        timed,
+      );
+      assert.equal(result.totalFileSize, 1100);
       const video = calls.find((c) => c.step === "acquire-video")!.timeoutMs!;
       const audio = calls.find((c) => c.step === "acquire-audio")!.timeoutMs!;
-      assert.ok(video <= 1_000 && video > 900, `video ${video}`);
-      assert.ok(audio <= video - 100, `audio ${audio} must be what is left of ${video}`);
+      assert.ok(video <= 5_000 && video > 4_900, `video ${video}: the order's limit, not a 1 ms legacy cap`);
+      // A timer can measure a hair under its delay on the monotonic clock, so
+      // the margin is 50 of the 60 ms the video half took.
+      assert.ok(audio <= video - 50, `audio ${audio} is what is left of ${video}, never a fresh 5000`);
     } finally {
       Object.assign(config, { downloadTimeoutMs: saved });
     }
   });
 
-  it("refuses with TIMEOUT when nothing is left for the audio half", async () => {
-    const saved = config.downloadTimeoutMs;
-    Object.assign(config, { downloadTimeoutMs: 50 });
-    try {
+  it("refuses a missing or malformed limit before either preflight (no default, fail closed)", async () => {
+    for (const bad of [undefined, null, 0, -1, 1.5, Number.NaN, "600000"]) {
       const { impl, calls } = primitives({});
-      const slowVideo = impl.acquireVideo;
-      const timed: ClearHlsSeparateAudioAcquisitionPrimitives = {
-        ...impl,
-        acquireVideo: async (request) => {
-          await new Promise((r) => setTimeout(r, 80));
-          return slowVideo(request);
-        },
-      };
-      assert.equal(await codeOf(acquireSelectedSeparateHlsMedia({ plan: PLAN, workDir, signal: new AbortController().signal }, timed)), "TIMEOUT");
-      assert.equal(calls.some((c) => c.step === "acquire-audio"), false);
-    } finally {
-      Object.assign(config, { downloadTimeoutMs: saved });
+      const order = { plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: bad };
+      assert.equal(
+        await codeOf(acquireSelectedSeparateHlsMedia(order as unknown as Parameters<typeof acquireSelectedSeparateHlsMedia>[0], impl)),
+        "PROCESSING_FAILED",
+        String(bad),
+      );
+      assert.deepEqual(calls, [], `${String(bad)}: no preflight, no acquisition`);
     }
   });
 });
@@ -266,7 +314,7 @@ describe("separate-audio acquisition: one monotonic progress stream", () => {
     });
     const seen: ClearHlsAcquisitionProgress[] = [];
     await acquireSelectedSeparateHlsMedia(
-      { plan: PLAN, workDir, signal: new AbortController().signal, onProgress: (p) => seen.push(p) },
+      { plan: PLAN, workDir, signal: new AbortController().signal, downloadTimeLimitMs: DOWNLOAD_LIMIT_MS, onProgress: (p) => seen.push(p) },
       impl,
     );
     assert.deepEqual(seen.map((p) => p.progress), [0, 24, 50, 75, 75, 99, 100]);
@@ -287,6 +335,7 @@ describe("separate-audio acquisition: one monotonic progress stream", () => {
         plan: PLAN,
         workDir,
         signal: new AbortController().signal,
+        downloadTimeLimitMs: DOWNLOAD_LIMIT_MS,
         onProgress: () => {
           throw new Error("reporter defect");
         },

@@ -31,6 +31,8 @@ const FRAGMENTS = [`${BASE}seg-0.m4s`, `${BASE}seg-1.m4s`];
 const INIT_BYTES = Buffer.alloc(30, 0x49);
 const FRAGMENT_BYTES = [Buffer.alloc(40, 0x41), Buffer.alloc(50, 0x42)];
 const TOTAL = INIT_BYTES.length + FRAGMENT_BYTES[0]!.length + FRAGMENT_BYTES[1]!.length;
+/** Every acquisition carries its own budget (VIDEOFETCH-LD1); generous, and never reached here. */
+const BUDGET_MS = 30_000;
 
 let workDir = "";
 let requests: string[] = [];
@@ -80,7 +82,7 @@ async function refusal(run: Promise<unknown>): Promise<ClearHlsAcquisitionError>
 
 describe("separate-audio halves: their own fixed artifact names", () => {
   it("acquires the video half, map first, into hls-video.fmp4", async () => {
-    const result = await acquireClearHlsSeparateVideoFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal });
+    const result = await acquireClearHlsSeparateVideoFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal, timeoutMs: BUDGET_MS });
     assert.equal(result.filePath, join(workDir, SEPARATE_VIDEO_FMP4_FILE_NAME));
     assert.equal(result.segmentType, "fmp4");
     assert.equal(result.fileSize, TOTAL);
@@ -90,8 +92,8 @@ describe("separate-audio halves: their own fixed artifact names", () => {
   });
 
   it("acquires the audio half into hls-audio.fmp4, beside an existing video half", async () => {
-    await acquireClearHlsSeparateVideoFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal });
-    const audio = await acquireClearHlsSeparateAudioFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal });
+    await acquireClearHlsSeparateVideoFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal, timeoutMs: BUDGET_MS });
+    const audio = await acquireClearHlsSeparateAudioFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal, timeoutMs: BUDGET_MS });
     assert.equal(audio.filePath, join(workDir, SEPARATE_AUDIO_FMP4_FILE_NAME));
     assert.deepEqual(readdirSync(workDir).sort(), [SEPARATE_AUDIO_FMP4_FILE_NAME, SEPARATE_VIDEO_FMP4_FILE_NAME]);
   });
@@ -107,7 +109,7 @@ describe("separate-audio halves: their own fixed artifact names", () => {
       fragmentCount: 1,
     });
     for (const acquire of [acquireClearHlsSeparateVideoFmp4, acquireClearHlsSeparateAudioFmp4]) {
-      const err = await refusal(acquire({ plan: ts as unknown as ClearHlsFmp4AcquisitionPlan, workDir, signal: new AbortController().signal }));
+      const err = await refusal(acquire({ plan: ts as unknown as ClearHlsFmp4AcquisitionPlan, workDir, signal: new AbortController().signal, timeoutMs: BUDGET_MS }));
       assert.equal(err.reason, "invalid_plan");
     }
     assert.equal(requests.length, 0);
@@ -115,9 +117,9 @@ describe("separate-audio halves: their own fixed artifact names", () => {
   });
 
   it("never overwrites an existing half", async () => {
-    await acquireClearHlsSeparateVideoFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal });
+    await acquireClearHlsSeparateVideoFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal, timeoutMs: BUDGET_MS });
     requests = [];
-    const err = await refusal(acquireClearHlsSeparateVideoFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal }));
+    const err = await refusal(acquireClearHlsSeparateVideoFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal, timeoutMs: BUDGET_MS }));
     assert.equal(err.reason, "output_error");
     assert.equal(requests.length, 0);
   });
@@ -129,6 +131,7 @@ describe("the aggregate allowance: it can only narrow", () => {
       plan: fmp4Plan(),
       workDir,
       signal: new AbortController().signal,
+      timeoutMs: BUDGET_MS,
       maxAggregateBytes: TOTAL,
     });
     assert.equal(result.fileSize, TOTAL);
@@ -140,6 +143,7 @@ describe("the aggregate allowance: it can only narrow", () => {
         plan: fmp4Plan(),
         workDir,
         signal: new AbortController().signal,
+        timeoutMs: BUDGET_MS,
         maxAggregateBytes: TOTAL - 1,
       }),
     );
@@ -153,6 +157,7 @@ describe("the aggregate allowance: it can only narrow", () => {
         plan: fmp4Plan(),
         workDir,
         signal: new AbortController().signal,
+        timeoutMs: BUDGET_MS,
         maxAggregateBytes: INIT_BYTES.length - 1,
       }),
     );
@@ -170,6 +175,7 @@ describe("the aggregate allowance: it can only narrow", () => {
           plan: fmp4Plan(),
           workDir,
           signal: new AbortController().signal,
+          timeoutMs: BUDGET_MS,
           maxAggregateBytes: Number.MAX_SAFE_INTEGER,
         }),
       );
@@ -182,7 +188,7 @@ describe("the aggregate allowance: it can only narrow", () => {
   it("refuses a malformed allowance before any I/O", async () => {
     for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "10" as unknown as number]) {
       const err = await refusal(
-        acquireClearHlsSeparateAudioFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal, maxAggregateBytes: bad }),
+        acquireClearHlsSeparateAudioFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal, timeoutMs: BUDGET_MS, maxAggregateBytes: bad }),
       );
       assert.equal(err.reason, "invalid_plan", String(bad));
     }
@@ -191,7 +197,7 @@ describe("the aggregate allowance: it can only narrow", () => {
   });
 
   it("leaves the muxed fMP4 path exactly as it was when no allowance is passed", async () => {
-    const muxed = await acquireClearHlsFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal });
+    const muxed = await acquireClearHlsFmp4({ plan: fmp4Plan(), workDir, signal: new AbortController().signal, timeoutMs: BUDGET_MS });
     assert.equal(muxed.filePath, join(workDir, FMP4_AGGREGATE_FILE_NAME));
     assert.equal(muxed.fileSize, TOTAL);
     assert.equal(existsSync(join(workDir, SEPARATE_VIDEO_FMP4_FILE_NAME)), false);
