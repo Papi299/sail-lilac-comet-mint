@@ -479,6 +479,35 @@ describe("generic download: pre-flight ordering (§25/§26)", () => {
     assert.equal(calls.length, 0, "an unverified runtime must acquire nothing");
   });
 
+  it("refuses a missing or malformed acquisition limit before validation, the probe or any subprocess (VIDEOFETCH-LD1)", async () => {
+    // The limit is injected by the executor and never defaulted here.
+    for (const bad of [undefined, null, 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "60000"]) {
+      const { runner, calls } = forbiddenRunner();
+      let validated = 0;
+      let probed = 0;
+      await assert.rejects(
+        () =>
+          downloadGenericOriginal(SAFE_URL, workDir, videoPlan(), {
+            ...baseDeps({ runner }),
+            limits: { maxFileSizeBytes: MAX_BYTES, downloadTimeLimitMs: bad } as never,
+            validateUrl: async (raw: string) => {
+              validated += 1;
+              return { url: raw, hostname: "example.invalid" };
+            },
+            probeRuntime: async () => {
+              probed += 1;
+              return OK_RUNTIME;
+            },
+          }),
+        (err: unknown) => err instanceof AppError && err.code === "PROCESSING_FAILED",
+        String(bad),
+      );
+      assert.equal(validated, 0, String(bad));
+      assert.equal(probed, 0, String(bad));
+      assert.equal(calls.length, 0, String(bad));
+    }
+  });
+
   it("shares ONE deadline between the probe and the acquisition", async () => {
     let now = 1_000_000;
     const clock = () => now;

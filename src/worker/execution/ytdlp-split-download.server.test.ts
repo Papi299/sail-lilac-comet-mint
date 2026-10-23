@@ -585,6 +585,27 @@ describe("split download: pre-flight ordering (§9/§10/§57)", () => {
       assert.equal(probe.seen.length, 0);
     }
   });
+
+  it("refuses a missing or malformed acquisition limit before anything runs (VIDEOFETCH-LD1)", async () => {
+    for (const bad of [undefined, null, 0, -1, 1.5, Number.NaN, "60000"]) {
+      const { runner, calls } = forbiddenRunner();
+      const probe = countingProbe();
+      await rejectsWith("PROCESSING_FAILED", () =>
+        downloadGenericSplitSources(
+          SAFE_URL,
+          workDir,
+          mp4Plan(),
+          baseDeps({
+            runner,
+            limits: { maxFileSizeBytes: MAX, downloadTimeLimitMs: bad } as never,
+            probeRuntime: probe.probeRuntime,
+          }),
+        ),
+      );
+      assert.equal(calls.length, 0, String(bad));
+      assert.equal(probe.seen.length, 0, String(bad));
+    }
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
