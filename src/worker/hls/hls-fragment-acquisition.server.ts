@@ -262,10 +262,17 @@ export type ClearHlsAcquisitionProgress = {
  *
  * `workDir` is the server-owned per-job directory; it must already exist and
  * must be absolute. `signal` is REQUIRED so no caller can start an
- * uncancellable acquisition. `timeoutMs` may only NARROW the download budget.
+ * uncancellable acquisition.
+ *
+ * `timeoutMs` is REQUIRED too (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001): it is this
+ * acquisition's ONE total budget, and it is the caller's — the Worker's
+ * `DOWNLOAD_TIME_LIMIT` handed down by the executor, or for one half of a
+ * separate-audio pair what is left of the pair's shared deadline. This module no
+ * longer caps it with the legacy module budget, which would be a second owner of
+ * the same limit. A request without one is malformed and refused before any I/O.
  *
  * `maxAggregateBytes` (HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001) may only
- * NARROW the aggregate limit, exactly as `timeoutMs` narrows the budget: the
+ * NARROW the aggregate limit: the
  * effective limit is the smaller of it and `hlsV1EffectiveAggregateLimitBytes()`.
  * It is how a separate-audio pair keeps ONE combined byte counter — the audio
  * half is handed the Product limit minus the video half's actual bytes — so
@@ -280,7 +287,7 @@ export type ClearHlsAcquisitionRequest<P extends ClearHlsAcquisitionPlan = Clear
   readonly plan: P;
   readonly workDir: string;
   readonly signal: AbortSignal;
-  readonly timeoutMs?: number;
+  readonly timeoutMs: number;
   readonly maxAggregateBytes?: number;
   readonly onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
 };
@@ -295,8 +302,9 @@ export type ClearHlsAcquisitionRequest<P extends ClearHlsAcquisitionPlan = Clear
  * → extraction semantics, aggregate overflow → TOO_LARGE, timeout → TIMEOUT,
  * local output failure → the existing processing/infrastructure semantics).
  *
- *   invalid_plan           the supplied plan failed its structural gate; no
- *                          network or filesystem work ran
+ *   invalid_plan           the supplied plan, or a request bound (the byte
+ *                          allowance, or the required budget), failed its
+ *                          structural gate; no network or filesystem work ran
  *   destination_rejected   safe-HTTP refused a hop at request time (a private
  *                          DNS answer, or an unsafe redirect target)
  *   network_error          transport failure, including a redirect chain
@@ -785,14 +793,13 @@ type StopCause = "cancelled" | "timeout";
  * redirect hop, response body and the finalization share it, and no fragment
  * gets a fresh one.
  *
- * It defaults to, and is capped at, the existing download budget. A budget that
- * is not a positive number is a deadline that has already passed, so nothing
- * starts.
+ * It is the caller's, uncapped here (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001): the
+ * Worker's strict configuration is the only owner of acquisition time. A budget
+ * that is not a positive number is a deadline that has already passed, so
+ * nothing starts.
  */
-function acquisitionBudgetMs(requested: number | undefined): number | null {
-  const ceiling = config.downloadTimeoutMs;
-  const budget = requested === undefined ? ceiling : Math.min(requested, ceiling);
-  return Number.isFinite(budget) && budget > 0 ? budget : null;
+function acquisitionBudgetMs(requested: number): number | null {
+  return Number.isFinite(requested) && requested > 0 ? requested : null;
 }
 
 /**
@@ -1020,6 +1027,9 @@ async function acquireAggregate<S extends ClearHlsSegmentType>(
   // Fixed once, before any I/O: the allowance can only narrow the Product limit.
   const aggregateLimit = acquisitionAggregateLimit(maxAggregateBytes);
   if (aggregateLimit === null) throw new ClearHlsAcquisitionError("invalid_plan");
+  // The budget is the caller's and has no default: a request that carries none
+  // is malformed exactly as a malformed allowance is — never a silent fallback.
+  if (typeof timeoutMs !== "number") throw new ClearHlsAcquisitionError("invalid_plan");
 
   const paths = acquisitionPaths(workDir, family);
   if (paths === null) throw new ClearHlsAcquisitionError("output_error");

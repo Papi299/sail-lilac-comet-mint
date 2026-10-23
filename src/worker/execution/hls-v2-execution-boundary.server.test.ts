@@ -188,12 +188,15 @@ function productionHlsDeps(): JobExecutorDeps {
   };
 }
 
-async function runJob(executorRef?: { executor?: JobExecutor }) {
+async function runJob(executorRef?: { executor?: JobExecutor }, extraDeps: JobExecutorDeps = {}) {
   world.store.createJob({ url: PAGE_URL, formatId: "preset:1080", principalId: "private-access-user" }, randomUUID());
   const job = world.store.claimNextQueuedJob();
   assert.ok(job);
   world.jobId = job.jobId;
-  const executor = new JobExecutor(world.store, world.writer, () => Date.now(), new Map(), productionHlsDeps());
+  const executor = new JobExecutor(world.store, world.writer, () => Date.now(), new Map(), {
+    ...productionHlsDeps(),
+    ...extraDeps,
+  });
   if (executorRef) executorRef.executor = executor;
   await executor.execute(job);
   const final = world.store.getJob(job.jobId);
@@ -379,8 +382,8 @@ describe("HLS v2 boundary: an fMP4 job through the production composition", () =
 });
 
 describe("HLS v2 boundary: every fMP4 failure fails closed before any media tool", () => {
-  const failsClosed = async (expectedCode: string) => {
-    const { final, workDirGone } = await runJob();
+  const failsClosed = async (expectedCode: string, extraDeps: JobExecutorDeps = {}) => {
+    const { final, workDirGone } = await runJob(undefined, extraDeps);
     assert.equal(final?.status, "failed", `status ${final?.status}`);
     assert.equal(final?.errorCode, expectedCode);
     assert.equal(world.puts.length, 0, "no upload");
@@ -490,20 +493,34 @@ describe("HLS v2 boundary: every fMP4 failure fails closed before any media tool
   });
 
   it("times out on the one acquisition deadline while the map never answers", async () => {
+    // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: the deadline is narrowed through the
+    // executor's injected model, which the production composition hands to the
+    // HLS seam — not through the legacy module configuration.
+    const requests = network({
+      ...fmp4Routes(),
+      [INIT_URL]: (args) =>
+        new Promise<Served>((_, reject) => {
+          args.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        }),
+    });
+    const spawned = processes();
+    await failsClosed("TIMEOUT", { timeLimits: { downloadTimeLimitMs: 60, processingMs: 600_000 } });
+    assert.deepEqual(requests.map((r) => r.url), [PLAYLIST_URL, INIT_URL]);
+    assert.equal(spawned.length, 0);
+  });
+
+  it("is no longer bounded by the legacy module budget (VIDEOFETCH-LD1)", async () => {
+    // A zero legacy budget used to refuse the acquisition before its first
+    // request. The production composition now hands the HLS seam the
+    // executor's own limit, so the job completes.
     const saved = config.downloadTimeoutMs;
-    Object.assign(config, { downloadTimeoutMs: 60 });
+    Object.assign(config, { downloadTimeoutMs: 0 });
     try {
-      const requests = network({
-        ...fmp4Routes(),
-        [INIT_URL]: (args) =>
-          new Promise<Served>((_, reject) => {
-            args.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-          }),
-      });
-      const spawned = processes();
-      await failsClosed("TIMEOUT");
-      assert.deepEqual(requests.map((r) => r.url), [PLAYLIST_URL, INIT_URL]);
-      assert.equal(spawned.length, 0);
+      const requests = network(fmp4Routes());
+      processes();
+      const { final } = await runJob();
+      assert.equal(final?.status, "ready", `final ${final?.status} ${final?.errorCode ?? ""}`);
+      assert.deepEqual(requests.map((r) => r.url), [PLAYLIST_URL, INIT_URL, ...FRAGMENTS]);
     } finally {
       Object.assign(config, { downloadTimeoutMs: saved });
     }

@@ -1064,6 +1064,9 @@ block restarts. Nothing is wiped before identity and hardening pass.
 - Direct acquisition now has the same absolute deadline generic acquisition already
   had: `DOWNLOAD_TIMEOUT`, 600 s for the whole transfer, never extended by
   progress. A 4 GiB acquisition therefore needs about 57 Mbit/s sustained.
+  (`VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001` renames this limit
+  `DOWNLOAD_TIME_LIMIT`, same 600 s default, and retires `DOWNLOAD_TIMEOUT`;
+  see §7a for its deployment state.)
 - `FILE_EXPIRATION_MINUTES` (45) and `DOWNLOAD_TIMEOUT` are unchanged.
 - The upload is still one R2 `PutObject`. 4 GiB is below the provider's
   single-part maximum (5 GiB, documented as 4.995 GiB), so no multipart upload,
@@ -6165,6 +6168,83 @@ restart message never appeared. See §11f.
 
 Configure the platform's termination grace period to at least the Worker's
 shutdown grace so a clean SIGTERM is not truncated by an immediate SIGKILL.
+
+### 7a. Stage time limits (`VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001`) — source change, NOT DEPLOYED
+
+**Status.** A source change for review. No image has been built for Production
+and nothing is deployed: the Production Worker still runs its earlier image,
+which reads `DOWNLOAD_TIMEOUT` (default 600 s) and ignores the names below.
+This is the first phase (LD-1) of the bounded long-download design; it does
+**not** enable long downloads.
+
+The strict loader is now the one owner of the Worker's acquisition and
+processing limits. It builds them once into `WorkerTimeLimits`
+(`src/worker/runtime/time-limits.ts`), and the runtime hands that model to every
+acquisition path (direct, generic yt-dlp single and split, clear HLS,
+separate-audio HLS) and every processing stage. No Worker execution path reads
+the legacy module value `config.downloadTimeoutMs` any more
+(`worker-time-limits-boundary.test.ts`).
+
+| Variable | Unit, range | Default | Meaning |
+| :--- | :--- | ---: | :--- |
+| `DOWNLOAD_TIME_LIMIT` | seconds, 60–21,600 | 600 | ONE absolute deadline for a job's whole acquisition, armed after analysis and the URL check. The yt-dlp runtime probe, both halves of a split or separate-audio pair, every fragment and every retry share it. Progress never extends it. |
+| `PROCESSING_TIMEOUT` | seconds, 60–14,400 | 600 | ONE absolute deadline per processing stage, shared by every FFmpeg and ffprobe subprocess of that stage — never a fresh budget per subprocess. |
+| `DOWNLOAD_TIMEOUT` | — | — | **RETIRED.** Startup-fatal if present at *any* value, empty and whitespace included. It is not an alias of either variable above. |
+| `ANALYSIS_TIMEOUT`, `MAX_FILE_SIZE`, `FILE_EXPIRATION_MINUTES` | — | 45 s / 4 GiB / 45 | Unchanged. |
+
+Both new variables use the loader's existing grammar: unset, empty or
+whitespace-only means the default; anything else must be a decimal integer
+(`^[0-9]{1,17}$`) inside the range, or the Worker refuses to start, naming only
+the variable (`startup blocked: invalid configuration for <NAME>`).
+
+**Behaviour changes at the defaults — exactly three, all deliberate:**
+
+1. A `DOWNLOAD_TIMEOUT` still present in the Worker environment, even empty,
+   blocks startup: `startup blocked: invalid configuration for DOWNLOAD_TIMEOUT`.
+2. Split-media merge processing (`mergeSplitMedia`) shares ONE 600 s budget
+   across its two input probes, FFmpeg and its output probe. Before, each of the
+   four could receive the full value, so the stage could take up to 4 × 600 s.
+   Clear-HLS and separate-audio processing already shared one budget.
+3. In the legacy module loader (`src/lib/config.ts`) a whitespace-only numeric
+   value now means the default instead of `0`, so it agrees with the strict
+   loader for every value the strict loader accepts.
+
+**Unchanged:** the 600 s acquisition default (the long-download value,
+9,000 s, is a later phase, LD-5b); no inactivity watchdog (LD-3); job expiry,
+still creation + `FILE_EXPIRATION_MINUTES` (LD-2a); the R2 upload, still
+unbounded (LD-2b); yt-dlp arguments, retries and socket timeout; the direct and
+HLS socket-idle timeouts (equal to the acquisition limit, as before);
+concurrency; size and workspace limits; safe egress; R2 credentials; the
+Worker/control-plane contract; the SQLite schema (v1).
+
+#### Pre-deployment check — MANDATORY before an image with this change starts
+
+A new image refuses to start while `DOWNLOAD_TIMEOUT` is in its environment.
+The image sets no such `ENV`, and the unit passes only
+`R2_BROKER_SOCKET_PATH` beside `--env-file /etc/videofetch/worker.env`, so that
+file is the one place to check. Read-only, names first, values only for the
+non-secret keys named here — never print the file:
+
+```
+# 1. The retired key: must print 0 (a bare "DOWNLOAD_TIMEOUT" line counts too).
+sudo grep -c -E '^[[:space:]]*DOWNLOAD_TIMEOUT([[:space:]]*=|[[:space:]]*$)' /etc/videofetch/worker.env
+
+# 2. Stage-time and retention keys: prints only these non-secret lines.
+sudo grep -E '^[[:space:]]*(DOWNLOAD_TIME_LIMIT|PROCESSING_TIMEOUT|DOWNLOAD_INACTIVITY_TIMEOUT|UPLOAD_TIMEOUT|FILE_EXPIRATION_MINUTES)[[:space:]]*=' /etc/videofetch/worker.env
+```
+
+| Finding | Action |
+| :--- | :--- |
+| check 1 prints anything but `0` | **BLOCK the promotion.** Remove the key through a separately authorised `worker.env` change, never as part of the image promotion and never by automation, then repeat the check. The Worker is never changed to accept it. |
+| `DOWNLOAD_TIME_LIMIT` above 600, or `PROCESSING_TIMEOUT` set at all | **STOP** for a decision: LD-1 is meant to run at the defaults. A longer acquisition limit belongs to the later phases. |
+| `DOWNLOAD_INACTIVITY_TIMEOUT` or `UPLOAD_TIMEOUT` present | **STOP**: future-phase overrides that this image ignores; remove them before they meet the phase that reads them. |
+| `FILE_EXPIRATION_MINUTES` above 55 | Not a blocker for LD-1. **Flag it for LD-2a**, whose loader caps the value at 55. |
+
+**Rollback.** Retag the previous image. An earlier image's strict loader does
+not read `DOWNLOAD_TIME_LIMIT` or `PROCESSING_TIMEOUT`, so a rollback can never
+apply a longer limit to the old coupled code: with `DOWNLOAD_TIMEOUT` absent it
+runs at its own 600 s default. No schema or contract change is involved, so an
+old control plane and a new Worker are compatible in either order.
 
 ---
 

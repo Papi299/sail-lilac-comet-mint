@@ -5,7 +5,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { config } from "@/lib/config";
 import { AppError, ERROR_MESSAGES } from "@/lib/errors";
 import { applyMigrations } from "@/worker/state/migrations.server.ts";
 import { SQLiteJobStore } from "@/worker/state/sqlite-job-store.server.ts";
@@ -22,9 +21,11 @@ import {
   availableBytesOnWorkDirFilesystem,
   type DownloadGenericOriginalFn,
   type DownloadGenericSplitFn,
+  type GenericByteLimits,
   type JobExecutorDeps,
   type MergeSplitMediaFn,
 } from "./job-executor.server.ts";
+import type { WorkerTimeLimits } from "../runtime/time-limits.ts";
 import type { ExecutionAnalysis } from "../analysis/media-analyzer.server.ts";
 import { GenericPresetSourceSchema, type GenericPresetSource } from "./generic-source.ts";
 import {
@@ -58,7 +59,14 @@ const SPLIT_URL = "https://example.invalid/watch/split";
 
 /** A deliberately tiny ceiling, so every byte bound is exercised exactly. */
 const MAX = 1000;
-const LIMITS: GenericDownloadLimits = { maxFileSizeBytes: MAX, downloadTimeoutSeconds: 600 };
+/**
+ * VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: the executor's stage limits, deliberately
+ * DIFFERENT from each other and from the defaults, so a seam handed the wrong
+ * one — or a missed injection — is caught.
+ */
+const TIME_LIMITS: WorkerTimeLimits = Object.freeze({ downloadTimeLimitMs: 1_234_000, processingMs: 450_000 });
+/** What the split downloader is handed: the byte ceiling plus the acquisition limit. */
+const LIMITS: GenericDownloadLimits = { maxFileSizeBytes: MAX, downloadTimeLimitMs: TIME_LIMITS.downloadTimeLimitMs };
 /** Exactly the split preflight's requirement: 2 × MAX. */
 const ENOUGH = 2 * MAX;
 
@@ -342,7 +350,8 @@ function executorFor(
   controllers: Map<string, AbortController> = new Map(),
 ): JobExecutor {
   return new JobExecutor(h.store, h.writer, () => Date.now(), controllers, {
-    genericLimits: LIMITS,
+    genericLimits: { maxFileSizeBytes: MAX },
+    timeLimits: TIME_LIMITS,
     ...deps,
   });
 }
@@ -578,7 +587,7 @@ describe("SPLIT-04: seam arguments are bound exactly (§8/§18)", () => {
       assert.equal(opts.workDir, workDir);
       assert.equal(opts.target, target, "the plan's table-derived target, never substituted");
       assert.equal(opts.maxOutputBytes, LIMITS.maxFileSizeBytes, "ONE normal ceiling, not 2x");
-      assert.equal(opts.timeoutMs, config.downloadTimeoutMs, "the one-input processing timeout policy");
+      assert.equal(opts.timeoutMs, TIME_LIMITS.processingMs, "the processing stage budget, never the acquisition limit");
       assert.ok(opts.signal instanceof AbortSignal);
       assert.equal(opts.signal, registeredSignal, "the job's own registered AbortSignal");
       assert.equal(opts.signal, rec.downloads[0]!.ctx.signal, "the same signal acquisition had");
@@ -797,7 +806,7 @@ describe("SPLIT-04: split temp-capacity preflight (§13-§15/§50)", () => {
     for (const maxFileSizeBytes of [Number.MAX_SAFE_INTEGER, 0, -1, 1.5]) {
       const job = claimJob(h.store, "preset:1080");
       const { deps, rec } = splitDeps(h, job.jobId, "mp4", {
-        genericLimits: { maxFileSizeBytes, downloadTimeoutSeconds: 600 },
+        genericLimits: { maxFileSizeBytes },
       });
       await executorFor(h, deps).execute(job);
       assert.equal(rec.capacity.length, 0, `${maxFileSizeBytes}: nothing to compare against`);
@@ -824,7 +833,7 @@ describe("SPLIT-04: split temp-capacity preflight (§13-§15/§50)", () => {
     const job = claimJob(h.store, "preset:1080");
     const { deps, rec } = splitDeps(h, job.jobId, "mp4", {
       // 2 x 2^51 bytes = 4 PiB: a safe integer, and more than any test host has.
-      genericLimits: { maxFileSizeBytes: 2 ** 51, downloadTimeoutSeconds: 600 },
+      genericLimits: { maxFileSizeBytes: 2 ** 51 },
     });
     delete deps.availableWorkDirBytes;
     await executorFor(h, deps).execute(job);
@@ -1047,7 +1056,7 @@ describe("SPLIT-04: malformed or mismatched acquisition results fail closed (§1
 describe("MAX-FILE-SIZE-4GIB: plan-aware media-workspace preflight at the 4 GiB ceiling", () => {
   const FOUR_GIB = 4_294_967_296;
   const EIGHT_GIB = 8_589_934_592;
-  const GIB4_LIMITS: GenericDownloadLimits = { maxFileSizeBytes: FOUR_GIB, downloadTimeoutSeconds: 600 };
+  const GIB4_LIMITS: GenericByteLimits = { maxFileSizeBytes: FOUR_GIB };
 
   /** A direct source advertising ONE preset the direct planner must process. */
   function directPresetAnalysis(preset: {

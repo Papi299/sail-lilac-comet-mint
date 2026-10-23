@@ -626,8 +626,13 @@ export type GenericDownloadLimits = {
    * video bytes plus audio bytes together — never a separate allowance per half.
    */
   readonly maxFileSizeBytes: number;
-  /** ONE subprocess budget for the whole call, the runtime probe included. */
-  readonly downloadTimeoutSeconds: number;
+  /**
+   * ONE subprocess budget for the whole call, the runtime probe included, in
+   * milliseconds. The Worker's `WorkerTimeLimits.downloadTimeLimitMs`
+   * (`DOWNLOAD_TIME_LIMIT`), handed down by the executor; for a split pair it
+   * bounds the probe and both halves together.
+   */
+  readonly downloadTimeLimitMs: number;
 };
 
 export type GenericDownloadProgress = {
@@ -780,6 +785,11 @@ export async function downloadGenericOriginal(
   if (!isAbsolute(workDir)) throw new AppError("PROCESSING_FAILED");
   const maxBytes = deps.limits.maxFileSizeBytes;
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new AppError("PROCESSING_FAILED");
+  }
+  // The acquisition time limit is injected, never defaulted here: a missing or
+  // malformed one is a composition fault, refused before any work.
+  if (!hasAcquisitionTimeLimit(deps.limits)) {
     throw new AppError("PROCESSING_FAILED");
   }
 
@@ -938,14 +948,17 @@ export async function downloadGenericOriginal(
  * The ONE subprocess budget of an acquisition call, floored like analysis.
  *
  * Shared, so a split pair is bounded by exactly the configured limit a single
- * source is — the same `downloadTimeoutSeconds`, the same floor — and never by
- * a budget of its own.
+ * source is — the same `downloadTimeLimitMs`, the same floor — and never by a
+ * budget of its own.
  */
 function acquisitionBudgetMs(limits: GenericDownloadLimits): number {
-  return Math.max(
-    YTDLP_DOWNLOAD_MIN_TIMEOUT_MS,
-    Math.floor(limits.downloadTimeoutSeconds * 1000),
-  );
+  return Math.max(YTDLP_DOWNLOAD_MIN_TIMEOUT_MS, Math.floor(limits.downloadTimeLimitMs));
+}
+
+/** True when the injected acquisition limit is a positive safe integer of milliseconds. */
+function hasAcquisitionTimeLimit(limits: GenericDownloadLimits): boolean {
+  const ms: unknown = (limits as { downloadTimeLimitMs?: unknown }).downloadTimeLimitMs;
+  return typeof ms === "number" && Number.isSafeInteger(ms) && ms > 0;
 }
 
 // ── Segmented acquisition grammar (GENERIC-SEGMENTED-DASH-EXECUTION-001) ─────
@@ -1539,6 +1552,11 @@ export async function downloadGenericSplitSources(
   if (!isAbsolute(workDir)) throw new AppError("PROCESSING_FAILED");
   const maxBytes = deps.limits.maxFileSizeBytes;
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new AppError("PROCESSING_FAILED");
+  }
+  // The acquisition time limit is injected, never defaulted here: a missing or
+  // malformed one is a composition fault, refused before any work.
+  if (!hasAcquisitionTimeLimit(deps.limits)) {
     throw new AppError("PROCESSING_FAILED");
   }
 

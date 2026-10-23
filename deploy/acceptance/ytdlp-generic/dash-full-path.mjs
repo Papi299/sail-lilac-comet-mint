@@ -62,6 +62,7 @@ import { deriveGenericExecutionPlan } from "../../../src/worker/execution/format
 import { GenericSplitSourceSelectionSchema } from "../../../src/worker/execution/generic-source.ts";
 import { downloadGenericSplitSources } from "../../../src/worker/execution/ytdlp-download.server.ts";
 import { JobExecutor } from "../../../src/worker/execution/job-executor.server.ts";
+import { DEFAULT_WORKER_TIME_LIMITS } from "../../../src/worker/runtime/time-limits.ts";
 import { openWorkerDatabase } from "../../../src/worker/state/database.server.ts";
 import { applyMigrations } from "../../../src/worker/state/migrations.server.ts";
 import { SQLiteJobStore } from "../../../src/worker/state/sqlite-job-store.server.ts";
@@ -469,6 +470,9 @@ async function runJob(ctx, { label, url, genericLimits }) {
 
   const executor = new JobExecutor(store, writer, () => Date.now(), new Map(), {
     genericLimits,
+    // The Product's stage time limits (VIDEOFETCH-LD1): the strict loader's
+    // defaults, exactly what a Worker with no override runs with.
+    timeLimits: ctx.productTimeLimits,
     // The FRESH execution analysis: Production re-analyzes its own stored URL.
     analyzeForExecution: async (u, signal) => {
       setPhase("analysis-execution");
@@ -1097,7 +1101,6 @@ async function runNegative(ctx, { name, caseName, genericLimits, behavior }) {
 
 async function runNegatives(ctx) {
   const { checks, fixtures } = ctx;
-  const timeout = ctx.productGenericLimits.downloadTimeoutSeconds;
 
   // ── fragment-aware byte guard ────────────────────────────────────────────
   // The allowance admits every byte before the LAST video segment plus half of
@@ -1112,7 +1115,7 @@ async function runNegatives(ctx) {
   const guard = await runNegative(ctx, {
     name: "fragment-guard",
     caseName: "dash-dash",
-    genericLimits: { maxFileSizeBytes: guardAllowance, downloadTimeoutSeconds: timeout },
+    genericLimits: { maxFileSizeBytes: guardAllowance },
     behavior: { hold: { route: heldRoute, tailBytes: GUARD_HOLD_TAIL_BYTES, holdMs: GUARD_HOLD_MS } },
   });
   const held = guard.requests("acquisition").filter((r) => r.held);
@@ -1140,7 +1143,7 @@ async function runNegatives(ctx) {
   const combined = await runNegative(ctx, {
     name: "combined-budget",
     caseName: "dash-dash",
-    genericLimits: { maxFileSizeBytes: combinedAllowance, downloadTimeoutSeconds: timeout },
+    genericLimits: { maxFileSizeBytes: combinedAllowance },
     behavior: {},
   });
   checks.require(
@@ -1285,10 +1288,10 @@ async function main(argv) {
         maxVideoDurationSeconds: config.maxVideoDuration,
         maxFileSizeBytes: config.maxFileSize,
       },
-      productGenericLimits: {
-        maxFileSizeBytes: config.maxFileSize,
-        downloadTimeoutSeconds: Math.max(1, Math.floor(config.downloadTimeoutMs / 1000)),
-      },
+      // The byte ceiling only: since VIDEOFETCH-LD1 the executor's time comes
+      // from `timeLimits`, never through `genericLimits`.
+      productGenericLimits: { maxFileSizeBytes: config.maxFileSize },
+      productTimeLimits: DEFAULT_WORKER_TIME_LIMITS,
     };
     for (const caseName of DASH_CASES) {
       cases[caseName] = await runPositiveCase(ctx, caseName);

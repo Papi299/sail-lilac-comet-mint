@@ -16,7 +16,7 @@ import {
 } from "@/shared/worker/contracts";
 import type { DurableWorkerJob } from "@/worker/state/job-store";
 import type { ObjectStoreWriter, ObjectStorePutInput } from "@/worker/storage/writer.ts";
-import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
+import { JobExecutor, type GenericByteLimits, type JobExecutorDeps } from "./job-executor.server.ts";
 import type { ExecutionAnalysis } from "../analysis/media-analyzer.server.ts";
 import type {
   GenericPresetSource,
@@ -1001,7 +1001,7 @@ describe("generic job: operator shutdown during acquisition", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("generic job: a pinned --max-filesize refusal (YTDLP-MAX-FILESIZE-REFUSAL-CLASSIFICATION-001)", () => {
-  const LIMITS: GenericDownloadLimits = { maxFileSizeBytes: 1000, downloadTimeoutSeconds: 60 };
+  const LIMITS: GenericByteLimits = { maxFileSizeBytes: 1000 };
 
   /** The stdout the pinned runtime produces when `--max-filesize` refuses `ceiling`. */
   const refusalStdout = (ceiling: number) =>
@@ -1281,7 +1281,7 @@ describe("generic job: a pinned --max-filesize refusal (YTDLP-MAX-FILESIZE-REFUS
 
 describe("generic job: unknown-audio progressive video (GENERIC-UNKNOWN-AUDIO-VIDEO-PRESET-IMPLEMENTATION-001)", () => {
   const MAX = 10 * 1024 * 1024;
-  const DOWNLOAD_LIMITS: GenericDownloadLimits = { maxFileSizeBytes: MAX, downloadTimeoutSeconds: 60 };
+  const DOWNLOAD_LIMITS: GenericByteLimits = { maxFileSizeBytes: MAX };
   const PINNED = { available: true, version: "2026.08.19", reason: "ok" as const };
 
   const FIXTURE = JSON.parse(

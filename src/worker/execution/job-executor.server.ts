@@ -51,6 +51,12 @@ import type { ObjectStoreWriter } from "@/worker/storage/writer";
 import type { WorkerVideoMetadata } from "@/shared/worker/contracts";
 import { WorkerErrorCodeSchema } from "@/shared/worker/errors";
 import { finalizeJobUpload } from "@/worker/storage/upload-lifecycle.server";
+import {
+  DEFAULT_WORKER_TIME_LIMITS,
+  WorkerTimeLimitsError,
+  assertWorkerTimeLimits,
+  type WorkerTimeLimits,
+} from "../runtime/time-limits.ts";
 
 /** Minimum wall-clock gap between two durable progress writes (§21). */
 export const PROGRESS_THROTTLE_MS = 250;
@@ -83,12 +89,17 @@ export type OriginalDownloadResult = {
 /**
  * §5: downloads the ORIGINAL direct artifact only. It must never convert, and
  * it never receives a formatId or a preferred container.
+ *
+ * `downloadTimeLimitMs` is the job's ONE absolute acquisition deadline
+ * (`WorkerTimeLimits.downloadTimeLimitMs`), supplied by the executor on every
+ * call: the direct downloader has no default of its own.
  */
 export type DownloadOriginalFn = (
   url: string,
   ctx: {
     workDir: string;
     signal?: AbortSignal;
+    downloadTimeLimitMs: number;
     onProgress?: (update: {
       progress: number | null;
       downloadedBytes?: number | null;
@@ -100,7 +111,11 @@ export type DownloadOriginalFn = (
   },
 ) => Promise<OriginalDownloadResult>;
 
-/** What either generic acquisition seam receives besides the URL, workDir and plan. */
+/**
+ * What either generic acquisition seam receives besides the URL, workDir and
+ * plan. `limits` carries the product byte ceiling and the job's ONE absolute
+ * acquisition deadline (`downloadTimeLimitMs`), both from the executor.
+ */
 export type GenericAcquisitionContext = {
   limits: GenericDownloadLimits;
   signal?: AbortSignal;
@@ -164,12 +179,16 @@ export type DownloadGenericSplitFn = (
  * Like every acquisition seam it performs no local media work at all: no
  * ffprobe, no FFmpeg, no container inspection. Remuxing is a separate seam,
  * reachable only after `beginProcessing()` commits.
+ *
+ * `downloadTimeLimitMs` is the job's ONE absolute acquisition deadline, from the
+ * executor; the HLS transport has no ceiling of its own.
  */
 export type AcquireClearHlsFn = (
   plan: ClearHlsExecutionPlan,
   workDir: string,
   ctx: {
     signal: AbortSignal;
+    downloadTimeLimitMs: number;
     onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
   },
 ) => Promise<ClearHlsAcquiredMedia>;
@@ -185,6 +204,10 @@ export type AcquireClearHlsFn = (
  * one takes the HLS-3 artifact by its own type and always produces MP4. Reusing
  * the generic seam would have made "HLS never reaches convertMedia" a
  * convention rather than a type.
+ *
+ * Like every processing seam below, `timeoutMs` is the processing stage's ONE
+ * budget (`WorkerTimeLimits.processingMs`, `PROCESSING_TIMEOUT`), shared by
+ * every subprocess the stage runs — never the acquisition limit.
  */
 export type ProcessClearHlsFn = (opts: {
   source: ClearHlsAcquiredMedia;
@@ -203,12 +226,16 @@ export type ProcessClearHlsFn = (opts: {
  * acquisition seams, and like the muxed HLS seam it takes no page URL: the only
  * locations it may contact are the two media playlists the fresh analysis
  * proved. No local media work of any kind.
+ *
+ * `downloadTimeLimitMs` is the job's ONE absolute acquisition deadline, shared
+ * by both halves; never a fresh budget per half.
  */
 export type AcquireSeparateHlsFn = (
   plan: ClearHlsSeparateAudioExecutionPlan,
   workDir: string,
   ctx: {
     signal: AbortSignal;
+    downloadTimeLimitMs: number;
     onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
   },
 ) => Promise<ClearHlsSeparateAudioAcquired>;
@@ -246,6 +273,7 @@ export type DerivePlanForExecutionFn = typeof deriveExecutionPlan;
 /**
  * §12: local processing is dependency-injected so acceptance tests can observe
  * the durable job status at the exact moment FFmpeg would be invoked.
+ * `timeoutMs` is the processing stage's budget (`processingMs`).
  */
 export type LocalProcessingFn = (opts: {
   inputPath: string;
@@ -259,7 +287,8 @@ export type LocalProcessingFn = (opts: {
  * SPLIT-04: the TWO-input local merge, dependency-injected for the same reason
  * as `LocalProcessingFn`. Deliberately a separate seam: a merge has no single
  * "input", and fabricating one to reuse the one-input seam would hide which
- * half is which.
+ * half is which. `timeoutMs` is the processing stage's ONE budget
+ * (`processingMs`): both input probes, the merge and the output probe share it.
  */
 export type MergeSplitMediaFn = (opts: {
   videoPath: string;
@@ -377,9 +406,26 @@ export type JobExecutorDeps = {
    * MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001). Production: `statfs` on the workDir.
    */
   availableWorkDirBytes?: AvailableWorkDirBytesFn;
-  /** Bounds handed to generic acquisition. Defaults to the process config. */
-  genericLimits?: GenericDownloadLimits;
+  /**
+   * The product byte ceiling every acquisition and processing seam is held to.
+   * Defaults to the process config's `MAX_FILE_SIZE`. It carries NO time limit:
+   * a `genericLimits` that names one is refused, because `timeLimits` is the
+   * executor's only time source.
+   */
+  genericLimits?: GenericByteLimits;
+  /**
+   * The Worker's stage time limits (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001) — the
+   * ONE source of every acquisition deadline and processing budget this
+   * executor hands out. Production: the runtime's model, built once from the
+   * strict loader. Absent, the strict loader's own defaults apply
+   * (`DEFAULT_WORKER_TIME_LIMITS`), never the legacy module configuration. A
+   * malformed model is refused at construction.
+   */
+  timeLimits?: WorkerTimeLimits;
 };
+
+/** The byte half of `GenericDownloadLimits`: the executor's time comes from `timeLimits`. */
+export type GenericByteLimits = Pick<GenericDownloadLimits, "maxFileSizeBytes">;
 
 /**
  * Wraps a direct-only analyzer as a direct `ExecutionAnalysis`.
@@ -450,7 +496,10 @@ export class JobExecutor {
   private readonly processSeparateHls: ProcessSeparateHlsFn;
   private readonly derivePlanForExecution: DerivePlanForExecutionFn;
   private readonly availableWorkDirBytes: AvailableWorkDirBytesFn;
-  private readonly genericLimits: GenericDownloadLimits;
+  private readonly genericLimits: GenericByteLimits;
+  private readonly stageTimeLimits: WorkerTimeLimits;
+  /** What both yt-dlp seams receive: the byte ceiling and the acquisition limit. */
+  private readonly genericDownloadLimits: GenericDownloadLimits;
 
   constructor(
     store: WorkerJobStore,
@@ -504,6 +553,7 @@ export class JobExecutor {
           plan,
           workDir,
           signal: ctx.signal,
+          downloadTimeLimitMs: ctx.downloadTimeLimitMs,
           ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
         }));
     this.processClearHls = deps.processClearHls ?? ((opts) => processAcquiredClearHlsMedia(opts));
@@ -517,21 +567,36 @@ export class JobExecutor {
           plan,
           workDir,
           signal: ctx.signal,
+          downloadTimeLimitMs: ctx.downloadTimeLimitMs,
           ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
         }));
     this.processSeparateHls = deps.processSeparateHls ?? ((opts) => processAcquiredSeparateHlsMedia(opts));
     // HLS-6 §24: the ordinary Product planner, and nothing else, by default.
     this.derivePlanForExecution = deps.derivePlanForExecution ?? deriveExecutionPlan;
     this.availableWorkDirBytes = deps.availableWorkDirBytes ?? availableBytesOnWorkDirFilesystem;
-    this.genericLimits = deps.genericLimits ?? {
-      maxFileSizeBytes: config.maxFileSize,
-      downloadTimeoutSeconds: Math.max(1, Math.floor(config.downloadTimeoutMs / 1000)),
-    };
+    // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: ONE owner for every stage time
+    // limit. A time limit arriving through the byte-ceiling channel would be a
+    // second, silently ignored source, so it is refused rather than dropped.
+    if (deps.genericLimits !== undefined && carriesTimeLimit(deps.genericLimits)) {
+      throw new WorkerTimeLimitsError("genericLimits");
+    }
+    this.genericLimits = deps.genericLimits ?? { maxFileSizeBytes: config.maxFileSize };
+    this.stageTimeLimits =
+      deps.timeLimits === undefined ? DEFAULT_WORKER_TIME_LIMITS : assertWorkerTimeLimits(deps.timeLimits);
+    this.genericDownloadLimits = Object.freeze({
+      maxFileSizeBytes: this.genericLimits.maxFileSizeBytes,
+      downloadTimeLimitMs: this.stageTimeLimits.downloadTimeLimitMs,
+    });
   }
 
   /** Number of executions currently holding an AbortController (§11 diagnostics). */
   public get activeJobCount(): number {
     return this.activeControllers.size;
+  }
+
+  /** The stage time limits this executor hands out (frozen). */
+  public get timeLimits(): WorkerTimeLimits {
+    return this.stageTimeLimits;
   }
 
   /**
@@ -793,10 +858,16 @@ export class JobExecutor {
     await this.assertWorkDirCapacity(workDir, plan);
     this.checkCancelled(signal);
 
+    // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: every acquisition seam below receives
+    // the SAME absolute deadline, from the one model. Each seam arms it once and
+    // keeps its own first-cause latch; nothing here arms a second timer.
+    const downloadTimeLimitMs = this.stageTimeLimits.downloadTimeLimitMs;
+
     if (plan.strategy === "direct") {
       const original = await this.downloadOriginal(url, {
         workDir,
         signal,
+        downloadTimeLimitMs,
         onProgress: this.makeProgressReporter(jobId),
       });
       return { kind: "single", plan, original: assertSingleOriginal(original) };
@@ -817,6 +888,7 @@ export class JobExecutor {
       try {
         source = await this.acquireSeparateHls(generic, workDir, {
           signal,
+          downloadTimeLimitMs,
           onProgress: (update) => {
             if (acquisitionLive) report(update);
           },
@@ -852,6 +924,7 @@ export class JobExecutor {
       try {
         source = await this.acquireClearHls(generic, workDir, {
           signal,
+          downloadTimeLimitMs,
           onProgress: (update) => {
             if (acquisitionLive) report(update);
           },
@@ -864,7 +937,7 @@ export class JobExecutor {
 
     if (generic.operation !== "merge-split") {
       const original = await this.downloadGeneric(url, workDir, generic, {
-        limits: this.genericLimits,
+        limits: this.genericDownloadLimits,
         signal,
         onProgress: this.makeProgressReporter(jobId),
       });
@@ -898,7 +971,7 @@ export class JobExecutor {
     let sources: unknown;
     try {
       sources = await this.downloadGenericSplit(url, workDir, generic, {
-        limits: this.genericLimits,
+        limits: this.genericDownloadLimits,
         signal,
         onProgress: (update) => {
           if (acquisitionLive) report(update);
@@ -964,10 +1037,11 @@ export class JobExecutor {
    *
    * Every argument is bound here and nowhere else: the video half to
    * `videoPath`, the audio half to `audioPath`, the plan's table-derived target,
-   * the same application-owned processing timeout the one-input path uses (not
-   * what is left of the acquisition deadline), and ONE normal product ceiling
-   * for the delivered artifact. No pair member is re-selected, no fallback
-   * source exists, and nothing is inferred from codecs.
+   * the processing stage's ONE budget (`processingMs`, never what is left of the
+   * acquisition deadline) — which the merge shares across its two input probes,
+   * FFmpeg and its output probe — and ONE normal product ceiling for the
+   * delivered artifact. No pair member is re-selected, no fallback source
+   * exists, and nothing is inferred from codecs.
    */
   private async executeSplitPlan(
     plan: GenericSplitExecutionPlan,
@@ -985,7 +1059,7 @@ export class JobExecutor {
       audioPath: sources.audio.filePath,
       workDir,
       target,
-      timeoutMs: config.downloadTimeoutMs,
+      timeoutMs: this.stageTimeLimits.processingMs,
       maxOutputBytes: this.genericLimits.maxFileSizeBytes,
       signal,
     });
@@ -1007,9 +1081,9 @@ export class JobExecutor {
    *
    * Every argument is bound here and nowhere else: the acquired artifact
    * verbatim (never a path rebuilt from a user value, and never re-analyzed in
-   * between), this job's server-owned workDir, the same application-owned
-   * processing timeout the other two paths use, and ONE normal product ceiling
-   * for the delivered artifact.
+   * between), this job's server-owned workDir, the same processing stage budget
+   * (`processingMs`) the other paths use, and ONE normal product ceiling for the
+   * delivered artifact.
    *
    * `convertMedia` and `mergeSplitMedia` are unreachable from here: neither is
    * named on this path, and the plan type could not be handed to either.
@@ -1023,7 +1097,7 @@ export class JobExecutor {
     const produced = await this.processClearHls({
       source,
       workDir,
-      timeoutMs: config.downloadTimeoutMs,
+      timeoutMs: this.stageTimeLimits.processingMs,
       maxOutputBytes: this.genericLimits.maxFileSizeBytes,
       signal,
     });
@@ -1049,8 +1123,8 @@ export class JobExecutor {
    * `clear-hls-separate-audio-remux` plan — the shared timestamp-aware
    * stream-copy merge of the two acquired halves into MP4, over the EXACT
    * acquisition result. Reached only after `beginProcessing()` committed, with
-   * the same application-owned processing timeout and ONE product ceiling every
-   * other path uses.
+   * the same processing stage budget (`processingMs`) and ONE product ceiling
+   * every other path uses.
    *
    * The delivered artifact must be the merge's OWN MP4: never either half
    * handed back as if it had been merged.
@@ -1064,7 +1138,7 @@ export class JobExecutor {
     const produced = await this.processSeparateHls({
       source,
       workDir,
-      timeoutMs: config.downloadTimeoutMs,
+      timeoutMs: this.stageTimeLimits.processingMs,
       maxOutputBytes: this.genericLimits.maxFileSizeBytes,
       signal,
     });
@@ -1125,7 +1199,7 @@ export class JobExecutor {
       inputPath: original.filePath,
       workDir,
       target,
-      timeoutMs: config.downloadTimeoutMs,
+      timeoutMs: this.stageTimeLimits.processingMs,
       signal,
     });
 
@@ -1201,6 +1275,15 @@ export class JobExecutor {
       /* cleanup is best effort and must never mask the terminal state */
     }
   }
+}
+
+/**
+ * True when a `genericLimits` value carries anything besides the byte ceiling —
+ * in practice a time limit, in the pre-LD-1 shape (`downloadTimeoutSeconds`) or
+ * the yt-dlp seam's own (`downloadTimeLimitMs`).
+ */
+function carriesTimeLimit(limits: object): boolean {
+  return Reflect.ownKeys(limits).some((key) => key !== "maxFileSizeBytes");
 }
 
 function finiteInt(value: number | null | undefined): number | null {

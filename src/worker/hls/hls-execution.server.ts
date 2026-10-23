@@ -99,12 +99,13 @@ import type { WorkerErrorCode } from "@/shared/worker/errors";
  * simply not supported.
  *
  * `workDir` is the server-owned per-job directory. `signal` is REQUIRED so no
- * caller can start an uncancellable acquisition. `acquisitionTimeoutMs` may
- * only NARROW HLS-3's budget; omitting it uses the application download budget,
- * which is what Production does. The preflight is not given one at all: HLS-2
- * already defaults to, and caps itself at, the application analysis budget, and
- * inventing a second policy here would be a budget this task has no evidence
- * for.
+ * caller can start an uncancellable acquisition. `downloadTimeLimitMs` is
+ * REQUIRED as well (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001): it is the job's ONE
+ * absolute acquisition deadline, the executor's `WorkerTimeLimits`, and it
+ * becomes HLS-3's whole budget — this seam has no default of its own. The
+ * preflight is not given one at all: HLS-2 already defaults to, and caps itself
+ * at, the application analysis budget, and inventing a second policy here would
+ * be a budget this task has no evidence for.
  */
 export type ClearHlsAcquisitionOrder = {
   readonly plan: {
@@ -113,7 +114,7 @@ export type ClearHlsAcquisitionOrder = {
   };
   readonly workDir: string;
   readonly signal: AbortSignal;
-  readonly acquisitionTimeoutMs?: number;
+  readonly downloadTimeLimitMs: number;
   readonly onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
 };
 
@@ -295,7 +296,16 @@ export async function acquireSelectedClearHlsMedia(
   order: ClearHlsAcquisitionOrder,
   primitives: ClearHlsAcquisitionPrimitives = PRODUCTION_ACQUISITION_PRIMITIVES,
 ): Promise<ClearHlsAcquiredMedia> {
-  const { plan, workDir, signal, acquisitionTimeoutMs, onProgress } = order;
+  const { plan, workDir, signal, downloadTimeLimitMs, onProgress } = order;
+  // A missing or malformed limit is a composition fault: refused before the
+  // preflight, so no request is made under a deadline nobody configured.
+  if (
+    typeof downloadTimeLimitMs !== "number" ||
+    !Number.isSafeInteger(downloadTimeLimitMs) ||
+    downloadTimeLimitMs <= 0
+  ) {
+    throw new AppError("PROCESSING_FAILED");
+  }
   // The sensitive value is read ONCE, here, and the plan is not consulted again.
   const playlistUrl = plan.source.playlistUrl;
 
@@ -309,7 +319,7 @@ export async function acquireSelectedClearHlsMedia(
   const common = {
     workDir,
     signal,
-    ...(acquisitionTimeoutMs !== undefined ? { timeoutMs: acquisitionTimeoutMs } : {}),
+    timeoutMs: downloadTimeLimitMs,
     ...(onProgress ? { onProgress } : {}),
   };
   try {

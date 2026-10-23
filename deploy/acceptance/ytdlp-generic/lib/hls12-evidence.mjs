@@ -276,8 +276,9 @@ export const HLS12_SUBSTITUTIONS = Object.freeze({
   byteBudgetControl:
     "neg-budget only: the Product's configured byte limit (config.maxFileSize) narrowed to the two halves' sum minus one byte for that one job, and restored",
   deadlineControl:
-    `neg-deadline only: the Product's configured download budget (config.downloadTimeoutMs, the DOWNLOAD_TIMEOUT value) ` +
-    `narrowed to ${HLS12_DEADLINE_CONTROL.budgetMs} ms for that one job, and restored; the fixture held the video half's last ` +
+    `neg-deadline only: the Product's acquisition limit (timeLimits.downloadTimeLimitMs, which the Worker builds from ` +
+    `DOWNLOAD_TIME_LIMIT) narrowed to ${HLS12_DEADLINE_CONTROL.budgetMs} ms for that one job's executor, every other job at the ` +
+    `Product default; the fixture held the video half's last ` +
     `fragment until ${HLS12_DEADLINE_CONTROL.videoHoldMs} ms after the video map arrived, and would answer the audio map only at ` +
     `${HLS12_DEADLINE_CONTROL.audioReleaseMs} ms after it, if the Product were still waiting (late, never altered; the observed ` +
     `block records whether it was). No Product code, clock or timer is replaced`,

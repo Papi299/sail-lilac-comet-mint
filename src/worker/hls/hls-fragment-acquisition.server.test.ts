@@ -1516,25 +1516,35 @@ describe("clear-HLS acquisition: one deadline, one first cause", () => {
     noArtifacts();
   });
 
-  it("defaults to the configured download budget when none is supplied", async () => {
-    await withConfig({ downloadTimeoutMs: 60 }, async () => {
-      fakeNetwork({ [F1]: neverAnswers });
-      await refusedWith(
-        acquireClearHlsTs({
-          plan: planOf([F1]),
-          workDir,
-          signal: new AbortController().signal,
-        }),
-        "timeout",
-      );
-      noArtifacts();
-    });
+  // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: the budget is the caller's — the
+  // Worker's DOWNLOAD_TIME_LIMIT, handed down — with no default and no cap here.
+
+  it("refuses a request that carries no budget, before any request (no default)", async () => {
+    const net = fakeNetwork({ [F1]: serve(payload("A", 8)) });
+    await refusedWith(
+      acquireClearHlsTs({
+        plan: planOf([F1]),
+        workDir,
+        signal: new AbortController().signal,
+      } as unknown as Parameters<typeof acquireClearHlsTs>[0]),
+      "invalid_plan",
+    );
+    assert.deepEqual(net.requests, []);
+    noArtifacts();
   });
 
-  it("caps a caller-supplied budget at the configured download budget", async () => {
-    await withConfig({ downloadTimeoutMs: 60 }, async () => {
-      fakeNetwork({ [F1]: neverAnswers });
-      await refusedWith(acquire(planOf([F1]), { timeoutMs: 60_000 }), "timeout");
+  it("is NOT capped by the legacy module budget: the caller's budget is the whole budget", async () => {
+    // Under the pre-LD-1 cap a 1 ms module budget would have stopped this
+    // acquisition before its first, 40 ms-late fragment answered.
+    await withConfig({ downloadTimeoutMs: 1 }, async () => {
+      fakeNetwork({
+        [F1]: async (): Promise<Served> => {
+          await sleep(40);
+          return serve(payload("A", 8));
+        },
+      });
+      const acquired = await acquire(planOf([F1]), { timeoutMs: 5_000 });
+      assert.equal(acquired.fileSize, 8);
     });
   });
 

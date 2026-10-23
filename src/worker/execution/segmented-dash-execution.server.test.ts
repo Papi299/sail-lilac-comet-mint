@@ -50,7 +50,7 @@ import { analyzeGenericMediaInternal } from "../analysis/ytdlp-analysis.server.t
  */
 
 const URL = "https://example.invalid/watch/dash";
-const LIMITS = { maxFileSizeBytes: 100_000, downloadTimeoutSeconds: 600 };
+const LIMITS = { maxFileSizeBytes: 100_000 };
 const ISO = "mov,mp4,m4a,3gp,3g2,mj2";
 const MERGED = "MERGED-MP4-FROM-DASH";
 

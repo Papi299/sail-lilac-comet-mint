@@ -11,10 +11,11 @@
 //
 // ── The control ────────────────────────────────────────────────────────────
 //
-// For that one job, the Product's configured download budget
-// (`config.downloadTimeoutMs`, the `DOWNLOAD_TIMEOUT` value every acquisition
-// already reads) is narrowed to `budgetMs`, and the fixture DELAYS two answers
-// — it never alters or withholds a byte:
+// For that one job, the Product's acquisition limit is narrowed to `budgetMs`:
+// that job's executor is handed `timeLimits.downloadTimeLimitMs`, the value the
+// Worker runtime builds from `DOWNLOAD_TIME_LIMIT` and hands every acquisition
+// in Production (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001). The fixture DELAYS two
+// answers — it never alters or withholds a byte:
 //
 //   the video half's LAST fragment  answered `videoHoldMs` after the video map
 //                                   arrived: the video half completes INSIDE
@@ -45,7 +46,7 @@
 
 /** The `neg-deadline` control, in milliseconds. */
 export const HLS12_DEADLINE_CONTROL = Object.freeze({
-  /** The narrowed `config.downloadTimeoutMs` (the `DOWNLOAD_TIMEOUT=10` value). */
+  /** The narrowed acquisition limit: that one job's `timeLimits.downloadTimeLimitMs`. */
   budgetMs: 10_000,
   /** When the video half's last fragment is answered, after the video map arrived. */
   videoHoldMs: 6_000,

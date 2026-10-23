@@ -128,11 +128,18 @@ function processors(over: Partial<ClearHlsProcessingPrimitives>): ClearHlsProces
   } as ClearHlsProcessingPrimitives;
 }
 
+/**
+ * The job's acquisition limit the executor hands this seam
+ * (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001). Deliberately not the 600 s default.
+ */
+const DOWNLOAD_LIMIT_MS = 1_234_000;
+
 function order(over: Record<string, unknown> = {}) {
   return {
     plan: PLAN,
     workDir: "/work/job-1",
     signal: new AbortController().signal,
+    downloadTimeLimitMs: DOWNLOAD_LIMIT_MS,
     ...over,
   } as Parameters<typeof acquireSelectedClearHlsMedia>[0];
 }
@@ -194,21 +201,48 @@ describe("HLS-6 acquisition: preflight, then fragments, and nothing else", () =>
     assert.equal(request.plan, ACQUISITION_PLAN, "the same object, not a rebuild");
     assert.equal(request.workDir, "/work/job-7");
     assert.equal(request.signal, controller.signal);
-    assert.equal(request.timeoutMs, undefined, "omitted means the application download budget");
+    assert.equal(request.timeoutMs, DOWNLOAD_LIMIT_MS, "the job's acquisition limit IS HLS-3's whole budget");
   });
 
-  it("passes a narrowing acquisition budget through when one is given", async () => {
-    let seen: number | undefined;
-    await acquireSelectedClearHlsMedia(
-      order({ acquisitionTimeoutMs: 1234 }),
-      primitives({
-        acquire: async (request) => {
-          seen = request.timeoutMs;
-          return ARTIFACT;
-        },
-      }),
-    );
-    assert.equal(seen, 1234);
+  it("passes the job's acquisition limit through, uncapped by the legacy module budget (VIDEOFETCH-LD1)", async () => {
+    for (const limit of [1234, 60_000, 21_600_000]) {
+      let seen: number | undefined;
+      await acquireSelectedClearHlsMedia(
+        order({ downloadTimeLimitMs: limit }),
+        primitives({
+          acquire: async (request) => {
+            seen = request.timeoutMs;
+            return ARTIFACT;
+          },
+        }),
+      );
+      assert.equal(seen, limit);
+    }
+  });
+
+  it("refuses a missing or malformed limit before the preflight (no default, fail closed)", async () => {
+    for (const bad of [undefined, null, 0, -1, 1.5, Number.NaN, "600000"]) {
+      let calls = 0;
+      const err = await refusal(
+        () =>
+          acquireSelectedClearHlsMedia(
+            order({ downloadTimeLimitMs: bad }),
+            primitives({
+              preflight: async () => {
+                calls += 1;
+                return ACQUISITION_PLAN;
+              },
+              acquire: async () => {
+                calls += 1;
+                return ARTIFACT;
+              },
+            }),
+          ),
+        String(bad),
+      );
+      assert.equal(err.code, "PROCESSING_FAILED", String(bad));
+      assert.equal(calls, 0, `${String(bad)}: no preflight and no acquisition`);
+    }
   });
 
   it("returns the HLS-3 artifact IDENTICALLY, so HLS-4 revalidates what was committed", async () => {

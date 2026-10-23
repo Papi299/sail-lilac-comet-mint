@@ -20,6 +20,13 @@ import {
   type DirectDownloadDeadlineTimer,
 } from "./direct.server.ts";
 
+/**
+ * VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: the Worker entry's injected acquisition
+ * limit. Deliberately NOT the legacy module default, so a test passing only
+ * because the old budget happened to match it would fail.
+ */
+const LIMIT_MS = 1_234_000;
+
 describe("direct extractor response disposal", () => {
   afterEach(() => {
     setSafeHttpTestHooks(null);
@@ -131,23 +138,83 @@ describe("direct acquisition absolute deadline", () => {
     await rm(workDir, { recursive: true, force: true });
   });
 
-  it("arms exactly one deadline of DOWNLOAD_TIMEOUT (600 s) for the whole transfer", async () => {
+  it("arms exactly one deadline of the INJECTED acquisition limit for the whole transfer", async () => {
     const deadline = fakeDeadline();
-    serve(Readable.from([Buffer.from("0123456789")]), { "content-length": "10" });
+    const socketIdle: number[] = [];
+    setSafeHttpTestHooks({
+      lookup: async () => [{ address: "8.8.8.8", family: 4 }],
+      requestOnce: async ({ timeoutMs }) => {
+        socketIdle.push(timeoutMs);
+        return {
+          status: 200,
+          headers: { "content-type": "video/mp4", "content-length": "10" },
+          body: Readable.from([Buffer.from("0123456789")]),
+        };
+      },
+    });
 
-    const result = await downloadDirectOriginalWorker(MEDIA_URL, { workDir });
+    const result = await downloadDirectOriginalWorker(MEDIA_URL, { downloadTimeLimitMs: LIMIT_MS, workDir });
 
     assert.equal(result.fileSize, 10);
-    assert.equal(config.downloadTimeoutMs, 600_000, "the default policy value is unchanged");
     assert.equal(deadline.armed.length, 1);
-    assert.equal(deadline.armed[0]!.ms, config.downloadTimeoutMs);
+    assert.equal(deadline.armed[0]!.ms, LIMIT_MS, "the Worker's DOWNLOAD_TIME_LIMIT, exactly as injected");
+    assert.deepEqual(socketIdle, [LIMIT_MS], "the socket-idle timeout is the same value, as it always was");
+  });
+
+  it("never reads the legacy module budget on the Worker entry (VIDEOFETCH-LD1)", async () => {
+    const saved = config.downloadTimeoutMs;
+    Object.assign(config, { downloadTimeoutMs: 7 });
+    try {
+      const deadline = fakeDeadline();
+      serve(Readable.from([Buffer.from("abc")]));
+      await downloadDirectOriginalWorker(MEDIA_URL, { downloadTimeLimitMs: LIMIT_MS, workDir });
+      assert.deepEqual(deadline.armed.map((entry) => entry.ms), [LIMIT_MS]);
+    } finally {
+      Object.assign(config, { downloadTimeoutMs: saved });
+    }
+  });
+
+  it("refuses a missing or malformed limit before any lookup, request or deadline (fail closed)", async () => {
+    for (const bad of [undefined, null, 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "600000"]) {
+      const deadline = fakeDeadline();
+      let lookups = 0;
+      let requests = 0;
+      setSafeHttpTestHooks({
+        lookup: async () => {
+          lookups += 1;
+          return [{ address: "8.8.8.8", family: 4 }];
+        },
+        requestOnce: async () => {
+          requests += 1;
+          return { status: 200, headers: { "content-type": "video/mp4" }, body: Readable.from([Buffer.from("x")]) };
+        },
+      });
+      const ctx = { workDir, downloadTimeLimitMs: bad } as unknown as Parameters<
+        typeof downloadDirectOriginalWorker
+      >[1];
+      await assert.rejects(downloadDirectOriginalWorker(MEDIA_URL, ctx), (err: unknown) => {
+        assert.ok(err instanceof AppError, String(bad));
+        assert.equal(err.code, "PROCESSING_FAILED", String(bad));
+        return true;
+      });
+      assert.equal(lookups, 0, String(bad));
+      assert.equal(requests, 0, String(bad));
+      assert.equal(deadline.armed.length, 0, `${String(bad)}: no deadline from a default`);
+    }
+  });
+
+  it("leaves the LEGACY application path on its own module budget", async () => {
+    const deadline = fakeDeadline();
+    serve(Readable.from([Buffer.from("0123456789")]));
+    await directExtractor.download(MEDIA_URL, { formatId: "direct-original" }, { workDir });
+    assert.deepEqual(deadline.armed.map((entry) => entry.ms), [config.downloadTimeoutMs]);
   });
 
   it("an ordinary acquisition still succeeds and disarms its deadline exactly once", async () => {
     const deadline = fakeDeadline();
     for (let run = 0; run < 2; run += 1) {
       serve(Readable.from([Buffer.from("abc"), Buffer.from("def")]));
-      const result = await downloadDirectOriginalWorker(MEDIA_URL, { workDir });
+      const result = await downloadDirectOriginalWorker(MEDIA_URL, { downloadTimeLimitMs: LIMIT_MS, workDir });
       assert.equal(result.fileSize, 6);
       assert.equal(result.container, "mp4");
     }
@@ -167,6 +234,7 @@ describe("direct acquisition absolute deadline", () => {
 
     let progressEvents = 0;
     const pending = downloadDirectOriginalWorker(MEDIA_URL, {
+      downloadTimeLimitMs: LIMIT_MS,
       workDir,
       onProgress: () => {
         progressEvents += 1;
@@ -201,7 +269,7 @@ describe("direct acquisition absolute deadline", () => {
         }),
     });
 
-    await assert.rejects(downloadDirectOriginalWorker(MEDIA_URL, { workDir }), (err: unknown) => {
+    await assert.rejects(downloadDirectOriginalWorker(MEDIA_URL, { downloadTimeLimitMs: LIMIT_MS, workDir }), (err: unknown) => {
       assert.ok(err instanceof AppError);
       assert.equal(err.code, "TIMEOUT");
       return true;
@@ -232,6 +300,7 @@ describe("direct acquisition absolute deadline", () => {
 
     let progressEvents = 0;
     const pending = downloadDirectOriginalWorker(MEDIA_URL, {
+      downloadTimeLimitMs: LIMIT_MS,
       workDir,
       signal,
       onProgress: () => {
@@ -271,7 +340,7 @@ describe("direct acquisition absolute deadline", () => {
     const caller = new AbortController();
     caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
 
-    await assert.rejects(downloadDirectOriginalWorker(MEDIA_URL, { workDir, signal: caller.signal }));
+    await assert.rejects(downloadDirectOriginalWorker(MEDIA_URL, { downloadTimeLimitMs: LIMIT_MS, workDir, signal: caller.signal }));
     // Safe-HTTP refuses an aborted operation before resolving or requesting
     // anything, so no body is ever produced — there is nothing to dispose.
     assert.equal(lookups, 0);
@@ -330,6 +399,7 @@ describe("direct acquisition transport-failure classification", () => {
     let received = 0;
     await assert.rejects(
       downloadDirectOriginalWorker(MEDIA_URL, {
+        downloadTimeLimitMs: LIMIT_MS,
         workDir,
         onProgress: (p) => {
           received = p.downloadedBytes ?? received;
@@ -348,7 +418,7 @@ describe("direct acquisition transport-failure classification", () => {
 
   it("an AppError raised on the body keeps its own code", async () => {
     serve(failingBody(new AppError("TOO_LARGE")));
-    await assert.rejects(downloadDirectOriginalWorker(MEDIA_URL, { workDir }), (err: unknown) => {
+    await assert.rejects(downloadDirectOriginalWorker(MEDIA_URL, { downloadTimeLimitMs: LIMIT_MS, workDir }), (err: unknown) => {
       assert.ok(err instanceof AppError);
       assert.equal(err.code, "TOO_LARGE");
       return true;
@@ -358,7 +428,7 @@ describe("direct acquisition transport-failure classification", () => {
   it("a local file-stream failure is NOT reclassified as a network failure", async () => {
     serve(Readable.from([Buffer.from("0123456789")]));
     await assert.rejects(
-      downloadDirectOriginalWorker(MEDIA_URL, { workDir: join(workDir, "does-not-exist") }),
+      downloadDirectOriginalWorker(MEDIA_URL, { downloadTimeLimitMs: LIMIT_MS, workDir: join(workDir, "does-not-exist") }),
       (err: unknown) => {
         assert.equal(err instanceof AppError, false, "a local failure stays internal");
         return true;
@@ -377,6 +447,7 @@ describe("direct acquisition transport-failure classification", () => {
     let events = 0;
     await assert.rejects(
       downloadDirectOriginalWorker(MEDIA_URL, {
+        downloadTimeLimitMs: LIMIT_MS,
         workDir,
         signal: caller.signal,
         onProgress: () => {
@@ -418,6 +489,7 @@ describe("direct acquisition transport-failure classification", () => {
       let received = 0;
       await assert.rejects(
         downloadDirectOriginalWorker(MEDIA_URL, {
+          downloadTimeLimitMs: LIMIT_MS,
           workDir,
           onProgress: (p) => {
             received = p.downloadedBytes ?? received;

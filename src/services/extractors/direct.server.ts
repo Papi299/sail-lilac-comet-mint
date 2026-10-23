@@ -185,6 +185,12 @@ async function _probeDirect(
   };
 }
 
+/** The Worker entry's context: the shared `DownloadContext` plus its acquisition limit. */
+export type DirectWorkerDownloadContext = DownloadContext & {
+  /** The Worker's ONE absolute acquisition deadline (`DOWNLOAD_TIME_LIMIT`), in milliseconds. */
+  readonly downloadTimeLimitMs: number;
+};
+
 /**
  * §5: Worker-safe original-media download primitive.
  *
@@ -194,14 +200,25 @@ async function _probeDirect(
  * preferredContainer, and it never runs FFmpeg or any conversion: Worker
  * Phase-6 requires that all local processing happen strictly after the durable
  * job has transitioned into `processing`.
+ *
+ * VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: the transfer is bounded by
+ * `ctx.downloadTimeLimitMs`, the Worker's ONE acquisition deadline
+ * (`DOWNLOAD_TIME_LIMIT`), which the executor supplies on every call. This
+ * entry has no default of its own and never reads the legacy module budget: a
+ * missing or malformed limit is a composition fault and fails closed before
+ * any request.
  */
 export async function downloadDirectOriginalWorker(
   url: string,
-  ctx: DownloadContext,
+  ctx: DirectWorkerDownloadContext,
 ): Promise<{ filePath: string; container: string; mime: string; fileSize: number }> {
+  const timeLimitMs: unknown = (ctx as { downloadTimeLimitMs?: unknown }).downloadTimeLimitMs;
+  if (typeof timeLimitMs !== "number" || !Number.isSafeInteger(timeLimitMs) || timeLimitMs <= 0) {
+    throw new AppError("PROCESSING_FAILED");
+  }
   const ext = extensionFromUrl(url) || "bin";
   const dest = join(ctx.workDir, `source.${ext}`);
-  await streamDownload(url, dest, ctx);
+  await streamDownload(url, dest, ctx, timeLimitMs);
   const st = await stat(dest);
   if (st.size > config.maxFileSize) throw new AppError("TOO_LARGE");
   return {
@@ -219,7 +236,9 @@ async function downloadDirect(
 ): Promise<DownloadResult> {
   const ext = extensionFromUrl(url) || "bin";
   const dest = join(ctx.workDir, `source.${ext}`);
-  await streamDownload(url, dest, ctx);
+  // The legacy application path keeps its own module budget. The Worker never
+  // reaches this function (see `downloadDirectOriginalWorker`).
+  await streamDownload(url, dest, ctx, config.downloadTimeoutMs);
   const st = await stat(dest);
   if (st.size > config.maxFileSize) throw new AppError("TOO_LARGE");
 
@@ -280,14 +299,17 @@ export function setDirectDownloadDeadlineTimerForTests(timer: DirectDownloadDead
 }
 
 /**
- * Direct acquisition under ONE absolute deadline of `DOWNLOAD_TIMEOUT`
- * (MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001).
+ * Direct acquisition under ONE absolute deadline of `timeLimitMs`
+ * (MAX-FILE-SIZE-4GIB-IMPLEMENTATION-001): the Worker's `DOWNLOAD_TIME_LIMIT`
+ * for the Worker entry (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001), the legacy
+ * module budget for the legacy application path.
  *
  * `safeGet`'s `timeoutMs` is a socket INACTIVITY timeout: a server trickling a
  * byte just often enough never trips it, and before this deadline existed such
  * a download could hold the single-flight Worker indefinitely. The generic path
  * already shares one deadline across its whole subprocess phase; this gives
- * the direct path the same whole-transfer bound.
+ * the direct path the same whole-transfer bound. The socket-idle timeout is the
+ * same value, as it always was.
  *
  * The deadline is armed ONCE, before the request, and covers resolution,
  * redirects, headers and the entire body. Progress never re-arms it. Its timer
@@ -299,7 +321,7 @@ export function setDirectDownloadDeadlineTimerForTests(timer: DirectDownloadDead
  * first cause is latched, so a cancellation stays a cancellation and an
  * expired deadline is reported as `TIMEOUT`.
  */
-async function streamDownload(url: string, dest: string, ctx: DownloadContext) {
+async function streamDownload(url: string, dest: string, ctx: DownloadContext, timeLimitMs: number) {
   const controller = new AbortController();
   let abortCause = null as "caller" | "deadline" | null;
   const abortOnce = (cause: "caller" | "deadline", reason: unknown) => {
@@ -312,7 +334,7 @@ async function streamDownload(url: string, dest: string, ctx: DownloadContext) {
   const relayCallerAbort = () => abortOnce("caller", callerSignal?.reason);
   const deadline = deadlineTimer.set(
     () => abortOnce("deadline", new AppError("TIMEOUT")),
-    config.downloadTimeoutMs,
+    timeLimitMs,
   );
   if (callerSignal) {
     if (callerSignal.aborted) relayCallerAbort();
@@ -320,7 +342,7 @@ async function streamDownload(url: string, dest: string, ctx: DownloadContext) {
   }
 
   try {
-    await transferDirectBody(url, dest, ctx, controller.signal);
+    await transferDirectBody(url, dest, ctx, controller.signal, timeLimitMs);
   } catch (err) {
     if (abortCause === "deadline") throw new AppError("TIMEOUT");
     throw err;
@@ -335,10 +357,11 @@ async function transferDirectBody(
   dest: string,
   ctx: DownloadContext,
   signal: AbortSignal,
+  socketIdleMs: number,
 ) {
   const res = await safeGet(url, {
     signal,
-    timeoutMs: config.downloadTimeoutMs,
+    timeoutMs: socketIdleMs,
   });
   if (signal.aborted) {
     // The response arrived after the operation was already aborted.

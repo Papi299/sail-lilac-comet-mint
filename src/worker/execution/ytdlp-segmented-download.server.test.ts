@@ -284,7 +284,7 @@ function download(
 ) {
   const { maxFileSizeBytes, ...rest } = extra;
   return downloadGenericSplitSources(SAFE_URL, workDir, p, {
-    limits: { maxFileSizeBytes: maxFileSizeBytes ?? 100_000, downloadTimeoutSeconds: 600 },
+    limits: { maxFileSizeBytes: maxFileSizeBytes ?? 100_000, downloadTimeLimitMs: 600_000 },
     runner: run,
     probeRuntime: async () => OK_RUNTIME,
     validateUrl: async (raw: string) => ({ url: raw, hostname: "example.invalid" }),
@@ -534,7 +534,7 @@ describe("segmented acquisition: the fragment-aware byte guard", () => {
       return inner(call);
     };
   };
-  const guardDeadline = { downloadTimeoutSeconds: 2 };
+  const guardDeadline = { downloadTimeLimitMs: 2000 };
 
   it("an IN-FLIGHT fragment pushing aggregate + fragment past the budget is TOO_LARGE", async () => {
     const p = plan();
@@ -694,7 +694,7 @@ describe("segmented acquisition: deadline, retries and cancellation", () => {
     });
     await download(p, run, {
       clock: () => now,
-      limits: { maxFileSizeBytes: 100_000, downloadTimeoutSeconds: 30 },
+      limits: { maxFileSizeBytes: 100_000, downloadTimeLimitMs: 30_000 },
     });
     assert.equal(calls[0]!.timeoutMs, 30_000, "video: the whole budget (the probe took no time)");
     assert.equal(calls[1]!.timeoutMs, 15_000, "audio: only what the video's retries left");
@@ -727,7 +727,7 @@ describe("segmented acquisition: deadline, retries and cancellation", () => {
       },
     });
     await rejectsWith("TIMEOUT", () =>
-      download(p, run, { clock: () => now, limits: { maxFileSizeBytes: 100_000, downloadTimeoutSeconds: 30 } }),
+      download(p, run, { clock: () => now, limits: { maxFileSizeBytes: 100_000, downloadTimeLimitMs: 30_000 } }),
     );
     assert.equal(calls.length, 1, "no audio run with no time left");
   });
@@ -853,7 +853,7 @@ describe("segmented acquisition: the single-source downloader never acquires a D
     } as unknown as GenericSingleSourceExecutionPlan;
     await rejectsWith("FORMAT_UNAVAILABLE", () =>
       downloadGenericOriginal(SAFE_URL, workDir, forged, {
-        limits: { maxFileSizeBytes: 1000, downloadTimeoutSeconds: 600 },
+        limits: { maxFileSizeBytes: 1000, downloadTimeLimitMs: 600_000 },
         probeRuntime: async () => {
           calls.push("probe");
           return OK_RUNTIME;
@@ -882,7 +882,7 @@ describe("segmented acquisition: the single-source downloader never acquires a D
       targetContainer: "m4a",
     } as GenericSingleSourceExecutionPlan;
     const res = await downloadGenericOriginal(SAFE_URL, workDir, p, {
-      limits: { maxFileSizeBytes: 1000, downloadTimeoutSeconds: 600 },
+      limits: { maxFileSizeBytes: 1000, downloadTimeLimitMs: 600_000 },
       probeRuntime: async () => OK_RUNTIME,
       validateUrl: async (raw) => ({ url: raw, hostname: "example.invalid" }),
       runner: async () => {

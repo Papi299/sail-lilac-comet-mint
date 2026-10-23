@@ -60,10 +60,10 @@ the workspace-capacity reader are the executor's defaults. The substitutions
   fixed request profile, which the transport verifies independently;
 - a local object writer in place of R2;
 - a fresh temporary SQLite job store per job, with a status-audit trigger;
-- two per-case controls, each applied to one job and restored after it:
-  `neg-budget` narrows the Product's configured byte limit
-  (`config.maxFileSize`), and `neg-deadline` narrows its configured download
-  budget (`config.downloadTimeoutMs`) and has the fixture hold two routes'
+- two per-case controls, each confined to one job: `neg-budget` narrows the
+  Product's configured byte limit (`config.maxFileSize`) and restores it, and
+  `neg-deadline` hands that one job's executor a narrowed acquisition limit
+  (`timeLimits.downloadTimeLimitMs`) and has the fixture hold two routes'
   answers (below). No Product code, clock or timer is replaced.
 
 ---
@@ -224,10 +224,19 @@ It runs a full job through the candidate's real executor, HLS-2 preflights and
 HLS-3 acquisitions, with exactly two controls (`HLS12_DEADLINE_CONTROL`,
 `lib/hls12-deadline.mjs`):
 
-- **The budget.** For this one job, the Product's configured download budget
-  `config.downloadTimeoutMs` (the `DOWNLOAD_TIMEOUT` value every acquisition
-  already reads) is **10,000 ms**, and it is restored afterwards. The executor
-  passes no narrower one, so this is the one shared deadline.
+- **The budget.** For this one job, the Product's acquisition limit is
+  **10,000 ms**: the job's executor is handed `timeLimits.downloadTimeLimitMs`,
+  the value the Worker runtime builds from `DOWNLOAD_TIME_LIMIT` and hands every
+  acquisition in Production. Every other job runs at the Product default, so
+  there is nothing to restore. The executor passes no narrower one, so this is
+  the one shared deadline.
+
+  Before `VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001` the same control narrowed the
+  legacy module value `config.downloadTimeoutMs` (the retired
+  `DOWNLOAD_TIMEOUT`) and restored it afterwards. LD-1 moved every Worker
+  acquisition onto the injected limit, where that module value no longer
+  reaches; the control moved with it. The check list and the schema
+  (`hls12-release-image-separate-audio-02`) are unchanged.
 - **Two held answers.** The fixture holds two routes, answering them with
   their own bytes, only later, never differently, and only if the Product is
   still waiting. Each time is measured from the arrival of the video map, the
@@ -276,7 +285,7 @@ relative times and two verdicts. The eight checks:
 | `neg-deadline/video-consumed-the-shared-deadline` | the video map and every fragment answered 200 exactly once; the held last fragment released, never abandoned; the half completed between 4,500 and 8,500 ms |
 | `neg-deadline/audio-did-not-receive-a-fresh-deadline` | ONE audio request, its map, made only after the video half completed; never answered; abandoned by the Product within ±1,500 ms of the 10,000 ms deadline, before the 13,000 ms answer |
 | `neg-deadline/requests-end-at-the-unanswered-audio-map` | the Product's requests were exactly master, both playlists, the video map and fragments, then the audio map, which received no response; no audio fragment was ever requested |
-| `neg-deadline/download-timeout-restored` | `config.downloadTimeoutMs` is back to its value before the case |
+| `neg-deadline/download-timeout-restored` | the narrowed limit reached exactly one executor, the `neg-deadline` job's, and every other job of the run had the Product default (600,000 ms). Before LD-1: `config.downloadTimeoutMs` was back to its value before the case |
 | `neg-deadline/never-processing-no-media-tool` | the trace was `queued → analyzing → downloading → failed`, with no ffprobe and no FFmpeg |
 
 On a disposable development image (offline, Docker Desktop), the video half

@@ -366,7 +366,7 @@ function acquireThroughPinned(
   runner: typeof runProcess = pinnedRunner,
 ) {
   return downloadGenericSplitSources(url, workDir, plan, {
-    limits: { maxFileSizeBytes, downloadTimeoutSeconds: 120 },
+    limits: { maxFileSizeBytes, downloadTimeLimitMs: 120_000 },
     runner,
     probeRuntime: pinnedProbe,
     validateUrl: async (raw: string) => ({ url: raw, hostname: "127.0.0.1" }),

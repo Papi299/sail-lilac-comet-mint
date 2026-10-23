@@ -713,7 +713,7 @@ describe("HLS-12 evidence", () => {
   it("states the shared-deadline control in every record, and what it does not prove", () => {
     const record = buildHls12ReleaseEvidence(input());
     assert.equal(record.substitutions.deadlineControl, HLS12_SUBSTITUTIONS.deadlineControl);
-    for (const fact of ["config.downloadTimeoutMs", "10000 ms", "6000 ms", "13000 ms", "No Product code, clock or timer is replaced"]) {
+    for (const fact of ["timeLimits.downloadTimeLimitMs", "DOWNLOAD_TIME_LIMIT", "10000 ms", "6000 ms", "13000 ms", "No Product code, clock or timer is replaced"]) {
       assert.ok(record.substitutions.deadlineControl.includes(fact), fact);
     }
     assert.ok(record.substitutions.byteBudgetControl.includes("config.maxFileSize"));

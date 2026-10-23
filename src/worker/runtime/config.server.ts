@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import { z } from "zod";
 import { WorkerKeyIdSchema } from "../../shared/worker/auth.ts";
 import { DEFAULT_MAX_FILE_SIZE_BYTES } from "../../shared/media-limits.ts";
+import { DOWNLOAD_TIME_LIMIT_SECONDS, PROCESSING_TIMEOUT_SECONDS } from "./time-limits.ts";
 
 /**
  * Strict Worker runtime configuration boundary (Phase 8A §6/§7).
@@ -192,7 +193,12 @@ const MEDIA_DEFAULTS = {
   maxFileSizeBytes: DEFAULT_MAX_FILE_SIZE_BYTES,
   maxVideoDurationSeconds: 2 * 60 * 60,
   fileExpirationMinutes: 45,
-  downloadTimeoutSeconds: 600,
+  // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: the two stage limits that replace the
+  // retired DOWNLOAD_TIMEOUT. Their ranges and defaults live in `time-limits.ts`
+  // so the loader and the model cannot disagree. The acquisition default stays
+  // 600 s; the long-download value is a later, separate change (LD-5b).
+  downloadTimeLimitSeconds: DOWNLOAD_TIME_LIMIT_SECONDS.default,
+  processingTimeoutSeconds: PROCESSING_TIMEOUT_SECONDS.default,
   analysisTimeoutSeconds: 45,
   maxRedirects: 5,
 } as const;
@@ -226,7 +232,10 @@ export type WorkerRuntimeConfig = {
     readonly maxFileSizeBytes: number;
     readonly maxVideoDurationSeconds: number;
     readonly fileExpirationMinutes: number;
-    readonly downloadTimeoutSeconds: number;
+    /** `DOWNLOAD_TIME_LIMIT`: ONE absolute deadline for a job's acquisition stage. */
+    readonly downloadTimeLimitSeconds: number;
+    /** `PROCESSING_TIMEOUT`: ONE absolute deadline per processing stage. */
+    readonly processingTimeoutSeconds: number;
     readonly analysisTimeoutSeconds: number;
     readonly maxRedirects: number;
     readonly tempDirectory: string | null;
@@ -305,6 +314,27 @@ export const WORKER_FORBIDDEN_YTDLP_VARIABLES = Object.freeze([
 ] as const);
 
 /**
+ * Retired stage-time variable (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001), refused
+ * by PRESENCE exactly like the retired yt-dlp variables above: an empty or
+ * whitespace-only value is refused too.
+ *
+ * `DOWNLOAD_TIMEOUT` bounded acquisition AND every processing subprocess with
+ * one value, and two loaders read it. It is replaced by `DOWNLOAD_TIME_LIMIT`
+ * (acquisition) and `PROCESSING_TIMEOUT` (per processing stage), and is NOT an
+ * alias of either:
+ *
+ *  - a leftover `DOWNLOAD_TIMEOUT=600` would otherwise silently pin the
+ *    acquisition limit and make a later, longer limit appear not to work;
+ *  - raising it for this image would make a rollback to an older image apply
+ *    the raised value to that image's coupled processing timeout.
+ *
+ * A deployment still carrying it fails closed and is named precisely, without
+ * its value. The variable must be removed from the Worker environment before
+ * an image with this loader is started (deployment runbook).
+ */
+export const WORKER_FORBIDDEN_TIME_LIMIT_VARIABLES = Object.freeze(["DOWNLOAD_TIMEOUT"] as const);
+
+/**
  * Strict boolean grammar for `YTDLP_ENABLED`.
  *
  * Deliberately NOT the retired `1`/`true`/`yes` truthiness rule: a feature
@@ -374,7 +404,8 @@ function readOptionalField<S extends z.ZodTypeAny, F>(
  *
  * Throws `WorkerRuntimeConfigError`, naming only the offending variables. It
  * is startup-fatal by design: the caller must never reach `listen()` after it.
- * A retired yt-dlp variable (`WORKER_FORBIDDEN_YTDLP_VARIABLES`) is reported
+ * A retired yt-dlp variable (`WORKER_FORBIDDEN_YTDLP_VARIABLES`) or the retired
+ * `DOWNLOAD_TIMEOUT` (`WORKER_FORBIDDEN_TIME_LIMIT_VARIABLES`) is reported
  * through the same error, so a stale deployment is named precisely without a
  * dedicated error class.
  *
@@ -400,6 +431,10 @@ export function loadWorkerRuntimeConfig(
   // still counts: the objection is to the variable existing at all, not to the
   // material it carries.
   for (const name of WORKER_FORBIDDEN_YTDLP_VARIABLES) {
+    if (env[name] !== undefined) invalid.push(name);
+  }
+  // The retired stage-time variable, on the same presence rule.
+  for (const name of WORKER_FORBIDDEN_TIME_LIMIT_VARIABLES) {
     if (env[name] !== undefined) invalid.push(name);
   }
 
@@ -532,12 +567,19 @@ export function loadWorkerRuntimeConfig(
       invalid,
       MEDIA_DEFAULTS.fileExpirationMinutes,
     ),
-    downloadTimeoutSeconds: readOptionalField(
-      "DOWNLOAD_TIMEOUT",
-      env.DOWNLOAD_TIMEOUT,
-      boundedInt(1, 86400),
+    downloadTimeLimitSeconds: readOptionalField(
+      "DOWNLOAD_TIME_LIMIT",
+      env.DOWNLOAD_TIME_LIMIT,
+      boundedInt(DOWNLOAD_TIME_LIMIT_SECONDS.min, DOWNLOAD_TIME_LIMIT_SECONDS.max),
       invalid,
-      MEDIA_DEFAULTS.downloadTimeoutSeconds,
+      MEDIA_DEFAULTS.downloadTimeLimitSeconds,
+    ),
+    processingTimeoutSeconds: readOptionalField(
+      "PROCESSING_TIMEOUT",
+      env.PROCESSING_TIMEOUT,
+      boundedInt(PROCESSING_TIMEOUT_SECONDS.min, PROCESSING_TIMEOUT_SECONDS.max),
+      invalid,
+      MEDIA_DEFAULTS.processingTimeoutSeconds,
     ),
     analysisTimeoutSeconds: readOptionalField(
       "ANALYSIS_TIMEOUT",

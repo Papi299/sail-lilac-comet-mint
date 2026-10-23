@@ -40,9 +40,11 @@
 //   safe-HTTP DNS answer + socket `lib/hls-safe-http-transport.mjs`
 //   object-store provider         `lib/local-object-writer.mjs`
 //
-// and two per-case controls, each applied to ONE job and restored after it:
-// `neg-budget` narrows `config.maxFileSize`; `neg-deadline` narrows
-// `config.downloadTimeoutMs` and has the fixture hold two routes' answers.
+// and two per-case controls, each applied to ONE job: `neg-budget` narrows
+// `config.maxFileSize` and restores it; `neg-deadline` hands that one job's
+// executor a narrowed acquisition limit (`timeLimits.downloadTimeLimitMs`, the
+// Worker's `DOWNLOAD_TIME_LIMIT` in Production — VIDEOFETCH-LD1) and has the
+// fixture hold two routes' answers.
 //
 // ── Where it runs ──────────────────────────────────────────────────────────
 //
@@ -70,6 +72,7 @@ import { decideMergeSync } from "../../../src/services/processing/merge-sync.ts"
 import { deriveExecutionPlan } from "../../../src/worker/execution/format-plan.ts";
 import { GENERIC_SOURCE_PROTOCOLS } from "../../../src/worker/execution/generic-source.ts";
 import { JobExecutor } from "../../../src/worker/execution/job-executor.server.ts";
+import { DEFAULT_WORKER_TIME_LIMITS } from "../../../src/worker/runtime/time-limits.ts";
 import { ClearHlsPlaylistError, parseClearHlsMediaPlaylist } from "../../../src/worker/hls/hls-media-playlist.ts";
 import {
   ClearHlsMasterPlaylistError,
@@ -714,7 +717,7 @@ function routeTable(prepared) {
 
 // ── 3. One durable job through the real executor ───────────────────────────
 
-async function runJob(ctx, caseName) {
+async function runJob(ctx, caseName, { timeLimits = null } = {}) {
   const { policy, service, workRoot, spawnContext, spawnObserver, transport } = ctx;
   const dbDir = await mkdtemp(join(workRoot, "hls12-db-"));
   const db = openWorkerDatabase({ path: join(dbDir, "worker.sqlite") });
@@ -808,7 +811,13 @@ async function runJob(ctx, caseName) {
   const statusPoll = setInterval(() => {
     if (statusNow() === "processing") workspace.setPhase("processing");
   }, 2);
-  const executor = new JobExecutor(store, writer, () => Date.now(), new Map(), deps);
+  // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: a narrowed acquisition limit reaches
+  // ONE job's executor only, exactly as the runtime hands the configured one.
+  const executor = new JobExecutor(store, writer, () => Date.now(), new Map(), {
+    ...deps,
+    ...(timeLimits ? { timeLimits } : {}),
+  });
+  ctx.executorLimits.push({ caseName, downloadTimeLimitMs: executor.timeLimits.downloadTimeLimitMs });
   try {
     await executor.execute(claimed);
   } finally {
@@ -1356,14 +1365,14 @@ async function runMasterNegatives(ctx) {
 
 // ── 6. The execution negatives (full jobs) ─────────────────────────────────
 
-async function runExecutionNegative(ctx, caseName, { expectedCode, before = null, after = null }) {
+async function runExecutionNegative(ctx, caseName, { expectedCode, before = null, after = null, timeLimits = null }) {
   const { checks } = ctx;
   const C = (name) => `${caseName}/${name}`;
   ctx.currentCase = caseName;
   if (before) before();
   let job;
   try {
-    job = await runJob(ctx, caseName);
+    job = await runJob(ctx, caseName, { timeLimits });
   } finally {
     if (after) after();
   }
@@ -1482,14 +1491,15 @@ async function runExecutionNegatives(ctx) {
   neverProcessed("neg-audio-map-404", map404);
 
   // ONE acquisition deadline for both halves (since `-02`). The Product's own
-  // configured download budget is narrowed for this one job — the
-  // `DOWNLOAD_TIMEOUT` value every acquisition reads, exactly as `neg-budget`
-  // narrows the byte limit — and the fixture HOLDS two answers, late and never
-  // different: the video half's last fragment, so the video half completes
-  // inside the budget having used most of it, and the audio map, until after
-  // the shared deadline. One deadline stops the audio half unanswered: TIMEOUT. A
-  // fresh deadline per half would outlive the late answer, fetch the audio
-  // fragments, merge and reach `ready`. Margins are seconds; see the module.
+  // acquisition limit is narrowed for this one job — handed to its executor as
+  // `timeLimits.downloadTimeLimitMs`, the value the runtime builds from
+  // `DOWNLOAD_TIME_LIMIT` in Production (VIDEOFETCH-LD1); processing keeps the
+  // default — and the fixture HOLDS two answers, late and never different: the
+  // video half's last fragment, so the video half completes inside the budget
+  // having used most of it, and the audio map, until after the shared
+  // deadline. One deadline stops the audio half unanswered: TIMEOUT. A fresh
+  // deadline per half would outlive the late answer, fetch the audio fragments,
+  // merge and reach `ready`. Margins are seconds; see the module.
   const controlProblems = hls12DeadlineControlProblems(HLS12_DEADLINE_CONTROL);
   if (controlProblems.length > 0) throw new Error(`the shared-deadline control cannot discriminate: ${controlProblems.join("; ")}`);
   const deadlineCase = prepared.cases["neg-deadline"];
@@ -1502,11 +1512,12 @@ async function runExecutionNegatives(ctx) {
     anchorPath: videoMapPath,
     releaseAfterMs: HLS12_DEADLINE_CONTROL.audioReleaseMs,
   });
-  const savedTimeoutMs = config.downloadTimeoutMs;
   const deadlineRun = await runExecutionNegative(ctx, "neg-deadline", {
     expectedCode: "TIMEOUT",
-    before: () => Object.assign(config, { downloadTimeoutMs: HLS12_DEADLINE_CONTROL.budgetMs }),
-    after: () => Object.assign(config, { downloadTimeoutMs: savedTimeoutMs }),
+    timeLimits: {
+      downloadTimeLimitMs: HLS12_DEADLINE_CONTROL.budgetMs,
+      processingMs: DEFAULT_WORKER_TIME_LIMITS.processingMs,
+    },
   });
   const deadline = evaluateHls12SharedDeadline({
     requests: service.requests("neg-deadline:acquisition").filter((r) => r.userAgentClass === "product"),
@@ -1540,7 +1551,19 @@ async function runExecutionNegatives(ctx) {
       service.requests().filter((r) => r.caseName === "neg-deadline" && r.kind === "fragment" && r.role === "audio").length === 0,
     deadlineRun.job.http.map((e) => `${requestLabel(e)}:${e.responseStatus}`).join(","),
   );
-  checks.record("neg-deadline/download-timeout-restored", config.downloadTimeoutMs === savedTimeoutMs);
+  // The control is CONFINED to its one job (since VIDEOFETCH-LD1 there is no
+  // process-wide value to restore): the narrowed limit reached exactly the
+  // neg-deadline executor, and every other job ran at the Product default.
+  const limitLedger = ctx.executorLimits;
+  checks.record(
+    "neg-deadline/download-timeout-restored",
+    limitLedger.filter((e) => e.caseName === "neg-deadline").length === 1 &&
+      limitLedger.every((e) =>
+        e.downloadTimeLimitMs ===
+        (e.caseName === "neg-deadline" ? HLS12_DEADLINE_CONTROL.budgetMs : DEFAULT_WORKER_TIME_LIMITS.downloadTimeLimitMs),
+      ),
+    limitLedger.map((e) => `${e.caseName}=${e.downloadTimeLimitMs}`).join(","),
+  );
   neverProcessed("neg-deadline", deadlineRun);
 
   return {
@@ -1636,7 +1659,7 @@ async function main(argv) {
     const spawnContext = { statusNow: () => "<no-job>", phase: "setup" };
     const ctx = {
       checks, service, prepared, toolchain, workRoot, timing, spawnContext, port: bound.port,
-      currentCase: "setup", documents: [], halves: new Map(), mergeArgvMatches: new Map(),
+      currentCase: "setup", documents: [], halves: new Map(), mergeArgvMatches: new Map(), executorLimits: [],
       transportState: { statusNow: () => "<no-job>", caseNow: () => "setup" },
     };
     const ledger = {

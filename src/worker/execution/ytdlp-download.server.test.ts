@@ -52,7 +52,7 @@ const SAFE_URL = "https://example.invalid/watch/abc";
 
 const MAX_BYTES = 500 * 1024 * 1024;
 
-const LIMITS = { maxFileSizeBytes: MAX_BYTES, downloadTimeoutSeconds: 600 };
+const LIMITS = { maxFileSizeBytes: MAX_BYTES, downloadTimeLimitMs: 600_000 };
 
 const OK_RUNTIME: YtdlpRuntimeStatus = Object.freeze({
   available: true,
@@ -497,7 +497,7 @@ describe("generic download: pre-flight ordering (§25/§26)", () => {
       baseDeps({
         runner,
         clock,
-        limits: { maxFileSizeBytes: MAX_BYTES, downloadTimeoutSeconds: 60 },
+        limits: { maxFileSizeBytes: MAX_BYTES, downloadTimeLimitMs: 60_000 },
         probeRuntime: async (o) => {
           probeBudget = o.timeoutMs ?? 0;
           now += 4_000; // the probe consumes 4s of the 60s budget
@@ -661,7 +661,7 @@ describe("generic download: actual-byte enforcement (§30/§58)", () => {
       SAFE_URL,
       workDir,
       videoPlan(),
-      baseDeps({ runner, limits: { maxFileSizeBytes: limit, downloadTimeoutSeconds: 60 } }),
+      baseDeps({ runner, limits: { maxFileSizeBytes: limit, downloadTimeLimitMs: 60_000 } }),
     );
     assert.equal(res.fileSize, limit);
   });
@@ -679,7 +679,7 @@ describe("generic download: actual-byte enforcement (§30/§58)", () => {
           SAFE_URL,
           workDir,
           videoPlan(),
-          baseDeps({ runner, limits: { maxFileSizeBytes: limit, downloadTimeoutSeconds: 60 } }),
+          baseDeps({ runner, limits: { maxFileSizeBytes: limit, downloadTimeLimitMs: 60_000 } }),
         ),
       (err: unknown) => err instanceof AppError && err.code === "TOO_LARGE",
     );
@@ -712,7 +712,7 @@ describe("generic download: actual-byte enforcement (§30/§58)", () => {
           baseDeps({
             runner,
             sizePollMs: 5,
-            limits: { maxFileSizeBytes: limit, downloadTimeoutSeconds: 60 },
+            limits: { maxFileSizeBytes: limit, downloadTimeLimitMs: 60_000 },
           }),
         ),
       (err: unknown) => err instanceof AppError && err.code === "TOO_LARGE",
@@ -745,7 +745,7 @@ describe("generic download: actual-byte enforcement (§30/§58)", () => {
           baseDeps({
             runner,
             sizePollMs: 5,
-            limits: { maxFileSizeBytes: limit, downloadTimeoutSeconds: 60 },
+            limits: { maxFileSizeBytes: limit, downloadTimeLimitMs: 60_000 },
           }),
         ),
       (err: unknown) => err instanceof AppError && err.code === "TOO_LARGE",
@@ -784,7 +784,7 @@ describe("generic download: actual-byte enforcement (§30/§58)", () => {
           SAFE_URL,
           workDir,
           videoPlan(),
-          baseDeps({ runner, sizePollMs: 5, limits: { maxFileSizeBytes: 8, downloadTimeoutSeconds: 60 } }),
+          baseDeps({ runner, sizePollMs: 5, limits: { maxFileSizeBytes: 8, downloadTimeLimitMs: 60_000 } }),
         ),
       );
       rmSync(expectedPartPath(workDir, "mp4"), { force: true });
@@ -987,7 +987,7 @@ describe("generic download: the pinned --max-filesize refusal (YTDLP-MAX-FILESIZ
   const LIMIT = 1000;
   /** A declared length no stack frame or line number could ever contain. */
   const DECLARED = 987_654_321;
-  const limits = { maxFileSizeBytes: LIMIT, downloadTimeoutSeconds: 60 };
+  const limits = { maxFileSizeBytes: LIMIT, downloadTimeLimitMs: 60_000 };
   const run = (
     overrides: Partial<Parameters<typeof downloadGenericOriginal>[3]> = {},
     url = SAFE_URL,
@@ -1323,7 +1323,7 @@ describe("generic download: the pinned --max-filesize refusal (YTDLP-MAX-FILESIZ
             SAFE_URL,
             workDir,
             videoPlan(),
-            baseDeps({ limits: { maxFileSizeBytes: LIMIT, downloadTimeoutSeconds: 1 }, clock }),
+            baseDeps({ limits: { maxFileSizeBytes: LIMIT, downloadTimeLimitMs: 1000 }, clock }),
           ),
         (err: unknown) => {
           assert.ok(err instanceof AppError);
@@ -1396,7 +1396,7 @@ describe("generic download: a pinned --max-filesize refusal on a LATER chunk (YT
   const LIMIT = 1000;
   /** A declared length no stack frame or line number could ever contain. */
   const DECLARED = 987_654_321;
-  const limits = { maxFileSizeBytes: LIMIT, downloadTimeoutSeconds: 60 };
+  const limits = { maxFileSizeBytes: LIMIT, downloadTimeLimitMs: 60_000 };
   const part = () => expectedPartPath(workDir, "mp4");
   const run = (
     overrides: Partial<Parameters<typeof downloadGenericOriginal>[3]> = {},
@@ -1970,7 +1970,7 @@ describe("generic download: first-cause abort latch (§11/§12)", () => {
         runner,
         statSize,
         sizePollMs: 1,
-        limits: { maxFileSizeBytes: 16, downloadTimeoutSeconds: 60 },
+        limits: { maxFileSizeBytes: 16, downloadTimeLimitMs: 60_000 },
       }),
       signal: caller.signal,
     }).catch((err: unknown) => {
