@@ -88,7 +88,6 @@ export type WorkerRuntimeOverrides = {
    * needs different limits configures them, exactly as an operator would.
    */
   executorDeps?: Omit<JobExecutorDeps, "timeLimits">;
-  jobTtlMs?: number;
   maintenanceIntervalMs?: number;
   maintenanceBatchSize?: number;
   maintenanceTimers?: Pick<WorkerMaintenanceDeps, "setIntervalFn" | "clearIntervalFn">;
@@ -101,7 +100,10 @@ export type WorkerRuntimeOverrides = {
 
 export type WorkerRuntime = {
   readonly config: WorkerRuntimeConfig;
-  /** The stage time limits, built once from `config` and handed to the executor. */
+  /**
+   * The time-limit model, built once from `config`: its stage limits go to the
+   * executor, its job lifetimes (`L`, `R`) to the durable store.
+   */
   readonly timeLimits: WorkerTimeLimits;
   readonly stateDirectory: string;
   readonly databasePath: string;
@@ -129,7 +131,7 @@ export type WorkerRuntime = {
  * Mandatory initialization order (§11) — every step must succeed before the
  * next begins, and the caller must not `listen()` until this resolves:
  *
- *   validated config → stage time limits → persistent directory →
+ *   validated config → time limits and job lifetimes → persistent directory →
  *   openWorkerDatabase → applyMigrations → SQLiteJobStore → store.recover() →
  *   SQLiteWorkerReplayStore → writer → executor → runner → pump →
  *   service → server → maintenance
@@ -141,15 +143,21 @@ export async function createWorkerRuntime(
   config: WorkerRuntimeConfig,
   overrides: WorkerRuntimeOverrides = {},
 ): Promise<WorkerRuntime> {
-  // ── The stage time limits (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001) ──────────
+  // ── The time limits (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001) and job
+  //    lifetimes (VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001) ─────────────
   //
-  // Built ONCE, here, from the strict loader's validated values, and handed to
-  // the executor as the single source of every acquisition deadline and
-  // processing budget. Built first, so a malformed configuration fails before
-  // any directory or database is touched. The builder re-checks the ranges.
+  // Built ONCE, here, from the strict loader's validated values: the single
+  // source of every acquisition deadline and processing budget handed to the
+  // executor, and of the derived execution lifetime `L` and the retention `R`
+  // handed to the durable store. Built first, so a malformed configuration
+  // fails before any directory or database is touched. The builder re-checks
+  // the ranges.
   const timeLimits = buildWorkerTimeLimits({
+    analysisTimeoutSeconds: config.media.analysisTimeoutSeconds,
     downloadTimeLimitSeconds: config.media.downloadTimeLimitSeconds,
     processingTimeoutSeconds: config.media.processingTimeoutSeconds,
+    uploadTimeoutSeconds: config.media.uploadTimeoutSeconds,
+    fileExpirationMinutes: config.media.fileExpirationMinutes,
   });
 
   const prepared = await prepareWorkerStateDirectory(config.dataDirectory);
@@ -161,19 +169,16 @@ export async function createWorkerRuntime(
   try {
     applyMigrations(db);
 
-    // The operator-configured retention is authoritative for durable job rows:
-    // every job's `expiresAt` is derived from it, and Vercel refuses to sign a
-    // download URL past that instant. `FILE_EXPIRATION_MINUTES` is validated to
-    // 1..1440, so the product stays far inside the safe-integer range.
-    const configuredJobTtlMs = config.media.fileExpirationMinutes * 60_000;
-    if (!Number.isSafeInteger(configuredJobTtlMs) || configuredJobTtlMs <= 0) {
-      throw new Error("configured job TTL must be a positive safe integer");
-    }
-    const effectiveJobTtlMs = overrides.jobTtlMs ?? configuredJobTtlMs;
-
+    // The model's lifetimes are authoritative for durable job rows
+    // (VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001): the store assigns
+    // `expiresAt` from them — `created + L` queued, `claimed + L` running,
+    // `finished + R` once terminal — and Vercel refuses to sign a download URL
+    // past that instant. There is no test override: the configuration is the
+    // one owner, exactly as for the stage limits.
     const store = new SQLiteJobStore({
       db,
-      jobTtlMs: effectiveJobTtlMs,
+      executionLifetimeMs: timeLimits.executionLifetimeMs,
+      retentionMs: timeLimits.retentionMs,
       ...(overrides.clock ? { clock: overrides.clock } : {}),
     });
 
@@ -206,7 +211,10 @@ export async function createWorkerRuntime(
     // lifetime where that is known, which is why the durable store is consulted
     // here. An unknown deadline falls back to the action's conservative
     // ceiling, and an EXPIRED job still yields the floor so maintenance can
-    // mint a fresh DeleteObject-only credential.
+    // mint a fresh DeleteObject-only credential. Since LD-2a a running job's
+    // deadline is `claimed + L`, so a PutObject credential is normally the
+    // action's 900 s ceiling: a longer job lifetime never lengthens a
+    // credential.
     const credentials =
       overrides.r2Credentials ??
       new BrokerR2CredentialProvider({
@@ -281,7 +289,9 @@ export async function createWorkerRuntime(
         ...executorDeps,
         // AFTER the test seams: the strict configuration is the one owner of
         // every stage time limit — direct, generic, split, clear-HLS and
-        // separate-audio acquisition, and every processing stage.
+        // separate-audio acquisition, and every processing stage. The executor
+        // keeps only those two; the lifetimes went to the store above, and it
+        // reads its execution deadline back from the job it claims.
         timeLimits,
       },
     );

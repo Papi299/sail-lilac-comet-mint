@@ -102,7 +102,8 @@ See `.env.example`. Important knobs:
 | --- | --- | --- |
 | `MAX_FILE_SIZE` | 4 GiB (4,294,967,296 bytes) | Reject delivered outputs larger than this. A capacity contract as well as a limit — see *Large files* below. |
 | `MAX_VIDEO_DURATION` | 2 hours | Reject longer videos |
-| `FILE_EXPIRATION_MINUTES` | 45 | Temporary file lifetime |
+| `FILE_EXPIRATION_MINUTES` | 45 | Worker: retention after a job ends, 1–55 minutes. A ready file's link — and a failed or cancelled outcome — stays available this long, counted from the end of the job rather than its creation (VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001; runbook §7b). |
+| `UPLOAD_TIMEOUT` | 3,600 s | Worker-only, 300–14,400 s. The upload's share of the derived job lifetime. Parsed and budgeted only: the upload itself is not yet bounded or cancellable (a later phase, LD-2b). |
 | `DOWNLOAD_TIME_LIMIT` | 600 s | Worker-only. ONE absolute deadline for a job's whole acquisition (60–21,600 s). Progress never extends it. Long downloads are **not** enabled yet: the default stays 600 s until the later lifecycle, upload, inactivity and cancellation work is live. |
 | `PROCESSING_TIMEOUT` | 600 s | Worker-only. ONE absolute deadline per processing stage (60–14,400 s), shared by every FFmpeg/ffprobe subprocess of that stage — a split merge's two input probes, the merge and its output probe share one budget. |
 | ~~`DOWNLOAD_TIMEOUT`~~ | — | **Retired** for the Worker (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001): it bounded acquisition and every processing subprocess with one value. The Worker refuses to start if it is present at all, empty included. It is not an alias of either variable above; remove it from the Worker environment before deploying. |
@@ -120,7 +121,7 @@ Analyze/download rate limits and per-operator concurrency are keyed on the priva
 **Large files.** The delivered-file ceiling is 4 GiB, and it is a capacity contract as well as a limit:
 
 - The Worker executes one job at a time. A job keeps its original and its produced file side by side (or both split halves and the merge), so it can need up to **8 GiB** of local media space. The Worker refuses to start unless its media workspace can hold that. In Production the workspace is a bounded **10 GiB disk-backed ext4 filesystem**, not a memory-backed tmpfs (`deploy/README.md`, runbook §2a).
-- Size is not the only bound. Every acquisition — direct, generic or HLS — must finish within `DOWNLOAD_TIME_LIMIT` (600 s, absolute), so a 4 GiB file needs roughly 57 Mbit/s of sustained download. Local processing (`PROCESSING_TIMEOUT`, per stage) and the job's `FILE_EXPIRATION_MINUTES` lifetime are separate bounds too. Completion at arbitrary bandwidth is not guaranteed; a transfer that is too slow fails as `TIMEOUT`.
+- Size is not the only bound. Every acquisition — direct, generic or HLS — must finish within `DOWNLOAD_TIME_LIMIT` (600 s, absolute), so a 4 GiB file needs roughly 57 Mbit/s of sustained download. Local processing (`PROCESSING_TIMEOUT`, per stage) is a separate bound too, and so is the job's lifetime: derived from those limits plus the upload's share, with `FILE_EXPIRATION_MINUTES` of retention once the job ends (runbook §7b). Completion at arbitrary bandwidth is not guaranteed; a transfer that is too slow fails as `TIMEOUT`.
 - The finished file is stored with **one single-part upload**, which 4 GiB fits under the object store's single-part limit. There is no multipart upload and no upload resume; a failed upload fails the job. The browser downloads the file directly from object storage through a short-lived signed link — the control plane never proxies it.
 
 ## API

@@ -310,6 +310,76 @@ describe("Upload Lifecycle Coordinator", () => {
     assert.ok(!json.includes("provider-request-id-123"));
   });
 
+  // ── VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001: the lifetime race ──────
+  //
+  // The ready commit requires the job's execution lifetime to still be
+  // running. A clock-controlled store over the same database plays an upload
+  // that finishes after `claimed + L`.
+  function lifetimeStore() {
+    const clock = { now: 1_800_000_000_000 };
+    const timed = new SQLiteJobStore({ db, clock: () => clock.now, executionLifetimeMs: 60_000, retentionMs: 30_000 });
+    const { job } = timed.createJob(
+      { url: "https://example.com/video", formatId: "preset:1080", principalId: "private-access-user" },
+      randomUUID(),
+    ) as { job: WorkerJobView };
+    clock.now += 1_000;
+    const claimed = timed.claimNextQueuedJob()!;
+    db.prepare("UPDATE worker_jobs SET status = 'uploading' WHERE job_id = ?").run(job.jobId);
+    return { clock, timed, jobId: job.jobId, deadline: claimed.expiresAt };
+  }
+
+  it("LD-2a: an upload finishing after the lifetime is refused, and exactly its key is deleted", async () => {
+    const { clock, timed, jobId, deadline } = lifetimeStore();
+    const originalHead = writer.head.bind(writer);
+    writer.head = async (key) => {
+      clock.now = deadline + 1; // the PUT and HEAD took the job past its deadline
+      return originalHead(key);
+    };
+
+    const result = await finalizeJobUpload({ ...getUploadInput(jobId), store: timed });
+
+    assert.deepStrictEqual(result, { type: "lifetime_expired", cleanup: "deleted" });
+    assert.strictEqual(writer.putCalls.length, 1);
+    assert.deepStrictEqual(writer.deleteCalls, [writer.putCalls[0]!.objectKey], "exactly the uploaded key");
+    assert.strictEqual(writer.objects.size, 0, "no unauthorised object survives");
+    const view = timed.getJob(jobId)!;
+    assert.strictEqual(view.status, "uploading", "left to its executor, which fails it");
+    assert.strictEqual(view.objectKey, null);
+    assert.strictEqual(view.expiresAt, deadline);
+  });
+
+  it("LD-2a: a failed cleanup after the refused commit is reported as failed, never as ready", async () => {
+    const { clock, timed, jobId, deadline } = lifetimeStore();
+    const originalHead = writer.head.bind(writer);
+    writer.head = async (key) => {
+      clock.now = deadline;
+      return originalHead(key);
+    };
+    writer.deleteShouldThrow = true;
+
+    const result = await finalizeJobUpload({ ...getUploadInput(jobId), store: timed });
+
+    assert.deepStrictEqual(result, { type: "lifetime_expired", cleanup: "failed" });
+    assert.strictEqual(writer.deleteCalls.length, 1);
+    assert.strictEqual(timed.getJob(jobId)!.status, "uploading");
+    assert.deepStrictEqual(timed.listExpiredReadyObjects(10), [], "never reachable through ready metadata");
+  });
+
+  it("LD-2a: a commit a millisecond before the deadline is ready, retained R from it", async () => {
+    const { clock, timed, jobId, deadline } = lifetimeStore();
+    const originalHead = writer.head.bind(writer);
+    writer.head = async (key) => {
+      clock.now = deadline - 1;
+      return originalHead(key);
+    };
+
+    const result = await finalizeJobUpload({ ...getUploadInput(jobId), store: timed });
+
+    assert.strictEqual(result.type, "ready");
+    assert.strictEqual(result.type === "ready" && result.job.expiresAt, deadline - 1 + 30_000);
+    assert.strictEqual(writer.deleteCalls.length, 0);
+  });
+
   it("cancel race: delete succeeds -> cleanup == deleted", async () => {
     const job = setupUploadingJob();
     const input = getUploadInput(job.jobId);

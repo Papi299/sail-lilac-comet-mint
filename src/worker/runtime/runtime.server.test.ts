@@ -168,6 +168,7 @@ function makeConfig(
       fileExpirationMinutes: 45,
       downloadTimeLimitSeconds: 600,
       processingTimeoutSeconds: 600,
+      uploadTimeoutSeconds: 3600,
       analysisTimeoutSeconds: 45,
       maxRedirects: 5,
       ytdlp: { enabled: false },
@@ -710,12 +711,29 @@ describe("Worker runtime composition", () => {
     });
   });
 
-  // ── Correction-01: FILE_EXPIRATION_MINUTES reaches durable state ──────────
-  describe("configured job TTL", () => {
-    it("derives the DURABLE expiresAt from fileExpirationMinutes", async () => {
+  // ── Correction-01, redesigned by VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001:
+  //    the configured lifetimes reach durable state ─────────────────────────
+  describe("configured job lifetime and retention", () => {
+    const expiryRow = (runtime: Awaited<ReturnType<typeof createWorkerRuntime>>, jobId: string) =>
+      runtime.db
+        .prepare("SELECT created_at_ms, started_at_ms, finished_at_ms, expires_at_ms FROM worker_jobs WHERE job_id = ?")
+        .get(jobId) as {
+        created_at_ms: number;
+        started_at_ms: number | null;
+        finished_at_ms: number | null;
+        expires_at_ms: number;
+      };
+
+    it("assigns created + L at creation, L derived from the configured stage limits", async () => {
       const FIXED_NOW = 1_800_000_000_000;
       const runtime = await createWorkerRuntime(
-        makeConfig(join(root, "state"), await reservePort(), { fileExpirationMinutes: 7 }),
+        makeConfig(join(root, "state"), await reservePort(), {
+          analysisTimeoutSeconds: 30,
+          downloadTimeLimitSeconds: 120,
+          processingTimeoutSeconds: 90,
+          uploadTimeoutSeconds: 300,
+          fileExpirationMinutes: 7,
+        }),
         {
           objectStoreWriter: new MemoryWriter(),
           executorDeps: mediaDeps(),
@@ -732,29 +750,37 @@ describe("Worker runtime composition", () => {
         const job = created.type === "created" ? created.job : null;
         assert.ok(job);
 
-        // The durable row itself — not the parsed config — must carry the TTL.
+        // L = 30 + 120 + 90 + 300 + 600 s. The durable row itself — not the
+        // parsed config — carries it; retention plays no part until terminal.
+        assert.equal(runtime.timeLimits.executionLifetimeMs, 1_140_000);
         assert.equal(job.createdAt, FIXED_NOW);
-        assert.equal(job.expiresAt - job.createdAt, 420_000, "7 minutes in milliseconds");
-        assert.equal(job.expiresAt, FIXED_NOW + 420_000);
-
-        // Confirmed straight from SQLite, bypassing the view entirely.
-        const row = runtime.db
-          .prepare("SELECT created_at_ms, expires_at_ms FROM worker_jobs WHERE job_id = ?")
-          .get(job.jobId) as { created_at_ms: number; expires_at_ms: number };
-        assert.equal(Number(row.expires_at_ms) - Number(row.created_at_ms), 420_000);
+        assert.equal(job.expiresAt, FIXED_NOW + 1_140_000);
+        const row = expiryRow(runtime, job.jobId);
+        assert.equal(Number(row.expires_at_ms) - Number(row.created_at_ms), 1_140_000);
       } finally {
         await runtime.shutdown();
       }
     });
 
-    it("uses a different configured retention for a different value", async () => {
-      const FIXED_NOW = 1_800_000_000_000;
+    it("re-assigns claimed + L at claim and finished + R at ready, from the configuration", async () => {
+      const T0 = 1_800_000_000_000;
+      let now = T0;
       const runtime = await createWorkerRuntime(
-        makeConfig(join(root, "state"), await reservePort(), { fileExpirationMinutes: 90 }),
+        makeConfig(join(root, "state"), await reservePort(), { fileExpirationMinutes: 7 }),
         {
           objectStoreWriter: new MemoryWriter(),
-          executorDeps: mediaDeps(),
-          clock: () => FIXED_NOW,
+          executorDeps: {
+            ...mediaDeps(),
+            // Acquisition takes a simulated minute: the ready instant is later
+            // than the claim, and the retention is counted from it.
+            downloadOriginal: async (_url, ctx) => {
+              now += 60_000;
+              const filePath = join(ctx.workDir, "original.mp4");
+              await writeFile(filePath, "RUNTIME-MEDIA-BYTES");
+              return { filePath, container: "mp4", mime: "video/mp4", fileSize: 19 };
+            },
+          },
+          clock: () => now,
         },
       );
 
@@ -763,15 +789,24 @@ describe("Worker runtime composition", () => {
           { url: MEDIA_URL, formatId: FORMAT_ID, principalId: "private-access-user" },
           randomUUID(),
         );
-        const job = created.type === "created" ? created.job : null;
-        assert.ok(job);
-        assert.equal(job.expiresAt - job.createdAt, 5_400_000, "90 minutes in milliseconds");
+        const jobId = created.type === "created" ? created.job.jobId : "";
+        assert.equal(created.type === "created" && created.job.expiresAt, T0 + 5_445_000);
+
+        now = T0 + 1_000; // the claim happens a second after creation
+        runtime.wakeQueue();
+        await waitFor(() => runtime.store.getJob(jobId)?.status === "ready", "the job to become ready");
+
+        const row = expiryRow(runtime, jobId);
+        assert.equal(Number(row.started_at_ms), T0 + 1_000, "claimed a second after creation");
+        assert.equal(Number(row.finished_at_ms), T0 + 61_000, "ready a minute after the claim");
+        assert.equal(Number(row.expires_at_ms), T0 + 61_000 + 420_000, "ready + 7 minutes, exactly");
+        assert.equal(runtime.store.getJob(jobId)?.expiresAt, T0 + 481_000);
       } finally {
         await runtime.shutdown();
       }
     });
 
-    it("lets an explicit test override win over the configured retention", async () => {
+    it("has no lifetime override: the configuration is the one owner", async () => {
       const FIXED_NOW = 1_800_000_000_000;
       const runtime = await createWorkerRuntime(
         makeConfig(join(root, "state"), await reservePort(), { fileExpirationMinutes: 45 }),
@@ -779,7 +814,9 @@ describe("Worker runtime composition", () => {
           objectStoreWriter: new MemoryWriter(),
           executorDeps: mediaDeps(),
           clock: () => FIXED_NOW,
-          jobTtlMs: 1_000,
+          // The retired override, refused by the type; passed anyway, it is
+          // read by nothing.
+          ...({ jobTtlMs: 1_000 } as object),
         },
       );
 
@@ -790,7 +827,7 @@ describe("Worker runtime composition", () => {
         );
         const job = created.type === "created" ? created.job : null;
         assert.ok(job);
-        assert.equal(job.expiresAt - job.createdAt, 1_000);
+        assert.equal(job.expiresAt - job.createdAt, 5_445_000, "the configured L, at the defaults");
       } finally {
         await runtime.shutdown();
       }

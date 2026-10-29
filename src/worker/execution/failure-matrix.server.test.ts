@@ -403,7 +403,11 @@ describe("failure matrix", () => {
     assert.deepEqual(consoleErrors, [], "execution must not log raw diagnostics at all");
   });
 
-  it("expired jobs terminate with EXPIRED and never download", async () => {
+  it("a job past its execution lifetime terminates with TIMEOUT, never EXPIRED, and never downloads", async () => {
+    // VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001: a claimed job's
+    // `expiresAt` is its execution deadline (`claimed + L`). Running past it is
+    // a TIMEOUT with the stage of the status it leaves — "This download link
+    // has expired" described no running job.
     const job = claimJob(h.store, "direct-original");
     let analyzed = 0;
     const executor = new JobExecutor(
@@ -421,7 +425,10 @@ describe("failure matrix", () => {
     await executor.execute(job);
 
     assert.equal(analyzed, 0);
-    assertSafeTerminalFailure(h, executor, job.jobId, "EXPIRED", "expired job");
+    assertSafeTerminalFailure(h, executor, job.jobId, "TIMEOUT", "job past its execution lifetime");
+    const view = h.store.getJob(job.jobId)!;
+    assert.notEqual(view.errorCode, "EXPIRED");
+    assert.equal(view.stageLabel, "Download failed", "the stage of `analyzing`, the status it left");
   });
 });
 

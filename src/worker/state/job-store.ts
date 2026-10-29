@@ -174,10 +174,16 @@ export const CommitReadyInputSchema = z.object({
 
 export type CommitReadyInput = z.infer<typeof CommitReadyInputSchema>;
 
-export type CommitReadyResult = 
+export type CommitReadyResult =
   | { type: "ready"; job: WorkerJobView }
   | { type: "terminal"; job: WorkerJobView }
   | { type: "not_uploading"; job: WorkerJobView }
+  /**
+   * LD-2a: the job is still `uploading`, but its execution lifetime
+   * (`claimed + L`) has ended, so it may no longer become ready. Nothing was
+   * written; the caller must delete the exact key it uploaded.
+   */
+  | { type: "lifetime_expired"; job: WorkerJobView }
   | { type: "not_found" };
 
 export const ExpiredReadyObjectSchema = z.object({
@@ -197,6 +203,24 @@ export const ExpiredReadyObjectSchema = z.object({
 
 export type ExpiredReadyObject = z.infer<typeof ExpiredReadyObjectSchema>;
 
+/**
+ * The durable job store.
+ *
+ * Job lifetime (VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001). One column,
+ * `expiresAt` — "the instant after which this job is no longer authorised" — is
+ * assigned at most three times per job, each inside the transaction of the
+ * transition it belongs to, together with the job's idempotency record:
+ *
+ *  - `createJob` (→ `queued`): `created + L`, the queue-wait bound;
+ *  - `claimNextQueuedJob` (`queued` → `analyzing`): `claimed + L`, the
+ *    execution bound;
+ *  - every terminal transition — `commitReadyFromUploading`, `failJob`,
+ *    `cancelJob`, `recover` — `finished + R`, the retention.
+ *
+ * Nothing else moves it: no progress write, no stage transition, no replay.
+ * The status machine is acyclic, so the assignments are finite and there is
+ * no renewal path. `L` and `R` come from the runtime's one time-limit model.
+ */
 export interface WorkerJobStore {
   createJob(
     request: WorkerCreateJobRequest,
@@ -223,6 +247,11 @@ export interface WorkerJobStore {
   updateExecutionProgress(jobId: string, expectedStatus: WorkerExecutionProgressStatus, input: UpdateProgressInput): ExecutionMutationResult;
   beginProcessing(jobId: string): ExecutionMutationResult;
   beginUploading(jobId: string): ExecutionMutationResult;
+  /**
+   * `uploading` → `ready`, only while the job's execution lifetime is still
+   * running (`expiresAt > now`, part of the conditional write). A late upload
+   * gets `lifetime_expired` and nothing is written.
+   */
   commitReadyFromUploading(jobId: string, input: CommitReadyInput): CommitReadyResult;
 
   listExpiredReadyObjects(limit: number): ExpiredReadyObject[];

@@ -3,7 +3,13 @@ import { Buffer } from "node:buffer";
 import { z } from "zod";
 import { WorkerKeyIdSchema } from "../../shared/worker/auth.ts";
 import { DEFAULT_MAX_FILE_SIZE_BYTES } from "../../shared/media-limits.ts";
-import { DOWNLOAD_TIME_LIMIT_SECONDS, PROCESSING_TIMEOUT_SECONDS } from "./time-limits.ts";
+import {
+  ANALYSIS_TIMEOUT_SECONDS,
+  DOWNLOAD_TIME_LIMIT_SECONDS,
+  FILE_EXPIRATION_MINUTES_RANGE,
+  PROCESSING_TIMEOUT_SECONDS,
+  UPLOAD_TIMEOUT_SECONDS,
+} from "./time-limits.ts";
 
 /**
  * Strict Worker runtime configuration boundary (Phase 8A §6/§7).
@@ -192,14 +198,18 @@ const MEDIA_DEFAULTS = {
   // workspace that cannot hold 2 × it.
   maxFileSizeBytes: DEFAULT_MAX_FILE_SIZE_BYTES,
   maxVideoDurationSeconds: 2 * 60 * 60,
-  fileExpirationMinutes: 45,
+  // VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001: the retention after a job
+  // ends (ready, failed, cancelled), no longer a TTL counted from creation.
+  fileExpirationMinutes: FILE_EXPIRATION_MINUTES_RANGE.default,
   // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: the two stage limits that replace the
   // retired DOWNLOAD_TIMEOUT. Their ranges and defaults live in `time-limits.ts`
   // so the loader and the model cannot disagree. The acquisition default stays
   // 600 s; the long-download value is a later, separate change (LD-5b).
   downloadTimeLimitSeconds: DOWNLOAD_TIME_LIMIT_SECONDS.default,
   processingTimeoutSeconds: PROCESSING_TIMEOUT_SECONDS.default,
-  analysisTimeoutSeconds: 45,
+  // LD-2a: parsed and budgeted into the derived job lifetime; enforced from LD-2b.
+  uploadTimeoutSeconds: UPLOAD_TIMEOUT_SECONDS.default,
+  analysisTimeoutSeconds: ANALYSIS_TIMEOUT_SECONDS.default,
   maxRedirects: 5,
 } as const;
 
@@ -231,11 +241,21 @@ export type WorkerRuntimeConfig = {
   readonly media: {
     readonly maxFileSizeBytes: number;
     readonly maxVideoDurationSeconds: number;
+    /**
+     * `FILE_EXPIRATION_MINUTES`: how long a job's terminal outcome — a ready
+     * file's link included — stays authorised after the job ends. 1..55.
+     */
     readonly fileExpirationMinutes: number;
     /** `DOWNLOAD_TIME_LIMIT`: ONE absolute deadline for a job's acquisition stage. */
     readonly downloadTimeLimitSeconds: number;
     /** `PROCESSING_TIMEOUT`: ONE absolute deadline per processing stage. */
     readonly processingTimeoutSeconds: number;
+    /**
+     * `UPLOAD_TIMEOUT`: the upload's share of the derived job lifetime. Parsed
+     * and budgeted since LD-2a, NOT enforced: nothing bounds or cancels the
+     * R2 upload before LD-2b.
+     */
+    readonly uploadTimeoutSeconds: number;
     readonly analysisTimeoutSeconds: number;
     readonly maxRedirects: number;
     readonly tempDirectory: string | null;
@@ -560,10 +580,13 @@ export function loadWorkerRuntimeConfig(
       invalid,
       MEDIA_DEFAULTS.maxVideoDurationSeconds,
     ),
+    // LD-2a: capped at 55 (was 1440). Retention is now counted from the moment
+    // a job ends, and a ready link must end before the R2 lifecycle rule
+    // deletes the object 60 minutes after it was written.
     fileExpirationMinutes: readOptionalField(
       "FILE_EXPIRATION_MINUTES",
       env.FILE_EXPIRATION_MINUTES,
-      boundedInt(1, 1440),
+      boundedInt(FILE_EXPIRATION_MINUTES_RANGE.min, FILE_EXPIRATION_MINUTES_RANGE.max),
       invalid,
       MEDIA_DEFAULTS.fileExpirationMinutes,
     ),
@@ -581,10 +604,17 @@ export function loadWorkerRuntimeConfig(
       invalid,
       MEDIA_DEFAULTS.processingTimeoutSeconds,
     ),
+    uploadTimeoutSeconds: readOptionalField(
+      "UPLOAD_TIMEOUT",
+      env.UPLOAD_TIMEOUT,
+      boundedInt(UPLOAD_TIMEOUT_SECONDS.min, UPLOAD_TIMEOUT_SECONDS.max),
+      invalid,
+      MEDIA_DEFAULTS.uploadTimeoutSeconds,
+    ),
     analysisTimeoutSeconds: readOptionalField(
       "ANALYSIS_TIMEOUT",
       env.ANALYSIS_TIMEOUT,
-      boundedInt(1, 3600),
+      boundedInt(ANALYSIS_TIMEOUT_SECONDS.min, ANALYSIS_TIMEOUT_SECONDS.max),
       invalid,
       MEDIA_DEFAULTS.analysisTimeoutSeconds,
     ),

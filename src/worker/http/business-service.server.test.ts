@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -180,6 +181,124 @@ describe("Worker business service", () => {
       (err: unknown) =>
         err instanceof WorkerBusinessError && err.code === "EXPIRED" && err.httpStatus === 410,
     );
+  });
+
+  // ── LD-2a: what the view returns, and when it answers 410 ─────────────────
+  //
+  // VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001. The store here runs the
+  // strict loader's default lifetimes — L = 5,445,000 ms, R = 2,700,000 ms —
+  // and every job is driven through the store directly, so no execution runs.
+  describe("LD-2a visibility", () => {
+    const L = 5_445_000;
+    const R = 2_700_000;
+    const ACTIVE = ["analyzing", "downloading", "processing", "uploading"] as const;
+
+    const isExpired = (err: unknown) =>
+      err instanceof WorkerBusinessError && err.code === "EXPIRED" && err.httpStatus === 410;
+
+    function queue(): string {
+      const res = store.createJob(request(), randomUUID());
+      assert.equal(res.type, "created");
+      return res.type === "created" ? res.job.jobId : "";
+    }
+
+    /** Claims the job a second after creation and drives it to `status`, a minute per step. */
+    function activate(jobId: string, status: (typeof ACTIVE)[number]): number {
+      now += 1_000;
+      const claimedAt = now;
+      assert.equal(store.claimNextQueuedJob()?.jobId, jobId);
+      const steps = [
+        () => store.completeAnalysis(jobId, { title: "Clip", thumbnail: null, source: "cdn.example", extractor: "direct" }),
+        () => store.beginProcessing(jobId),
+        () => store.beginUploading(jobId),
+      ];
+      for (const step of steps.slice(0, ACTIVE.indexOf(status))) {
+        now += 60_000;
+        assert.equal(step().type, "updated");
+      }
+      return claimedAt;
+    }
+
+    for (const status of ACTIVE) {
+      it(`returns an ${status} job past the retired 45-minute instant, and past its own deadline`, async () => {
+        const service = makeService();
+        const createdAt = now;
+        const jobId = queue();
+        const claimedAt = activate(jobId, status);
+
+        now = createdAt + 46 * 60_000; // the old creation-based TTL would 410 here
+        const got = await service.getJob(jobId);
+        assert.equal(got.job.status, status);
+        assert.equal(got.job.expiresAt, claimedAt + L, "the view reports the execution deadline");
+
+        // Past even that: the executor owns an active job's lifetime and fails
+        // it as TIMEOUT; the view keeps answering with the authoritative row.
+        now = claimedAt + L + 1;
+        assert.equal((await service.getJob(jobId)).job.status, status);
+      });
+    }
+
+    it("returns a queued job until created + L and answers 410 EXPIRED from that instant", async () => {
+      const service = makeService();
+      const createdAt = now;
+      const jobId = queue();
+      now = createdAt + L - 1;
+      assert.equal((await service.getJob(jobId)).job.status, "queued");
+      now = createdAt + L;
+      await assert.rejects(() => service.getJob(jobId), isExpired);
+    });
+
+    it("returns a ready job until ready + R, answers 410 EXPIRED then, and 404 once its metadata is cleaned", async () => {
+      const service = makeService();
+      const jobId = queue();
+      activate(jobId, "uploading");
+      now += 30 * 60_000; // a long pipeline: the full retention is still counted from ready
+      const readyAt = now;
+      const objectKey = `videofetch/jobs/${jobId}/${"b".repeat(32)}`;
+      const ready = store.commitReadyFromUploading(jobId, {
+        objectKey,
+        filename: "clip.mp4",
+        fileSize: 8,
+        mime: "video/mp4",
+        quality: null,
+        container: "mp4",
+      });
+      assert.equal(ready.type, "ready");
+
+      now = readyAt + R - 1;
+      const got = await service.getJob(jobId);
+      assert.equal(got.job.status, "ready");
+      assert.equal(got.job.expiresAt, readyAt + R);
+      now = readyAt + R;
+      await assert.rejects(() => service.getJob(jobId), isExpired);
+
+      assert.equal(store.deleteExpiredReadyMetadata(jobId, objectKey), true);
+      await assert.rejects(
+        () => service.getJob(jobId),
+        (err: unknown) => err instanceof WorkerBusinessError && err.code === "NOT_FOUND" && err.httpStatus === 404,
+      );
+    });
+
+    for (const terminal of ["failed", "cancelled"] as const) {
+      for (const from of ["queued", "downloading"] as const) {
+        it(`returns a ${terminal} job (from ${from}) until finished + R, then answers 410 EXPIRED`, async () => {
+          const service = makeService();
+          const jobId = queue();
+          if (from === "downloading") activate(jobId, "downloading");
+          now += 7_000;
+          const finishedAt = now;
+          if (terminal === "failed") store.failJob(jobId, "TIMEOUT", "The video took too long to process.");
+          else store.cancelJob(jobId);
+
+          now = finishedAt + R - 1;
+          const got = await service.getJob(jobId);
+          assert.equal(got.job.status, terminal);
+          assert.equal(got.job.expiresAt, finishedAt + R);
+          now = finishedAt + R;
+          await assert.rejects(() => service.getJob(jobId), isExpired);
+        });
+      }
+    }
   });
 
   it("returns the server-to-server job view for a live job", async () => {

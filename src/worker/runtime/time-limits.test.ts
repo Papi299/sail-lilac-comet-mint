@@ -12,18 +12,28 @@ import type { WorkerRuntimeConfig } from "./config.server.ts";
 import { startWorker } from "./main.server.ts";
 import { createWorkerRuntime } from "./runtime.server.ts";
 import {
+  ANALYSIS_TIMEOUT_SECONDS,
   DEFAULT_WORKER_TIME_LIMITS,
   DOWNLOAD_TIME_LIMIT_SECONDS,
+  EXECUTION_MARGIN_SECONDS,
+  FILE_EXPIRATION_MINUTES_RANGE,
   PROCESSING_TIMEOUT_SECONDS,
+  UPLOAD_TIMEOUT_SECONDS,
   WorkerTimeLimitsError,
-  assertWorkerTimeLimits,
+  assertWorkerJobLifetimes,
+  assertWorkerStageTimeLimits,
   buildWorkerTimeLimits,
+  type WorkerTimeLimitInputs,
 } from "./time-limits.ts";
 
 /**
  * VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: the stage time-limit model, its one
  * construction point in the runtime, and the startup refusal of the retired
  * `DOWNLOAD_TIMEOUT`.
+ *
+ * VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001: the same model now also
+ * carries the job lifetimes — the derived execution lifetime `L` and the
+ * retention `R` — and the parsed-but-not-enforced `UPLOAD_TIMEOUT`.
  *
  * Every value here is a fake. No network, no real media and no real R2.
  */
@@ -34,138 +44,263 @@ const BAD_FIELD = (field: string) => (err: unknown) => {
   return true;
 };
 
+/** The strict loader's defaults, as builder inputs. */
+const DEFAULT_INPUTS: WorkerTimeLimitInputs = Object.freeze({
+  analysisTimeoutSeconds: 45,
+  downloadTimeLimitSeconds: 600,
+  processingTimeoutSeconds: 600,
+  uploadTimeoutSeconds: 3600,
+  fileExpirationMinutes: 45,
+});
+
+const inputs = (overrides: Partial<WorkerTimeLimitInputs> = {}): WorkerTimeLimitInputs => ({
+  ...DEFAULT_INPUTS,
+  ...overrides,
+});
+
+/** Each builder input with its range and its unit in milliseconds. */
+const INPUT_FIELDS = [
+  { field: "analysisTimeoutSeconds", range: ANALYSIS_TIMEOUT_SECONDS, unitMs: 1000, out: "analysisMs" },
+  { field: "downloadTimeLimitSeconds", range: DOWNLOAD_TIME_LIMIT_SECONDS, unitMs: 1000, out: "downloadTimeLimitMs" },
+  { field: "processingTimeoutSeconds", range: PROCESSING_TIMEOUT_SECONDS, unitMs: 1000, out: "processingMs" },
+  { field: "uploadTimeoutSeconds", range: UPLOAD_TIMEOUT_SECONDS, unitMs: 1000, out: "uploadMs" },
+  { field: "fileExpirationMinutes", range: FILE_EXPIRATION_MINUTES_RANGE, unitMs: 60_000, out: "retentionMs" },
+] as const;
+
 describe("WorkerTimeLimits: the model", () => {
-  it("states the approved ranges and the LD-1 defaults", () => {
+  it("states the approved ranges, the margin and the defaults", () => {
+    assert.deepEqual({ ...ANALYSIS_TIMEOUT_SECONDS }, { min: 1, max: 3_600, default: 45 });
     assert.deepEqual({ ...DOWNLOAD_TIME_LIMIT_SECONDS }, { min: 60, max: 21_600, default: 600 });
     assert.deepEqual({ ...PROCESSING_TIMEOUT_SECONDS }, { min: 60, max: 14_400, default: 600 });
-    assert.ok(Object.isFrozen(DOWNLOAD_TIME_LIMIT_SECONDS));
-    assert.ok(Object.isFrozen(PROCESSING_TIMEOUT_SECONDS));
+    assert.deepEqual({ ...UPLOAD_TIMEOUT_SECONDS }, { min: 300, max: 14_400, default: 3_600 });
+    assert.deepEqual({ ...FILE_EXPIRATION_MINUTES_RANGE }, { min: 1, max: 55, default: 45 });
+    assert.equal(EXECUTION_MARGIN_SECONDS, 600);
+    for (const range of [
+      ANALYSIS_TIMEOUT_SECONDS,
+      DOWNLOAD_TIME_LIMIT_SECONDS,
+      PROCESSING_TIMEOUT_SECONDS,
+      UPLOAD_TIMEOUT_SECONDS,
+      FILE_EXPIRATION_MINUTES_RANGE,
+    ]) {
+      assert.ok(Object.isFrozen(range));
+    }
   });
 
-  it("keeps the 600 s acquisition default: long downloads are NOT enabled by LD-1", () => {
-    assert.deepEqual({ ...DEFAULT_WORKER_TIME_LIMITS }, { downloadTimeLimitMs: 600_000, processingMs: 600_000 });
-    assert.notEqual(DEFAULT_WORKER_TIME_LIMITS.downloadTimeLimitMs, 9_000_000, "LD-5b, not LD-1");
+  it("keeps the 600 s acquisition default: long downloads are NOT enabled by LD-2a", () => {
+    assert.deepEqual(
+      { ...DEFAULT_WORKER_TIME_LIMITS },
+      {
+        analysisMs: 45_000,
+        downloadTimeLimitMs: 600_000,
+        processingMs: 600_000,
+        uploadMs: 3_600_000,
+        retentionMs: 2_700_000,
+        executionLifetimeMs: 5_445_000,
+      },
+    );
+    assert.notEqual(DEFAULT_WORKER_TIME_LIMITS.downloadTimeLimitMs, 9_000_000, "LD-5b, not LD-2a");
     assert.ok(Object.isFrozen(DEFAULT_WORKER_TIME_LIMITS));
   });
 
-  it("builds a frozen model of exactly the two LD-1 fields, in milliseconds", () => {
-    const limits = buildWorkerTimeLimits({ downloadTimeLimitSeconds: 1234, processingTimeoutSeconds: 2345 });
-    assert.deepEqual(Object.keys(limits).sort(), ["downloadTimeLimitMs", "processingMs"]);
+  it("derives L = 5,445,000 ms (1 h 30 min 45 s) and R = 2,700,000 ms at the staged defaults", () => {
+    const model = buildWorkerTimeLimits(DEFAULT_INPUTS);
+    assert.equal(model.executionLifetimeMs, (45 + 600 + 600 + 3_600 + 600) * 1000);
+    assert.equal(model.executionLifetimeMs, 5_445_000);
+    assert.equal(model.executionLifetimeMs, ((1 * 60 + 30) * 60 + 45) * 1000);
+    assert.equal(model.retentionMs, 45 * 60_000);
+    assert.equal(model.retentionMs, 2_700_000);
+  });
+
+  it("builds a frozen model of exactly the LD-2a fields, in milliseconds", () => {
+    const limits = buildWorkerTimeLimits(
+      inputs({ downloadTimeLimitSeconds: 1234, processingTimeoutSeconds: 2345 }),
+    );
+    assert.deepEqual(Object.keys(limits).sort(), [
+      "analysisMs",
+      "downloadTimeLimitMs",
+      "executionLifetimeMs",
+      "processingMs",
+      "retentionMs",
+      "uploadMs",
+    ]);
     assert.equal(limits.downloadTimeLimitMs, 1_234_000);
     assert.equal(limits.processingMs, 2_345_000);
     assert.ok(Object.isFrozen(limits));
     assert.throws(() => {
       (limits as { downloadTimeLimitMs: number }).downloadTimeLimitMs = 1;
     }, TypeError);
-    // No stage-anonymous field, and none of the later phases' fields yet.
-    for (const absent of ["timeoutMs", "inactivityMs", "uploadMs", "retentionMs", "executionLifetimeMs"]) {
+    assert.throws(() => {
+      (limits as { executionLifetimeMs: number }).executionLifetimeMs = 1;
+    }, TypeError);
+    // No stage-anonymous field, and the inactivity watchdog's field only with
+    // its watchdog (LD-3b).
+    for (const absent of ["timeoutMs", "inactivityMs", "jobTtlMs"]) {
       assert.equal(Object.hasOwn(limits, absent), false, absent);
     }
   });
 
+  it("derives L from every component, exactly, and R from the minutes", () => {
+    for (const [a, d, p, u, m] of [
+      [45, 600, 600, 3_600, 45],
+      [1, 60, 60, 300, 1],
+      [30, 120, 90, 300, 7],
+      [45, 9_000, 600, 3_600, 45],
+      [3_600, 21_600, 14_400, 14_400, 55],
+      [17, 6_013, 4_021, 1_009, 54],
+    ] as const) {
+      const model = buildWorkerTimeLimits({
+        analysisTimeoutSeconds: a,
+        downloadTimeLimitSeconds: d,
+        processingTimeoutSeconds: p,
+        uploadTimeoutSeconds: u,
+        fileExpirationMinutes: m,
+      });
+      assert.equal(model.executionLifetimeMs, (a + d + p + u + EXECUTION_MARGIN_SECONDS) * 1000, `${[a, d, p, u]}`);
+      assert.equal(model.retentionMs, m * 60_000);
+      // Invariant I2: L covers every stage bound plus the margin, never less.
+      assert.equal(
+        model.executionLifetimeMs -
+          (model.analysisMs + model.downloadTimeLimitMs + model.processingMs + model.uploadMs),
+        600_000,
+      );
+      for (const value of Object.values(model)) assert.ok(Number.isSafeInteger(value) && value > 0);
+    }
+  });
+
+  it("states the widest model any configuration can reach, far inside the safe integers", () => {
+    const widest = buildWorkerTimeLimits({
+      analysisTimeoutSeconds: 3_600,
+      downloadTimeLimitSeconds: 21_600,
+      processingTimeoutSeconds: 14_400,
+      uploadTimeoutSeconds: 14_400,
+      fileExpirationMinutes: 55,
+    });
+    assert.equal(widest.executionLifetimeMs, 54_600_000, "15 h 10 min");
+    assert.equal(widest.retentionMs, 3_300_000, "55 min");
+    assert.ok(Number.isSafeInteger(2 * widest.executionLifetimeMs + widest.retentionMs));
+    // The R2 lifecycle rule deletes an object 3,600 s after it is written: the
+    // longest retention keeps a ready link five minutes inside it.
+    assert.ok(widest.retentionMs + 300_000 <= 3_600_000);
+  });
+
   it("keeps acquisition and processing independent of each other", () => {
-    const a = buildWorkerTimeLimits({ downloadTimeLimitSeconds: 21_600, processingTimeoutSeconds: 60 });
-    assert.deepEqual({ ...a }, { downloadTimeLimitMs: 21_600_000, processingMs: 60_000 });
-    const b = buildWorkerTimeLimits({ downloadTimeLimitSeconds: 60, processingTimeoutSeconds: 14_400 });
-    assert.deepEqual({ ...b }, { downloadTimeLimitMs: 60_000, processingMs: 14_400_000 });
+    const a = buildWorkerTimeLimits(inputs({ downloadTimeLimitSeconds: 21_600, processingTimeoutSeconds: 60 }));
+    assert.equal(a.downloadTimeLimitMs, 21_600_000);
+    assert.equal(a.processingMs, 60_000);
+    const b = buildWorkerTimeLimits(inputs({ downloadTimeLimitSeconds: 60, processingTimeoutSeconds: 14_400 }));
+    assert.equal(b.downloadTimeLimitMs, 60_000);
+    assert.equal(b.processingMs, 14_400_000);
   });
 
-  it("accepts each range end and refuses one beyond it", () => {
-    for (const s of [60, 61, 600, 9000, 21_599, 21_600]) {
-      assert.equal(
-        buildWorkerTimeLimits({ downloadTimeLimitSeconds: s, processingTimeoutSeconds: 600 }).downloadTimeLimitMs,
-        s * 1000,
-      );
-    }
-    for (const s of [60, 14_400]) {
-      assert.equal(
-        buildWorkerTimeLimits({ downloadTimeLimitSeconds: 600, processingTimeoutSeconds: s }).processingMs,
-        s * 1000,
-      );
-    }
-    for (const s of [59, 21_601, 0]) {
-      assert.throws(
-        () => buildWorkerTimeLimits({ downloadTimeLimitSeconds: s, processingTimeoutSeconds: 600 }),
-        BAD_FIELD("downloadTimeLimitSeconds"),
-      );
-    }
-    for (const s of [59, 14_401, 0]) {
-      assert.throws(
-        () => buildWorkerTimeLimits({ downloadTimeLimitSeconds: 600, processingTimeoutSeconds: s }),
-        BAD_FIELD("processingTimeoutSeconds"),
-      );
-    }
-  });
+  for (const { field, range, unitMs, out } of INPUT_FIELDS) {
+    it(`${field}: accepts each range end and refuses one beyond it`, () => {
+      for (const value of [range.min, range.min + 1, range.default, range.max - 1, range.max]) {
+        assert.equal(buildWorkerTimeLimits(inputs({ [field]: value }))[out], value * unitMs, String(value));
+      }
+      for (const value of [range.min - 1, range.max + 1, 0]) {
+        assert.throws(() => buildWorkerTimeLimits(inputs({ [field]: value })), BAD_FIELD(field));
+      }
+    });
 
-  it("refuses non-integers, non-finite, unsafe and non-number values, naming the field only", () => {
-    const bad: unknown[] = [
-      -1,
-      600.5,
-      Number.NaN,
-      Number.POSITIVE_INFINITY,
-      Number.MAX_SAFE_INTEGER + 1,
-      "600",
-      null,
-      undefined,
-      987_654_321,
-    ];
-    for (const value of bad) {
-      assert.throws(
-        () =>
-          buildWorkerTimeLimits({
-            downloadTimeLimitSeconds: value as number,
-            processingTimeoutSeconds: 600,
-          }),
-        (err: unknown) => {
-          BAD_FIELD("downloadTimeLimitSeconds")(err);
-          // The exact message: the field, and never the value.
-          assert.equal((err as Error).message, "Invalid Worker time limit: downloadTimeLimitSeconds");
-          return true;
-        },
-      );
-    }
-  });
+    it(`${field}: refuses non-integers, non-finite, unsafe and non-number values, naming the field only`, () => {
+      const bad: unknown[] = [
+        -1,
+        range.default + 0.5,
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        Number.MAX_SAFE_INTEGER + 1,
+        String(range.default),
+        null,
+        undefined,
+        987_654_321,
+      ];
+      for (const value of bad) {
+        assert.throws(
+          () => buildWorkerTimeLimits(inputs({ [field]: value as number })),
+          (err: unknown) => {
+            BAD_FIELD(field)(err);
+            // The exact message: the field, and never the value.
+            assert.equal((err as Error).message, `Invalid Worker time limit: ${field}`);
+            return true;
+          },
+        );
+      }
+    });
+  }
 
-  it("validates an INJECTED model: narrower is allowed, malformed or wider is refused", () => {
+  it("validates an INJECTED stage model: narrower is allowed, malformed or wider is refused", () => {
     // Narrower than the environment minimum: tests and harnesses prove a
     // shared deadline with a few milliseconds.
-    assert.deepEqual({ ...assertWorkerTimeLimits({ downloadTimeLimitMs: 60, processingMs: 1 }) }, {
+    assert.deepEqual({ ...assertWorkerStageTimeLimits({ downloadTimeLimitMs: 60, processingMs: 1 }) }, {
       downloadTimeLimitMs: 60,
       processingMs: 1,
     });
     // The environment maximum is the ceiling an injection can never lift.
-    assert.ok(assertWorkerTimeLimits({ downloadTimeLimitMs: 21_600_000, processingMs: 14_400_000 }));
+    assert.ok(assertWorkerStageTimeLimits({ downloadTimeLimitMs: 21_600_000, processingMs: 14_400_000 }));
     assert.throws(
-      () => assertWorkerTimeLimits({ downloadTimeLimitMs: 21_600_001, processingMs: 1 }),
+      () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 21_600_001, processingMs: 1 }),
       BAD_FIELD("downloadTimeLimitMs"),
     );
     assert.throws(
-      () => assertWorkerTimeLimits({ downloadTimeLimitMs: 1, processingMs: 14_400_001 }),
+      () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 1, processingMs: 14_400_001 }),
       BAD_FIELD("processingMs"),
     );
     for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "600000", null, undefined]) {
       assert.throws(
-        () => assertWorkerTimeLimits({ downloadTimeLimitMs: bad, processingMs: 600_000 }),
+        () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: bad, processingMs: 600_000 }),
         BAD_FIELD("downloadTimeLimitMs"),
       );
       assert.throws(
-        () => assertWorkerTimeLimits({ downloadTimeLimitMs: 600_000, processingMs: bad }),
+        () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 600_000, processingMs: bad }),
         BAD_FIELD("processingMs"),
       );
     }
     for (const notAModel of [null, undefined, "600000", 600_000]) {
-      assert.throws(() => assertWorkerTimeLimits(notAModel), BAD_FIELD("timeLimits"));
+      assert.throws(() => assertWorkerStageTimeLimits(notAModel), BAD_FIELD("timeLimits"));
     }
   });
 
-  it("returns a frozen COPY of exactly the two fields, never the caller's object", () => {
-    const injected = { downloadTimeLimitMs: 1_000, processingMs: 2_000, uploadMs: 3_000 };
-    const model = assertWorkerTimeLimits(injected);
+  it("returns a frozen COPY of exactly the two stage fields: uploadMs and the lifetimes never pass", () => {
+    const injected = { ...DEFAULT_WORKER_TIME_LIMITS, downloadTimeLimitMs: 1_000, processingMs: 2_000 };
+    const model = assertWorkerStageTimeLimits(injected);
     assert.notEqual(model, injected);
     assert.deepEqual(Object.keys(model).sort(), ["downloadTimeLimitMs", "processingMs"]);
     assert.ok(Object.isFrozen(model));
     injected.downloadTimeLimitMs = 9;
     assert.equal(model.downloadTimeLimitMs, 1_000, "a later mutation of the input cannot reach the model");
+  });
+
+  it("validates the store's lifetimes: narrower is allowed; malformed, or wider than configurable, is refused", () => {
+    assert.deepEqual({ ...assertWorkerJobLifetimes({ executionLifetimeMs: 1, retentionMs: 1 }) }, {
+      executionLifetimeMs: 1,
+      retentionMs: 1,
+    });
+    assert.ok(assertWorkerJobLifetimes({ executionLifetimeMs: 54_600_000, retentionMs: 3_300_000 }));
+    assert.throws(
+      () => assertWorkerJobLifetimes({ executionLifetimeMs: 54_600_001, retentionMs: 1 }),
+      BAD_FIELD("executionLifetimeMs"),
+    );
+    // No injection can give a ready link a retention past the R2 backstop margin.
+    assert.throws(
+      () => assertWorkerJobLifetimes({ executionLifetimeMs: 1, retentionMs: 3_300_001 }),
+      BAD_FIELD("retentionMs"),
+    );
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "2700000", null, undefined]) {
+      assert.throws(
+        () => assertWorkerJobLifetimes({ executionLifetimeMs: bad, retentionMs: 1 }),
+        BAD_FIELD("executionLifetimeMs"),
+      );
+      assert.throws(
+        () => assertWorkerJobLifetimes({ executionLifetimeMs: 1, retentionMs: bad }),
+        BAD_FIELD("retentionMs"),
+      );
+    }
+    for (const notAModel of [null, undefined, 1]) {
+      assert.throws(() => assertWorkerJobLifetimes(notAModel), BAD_FIELD("jobLifetimes"));
+    }
+    const lifetimes = assertWorkerJobLifetimes(DEFAULT_WORKER_TIME_LIMITS);
+    assert.deepEqual(Object.keys(lifetimes).sort(), ["executionLifetimeMs", "retentionMs"]);
+    assert.ok(Object.isFrozen(lifetimes));
   });
 });
 
@@ -231,6 +366,7 @@ function makeConfig(
       fileExpirationMinutes: 45,
       downloadTimeLimitSeconds: 600,
       processingTimeoutSeconds: 600,
+      uploadTimeoutSeconds: 3600,
       analysisTimeoutSeconds: 45,
       maxRedirects: 5,
       ytdlp: { enabled: false },
@@ -315,9 +451,25 @@ describe("WorkerTimeLimits: built once by the runtime and handed to every stage"
       { objectStoreWriter: new MemoryWriter() },
     );
     try {
-      assert.deepEqual({ ...runtime.timeLimits }, { downloadTimeLimitMs: 1_234_000, processingMs: 2_345_000 });
+      assert.deepEqual(
+        { ...runtime.timeLimits },
+        {
+          analysisMs: 45_000,
+          downloadTimeLimitMs: 1_234_000,
+          processingMs: 2_345_000,
+          uploadMs: 3_600_000,
+          retentionMs: 2_700_000,
+          // L follows the configured stage limits: 45 + 1234 + 2345 + 3600 + 600 s.
+          executionLifetimeMs: 7_824_000,
+        },
+      );
       assert.ok(Object.isFrozen(runtime.timeLimits));
-      assert.deepEqual({ ...runtime.executor.timeLimits }, { ...runtime.timeLimits });
+      // The executor keeps exactly the two stage limits: never uploadMs, which
+      // nothing enforces before LD-2b, and never a lifetime.
+      assert.deepEqual(
+        { ...runtime.executor.timeLimits },
+        { downloadTimeLimitMs: 1_234_000, processingMs: 2_345_000 },
+      );
     } finally {
       await runtime.shutdown();
     }
@@ -366,13 +518,14 @@ describe("WorkerTimeLimits: built once by the runtime and handed to every stage"
     }
   });
 
-  it("leaves job expiry exactly as it was: created + FILE_EXPIRATION_MINUTES, whatever the stage limits", async () => {
-    // LD-1 changes no lifetime: the creation-based TTL is LD-2a's to redesign.
+  it("hands the store the derived L, so a queued job's expiry follows the stage limits, not the retention", async () => {
+    // LD-1 left the creation-based TTL alone; LD-2a replaces it with `L`.
     const FIXED_NOW = 1_800_000_000_000;
     const runtime = await createWorkerRuntime(
       makeConfig(join(root, "state"), await reservePort(), {
         downloadTimeLimitSeconds: 21_600,
         processingTimeoutSeconds: 14_400,
+        fileExpirationMinutes: 7,
       }),
       { objectStoreWriter: new MemoryWriter(), clock: () => FIXED_NOW },
     );
@@ -384,23 +537,33 @@ describe("WorkerTimeLimits: built once by the runtime and handed to every stage"
       const job = created.type === "created" ? created.job : null;
       assert.ok(job);
       assert.equal(job.createdAt, FIXED_NOW);
-      assert.equal(job.expiresAt - job.createdAt, 45 * 60_000);
+      assert.equal(job.expiresAt - job.createdAt, (45 + 21_600 + 14_400 + 3_600 + 600) * 1000);
+      assert.equal(job.expiresAt - job.createdAt, runtime.timeLimits.executionLifetimeMs);
+      assert.notEqual(job.expiresAt - job.createdAt, 7 * 60_000, "the retention is for terminal outcomes only");
     } finally {
       await runtime.shutdown();
     }
   });
 
-  it("refuses a model the loader could not express before touching the state directory", async () => {
-    const dataDirectory = join(root, "never-created");
-    await assert.rejects(
-      createWorkerRuntime(
-        makeConfig(dataDirectory, await reservePort(), { downloadTimeLimitSeconds: 59 }),
-        { objectStoreWriter: new MemoryWriter() },
-      ),
-      BAD_FIELD("downloadTimeLimitSeconds"),
-    );
-    await assert.rejects(stat(dataDirectory), { code: "ENOENT" });
-  });
+  for (const [label, media, field] of [
+    ["an acquisition limit below its range", { downloadTimeLimitSeconds: 59 }, "downloadTimeLimitSeconds"],
+    ["an upload limit below its range", { uploadTimeoutSeconds: 299 }, "uploadTimeoutSeconds"],
+    ["an upload limit above its range", { uploadTimeoutSeconds: 14_401 }, "uploadTimeoutSeconds"],
+    ["a retention past the R2 backstop margin", { fileExpirationMinutes: 56 }, "fileExpirationMinutes"],
+    ["the pre-LD-2a retention maximum", { fileExpirationMinutes: 1440 }, "fileExpirationMinutes"],
+    ["an analysis limit of zero", { analysisTimeoutSeconds: 0 }, "analysisTimeoutSeconds"],
+  ] as const) {
+    it(`refuses ${label} before touching the state directory`, async () => {
+      const dataDirectory = join(root, "never-created");
+      await assert.rejects(
+        createWorkerRuntime(makeConfig(dataDirectory, await reservePort(), media), {
+          objectStoreWriter: new MemoryWriter(),
+        }),
+        BAD_FIELD(field),
+      );
+      await assert.rejects(stat(dataDirectory), { code: "ENOENT" });
+    });
+  }
 
   it("cannot be overridden through an executor test seam: the configuration is the one owner", async () => {
     const runtime = await createWorkerRuntime(makeConfig(join(root, "state"), await reservePort()), {
@@ -480,5 +643,37 @@ describe("startup refuses the retired DOWNLOAD_TIMEOUT by presence", () => {
     assert.equal(run.runtime, null);
     assert.equal(run.workspaceChecks, 1, "configuration accepted; the stub stopped the start");
     assert.deepEqual(run.errors, ["[worker] startup failed: Error"]);
+  });
+
+  // VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001: the two LD-2a ranges block
+  // startup end to end, before the workspace check, naming only the variable.
+  for (const [name, value] of [
+    ["FILE_EXPIRATION_MINUTES", "0"],
+    ["FILE_EXPIRATION_MINUTES", "56"],
+    ["FILE_EXPIRATION_MINUTES", "60"],
+    ["FILE_EXPIRATION_MINUTES", "1440"],
+    ["UPLOAD_TIMEOUT", "299"],
+    ["UPLOAD_TIMEOUT", "14401"],
+    ["UPLOAD_TIMEOUT", "SENTINEL-UPLOAD-TIMEOUT-VALUE"],
+  ] as const) {
+    it(`${name}=${JSON.stringify(value)} blocks startup before the workspace check, naming only the variable`, async () => {
+      const run = await start(validEnv({ [name]: value }));
+      assert.equal(run.runtime, null);
+      assert.equal(run.exitCode, 1);
+      assert.equal(run.workspaceChecks, 0, "nothing past configuration ran");
+      assert.deepEqual(run.errors, [`[worker] startup blocked: invalid configuration for ${name}`]);
+      assert.equal(run.errors.join("\n").includes(value), false, "the value is never rendered");
+    });
+  }
+
+  it("positive control: the LD-2a range ends pass configuration", async () => {
+    for (const env of [
+      { FILE_EXPIRATION_MINUTES: "55", UPLOAD_TIMEOUT: "300" },
+      { FILE_EXPIRATION_MINUTES: "1", UPLOAD_TIMEOUT: "14400" },
+    ]) {
+      const run = await start(validEnv(env));
+      assert.equal(run.workspaceChecks, 1, JSON.stringify(env));
+      assert.deepEqual(run.errors, ["[worker] startup failed: Error"]);
+    }
   });
 });

@@ -19,7 +19,7 @@ import {
 } from "../analysis/media-analyzer.server.ts";
 import type { JobExecutor } from "../execution/job-executor.server.ts";
 import { WORKER_MAX_CONCURRENT_JOBS, type QueuePump } from "../execution/queue-pump.server.ts";
-import type { WorkerJobStore } from "../state/job-store.ts";
+import { WorkerExecutionProgressStatusSchema, type WorkerJobStore } from "../state/job-store.ts";
 import { probeWorkerBinaries, type WorkerBinaryProbe } from "./binaries.server.ts";
 import { WorkerBusinessError } from "./errors.server.ts";
 
@@ -164,7 +164,14 @@ export class WorkerService implements WorkerBusinessService {
     if (!job) {
       throw new WorkerBusinessError("NOT_FOUND");
     }
-    if (this.clock() >= job.expiresAt) {
+    // VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001: a queued row past its
+    // queue bound, and a terminal row past its retention, are EXPIRED. An
+    // ACTIVE row is always the authoritative job: its lifetime is enforced by
+    // the executor, which fails it as TIMEOUT, so the view never answers 410
+    // while the job is still running. The active statuses are exactly the ones
+    // a progress write may target.
+    const active = WorkerExecutionProgressStatusSchema.safeParse(job.status).success;
+    if (!active && this.clock() >= job.expiresAt) {
       throw new WorkerBusinessError("EXPIRED");
     }
     return WorkerJobStatusSuccessSchema.parse({ success: true, job });

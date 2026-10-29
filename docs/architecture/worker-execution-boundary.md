@@ -138,6 +138,7 @@ There are two distinct lifetimes: durable job metadata (authoritative) and the c
 - **Worker Expiration Cleanup:** Worker periodically attempts exact-object deletion using the stored `objectKey`.
 - **Provider Lifecycle (TTL):** Acts as a safety backstop if worker cleanup is unavailable or fails. Retention may be slightly longer than app expiration so normal worker cleanup attempts first.
 - **Failure Handling:** Object deletion failure is recorded for diagnostics but NEVER extends user authorization. Metadata cleanup failure leaves stale metadata internally, but `expiresAt` still prevents authorization. If the worker is unavailable at expiry, Vercel still refuses new URLs, and provider TTL eventually removes the object.
+- **Job lifetime (`VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001`, source change, NOT DEPLOYED — deployment runbook §7b):** `expiresAt` is assigned at creation (`created + L`, the queue wait), at claim (`claimed + L`, the execution) and at the terminal transition (`finished + R`, the retention), each in that transition's own transaction and never renewed. A ready object is therefore authorized for `R` from its `ready` commit. The `ready` commit itself requires the execution lifetime to still be running, so an upload that finishes late is deleted by exact key and never becomes ready.
 
 ### File Delivery Sequence
 

@@ -116,7 +116,8 @@ function ownersOf(node: ts.Node): string[] {
   return owners;
 }
 
-const STAGE_VARIABLES = new Set(["DOWNLOAD_TIME_LIMIT", "PROCESSING_TIMEOUT"]);
+// LD-2a adds UPLOAD_TIMEOUT: parsed by the strict loader alone, like the LD-1 pair.
+const STAGE_VARIABLES = new Set(["DOWNLOAD_TIME_LIMIT", "PROCESSING_TIMEOUT", "UPLOAD_TIMEOUT"]);
 
 function scan(file: string, source: string): Finding[] {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
@@ -250,8 +251,8 @@ describe("Worker time-limit boundary (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001)", ()
     assert.equal(strict.filter((f) => f.kind === "retired-variable").length, 1);
     assert.deepEqual(
       strict.filter((f) => f.kind === "stage-variable").length,
-      4,
-      "DOWNLOAD_TIME_LIMIT and PROCESSING_TIMEOUT, each as a name and an env read",
+      6,
+      "DOWNLOAD_TIME_LIMIT, PROCESSING_TIMEOUT and UPLOAD_TIMEOUT, each as a name and an env read",
     );
     const direct = of("src/services/extractors/direct.server.ts");
     assert.ok(direct.length >= 1, "the legacy application path's reads are seen");
@@ -351,6 +352,12 @@ describe("Worker time-limit boundary: planted dependencies are caught (in-memory
       "src/worker/execution/ytdlp-download.server.ts",
     ],
     [
+      "a downstream read of UPLOAD_TIMEOUT (LD-2a)",
+      "src/worker/storage/upload-lifecycle.server.ts",
+      "export const ld1PlantedH = process.env.UPLOAD_TIMEOUT;",
+      "src/worker/storage/upload-lifecycle.server.ts",
+    ],
+    [
       "the retired field reintroduced in the runtime",
       "src/worker/runtime/runtime.server.ts",
       "export const ld1PlantedF = { downloadTimeoutSeconds: 600 };",
@@ -402,6 +409,7 @@ describe("Worker time-limit boundary: planted dependencies are caught (in-memory
       "src/worker/execution/job-executor.server.ts",
       "src/services/processing/ffmpeg.server.ts",
       "src/worker/execution/ytdlp-download.server.ts",
+      "src/worker/storage/upload-lifecycle.server.ts",
     ]) {
       assert.equal(real(file).includes("ld1Planted"), false, file);
     }
@@ -475,5 +483,118 @@ describe("WorkerTimeLimits is consumed consistently by every stage seam", () => 
     const runtime = squash(readFileSync(join(ROOT, "src/worker/runtime/runtime.server.ts"), "utf8"));
     assert.equal(runtime.split("buildWorkerTimeLimits(").length - 1, 1);
     assert.match(runtime, /\.\.\.executorDeps, \/\/ [^\n]*?timeLimits, \}/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001: ONE derivation of the job
+// lifetime, and UPLOAD_TIMEOUT parsed and budgeted but NOT enforced
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Where each LD-2a name may appear in the Worker's production graph — as a
+ * property read, a property written in an object literal, a destructured
+ * binding, an identifier or a string literal. Anywhere else is a finding.
+ *
+ *  - `uploadMs`: only the model, which defines it and sums it into `L`. No
+ *    stage, executor, upload or storage module may read it before LD-2b gives
+ *    it an enforcement; LD-2b updates this table deliberately.
+ *  - `executionLifetimeMs` / `retentionMs`: the model (definition), the
+ *    composition root (hands them to the store) and the store (assigns them).
+ *    Never the executor, the HTTP view or the storage layer: the executor
+ *    reads its deadline back from the claimed job.
+ *  - `EXECUTION_MARGIN_SECONDS`: only the model — `L` is computed once.
+ *  - `jobTtlMs`: only the store, which refuses it by presence.
+ */
+const LD2A_NAMES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  uploadMs: ["src/worker/runtime/time-limits.ts"],
+  executionLifetimeMs: [
+    "src/worker/runtime/time-limits.ts",
+    "src/worker/runtime/runtime.server.ts",
+    "src/worker/state/sqlite-job-store.server.ts",
+  ],
+  retentionMs: [
+    "src/worker/runtime/time-limits.ts",
+    "src/worker/runtime/runtime.server.ts",
+    "src/worker/state/sqlite-job-store.server.ts",
+  ],
+  EXECUTION_MARGIN_SECONDS: ["src/worker/runtime/time-limits.ts"],
+  jobTtlMs: ["src/worker/state/sqlite-job-store.server.ts"],
+});
+
+function ld2aNameUses(file: string, source: string): Array<{ name: string; file: string; line: number }> {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
+  const out: Array<{ name: string; file: string; line: number }> = [];
+  const add = (node: ts.Node, name: string) =>
+    out.push({ name, file: rel(file), line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1 });
+  const visit = (node: ts.Node) => {
+    let name: string | null = null;
+    if (ts.isIdentifier(node)) name = node.text;
+    else if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) name = node.text;
+    if (name !== null && Object.hasOwn(LD2A_NAMES, name)) add(node, name);
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return out;
+}
+
+function ld2aViolations(graph: Map<string, string>): string[] {
+  const out: string[] = [];
+  for (const [file, source] of graph) {
+    for (const use of ld2aNameUses(file, source)) {
+      if (!LD2A_NAMES[use.name]!.includes(use.file)) out.push(`${use.file}:${use.line} ${use.name}`);
+    }
+  }
+  return out;
+}
+
+describe("LD-2a: the lifetime is derived once and UPLOAD_TIMEOUT is not enforced", () => {
+  const graph = workerGraph();
+  const real = (file: string) => readFileSync(join(ROOT, file), "utf8");
+  const plant = (file: string, code: string): Overlay => ({ [file]: `${real(file)}\n${code}\n` });
+
+  it("finds every LD-2a name only where the table allows it", () => {
+    assert.deepEqual(ld2aViolations(graph), []);
+  });
+
+  it("positive controls: the scan sees each allowed use in the real graph", () => {
+    const uses = [...graph].flatMap(([file, source]) => ld2aNameUses(file, source));
+    const where = (name: string) => [...new Set(uses.filter((u) => u.name === name).map((u) => u.file))].sort();
+    assert.deepEqual(where("uploadMs"), ["src/worker/runtime/time-limits.ts"]);
+    assert.deepEqual(where("EXECUTION_MARGIN_SECONDS"), ["src/worker/runtime/time-limits.ts"]);
+    assert.deepEqual(where("executionLifetimeMs"), [...LD2A_NAMES.executionLifetimeMs!].sort());
+    assert.deepEqual(where("retentionMs"), [...LD2A_NAMES.retentionMs!].sort());
+    assert.deepEqual(where("jobTtlMs"), ["src/worker/state/sqlite-job-store.server.ts"]);
+  });
+
+  it("the derivation itself: exactly one sum of the four stage limits and the margin", () => {
+    const text = real("src/worker/runtime/time-limits.ts").replace(/\s+/g, " ");
+    const sums = text.match(/analysisMs \+ downloadTimeLimitMs \+ processingMs \+ uploadMs \+ EXECUTION_MARGIN_SECONDS \* 1000/g) ?? [];
+    assert.equal(sums.length, 1);
+  });
+
+  for (const [label, file, code, name] of [
+    ["the executor reading uploadMs", "src/worker/execution/job-executor.server.ts", "export const ld2aPlantedA = (x: { uploadMs: number }) => x.uploadMs;", "uploadMs"],
+    ["the upload lifecycle reading uploadMs", "src/worker/storage/upload-lifecycle.server.ts", "export const ld2aPlantedB = (x: { uploadMs: number }) => x.uploadMs;", "uploadMs"],
+    ["the HTTP view reading the lifetime", "src/worker/http/business-service.server.ts", "export const ld2aPlantedC = (x: { executionLifetimeMs: number }) => x.executionLifetimeMs;", "executionLifetimeMs"],
+    ["the executor recomputing L from a margin", "src/worker/execution/job-executor.server.ts", "export const EXECUTION_MARGIN_SECONDS = 600;", "EXECUTION_MARGIN_SECONDS"],
+    ["the runtime reviving the retired TTL", "src/worker/runtime/runtime.server.ts", "export const ld2aPlantedD = { jobTtlMs: 1 };", "jobTtlMs"],
+  ] as const) {
+    it(`catches ${label} (in-memory overlay)`, () => {
+      const found = ld2aViolations(workerGraph(plant(file, code)));
+      assert.ok(found.length >= 1, `${label}: nothing flagged`);
+      assert.ok(found.every((f) => f.startsWith(`${file}:`) && f.endsWith(` ${name}`)), found.join("; "));
+    });
+  }
+
+  it("never wrote anything: the real sources carry no planted marker", () => {
+    for (const file of [
+      "src/worker/execution/job-executor.server.ts",
+      "src/worker/storage/upload-lifecycle.server.ts",
+      "src/worker/http/business-service.server.ts",
+      "src/worker/runtime/runtime.server.ts",
+    ]) {
+      assert.equal(real(file).includes("ld2aPlanted"), false, file);
+    }
   });
 });
