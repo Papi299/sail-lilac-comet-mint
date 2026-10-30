@@ -466,12 +466,16 @@ describe("execution-lifetime backstop: fires exactly at its bound, as TIMEOUT wi
     const execution = makeExecutor(h, {
       analyze: async () => MP3_META(),
       downloadOriginal: async (_url, ctx) => writeOriginal(ctx.workDir),
-      // processLocally is NOT injected: production's convertMedia runs.
+      // processLocally is NOT injected: production's convertMedia runs. Its own
+      // processing budget is narrowed to 30 s, far beyond the 2 s this test
+      // allows the backstop's kill, so the stage's timeout can never pass it.
+      timeLimits: { downloadTimeLimitMs: 600_000, processingMs: 30_000 },
     }).execute(job);
     await waitFor(() => spawned.length === 1, "FFmpeg to be spawned");
     assert.equal(row(h, job.jobId).status, "processing");
     h.clock.now = job.expiresAt;
     h.timers.fire();
+    await waitFor(() => killRequests.length === 1, "the backstop's group kill", 2_000);
     await execution;
 
     assert.deepEqual(killRequests, [{ pid: -FAKE_PID, signal: "SIGKILL" }], "exactly the group, with SIGKILL");
