@@ -1,7 +1,14 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import * as assert from "node:assert";
-import { finalizeJobUpload, cleanupExpiredObjects, type FinalizeUploadInput } from "./upload-lifecycle.server.ts";
-import type { ObjectStoreWriter, ObjectStorePutInput, ObjectStoreHead } from "./writer.ts";
+import {
+  finalizeJobUpload,
+  cleanupExpiredObjects,
+  UPLOAD_CLEANUP_BUDGET_MS,
+  type FinalizeUploadInput,
+  type UploadStageTimerHandle,
+  type UploadStageTimers,
+} from "./upload-lifecycle.server.ts";
+import type { ObjectStoreWriter, ObjectStorePutInput, ObjectStoreHead, ObjectStoreOperationContext } from "./writer.ts";
 import { SQLiteJobStore } from "../state/sqlite-job-store.server.ts";
 import { openWorkerDatabase } from "../state/database.server.ts";
 import { applyMigrations } from "../state/migrations.server.ts";
@@ -127,6 +134,9 @@ describe("Upload Lifecycle Coordinator", () => {
       quality: "1080p",
       container: "mp4",
       randomSource: () => new Uint8Array(16).fill(0xAA), // Deterministic token
+      // LD-2b: a stage whose deadline is an hour away and whose signal never
+      // aborts, so every pre-LD-2b case below runs exactly as before.
+      stage: { signal: new AbortController().signal, deadlineMs: Date.now() + 3_600_000 },
       ...overrides
     };
   }
@@ -682,5 +692,465 @@ describe("Upload Lifecycle Coordinator", () => {
     const deletedKey = writer.deleteCalls[0];
     assert.ok(!deletedKey.endsWith("/"), "Deleted key must not end with slash (prefix)");
     assert.strictEqual(deletedKey.length, 81); 
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001: one absolute upload-stage
+// deadline, the execution's signal, and an independent, bounded cleanup.
+//
+// Virtual time: the stage's timers are injected and fired by hand, and its
+// clock is a plain number. The writer is gated: each operation records the
+// signal it was handed and waits for a release, or for that signal to abort.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type ArmedTimer = UploadStageTimerHandle & { handler: () => void; ms: number; cleared: boolean; unrefed: boolean };
+
+class VirtualTimers implements UploadStageTimers {
+  readonly armed: ArmedTimer[] = [];
+  setTimeoutFn = (handler: () => void, ms: number): UploadStageTimerHandle => {
+    const timer: ArmedTimer = { handler, ms, cleared: false, unrefed: false, unref: () => (timer.unrefed = true) };
+    this.armed.push(timer);
+    return timer;
+  };
+  clearTimeoutFn = (handle: UploadStageTimerHandle) => {
+    (handle as ArmedTimer).cleared = true;
+  };
+  /** Fires a timer as the platform would: only if it was not cleared. */
+  fire(index: number): void {
+    const timer = this.armed[index]!;
+    if (!timer.cleared) timer.handler();
+  }
+}
+
+type Gate = { release: () => void; promise: Promise<void> };
+const gate = (): Gate => {
+  let release: () => void = () => {};
+  const promise = new Promise<void>((resolve) => (release = resolve));
+  return { release, promise };
+};
+
+type OpRecord = { op: "put" | "head" | "delete"; key: string; signal: AbortSignal | undefined; abortedSeen: boolean };
+
+/**
+ * A writer whose operations behave like the real one by default — they end,
+ * rejecting, the moment their own signal aborts — and which can be told to
+ * hold an operation until released, to ignore its signal (a provider that
+ * keeps going), or to fail.
+ */
+class GatedWriter implements ObjectStoreWriter {
+  readonly records: OpRecord[] = [];
+  readonly objects = new Map<string, ObjectStorePutInput>();
+  readonly gates: Partial<Record<OpRecord["op"], Gate>> = {};
+  ignoreSignal: Partial<Record<OpRecord["op"], boolean>> = {};
+  fail: Partial<Record<OpRecord["op"], boolean>> = {};
+  bodyBytesRead = 0;
+  readonly entered: Partial<Record<OpRecord["op"], boolean>> = {};
+
+  private async run(op: OpRecord["op"], key: string, context: ObjectStoreOperationContext | undefined) {
+    const record: OpRecord = { op, key, signal: context?.signal, abortedSeen: false };
+    this.records.push(record);
+    this.entered[op] = true;
+    const signal = context?.signal;
+    if (signal?.aborted && !this.ignoreSignal[op]) {
+      record.abortedSeen = true;
+      throw new Error(`${op} refused: already aborted`);
+    }
+    const held = this.gates[op];
+    if (held) {
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => {
+          record.abortedSeen = true;
+          reject(new Error(`${op} torn down`));
+        };
+        if (signal && !this.ignoreSignal[op]) signal.addEventListener("abort", onAbort, { once: true });
+        void held.promise.then(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        });
+      });
+    }
+    if (this.fail[op]) throw new Error(`${op} failed: provider-internal detail`);
+  }
+
+  async put(input: ObjectStorePutInput, context?: ObjectStoreOperationContext): Promise<void> {
+    await this.run("put", input.objectKey, context);
+    for await (const chunk of input.body) this.bodyBytesRead += chunk.byteLength;
+    this.objects.set(input.objectKey, input);
+  }
+
+  async head(objectKey: string, context?: ObjectStoreOperationContext): Promise<ObjectStoreHead | null> {
+    await this.run("head", objectKey, context);
+    const object = this.objects.get(objectKey);
+    return object
+      ? { objectKey, contentLength: object.contentLength, contentType: object.contentType, contentDisposition: object.contentDisposition }
+      : null;
+  }
+
+  async delete(objectKey: string, context?: ObjectStoreOperationContext): Promise<void> {
+    await this.run("delete", objectKey, context);
+    this.objects.delete(objectKey);
+  }
+
+  ops(): string[] {
+    return this.records.map((r) => r.op);
+  }
+}
+
+describe("LD-2b upload stage: one absolute deadline, the execution's signal, a bounded cleanup", () => {
+  const T0 = 1_800_000_000_000;
+  const BUDGET = 3_600_000;
+  let db: ReturnType<typeof openWorkerDatabase>;
+  let store: SQLiteJobStore;
+  let writer: GatedWriter;
+  let timers: VirtualTimers;
+  let clock: { now: number };
+  let execution: AbortController;
+
+  beforeEach(() => {
+    db = openWorkerDatabase({ path: ":memory:" });
+    applyMigrations(db);
+    store = new SQLiteJobStore({ db });
+    writer = new GatedWriter();
+    timers = new VirtualTimers();
+    clock = { now: T0 };
+    execution = new AbortController();
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  function uploadingJobId(): string {
+    const { job } = store.createJob(
+      { url: "https://example.com/video", formatId: "preset:1080", principalId: "private-access-user" },
+      randomUUID(),
+    ) as { job: WorkerJobView };
+    store.claimNextQueuedJob();
+    db.prepare("UPDATE worker_jobs SET status = 'uploading' WHERE job_id = ?").run(job.jobId);
+    return job.jobId;
+  }
+
+  function bodyOf(bytes: number) {
+    const state = { read: 0 };
+    const body = (async function* () {
+      state.read += bytes;
+      yield new Uint8Array(bytes);
+    })();
+    return { state, body };
+  }
+
+  function input(jobId: string, deadlineMs = T0 + BUDGET): FinalizeUploadInput {
+    return {
+      jobId,
+      store,
+      writer,
+      body: bodyOf(3).body,
+      filename: "test.mp4",
+      fileSize: 3,
+      mime: "video/mp4",
+      quality: "1080p",
+      container: "mp4",
+      randomSource: () => new Uint8Array(16).fill(0xaa),
+      stage: { signal: execution.signal, deadlineMs, clock: () => clock.now, timers },
+    };
+  }
+
+  const KEY_OF = (jobId: string) => `videofetch/jobs/${jobId}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`;
+
+  async function untilEntered(op: OpRecord["op"]) {
+    for (let i = 0; i < 1000 && !writer.entered[op]; i += 1) await new Promise((r) => setImmediate(r));
+    assert.ok(writer.entered[op], `${op} was reached`);
+  }
+
+  // ── H2: the absolute deadline ──────────────────────────────────────────────
+
+  it("arms ONE unref'd timer for the remaining budget, hands every operation the same signal, and disposes it", async () => {
+    const jobId = uploadingJobId();
+    clock.now = T0 + 1_250; // the stage opened a moment ago: only the remainder is left
+    const result = await finalizeJobUpload(input(jobId));
+    assert.strictEqual(result.type, "ready");
+    assert.strictEqual(timers.armed.length, 1, "one stage timer, no cleanup timer");
+    assert.strictEqual(timers.armed[0]!.ms, BUDGET - 1_250, "the remainder of the ONE deadline, never a fresh budget");
+    assert.strictEqual(timers.armed[0]!.unrefed, true);
+    assert.strictEqual(timers.armed[0]!.cleared, true, "disposed when the stage ended");
+    const [put, head] = writer.records;
+    assert.ok(put!.signal && put!.signal === head!.signal, "the put and the head share the stage's one signal");
+    assert.notStrictEqual(put!.signal, execution.signal, "the stage composes its own; it never aborts the execution's");
+  });
+
+  it("a slow put leaves the head only what remains: the SAME deadline fires during the head", async () => {
+    const jobId = uploadingJobId();
+    writer.gates.head = gate();
+    const pending = finalizeJobUpload(input(jobId));
+    await untilEntered("head");
+    // The put took most of the budget; no new timer was armed for the head.
+    clock.now = T0 + BUDGET;
+    assert.strictEqual(timers.armed.length, 1, "the head got no budget of its own");
+    timers.fire(0);
+    const result = await pending;
+    assert.deepStrictEqual(result, { type: "upload_timeout", cleanup: "deleted" });
+    assert.strictEqual(writer.records[1]!.abortedSeen, true, "the in-flight head saw the deadline");
+    assert.deepStrictEqual(writer.ops(), ["put", "head", "delete"]);
+    assert.strictEqual(store.getJob(jobId)!.status, "uploading", "left for the executor to fail");
+  });
+
+  it("the deadline is exact: a commit one millisecond before it is ready; at it, nothing is committed", async () => {
+    for (const [offset, expected] of [
+      [-1, "ready"],
+      [0, "upload_timeout"],
+    ] as const) {
+      writer = new GatedWriter();
+      timers = new VirtualTimers();
+      const jobId = uploadingJobId();
+      const deadline = T0 + BUDGET;
+      const realHead = writer.head.bind(writer);
+      writer.head = async (key, context) => {
+        const answer = await realHead(key, context);
+        clock.now = deadline + offset; // the provider answers at this instant; no timer has fired
+        return answer;
+      };
+      const result = await finalizeJobUpload(input(jobId, deadline));
+      assert.strictEqual(result.type, expected, `offset ${offset}`);
+      assert.strictEqual(store.getJob(jobId)!.status, expected === "ready" ? "ready" : "uploading");
+      clock.now = T0;
+    }
+  });
+
+  it("a deadline already passed refuses all work: nothing minted, sent or read, and nothing to clean", async () => {
+    for (const deadlineMs of [T0, T0 - 1, 0]) {
+      writer = new GatedWriter();
+      const jobId = uploadingJobId();
+      const { state, body } = bodyOf(3);
+      const result = await finalizeJobUpload({ ...input(jobId, deadlineMs), body });
+      assert.deepStrictEqual(result, { type: "upload_timeout", cleanup: "not_needed" });
+      assert.deepStrictEqual(writer.ops(), [], "no operation started");
+      assert.strictEqual(state.read, 0, "the body was never read");
+      assert.strictEqual(store.getJob(jobId)!.status, "uploading");
+    }
+  });
+
+  it("nothing renews the deadline: many operations, one timer, armed once", async () => {
+    const jobId = uploadingJobId();
+    const realPut = writer.put.bind(writer);
+    writer.put = async (i, context) => {
+      for (let step = 0; step < 20; step += 1) clock.now += 10_000; // a long, active transfer
+      return realPut(i, context);
+    };
+    const result = await finalizeJobUpload(input(jobId));
+    assert.strictEqual(result.type, "ready");
+    assert.strictEqual(timers.armed.length, 1);
+    assert.strictEqual(timers.armed[0]!.ms, BUDGET);
+  });
+
+  // ── H5/H6: interruptions, races and the first cause ────────────────────────
+
+  for (const [label, interrupt, expected] of [
+    ["the execution's signal (cancellation, shutdown, the lifetime backstop)", "signal", "aborted"],
+    ["the stage's deadline", "deadline", "upload_timeout"],
+  ] as const) {
+    it(`${label} during the put tears the put down and deletes exactly the attempted key`, async () => {
+      const jobId = uploadingJobId();
+      writer.gates.put = gate();
+      const pending = finalizeJobUpload(input(jobId));
+      await untilEntered("put");
+      if (interrupt === "signal") execution.abort(new Error("cancelled"));
+      else {
+        clock.now = T0 + BUDGET;
+        timers.fire(0);
+      }
+      const result = await pending;
+      assert.deepStrictEqual(result, { type: expected, cleanup: "deleted" });
+      assert.strictEqual(writer.records[0]!.abortedSeen, true, "the in-flight put observed it");
+      assert.deepStrictEqual(writer.ops(), ["put", "delete"], "no head, and no commit");
+      const del = writer.records[1]!;
+      assert.strictEqual(del.key, KEY_OF(jobId), "exactly the attempted key");
+      assert.ok(del.signal && !del.signal.aborted, "the cleanup ran under its own, live signal");
+      assert.notStrictEqual(del.signal, writer.records[0]!.signal);
+      assert.strictEqual(store.getJob(jobId)!.status, "uploading");
+      assert.strictEqual(store.getJob(jobId)!.objectKey, null);
+    });
+  }
+
+  it("cancelled after the put, before the head: no head, the key is deleted", async () => {
+    const jobId = uploadingJobId();
+    const realPut = writer.put.bind(writer);
+    writer.put = async (i, context) => {
+      await realPut(i, context);
+      execution.abort(new Error("cancelled")); // lands as the put returns
+    };
+    const result = await finalizeJobUpload(input(jobId));
+    assert.deepStrictEqual(result, { type: "aborted", cleanup: "deleted" });
+    assert.deepStrictEqual(writer.ops(), ["put", "delete"]);
+  });
+
+  it("a provider that ignores the abort and 'succeeds' late is never trusted: no head, no commit, key deleted", async () => {
+    const jobId = uploadingJobId();
+    writer.gates.put = gate();
+    writer.ignoreSignal.put = true;
+    const pending = finalizeJobUpload(input(jobId));
+    await untilEntered("put");
+    execution.abort(new Error("cancelled"));
+    writer.gates.put.release(); // the put completes anyway, after the abort
+    const result = await pending;
+    assert.deepStrictEqual(result, { type: "aborted", cleanup: "deleted" });
+    assert.deepStrictEqual(writer.ops(), ["put", "delete"]);
+    assert.strictEqual(writer.objects.size, 0, "the late object was deleted");
+  });
+
+  it("a late SUCCESSFUL head after the deadline never leads to a commit", async () => {
+    const jobId = uploadingJobId();
+    writer.gates.head = gate();
+    writer.ignoreSignal.head = true;
+    const pending = finalizeJobUpload(input(jobId));
+    await untilEntered("head");
+    clock.now = T0 + BUDGET + 5;
+    timers.fire(0);
+    writer.gates.head.release(); // the head answers, correctly, after the deadline
+    const result = await pending;
+    assert.deepStrictEqual(result, { type: "upload_timeout", cleanup: "deleted" });
+    assert.strictEqual(store.getJob(jobId)!.status, "uploading", "never ready");
+    assert.strictEqual(store.getJob(jobId)!.objectKey, null);
+  });
+
+  it("an abort landing immediately before the ready CAS prevents it", async () => {
+    const jobId = uploadingJobId();
+    const realHead = writer.head.bind(writer);
+    writer.head = async (key, context) => {
+      const answer = await realHead(key, context);
+      execution.abort(new Error("cancelled")); // after verification succeeded, before the commit
+      return answer;
+    };
+    const result = await finalizeJobUpload(input(jobId));
+    assert.deepStrictEqual(result, { type: "aborted", cleanup: "deleted" });
+    assert.strictEqual(store.getJob(jobId)!.status, "uploading");
+  });
+
+  it("the first cause wins: a deadline then a cancellation is a timeout; a cancellation then a deadline is an abort", async () => {
+    for (const order of [["deadline", "signal"], ["signal", "deadline"]] as const) {
+      writer = new GatedWriter();
+      timers = new VirtualTimers();
+      execution = new AbortController();
+      const jobId = uploadingJobId();
+      writer.gates.put = gate();
+      const pending = finalizeJobUpload(input(jobId));
+      await untilEntered("put");
+      for (const cause of order) {
+        if (cause === "signal") execution.abort(new Error("cancelled"));
+        else {
+          clock.now = T0 + BUDGET;
+          timers.fire(0);
+        }
+      }
+      const result = await pending;
+      assert.strictEqual(result.type, order[0] === "deadline" ? "upload_timeout" : "aborted", order.join(" then "));
+      clock.now = T0;
+    }
+  });
+
+  it("an ORDINARY put failure keeps its own code even if the deadline passes during the cleanup", async () => {
+    const jobId = uploadingJobId();
+    writer.fail.put = true;
+    writer.gates.delete = gate();
+    const pending = finalizeJobUpload(input(jobId));
+    await untilEntered("delete");
+    clock.now = T0 + BUDGET + 1;
+    timers.armed[0]!.handler(); // even a stage timer that slipped past its disposal
+    writer.gates.delete.release();
+    const result = await pending;
+    assert.deepStrictEqual(result, { type: "storage_failure", code: "put_failed", cleanup: "deleted" });
+  });
+
+  it("the stage's abort reason is not a transient error an SDK retry layer would re-attempt", async () => {
+    const jobId = uploadingJobId();
+    writer.gates.put = gate();
+    const pending = finalizeJobUpload(input(jobId));
+    await untilEntered("put");
+    clock.now = T0 + BUDGET;
+    timers.fire(0);
+    await pending;
+    const reason = writer.records[0]!.signal!.reason as { name?: unknown; code?: unknown; $retryable?: unknown };
+    assert.notStrictEqual(reason.name, "TimeoutError", "not AbortSignal.timeout()'s transient-looking reason");
+    assert.ok(!["ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT"].includes(String(reason.code)));
+    assert.strictEqual(reason.$retryable, undefined);
+  });
+
+  // ── E6: cleanup ────────────────────────────────────────────────────────────
+
+  it("a failed cleanup is reported as failed and never as ready; the job stays for its executor", async () => {
+    const jobId = uploadingJobId();
+    writer.gates.put = gate();
+    writer.fail.delete = true;
+    const pending = finalizeJobUpload(input(jobId));
+    await untilEntered("put");
+    execution.abort(new Error("cancelled"));
+    const result = await pending;
+    assert.deepStrictEqual(result, { type: "aborted", cleanup: "failed" });
+    assert.ok(!JSON.stringify(result).includes("provider-internal"), "no provider detail leaks");
+    assert.strictEqual(store.getJob(jobId)!.status, "uploading");
+    assert.deepStrictEqual(store.listExpiredReadyObjects(10), []);
+  });
+
+  it("a cleanup that hangs ends at its own allowance, and the allowance is torn down after", async () => {
+    const jobId = uploadingJobId();
+    writer.gates.put = gate();
+    writer.gates.delete = gate(); // never released: a DeleteObject that never answers
+    const pending = finalizeJobUpload(input(jobId));
+    await untilEntered("put");
+    execution.abort(new Error("cancelled"));
+    await untilEntered("delete");
+    assert.strictEqual(timers.armed.length, 2, "the stage's timer, then the cleanup allowance's");
+    assert.strictEqual(timers.armed[1]!.ms, UPLOAD_CLEANUP_BUDGET_MS);
+    assert.strictEqual(timers.armed[1]!.unrefed, true);
+    timers.fire(1);
+    const result = await pending;
+    assert.deepStrictEqual(result, { type: "aborted", cleanup: "failed" });
+    assert.strictEqual(writer.records[1]!.abortedSeen, true, "the hanging delete was torn down");
+    assert.ok(timers.armed.every((t) => t.cleared), "no timer outlives the call");
+  });
+
+  it("pins the cleanup allowance: 5 s, inside the Worker's 10 s shutdown grace", () => {
+    assert.strictEqual(UPLOAD_CLEANUP_BUDGET_MS, 5_000);
+  });
+
+  it("leaves no listener on the execution's signal once the stage is over", async () => {
+    const live = new Set<unknown>();
+    const signal = execution.signal;
+    const add = signal.addEventListener.bind(signal);
+    const remove = signal.removeEventListener.bind(signal);
+    signal.addEventListener = ((type: string, listener: unknown, options?: unknown) => {
+      live.add(listener);
+      add(type, listener as EventListener, options as AddEventListenerOptions);
+    }) as typeof signal.addEventListener;
+    signal.removeEventListener = ((type: string, listener: unknown, options?: unknown) => {
+      live.delete(listener);
+      remove(type, listener as EventListener, options as EventListenerOptions);
+    }) as typeof signal.removeEventListener;
+    for (const failPut of [false, true]) {
+      writer = new GatedWriter();
+      writer.fail.put = failPut;
+      const jobId = uploadingJobId();
+      await finalizeJobUpload(input(jobId));
+      assert.strictEqual(live.size, 0, `no listener left (put ${failPut ? "failed" : "succeeded"})`);
+    }
+  });
+
+  it("refuses malformed stage bounds before any work", async () => {
+    for (const stage of [
+      undefined,
+      null,
+      { signal: execution.signal },
+      { signal: execution.signal, deadlineMs: -1 },
+      { signal: execution.signal, deadlineMs: 1.5 },
+      { signal: execution.signal, deadlineMs: Number.MAX_SAFE_INTEGER + 2 },
+      { signal: {}, deadlineMs: T0 + 1 },
+      { deadlineMs: T0 + 1 },
+    ]) {
+      writer = new GatedWriter();
+      const jobId = uploadingJobId();
+      const result = await finalizeJobUpload({ ...input(jobId), stage: stage as never });
+      assert.deepStrictEqual(result, { type: "storage_failure", code: "invalid_input", cleanup: "not_needed" }, JSON.stringify(stage));
+      assert.deepStrictEqual(writer.ops(), []);
+    }
   });
 });

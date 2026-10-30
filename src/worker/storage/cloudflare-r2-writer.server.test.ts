@@ -446,6 +446,113 @@ describe("CloudflareR2ObjectStoreWriter", () => {
     }
   });
 
+  // ── VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001 ─────────────────────────
+  //
+  // The abort plumbing, with fake clients: deterministic, no socket. The real
+  // SDK and real sockets are exercised in `r2-transport.server.test.ts`.
+
+  function bodyThatRecordsItsClose() {
+    const state = { started: false, closed: false };
+    const body: AsyncIterable<Uint8Array> = (async function* () {
+      try {
+        state.started = true;
+        yield new Uint8Array([1, 2, 3]);
+        yield new Uint8Array([4, 5, 6]);
+      } finally {
+        state.closed = true;
+      }
+    })();
+    return { state, body };
+  }
+
+  it("LD-2b: hands every operation's signal to the SDK as its abortSignal, and nothing when there is none", async () => {
+    const seen: Array<{ command: string; options: unknown }> = [];
+    const fakeClient: S3SendClient = {
+      send: async (command: any, options?: unknown) => {
+        seen.push({ command: command.constructor.name, options });
+        if (command instanceof HeadObjectCommand) {
+          return { ContentLength: 1, ContentType: "video/mp4", ContentDisposition: "attachment" };
+        }
+        return {};
+      },
+    };
+    const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
+    const signal = new AbortController().signal;
+    const { body } = bodyThatRecordsItsClose();
+    await writer.put({ objectKey: validKey, contentLength: 6, contentType: "video/mp4", contentDisposition: "attachment", body }, { signal });
+    await writer.head(validKey, { signal });
+    await writer.delete(validKey, { signal });
+    await writer.delete(validKey);
+    assert.deepStrictEqual(
+      seen.map((c) => c.command),
+      ["PutObjectCommand", "HeadObjectCommand", "DeleteObjectCommand", "DeleteObjectCommand"],
+    );
+    for (const call of seen.slice(0, 3)) {
+      assert.strictEqual((call.options as { abortSignal?: AbortSignal }).abortSignal, signal, call.command);
+    }
+    assert.deepStrictEqual(seen[3]!.options, {}, "no signal, no abortSignal");
+  });
+
+  it("LD-2b: an already-aborted operation never reaches the SDK and never reads its body", async () => {
+    let sends = 0;
+    const fakeClient: S3SendClient = {
+      send: async () => {
+        sends += 1;
+        return {};
+      },
+    };
+    const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
+    const controller = new AbortController();
+    controller.abort(new Error("over"));
+    const { state, body } = bodyThatRecordsItsClose();
+    await assert.rejects(
+      writer.put({ objectKey: validKey, contentLength: 6, contentType: "video/mp4", contentDisposition: "attachment", body }, { signal: controller.signal }),
+      CloudflareR2Error,
+    );
+    await assert.rejects(writer.head(validKey, { signal: controller.signal }), CloudflareR2Error);
+    await assert.rejects(writer.delete(validKey, { signal: controller.signal }), CloudflareR2Error);
+    assert.strictEqual(sends, 0);
+    assert.strictEqual(state.started, false);
+  });
+
+  it("LD-2b: a put the SDK rejected part-way closes its body: no further read, the source returned", async () => {
+    const fakeClient: S3SendClient = {
+      send: async (command: any) => {
+        // Reads ONE chunk, as a request would before its socket stalled, then fails.
+        const reader = (command.input.Body as Readable)[Symbol.asyncIterator]();
+        await reader.next();
+        throw Object.assign(new Error("Request aborted"), { name: "AbortError" });
+      },
+    };
+    const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
+    const { state, body } = bodyThatRecordsItsClose();
+    await assert.rejects(
+      writer.put({ objectKey: validKey, contentLength: 6, contentType: "video/mp4", contentDisposition: "attachment", body }),
+      (err: unknown) => err instanceof CloudflareR2Error && err.message === "Failed to put object",
+    );
+    // The writer destroys the request body it created; that returns the
+    // source's iterator, whose `finally` runs.
+    for (let i = 0; i < 50 && !state.closed; i += 1) await new Promise((r) => setImmediate(r));
+    assert.strictEqual(state.started, true);
+    assert.strictEqual(state.closed, true);
+  });
+
+  it("LD-2b: the request body it handed the SDK is destroyed on success too (a no-op once it ended)", async () => {
+    let handed: Readable | null = null;
+    const fakeClient: S3SendClient = {
+      send: async (command: any) => {
+        handed = command.input.Body as Readable;
+        for await (const chunk of handed) void chunk;
+        return {};
+      },
+    };
+    const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
+    const { state, body } = bodyThatRecordsItsClose();
+    await writer.put({ objectKey: validKey, contentLength: 6, contentType: "video/mp4", contentDisposition: "attachment", body });
+    assert.ok(handed !== null && (handed as Readable).destroyed);
+    assert.strictEqual(state.closed, true);
+  });
+
   it("static capability exclusions", () => {
     const source = fs.readFileSync(new URL("./cloudflare-r2-writer.server.ts", import.meta.url), "utf-8");
     assert.ok(!source.includes("GetObjectCommand"), "Must not import GetObjectCommand");

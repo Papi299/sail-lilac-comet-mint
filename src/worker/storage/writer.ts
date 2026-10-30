@@ -25,26 +25,45 @@ export const ObjectStoreHeadSchema = z.object({
 export type ObjectStoreHead = z.infer<typeof ObjectStoreHeadSchema>;
 
 /**
+ * VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001: how the caller can end ONE
+ * operation early.
+ *
+ * Aborting `signal` must end the operation for real: no credential is acquired
+ * after it, no request is started after it, and a request already in flight is
+ * torn down — its socket destroyed and, for a put, its body no longer read.
+ * The operation then rejects. An implementation must never merely stop
+ * waiting while the request carries on.
+ *
+ * Absent, the operation is bounded only by its implementation's own transport
+ * limits. The context carries no deadline of its own: a caller with one aborts
+ * the signal when it passes.
+ */
+export type ObjectStoreOperationContext = {
+  readonly signal?: AbortSignal;
+};
+
+/**
  * Provider-neutral boundary for object storage operations.
  * Must NOT expose presigned URLs, list operations, or wildcard deletes.
  */
 export interface ObjectStoreWriter {
   /**
-   * Uploads an object. Throws on failure.
+   * Uploads an object. Throws on failure, including when `context.signal`
+   * aborts it.
    */
-  put(input: ObjectStorePutInput): Promise<void>;
+  put(input: ObjectStorePutInput, context?: ObjectStoreOperationContext): Promise<void>;
 
   /**
    * Retrieves object metadata.
    * Returns null if the object is missing.
-   * Throws on operational failure.
+   * Throws on operational failure, including when `context.signal` aborts it.
    */
-  head(objectKey: WorkerObjectKey): Promise<ObjectStoreHead | null>;
+  head(objectKey: WorkerObjectKey, context?: ObjectStoreOperationContext): Promise<ObjectStoreHead | null>;
 
   /**
    * Deletes exactly one object by key.
    * Succeeds silently if the object is already missing.
-   * Throws on operational failure.
+   * Throws on operational failure, including when `context.signal` aborts it.
    */
-  delete(objectKey: WorkerObjectKey): Promise<void>;
+  delete(objectKey: WorkerObjectKey, context?: ObjectStoreOperationContext): Promise<void>;
 }

@@ -504,7 +504,7 @@ describe("HLS v2 boundary: every fMP4 failure fails closed before any media tool
         }),
     });
     const spawned = processes();
-    await failsClosed("TIMEOUT", { timeLimits: { downloadTimeLimitMs: 60, processingMs: 600_000 } });
+    await failsClosed("TIMEOUT", { timeLimits: { downloadTimeLimitMs: 60, processingMs: 600_000, uploadMs: 3_600_000 } });
     assert.deepEqual(requests.map((r) => r.url), [PLAYLIST_URL, INIT_URL]);
     assert.equal(spawned.length, 0);
   });

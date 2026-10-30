@@ -1,6 +1,7 @@
 /**
  * The Worker's time limits and job lifetimes (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001,
- * extended by VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001).
+ * extended by VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001 and
+ * VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001).
  *
  * ONE model, built ONCE by the composition root (`runtime.server.ts`) from the
  * strict loader's validated values, and injected into every stage a time limit
@@ -24,8 +25,19 @@
  *
  * Both replace the retired `DOWNLOAD_TIMEOUT`, which bounded acquisition AND
  * every processing subprocess with one value read by two loaders. The strict
- * loader now refuses that variable by presence. They are the only two limits
- * the executor receives (`WorkerStageTimeLimits`).
+ * loader now refuses that variable by presence.
+ *
+ * ─── Upload stage (LD-2b) ────────────────────────────────────────────────────
+ *
+ *  - `uploadMs` (`UPLOAD_TIMEOUT`) is ONE absolute deadline for a job's whole
+ *    UPLOAD stage, armed once from the durable `processing → uploading`
+ *    transition and capped by the job's execution deadline
+ *    (`deriveUploadStageDeadlineMs`). It covers the credential mints, the
+ *    PutObject, the HeadObject verification and the ready commit: no operation
+ *    receives a fresh budget, and progress and retries never extend it.
+ *
+ * Those three are the only limits the executor receives
+ * (`WorkerStageTimeLimits`).
  *
  * ─── Job lifetimes (LD-2a) ───────────────────────────────────────────────────
  *
@@ -48,20 +60,18 @@
  * `FILE_EXPIRATION_MINUTES`, capped at 55 minutes because the R2 lifecycle rule
  * deletes an object 60 minutes after it is written: the link must end first.
  *
- * Two fields exist only because `L` must budget for them:
+ * `analysisMs` (`ANALYSIS_TIMEOUT`) exists here only because `L` must budget for
+ * it. Analysis is still bounded by the analysis policy, which the runtime builds
+ * from the same validated value.
  *
- *  - `analysisMs` (`ANALYSIS_TIMEOUT`). Analysis is still bounded by the analysis
- *    policy, which the runtime builds from the same validated value.
- *  - `uploadMs` (`UPLOAD_TIMEOUT`) is PARSED AND BUDGETED, NOT ENFORCED. Nothing
- *    bounds or cancels the R2 upload yet: an upload already in flight runs to its
- *    own end. LD-2b enforces this value. Until then no Worker module reads it but
- *    the derivation below (`worker-time-limits-boundary.test.ts`), and the
- *    executor never receives it.
+ * `uploadMs` (`UPLOAD_TIMEOUT`) was parsed and budgeted by LD-2a and is ENFORCED
+ * since LD-2b. Only the derivation below and the executor read it
+ * (`worker-time-limits-boundary.test.ts`); the upload lifecycle receives the
+ * absolute deadline the executor derives from it, never the duration.
  *
  * `inactivityMs` (`DOWNLOAD_INACTIVITY_TIMEOUT`) arrives with its watchdog in
  * LD-3b. A field that nothing enforces would be a value some later code could
- * read before the change that gives it meaning; `uploadMs` is the one deliberate
- * exception, because the lifetime must already reserve the upload's time.
+ * read before the change that gives it meaning.
  *
  * ─── Defaults ────────────────────────────────────────────────────────────────
  *
@@ -95,7 +105,8 @@ export const PROCESSING_TIMEOUT_SECONDS = Object.freeze({
 
 /**
  * `UPLOAD_TIMEOUT`, in seconds: the strict loader's range and default. Parsed
- * and budgeted into `L` by LD-2a; enforced only from LD-2b.
+ * and budgeted into `L` by LD-2a; enforced as the upload stage's one absolute
+ * deadline since LD-2b.
  */
 export const UPLOAD_TIMEOUT_SECONDS = Object.freeze({
   min: 300,
@@ -127,7 +138,7 @@ export type WorkerTimeLimits = Readonly<{
   downloadTimeLimitMs: number;
   /** ONE absolute deadline per processing stage, shared by its subprocesses. */
   processingMs: number;
-  /** `UPLOAD_TIMEOUT`. Budgeted into `L`; NOT enforced before LD-2b. */
+  /** `UPLOAD_TIMEOUT`. ONE absolute deadline for a job's upload stage, budgeted into `L`. */
   uploadMs: number;
   /** `R`: how long a terminal outcome stays authorised after it is reached. */
   retentionMs: number;
@@ -136,12 +147,14 @@ export type WorkerTimeLimits = Readonly<{
 }>;
 
 /**
- * The two limits the executor hands to its stage seams. An executor receives
- * ONLY these: never `uploadMs`, which nothing enforces yet, and never a
- * lifetime, which the store assigns and the executor reads back from the job it
- * claimed.
+ * The three stage limits the executor enforces. An executor receives ONLY these:
+ * never a lifetime, which the store assigns and the executor reads back from the
+ * job it claimed.
  */
-export type WorkerStageTimeLimits = Pick<WorkerTimeLimits, "downloadTimeLimitMs" | "processingMs">;
+export type WorkerStageTimeLimits = Pick<
+  WorkerTimeLimits,
+  "downloadTimeLimitMs" | "processingMs" | "uploadMs"
+>;
 
 /** The two lifetimes the durable store assigns to `expires_at_ms`. */
 export type WorkerJobLifetimes = Pick<WorkerTimeLimits, "executionLifetimeMs" | "retentionMs">;
@@ -274,8 +287,8 @@ function readInjected(value: object, field: string, maximum: number): number {
 }
 
 /**
- * Validates an INJECTED stage model and returns a frozen copy of exactly its two
- * fields — whatever else the caller's object carries, `uploadMs` included,
+ * Validates an INJECTED stage model and returns a frozen copy of exactly its
+ * three fields — whatever else the caller's object carries, a lifetime included,
  * never reaches the executor.
  *
  * Each field must be a positive safe integer of milliseconds no larger than
@@ -295,7 +308,48 @@ export function assertWorkerStageTimeLimits(value: unknown): WorkerStageTimeLimi
       MAXIMUM_WORKER_TIME_LIMITS.downloadTimeLimitMs,
     ),
     processingMs: readInjected(value, "processingMs", MAXIMUM_WORKER_TIME_LIMITS.processingMs),
+    uploadMs: readInjected(value, "uploadMs", MAXIMUM_WORKER_TIME_LIMITS.uploadMs),
   });
+}
+
+/**
+ * LD-2b: the ONE absolute deadline of a job's upload stage, in epoch
+ * milliseconds.
+ *
+ *     deadline = min(stageStartedAtMs + uploadMs, executionDeadlineMs)
+ *
+ * `stageStartedAtMs` is the instant the durable `processing → uploading`
+ * transition committed, read back from that transition's own row, and
+ * `executionDeadlineMs` is the claimed job's `expiresAt` (`claimed + L`): the
+ * upload stage never outlives the job it belongs to. The value is computed once
+ * per execution and nothing renews it.
+ *
+ * Every input must be a safe integer, `uploadMs` positive and no wider than the
+ * strict loader can configure; anything else is refused by field name, never
+ * clamped into a plausible deadline.
+ */
+export function deriveUploadStageDeadlineMs(input: {
+  stageStartedAtMs: number;
+  uploadMs: number;
+  executionDeadlineMs: number;
+}): number {
+  const { stageStartedAtMs, uploadMs, executionDeadlineMs } = input;
+  if (!Number.isSafeInteger(stageStartedAtMs) || stageStartedAtMs < 0) {
+    throw new WorkerTimeLimitsError("stageStartedAtMs");
+  }
+  if (
+    !Number.isSafeInteger(uploadMs) ||
+    uploadMs <= 0 ||
+    uploadMs > MAXIMUM_WORKER_TIME_LIMITS.uploadMs
+  ) {
+    throw new WorkerTimeLimitsError("uploadMs");
+  }
+  if (!Number.isSafeInteger(executionDeadlineMs) || executionDeadlineMs < 0) {
+    throw new WorkerTimeLimitsError("executionDeadlineMs");
+  }
+  const stageDeadlineMs = stageStartedAtMs + uploadMs;
+  if (!Number.isSafeInteger(stageDeadlineMs)) throw new WorkerTimeLimitsError("stageStartedAtMs");
+  return Math.min(stageDeadlineMs, executionDeadlineMs);
 }
 
 /**

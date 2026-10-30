@@ -1,4 +1,4 @@
-import { createReadStream } from "node:fs";
+import { createReadStream, type ReadStream } from "node:fs";
 import { statfs } from "node:fs/promises";
 import { z } from "zod";
 import { buildDownloadFilename } from "@/lib/filenames";
@@ -50,11 +50,12 @@ import type { CancelJobResult, DurableWorkerJob, WorkerJobStore } from "@/worker
 import type { ObjectStoreWriter } from "@/worker/storage/writer";
 import type { WorkerVideoMetadata } from "@/shared/worker/contracts";
 import { WorkerErrorCodeSchema } from "@/shared/worker/errors";
-import { finalizeJobUpload } from "@/worker/storage/upload-lifecycle.server";
+import { finalizeJobUpload, type FinalizeUploadResult } from "@/worker/storage/upload-lifecycle.server";
 import {
   DEFAULT_WORKER_TIME_LIMITS,
   WorkerTimeLimitsError,
   assertWorkerStageTimeLimits,
+  deriveUploadStageDeadlineMs,
   type WorkerStageTimeLimits,
 } from "../runtime/time-limits.ts";
 
@@ -74,7 +75,8 @@ export type ExecutionBackstopTimerHandle = { unref?: () => unknown };
 /**
  * VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001: the execution-lifetime
  * backstop's timer hooks, injectable so tests drive it in virtual time.
- * Production: the platform `setTimeout` / `clearTimeout`.
+ * Production: the platform `setTimeout` / `clearTimeout`. Since LD-2b the same
+ * hooks also drive the upload stage's deadline and its cleanup allowance.
  */
 export type ExecutionBackstopTimers = {
   setTimeoutFn: (handler: () => void, ms: number) => ExecutionBackstopTimerHandle;
@@ -434,22 +436,22 @@ export type JobExecutorDeps = {
    */
   genericLimits?: GenericByteLimits;
   /**
-   * The Worker's stage time limits (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001) — the
-   * ONE source of every acquisition deadline and processing budget this
-   * executor hands out. Production: the runtime's model, built once from the
-   * strict loader. Absent, the strict loader's own defaults apply
+   * The Worker's stage time limits (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001,
+   * VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001) — the ONE source of every
+   * acquisition deadline, processing budget and upload deadline this executor
+   * hands out. Production: the runtime's model, built once from the strict
+   * loader. Absent, the strict loader's own defaults apply
    * (`DEFAULT_WORKER_TIME_LIMITS`), never the legacy module configuration. A
    * malformed model is refused at construction.
    *
-   * Only the two stage limits are kept, whatever else the model carries: the
-   * executor never receives `uploadMs`, which nothing enforces before LD-2b,
-   * and its execution deadline is the claimed job's own `expiresAt`, never a
-   * lifetime from here.
+   * Only the three stage limits are kept, whatever else the model carries: the
+   * execution deadline is the claimed job's own `expiresAt`, never a lifetime
+   * from here.
    */
   timeLimits?: WorkerStageTimeLimits;
   /**
-   * LD-2a: the execution-lifetime backstop's timer hooks. Production: the
-   * platform timer.
+   * LD-2a: the execution-lifetime backstop's timer hooks; since LD-2b also the
+   * upload stage's. Production: the platform timer.
    */
   backstopTimers?: ExecutionBackstopTimers;
 };
@@ -625,7 +627,7 @@ export class JobExecutor {
       throw new WorkerTimeLimitsError("genericLimits");
     }
     this.genericLimits = deps.genericLimits ?? { maxFileSizeBytes: config.maxFileSize };
-    // Exactly the two stage limits, copied and validated, from the injected
+    // Exactly the three stage limits, copied and validated, from the injected
     // model or else the strict loader's defaults.
     this.stageTimeLimits = assertWorkerStageTimeLimits(deps.timeLimits ?? DEFAULT_WORKER_TIME_LIMITS);
     this.genericDownloadLimits = Object.freeze({
@@ -852,6 +854,16 @@ export class JobExecutor {
     this.checkExecutionLifetime(job);
     this.checkCancelled(signal);
 
+    // LD-2b: the upload stage's ONE absolute deadline — from the instant the
+    // durable `uploading` transition committed (that row's own `updatedAt`),
+    // plus `UPLOAD_TIMEOUT`, and never past the claimed job's execution
+    // deadline. Computed once; nothing below receives a duration.
+    const uploadDeadlineMs = deriveUploadStageDeadlineMs({
+      stageStartedAtMs: upRes.job.updatedAt,
+      uploadMs: this.stageTimeLimits.uploadMs,
+      executionDeadlineMs: job.expiresAt,
+    });
+
     // §10: the container, MIME and filename extension all come from the plan's
     // single allowlisted target, so the advertised preset and the produced
     // artifact cannot diverge.
@@ -865,17 +877,35 @@ export class JobExecutor {
     // The canonical, containment-validated path is the exact path opened.
     const stream = createReadStream(validOut.path);
 
-    const readyResult = await finalizeJobUpload({
-      jobId,
-      store: this.store,
-      writer: this.writer,
-      body: stream,
-      filename,
-      fileSize: validOut.size,
-      mime: mimeForContainer(container),
-      quality,
-      container,
-    });
+    // LD-2b: the stage follows this execution's signal — cancellation,
+    // operator shutdown and the lifetime backstop reach the in-flight request
+    // — and arms its own deadline once, on the same timer hooks.
+    let readyResult: FinalizeUploadResult;
+    try {
+      readyResult = await finalizeJobUpload({
+        jobId,
+        store: this.store,
+        writer: this.writer,
+        body: stream,
+        filename,
+        fileSize: validOut.size,
+        mime: mimeForContainer(container),
+        quality,
+        container,
+        stage: {
+          signal,
+          deadlineMs: uploadDeadlineMs,
+          clock: this.getClock,
+          timers: this.backstopTimers,
+        },
+      });
+    } finally {
+      // LD-2b: this execution opened the file, so it closes it, on every
+      // outcome and before its work directory is removed. A body the upload
+      // read to its end is already closed; an aborted, failed or never-started
+      // one would otherwise keep its descriptor.
+      await closeUploadSource(stream);
+    }
 
     if (readyResult.type === "storage_failure") {
       // No existing code is more specific, and object-store detail is not for
@@ -890,6 +920,20 @@ export class JobExecutor {
       // is still `uploading` and no other writer will end it: this execution
       // fails it — TIMEOUT, stage "Upload failed".
       throw new AppError("TIMEOUT");
+    }
+    if (readyResult.type === "upload_timeout") {
+      // LD-2b: the upload stage's deadline passed first. The request was torn
+      // down and the attempted key deleted; the job is still `uploading`. It is
+      // a TIMEOUT, stage "Upload failed" — unless a cancellation, a shutdown or
+      // the lifetime backstop also reached this execution's signal, which
+      // `execute()`'s catch ranks above it.
+      throw new AppError("TIMEOUT");
+    }
+    if (readyResult.type === "aborted") {
+      // LD-2b: this execution's signal ended the upload. Its provenance —
+      // durable cancellation, operator shutdown, the lifetime backstop — is
+      // decided in `execute()`'s catch, never from this error.
+      throw new AppError("PROCESSING_FAILED");
     }
     // `job_state_conflict` means another writer already committed a terminal
     // state (cancelled / failed / ready). finalizeJobUpload has deleted the
@@ -1352,9 +1396,10 @@ export class JobExecutor {
    * TIMEOUT, below cancellation and shutdown. A signal already aborted for
    * another cause is left alone.
    *
-   * An upload in flight does not observe the abort until LD-2b makes it
-   * cancellable. It runs to its own end, and the ready commit — which requires
-   * the lifetime to still be running — then refuses it.
+   * Since LD-2b an upload in flight observes the abort too: the upload stage
+   * follows this signal, tears down its request and deletes the attempted key.
+   * The upload stage's own deadline is capped at this same instant, and the
+   * ready commit still requires the lifetime to be running.
    *
    * The timer is unref'd, because the execution's own work holds the event
    * loop, and `dispose()` (idempotent) clears it for good. The delay is
@@ -1404,6 +1449,19 @@ export class JobExecutor {
  */
 function carriesTimeLimit(limits: object): boolean {
   return Reflect.ownKeys(limits).some((key) => key !== "maxFileSizeBytes");
+}
+
+/**
+ * LD-2b: closes an upload's source file and waits until its descriptor is
+ * released. A stream the upload read to its end has already closed; any other
+ * — aborted mid-file, failed, or never read at all — is destroyed here.
+ */
+async function closeUploadSource(stream: ReadStream): Promise<void> {
+  if (stream.closed) return;
+  await new Promise<void>((resolve) => {
+    stream.once("close", () => resolve());
+    stream.destroy();
+  });
 }
 
 function finiteInt(value: number | null | undefined): number | null {
