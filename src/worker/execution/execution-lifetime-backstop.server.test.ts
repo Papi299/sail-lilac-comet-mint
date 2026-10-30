@@ -181,6 +181,26 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 5000
   throw new Error(`timed out waiting for: ${label}`);
 }
 
+/**
+ * Awaits an execution, but never forever. If the backstop under test were
+ * broken, the stage it should abort would never settle, and Node 26's test
+ * runner waits on a pending test indefinitely (Node 22's cancels it). This
+ * turns that into a bounded, named failure instead of a hang.
+ */
+async function settled(execution: Promise<void>, label: string, timeoutMs = 5000): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      execution,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`the execution never settled: ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 type Harness = {
   tempDir: string;
   db: DatabaseSync;
@@ -366,7 +386,7 @@ describe("execution-lifetime backstop: arming and disposal", () => {
     assert.equal(executor.activeJobCount, 1);
     assert.equal(row(h, second.jobId).status, "downloading", "the later job is untouched");
     release();
-    await running;
+    await settled(running, "the later execution");
     assert.equal(row(h, second.jobId).status, "ready");
     assert.equal(h.timers.armed.length, 2, "one timer per execution");
   });
@@ -400,7 +420,7 @@ describe("execution-lifetime backstop: fires exactly at its bound, as TIMEOUT wi
     assert.equal(executor.activeJobCount, 1);
     h.clock.now = job.expiresAt;
     h.timers.fire();
-    await execution;
+    await settled(execution, "analysis");
     assertLifetimeTimeout(h, job.jobId, "Download failed", job.expiresAt);
     assert.equal(existsSync(workRoot), false, "the work directory is removed");
     assert.equal(executor.activeJobCount, 0, "the controller is unregistered");
@@ -421,7 +441,7 @@ describe("execution-lifetime backstop: fires exactly at its bound, as TIMEOUT wi
     await waitFor(() => entered.value, "acquisition");
     h.clock.now = job.expiresAt;
     h.timers.fire();
-    await execution;
+    await settled(execution, "acquisition");
     assertLifetimeTimeout(h, job.jobId, "Download failed", job.expiresAt);
     assert.equal(existsSync(partial), false);
     assert.deepEqual(h.writer.puts, [], "nothing is uploaded");
@@ -448,6 +468,12 @@ describe("execution-lifetime backstop: fires exactly at its bound, as TIMEOUT wi
       child.killCalls.push(signal);
       return true;
     };
+    let closed = false;
+    const closeChild = () => {
+      if (closed) return;
+      closed = true;
+      queueMicrotask(() => child.emit("close", null));
+    };
     const spawn: SpawnImpl = (command) => {
       spawned.push(command);
       return child as unknown as ChildProcess; // stays alive until its group is killed
@@ -457,11 +483,10 @@ describe("execution-lifetime backstop: fires exactly at its bound, as TIMEOUT wi
       spawn,
       processKill: (pid, signal) => {
         killRequests.push({ pid, signal });
-        if (pid === -FAKE_PID) queueMicrotask(() => child.emit("close", null));
+        if (pid === -FAKE_PID) closeChild();
         return true;
       },
     });
-
     const job = claimJob(h, "preset:mp3");
     const execution = makeExecutor(h, {
       analyze: async () => MP3_META(),
@@ -471,12 +496,20 @@ describe("execution-lifetime backstop: fires exactly at its bound, as TIMEOUT wi
       // allows the backstop's kill, so the stage's timeout can never pass it.
       timeLimits: { downloadTimeLimitMs: 600_000, processingMs: 30_000 },
     }).execute(job);
-    await waitFor(() => spawned.length === 1, "FFmpeg to be spawned");
-    assert.equal(row(h, job.jobId).status, "processing");
-    h.clock.now = job.expiresAt;
-    h.timers.fire();
-    await waitFor(() => killRequests.length === 1, "the backstop's group kill", 2_000);
-    await execution;
+    try {
+      await waitFor(() => spawned.length === 1, "FFmpeg to be spawned");
+      assert.equal(row(h, job.jobId).status, "processing");
+      h.clock.now = job.expiresAt;
+      h.timers.fire();
+      await waitFor(() => killRequests.length === 1, "the backstop's group kill", 2_000);
+      await settled(execution, "processing");
+    } finally {
+      // Whatever failed above, the fake child closes and the execution settles
+      // BEFORE afterEach removes the hooks: a runner timer left pending would
+      // otherwise send a real SIGKILL to the fabricated group on the host.
+      closeChild();
+      await settled(execution, "processing cleanup").catch(() => {});
+    }
 
     assert.deepEqual(killRequests, [{ pid: -FAKE_PID, signal: "SIGKILL" }], "exactly the group, with SIGKILL");
     assert.deepEqual(child.killCalls, [], "no direct-child fallback was needed");
@@ -501,7 +534,7 @@ describe("execution-lifetime backstop: fires exactly at its bound, as TIMEOUT wi
     assert.equal(h.writer.deletes.length, 0, "nothing deleted while the upload is still in flight");
     h.clock.now = job.expiresAt + 2_000;
     releaseUpload(); // the PUT completes after the lifetime
-    await execution;
+    await settled(execution, "the late upload");
 
     assert.equal(h.writer.puts.length, 1);
     assert.deepEqual(h.writer.deletes, [h.writer.puts[0]!.objectKey], "exactly the uploaded key, nothing else");
@@ -537,7 +570,7 @@ describe("execution-lifetime backstop: the ready commit at, before and after the
     await waitFor(() => h.writer.putEntered, "the upload");
     h.clock.now = commitAt(job);
     releaseUpload();
-    await execution;
+    await settled(execution, "the upload completing");
     return job;
   }
 
@@ -597,7 +630,7 @@ describe("execution-lifetime backstop: precedence — cancellation, then shutdow
     h.clock.now += 5_000;
     const cancelledAt = h.clock.now;
     assert.equal(executor.cancel(job.jobId).type, "cancelled");
-    await execution;
+    await settled(execution, "cancel first");
     h.clock.now = job.expiresAt;
     h.timers.forceFire();
     const r = row(h, job.jobId);
@@ -616,7 +649,7 @@ describe("execution-lifetime backstop: precedence — cancellation, then shutdow
     h.timers.fire();
     // The acquisition settles a macrotask later; the cancel lands in between.
     assert.equal(executor.cancel(job.jobId).type, "cancelled");
-    await execution;
+    await settled(execution, "deadline, then cancel");
     assert.equal(row(h, job.jobId).status, "cancelled");
     assert.deepEqual(h.failCalls, []);
   });
@@ -629,7 +662,7 @@ describe("execution-lifetime backstop: precedence — cancellation, then shutdow
     await waitFor(() => entered.value, "acquisition");
     h.clock.now = job.expiresAt;
     h.timers.fire();
-    await execution;
+    await settled(execution, "deadline first");
     assert.equal(executor.cancel(job.jobId).type, "unchanged");
     assertLifetimeTimeout(h, job.jobId, "Download failed", job.expiresAt);
   });
@@ -641,7 +674,7 @@ describe("execution-lifetime backstop: precedence — cancellation, then shutdow
     const execution = executor.execute(job);
     await waitFor(() => entered.value, "acquisition");
     executor.abortActiveForShutdown();
-    await execution;
+    await settled(execution, "shutdown first");
     assert.equal(row(h, job.jobId).status, "downloading");
     h.clock.now = job.expiresAt;
     h.timers.forceFire();
@@ -665,7 +698,7 @@ describe("execution-lifetime backstop: precedence — cancellation, then shutdow
     h.clock.now = job.expiresAt;
     h.timers.fire();
     executor.abortActiveForShutdown();
-    await execution;
+    await settled(execution, "deadline, then shutdown");
     assert.equal(row(h, job.jobId).status, "downloading", "an operator restart is never turned into a TIMEOUT");
     assert.deepEqual(h.failCalls, []);
   });
@@ -708,7 +741,7 @@ describe("execution-lifetime backstop: nothing renews it", () => {
       assert.equal(row(h, job.jobId).status, "downloading");
       h.clock.now = job.expiresAt;
       h.timers.fire();
-      await execution;
+      await settled(execution, "progress then the deadline");
       assertLifetimeTimeout(h, job.jobId, "Download failed", job.expiresAt);
     } finally {
       h.cleanup();
