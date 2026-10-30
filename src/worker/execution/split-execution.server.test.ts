@@ -25,7 +25,7 @@ import {
   type JobExecutorDeps,
   type MergeSplitMediaFn,
 } from "./job-executor.server.ts";
-import type { WorkerTimeLimits } from "../runtime/time-limits.ts";
+import type { WorkerStageTimeLimits } from "../runtime/time-limits.ts";
 import type { ExecutionAnalysis } from "../analysis/media-analyzer.server.ts";
 import { GenericPresetSourceSchema, type GenericPresetSource } from "./generic-source.ts";
 import {
@@ -64,7 +64,7 @@ const MAX = 1000;
  * DIFFERENT from each other and from the defaults, so a seam handed the wrong
  * one — or a missed injection — is caught.
  */
-const TIME_LIMITS: WorkerTimeLimits = Object.freeze({ downloadTimeLimitMs: 1_234_000, processingMs: 450_000 });
+const TIME_LIMITS: WorkerStageTimeLimits = Object.freeze({ downloadTimeLimitMs: 1_234_000, processingMs: 450_000 });
 /** What the split downloader is handed: the byte ceiling plus the acquisition limit. */
 const LIMITS: GenericDownloadLimits = { maxFileSizeBytes: MAX, downloadTimeLimitMs: TIME_LIMITS.downloadTimeLimitMs };
 /** Exactly the split preflight's requirement: 2 × MAX. */

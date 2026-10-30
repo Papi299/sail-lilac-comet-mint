@@ -5972,6 +5972,11 @@ mid-job, a delete that failed and was never retried. 60 minutes is deliberately
 *longer* than 45 so the application always gets its attempt first, and bounded
 enough that an escaped object is measured in minutes rather than days.
 
+*LD-2a (§7b, not deployed):* the 45 minutes are then counted from the job's
+`ready` commit — moments after the object write — instead of from job
+creation, and `FILE_EXPIRATION_MINUTES` is capped at 55, so a ready link still
+ends at least five minutes before this rule can delete its object.
+
 Two properties worth stating precisely:
 
 - **Provider deletion is asynchronous.** Cloudflare removes objects on its own
@@ -6245,6 +6250,130 @@ not read `DOWNLOAD_TIME_LIMIT` or `PROCESSING_TIMEOUT`, so a rollback can never
 apply a longer limit to the old coupled code: with `DOWNLOAD_TIMEOUT` absent it
 runs at its own 600 s default. No schema or contract change is involved, so an
 old control plane and a new Worker are compatible in either order.
+
+### 7b. Job lifetime and retention (`VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001`) — source change, NOT DEPLOYED
+
+**Status.** A source change for review. No image has been built for Production
+and nothing is deployed. A Worker image without this change keeps the
+creation-based expiry: every job's `expires_at_ms` is
+`created + FILE_EXPIRATION_MINUTES`, whatever its status, and its job view
+answers `410 EXPIRED` past that instant even while the job runs. This is phase
+LD-2a of the bounded long-download design. It does **not** enable long
+downloads: `DOWNLOAD_TIME_LIMIT` stays 600 s.
+
+**The model.** One existing column, `worker_jobs.expires_at_ms` — "the instant
+after which this job is no longer authorised" — is assigned at most three times
+per job, each inside the transaction of its state transition, together with the
+job's idempotency record:
+
+| Transition | `expires_at_ms` | What it bounds |
+| :--- | :--- | :--- |
+| create (→ `queued`) | `created + L` | the queue wait |
+| claim (`queued` → `analyzing`) | `claimed + L` | the execution |
+| `ready`, `failed`, `cancelled`, restart recovery | `finished + R` | the retention |
+
+- `L` = `ANALYSIS_TIMEOUT` + `DOWNLOAD_TIME_LIMIT` + `PROCESSING_TIMEOUT` +
+  `UPLOAD_TIMEOUT` + 600 s, derived once in `src/worker/runtime/time-limits.ts`
+  and never configured: **5,445 s** (1 h 30 min 45 s) at the defaults, at most
+  54,600 s.
+- `R` = `FILE_EXPIRATION_MINUTES` × 60 s: **2,700 s** (45 min) at the default.
+- No progress write, stage transition, retry or replay moves it, and the status
+  machine is acyclic, so there is no renewal path. An unfinished job lives at
+  most `2L` (queue wait, then execution), and its outcome `R` more.
+
+| Variable | Unit, range | Default | Meaning |
+| :--- | :--- | ---: | :--- |
+| `UPLOAD_TIMEOUT` | seconds, 300–14,400 | 3,600 | **New.** The upload's share of `L`. **Parsed and budgeted, NOT enforced:** nothing bounds or cancels the R2 upload before LD-2b. |
+| `FILE_EXPIRATION_MINUTES` | minutes, **1–55** (was 1–1,440) | 45 | **Redefined:** the retention after a job ends — ready, failed or cancelled — counted from that moment. |
+| `ANALYSIS_TIMEOUT`, `DOWNLOAD_TIME_LIMIT`, `PROCESSING_TIMEOUT` | — | 45 / 600 / 600 s | Unchanged; now also terms of `L`. |
+
+There is no `JOB_LIFETIME` variable. Both variables use the strict loader's
+grammar (§7a); an invalid value blocks startup, naming only the variable.
+
+**Behaviour changes at the defaults:**
+
+1. A ready link lasts 45 minutes **from ready**, however long the job took.
+2. A failed or cancelled outcome stays viewable for 45 minutes after it ends.
+3. The Worker job view never answers 410 for an **active** job (`analyzing` …
+   `uploading`). A queued job past `created + L` and a terminal one past
+   `finished + R` answer `410 EXPIRED`, as before.
+4. A running job past `claimed + L` is failed by its executor as `TIMEOUT`
+   ("The video took too long to process.") with the stage of its status —
+   through a one-shot backstop timer at the claimed deadline or a stage-boundary
+   check — never as `EXPIRED` ("This download link has expired"). Cancellation
+   and operator shutdown keep their precedence over it.
+5. The ready commit requires `claimed + L` to still be running, as part of its
+   conditional write. An upload finishing later loses: its exact object key is
+   deleted and the job fails `TIMEOUT` · "Upload failed".
+6. `FILE_EXPIRATION_MINUTES` above 55 blocks startup.
+
+**Unchanged:** the 600 s acquisition and 600 s per-stage processing defaults;
+the R2 upload itself (one unbounded, non-cancellable `PutObject`, until LD-2b);
+credential ceilings (`PutObject` ≤ min(900 s, remaining lifetime) — a longer
+lifetime never lengthens a credential); maintenance (exact-key deletion of
+expired READY objects only, metadata after the object, idempotency tombstones
+kept, failed and cancelled rows kept); the Worker/control-plane contract (no new
+field, `expiresAt` keeps its type); the SQLite schema (v1, no migration); yt-dlp,
+safe egress, concurrency and size limits.
+
+**Idempotency.** Every assignment mirrors into the job's idempotency record in
+the same transaction: `job_expires_at_ms` = the new expiry and `expires_at_ms` =
+max(record creation + 24 h, the new expiry). The 24-hour floor counts from the
+record's creation, never from a transition. A replay returns the job while it is
+authorised and `EXPIRED` (410) after, and never mints a second job while the
+record is retained. At the widest configuration a job can stay authorised past
+24 hours; its record then lives exactly as long as that authorisation.
+
+**Known limitations of LD-2a:**
+
+- **The upload is neither bounded nor cancellable before LD-2b.** The backstop's
+  abort does not stop a `PutObject` already in flight: it runs to its own end.
+  LD-2a guarantees only that such an upload can never commit `ready` after the
+  lifetime, and that its exact key is then deleted. A PUT that never returns
+  holds the single execution slot until LD-2b, or a Worker restart.
+- A `PutObject` credential is at most 900 s. Whether R2 completes a single PUT
+  whose body outlives its credential is **unverified** (gate G-UPLOAD, LD-2b /
+  LD-5a).
+- **Provider lifecycle margin.** `R` ≤ 55 min keeps a ready link at least five
+  minutes inside the 3,600 s backstop (§5h) when the ready commit closely
+  follows the object write, which it does: a HEAD and one SQLite transaction.
+  If R2 dates an object from the start of a long upload rather than its
+  completion, the margin shrinks by that upload's duration. Unverified; it
+  belongs with G-UPLOAD.
+- **Wall-clock regression.** Every assignment after creation is floored at
+  `created_at_ms`, which the schema's `CHECK` requires. Only a clock stepped
+  back past a job's creation by more than the window reaches the floor; without
+  it, such a clock would make `recover()` fail at every start.
+
+#### Pre-deployment check — before an image with this change starts
+
+The §7a check (no `DOWNLOAD_TIMEOUT`) still applies. Then, read-only and
+names-first, for the two keys LD-2a reads:
+
+```
+sudo grep -E '^[[:space:]]*(FILE_EXPIRATION_MINUTES|UPLOAD_TIMEOUT)[[:space:]]*=' /etc/videofetch/worker.env
+```
+
+| Finding | Action |
+| :--- | :--- |
+| `FILE_EXPIRATION_MINUTES` above 55, or not a plain decimal integer | **BLOCK the promotion**: the image refuses to start. Change `worker.env` through a separately authorised change first, never as part of the promotion. |
+| `UPLOAD_TIMEOUT` present | **STOP** for a decision. In range it only lengthens `L` and the queue bound — it enforces nothing before LD-2b; out of range it blocks startup. |
+| neither present | Proceed: `L` 5,445 s, `R` 2,700 s. |
+
+#### Mixed versions and rollback
+
+| Situation | Behaviour |
+| :--- | :--- |
+| Old control plane + LD-2a Worker | Compatible: no contract change. The control plane uses `expiresAt` as before; it signs only `ready && now < expiresAt`. |
+| LD-2a Worker on a pre-LD-2a database | No migration. Queued rows keep `created + 45 min` until claimed, then `claimed + L`; ready and terminal rows keep their instants; active rows are recovered at start with `recovery + R`. |
+| Previous Worker (rollback) on an LD-2a database | No migration: schema v1 opens and every row hydrates. It treats `expires_at_ms` as an opaque deadline and never re-assigns it: a running row it recovers at start keeps `claimed + L` (viewable up to `L` instead of `R`); a row still queued at the rollback keeps `created + L` through its claim, execution and ready commit under the old code. |
+
+**Rollback** is the image retag and a Worker-only restart; no database restore.
+One transient consequence: a job queued by LD-2a and completed by the rolled-back
+image keeps `created + L` as its ready link's end, which can outlive the R2
+backstop by up to about 30 minutes; the object is still collected on time and the
+link then fails rather than serving it. Rolling back with an empty queue (the
+promotion procedure's in-flight check) avoids it.
 
 ---
 

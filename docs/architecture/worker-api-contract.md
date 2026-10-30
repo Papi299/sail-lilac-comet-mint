@@ -95,6 +95,24 @@ Safe for transmission to Vercel. When ready, it contains:
 
 **Important:** `objectKey` travels from the Worker to the authenticated Vercel control plane, but it MUST NOT appear in the browser-facing/public VideoFetch job DTO. Vercel strictly strips `objectKey` before returning the public response to the browser.
 
+**`expiresAt` — the instant after which the job is no longer authorised.**
+`VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001` — **source change, NOT
+DEPLOYED** (deployment runbook §7b). The field, its type and its name are
+unchanged; what it holds depends on the job's state:
+
+| Status | `expiresAt` | `GET /v1/jobs/:jobId` |
+| :--- | :--- | :--- |
+| `queued` | `createdAt + L` | the job until then; `410 EXPIRED` from then |
+| `analyzing` … `uploading` | claim instant `+ L` | **always the job** — the executor, not the view, ends an active job (as `TIMEOUT`) |
+| `ready`, `failed`, `cancelled` | the instant the job ended `+ R` | the job until then; `410 EXPIRED` from then |
+
+`L` is the Worker's derived execution lifetime and `R` its retention
+(`FILE_EXPIRATION_MINUTES`, 1–55 min). A ready link is therefore authorised for
+`R` from the moment the file exists. The control plane needs no change: it
+signs only while `status == ready` and `now < expiresAt`. A Worker image without
+this change holds `createdAt + FILE_EXPIRATION_MINUTES` in every state and
+answers 410 past it for any status.
+
 **3. `VideoMetadata.sourceQuality` (OPTIONAL; analysis only)**
 
 `GENERIC-SOURCE-RENDITION-INVENTORY-001` — **DEPLOYED / PRODUCTION ACCEPTED**
@@ -781,6 +799,12 @@ The worker persists:
 **Retention:**
 The idempotency record is retained for at least 24 hours, and NEVER shorter than the referenced job metadata lifetime. Even if job metadata is cleaned up early, a tombstone remains to avoid silently recreating the operation. After the idempotency record itself expires, reuse may create a new job.
 
+*LD-2a (source change, NOT DEPLOYED):* the job's `expiresAt` is re-assigned at
+claim and at the terminal transition, and the record follows every assignment in
+the same transaction: its job expiry mirrors the job's, and its own retention is
+`max(record creation + 24 h, job expiry)`. The 24 hours still count from the
+record's creation. A replay never moves a job's lifetime.
+
 **Behavior during retention window:**
 - New key + valid payload → Creates one job, returns 201 Created.
 - Same key + same semantic payload + existing job → Returns the existing job, returns 200 OK.
@@ -844,7 +868,7 @@ Vercel validates the returned code against the shared allowlist before mapping i
 | Invalid URL (yt-dlp fails) | 400 Bad Request | `INVALID_URL` |
 | Processing Timeout | 408 Request Timeout | `TIMEOUT` |
 | Processing Failed | 500 Internal Error | `PROCESSING_FAILED` |
-| Job Expired | 410 Gone | `EXPIRED` |
+| Job Expired | 410 Gone | `EXPIRED` — since LD-2a (not deployed) only a queued or terminal job past its `expiresAt`, never an active one |
 
 ### Failed-job classification
 

@@ -440,6 +440,7 @@ describe("Worker runtime configuration", () => {
       assert.equal(media.fileExpirationMinutes, 45);
       assert.equal(media.downloadTimeLimitSeconds, 600);
       assert.equal(media.processingTimeoutSeconds, 600);
+      assert.equal(media.uploadTimeoutSeconds, 3600);
       assert.equal(media.analysisTimeoutSeconds, 45);
       assert.equal(media.maxRedirects, 5);
       assert.equal(media.tempDirectory, null);
@@ -504,6 +505,8 @@ describe("Worker runtime configuration", () => {
       expectInvalid(baseEnv({ MAX_FILE_SIZE: "99999999999999999999" }), "MAX_FILE_SIZE");
       expectInvalid(baseEnv({ MAX_VIDEO_DURATION: "604801" }), "MAX_VIDEO_DURATION");
       expectInvalid(baseEnv({ FILE_EXPIRATION_MINUTES: "1441" }), "FILE_EXPIRATION_MINUTES");
+      expectInvalid(baseEnv({ FILE_EXPIRATION_MINUTES: "56" }), "FILE_EXPIRATION_MINUTES");
+      expectInvalid(baseEnv({ UPLOAD_TIMEOUT: "0" }), "UPLOAD_TIMEOUT");
       expectInvalid(baseEnv({ DOWNLOAD_TIME_LIMIT: "0" }), "DOWNLOAD_TIME_LIMIT");
       expectInvalid(baseEnv({ PROCESSING_TIMEOUT: "0" }), "PROCESSING_TIMEOUT");
       expectInvalid(baseEnv({ ANALYSIS_TIMEOUT: "3601" }), "ANALYSIS_TIMEOUT");
@@ -849,5 +852,137 @@ describe("VIDEOFETCH-LD1 stage time limits", () => {
     it("accepts startup when it is absent", () => {
       assert.doesNotThrow(() => loadWorkerRuntimeConfig(baseEnv()));
     });
+  });
+});
+
+/**
+ * VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001 — the job-lifetime inputs.
+ *
+ * `UPLOAD_TIMEOUT` (300..14400 s, default 3600) is new: parsed and budgeted into
+ * the derived job lifetime, NOT enforced before LD-2b. `FILE_EXPIRATION_MINUTES`
+ * keeps its default (45) but is capped at 55 (was 1440): it is now the retention
+ * after a job ends, and a ready link must end before the R2 lifecycle rule
+ * deletes the object. Both follow the strict loader's grammar exactly.
+ */
+describe("VIDEOFETCH-LD2A job-lifetime inputs", () => {
+  const VARIABLES = [
+    { name: "UPLOAD_TIMEOUT", field: "uploadTimeoutSeconds", min: 300, max: 14_400, fallback: 3600 },
+    { name: "FILE_EXPIRATION_MINUTES", field: "fileExpirationMinutes", min: 1, max: 55, fallback: 45 },
+  ] as const;
+
+  const read = (env: NodeJS.ProcessEnv, field: (typeof VARIABLES)[number]["field"]) =>
+    loadWorkerRuntimeConfig(env).media[field];
+
+  for (const v of VARIABLES) {
+    describe(v.name, () => {
+      it(`defaults to ${v.fallback} when absent`, () => {
+        assert.equal(read(baseEnv(), v.field), v.fallback);
+      });
+
+      for (const blank of ["", " ", "   ", "\t", " \n ", "\r\n"]) {
+        it(`treats ${JSON.stringify(blank)} as unset (the default), never as zero`, () => {
+          assert.equal(read(baseEnv({ [v.name]: blank }), v.field), v.fallback);
+        });
+      }
+
+      it("accepts the range ends, the default and the values just inside the ends", () => {
+        for (const n of [v.min, v.min + 1, v.fallback, v.max - 1, v.max]) {
+          assert.equal(read(baseEnv({ [v.name]: String(n) }), v.field), n, String(n));
+        }
+      });
+
+      it("refuses the values just outside the range, zero and negatives", () => {
+        for (const raw of [String(v.min - 1), String(v.max + 1), "0", "-1", `-${v.fallback}`]) {
+          expectInvalid(baseEnv({ [v.name]: raw }), v.name);
+        }
+      });
+
+      it("refuses decimals, exponents, signs, separators, hex and words", () => {
+        for (const raw of [
+          `${v.fallback}.0`,
+          `${v.fallback}.5`,
+          "1e1",
+          "3.6e3",
+          "1E2",
+          `+${v.fallback}`,
+          "3_600",
+          "3 600",
+          "0x10",
+          `${v.fallback}s`,
+          "45m",
+          "forty-five",
+          "Infinity",
+          "NaN",
+        ]) {
+          expectInvalid(baseEnv({ [v.name]: raw }), v.name);
+        }
+      });
+
+      it("refuses unsafe and oversized integers rather than rounding them", () => {
+        for (const raw of ["9007199254740992", "9007199254740993", "99999999999999999", "123456789012345678"]) {
+          expectInvalid(baseEnv({ [v.name]: raw }), v.name);
+        }
+      });
+
+      it("accepts leading zeros within the 17-digit grammar, and trims surrounding whitespace", () => {
+        assert.equal(read(baseEnv({ [v.name]: `0${v.fallback}` }), v.field), v.fallback);
+        assert.equal(read(baseEnv({ [v.name]: ` ${v.fallback} ` }), v.field), v.fallback);
+        // Eighteen digits break the grammar even when the value is in range.
+        expectInvalid(baseEnv({ [v.name]: String(v.fallback).padStart(18, "0") }), v.name);
+      });
+
+      it("names only the variable, never the rejected value", () => {
+        assert.throws(
+          () => loadWorkerRuntimeConfig(baseEnv({ [v.name]: "SENTINEL-LIFETIME-VALUE" })),
+          (err: unknown) => {
+            assert.ok(err instanceof WorkerRuntimeConfigError);
+            assert.deepEqual([...err.variables], [v.name]);
+            assert.equal(`${err.message}\n${err.stack ?? ""}`.includes("SENTINEL-LIFETIME-VALUE"), false);
+            return true;
+          },
+        );
+      });
+    });
+  }
+
+  it("caps FILE_EXPIRATION_MINUTES at 55: 0, 56, 60 and the pre-LD-2a 1440 are refused", () => {
+    for (const raw of ["0", "56", "60", "1440", "1441"]) {
+      expectInvalid(baseEnv({ FILE_EXPIRATION_MINUTES: raw }), "FILE_EXPIRATION_MINUTES");
+    }
+    for (const n of [1, 45, 55]) {
+      assert.equal(read(baseEnv({ FILE_EXPIRATION_MINUTES: String(n) }), "fileExpirationMinutes"), n);
+    }
+  });
+
+  it("keeps the inputs independent: setting one never moves another", () => {
+    const a = loadWorkerRuntimeConfig(baseEnv({ UPLOAD_TIMEOUT: "14400" })).media;
+    assert.equal(a.uploadTimeoutSeconds, 14_400);
+    assert.equal(a.fileExpirationMinutes, 45);
+    assert.equal(a.downloadTimeLimitSeconds, 600);
+    assert.equal(a.processingTimeoutSeconds, 600);
+    const b = loadWorkerRuntimeConfig(baseEnv({ FILE_EXPIRATION_MINUTES: "55" })).media;
+    assert.equal(b.uploadTimeoutSeconds, 3600);
+    assert.equal(b.fileExpirationMinutes, 55);
+  });
+
+  it("names every offending variable at once, and still refuses the retired DOWNLOAD_TIMEOUT", () => {
+    assert.throws(
+      () =>
+        loadWorkerRuntimeConfig(
+          baseEnv({ UPLOAD_TIMEOUT: "1", FILE_EXPIRATION_MINUTES: "99", DOWNLOAD_TIMEOUT: "600" }),
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof WorkerRuntimeConfigError);
+        assert.deepEqual([...err.variables], ["DOWNLOAD_TIMEOUT", "FILE_EXPIRATION_MINUTES", "UPLOAD_TIMEOUT"]);
+        return true;
+      },
+    );
+  });
+
+  it("introduces no lifetime variable: JOB_LIFETIME and EXECUTION_MARGIN are not read", () => {
+    const media = loadWorkerRuntimeConfig(baseEnv({ JOB_LIFETIME: "1", EXECUTION_MARGIN: "1" })).media;
+    assert.equal(Object.hasOwn(media, "jobLifetimeSeconds"), false);
+    assert.equal(Object.hasOwn(media, "executionMarginSeconds"), false);
+    assert.equal(media.uploadTimeoutSeconds, 3600);
   });
 });

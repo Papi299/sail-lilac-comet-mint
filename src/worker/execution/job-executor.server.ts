@@ -54,12 +54,32 @@ import { finalizeJobUpload } from "@/worker/storage/upload-lifecycle.server";
 import {
   DEFAULT_WORKER_TIME_LIMITS,
   WorkerTimeLimitsError,
-  assertWorkerTimeLimits,
-  type WorkerTimeLimits,
+  assertWorkerStageTimeLimits,
+  type WorkerStageTimeLimits,
 } from "../runtime/time-limits.ts";
 
 /** Minimum wall-clock gap between two durable progress writes (§21). */
 export const PROGRESS_THROTTLE_MS = 250;
+
+/**
+ * The longest delay the platform timer accepts. A larger one would fire after
+ * 1 ms with a warning, so the backstop clamps to it (see
+ * `armExecutionLifetimeBackstop`).
+ */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/** A backstop timer handle: `unref` where the platform has one. */
+export type ExecutionBackstopTimerHandle = { unref?: () => unknown };
+
+/**
+ * VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001: the execution-lifetime
+ * backstop's timer hooks, injectable so tests drive it in virtual time.
+ * Production: the platform `setTimeout` / `clearTimeout`.
+ */
+export type ExecutionBackstopTimers = {
+  setTimeoutFn: (handler: () => void, ms: number) => ExecutionBackstopTimerHandle;
+  clearTimeoutFn: (handle: ExecutionBackstopTimerHandle) => void;
+};
 
 /** Analysis is dependency-injected so tests can drive it without live network. */
 export type AnalyzeDirectMediaFn = (
@@ -420,8 +440,18 @@ export type JobExecutorDeps = {
    * strict loader. Absent, the strict loader's own defaults apply
    * (`DEFAULT_WORKER_TIME_LIMITS`), never the legacy module configuration. A
    * malformed model is refused at construction.
+   *
+   * Only the two stage limits are kept, whatever else the model carries: the
+   * executor never receives `uploadMs`, which nothing enforces before LD-2b,
+   * and its execution deadline is the claimed job's own `expiresAt`, never a
+   * lifetime from here.
    */
-  timeLimits?: WorkerTimeLimits;
+  timeLimits?: WorkerStageTimeLimits;
+  /**
+   * LD-2a: the execution-lifetime backstop's timer hooks. Production: the
+   * platform timer.
+   */
+  backstopTimers?: ExecutionBackstopTimers;
 };
 
 /** The byte half of `GenericDownloadLimits`: the executor's time comes from `timeLimits`. */
@@ -479,6 +509,19 @@ function sanitizeForDurableState(value: string, maxLength: number): string {
  */
 const SHUTDOWN_ABORTED_SIGNALS = new WeakSet<AbortSignal>();
 
+/**
+ * VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001: the provenance of an
+ * execution-lifetime abort — the backstop firing at the claimed job's durable
+ * deadline.
+ *
+ * The same rules as `SHUTDOWN_ABORTED_SIGNALS`: membership is the OBJECT
+ * IDENTITY of the very signal the backstop aborted, never a message, a code or
+ * anything an acquisition tool or FFmpeg rejected with; the set is
+ * module-private and holds no strong reference; and it is per execution, so a
+ * later job can never inherit it.
+ */
+const LIFETIME_ABORTED_SIGNALS = new WeakSet<AbortSignal>();
+
 export class JobExecutor {
   private readonly store: WorkerJobStore;
   private readonly writer: ObjectStoreWriter;
@@ -497,9 +540,10 @@ export class JobExecutor {
   private readonly derivePlanForExecution: DerivePlanForExecutionFn;
   private readonly availableWorkDirBytes: AvailableWorkDirBytesFn;
   private readonly genericLimits: GenericByteLimits;
-  private readonly stageTimeLimits: WorkerTimeLimits;
+  private readonly stageTimeLimits: WorkerStageTimeLimits;
   /** What both yt-dlp seams receive: the byte ceiling and the acquisition limit. */
   private readonly genericDownloadLimits: GenericDownloadLimits;
+  private readonly backstopTimers: ExecutionBackstopTimers;
 
   constructor(
     store: WorkerJobStore,
@@ -581,12 +625,17 @@ export class JobExecutor {
       throw new WorkerTimeLimitsError("genericLimits");
     }
     this.genericLimits = deps.genericLimits ?? { maxFileSizeBytes: config.maxFileSize };
-    this.stageTimeLimits =
-      deps.timeLimits === undefined ? DEFAULT_WORKER_TIME_LIMITS : assertWorkerTimeLimits(deps.timeLimits);
+    // Exactly the two stage limits, copied and validated, from the injected
+    // model or else the strict loader's defaults.
+    this.stageTimeLimits = assertWorkerStageTimeLimits(deps.timeLimits ?? DEFAULT_WORKER_TIME_LIMITS);
     this.genericDownloadLimits = Object.freeze({
       maxFileSizeBytes: this.genericLimits.maxFileSizeBytes,
       downloadTimeLimitMs: this.stageTimeLimits.downloadTimeLimitMs,
     });
+    this.backstopTimers = deps.backstopTimers ?? {
+      setTimeoutFn: (handler, ms) => setTimeout(handler, ms),
+      clearTimeoutFn: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    };
   }
 
   /** Number of executions currently holding an AbortController (§11 diagnostics). */
@@ -595,7 +644,7 @@ export class JobExecutor {
   }
 
   /** The stage time limits this executor hands out (frozen). */
-  public get timeLimits(): WorkerTimeLimits {
+  public get timeLimits(): WorkerStageTimeLimits {
     return this.stageTimeLimits;
   }
 
@@ -654,6 +703,11 @@ export class JobExecutor {
     this.activeControllers.set(jobId, controller);
     const signal = controller.signal;
 
+    // LD-2a: ONE backstop for the whole execution, at the claimed job's durable
+    // deadline (`claimed + L`). It can only fire asynchronously, so never before
+    // the checks below; it is disposed first in `finally`.
+    const backstop = this.armExecutionLifetimeBackstop(job.expiresAt, controller);
+
     let workDir = "";
     try {
       const currentView = this.store.getJob(jobId);
@@ -698,14 +752,20 @@ export class JobExecutor {
         }
       }
 
-      const code = this.classifyErrorCode(err);
+      // 3. LD-2a: the execution outlived its lifetime and the backstop aborted
+      //    it. That is a TIMEOUT whatever the interrupted stage rejected with;
+      //    `failJob()` derives the stage from the status it leaves. It ranks
+      //    below cancellation and shutdown, which return above.
+      const code = LIFETIME_ABORTED_SIGNALS.has(signal) ? "TIMEOUT" : this.classifyErrorCode(err);
       const safeMsg = ERROR_MESSAGES[code];
       // §27: the raw error is deliberately never logged and never persisted.
       this.store.failJob(jobId, code, safeMsg);
     } finally {
       // Cleanup is NEVER skipped, on any of the three outcomes above: the
       // active controller is unregistered and the per-job working directory is
-      // removed even when the durable row is intentionally left active.
+      // removed even when the durable row is intentionally left active. The
+      // backstop goes first, so no late timer can act during the cleanup.
+      backstop.dispose();
       this.activeControllers.delete(jobId);
       if (workDir) {
         await this.cleanup(workDir);
@@ -722,7 +782,7 @@ export class JobExecutor {
   private async runWorkflow(job: DurableWorkerJob, workDir: string, signal: AbortSignal) {
     const jobId = job.jobId;
 
-    this.checkExpiry(job);
+    this.checkExecutionLifetime(job);
     this.checkCancelled(signal);
 
     // ── analyzing ────────────────────────────────────────────────────────────
@@ -752,7 +812,7 @@ export class JobExecutor {
     });
     if (analysisRes.type !== "updated") return;
 
-    this.checkExpiry(job);
+    this.checkExecutionLifetime(job);
     this.checkCancelled(signal);
 
     // ── downloading: ORIGINAL BYTES ONLY ─────────────────────────────────────
@@ -768,7 +828,7 @@ export class JobExecutor {
     const procRes = this.store.beginProcessing(jobId);
     if (procRes.type !== "updated") return;
 
-    this.checkExpiry(job);
+    this.checkExecutionLifetime(job);
     this.checkCancelled(signal);
 
     // §11/§36: local processing happens strictly AFTER beginProcessing()
@@ -789,7 +849,7 @@ export class JobExecutor {
     const upRes = this.store.beginUploading(jobId);
     if (upRes.type !== "updated") return;
 
-    this.checkExpiry(job);
+    this.checkExecutionLifetime(job);
     this.checkCancelled(signal);
 
     // §10: the container, MIME and filename extension all come from the plan's
@@ -823,6 +883,13 @@ export class JobExecutor {
       // `failJob()` as the "Upload failed" stage of the `uploading` status
       // this failure leaves.
       throw new AppError("PROCESSING_FAILED");
+    }
+    if (readyResult.type === "lifetime_expired") {
+      // LD-2a: the upload finished after the job's execution lifetime. The ready
+      // commit refused it and the uploaded key is already deleted, but the job
+      // is still `uploading` and no other writer will end it: this execution
+      // fails it — TIMEOUT, stage "Upload failed".
+      throw new AppError("TIMEOUT");
     }
     // `job_state_conflict` means another writer already committed a terminal
     // state (cancelled / failed / ready). finalizeJobUpload has deleted the
@@ -1256,10 +1323,63 @@ export class JobExecutor {
     };
   }
 
-  private checkExpiry(job: DurableWorkerJob) {
+  /**
+   * LD-2a: the stage-boundary half of the execution-lifetime bound; the
+   * backstop timer is the other. `job` is the job as claimed, so its
+   * `expiresAt` is the execution deadline, `claimed + L`. Running past it is a
+   * TIMEOUT, never EXPIRED: no completed file has expired, and the failure
+   * stage still comes from the durable status the job leaves.
+   */
+  private checkExecutionLifetime(job: DurableWorkerJob) {
     if (this.getClock() >= job.expiresAt) {
-      throw new AppError("EXPIRED");
+      throw new AppError("TIMEOUT");
     }
+  }
+
+  /**
+   * LD-2a: arms the ONE execution-lifetime backstop of one execution.
+   *
+   * The deadline is the claimed job's durable `expiresAt` — `claimed + L`,
+   * written by the claim itself — never a fresh full-length timeout from now,
+   * and nothing renews it: progress, stage transitions and retries never reach
+   * it. Every stage honours its own shorter bound, so the backstop fires only
+   * if one does not: a hung probe, a hung lookup, an upload that never ends.
+   *
+   * Firing marks this execution's signal and aborts its EXISTING controller —
+   * the abort a cancellation sends — so process-group termination, child
+   * cleanup and work-directory removal are the paths every abort already uses.
+   * It writes no durable state: `execute()`'s catch classifies the abort as
+   * TIMEOUT, below cancellation and shutdown. A signal already aborted for
+   * another cause is left alone.
+   *
+   * An upload in flight does not observe the abort until LD-2b makes it
+   * cancellable. It runs to its own end, and the ready commit — which requires
+   * the lifetime to still be running — then refuses it.
+   *
+   * The timer is unref'd, because the execution's own work holds the event
+   * loop, and `dispose()` (idempotent) clears it for good. The delay is
+   * clamped into the platform timer range; `L` is far below the limit, so the
+   * clamp can only ever make the backstop fire early, never keep it from firing.
+   */
+  private armExecutionLifetimeBackstop(
+    deadlineMs: number,
+    controller: AbortController,
+  ): { dispose(): void } {
+    let disposed = false;
+    const delayMs = Math.min(Math.max(deadlineMs - this.getClock(), 0), MAX_TIMER_DELAY_MS);
+    const handle = this.backstopTimers.setTimeoutFn(() => {
+      if (disposed || controller.signal.aborted) return;
+      LIFETIME_ABORTED_SIGNALS.add(controller.signal);
+      controller.abort(new AppError("TIMEOUT"));
+    }, delayMs);
+    handle.unref?.();
+    return {
+      dispose: () => {
+        if (disposed) return;
+        disposed = true;
+        this.backstopTimers.clearTimeoutFn(handle);
+      },
+    };
   }
 
   private checkCancelled(signal: AbortSignal) {

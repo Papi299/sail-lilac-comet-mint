@@ -22,7 +22,7 @@ import {
   type ExecutionPlan,
 } from "./format-plan.ts";
 import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
-import { WorkerTimeLimitsError, type WorkerTimeLimits } from "../runtime/time-limits.ts";
+import { WorkerTimeLimitsError, type WorkerStageTimeLimits } from "../runtime/time-limits.ts";
 
 /**
  * VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001 — the executor hands out the ONE model.
@@ -38,7 +38,7 @@ import { WorkerTimeLimitsError, type WorkerTimeLimits } from "../runtime/time-li
  * Fakes only: no network, no subprocess, no real media.
  */
 
-const LIMITS: WorkerTimeLimits = Object.freeze({ downloadTimeLimitMs: 1_234_000, processingMs: 2_345_000 });
+const LIMITS: WorkerStageTimeLimits = Object.freeze({ downloadTimeLimitMs: 1_234_000, processingMs: 2_345_000 });
 const DEFAULTS = { downloadTimeLimitMs: 600_000, processingMs: 600_000 } as const;
 const MAX = 10_000;
 
@@ -426,7 +426,7 @@ describe("stage time limits: construction refuses a second or malformed source",
       { downloadTimeLimitMs: 1, processingMs: 14_400_001 },
     ]) {
       const field = (bad.downloadTimeLimitMs as unknown) === 1 ? "processingMs" : "downloadTimeLimitMs";
-      assert.throws(construct({ timeLimits: bad as unknown as WorkerTimeLimits }), refusedFor(field));
+      assert.throws(construct({ timeLimits: bad as unknown as WorkerStageTimeLimits }), refusedFor(field));
     }
   });
 

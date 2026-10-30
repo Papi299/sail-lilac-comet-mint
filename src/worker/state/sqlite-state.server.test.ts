@@ -261,7 +261,7 @@ describe("Worker SQLite State", () => {
 
   it("expired queued job not claimed", () => {
     let mockTime = 1000;
-    const store = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000, generateJobId: () => "00000000000000000000000000000001" });
+    const store = new SQLiteJobStore({ db, clock: () => mockTime, executionLifetimeMs: 5000, generateJobId: () => "00000000000000000000000000000001" });
 
     store.createJob({ url: "http://a", formatId: "preset:720", principalId: "private-access-user" }, "123e4567-e89b-42d3-a456-426614174006");
 
@@ -533,13 +533,13 @@ describe("Worker SQLite State", () => {
 
   it("expired-via-job-ttl does NOT invoke generator", () => {
     let mockTime = 1000;
-    const storeA = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000 });
+    const storeA = new SQLiteJobStore({ db, clock: () => mockTime, executionLifetimeMs: 5000 });
     const req: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     storeA.createJob(req, "123e4567-e89b-42d3-a456-426614174032");
 
     // Advance past job TTL but within idempotency retention (24h)
     mockTime = 10000;
-    const storeB = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000, generateJobId: () => { throw new Error("generator must not run"); } });
+    const storeB = new SQLiteJobStore({ db, clock: () => mockTime, executionLifetimeMs: 5000, generateJobId: () => { throw new Error("generator must not run"); } });
     const res = storeB.createJob(req, "123e4567-e89b-42d3-a456-426614174032");
     assert.strictEqual(res.type, "expired");
   });
@@ -560,14 +560,14 @@ describe("Worker SQLite State", () => {
   it("expired idempotency record reuse DOES invoke generator", () => {
     let mockTime = 1000;
     let generatorCalled = false;
-    const storeA = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000 });
+    const storeA = new SQLiteJobStore({ db, clock: () => mockTime, executionLifetimeMs: 5000 });
     const req: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     storeA.createJob(req, "123e4567-e89b-42d3-a456-426614174034");
 
     // Advance past idempotency retention (24h)
     mockTime = 1000 + 25 * 60 * 60 * 1000;
     const storeB = new SQLiteJobStore({
-      db, clock: () => mockTime, jobTtlMs: 5000,
+      db, clock: () => mockTime, executionLifetimeMs: 5000,
       generateJobId: () => { generatorCalled = true; return Math.random().toString(16).slice(2).padStart(32, '0'); }
     });
     const req2: WorkerCreateJobRequest = { url: "http://b", formatId: "preset:720", principalId: "private-access-user" };
@@ -637,7 +637,7 @@ describe("Worker SQLite State", () => {
 
   it("idempotency created/existing/conflict/expired", () => {
     let mockTime = 1000;
-    const store = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000, generateJobId: () => Math.random().toString(16).slice(2).padStart(32, '0') });
+    const store = new SQLiteJobStore({ db, clock: () => mockTime, executionLifetimeMs: 5000, generateJobId: () => Math.random().toString(16).slice(2).padStart(32, '0') });
 
     const req1: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
 
@@ -689,7 +689,7 @@ describe("Worker SQLite State", () => {
 
   it("expired idempotency record reuse", () => {
     let mockTime = 1000;
-    const store = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000, generateJobId: () => Math.random().toString(16).slice(2).padStart(32, '0') });
+    const store = new SQLiteJobStore({ db, clock: () => mockTime, executionLifetimeMs: 5000, generateJobId: () => Math.random().toString(16).slice(2).padStart(32, '0') });
 
     const req1: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     store.createJob(req1, "123e4567-e89b-42d3-a456-426614174023");
@@ -705,7 +705,7 @@ describe("Worker SQLite State", () => {
 
   it("cleanupExpiredIdempotencyRecords deletes expired records", () => {
     let mockTime = 1000;
-    const store = new SQLiteJobStore({ db, clock: () => mockTime, jobTtlMs: 5000 });
+    const store = new SQLiteJobStore({ db, clock: () => mockTime, executionLifetimeMs: 5000 });
     const req: WorkerCreateJobRequest = { url: "http://a", formatId: "preset:720", principalId: "private-access-user" };
     store.createJob(req, "123e4567-e89b-42d3-a456-426614174050");
 

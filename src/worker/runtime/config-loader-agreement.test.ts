@@ -53,7 +53,8 @@ const SHARED = [
     max: Number.MAX_SAFE_INTEGER,
   },
   { name: "MAX_VIDEO_DURATION", strict: (m: Media) => m.maxVideoDurationSeconds, fallback: 7200, min: 1, max: 604_800 },
-  { name: "FILE_EXPIRATION_MINUTES", strict: (m: Media) => m.fileExpirationMinutes, fallback: 45, min: 1, max: 1440 },
+  // LD-2a caps the strict range at 55 (was 1440); the legacy loader has no range.
+  { name: "FILE_EXPIRATION_MINUTES", strict: (m: Media) => m.fileExpirationMinutes, fallback: 45, min: 1, max: 55 },
   { name: "MAX_REDIRECTS", strict: (m: Media) => m.maxRedirects, fallback: 5, min: 0, max: 20 },
 ] as const;
 

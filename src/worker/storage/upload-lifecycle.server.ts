@@ -35,10 +35,17 @@ export type JobStateConflictReason =
   | "ready"
   | "not_uploading";
 
-export type FinalizeUploadResult = 
+export type FinalizeUploadResult =
   | { type: "ready"; job: WorkerJobView }
   | { type: "storage_failure"; code: StorageFailureCode; cleanup: CleanupOutcome }
-  | { type: "job_state_conflict"; reason: JobStateConflictReason; cleanup: CleanupOutcome };
+  | { type: "job_state_conflict"; reason: JobStateConflictReason; cleanup: CleanupOutcome }
+  /**
+   * LD-2a: the upload completed after the job's execution lifetime ended. The
+   * ready commit refused it, the uploaded object was deleted by exact key, and
+   * the job is still `uploading` — no other writer has claimed it, so the
+   * caller must fail it.
+   */
+  | { type: "lifetime_expired"; cleanup: CleanupOutcome };
 
 async function cleanupUploadedObject(writer: ObjectStoreWriter, objectKey: string): Promise<CleanupOutcome> {
   try {
@@ -178,6 +185,9 @@ export async function finalizeJobUpload(input: FinalizeUploadInput): Promise<Fin
 
   // 9. Races -> cleanup
   const cleanup = await cleanupUploadedObject(writer, objectKey);
+  if (commitResult.type === "lifetime_expired") {
+    return { type: "lifetime_expired", cleanup };
+  }
   let reason: JobStateConflictReason = "not_uploading";
   if (commitResult.type === "not_found") {
     reason = "missing";
