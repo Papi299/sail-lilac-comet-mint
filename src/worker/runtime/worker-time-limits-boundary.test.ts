@@ -496,9 +496,11 @@ describe("WorkerTimeLimits is consumed consistently by every stage seam", () => 
  * property read, a property written in an object literal, a destructured
  * binding, an identifier or a string literal. Anywhere else is a finding.
  *
- *  - `uploadMs`: only the model, which defines it and sums it into `L`. No
- *    stage, executor, upload or storage module may read it before LD-2b gives
- *    it an enforcement; LD-2b updates this table deliberately.
+ *  - `uploadMs`: the model, which defines it and sums it into `L`, and — since
+ *    VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001 deliberately updated this
+ *    table — the executor, which turns it into the upload stage's ONE absolute
+ *    deadline. The upload lifecycle and the storage layer never read it: they
+ *    receive that deadline, never a duration they could restart.
  *  - `executionLifetimeMs` / `retentionMs`: the model (definition), the
  *    composition root (hands them to the store) and the store (assigns them).
  *    Never the executor, the HTTP view or the storage layer: the executor
@@ -507,7 +509,9 @@ describe("WorkerTimeLimits is consumed consistently by every stage seam", () => 
  *  - `jobTtlMs`: only the store, which refuses it by presence.
  */
 const LD2A_NAMES: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  uploadMs: ["src/worker/runtime/time-limits.ts"],
+  uploadMs: ["src/worker/runtime/time-limits.ts", "src/worker/execution/job-executor.server.ts"],
+  // LD-2b: the deadline derivation is defined once and called once.
+  deriveUploadStageDeadlineMs: ["src/worker/runtime/time-limits.ts", "src/worker/execution/job-executor.server.ts"],
   executionLifetimeMs: [
     "src/worker/runtime/time-limits.ts",
     "src/worker/runtime/runtime.server.ts",
@@ -548,7 +552,7 @@ function ld2aViolations(graph: Map<string, string>): string[] {
   return out;
 }
 
-describe("LD-2a: the lifetime is derived once and UPLOAD_TIMEOUT is not enforced", () => {
+describe("LD-2a/LD-2b: the lifetime is derived once, and UPLOAD_TIMEOUT reaches only the executor", () => {
   const graph = workerGraph();
   const real = (file: string) => readFileSync(join(ROOT, file), "utf8");
   const plant = (file: string, code: string): Overlay => ({ [file]: `${real(file)}\n${code}\n` });
@@ -560,7 +564,14 @@ describe("LD-2a: the lifetime is derived once and UPLOAD_TIMEOUT is not enforced
   it("positive controls: the scan sees each allowed use in the real graph", () => {
     const uses = [...graph].flatMap(([file, source]) => ld2aNameUses(file, source));
     const where = (name: string) => [...new Set(uses.filter((u) => u.name === name).map((u) => u.file))].sort();
-    assert.deepEqual(where("uploadMs"), ["src/worker/runtime/time-limits.ts"]);
+    assert.deepEqual(where("uploadMs"), [
+      "src/worker/execution/job-executor.server.ts",
+      "src/worker/runtime/time-limits.ts",
+    ]);
+    assert.deepEqual(where("deriveUploadStageDeadlineMs"), [
+      "src/worker/execution/job-executor.server.ts",
+      "src/worker/runtime/time-limits.ts",
+    ]);
     assert.deepEqual(where("EXECUTION_MARGIN_SECONDS"), ["src/worker/runtime/time-limits.ts"]);
     assert.deepEqual(where("executionLifetimeMs"), [...LD2A_NAMES.executionLifetimeMs!].sort());
     assert.deepEqual(where("retentionMs"), [...LD2A_NAMES.retentionMs!].sort());
@@ -573,9 +584,22 @@ describe("LD-2a: the lifetime is derived once and UPLOAD_TIMEOUT is not enforced
     assert.equal(sums.length, 1);
   });
 
+  it("LD-2b: the executor derives the upload deadline exactly once, from the durable transition and the claimed deadline", () => {
+    const text = real("src/worker/execution/job-executor.server.ts").replace(/\s+/g, " ");
+    const calls = text.match(/deriveUploadStageDeadlineMs\(\{[^}]*\}\)/g) ?? [];
+    assert.equal(calls.length, 1, "one derivation per upload stage");
+    assert.match(calls[0]!, /stageStartedAtMs: upRes\.job\.updatedAt,/, "the durable uploading transition's own instant");
+    assert.match(calls[0]!, /uploadMs: this\.stageTimeLimits\.uploadMs,/, "the one model's upload limit");
+    assert.match(calls[0]!, /executionDeadlineMs: job\.expiresAt,/, "the claimed job's execution deadline");
+    // The lifecycle is handed the absolute deadline, never a duration.
+    assert.match(text, /stage: \{ signal, deadlineMs: uploadDeadlineMs, clock: this\.getClock, timers: this\.backstopTimers, \}/);
+  });
+
   for (const [label, file, code, name] of [
-    ["the executor reading uploadMs", "src/worker/execution/job-executor.server.ts", "export const ld2aPlantedA = (x: { uploadMs: number }) => x.uploadMs;", "uploadMs"],
+    ["the HTTP service reading uploadMs", "src/worker/http/business-service.server.ts", "export const ld2aPlantedA = (x: { uploadMs: number }) => x.uploadMs;", "uploadMs"],
     ["the upload lifecycle reading uploadMs", "src/worker/storage/upload-lifecycle.server.ts", "export const ld2aPlantedB = (x: { uploadMs: number }) => x.uploadMs;", "uploadMs"],
+    ["the R2 writer reading uploadMs", "src/worker/storage/cloudflare-r2-writer.server.ts", "export const ld2aPlantedE = (x: { uploadMs: number }) => x.uploadMs;", "uploadMs"],
+    ["the upload lifecycle deriving its own deadline", "src/worker/storage/upload-lifecycle.server.ts", 'import { deriveUploadStageDeadlineMs as ld2bPlanted } from "../runtime/time-limits.ts";\nvoid ld2bPlanted;', "deriveUploadStageDeadlineMs"],
     ["the HTTP view reading the lifetime", "src/worker/http/business-service.server.ts", "export const ld2aPlantedC = (x: { executionLifetimeMs: number }) => x.executionLifetimeMs;", "executionLifetimeMs"],
     ["the executor recomputing L from a margin", "src/worker/execution/job-executor.server.ts", "export const EXECUTION_MARGIN_SECONDS = 600;", "EXECUTION_MARGIN_SECONDS"],
     ["the runtime reviving the retired TTL", "src/worker/runtime/runtime.server.ts", "export const ld2aPlantedD = { jobTtlMs: 1 };", "jobTtlMs"],
@@ -591,10 +615,12 @@ describe("LD-2a: the lifetime is derived once and UPLOAD_TIMEOUT is not enforced
     for (const file of [
       "src/worker/execution/job-executor.server.ts",
       "src/worker/storage/upload-lifecycle.server.ts",
+      "src/worker/storage/cloudflare-r2-writer.server.ts",
       "src/worker/http/business-service.server.ts",
       "src/worker/runtime/runtime.server.ts",
     ]) {
       assert.equal(real(file).includes("ld2aPlanted"), false, file);
+      assert.equal(real(file).includes("ld2bPlanted"), false, file);
     }
   });
 });

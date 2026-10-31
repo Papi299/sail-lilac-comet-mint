@@ -39,13 +39,22 @@ export type R2CredentialRequestInput = {
   readonly ttlSeconds: number;
 };
 
+/**
+ * LD-2b: how the caller can end one acquisition early. Aborting `signal` ends
+ * the broker exchange itself — the request is destroyed, not merely no longer
+ * awaited — and the mint rejects.
+ */
+export type R2CredentialMintOptions = {
+  readonly signal?: AbortSignal;
+};
+
 export interface R2CredentialProvider {
   /**
    * Obtains a credential scoped to exactly one action against exactly one
    * object. Throws on any refusal — callers must fail the R2 operation closed
    * rather than proceeding without a credential.
    */
-  mint(request: R2CredentialRequestInput): Promise<R2TemporaryCredential>;
+  mint(request: R2CredentialRequestInput, options?: R2CredentialMintOptions): Promise<R2TemporaryCredential>;
 }
 
 /**

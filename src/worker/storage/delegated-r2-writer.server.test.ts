@@ -498,3 +498,148 @@ describe("credential TTL derivation", () => {
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001: cancellation reaches every
+// step — before the mint, during it, right after it, and the request itself
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("DelegatedR2ObjectStoreWriter: the operation's signal (LD-2b)", () => {
+  const isAborted = (err: unknown) => {
+    assert.ok(err instanceof DelegatedR2Error, String(err));
+    assert.equal(err.failure, "aborted");
+    return true;
+  };
+
+  /** A provider that records every mint, with the options it was handed. */
+  function signalProvider(
+    behaviour: (signal: AbortSignal | undefined, request: Mint) => Promise<void> = async () => {},
+  ) {
+    const mints: Array<{ request: Mint; signal: AbortSignal | undefined; argCount: number }> = [];
+    const provider: R2CredentialProvider = {
+      async mint(request, ...rest: unknown[]) {
+        const options = rest[0] as { signal?: AbortSignal } | undefined;
+        mints.push({ request, signal: options?.signal, argCount: 1 + rest.length });
+        await behaviour(options?.signal, request);
+        return {
+          accessKeyId: "fake-delegated-key-id",
+          secretAccessKey: "fake-delegated-secret",
+          sessionToken: `fake-session-token-${request.action}`,
+          expiresAt: NOW + request.ttlSeconds * 1000,
+        };
+      },
+    };
+    return { provider, mints };
+  }
+
+  for (const op of ["put", "head", "delete"] as const) {
+    const run = (writer: DelegatedR2ObjectStoreWriter, signal?: AbortSignal) =>
+      op === "put"
+        ? writer.put(putInput(), signal ? { signal } : undefined)
+        : op === "head"
+          ? writer.head(KEY, signal ? { signal } : undefined)
+          : writer.delete(KEY, signal ? { signal } : undefined);
+
+    it(`${op}: a signal aborted BEFORE the mint mints nothing and builds no writer`, async () => {
+      const { provider, mints } = signalProvider();
+      const configs: CloudflareR2Config[] = [];
+      const calls: Call[] = [];
+      const controller = new AbortController();
+      controller.abort(new Error("cancelled"));
+      await assert.rejects(run(makeWriter(provider, recordingWriterFactory(configs, calls)), controller.signal), isAborted);
+      assert.equal(mints.length, 0, "the broker was never asked");
+      assert.equal(configs.length, 0);
+      assert.deepEqual(calls, []);
+    });
+
+    it(`${op}: an abort DURING the mint is handed to the provider, and no writer follows`, async () => {
+      const { provider, mints } = signalProvider(
+        (signal) =>
+          new Promise<void>((_, reject) => {
+            // The broker exchange ends on the abort, as the real client's does.
+            signal!.addEventListener("abort", () => reject(new Error("exchange destroyed")), { once: true });
+          }),
+      );
+      const configs: CloudflareR2Config[] = [];
+      const controller = new AbortController();
+      const pending = run(makeWriter(provider, recordingWriterFactory(configs, [])), controller.signal);
+      await new Promise((r) => setImmediate(r));
+      assert.equal(mints.length, 1);
+      assert.equal(mints[0]!.signal, controller.signal, "the provider received the operation's signal");
+      controller.abort(new Error("cancelled"));
+      await assert.rejects(pending, isAborted);
+      assert.equal(configs.length, 0, "no writer was built");
+    });
+
+    it(`${op}: a credential that arrives just AFTER the abort is discarded unused`, async () => {
+      const controller = new AbortController();
+      const { provider } = signalProvider(async () => {
+        // The broker answered, but the abort landed before the answer was used.
+        controller.abort(new Error("cancelled"));
+      });
+      const configs: CloudflareR2Config[] = [];
+      const calls: Call[] = [];
+      await assert.rejects(run(makeWriter(provider, recordingWriterFactory(configs, calls)), controller.signal), isAborted);
+      assert.equal(configs.length, 0, "the late credential built no writer");
+      assert.deepEqual(calls, [], "and started no request");
+    });
+
+    it(`${op}: the signal reaches the per-operation writer, and its abort is reported as such`, async () => {
+      const { provider } = signalProvider();
+      const controller = new AbortController();
+      const seen: Array<AbortSignal | undefined> = [];
+      const factory = (): ObjectStoreWriter => {
+        const operation = async (_arg: unknown, context?: { signal?: AbortSignal }) => {
+          seen.push(context?.signal);
+          controller.abort(new Error("cancelled mid-request"));
+          throw new Error("request torn down");
+        };
+        return { put: operation, head: operation as ObjectStoreWriter["head"], delete: operation };
+      };
+      await assert.rejects(run(makeWriter(provider, factory), controller.signal), isAborted);
+      assert.deepEqual(seen, [controller.signal]);
+    });
+  }
+
+  it("without a signal every operation behaves exactly as before LD-2b: one-argument mints, ordinary failures", async () => {
+    const { provider, mints } = signalProvider();
+    const failing = (): ObjectStoreWriter => ({
+      async put() {
+        throw new Error("provider failure");
+      },
+      async head() {
+        throw new Error("provider failure");
+      },
+      async delete() {
+        throw new Error("provider failure");
+      },
+    });
+    const writer = makeWriter(provider, failing);
+    for (const op of [() => writer.put(putInput()), () => writer.head(KEY), () => writer.delete(KEY)]) {
+      await assert.rejects(op(), (err: unknown) => err instanceof DelegatedR2Error && err.failure === "operation_failed");
+    }
+    assert.deepEqual(mints.map((m) => m.argCount), [1, 1, 1], "the provider is called exactly as before");
+  });
+
+  it("a signal that is present but never aborted changes no classification", async () => {
+    const live = new AbortController().signal;
+    const unavailable = makeWriter(recordingProvider([], { fail: true }), recordingWriterFactory([], []));
+    await assert.rejects(unavailable.put(putInput(), { signal: live }), (err: unknown) =>
+      err instanceof DelegatedR2Error && err.failure === "credential_unavailable");
+    const expired = makeWriter(recordingProvider([]), recordingWriterFactory([], []), () => NOW - 1);
+    await assert.rejects(expired.put(putInput(), { signal: live }), (err: unknown) =>
+      err instanceof DelegatedR2Error && err.failure === "job_expired");
+  });
+
+  it("the TTL policy is untouched by a signal: the same action, key and TTL are requested", async () => {
+    const withSignal = signalProvider();
+    const without = signalProvider();
+    const deadline = () => NOW + 300_000;
+    await makeWriter(withSignal.provider, recordingWriterFactory([], []), deadline).put(putInput(), {
+      signal: new AbortController().signal,
+    });
+    await makeWriter(without.provider, recordingWriterFactory([], []), deadline).put(putInput());
+    assert.deepEqual(withSignal.mints[0]!.request, without.mints[0]!.request);
+    assert.equal(withSignal.mints[0]!.request.ttlSeconds, 300, "min(remaining, PutObject ceiling)");
+  });
+});

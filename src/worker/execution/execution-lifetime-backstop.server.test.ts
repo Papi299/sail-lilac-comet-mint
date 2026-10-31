@@ -21,7 +21,12 @@ import { openWorkerDatabase } from "../state/database.server.ts";
 import type { DurableWorkerJob } from "../state/job-store.ts";
 import { applyMigrations } from "../state/migrations.server.ts";
 import { SQLiteJobStore } from "../state/sqlite-job-store.server.ts";
-import type { ObjectStoreHead, ObjectStorePutInput, ObjectStoreWriter } from "../storage/writer.ts";
+import type {
+  ObjectStoreHead,
+  ObjectStoreOperationContext,
+  ObjectStorePutInput,
+  ObjectStoreWriter,
+} from "../storage/writer.ts";
 import {
   JobExecutor,
   type ExecutionBackstopTimerHandle,
@@ -91,12 +96,36 @@ class RecordingWriter implements ObjectStoreWriter {
   readonly deletes: string[] = [];
   /** When set, `put` waits for it after consuming the body: an upload still in flight. */
   gate: Promise<void> | null = null;
+  /**
+   * LD-2b: when true, a gated `put` also ends — rejecting — the moment its
+   * operation signal aborts, as the real R2 writer does. When false it ignores
+   * the signal: a provider that keeps going after an abort.
+   */
+  honoursSignal = false;
   putEntered = false;
-  async put(input: ObjectStorePutInput): Promise<void> {
+  putAborted = false;
+  async put(input: ObjectStorePutInput, context: ObjectStoreOperationContext = {}): Promise<void> {
     this.puts.push(input);
     for await (const chunk of input.body) void chunk;
     this.putEntered = true;
-    if (this.gate) await this.gate;
+    if (!this.gate) return;
+    if (!this.honoursSignal || !context.signal) {
+      await this.gate;
+      return;
+    }
+    const signal = context.signal;
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        this.putAborted = true;
+        reject(new Error("request aborted"));
+      };
+      if (signal.aborted) return onAbort();
+      signal.addEventListener("abort", onAbort, { once: true });
+      void this.gate!.then(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      });
+    });
   }
   async head(objectKey: WorkerObjectKey): Promise<ObjectStoreHead | null> {
     const put = this.puts.find((p) => p.objectKey === objectKey);
@@ -306,11 +335,18 @@ describe("execution-lifetime backstop: arming and disposal", () => {
     }).execute(job);
 
     assert.equal(row(h, job.jobId).status, "ready");
-    assert.equal(h.timers.armed.length, 1, "armed once");
-    const [timer] = h.timers.armed;
+    // LD-2b: the same hooks also arm the upload stage's ONE deadline, after the
+    // backstop. Exactly one of each: the backstop first, once per execution.
+    assert.equal(h.timers.armed.length, 2, "the backstop, then the upload stage's deadline");
+    const [timer, uploadStage] = h.timers.armed;
     assert.equal(timer!.ms, L - 250, "the remaining lifetime to the durable deadline — never a fresh L");
     assert.equal(timer!.unrefed, true, "it never holds the event loop on its own");
     assert.equal(timer!.cleared, true, "disposed in finally");
+    // UPLOAD_TIMEOUT (3,600 s) is longer than this harness's L, so the stage's
+    // deadline is capped at the same durable instant: min(uploading + 3,600 s, claimed + L).
+    assert.equal(uploadStage!.ms, L - 250, "the upload stage never outlives the execution deadline");
+    assert.equal(uploadStage!.unrefed, true);
+    assert.equal(uploadStage!.cleared, true, "disposed when the stage ended");
     assert.deepEqual(h.failCalls, []);
   });
 
@@ -351,8 +387,11 @@ describe("execution-lifetime backstop: arming and disposal", () => {
     assert.equal(ready.status, "ready");
 
     h.clock.now = job.expiresAt + 1;
-    h.timers.fire(); // cleared: the platform would not run it
-    h.timers.forceFire(); // even if it slipped through
+    // The backstop and (LD-2b) the upload stage's deadline, both disposed.
+    for (let i = 0; i < h.timers.armed.length; i += 1) {
+      h.timers.fire(i); // cleared: the platform would not run it
+      h.timers.forceFire(i); // even if it slipped through
+    }
     assert.deepEqual(row(h, job.jobId), ready, "a disposed backstop writes nothing");
     assert.deepEqual(h.failCalls, []);
     assert.deepEqual(h.writer.deletes, []);
@@ -388,7 +427,10 @@ describe("execution-lifetime backstop: arming and disposal", () => {
     release();
     await settled(running, "the later execution");
     assert.equal(row(h, second.jobId).status, "ready");
-    assert.equal(h.timers.armed.length, 2, "one timer per execution");
+    // One backstop per execution, each followed (LD-2b) by its own upload
+    // stage's deadline: [first backstop, first upload, second backstop, second upload].
+    assert.equal(h.timers.armed.length, 4, "one backstop and one upload-stage timer per execution");
+    assert.ok(h.timers.armed.every((t) => t.cleared), "every one of them disposed");
   });
 });
 
@@ -494,7 +536,7 @@ describe("execution-lifetime backstop: fires exactly at its bound, as TIMEOUT wi
       // processLocally is NOT injected: production's convertMedia runs. Its own
       // processing budget is narrowed to 30 s, far beyond the 2 s this test
       // allows the backstop's kill, so the stage's timeout can never pass it.
-      timeLimits: { downloadTimeLimitMs: 600_000, processingMs: 30_000 },
+      timeLimits: { downloadTimeLimitMs: 600_000, processingMs: 30_000, uploadMs: 3_600_000 },
     }).execute(job);
     try {
       await waitFor(() => spawned.length === 1, "FFmpeg to be spawned");
@@ -516,7 +558,33 @@ describe("execution-lifetime backstop: fires exactly at its bound, as TIMEOUT wi
     assertLifetimeTimeout(h, job.jobId, "Processing failed", job.expiresAt);
   });
 
-  it("an upload LD-2a cannot cancel runs to its end; the ready commit refuses it and the exact key is deleted", async () => {
+  // LD-2a pinned "an upload LD-2a cannot cancel runs to its end". LD-2b makes
+  // the upload cancellable, so that premise is replaced by the two cases below:
+  // the backstop now ends the in-flight request, and even a provider that
+  // ignored the abort could still never make the job ready.
+  it("LD-2b: the backstop reaches an upload in flight — the request is aborted and the exact key deleted", async () => {
+    const job = claimJob(h);
+    h.writer.honoursSignal = true;
+    h.writer.gate = new Promise<void>(() => {}); // a provider that never answers
+    const execution = makeExecutor(h, {
+      analyze: async () => metadata(),
+      downloadOriginal: async (_url, ctx) => writeOriginal(ctx.workDir),
+    }).execute(job);
+    await waitFor(() => h.writer.putEntered, "the upload to be in flight");
+    assert.equal(row(h, job.jobId).status, "uploading");
+
+    h.clock.now = job.expiresAt;
+    h.timers.fire(0); // the BACKSTOP (index 0), not the upload stage's own deadline
+    await settled(execution, "the aborted upload");
+
+    assert.equal(h.writer.putAborted, true, "the in-flight request observed the abort");
+    assert.equal(h.writer.puts.length, 1);
+    assert.deepEqual(h.writer.deletes, [h.writer.puts[0]!.objectKey], "exactly the attempted key, nothing else");
+    assertLifetimeTimeout(h, job.jobId, "Upload failed", job.expiresAt);
+    assert.deepEqual(h.failCalls.map((c) => c.code), ["TIMEOUT"], "one terminal outcome");
+  });
+
+  it("LD-2b: a provider that ignores the abort still cannot make the job ready; the exact key is deleted", async () => {
     const job = claimJob(h);
     let releaseUpload: () => void = () => {};
     h.writer.gate = new Promise<void>((resolve) => {
@@ -527,13 +595,12 @@ describe("execution-lifetime backstop: fires exactly at its bound, as TIMEOUT wi
       downloadOriginal: async (_url, ctx) => writeOriginal(ctx.workDir),
     }).execute(job);
     await waitFor(() => h.writer.putEntered, "the upload to be in flight");
-    assert.equal(row(h, job.jobId).status, "uploading");
 
     h.clock.now = job.expiresAt;
-    h.timers.fire(); // the abort reaches the controller; the PUT does not observe it before LD-2b
-    assert.equal(h.writer.deletes.length, 0, "nothing deleted while the upload is still in flight");
+    h.timers.fire(0); // the backstop; this writer keeps going regardless
+    assert.equal(h.writer.deletes.length, 0, "nothing deleted while the request is still in flight");
     h.clock.now = job.expiresAt + 2_000;
-    releaseUpload(); // the PUT completes after the lifetime
+    releaseUpload(); // the PUT "succeeds" after the abort
     await settled(execution, "the late upload");
 
     assert.equal(h.writer.puts.length, 1);

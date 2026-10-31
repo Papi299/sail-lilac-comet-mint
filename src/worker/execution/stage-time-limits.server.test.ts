@@ -38,8 +38,12 @@ import { WorkerTimeLimitsError, type WorkerStageTimeLimits } from "../runtime/ti
  * Fakes only: no network, no subprocess, no real media.
  */
 
-const LIMITS: WorkerStageTimeLimits = Object.freeze({ downloadTimeLimitMs: 1_234_000, processingMs: 2_345_000 });
-const DEFAULTS = { downloadTimeLimitMs: 600_000, processingMs: 600_000 } as const;
+const LIMITS: WorkerStageTimeLimits = Object.freeze({
+  downloadTimeLimitMs: 1_234_000,
+  processingMs: 2_345_000,
+  uploadMs: 3_456_000,
+});
+const DEFAULTS = { downloadTimeLimitMs: 600_000, processingMs: 600_000, uploadMs: 3_600_000 } as const;
 const MAX = 10_000;
 
 type Harness = {
@@ -417,15 +421,21 @@ describe("stage time limits: construction refuses a second or malformed source",
   };
 
   it("refuses a malformed model", () => {
-    for (const bad of [
-      { downloadTimeLimitMs: 0, processingMs: 1 },
-      { downloadTimeLimitMs: 1.5, processingMs: 1 },
-      { downloadTimeLimitMs: "600000", processingMs: 1 },
-      { downloadTimeLimitMs: 1, processingMs: Number.NaN },
-      { downloadTimeLimitMs: 21_600_001, processingMs: 1 },
-      { downloadTimeLimitMs: 1, processingMs: 14_400_001 },
-    ]) {
-      const field = (bad.downloadTimeLimitMs as unknown) === 1 ? "processingMs" : "downloadTimeLimitMs";
+    for (const [bad, field] of [
+      [{ downloadTimeLimitMs: 0, processingMs: 1, uploadMs: 1 }, "downloadTimeLimitMs"],
+      [{ downloadTimeLimitMs: 1.5, processingMs: 1, uploadMs: 1 }, "downloadTimeLimitMs"],
+      [{ downloadTimeLimitMs: "600000", processingMs: 1, uploadMs: 1 }, "downloadTimeLimitMs"],
+      [{ downloadTimeLimitMs: 1, processingMs: Number.NaN, uploadMs: 1 }, "processingMs"],
+      [{ downloadTimeLimitMs: 21_600_001, processingMs: 1, uploadMs: 1 }, "downloadTimeLimitMs"],
+      [{ downloadTimeLimitMs: 1, processingMs: 14_400_001, uploadMs: 1 }, "processingMs"],
+      // LD-2b: the upload stage's limit is held to the same rule.
+      [{ downloadTimeLimitMs: 1, processingMs: 1 }, "uploadMs"],
+      [{ downloadTimeLimitMs: 1, processingMs: 1, uploadMs: 0 }, "uploadMs"],
+      [{ downloadTimeLimitMs: 1, processingMs: 1, uploadMs: -1 }, "uploadMs"],
+      [{ downloadTimeLimitMs: 1, processingMs: 1, uploadMs: 2.5 }, "uploadMs"],
+      [{ downloadTimeLimitMs: 1, processingMs: 1, uploadMs: "3600000" }, "uploadMs"],
+      [{ downloadTimeLimitMs: 1, processingMs: 1, uploadMs: 14_400_001 }, "uploadMs"],
+    ] as const) {
       assert.throws(construct({ timeLimits: bad as unknown as WorkerStageTimeLimits }), refusedFor(field));
     }
   });
@@ -508,7 +518,7 @@ describe("stage time limits never bypass cancellation, shutdown, the byte ceilin
         };
       },
       genericLimits: { maxFileSizeBytes: MAX },
-      timeLimits: { downloadTimeLimitMs: 21_600_000, processingMs: 14_400_000 },
+      timeLimits: { downloadTimeLimitMs: 21_600_000, processingMs: 14_400_000, uploadMs: 14_400_000 },
     });
     await executor.execute(job);
     const view = h.store.getJob(job.jobId)!;

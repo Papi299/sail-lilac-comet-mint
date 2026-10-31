@@ -64,7 +64,11 @@ const MAX = 1000;
  * DIFFERENT from each other and from the defaults, so a seam handed the wrong
  * one — or a missed injection — is caught.
  */
-const TIME_LIMITS: WorkerStageTimeLimits = Object.freeze({ downloadTimeLimitMs: 1_234_000, processingMs: 450_000 });
+const TIME_LIMITS: WorkerStageTimeLimits = Object.freeze({
+  downloadTimeLimitMs: 1_234_000,
+  processingMs: 450_000,
+  uploadMs: 3_456_000,
+});
 /** What the split downloader is handed: the byte ceiling plus the acquisition limit. */
 const LIMITS: GenericDownloadLimits = { maxFileSizeBytes: MAX, downloadTimeLimitMs: TIME_LIMITS.downloadTimeLimitMs };
 /** Exactly the split preflight's requirement: 2 × MAX. */

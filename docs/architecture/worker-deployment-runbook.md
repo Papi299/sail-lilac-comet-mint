@@ -6375,6 +6375,175 @@ backstop by up to about 30 minutes; the object is still collected on time and th
 link then fails rather than serving it. Rolling back with an empty queue (the
 promotion procedure's in-flight check) avoids it.
 
+### 7c. Bounded, cancellable R2 upload (`VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001`) — source change, NOT DEPLOYED
+
+**Status.** A source change for review. No image has been built for Production
+and nothing is deployed. LD-2a (§7b) is the reported accepted Production
+baseline; this section does not restate its state of record. A Worker image
+without this change keeps LD-2a's upload: one `PutObject` that no timer,
+cancellation or shutdown stops once it is in flight (§7b, *Known limitations*).
+This is phase LD-2b of the bounded long-download design. It does **not** enable
+long downloads: `DOWNLOAD_TIME_LIMIT` stays 600 s.
+
+**The deadline.** `UPLOAD_TIMEOUT` keeps its range and default (300–14,400 s,
+3,600 s) and is now enforced as ONE absolute deadline for a job's whole upload
+stage:
+
+```
+upload deadline = min(uploading + UPLOAD_TIMEOUT, claimed + L)
+```
+
+- `uploading` is the instant the durable `processing → uploading` transition
+  committed (that row's own `updated_at_ms`); `claimed + L` is the job's
+  execution deadline (§7b), so the upload stage never outlives its job.
+- It is derived once (`deriveUploadStageDeadlineMs`, `time-limits.ts`) and armed
+  once. Every step of the stage shares it: each credential mint, the
+  `PutObject`, the `HeadObject` verification, the metadata check and the ready
+  commit. No step gets a fresh budget — a slow PUT leaves the HEAD only the
+  remainder — and neither progress nor an SDK retry extends it. The upload
+  lifecycle receives the absolute deadline, never the duration.
+- At the defaults (`L` = 5,445 s) the upload gets the full 3,600 s whenever the
+  job reaches the upload stage within 1,845 s of its claim, which every job does
+  while analysis, acquisition and processing stay inside their own bounds
+  (45 + 600 + 600 = 1,245 s).
+
+**Cancellation, shutdown and the lifetime backstop reach the request.** The
+executor's existing per-execution `AbortController` signal is handed to the
+upload stage, which composes it with its deadline into one internal signal; the
+stage never aborts the execution's controller, so cancellation and shutdown
+provenance stay the executor's. That one signal reaches:
+
+1. the broker exchange — an abort destroys the Unix-socket request, rather than
+   waiting out the client's 5 s timeout;
+2. the delegated writer — no credential is minted after an abort, and one that
+   arrives after an abort is discarded unused, so no request is started with it;
+3. the AWS SDK, as `abortSignal`, whose Node request handler destroys the
+   in-flight request and its socket.
+
+The R2 writer then destroys the request body it created, which stops reading the
+file at once, and the executor closes the file it opened on every outcome before
+its work directory is removed.
+
+**Transport bounds** (`R2_TRANSPORT_POLICY`, `cloudflare-r2-writer.server.ts`).
+Constants, not configuration; the SDK's own environment-driven defaults
+(`AWS_MAX_ATTEMPTS`, `AWS_RETRY_MODE`, `AWS_REQUEST_CHECKSUM_CALCULATION`, the
+shared config file) are overridden in code.
+
+| Bound | Value | What it bounds |
+| :--- | :--- | :--- |
+| Connection | 30 s | Request creation to TCP connect, DNS lookup included. |
+| Socket inactivity | 120 s | No byte read or written for 120 s ends the request: a stalled TLS handshake, a peer that stopped reading the body, a response that never starts. Progress resets it; it is a stall detector, not a total. |
+| Total | the upload deadline | The stage's signal. |
+| Attempts | 3, explicit | A `PutObject` is never re-attempted: its body is a non-replayable stream, which the SDK refuses to retry. `HeadObject` and `DeleteObject` may be retried on a transient error. No attempt starts after an abort. |
+
+Two further settings belong to the same change:
+
+- **`requestChecksumCalculation: WHEN_REQUIRED`.** Under the SDK default
+  (`WHEN_SUPPORTED`) a streaming `PutObject` body is re-framed by an aws-chunked
+  encoder that drains its source in flowing mode with no backpressure. Measured
+  against a synthetic peer that stopped reading after 7 bytes, it pulled a
+  256 MiB source entirely into memory within 4 s, and it would keep reading the
+  file after an abort. With `WHEN_REQUIRED` the body is piped straight into the
+  request with its declared `Content-Length`, read only as fast as the socket
+  drains it. Integrity in transit is TLS; the stored object's size, type and
+  disposition are verified by `HeadObject`, as before.
+- **Keep-alive off.** Every writer serves one operation with one scoped
+  credential, so a pooled socket could never be reused; each request's socket
+  closes when its exchange ends.
+
+**Cleanup.** After an upload stage that ends without a ready commit — the
+deadline, a cancellation, a shutdown, the backstop, or any failure after a PUT
+was started — the exact attempted key is deleted under its own allowance of
+**5 s** (`UPLOAD_CLEANUP_BUDGET_MS`), never under the stage's signal, which may
+be what ended the stage. 5 s is the broker client's timeout and half the
+Worker's 10 s shutdown grace, so an operator restart still completes the attempt
+before the database closes. The cleanup mints a DeleteObject-only credential
+(§5d, unchanged), never resumes the upload, never renews the stage and never
+permits a ready commit. A delete that fails or runs out is recorded internally as
+a failed cleanup, with no provider detail, and the object is left to the R2
+lifecycle rule (§5h, 3,600 s after write). A stage that ended before its PUT
+started deletes nothing.
+
+**Late completion.** No ready commit can follow the stage's end. The stage is
+re-checked after every operation and immediately before the ready commit, which
+is synchronous; a PUT or HEAD that settles after the deadline or an abort — even
+successfully — is never trusted, and the attempted key is deleted.
+
+**Outcome precedence.** The order is unchanged and extended:
+
+1. a cancellation whose durable CAS won stays `cancelled`;
+2. an operator shutdown leaves the row active for the next process's
+   `recover()` ("Worker restarted");
+3. the execution-lifetime backstop is `TIMEOUT`;
+4. the upload deadline is `TIMEOUT`;
+5. an ordinary upload failure is `PROCESSING_FAILED`.
+
+3–5 carry the stage "Upload failed", derived from the `uploading` status. No
+error code, stage label or contract field is added.
+
+**Unchanged:** the SQLite schema (v1, no migration); the Worker/control-plane
+contract; the credential policy — ceilings 900 / 120 / 120 s, one exact key, one
+action, the Worker-side deadline rule (the upload stage does not shorten a
+credential); the 600 s acquisition and processing defaults; `L` (5,445 s) and
+`R` (45 min); the 4 GiB ceiling; safe egress; concurrency.
+
+**Known limitations of LD-2b:**
+
+- **G-UPLOAD (carried from §7b).** Whether R2 completes a single PUT whose body
+  outlives its ≤ 900 s `PutObject` credential is unverified. LD-2b neither
+  lengthens the credential nor adds a multipart path. Until G-UPLOAD passes,
+  900 s — not `UPLOAD_TIMEOUT`'s 3,600 s — is the dependable upload duration,
+  about 38 Mbit/s for 4 GiB.
+- **Residual late-commit race.** An abort destroys the local request, but bytes
+  already handed to the kernel can still reach R2. If they complete the body, R2
+  can commit the object after the exact-key DeleteObject. Such an object is never
+  referenced by a ready job — its key is opaque and never published — and the R2
+  lifecycle rule removes it within 3,600 s of its write. Removing the race needs
+  provider-side conditional semantics or a durable record of attempted keys (a
+  schema change); both are later decisions.
+- **`PutObject` wire format.** A plain `Content-Length` body replaces the
+  aws-chunked framing with a CRC32 trailer. It is verified here only against a
+  synthetic local endpoint; a real R2 upload by the candidate image is a
+  promotion prerequisite (below).
+- **SDK internal timers, bounded.** After an abort during a connection that never
+  establishes, the SDK's connection timer stays armed until its 30 s bound and
+  then does nothing. An abort that lands in a HeadObject or DeleteObject retry
+  backoff settles when the backoff ends: with three attempts a few seconds at
+  most, and never above the SDK's 20 s cap.
+- **Maintenance deletes** (§8) carry no signal of their own. They are now bounded
+  by the transport (30 s connection, 120 s inactivity, 3 attempts) instead of
+  being unbounded.
+
+#### Pre-deployment check — before an image with this change starts
+
+The §7a and §7b checks still apply. `UPLOAD_TIMEOUT` is now enforced:
+
+| Finding | Action |
+| :--- | :--- |
+| `UPLOAD_TIMEOUT` present | **STOP** for a decision. In range it changes the upload deadline and `L`; out of range it blocks startup. |
+| absent | Proceed: the upload deadline is `min(uploading + 3,600 s, claimed + 5,445 s)`. |
+
+#### Release qualification — before promotion
+
+- Build the candidate from merged `main`; SPLIT-07 release-image gate.
+- The LD-2b suites inside the candidate image (`r2-transport`, `upload-stage`,
+  the upload lifecycle, delegated writer and broker client), network none.
+- The Node 22 suite in the candidate image, compared by test identity with
+  LD-2a's.
+- **One real R2 `PutObject` / `HeadObject` / `DeleteObject` through the candidate
+  image** (the controlled fixture job of the release acceptance), because the
+  `PutObject` framing changed. Disposable material only.
+- The names-only `worker.env` check above.
+- G-UPLOAD stays with LD-5a.
+
+#### Mixed versions and rollback
+
+No schema or contract change, and LD-2b writes no new durable value: an LD-2a
+Worker and an LD-2b Worker read and write the same rows. Rollback is the LD-2a
+image retag and a Worker-only restart, with an empty queue as in §7b. An upload in
+flight at the restart is aborted by the shutdown in either image and recovered as
+"Worker restarted".
+
 ---
 
 ## 8. Health and maintenance

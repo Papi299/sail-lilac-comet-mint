@@ -6,6 +6,7 @@ import {
   type R2CredentialRequest,
 } from "../../shared/worker/r2-broker.ts";
 import type {
+  R2CredentialMintOptions,
   R2CredentialProvider,
   R2CredentialRequestInput,
   R2TemporaryCredential,
@@ -36,7 +37,9 @@ export type R2CredentialBrokerFailure =
   | "broker_unavailable"
   | "broker_refused"
   | "broker_response_invalid"
-  | "credential_expired";
+  | "credential_expired"
+  /** LD-2b: the caller's signal ended the exchange; no credential is returned. */
+  | "aborted";
 
 /**
  * A credential acquisition failure.
@@ -76,7 +79,10 @@ export class BrokerR2CredentialProvider implements R2CredentialProvider {
     this.timeoutMs = deps.timeoutMs ?? R2_BROKER_CLIENT_TIMEOUT_MS;
   }
 
-  public async mint(input: R2CredentialRequestInput): Promise<R2TemporaryCredential> {
+  public async mint(
+    input: R2CredentialRequestInput,
+    options: R2CredentialMintOptions = {},
+  ): Promise<R2TemporaryCredential> {
     const payload: R2CredentialRequest = {
       bucket: this.bucket,
       objectKey: input.objectKey,
@@ -84,7 +90,9 @@ export class BrokerR2CredentialProvider implements R2CredentialProvider {
       ttlSeconds: input.ttlSeconds,
     };
 
-    const raw = await this.post(JSON.stringify(payload));
+    const raw = await this.post(JSON.stringify(payload), options.signal);
+    // An answer that arrived after an abort is discarded, never handed on.
+    if (options.signal?.aborted) throw new R2CredentialBrokerError("aborted");
 
     const parsed = R2CredentialResponseSchema.safeParse(raw);
     if (!parsed.success) throw new R2CredentialBrokerError("broker_response_invalid");
@@ -122,14 +130,26 @@ export class BrokerR2CredentialProvider implements R2CredentialProvider {
    * refused, timeout, non-200, oversized or unparseable body — resolves to a
    * thrown `R2CredentialBrokerError`. There is no path that returns a partial
    * or default credential.
+   *
+   * LD-2b: an abort of `signal` destroys the request — the exchange ends, it is
+   * not merely no longer awaited — and fails it as `aborted`. The client's own
+   * timeout still bounds an exchange nobody aborts.
    */
-  private post(body: string): Promise<unknown> {
+  private post(body: string, signal?: AbortSignal): Promise<unknown> {
+    if (signal?.aborted) return Promise.reject(new R2CredentialBrokerError("aborted"));
+
     return new Promise((resolve, reject) => {
       let settled = false;
+      const detach = () => signal?.removeEventListener("abort", onAbort);
       const fail = (failure: R2CredentialBrokerFailure) => {
         if (settled) return;
         settled = true;
+        detach();
         reject(new R2CredentialBrokerError(failure));
+      };
+      const onAbort = () => {
+        fail("aborted");
+        req.destroy();
       };
 
       const req = httpRequest(
@@ -169,6 +189,7 @@ export class BrokerR2CredentialProvider implements R2CredentialProvider {
 
             try {
               settled = true;
+              detach();
               resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
             } catch {
               settled = false;
@@ -188,6 +209,8 @@ export class BrokerR2CredentialProvider implements R2CredentialProvider {
       // Covers ENOENT (no socket -> broker not running), ECONNREFUSED and
       // EACCES. All of them mean the same thing to the caller: no credential.
       req.on("error", () => fail("broker_unavailable"));
+
+      signal?.addEventListener("abort", onAbort, { once: true });
 
       req.end(body);
     });

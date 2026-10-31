@@ -289,9 +289,10 @@ export async function createWorkerRuntime(
         ...executorDeps,
         // AFTER the test seams: the strict configuration is the one owner of
         // every stage time limit — direct, generic, split, clear-HLS and
-        // separate-audio acquisition, and every processing stage. The executor
-        // keeps only those two; the lifetimes went to the store above, and it
-        // reads its execution deadline back from the job it claims.
+        // separate-audio acquisition, every processing stage, and (LD-2b) the
+        // upload stage. The executor keeps only those three; the lifetimes went
+        // to the store above, and it reads its execution deadline back from the
+        // job it claims.
         timeLimits,
       },
     );

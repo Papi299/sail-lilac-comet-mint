@@ -2,6 +2,7 @@ import {
   ObjectStoreHeadSchema,
   ObjectStorePutInputSchema,
   type ObjectStoreHead,
+  type ObjectStoreOperationContext,
   type ObjectStorePutInput,
   type ObjectStoreWriter,
 } from "./writer.ts";
@@ -44,6 +45,14 @@ import { WorkerObjectKeySchema, type WorkerObjectKey } from "../../shared/worker
  * Validation deliberately happens BEFORE the mint. A malformed object key is
  * rejected here and never reaches the broker, so the broker's own key check is
  * a second independent gate rather than the only one.
+ *
+ * VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001: the operation's signal is
+ * honoured at every step. An operation aborted before its mint mints nothing;
+ * an abort during the mint ends the broker exchange itself; a credential that
+ * arrives after an abort is discarded unused, so no writer is built and no
+ * request is started with it; and the signal is handed to the per-operation
+ * writer, which tears down an in-flight request. The credential policy is
+ * untouched: the same action, the same exact key, the same TTL derivation.
  */
 
 export type DelegatedR2Failure =
@@ -57,6 +66,12 @@ export type DelegatedR2Failure =
    * authorized.
    */
   | "job_expired"
+  /**
+   * LD-2b: the caller's signal ended the operation — before its mint, during
+   * it, or while its request was in flight. Nothing was minted after the abort
+   * and no request was started after it.
+   */
+  | "aborted"
   | "operation_failed";
 
 /** Bounded, value-free failure. Mirrors `CloudflareR2Error`'s discipline. */
@@ -105,7 +120,7 @@ export class DelegatedR2ObjectStoreWriter implements ObjectStoreWriter {
       deps.createWriter ?? ((config) => new CloudflareR2ObjectStoreWriter(config));
   }
 
-  public async put(input: ObjectStorePutInput): Promise<void> {
+  public async put(input: ObjectStorePutInput, context: ObjectStoreOperationContext = {}): Promise<void> {
     let validated: ObjectStorePutInput;
     try {
       validated = ObjectStorePutInputSchema.parse(input);
@@ -113,23 +128,23 @@ export class DelegatedR2ObjectStoreWriter implements ObjectStoreWriter {
       throw new DelegatedR2Error("invalid_input", error);
     }
 
-    const writer = await this.writerFor("put", validated.objectKey);
+    const writer = await this.writerFor("put", validated.objectKey, context.signal);
     try {
-      await writer.put(validated);
+      await writer.put(validated, context);
     } catch (error) {
-      throw new DelegatedR2Error("operation_failed", error);
+      throw operationFailure(context.signal, error);
     }
   }
 
-  public async head(objectKey: WorkerObjectKey): Promise<ObjectStoreHead | null> {
+  public async head(objectKey: WorkerObjectKey, context: ObjectStoreOperationContext = {}): Promise<ObjectStoreHead | null> {
     const key = this.validateKey(objectKey);
-    const writer = await this.writerFor("head", key);
+    const writer = await this.writerFor("head", key, context.signal);
 
     let result: ObjectStoreHead | null;
     try {
-      result = await writer.head(key);
+      result = await writer.head(key, context);
     } catch (error) {
-      throw new DelegatedR2Error("operation_failed", error);
+      throw operationFailure(context.signal, error);
     }
 
     // A missing object stays a missing object, exactly as the contract says.
@@ -142,13 +157,13 @@ export class DelegatedR2ObjectStoreWriter implements ObjectStoreWriter {
     }
   }
 
-  public async delete(objectKey: WorkerObjectKey): Promise<void> {
+  public async delete(objectKey: WorkerObjectKey, context: ObjectStoreOperationContext = {}): Promise<void> {
     const key = this.validateKey(objectKey);
-    const writer = await this.writerFor("delete", key);
+    const writer = await this.writerFor("delete", key, context.signal);
     try {
-      await writer.delete(key);
+      await writer.delete(key, context);
     } catch (error) {
-      throw new DelegatedR2Error("operation_failed", error);
+      throw operationFailure(context.signal, error);
     }
   }
 
@@ -164,13 +179,20 @@ export class DelegatedR2ObjectStoreWriter implements ObjectStoreWriter {
    * A broker refusal propagates as `credential_unavailable`, which fails the
    * caller's R2 operation closed. There is deliberately no fallback branch:
    * the Worker has no other credential to fall back TO.
+   *
+   * LD-2b: an aborted signal is checked before the mint and again after it, so
+   * neither a mint nor a writer can follow an abort.
    */
   private async writerFor(
     operation: "put" | "head" | "delete",
     objectKey: WorkerObjectKey,
+    signal: AbortSignal | undefined,
   ): Promise<ObjectStoreWriter> {
     const action = actionForOperation(operation);
-    const credential = await this.mintFor(action, objectKey);
+    if (signal?.aborted) throw new DelegatedR2Error("aborted");
+    const credential = await this.mintFor(action, objectKey, signal);
+    // A credential that arrived after the abort is dropped here, unused.
+    if (signal?.aborted) throw new DelegatedR2Error("aborted");
 
     return this.createWriter({
       accountId: this.deps.location.accountId,
@@ -187,6 +209,7 @@ export class DelegatedR2ObjectStoreWriter implements ObjectStoreWriter {
   private async mintFor(
     action: R2DelegatedAction,
     objectKey: WorkerObjectKey,
+    signal: AbortSignal | undefined,
   ): Promise<R2TemporaryCredential> {
     const nowMs = this.clock();
 
@@ -215,8 +238,14 @@ export class DelegatedR2ObjectStoreWriter implements ObjectStoreWriter {
 
     let credential: R2TemporaryCredential;
     try {
-      credential = await this.deps.credentials.mint({ action, objectKey, ttlSeconds });
+      const request = { action, objectKey, ttlSeconds };
+      // The signal travels with the request, so an abort ends the broker
+      // exchange instead of waiting out the client's own timeout.
+      credential = await (signal
+        ? this.deps.credentials.mint(request, { signal })
+        : this.deps.credentials.mint(request));
     } catch (error) {
+      if (signal?.aborted) throw new DelegatedR2Error("aborted");
       throw new DelegatedR2Error("credential_unavailable", error);
     }
 
@@ -232,4 +261,11 @@ export class DelegatedR2ObjectStoreWriter implements ObjectStoreWriter {
 
     return credential;
   }
+}
+
+/** An operation that rejected: `aborted` when the caller's signal ended it. */
+function operationFailure(signal: AbortSignal | undefined, error: unknown): DelegatedR2Error {
+  return signal?.aborted
+    ? new DelegatedR2Error("aborted", error)
+    : new DelegatedR2Error("operation_failed", error);
 }

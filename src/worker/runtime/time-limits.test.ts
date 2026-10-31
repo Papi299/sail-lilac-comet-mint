@@ -23,6 +23,7 @@ import {
   assertWorkerJobLifetimes,
   assertWorkerStageTimeLimits,
   buildWorkerTimeLimits,
+  deriveUploadStageDeadlineMs,
   type WorkerTimeLimitInputs,
 } from "./time-limits.ts";
 
@@ -231,43 +232,63 @@ describe("WorkerTimeLimits: the model", () => {
   it("validates an INJECTED stage model: narrower is allowed, malformed or wider is refused", () => {
     // Narrower than the environment minimum: tests and harnesses prove a
     // shared deadline with a few milliseconds.
-    assert.deepEqual({ ...assertWorkerStageTimeLimits({ downloadTimeLimitMs: 60, processingMs: 1 }) }, {
-      downloadTimeLimitMs: 60,
-      processingMs: 1,
-    });
+    assert.deepEqual(
+      { ...assertWorkerStageTimeLimits({ downloadTimeLimitMs: 60, processingMs: 1, uploadMs: 5 }) },
+      { downloadTimeLimitMs: 60, processingMs: 1, uploadMs: 5 },
+    );
     // The environment maximum is the ceiling an injection can never lift.
-    assert.ok(assertWorkerStageTimeLimits({ downloadTimeLimitMs: 21_600_000, processingMs: 14_400_000 }));
+    assert.ok(
+      assertWorkerStageTimeLimits({ downloadTimeLimitMs: 21_600_000, processingMs: 14_400_000, uploadMs: 14_400_000 }),
+    );
     assert.throws(
-      () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 21_600_001, processingMs: 1 }),
+      () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 21_600_001, processingMs: 1, uploadMs: 1 }),
       BAD_FIELD("downloadTimeLimitMs"),
     );
     assert.throws(
-      () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 1, processingMs: 14_400_001 }),
+      () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 1, processingMs: 14_400_001, uploadMs: 1 }),
       BAD_FIELD("processingMs"),
+    );
+    // LD-2b: the upload stage's limit is held to the same rule.
+    assert.throws(
+      () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 1, processingMs: 1, uploadMs: 14_400_001 }),
+      BAD_FIELD("uploadMs"),
     );
     for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "600000", null, undefined]) {
       assert.throws(
-        () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: bad, processingMs: 600_000 }),
+        () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: bad, processingMs: 600_000, uploadMs: 600_000 }),
         BAD_FIELD("downloadTimeLimitMs"),
       );
       assert.throws(
-        () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 600_000, processingMs: bad }),
+        () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 600_000, processingMs: bad, uploadMs: 600_000 }),
         BAD_FIELD("processingMs"),
       );
+      assert.throws(
+        () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 600_000, processingMs: 600_000, uploadMs: bad }),
+        BAD_FIELD("uploadMs"),
+      );
     }
+    // A pre-LD-2b two-field model is refused, never silently given a default upload limit.
+    assert.throws(
+      () => assertWorkerStageTimeLimits({ downloadTimeLimitMs: 600_000, processingMs: 600_000 }),
+      BAD_FIELD("uploadMs"),
+    );
     for (const notAModel of [null, undefined, "600000", 600_000]) {
       assert.throws(() => assertWorkerStageTimeLimits(notAModel), BAD_FIELD("timeLimits"));
     }
   });
 
-  it("returns a frozen COPY of exactly the two stage fields: uploadMs and the lifetimes never pass", () => {
-    const injected = { ...DEFAULT_WORKER_TIME_LIMITS, downloadTimeLimitMs: 1_000, processingMs: 2_000 };
+  it("returns a frozen COPY of exactly the three stage fields: the lifetimes never pass", () => {
+    // LD-1/LD-2a pinned two fields here; LD-2b adds `uploadMs`, which the
+    // executor now enforces. `analysisMs` and both lifetimes still never pass.
+    const injected = { ...DEFAULT_WORKER_TIME_LIMITS, downloadTimeLimitMs: 1_000, processingMs: 2_000, uploadMs: 3_000 };
     const model = assertWorkerStageTimeLimits(injected);
     assert.notEqual(model, injected);
-    assert.deepEqual(Object.keys(model).sort(), ["downloadTimeLimitMs", "processingMs"]);
+    assert.deepEqual(Object.keys(model).sort(), ["downloadTimeLimitMs", "processingMs", "uploadMs"]);
     assert.ok(Object.isFrozen(model));
     injected.downloadTimeLimitMs = 9;
+    injected.uploadMs = 9;
     assert.equal(model.downloadTimeLimitMs, 1_000, "a later mutation of the input cannot reach the model");
+    assert.equal(model.uploadMs, 3_000);
   });
 
   it("validates the store's lifetimes: narrower is allowed; malformed, or wider than configurable, is refused", () => {
@@ -464,11 +485,11 @@ describe("WorkerTimeLimits: built once by the runtime and handed to every stage"
         },
       );
       assert.ok(Object.isFrozen(runtime.timeLimits));
-      // The executor keeps exactly the two stage limits: never uploadMs, which
-      // nothing enforces before LD-2b, and never a lifetime.
+      // The executor keeps exactly the three stage limits — since LD-2b the
+      // upload stage's too — and never a lifetime.
       assert.deepEqual(
         { ...runtime.executor.timeLimits },
-        { downloadTimeLimitMs: 1_234_000, processingMs: 2_345_000 },
+        { downloadTimeLimitMs: 1_234_000, processingMs: 2_345_000, uploadMs: 3_600_000 },
       );
     } finally {
       await runtime.shutdown();
@@ -569,10 +590,13 @@ describe("WorkerTimeLimits: built once by the runtime and handed to every stage"
     const runtime = await createWorkerRuntime(makeConfig(join(root, "state"), await reservePort()), {
       objectStoreWriter: new MemoryWriter(),
       // Refused by the type; a JavaScript caller passing it anyway is ignored.
-      executorDeps: { timeLimits: { downloadTimeLimitMs: 1, processingMs: 1 } } as never,
+      executorDeps: { timeLimits: { downloadTimeLimitMs: 1, processingMs: 1, uploadMs: 1 } } as never,
     });
     try {
-      assert.deepEqual({ ...runtime.executor.timeLimits }, { downloadTimeLimitMs: 600_000, processingMs: 600_000 });
+      assert.deepEqual(
+        { ...runtime.executor.timeLimits },
+        { downloadTimeLimitMs: 600_000, processingMs: 600_000, uploadMs: 3_600_000 },
+      );
     } finally {
       await runtime.shutdown();
     }
@@ -676,4 +700,89 @@ describe("startup refuses the retired DOWNLOAD_TIMEOUT by presence", () => {
       assert.deepEqual(run.errors, ["[worker] startup failed: Error"]);
     }
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001: the upload stage's ONE
+// absolute deadline
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("LD-2b: deriveUploadStageDeadlineMs — one absolute upload deadline", () => {
+  const START = 1_800_000_000_000;
+
+  it("is the uploading transition plus UPLOAD_TIMEOUT when the execution deadline is later", () => {
+    assert.equal(
+      deriveUploadStageDeadlineMs({ stageStartedAtMs: START, uploadMs: 3_600_000, executionDeadlineMs: START + 5_000_000 }),
+      START + 3_600_000,
+    );
+  });
+
+  it("never outlives the job: an earlier execution deadline wins", () => {
+    assert.equal(
+      deriveUploadStageDeadlineMs({ stageStartedAtMs: START, uploadMs: 3_600_000, executionDeadlineMs: START + 60_000 }),
+      START + 60_000,
+    );
+    // An execution deadline already behind the stage start yields a deadline
+    // already passed: the stage refuses to start anything.
+    assert.equal(
+      deriveUploadStageDeadlineMs({ stageStartedAtMs: START, uploadMs: 3_600_000, executionDeadlineMs: START - 1 }),
+      START - 1,
+    );
+  });
+
+  it("at the defaults, a job reaching upload at minute 21 gets the full hour, inside L = 5,445 s", () => {
+    const claimed = START;
+    const executionDeadlineMs = claimed + DEFAULT_WORKER_TIME_LIMITS.executionLifetimeMs;
+    const uploadingAt = claimed + 21 * 60_000;
+    assert.equal(
+      deriveUploadStageDeadlineMs({
+        stageStartedAtMs: uploadingAt,
+        uploadMs: DEFAULT_WORKER_TIME_LIMITS.uploadMs,
+        executionDeadlineMs,
+      }),
+      uploadingAt + 3_600_000,
+    );
+    assert.equal(DEFAULT_WORKER_TIME_LIMITS.uploadMs, 3_600_000, "UPLOAD_TIMEOUT's default is unchanged");
+    assert.equal(DEFAULT_WORKER_TIME_LIMITS.executionLifetimeMs, 5_445_000, "the LD-2a derivation of L is unchanged");
+  });
+
+  it("is computed from inputs alone: the same inputs give the same deadline, whenever it is asked", () => {
+    const input = { stageStartedAtMs: START, uploadMs: 300_000, executionDeadlineMs: START + 900_000 };
+    assert.equal(deriveUploadStageDeadlineMs(input), deriveUploadStageDeadlineMs({ ...input }));
+  });
+
+  it("accepts the strict loader's whole range and an injected narrower budget", () => {
+    for (const uploadMs of [1, 300_000, 3_600_000, 14_400_000]) {
+      assert.equal(
+        deriveUploadStageDeadlineMs({ stageStartedAtMs: START, uploadMs, executionDeadlineMs: START + 20_000_000 }),
+        START + uploadMs,
+      );
+    }
+  });
+
+  for (const [label, input, field] of [
+    ["a zero budget", { stageStartedAtMs: START, uploadMs: 0, executionDeadlineMs: START + 1 }, "uploadMs"],
+    ["a negative budget", { stageStartedAtMs: START, uploadMs: -1, executionDeadlineMs: START + 1 }, "uploadMs"],
+    ["a fractional budget", { stageStartedAtMs: START, uploadMs: 1.5, executionDeadlineMs: START + 1 }, "uploadMs"],
+    ["a budget wider than configurable", { stageStartedAtMs: START, uploadMs: 14_400_001, executionDeadlineMs: START + 1 }, "uploadMs"],
+    ["a NaN budget", { stageStartedAtMs: START, uploadMs: Number.NaN, executionDeadlineMs: START + 1 }, "uploadMs"],
+    ["a string budget", { stageStartedAtMs: START, uploadMs: "3600000", executionDeadlineMs: START + 1 }, "uploadMs"],
+    ["a negative stage start", { stageStartedAtMs: -1, uploadMs: 1, executionDeadlineMs: START }, "stageStartedAtMs"],
+    ["an unsafe stage start", { stageStartedAtMs: Number.MAX_SAFE_INTEGER + 2, uploadMs: 1, executionDeadlineMs: START }, "stageStartedAtMs"],
+    ["a stage start whose sum overflows", { stageStartedAtMs: Number.MAX_SAFE_INTEGER, uploadMs: 1, executionDeadlineMs: START }, "stageStartedAtMs"],
+    ["an infinite execution deadline", { stageStartedAtMs: START, uploadMs: 1, executionDeadlineMs: Number.POSITIVE_INFINITY }, "executionDeadlineMs"],
+    ["a missing execution deadline", { stageStartedAtMs: START, uploadMs: 1, executionDeadlineMs: undefined }, "executionDeadlineMs"],
+  ] as const) {
+    it(`refuses ${label}, naming the field and never the value`, () => {
+      assert.throws(
+        () => deriveUploadStageDeadlineMs(input as unknown as Parameters<typeof deriveUploadStageDeadlineMs>[0]),
+        (err: unknown) => {
+          assert.ok(err instanceof WorkerTimeLimitsError);
+          assert.equal(err.field, field);
+          assert.equal(err.message, `Invalid Worker time limit: ${field}`);
+          return true;
+        },
+      );
+    });
+  }
 });

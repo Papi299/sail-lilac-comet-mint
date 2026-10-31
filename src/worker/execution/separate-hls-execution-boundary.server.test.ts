@@ -510,7 +510,7 @@ describe("separate-audio boundary: every failure fails closed before any media t
         }),
     });
     const spawned = processes();
-    await failsClosed("TIMEOUT", { timeLimits: { downloadTimeLimitMs: 60, processingMs: 600_000 } });
+    await failsClosed("TIMEOUT", { timeLimits: { downloadTimeLimitMs: 60, processingMs: 600_000, uploadMs: 3_600_000 } });
     assert.ok(requests.length >= 1);
     assert.equal(spawned.length, 0);
   });

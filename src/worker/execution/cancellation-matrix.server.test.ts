@@ -341,6 +341,51 @@ describe("cancellation matrix", () => {
     assert.equal(view.objectKey, null, "a cancelled job never owns an object key");
   });
 
+  it("LD-2b: cancel while the object upload is IN FLIGHT: the request is aborted, the exact key deleted, no HEAD", async () => {
+    const job = claimJob(h.store, "direct-original");
+    const active: { executor?: JobExecutor } = {};
+    let sawAbort = false;
+    const heads: string[] = [];
+
+    const stallingWriter: ObjectStoreWriter = {
+      ...h.writer,
+      async put(input, context) {
+        h.puts.push(input);
+        // The request is mid-transfer when the cancellation lands.
+        active.executor!.cancel(job.jobId);
+        assert.equal(context?.signal?.aborted, true, "the cancellation reached the operation's own signal");
+        sawAbort = true;
+        throw new Error("request torn down");
+      },
+      async head(key) {
+        heads.push(key);
+        return h.writer.head(key);
+      },
+    };
+
+    const deps: JobExecutorDeps = {
+      analyze: async () => buildMeta({ container: "mp4", hasVideo: true }),
+      downloadOriginal: async (_url, ctx) => ({
+        filePath: writeOriginal(ctx.workDir, "mp4"),
+        container: "mp4",
+        mime: "video/mp4",
+        fileSize: 8,
+      }),
+    };
+
+    const executor = new JobExecutor(h.store, stallingWriter, () => Date.now(), new Map(), deps);
+    active.executor = executor;
+    await executor.execute(job);
+
+    assert.equal(sawAbort, true);
+    assert.deepEqual(heads, [], "nothing is verified after the cancellation");
+    assert.deepEqual(h.deletes, [h.puts[0]!.objectKey], "exactly the attempted key is deleted");
+    const view = h.store.getJob(job.jobId)!;
+    assert.equal(view.status, "cancelled");
+    assert.equal(view.objectKey, null);
+    assert.ok(!h.calls.includes("failJob"), "no failure is written over the cancellation");
+  });
+
   it("ready commits first: a later cancel changes nothing and deletes nothing", async () => {
     const job = claimJob(h.store, "direct-original");
 
