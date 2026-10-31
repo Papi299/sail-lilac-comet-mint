@@ -297,9 +297,12 @@ describe("LD-2b R2 transport: a healthy exchange", () => {
       contentDisposition: 'attachment; filename="clip.mp4"',
     });
     await h.writer.delete(KEY);
+    // Only successful exchanges so far: an error response would make the SDK
+    // destroy the connection itself and hide a pooled socket.
+    await waitFor(() => h.stub.sockets.closed === h.stub.sockets.opened, "no pooled socket remains", 2_000);
+    assert.equal(h.stub.sockets.opened, 3, "one connection per operation: nothing was reused from a pool");
     assert.equal(await h.writer.head(KEY), null);
     assert.deepEqual(h.stub.exchanges.map((e) => e.method), ["PUT", "HEAD", "DELETE", "HEAD"]);
-    await waitFor(() => h.stub.sockets.closed === h.stub.sockets.opened, "no pooled socket remains", 2_000);
   });
 
   it("a slow answer inside the inactivity bound still succeeds: the bound is a stall detector, not a total", async () => {
