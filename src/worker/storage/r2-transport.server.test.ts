@@ -283,7 +283,7 @@ describe("LD-2b R2 transport: a healthy exchange", () => {
     assert.equal(exchange!.headers["x-amz-security-token"], CREDENTIALS.sessionToken, "the delegated session token");
     assert.equal(state.produced, size);
     assert.equal(state.closed, true);
-    await waitFor(() => h.stub.sockets.closed === h.stub.sockets.opened, "every socket closed after the exchange");
+    await waitFor(() => h.stub.sockets.closed === h.stub.sockets.opened, "every socket closed after the exchange", 2_000);
   });
 
   it("verifies and deletes through the same bounded client, one exchange each", async () => {
@@ -299,7 +299,7 @@ describe("LD-2b R2 transport: a healthy exchange", () => {
     await h.writer.delete(KEY);
     assert.equal(await h.writer.head(KEY), null);
     assert.deepEqual(h.stub.exchanges.map((e) => e.method), ["PUT", "HEAD", "DELETE", "HEAD"]);
-    await waitFor(() => h.stub.sockets.closed === h.stub.sockets.opened, "no pooled socket remains");
+    await waitFor(() => h.stub.sockets.closed === h.stub.sockets.opened, "no pooled socket remains", 2_000);
   });
 
   it("a slow answer inside the inactivity bound still succeeds: the bound is a stall detector, not a total", async () => {

@@ -195,6 +195,11 @@ export async function startStubS3Server(options: {
     });
   });
 
+  // Idle connections are held long past any test's wait, so a socket that
+  // closes promptly was closed by the CLIENT, never by this server's own
+  // keep-alive timer.
+  server.keepAliveTimeout = 60_000;
+
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   const port = typeof address === "object" && address !== null ? address.port : 0;
