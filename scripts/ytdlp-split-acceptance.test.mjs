@@ -778,6 +778,9 @@ describe("split acceptance: real finalizeJobUpload against the local writer", ()
       quality: "best",
       container: "mp4",
       randomSource: () => new Uint8Array(16).fill(0xab),
+      // VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001: an upload stage is
+      // required; this one has an hour and a signal that never aborts.
+      stage: { signal: new AbortController().signal, deadlineMs: Date.now() + 3_600_000 },
     });
 
   it("refuses a provider that stored fewer bytes than declared, and cleans up", async () => {

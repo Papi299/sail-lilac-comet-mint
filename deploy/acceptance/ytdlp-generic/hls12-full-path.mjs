@@ -1517,6 +1517,9 @@ async function runExecutionNegatives(ctx) {
     timeLimits: {
       downloadTimeLimitMs: HLS12_DEADLINE_CONTROL.budgetMs,
       processingMs: DEFAULT_WORKER_TIME_LIMITS.processingMs,
+      // VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001: the executor's stage
+      // model has a third limit; this case narrows acquisition only.
+      uploadMs: DEFAULT_WORKER_TIME_LIMITS.uploadMs,
     },
   });
   const deadline = evaluateHls12SharedDeadline({
