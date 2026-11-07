@@ -158,7 +158,9 @@ const PROBE_MAX_STDERR_BYTES = 16_000;
 /**
  * Upper bound on stream entries accepted from one probe. The shapes SPLIT-02
  * allows have one or two streams; this only stops a pathological file from
- * turning into a large in-memory array before the shape check rejects it.
+ * turning into a large in-memory array before the shape check rejects it. It is
+ * a leading `.max()` on the schema, so on Zod >= 4.6.6 an oversized list fails
+ * before any element is read, for the timed and untimed parsers alike.
  */
 const MAX_PROBE_STREAMS = 16;
 
@@ -171,7 +173,7 @@ const MAX_PROBE_STREAMS = 16;
  */
 const FfprobeDocumentSchema = z.object({
   format: z.object({ format_name: z.string(), start_time: z.unknown().optional() }),
-  streams: z.array(z.object({ codec_type: z.string() })),
+  streams: z.array(z.object({ codec_type: z.string() })).max(MAX_PROBE_STREAMS),
 });
 
 /**
@@ -432,9 +434,7 @@ function parseProbeDocumentWithFormat(raw: string): {
   if (family === null) throw new AppError("PROCESSING_FAILED");
 
   const entries = parsed.data.streams;
-  if (entries.length === 0 || entries.length > MAX_PROBE_STREAMS) {
-    throw new AppError("PROCESSING_FAILED");
-  }
+  if (entries.length === 0) throw new AppError("PROCESSING_FAILED");
 
   const streams: LocalMediaStreamKind[] = [];
   for (const entry of entries) {

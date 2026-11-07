@@ -4,8 +4,8 @@
  * Every size here is small and fixed, so a regression fails an assertion and never exhausts memory.
  *
  * The fix only moves a LEADING `.max()` / `.length()` ahead of the element walk. An array with no bound
- * still builds one issue per bad element on every Zod version; for those, this application relies on its
- * byte ceilings (`YTDLP_ANALYSIS_MAX_STDOUT_BYTES` and friends).
+ * still builds one issue per bad element on every Zod version, so every application array now has a bound:
+ * see `zod-collection-bounds.test.ts`.
  *
  * Reaching the patched line also brings two older upstream changes, pinned below:
  *   - string `.min()` / `.max()` / `.length()` count code points, so `.max(n)` accepts up to 2n UTF-16 units;
@@ -54,13 +54,13 @@ describe("GHSA-mrhx-c7xc-m3w5 floor", () => {
   });
 });
 
-describe("an UNBOUNDED raw-format array is held by the application's own limits", () => {
+describe("the raw-format array is held by the application's own limits", () => {
   it("keeps the stdout ceiling that bounds the document before any parse", () => {
     assert.equal(YTDLP_ANALYSIS_MAX_STDOUT_BYTES, 4 * 1024 * 1024);
   });
 
   it("refuses a document of junk formats as a stable rejection", () => {
-    const stdout = JSON.stringify({ _type: "video", formats: new Array(OVERSIZED).fill(0) });
+    const stdout = JSON.stringify({ _type: "video", formats: new Array(YTDLP_ANALYSIS_MAX_RAW_FORMATS).fill(0) });
     assert.deepEqual(parseAnalysisInfo(stdout), { ok: false, rejection: "invalid_shape" });
   });
 

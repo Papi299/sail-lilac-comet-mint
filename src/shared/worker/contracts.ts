@@ -349,6 +349,27 @@ export const SourceQualitySchema = z
   });
 export type SourceQuality = z.infer<typeof SourceQualitySchema>;
 
+/**
+ * Upper bounds on the two option lists in `VideoMetadataSchema`, derived from
+ * `WORKER_REQUESTED_FORMAT_IDS` so they cannot drift from it.
+ *
+ * Both lists exist to offer ids the browser echoes back as `formatId`, and a job
+ * accepts nothing outside that vocabulary, so an option beyond it could never be
+ * chosen. That makes the vocabulary the real ceiling:
+ *   - `formats`: `direct-original`, the direct extractor's single concrete
+ *     format, is the only member. Generic analysis publishes none.
+ *   - `presets`: the `preset:*` ladder both analyzers share, each id at most once.
+ *
+ * Exceeding a bound means the document is malformed: it is rejected, never
+ * truncated. On Zod >= 4.6.6 a leading `.max()` rejects before any element is
+ * read, so an oversized list costs one issue, not one per element. Older Zod
+ * still rejects, but only after walking the elements. A control plane enforces
+ * these on what a Worker sends, so raising a bound means it must deploy first.
+ */
+const isPresetId = (id: string) => id.startsWith("preset:");
+export const VIDEO_METADATA_MAX_FORMATS = WORKER_REQUESTED_FORMAT_IDS.filter((id) => !isPresetId(id)).length;
+export const VIDEO_METADATA_MAX_PRESETS = WORKER_REQUESTED_FORMAT_IDS.filter(isPresetId).length;
+
 export const VideoMetadataSchema = z
   .object({
     title: z.string(),
@@ -358,8 +379,8 @@ export const VideoMetadataSchema = z
     // Worker-owned strategy identity: exactly `direct` or `yt-dlp`.
     extractor: WorkerExtractorStrategySchema,
     webpageUrl: z.string(),
-    formats: z.array(NormalizedFormatSchema),
-    presets: z.array(QualityPresetSchema),
+    formats: z.array(NormalizedFormatSchema).max(VIDEO_METADATA_MAX_FORMATS),
+    presets: z.array(QualityPresetSchema).max(VIDEO_METADATA_MAX_PRESETS),
     capabilities: z
       .object({
         mp3: z.boolean(),
