@@ -9,6 +9,7 @@ import {
 import {
   SOURCE_QUALITY_MAX_HEIGHT,
   SOURCE_QUALITY_WITHHELD_REASONS,
+  VIDEO_METADATA_MAX_PRESETS,
   VideoMetadataSchema,
   WorkerAnalyzeRequestSchema,
   type SourceQuality,
@@ -156,13 +157,13 @@ export const YTDLP_ANALYSIS_MAX_STDERR_BYTES = 256 * 1024;
 export const YTDLP_ANALYSIS_MAX_RAW_FORMATS = 512;
 
 /**
- * Maximum presets this module will ever emit.
+ * Maximum presets this module will ever emit: the contract's own bound.
  *
  * The preset vocabulary is closed and application-owned (see
  * GENERIC_PRESET_ID_PATTERN), so this can never be exceeded by upstream data;
  * it is asserted as a structural invariant rather than trusted.
  */
-export const YTDLP_ANALYSIS_MAX_PRESETS = 11;
+export const YTDLP_ANALYSIS_MAX_PRESETS = VIDEO_METADATA_MAX_PRESETS;
 
 /** Upper bound on any upstream string that becomes returned metadata. */
 export const YTDLP_ANALYSIS_MAX_TITLE_LENGTH = 1024;
@@ -554,7 +555,9 @@ const RawInfoSchema = z.object({
   is_live: z.boolean().nullish(),
   live_status: z.string().nullish(),
   entries: z.unknown().optional(),
-  formats: z.array(RawFormatSchema).nullish(),
+  // `hasTooManyRawFormats` refuses an oversized list before this schema runs, to
+  // keep `too_many_formats`; the bound here makes the schema fail closed alone.
+  formats: z.array(RawFormatSchema).max(YTDLP_ANALYSIS_MAX_RAW_FORMATS).nullish(),
   ext: z.string().nullish(),
   /**
    * The pinned runtime's own record that protected formats EXISTED and were
@@ -565,6 +568,9 @@ const RawInfoSchema = z.object({
   _has_drm: z.unknown().optional(),
 });
 type RawInfo = z.infer<typeof RawInfoSchema>;
+
+/** Everything `RawInfoSchema` reads except the formats, whose elements it never touches. */
+const RawInfoWithoutFormatsSchema = RawInfoSchema.omit({ formats: true });
 
 /** Why a result was refused. Stable, non-secret, safe to test against. */
 export type AnalysisRejection =
@@ -590,6 +596,13 @@ export type AnalysisParseResult =
  * indirection carries `url` or `url_transparent`. Every one of those is
  * refused, as is any value this module does not recognize: an unknown shape is
  * rejected rather than guessed at.
+ *
+ * A document over the raw-format bound is refused without reading one element,
+ * so it can never cost one validation issue per element. It still gets the same
+ * answer as any other document in the same order: its other fields are judged
+ * first, then the single-item and live gates, and only then `too_many_formats`.
+ * The one thing that cannot be reported any more is a bad element in an
+ * oversized list, which was `invalid_shape` when every element was walked.
  */
 export function parseAnalysisInfo(stdout: string): AnalysisParseResult {
   let parsed: unknown;
@@ -599,37 +612,49 @@ export function parseAnalysisInfo(stdout: string): AnalysisParseResult {
     return { ok: false, rejection: "malformed_json" };
   }
 
+  if (hasTooManyRawFormats(parsed)) {
+    const withoutFormats = RawInfoWithoutFormatsSchema.safeParse(parsed);
+    if (!withoutFormats.success) return { ok: false, rejection: "invalid_shape" };
+    return { ok: false, rejection: singleItemRejection(withoutFormats.data) ?? "too_many_formats" };
+  }
+
   const checked = RawInfoSchema.safeParse(parsed);
   if (!checked.success) return { ok: false, rejection: "invalid_shape" };
-  const info = checked.data;
+  const rejection = singleItemRejection(checked.data);
+  if (rejection !== null) return { ok: false, rejection };
 
+  return { ok: true, info: checked.data };
+}
+
+/** Reads only the list's length, so no element is visited or copied. */
+function hasTooManyRawFormats(document: unknown): boolean {
+  if (typeof document !== "object" || document === null) return false;
+  const formats = (document as { formats?: unknown }).formats;
+  return Array.isArray(formats) && formats.length > YTDLP_ANALYSIS_MAX_RAW_FORMATS;
+}
+
+function singleItemRejection(
+  info: Pick<RawInfo, "_type" | "entries" | "is_live" | "live_status">,
+): AnalysisRejection | null {
   // Single-item contract, primary gate.
-  if (info._type !== "video") return { ok: false, rejection: "not_single_video" };
+  if (info._type !== "video") return "not_single_video";
 
   // Single-item contract, independent second gate. `--no-playlist` is defence
   // in depth only (it is not even consulted for playlist-only URLs), and a
   // `video` result has no business carrying entries, so their presence means
   // the document is not the single item it claims to be.
-  if (info.entries !== undefined && info.entries !== null) {
-    return { ok: false, rejection: "multi_entry" };
-  }
+  if (info.entries !== undefined && info.entries !== null) return "multi_entry";
 
   // Live and wait-for-media states.
-  if (info.is_live === true) return { ok: false, rejection: "live_source" };
+  if (info.is_live === true) return "live_source";
   if (
     typeof info.live_status === "string" &&
     (YTDLP_REJECTED_LIVE_STATUSES as readonly string[]).includes(info.live_status)
   ) {
-    return { ok: false, rejection: "live_source" };
+    return "live_source";
   }
 
-  // Post-parse collection bound. The stdout ceiling is what actually limits
-  // memory; this bounds the application structures built from the document.
-  if ((info.formats?.length ?? 0) > YTDLP_ANALYSIS_MAX_RAW_FORMATS) {
-    return { ok: false, rejection: "too_many_formats" };
-  }
-
-  return { ok: true, info };
+  return null;
 }
 
 // ── Candidate selection ──────────────────────────────────────────────────────
