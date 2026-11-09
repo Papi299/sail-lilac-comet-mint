@@ -8,6 +8,13 @@ import {
   type RunResult,
 } from "../../services/processing/process-runner.server.ts";
 import {
+  observeAcquisitionSettlement,
+  reportActivity,
+  type AcquisitionActivityOutcome,
+  type AcquisitionActivityPhase,
+  type AcquisitionActivitySink,
+} from "../../services/downloads/acquisition-activity.ts";
+import {
   YTDLP_PROBE_TIMEOUT_MS,
   YTDLP_RUNTIME,
   buildYtdlpEnvironment,
@@ -679,6 +686,8 @@ export type GenericDownloadDeps = {
   readonly limits: GenericDownloadLimits;
   readonly signal?: AbortSignal;
   readonly onProgress?: (p: GenericDownloadProgress) => void;
+  /** Observation only (LD-3a): reported to, never consulted. */
+  readonly activity?: AcquisitionActivitySink;
   /** Test seams. Production uses the real hardened runner, probe, clock and fs. */
   readonly runner?: typeof runProcess;
   readonly probeRuntime?: (opts: YtdlpProbeOptions) => Promise<YtdlpRuntimeStatus>;
@@ -722,7 +731,20 @@ async function defaultStatSize(path: string): Promise<number | null> {
  * its own redirects. Those are constrained in Production by the external media
  * network namespace, its nftables policy and the watchdog.
  */
-export async function downloadGenericOriginal(
+export function downloadGenericOriginal(
+  url: string,
+  workDir: string,
+  plan: GenericSingleSourceExecutionPlan,
+  deps: GenericDownloadDeps,
+): Promise<GenericOriginalDownload> {
+  return observeAcquisitionSettlement(
+    deps.activity,
+    () => deps.signal?.aborted === true,
+    () => acquireGenericOriginal(url, workDir, plan, deps),
+  );
+}
+
+async function acquireGenericOriginal(
   url: string,
   workDir: string,
   plan: GenericSingleSourceExecutionPlan,
@@ -807,6 +829,7 @@ export async function downloadGenericOriginal(
   //    the probe already spent part of one would let the pair take up to twice
   //    what the configuration permits.
   const deadline = clock() + acquisitionBudgetMs(deps.limits);
+  reportActivity(deps.activity, { kind: "deadline-armed", limitMs: acquisitionBudgetMs(deps.limits) });
 
   const probeBudgetMs = Math.min(YTDLP_PROBE_TIMEOUT_MS, deadline - clock());
   if (probeBudgetMs <= 0) throw new AppError("TIMEOUT");
@@ -930,6 +953,8 @@ export async function downloadGenericOriginal(
       statSize,
       pollMs,
       onObserved,
+      activity: deps.activity,
+      activityPhase: "single",
     });
   } finally {
     deps.signal?.removeEventListener("abort", relayCallerAbort);
@@ -1109,6 +1134,9 @@ async function runMonitoredAcquisition(opts: {
   readonly pollMs: number;
   /** Called synchronously, and ONLY while this run's monitor is live. */
   readonly onObserved: (observed: ObservedAcquisitionBytes) => void;
+  /** Observation only (LD-3a): never consulted, and never part of the byte guard. */
+  readonly activity: AcquisitionActivitySink | undefined;
+  readonly activityPhase: AcquisitionActivityPhase;
 }): Promise<void> {
   const { statSize, partPath, finalPath } = opts;
 
@@ -1131,6 +1159,21 @@ async function runMonitoredAcquisition(opts: {
   // sample can neither report progress during audio nor abort the audio child.
   let monitorActive = true;
 
+  // Activity evidence (LD-3a), reported only from inside the gated samples below
+  // and only after the byte guard has seen the sample. `onObserved` decides what
+  // the guard and progress count; this reports the same raw per-run reading,
+  // never a split pair's monotonic display floor.
+  let seenBytes = false;
+  const reportSampledBytes = (totalBytes: number) => {
+    seenBytes ||= totalBytes > 0;
+    reportActivity(opts.activity, { kind: "bytes", totalBytes, evidence: "filesystem" });
+  };
+  // A sample that reads nothing is a gap only once this run has held bytes.
+  // Before the first write, "absent" is just what the job directory looks like.
+  const reportSampleGap = () => {
+    if (seenBytes) reportActivity(opts.activity, { kind: "sample-gap" });
+  };
+
   const sampleProgressive = async () => {
     if (!monitorActive) return;
 
@@ -1143,9 +1186,13 @@ async function runMonitoredAcquisition(opts: {
     if (!monitorActive) return;
 
     const observed = partSize ?? finalSize;
-    if (observed === null) return;
+    if (observed === null) {
+      reportSampleGap();
+      return;
+    }
 
     opts.onObserved({ guardBytes: observed, progressBytes: observed });
+    reportSampledBytes(observed);
   };
 
   // GENERIC-SEGMENTED-DASH-EXECUTION-001. A segmented run's in-flight fragment
@@ -1169,6 +1216,7 @@ async function runMonitoredAcquisition(opts: {
     try {
       names = await opts.readDir(opts.workDir);
     } catch {
+      if (monitorActive) reportSampleGap();
       return;
     }
     if (!monitorActive) return;
@@ -1216,7 +1264,10 @@ async function runMonitoredAcquisition(opts: {
           unexpected += size;
       }
     }
-    if (sized === 0) return;
+    if (sized === 0) {
+      reportSampleGap();
+      return;
+    }
 
     let pendingCharged = 0;
     let pendingKnown = 0;
@@ -1240,6 +1291,7 @@ async function runMonitoredAcquisition(opts: {
       guardBytes: aggregate + inFlight + pendingCharged + unexpected,
       progressBytes: aggregate + inFlight + pendingKnown,
     });
+    reportSampledBytes(aggregate + inFlight + pendingKnown);
   };
 
   const sample = opts.layout === "segmented" ? sampleSegmented : sampleProgressive;
@@ -1279,6 +1331,7 @@ async function runMonitoredAcquisition(opts: {
 
   let result: RunResult;
   try {
+    reportActivity(opts.activity, { kind: "phase-started", phase: opts.activityPhase });
     startMonitor();
     result = await opts.runner({
       command: YTDLP_RUNTIME.pythonPath,
@@ -1294,11 +1347,13 @@ async function runMonitoredAcquisition(opts: {
     // next half of a split pair starts, or once the executor moves on to
     // `beginProcessing()`.
     stopMonitor();
+    reportActivity(opts.activity, { kind: "phase-ended" });
   } catch (err: unknown) {
     // Disarm FIRST, before anything is interpreted. Otherwise a sample whose
     // stat resolves in this same turn could still latch a cause and convert an
     // already-determined TIMEOUT into a TOO_LARGE (§13).
     stopMonitor();
+    reportActivity(opts.activity, { kind: "settled", outcome: failedRunOutcome(opts, err) });
 
     // An internal size abort is a TOO_LARGE, not a cancellation. Checked before
     // the signal so it cannot be misreported as the user's own cancel (§30) —
@@ -1355,6 +1410,26 @@ async function runMonitoredAcquisition(opts: {
   // arrived meanwhile was still established before this classification.
   throwIfEarlierCause(opts);
   throw new AppError("TOO_LARGE");
+}
+
+/**
+ * How a run that REJECTED ended, for the activity record. The same order as the
+ * failure path it mirrors, and it reads only what that path reads. A runner
+ * TIMEOUT is this acquisition's absolute deadline: the runner's budget is what
+ * was left of it. A non-zero exit never comes through here, so a stderr that
+ * says "timed out" stays a failure rather than a deadline.
+ */
+function failedRunOutcome(
+  opts: {
+    readonly abortCause: () => AbortCause;
+    readonly callerSignal: AbortSignal | undefined;
+  },
+  err: unknown,
+): AcquisitionActivityOutcome {
+  if (opts.abortCause() === "overflow") return "failed";
+  if (opts.callerSignal?.aborted) return "cancelled";
+  if (err instanceof AppError && err.code === "TIMEOUT") return "deadline-exceeded";
+  return "failed";
 }
 
 /**
@@ -1523,7 +1598,20 @@ function splitKnownTotal(
  * there is no partial result, no substitute source and no retry. The workDir is
  * left to its lifecycle owner, the JobExecutor, to remove.
  */
-export async function downloadGenericSplitSources(
+export function downloadGenericSplitSources(
+  url: string,
+  workDir: string,
+  plan: GenericSplitExecutionPlan,
+  deps: GenericDownloadDeps,
+): Promise<GenericSplitSourcesDownload> {
+  return observeAcquisitionSettlement(
+    deps.activity,
+    () => deps.signal?.aborted === true,
+    () => acquireGenericSplitSources(url, workDir, plan, deps),
+  );
+}
+
+async function acquireGenericSplitSources(
   url: string,
   workDir: string,
   plan: GenericSplitExecutionPlan,
@@ -1581,6 +1669,7 @@ export async function downloadGenericSplitSources(
   // 4. ONE deadline for the WHOLE call — probe, video and audio. Each
   //    subprocess receives only what is left of it.
   const deadline = clock() + acquisitionBudgetMs(deps.limits);
+  reportActivity(deps.activity, { kind: "deadline-armed", limitMs: acquisitionBudgetMs(deps.limits) });
 
   // ONE operation-owned controller and ONE first-cause latch for the whole
   // call, linked to the caller before the probe starts, so user cancellation
@@ -1720,6 +1809,8 @@ export async function downloadGenericSplitSources(
           // aggregate stream monotonic across fragment moves and restarts.
           report(acquiredBytes + progressBytes);
         },
+        activity: deps.activity,
+        activityPhase: half.role,
       });
 
       await assertExactEntries(workDir, [...entriesBefore, half.name], readDir);

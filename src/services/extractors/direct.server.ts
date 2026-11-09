@@ -20,6 +20,11 @@ import type {
   MediaExtractor,
 } from "@/services/extractors/types";
 import { convertMedia, ffmpegAvailable } from "@/services/processing/ffmpeg.server";
+import {
+  observeAcquisitionSettlement,
+  reportActivity,
+  type AcquisitionActivitySink,
+} from "@/services/downloads/acquisition-activity";
 import type { NormalizedFormat, QualityPreset, VideoMetadata } from "@/types/media";
 
 const MEDIA_EXT = new Set([
@@ -189,6 +194,8 @@ async function _probeDirect(
 export type DirectWorkerDownloadContext = DownloadContext & {
   /** The Worker's ONE absolute acquisition deadline (`DOWNLOAD_TIME_LIMIT`), in milliseconds. */
   readonly downloadTimeLimitMs: number;
+  /** Observation only (LD-3a): reported to, never consulted. */
+  readonly activity?: AcquisitionActivitySink;
 };
 
 /**
@@ -208,7 +215,18 @@ export type DirectWorkerDownloadContext = DownloadContext & {
  * missing or malformed limit is a composition fault and fails closed before
  * any request.
  */
-export async function downloadDirectOriginalWorker(
+export function downloadDirectOriginalWorker(
+  url: string,
+  ctx: DirectWorkerDownloadContext,
+): Promise<{ filePath: string; container: string; mime: string; fileSize: number }> {
+  return observeAcquisitionSettlement(
+    ctx.activity,
+    () => ctx.signal?.aborted === true,
+    () => acquireDirectOriginal(url, ctx),
+  );
+}
+
+async function acquireDirectOriginal(
   url: string,
   ctx: DirectWorkerDownloadContext,
 ): Promise<{ filePath: string; container: string; mime: string; fileSize: number }> {
@@ -218,7 +236,7 @@ export async function downloadDirectOriginalWorker(
   }
   const ext = extensionFromUrl(url) || "bin";
   const dest = join(ctx.workDir, `source.${ext}`);
-  await streamDownload(url, dest, ctx, timeLimitMs);
+  await streamDownload(url, dest, ctx, timeLimitMs, ctx.activity);
   const st = await stat(dest);
   if (st.size > config.maxFileSize) throw new AppError("TOO_LARGE");
   return {
@@ -321,7 +339,13 @@ export function setDirectDownloadDeadlineTimerForTests(timer: DirectDownloadDead
  * first cause is latched, so a cancellation stays a cancellation and an
  * expired deadline is reported as `TIMEOUT`.
  */
-async function streamDownload(url: string, dest: string, ctx: DownloadContext, timeLimitMs: number) {
+async function streamDownload(
+  url: string,
+  dest: string,
+  ctx: DownloadContext,
+  timeLimitMs: number,
+  activity?: AcquisitionActivitySink,
+) {
   const controller = new AbortController();
   let abortCause = null as "caller" | "deadline" | null;
   const abortOnce = (cause: "caller" | "deadline", reason: unknown) => {
@@ -336,14 +360,21 @@ async function streamDownload(url: string, dest: string, ctx: DownloadContext, t
     () => abortOnce("deadline", new AppError("TIMEOUT")),
     timeLimitMs,
   );
+  reportActivity(activity, { kind: "deadline-armed", limitMs: timeLimitMs });
+  reportActivity(activity, { kind: "phase-started", phase: "single" });
   if (callerSignal) {
     if (callerSignal.aborted) relayCallerAbort();
     else callerSignal.addEventListener("abort", relayCallerAbort, { once: true });
   }
 
   try {
-    await transferDirectBody(url, dest, ctx, controller.signal, timeLimitMs);
+    await transferDirectBody(url, dest, ctx, controller.signal, timeLimitMs, activity);
+    reportActivity(activity, { kind: "phase-ended" });
   } catch (err) {
+    reportActivity(activity, {
+      kind: "settled",
+      outcome: abortCause === "deadline" ? "deadline-exceeded" : abortCause === "caller" ? "cancelled" : "failed",
+    });
     if (abortCause === "deadline") throw new AppError("TIMEOUT");
     throw err;
   } finally {
@@ -358,6 +389,7 @@ async function transferDirectBody(
   ctx: DownloadContext,
   signal: AbortSignal,
   socketIdleMs: number,
+  activity?: AcquisitionActivitySink,
 ) {
   const res = await safeGet(url, {
     signal,
@@ -392,6 +424,9 @@ async function transferDirectBody(
       nodeReadable.destroy(new AppError("TOO_LARGE"));
       return;
     }
+    // Only bytes that passed the ceiling, counted as they arrive: the in-process
+    // transport count, and independent of the size check above.
+    reportActivity(activity, { kind: "bytes", totalBytes: downloaded, evidence: "transport" });
     const elapsed = (Date.now() - started) / 1000;
     const speed = elapsed > 0 ? downloaded / elapsed : null;
     const progress = total ? Math.min(99, Math.round((downloaded / total) * 100)) : null;

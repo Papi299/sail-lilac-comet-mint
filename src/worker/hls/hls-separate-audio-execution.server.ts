@@ -6,6 +6,7 @@ import {
   assertWorkDirRealPath,
   regularFileSize,
 } from "@/services/processing/ffprobe.server";
+import { observeAcquisitionSettlement, reportActivity, type AcquisitionActivitySink } from "@/services/downloads/acquisition-activity";
 import type { WorkerErrorCode } from "@/shared/worker/errors";
 import {
   ClearHlsAcquisitionError,
@@ -139,6 +140,8 @@ export type ClearHlsSeparateAudioAcquisitionOrder = {
    */
   readonly downloadTimeLimitMs: number;
   readonly onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
+  /** Observation only (LD-3a): reported to, never consulted. */
+  readonly activity?: AcquisitionActivitySink;
 };
 
 /** Both committed halves, and their proven combined size. */
@@ -214,11 +217,22 @@ function pairProgress(
  * Either half failing fails the whole call; there is no partial result and no
  * fallback to one half. The workDir is the executor's to remove.
  */
-export async function acquireSelectedSeparateHlsMedia(
+export function acquireSelectedSeparateHlsMedia(
   order: ClearHlsSeparateAudioAcquisitionOrder,
   primitives: ClearHlsSeparateAudioAcquisitionPrimitives = PRODUCTION_ACQUISITION_PRIMITIVES,
 ): Promise<ClearHlsSeparateAudioAcquired> {
-  const { workDir, signal, downloadTimeLimitMs, onProgress } = order;
+  return observeAcquisitionSettlement(
+    order.activity,
+    () => order.signal.aborted,
+    () => runSeparateHlsAcquisition(order, primitives),
+  );
+}
+
+async function runSeparateHlsAcquisition(
+  order: ClearHlsSeparateAudioAcquisitionOrder,
+  primitives: ClearHlsSeparateAudioAcquisitionPrimitives,
+): Promise<ClearHlsSeparateAudioAcquired> {
+  const { workDir, signal, downloadTimeLimitMs, onProgress, activity } = order;
   // A missing or malformed limit is a composition fault: refused before either
   // preflight, so no request is made under a deadline nobody configured.
   if (
@@ -249,6 +263,7 @@ export async function acquireSelectedSeparateHlsMedia(
   // armed once, here, after both preflights — and each half receives only what
   // is left of it.
   const deadline = performance.now() + downloadTimeLimitMs;
+  reportActivity(activity, { kind: "deadline-armed", limitMs: downloadTimeLimitMs });
   const remainingMs = (): number => {
     const left = Math.floor(deadline - performance.now());
     if (left <= 0) throw new AppError("TIMEOUT");
@@ -267,6 +282,7 @@ export async function acquireSelectedSeparateHlsMedia(
         signal,
         timeoutMs: videoTimeoutMs,
         onProgress: progress.video,
+        ...(activity ? { activity } : {}),
       }),
     acquisitionAppError,
   );
@@ -284,6 +300,7 @@ export async function acquireSelectedSeparateHlsMedia(
         timeoutMs: audioTimeoutMs,
         maxAggregateBytes: allowance,
         onProgress: progress.audio(video.fileSize),
+        ...(activity ? { activity } : {}),
       }),
     acquisitionAppError,
   );

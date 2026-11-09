@@ -2403,6 +2403,7 @@ describe("split download: no media processing during acquisition (§3/§49/§50/
     assert.deepEqual(specifiers.sort(), [
       "../../lib/errors.ts",
       "../../lib/security/ssrf.server.ts",
+      "../../services/downloads/acquisition-activity.ts",
       "../../services/processing/process-runner.server.ts",
       "../runtime/ytdlp-runtime.server.ts",
       "./format-plan.ts",

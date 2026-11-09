@@ -5,6 +5,12 @@ import { config } from "@/lib/config";
 import { AppError } from "@/lib/errors";
 import { disposeHttpBody, safeGet, type SafeHttpResponse } from "@/lib/security/safe-http.server";
 import { DEFAULT_MAX_FILE_SIZE_BYTES } from "@/shared/media-limits";
+import {
+  reportActivity,
+  type AcquisitionActivityOutcome,
+  type AcquisitionActivityPhase,
+  type AcquisitionActivitySink,
+} from "@/services/downloads/acquisition-activity";
 import { HLS_V1_MAX_FRAGMENTS, type ClearHlsSegmentType } from "./hls-media-playlist.ts";
 import {
   HLS_V1_MAX_FRAGMENT_URL_BYTES,
@@ -290,6 +296,8 @@ export type ClearHlsAcquisitionRequest<P extends ClearHlsAcquisitionPlan = Clear
   readonly timeoutMs: number;
   readonly maxAggregateBytes?: number;
   readonly onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
+  /** Observation only (LD-3a): reported to, never consulted. */
+  readonly activity?: AcquisitionActivitySink;
 };
 
 // ── Private failures ─────────────────────────────────────────────────────────
@@ -619,6 +627,7 @@ type FragmentContext = {
   readonly signal: AbortSignal;
   readonly budgetMs: number;
   readonly aggregateLimit: number;
+  readonly activity: AcquisitionActivitySink | undefined;
 };
 
 /**
@@ -642,7 +651,7 @@ async function acquireFragment(
   aggregateBytes: number,
   ctx: FragmentContext,
 ): Promise<number> {
-  const { handle, signal, budgetMs, aggregateLimit } = ctx;
+  const { handle, signal, budgetMs, aggregateLimit, activity } = ctx;
   const response = await safeGet(url, {
     signal,
     timeoutMs: budgetMs,
@@ -672,6 +681,10 @@ async function acquireFragment(
       await writeAll(handle, chunk);
       fragmentBytes += length;
       total += length;
+      // Per chunk, after the write: a stall inside a large fragment must be
+      // visible while the fragment is still arriving. Observation only — it
+      // can neither admit bytes nor end the loop.
+      reportActivity(activity, { kind: "bytes", totalBytes: total, evidence: "transport" });
     }
     // A body destroyed without an error ends the iteration normally; a stop
     // that lands here must not be mistaken for a complete fragment.
@@ -716,8 +729,9 @@ async function transferResources(
   budgetMs: number,
   aggregateLimit: number,
   onProgress: ClearHlsAcquisitionRequest["onProgress"],
+  activity: AcquisitionActivitySink | undefined,
 ): Promise<number> {
-  const ctx: FragmentContext = { handle, signal, budgetMs, aggregateLimit };
+  const ctx: FragmentContext = { handle, signal, budgetMs, aggregateLimit, activity };
   const fragmentCount = resources.fragmentUrls.length;
   let aggregateBytes = 0;
   let completed = 0;
@@ -725,11 +739,13 @@ async function transferResources(
   if (resources.initializationUrl !== null) {
     signal.throwIfAborted();
     aggregateBytes = await acquireFragment(resources.initializationUrl, aggregateBytes, ctx);
+    reportActivity(activity, { kind: "resource-boundary" });
   }
   for (const url of resources.fragmentUrls) {
     // No next fragment begins once the operation has been stopped.
     signal.throwIfAborted();
     aggregateBytes = await acquireFragment(url, aggregateBytes, ctx);
+    reportActivity(activity, { kind: "resource-boundary" });
     completed += 1;
     // Only a fragment whose whole body was accepted AND written counts, and
     // the LAST one is deliberately withheld here: 100 belongs to a finalized
@@ -864,6 +880,8 @@ type AcquisitionFamily<S extends ClearHlsSegmentType> = {
   readonly aggregateFileName: string;
   readonly partialFileName: string;
   readonly admit: (plan: unknown) => AdmittedResources | null;
+  /** Which activity phase this family's transfer is. */
+  readonly activityPhase: AcquisitionActivityPhase;
 };
 
 const MPEGTS_FAMILY: AcquisitionFamily<"mpegts"> = Object.freeze({
@@ -871,6 +889,7 @@ const MPEGTS_FAMILY: AcquisitionFamily<"mpegts"> = Object.freeze({
   aggregateFileName: AGGREGATE_FILE_NAME,
   partialFileName: PARTIAL_FILE_NAME,
   admit: admitMpegTsPlan,
+  activityPhase: "single",
 });
 
 const FMP4_FAMILY: AcquisitionFamily<"fmp4"> = Object.freeze({
@@ -878,6 +897,7 @@ const FMP4_FAMILY: AcquisitionFamily<"fmp4"> = Object.freeze({
   aggregateFileName: FMP4_AGGREGATE_FILE_NAME,
   partialFileName: FMP4_PARTIAL_FILE_NAME,
   admit: admitFmp4Plan,
+  activityPhase: "single",
 });
 
 /**
@@ -890,6 +910,7 @@ const SEPARATE_VIDEO_FMP4_FAMILY: AcquisitionFamily<"fmp4"> = Object.freeze({
   aggregateFileName: SEPARATE_VIDEO_FMP4_FILE_NAME,
   partialFileName: SEPARATE_VIDEO_FMP4_PARTIAL_FILE_NAME,
   admit: admitFmp4Plan,
+  activityPhase: "video",
 });
 
 const SEPARATE_AUDIO_FMP4_FAMILY: AcquisitionFamily<"fmp4"> = Object.freeze({
@@ -897,6 +918,7 @@ const SEPARATE_AUDIO_FMP4_FAMILY: AcquisitionFamily<"fmp4"> = Object.freeze({
   aggregateFileName: SEPARATE_AUDIO_FMP4_FILE_NAME,
   partialFileName: SEPARATE_AUDIO_FMP4_PARTIAL_FILE_NAME,
   admit: admitFmp4Plan,
+  activityPhase: "audio",
 });
 
 // ── The acquisition ──────────────────────────────────────────────────────────
@@ -1014,7 +1036,7 @@ async function acquireAggregate<S extends ClearHlsSegmentType>(
   request: ClearHlsAcquisitionRequest,
   family: AcquisitionFamily<S>,
 ): Promise<{ readonly filePath: string; readonly segmentType: S; readonly fileSize: number }> {
-  const { plan, workDir, signal, timeoutMs, maxAggregateBytes, onProgress } = request;
+  const { plan, workDir, signal, timeoutMs, maxAggregateBytes, onProgress, activity } = request;
 
   // Nothing starts for a caller that has already gone: no plan work, no
   // lookup, no request and no file.
@@ -1047,6 +1069,8 @@ async function acquireAggregate<S extends ClearHlsSegmentType>(
   const onCallerAbort = () => stop("cancelled");
   signal.addEventListener("abort", onCallerAbort, { once: true });
   const timer = setTimeout(() => stop("timeout"), budgetMs);
+  reportActivity(activity, { kind: "deadline-armed", limitMs: budgetMs });
+  reportActivity(activity, { kind: "phase-started", phase: family.activityPhase });
 
   /**
    * Detach this acquisition from everything that could still stop it.
@@ -1078,6 +1102,10 @@ async function acquireAggregate<S extends ClearHlsSegmentType>(
     return new ClearHlsAcquisitionError("network_error");
   };
 
+  /** How a failed attempt ended, read from the latch only, never from the error. */
+  const failureOutcome = (): AcquisitionActivityOutcome =>
+    stopped === "cancelled" ? "cancelled" : stopped === "timeout" ? "deadline-exceeded" : "failed";
+
   // Only an artifact THIS call created may be removed by it. A pre-existing
   // partial or aggregate belongs to whatever put it there and is left exactly
   // as found.
@@ -1103,7 +1131,11 @@ async function acquireAggregate<S extends ClearHlsSegmentType>(
         budgetMs,
         aggregateLimit,
         onProgress,
+        activity,
       );
+      // The transfer is over: everything below is local finalization, under
+      // the absolute deadline only, like the other paths' artifact checks.
+      reportActivity(activity, { kind: "phase-ended" });
       let written: number;
       try {
         written = (await handle.stat()).size;
@@ -1182,6 +1214,7 @@ async function acquireAggregate<S extends ClearHlsSegmentType>(
     return result;
   } catch (err) {
     const failure = classify(err);
+    reportActivity(activity, { kind: "settled", outcome: failureOutcome() });
     if (owned !== null) await removeQuietly(owned);
     throw failure;
   } finally {
