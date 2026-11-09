@@ -2415,6 +2415,7 @@ describe("clear-HLS acquisition: inside its boundary", () => {
       "@/lib/errors",
       "@/lib/security/safe-http.server",
       "@/shared/media-limits",
+      "@/services/downloads/acquisition-activity",
       "./hls-media-playlist.ts",
       "./hls-preflight.server.ts",
     ]);

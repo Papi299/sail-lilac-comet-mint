@@ -20,6 +20,7 @@ import {
   processClearHlsTsToMp4,
   type ClearHlsProcessedMp4,
 } from "./hls-processing.server.ts";
+import { observeAcquisitionSettlement, type AcquisitionActivitySink } from "@/services/downloads/acquisition-activity";
 import type { WorkerErrorCode } from "@/shared/worker/errors";
 
 /**
@@ -116,6 +117,8 @@ export type ClearHlsAcquisitionOrder = {
   readonly signal: AbortSignal;
   readonly downloadTimeLimitMs: number;
   readonly onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
+  /** Observation only (LD-3a): reported to, never consulted. */
+  readonly activity?: AcquisitionActivitySink;
 };
 
 /**
@@ -292,11 +295,22 @@ function acquisitionAppError(err: unknown): AppError {
  *          rebuilds it nor copies it, so what HLS-4 later validates is the same
  *          object HLS-3 committed.
  */
-export async function acquireSelectedClearHlsMedia(
+export function acquireSelectedClearHlsMedia(
   order: ClearHlsAcquisitionOrder,
   primitives: ClearHlsAcquisitionPrimitives = PRODUCTION_ACQUISITION_PRIMITIVES,
 ): Promise<ClearHlsAcquiredMedia> {
-  const { plan, workDir, signal, downloadTimeLimitMs, onProgress } = order;
+  return observeAcquisitionSettlement(
+    order.activity,
+    () => order.signal.aborted,
+    () => runClearHlsAcquisition(order, primitives),
+  );
+}
+
+async function runClearHlsAcquisition(
+  order: ClearHlsAcquisitionOrder,
+  primitives: ClearHlsAcquisitionPrimitives,
+): Promise<ClearHlsAcquiredMedia> {
+  const { plan, workDir, signal, downloadTimeLimitMs, onProgress, activity } = order;
   // A missing or malformed limit is a composition fault: refused before the
   // preflight, so no request is made under a deadline nobody configured.
   if (
@@ -321,6 +335,7 @@ export async function acquireSelectedClearHlsMedia(
     signal,
     timeoutMs: downloadTimeLimitMs,
     ...(onProgress ? { onProgress } : {}),
+    ...(activity ? { activity } : {}),
   };
   try {
     switch (acquisitionPlan.segmentType) {

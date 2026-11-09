@@ -7,6 +7,7 @@ import { AppError, ERROR_MESSAGES } from "@/lib/errors";
 import { createJobDir, removeJobDir } from "@/services/temp/files.server";
 import { analyzeDirectMedia } from "./direct-media.server.ts";
 import { downloadDirectOriginalWorker } from "@/services/extractors/direct.server";
+import type { AcquisitionActivitySink } from "@/services/downloads/acquisition-activity";
 import { mimeForContainer } from "@/services/extractors/normalize";
 import {
   SPLIT_MERGE_TARGETS,
@@ -130,6 +131,7 @@ export type DownloadOriginalFn = (
       eta?: number | null;
       stage?: string;
     }) => void;
+    activity?: AcquisitionActivitySink;
   },
 ) => Promise<OriginalDownloadResult>;
 
@@ -149,6 +151,7 @@ export type GenericAcquisitionContext = {
     eta?: number | null;
     stage?: string;
   }) => void;
+  activity?: AcquisitionActivitySink;
 };
 
 /**
@@ -212,6 +215,7 @@ export type AcquireClearHlsFn = (
     signal: AbortSignal;
     downloadTimeLimitMs: number;
     onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
+    activity?: AcquisitionActivitySink;
   },
 ) => Promise<ClearHlsAcquiredMedia>;
 
@@ -259,6 +263,7 @@ export type AcquireSeparateHlsFn = (
     signal: AbortSignal;
     downloadTimeLimitMs: number;
     onProgress?: (progress: ClearHlsAcquisitionProgress) => void;
+    activity?: AcquisitionActivitySink;
   },
 ) => Promise<ClearHlsSeparateAudioAcquired>;
 
@@ -454,6 +459,13 @@ export type JobExecutorDeps = {
    * upload stage's. Production: the platform timer.
    */
   backstopTimers?: ExecutionBackstopTimers;
+  /**
+   * LD-3a: one activity sink per acquisition. Observation only — nothing in this
+   * executor reads what a sink records, and no outcome depends on it. Production
+   * supplies none (`runtime.server.ts`; pinned by a structural test), so no
+   * acquisition in this release reports anywhere. LD-3b adds the consumer.
+   */
+  createAcquisitionActivitySink?: () => AcquisitionActivitySink | undefined;
 };
 
 /** The byte half of `GenericDownloadLimits`: the executor's time comes from `timeLimits`. */
@@ -546,6 +558,7 @@ export class JobExecutor {
   /** What both yt-dlp seams receive: the byte ceiling and the acquisition limit. */
   private readonly genericDownloadLimits: GenericDownloadLimits;
   private readonly backstopTimers: ExecutionBackstopTimers;
+  private readonly createAcquisitionActivitySink: JobExecutorDeps["createAcquisitionActivitySink"];
 
   constructor(
     store: WorkerJobStore,
@@ -573,6 +586,7 @@ export class JobExecutor {
           limits: ctx.limits,
           ...(ctx.signal ? { signal: ctx.signal } : {}),
           ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
+          ...(ctx.activity ? { activity: ctx.activity } : {}),
         }).then((res) => ({
           filePath: res.filePath,
           container: res.container,
@@ -586,6 +600,7 @@ export class JobExecutor {
           limits: ctx.limits,
           ...(ctx.signal ? { signal: ctx.signal } : {}),
           ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
+          ...(ctx.activity ? { activity: ctx.activity } : {}),
         }));
     this.processLocally = deps.processLocally ?? convertMedia;
     this.mergeSplit = deps.mergeSplit ?? mergeSplitMedia;
@@ -601,6 +616,7 @@ export class JobExecutor {
           signal: ctx.signal,
           downloadTimeLimitMs: ctx.downloadTimeLimitMs,
           ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
+          ...(ctx.activity ? { activity: ctx.activity } : {}),
         }));
     this.processClearHls = deps.processClearHls ?? ((opts) => processAcquiredClearHlsMedia(opts));
     // HLS-SEPARATE-AUDIO-PAIRING-IMPLEMENTATION-001: the separate-audio seams
@@ -615,6 +631,7 @@ export class JobExecutor {
           signal: ctx.signal,
           downloadTimeLimitMs: ctx.downloadTimeLimitMs,
           ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
+          ...(ctx.activity ? { activity: ctx.activity } : {}),
         }));
     this.processSeparateHls = deps.processSeparateHls ?? ((opts) => processAcquiredSeparateHlsMedia(opts));
     // HLS-6 §24: the ordinary Product planner, and nothing else, by default.
@@ -638,6 +655,7 @@ export class JobExecutor {
       setTimeoutFn: (handler, ms) => setTimeout(handler, ms),
       clearTimeoutFn: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     };
+    this.createAcquisitionActivitySink = deps.createAcquisitionActivitySink;
   }
 
   /** Number of executions currently holding an AbortController (§11 diagnostics). */
@@ -974,12 +992,17 @@ export class JobExecutor {
     // keeps its own first-cause latch; nothing here arms a second timer.
     const downloadTimeLimitMs = this.stageTimeLimits.downloadTimeLimitMs;
 
+    // LD-3a: at most one sink per acquisition, and none in Production. A sink
+    // factory that fails is an observer failing: the acquisition goes on without it.
+    const activityOption = this.newAcquisitionActivityOption();
+
     if (plan.strategy === "direct") {
       const original = await this.downloadOriginal(url, {
         workDir,
         signal,
         downloadTimeLimitMs,
         onProgress: this.makeProgressReporter(jobId),
+        ...activityOption,
       });
       return { kind: "single", plan, original: assertSingleOriginal(original) };
     }
@@ -1003,6 +1026,7 @@ export class JobExecutor {
           onProgress: (update) => {
             if (acquisitionLive) report(update);
           },
+          ...activityOption,
         });
       } finally {
         acquisitionLive = false;
@@ -1039,6 +1063,7 @@ export class JobExecutor {
           onProgress: (update) => {
             if (acquisitionLive) report(update);
           },
+          ...activityOption,
         });
       } finally {
         acquisitionLive = false;
@@ -1051,6 +1076,7 @@ export class JobExecutor {
         limits: this.genericDownloadLimits,
         signal,
         onProgress: this.makeProgressReporter(jobId),
+        ...activityOption,
       });
       return {
         kind: "single",
@@ -1087,6 +1113,7 @@ export class JobExecutor {
         onProgress: (update) => {
           if (acquisitionLive) report(update);
         },
+        ...activityOption,
       });
     } finally {
       acquisitionLive = false;
@@ -1096,6 +1123,21 @@ export class JobExecutor {
       plan: generic,
       sources: assertSplitSources(generic, sources, this.genericLimits.maxFileSizeBytes),
     };
+  }
+
+  /**
+   * LD-3a: the option object every acquisition seam spreads in. Empty when no
+   * sink exists — the Production case — so a seam's context then has no extra
+   * key at all.
+   */
+  private newAcquisitionActivityOption(): { activity: AcquisitionActivitySink } | Record<string, never> {
+    let sink: AcquisitionActivitySink | undefined;
+    try {
+      sink = this.createAcquisitionActivitySink?.();
+    } catch {
+      return {};
+    }
+    return sink ? { activity: sink } : {};
   }
 
   /**

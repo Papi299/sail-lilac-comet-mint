@@ -761,7 +761,7 @@ describe("HLS-6 orchestration module: a seam, not a second implementation", () =
   const code = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
   it("strips prose without destroying the module under test", () => {
-    assert.ok(code.includes("export async function acquireSelectedClearHlsMedia"));
+    assert.ok(code.includes("export function acquireSelectedClearHlsMedia"));
     assert.equal(code.includes("Privacy"), false, "comments should be gone");
   });
 
@@ -772,6 +772,7 @@ describe("HLS-6 orchestration module: a seam, not a second implementation", () =
       "./hls-fragment-acquisition.server.ts",
       "./hls-preflight.server.ts",
       "./hls-processing.server.ts",
+      "@/services/downloads/acquisition-activity",
       "@/shared/worker/errors",
     ]);
   });
