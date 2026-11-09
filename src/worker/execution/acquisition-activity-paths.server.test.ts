@@ -804,6 +804,7 @@ describe("yt-dlp progressive: file growth is the evidence", () => {
     const final = expectedSourcePath(workDir, "mp4");
     const part = expectedPartPath(workDir, "mp4");
     const seen: number[] = [];
+    let renameAtEvent = -1;
     const samples = () => t.events.filter((e) => e.kind === "bytes").length;
     const result = await downloadGenericOriginal(
       SECRET_URL,
@@ -814,9 +815,10 @@ describe("yt-dlp progressive: file growth is the evidence", () => {
         await new Promise((resolve) => setTimeout(resolve, 8));
         writeFileSync(part, chunk(50_000));
         await samplesAfter(samples);
-        writeFileSync(part, chunk(120_000));
+        appendFileSync(part, chunk(70_000)); // a real `.part` only ever grows
         await samplesAfter(samples);
         seen.push(t.tracker.snapshot().observedBytes);
+        renameAtEvent = t.events.length;
         renameSync(part, final);
         await samplesAfter(samples);
         return EXIT_OK;
@@ -830,9 +832,12 @@ describe("yt-dlp progressive: file growth is the evidence", () => {
     assert.equal(snapshot.discardedBytes, 0, "a rename is not a discard");
     assert.deepEqual(t.events.at(-1), { kind: "settled", outcome: "completed" });
     assert.ok(t.events.some((e) => e.kind === "phase-ended"));
-    // After the rename every sample read the same size: no new bytes were invented.
+    // Every sample after the rename read the same size: no new bytes were invented.
     const totals = t.events.flatMap((e) => (e.kind === "bytes" ? [e.totalBytes] : []));
-    assert.deepEqual([...new Set(totals)].sort((a, b) => a - b), [50_000, 120_000]);
+    assert.equal(Math.max(...totals), 120_000);
+    const afterRename = t.events.slice(renameAtEvent).flatMap((e) => (e.kind === "bytes" ? [e.totalBytes] : []));
+    assert.ok(afterRename.length > 0, "the monitor sampled the renamed file");
+    assert.deepEqual([...new Set(afterRename)], [120_000]);
     assertClosedAndPrivate(t.events);
   });
 
@@ -897,7 +902,7 @@ describe("yt-dlp progressive: file growth is the evidence", () => {
         writeFileSync(part, chunk(10));
         await samplesAfter(samples, 4);
         discardSeen = t.tracker.snapshot().discardedBytes === 500_000 - 10 && t.assess().status === "retry-discarded";
-        writeFileSync(part, chunk(200_000));
+        appendFileSync(part, chunk(199_990));
         await samplesAfter(samples);
         const s = t.tracker.snapshot();
         assert.equal(s.observedBytes, 200_000, "real growth after the restart is real progress");
@@ -1280,9 +1285,10 @@ describe("yt-dlp segmented DASH: a fragment rollover is neither a stall nor new 
         writeFileSync(frag, bytes);
         await settle();
       } else {
-        writeFileSync(fragPart, bytes.subarray(0, Math.ceil(bytes.length / 2)));
+        const half = Math.ceil(bytes.length / 2);
+        writeFileSync(fragPart, bytes.subarray(0, half));
         await settle();
-        writeFileSync(fragPart, bytes);
+        appendFileSync(fragPart, bytes.subarray(half));
         await settle();
         renameSync(fragPart, frag);
         await settle();
