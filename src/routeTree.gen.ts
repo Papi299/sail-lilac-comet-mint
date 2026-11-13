@@ -21,6 +21,7 @@ import { Route as ApiSitesRouteImport } from './routes/api/sites'
 import { Route as ApiAccessLoginRouteImport } from './routes/api/access.login'
 import { Route as ApiAccessLogoutRouteImport } from './routes/api/access.logout'
 import { Route as ApiAccessSessionRouteImport } from './routes/api/access.session'
+import { Route as ApiDownloadJobIdCancelRouteImport } from './routes/api/download.$jobId.cancel'
 import { Route as ApiDownloadJobIdFileRouteImport } from './routes/api/download.$jobId.file'
 import { Route as ApiDownloadJobIdStatusRouteImport } from './routes/api/download.$jobId.status'
 
@@ -84,6 +85,11 @@ const ApiAccessSessionRoute = ApiAccessSessionRouteImport.update({
   path: '/api/access/session',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiDownloadJobIdCancelRoute = ApiDownloadJobIdCancelRouteImport.update({
+  id: '/$jobId/cancel',
+  path: '/$jobId/cancel',
+  getParentRoute: () => ApiDownloadRoute,
+} as any)
 const ApiDownloadJobIdFileRoute = ApiDownloadJobIdFileRouteImport.update({
   id: '/$jobId/file',
   path: '/$jobId/file',
@@ -108,6 +114,7 @@ export interface FileRoutesByFullPath {
   '/api/access/login': typeof ApiAccessLoginRoute
   '/api/access/logout': typeof ApiAccessLogoutRoute
   '/api/access/session': typeof ApiAccessSessionRoute
+  '/api/download/$jobId/cancel': typeof ApiDownloadJobIdCancelRoute
   '/api/download/$jobId/file': typeof ApiDownloadJobIdFileRoute
   '/api/download/$jobId/status': typeof ApiDownloadJobIdStatusRoute
 }
@@ -124,6 +131,7 @@ export interface FileRoutesByTo {
   '/api/access/login': typeof ApiAccessLoginRoute
   '/api/access/logout': typeof ApiAccessLogoutRoute
   '/api/access/session': typeof ApiAccessSessionRoute
+  '/api/download/$jobId/cancel': typeof ApiDownloadJobIdCancelRoute
   '/api/download/$jobId/file': typeof ApiDownloadJobIdFileRoute
   '/api/download/$jobId/status': typeof ApiDownloadJobIdStatusRoute
 }
@@ -141,6 +149,7 @@ export interface FileRoutesById {
   '/api/access/login': typeof ApiAccessLoginRoute
   '/api/access/logout': typeof ApiAccessLogoutRoute
   '/api/access/session': typeof ApiAccessSessionRoute
+  '/api/download/$jobId/cancel': typeof ApiDownloadJobIdCancelRoute
   '/api/download/$jobId/file': typeof ApiDownloadJobIdFileRoute
   '/api/download/$jobId/status': typeof ApiDownloadJobIdStatusRoute
 }
@@ -159,6 +168,7 @@ export interface FileRouteTypes {
     | '/api/access/login'
     | '/api/access/logout'
     | '/api/access/session'
+    | '/api/download/$jobId/cancel'
     | '/api/download/$jobId/file'
     | '/api/download/$jobId/status'
   fileRoutesByTo: FileRoutesByTo
@@ -175,6 +185,7 @@ export interface FileRouteTypes {
     | '/api/access/login'
     | '/api/access/logout'
     | '/api/access/session'
+    | '/api/download/$jobId/cancel'
     | '/api/download/$jobId/file'
     | '/api/download/$jobId/status'
   id:
@@ -191,6 +202,7 @@ export interface FileRouteTypes {
     | '/api/access/login'
     | '/api/access/logout'
     | '/api/access/session'
+    | '/api/download/$jobId/cancel'
     | '/api/download/$jobId/file'
     | '/api/download/$jobId/status'
   fileRoutesById: FileRoutesById
@@ -296,6 +308,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiAccessSessionRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/download/$jobId/cancel': {
+      id: '/api/download/$jobId/cancel'
+      path: '/$jobId/cancel'
+      fullPath: '/api/download/$jobId/cancel'
+      preLoaderRoute: typeof ApiDownloadJobIdCancelRouteImport
+      parentRoute: typeof ApiDownloadRoute
+    }
     '/api/download/$jobId/file': {
       id: '/api/download/$jobId/file'
       path: '/$jobId/file'
@@ -314,11 +333,13 @@ declare module '@tanstack/react-router' {
 }
 
 interface ApiDownloadRouteChildren {
+  ApiDownloadJobIdCancelRoute: typeof ApiDownloadJobIdCancelRoute
   ApiDownloadJobIdFileRoute: typeof ApiDownloadJobIdFileRoute
   ApiDownloadJobIdStatusRoute: typeof ApiDownloadJobIdStatusRoute
 }
 
 const ApiDownloadRouteChildren: ApiDownloadRouteChildren = {
+  ApiDownloadJobIdCancelRoute: ApiDownloadJobIdCancelRoute,
   ApiDownloadJobIdFileRoute: ApiDownloadJobIdFileRoute,
   ApiDownloadJobIdStatusRoute: ApiDownloadJobIdStatusRoute,
 }

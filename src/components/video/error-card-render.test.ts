@@ -121,7 +121,7 @@ describe("the error card for representative failures", () => {
     [
       "a download past its deadline",
       { errorCode: "TIMEOUT", safeErrorMessage: HOSTILE, stageLabel: "Download failed" },
-      "Download failed The video took too long to process. Start over",
+      "Download failed The download didn't finish in time. Start over",
     ],
     [
       "a video over the size limit",
@@ -189,10 +189,10 @@ describe("the error card for representative failures", () => {
     });
   }
 
-  it("a cancelled job keeps its own message and the generic heading", () => {
+  it("a cancelled job keeps its own message under its own heading (LD-4a)", () => {
     assert.equal(
       terminalCard(workerJob({ status: "cancelled" })),
-      "We hit a snag This download was cancelled. Start over",
+      "Download cancelled This download was cancelled. Start over",
     );
   });
 });
@@ -203,7 +203,8 @@ describe("the error card heading", () => {
   });
 
   it("is generic for a job that has not failed (a failed status poll)", () => {
-    for (const status of ["downloading", "processing", "uploading", "cancelled"] as const) {
+    // `cancelled` has its own heading since LD-4a (asserted above).
+    for (const status of ["downloading", "processing", "uploading"] as const) {
       const job = overTheWire(workerJob({ status, stageLabel: "Upload failed" }));
       assert.equal(errorCardHeading(job), DEFAULT_ERROR_HEADING, status);
     }

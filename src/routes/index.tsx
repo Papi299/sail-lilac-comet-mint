@@ -11,10 +11,12 @@ import { DownloadHistory } from "@/components/video/history";
 import { PrivateAccessGate } from "@/components/video/private-access-gate";
 import { ErrorCard } from "@/components/video/error-card";
 import { StatusConnectionNotice } from "@/components/video/status-connection-notice";
+import { CancelDownload } from "@/components/video/cancel-download";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   analyzeVideo,
+  cancelDownload,
   getJobStatus,
   loadHistory,
   rememberUrl,
@@ -30,8 +32,10 @@ import {
   initialDownloaderState,
   startStatusPollSession,
   statusPollTarget,
+  type DownloaderState,
 } from "@/lib/downloader-state";
-import { errorCardHeading } from "@/lib/job-failure-ui";
+import { createCancelController, type CancelController } from "@/lib/download-cancel";
+import { errorCardHeading, jobOutcomeRetry } from "@/lib/job-failure-ui";
 import type { VideoMetadata } from "@/types/media";
 
 export const Route = createFileRoute("/")({ component: Home });
@@ -54,6 +58,8 @@ function Downloader() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [starting, setStarting] = useState(false);
   const videoRef = useRef<VideoMetadata | null>(null);
+  const stateRef = useRef<DownloaderState>(state);
+  const cancelRef = useRef<CancelController | null>(null);
 
   useEffect(() => {
     setHistory(loadHistory());
@@ -62,6 +68,26 @@ function Downloader() {
   useEffect(() => {
     videoRef.current = video;
   }, [video]);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+
+  // LD-4a: one cancellation controller for the page's lifetime. Unmounting
+  // ignores a pending answer but never aborts a cancellation the person
+  // confirmed (see download-cancel).
+  useEffect(() => {
+    const controller = createCancelController({
+      getState: () => stateRef.current,
+      dispatch,
+      cancel: (id, signal) => cancelDownload(id, { signal }),
+    });
+    cancelRef.current = controller;
+    return () => {
+      controller.dispose();
+      cancelRef.current = null;
+    };
+  }, []);
 
   // One single-flight polling loop per session. The session changes only when
   // a new job starts or the person asks to retry the status, so progress
@@ -138,6 +164,21 @@ function Downloader() {
     dispatch({ type: "retry_status" });
   }
 
+  // Sends nothing unless the page may: the controller and the reducer both
+  // refuse a second request while one is out, and any job other than the one
+  // being processed.
+  function confirmCancel() {
+    if (job) cancelRef.current?.request(job.jobId);
+  }
+
+  // Back to the quality choice for the same video. A new job is created only
+  // when the person presses Download again.
+  function chooseAgain() {
+    dispatch({ type: "choose_again" });
+  }
+
+  const outcomeRetry = video ? jobOutcomeRetry(phase === "error" ? job : null) : null;
+
   // Unlike `reset`, clears the URL: analyzing the same link again would yield
   // the same result.
   function tryAnotherUrl() {
@@ -184,11 +225,18 @@ function Downloader() {
         ) : null}
 
         {phase === "error" && error ? (
-          // Only a FAILED job's closed stage label can change the heading; an
-          // analysis error or a definitive status answer (NOT_FOUND, EXPIRED,
-          // an access failure) has no job stage and keeps the generic one. A
-          // transient status failure never reaches this card.
-          <ErrorCard heading={errorCardHeading(job)} message={error} onReset={reset} />
+          // Only a job's own ending changes the heading — a FAILED job's closed
+          // stage label, or a cancelled job — and only such an ending offers
+          // "Try again"; an analysis error or a definitive status answer
+          // (NOT_FOUND, EXPIRED, an access failure) has neither and keeps the
+          // generic heading. A transient status failure, or a cancellation the
+          // Worker did not confirm, never reaches this card.
+          <ErrorCard
+            heading={errorCardHeading(job)}
+            message={error}
+            onReset={reset}
+            retry={outcomeRetry ? { ...outcomeRetry, onRetry: chooseAgain } : null}
+          />
         ) : null}
 
         {video && (phase === "ready" || phase === "processing" || phase === "complete") ? (
@@ -216,6 +264,11 @@ function Downloader() {
               {phase === "processing" && job ? (
                 <>
                   <ProgressCard job={job} />
+                  <CancelDownload
+                    downloadedBytes={job.downloadedBytes}
+                    cancel={state.cancel}
+                    onConfirm={confirmCancel}
+                  />
                   <StatusConnectionNotice
                     connectivity={connectivity}
                     onRetryStatus={retryStatus}

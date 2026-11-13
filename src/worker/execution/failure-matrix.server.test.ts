@@ -457,6 +457,19 @@ describe("failure classification end to end: Worker → public job", () => {
     availableWorkDirBytes: async () => Number.MAX_SAFE_INTEGER,
   };
 
+  /**
+   * The control plane's public message for a failure in the download stage.
+   * Since LD-4a (VIDEOFETCH-LD4A-CANCELLATION-UX-AND-OUTCOME-CONTRACT-001) the
+   * PROJECTION chooses a failed TIMEOUT's sentence by stage, instead of the
+   * canonical "took too long to process"; the Worker still stores and the
+   * row still carries the canonical text, which this matrix does not change.
+   */
+  function publicMessageInDownloadStage(code: ErrorCode): string {
+    if (code !== "TIMEOUT") return ERROR_MESSAGES[code];
+    assert.notEqual("The download didn't finish in time.", ERROR_MESSAGES.TIMEOUT);
+    return "The download didn't finish in time.";
+  }
+
   function assertPublicFailure(
     jobId: string,
     code: ErrorCode,
@@ -532,7 +545,7 @@ describe("failure classification end to end: Worker → public job", () => {
         },
       });
       await executor.execute(job);
-      assertPublicFailure(job.jobId, code, "Download failed");
+      assertPublicFailure(job.jobId, code, "Download failed", publicMessageInDownloadStage(code));
     });
   }
 
@@ -554,7 +567,7 @@ describe("failure classification end to end: Worker → public job", () => {
         },
       });
       await executor.execute(job);
-      assertPublicFailure(job.jobId, code, "Download failed");
+      assertPublicFailure(job.jobId, code, "Download failed", publicMessageInDownloadStage(code));
     });
   }
 

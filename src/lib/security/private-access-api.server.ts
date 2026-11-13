@@ -26,7 +26,7 @@ import {
   getObjectStoreSigner,
   getWorkerClient,
 } from "@/web/config/worker-runtime.server";
-import { toPublicJob } from "@/web/jobs/public-job";
+import { isTerminalPublicStatus, toPublicJob } from "@/web/jobs/public-job";
 
 /**
  * Vercel control plane.
@@ -247,6 +247,65 @@ export async function handleDownloadStatus(request: Request, jobId: string): Pro
     // a job which may still be running does not exist.
     return safeJsonError(err, "PROCESSING_FAILED");
   }
+}
+
+/**
+ * VIDEOFETCH-LD4A-CANCELLATION-UX-AND-OUTCOME-CONTRACT-001: per-principal cancel
+ * requests per minute. A bucket of its own, so analyze and download traffic can
+ * never use up a person's ability to stop a job; the window slides, so a refusal
+ * lasts at most a minute and nothing is persisted.
+ */
+export const DOWNLOAD_CANCEL_RATE_LIMIT = 20;
+
+/**
+ * `POST /api/download/:jobId/cancel`.
+ *
+ * The same gate as every other job route, in the same order as job creation:
+ * private access (the `Sec-Fetch-Site` isolation check, then the HttpOnly,
+ * SameSite=Strict session cookie), then the rate limit, then the closed job-id
+ * schema — so a refused request never reaches the Worker. The Worker's existing
+ * HMAC-authenticated cancel endpoint then decides, atomically, what happened:
+ * it answers the committed job, which is `cancelled` when THIS request won and
+ * the unchanged terminal job (`ready`, `failed` or an earlier `cancelled`) when
+ * an outcome had already been reached. This handler never invents an outcome,
+ * never creates a job, and never retries.
+ *
+ * A terminal job past its retention answers `EXPIRED`, exactly as a status read
+ * of it does, so an expired ready file is never presented as the result of a
+ * cancellation. The response is the public projection only — no object key, no
+ * Worker message — and is never cached.
+ */
+export async function handleDownloadCancel(request: Request, jobId: string): Promise<Response> {
+  try {
+    const principal = requirePrivateAccess(request);
+    if (!consumeRateLimit(`cancel:${principal.id}`, DOWNLOAD_CANCEL_RATE_LIMIT)) {
+      throw new AppError("RATE_LIMITED");
+    }
+    const validId = validateJobId(jobId);
+    const { job } = await getWorkerClient().cancelJob(validId);
+    const now = Date.now();
+    if (isTerminalPublicStatus(job.status) && now >= job.expiresAt) {
+      throw new AppError("EXPIRED");
+    }
+    return jsonNoStore(toPublicJob(job, now));
+  } catch (err) {
+    // As for status: every definitive answer keeps its code; anything else is
+    // an unclassified 500, which the browser treats as "not confirmed".
+    return withNoStore(safeJsonError(err, "PROCESSING_FAILED"));
+  }
+}
+
+/**
+ * Every other method on the cancel route. Answered before any access check or
+ * Worker call: a GET (a link, a prefetch, an image tag) can never cancel a job.
+ */
+export function handleDownloadCancelMethodNotAllowed(): Response {
+  return new Response(null, { status: 405, headers: noStoreHeaders({ Allow: "POST" }) });
+}
+
+function withNoStore(res: Response): Response {
+  res.headers.set("Cache-Control", "no-store");
+  return res;
 }
 
 /**

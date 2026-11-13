@@ -32,12 +32,37 @@ export type StatusConnectivity = "connected" | "reconnecting" | "retry_exhausted
  */
 export type StatusPollSession = { generation: number; initialDelayMs: number };
 
+/**
+ * VIDEOFETCH-LD4A-CANCELLATION-UX-AND-OUTCOME-CONTRACT-001: the one cancellation
+ * request the page may have for its CURRENT job. Browser-only, like
+ * `connectivity`: it describes the request, never the job. The job's outcome
+ * comes only from a status the Worker committed — a cancel answer or a poll.
+ *
+ *   idle         no request, or none that still matters
+ *   requesting   sent, no answer yet; a second one is never sent meanwhile
+ *   unconfirmed  it failed without a definitive answer, so it may or may not
+ *                have taken effect; the status channel decides
+ *   refused      the control plane answered definitively that it did not
+ *                cancel (access, rate limit, an unknown or expired job)
+ *
+ * `attempt` identifies the request, so an answer to an older one changes
+ * nothing.
+ */
+export type CancelRequestState =
+  | { kind: "idle" }
+  | { kind: "requesting"; jobId: string; attempt: number }
+  | { kind: "unconfirmed"; jobId: string; attempt: number }
+  | { kind: "refused"; jobId: string; attempt: number; message: string };
+
+export type CancelFailureClass = "unconfirmed" | "refused";
+
 export type DownloaderState = {
   phase: DownloaderPhase;
   job: PolledJob | null;
   error: string | null;
   connectivity: StatusConnectivity;
   poll: StatusPollSession;
+  cancel: CancelRequestState;
 };
 
 export type DownloaderAction =
@@ -49,7 +74,13 @@ export type DownloaderAction =
   | { type: "download_failed"; message: string }
   | { type: "reset" }
   | { type: "retry_status" }
-  | { type: "status_poll"; jobId: string; generation: number; event: JobStatusPollEvent };
+  | { type: "status_poll"; jobId: string; generation: number; event: JobStatusPollEvent }
+  | { type: "cancel_requested"; jobId: string; attempt: number }
+  | { type: "cancel_answered"; jobId: string; attempt: number; job: PolledJob }
+  | { type: "cancel_failed"; jobId: string; attempt: number; failure: CancelFailureClass; message: string }
+  | { type: "choose_again" };
+
+const NO_CANCEL: CancelRequestState = Object.freeze({ kind: "idle" });
 
 export const initialDownloaderState: DownloaderState = {
   phase: "idle",
@@ -57,9 +88,25 @@ export const initialDownloaderState: DownloaderState = {
   error: null,
   connectivity: "connected",
   poll: { generation: 0, initialDelayMs: STATUS_POLL_INTERVAL_MS },
+  cancel: NO_CANCEL,
 };
 
+/**
+ * Whether the page may send a cancellation for `jobId` now: only for the job
+ * it is processing, and only while no other request for it is outstanding.
+ */
+export function canRequestCancel(state: DownloaderState, jobId: string): boolean {
+  return state.phase === "processing" && state.job?.jobId === jobId && state.cancel.kind !== "requesting";
+}
+
 export function downloaderReducer(state: DownloaderState, action: DownloaderAction): DownloaderState {
+  const next = reduce(state, action);
+  // A cancellation request belongs to one processing job: once the page shows
+  // anything else, it no longer matters, and its late answer changes nothing.
+  return next.phase !== "processing" && next.cancel.kind !== "idle" ? { ...next, cancel: NO_CANCEL } : next;
+}
+
+function reduce(state: DownloaderState, action: DownloaderAction): DownloaderState {
   switch (action.type) {
     case "analyze_started":
       return { ...state, phase: "analyzing", error: null, job: null, connectivity: "connected" };
@@ -75,6 +122,7 @@ export function downloaderReducer(state: DownloaderState, action: DownloaderActi
         phase: "processing",
         job: action.job,
         connectivity: "connected",
+        cancel: NO_CANCEL,
         // The create response is itself a fresh status, so the first read
         // waits one ordinary interval.
         poll: { generation: state.poll.generation + 1, initialDelayMs: STATUS_POLL_INTERVAL_MS },
@@ -97,7 +145,89 @@ export function downloaderReducer(state: DownloaderState, action: DownloaderActi
       };
     case "status_poll":
       return applyStatusPollEvent(state, action);
+    case "cancel_requested":
+      if (!canRequestCancel(state, action.jobId)) return state;
+      return { ...state, cancel: { kind: "requesting", jobId: action.jobId, attempt: action.attempt } };
+    case "cancel_answered":
+      return applyCancelAnswer(state, action);
+    case "cancel_failed":
+      return applyCancelFailure(state, action);
+    case "choose_again":
+      // Back to the quality choice for the SAME analysis, after a job ended
+      // without a file. Nothing is sent: only pressing Download again starts a
+      // new job, which acquires from the beginning. Never valid for a job that
+      // is still running, for a finished file, or when no job outcome is shown.
+      if (state.phase !== "error" || !state.job || !ENDED_WITHOUT_FILE.has(state.job.status)) return state;
+      return { ...state, phase: "ready", job: null, error: null, connectivity: "connected", cancel: NO_CANCEL };
   }
+}
+
+const ENDED_WITHOUT_FILE: ReadonlySet<string> = new Set(["failed", "cancelled"]);
+
+function isCurrentCancel(
+  state: DownloaderState,
+  action: { jobId: string; attempt: number },
+): boolean {
+  return (
+    state.phase === "processing" &&
+    state.job?.jobId === action.jobId &&
+    state.cancel.kind === "requesting" &&
+    state.cancel.jobId === action.jobId &&
+    state.cancel.attempt === action.attempt
+  );
+}
+
+/**
+ * The Worker's committed job, as the cancel route returned it. It is shown for
+ * what it is: `cancelled` only when the Worker says so. A job that had already
+ * reached `ready` stays a finished download, and one that had failed keeps its
+ * failure. An answer that does not end the job proves nothing, so the status
+ * channel decides.
+ */
+function applyCancelAnswer(
+  state: DownloaderState,
+  action: Extract<DownloaderAction, { type: "cancel_answered" }>,
+): DownloaderState {
+  if (!isCurrentCancel(state, action)) return state;
+  const job = action.job;
+  if (job.jobId !== action.jobId) {
+    return { ...state, cancel: { kind: "unconfirmed", jobId: action.jobId, attempt: action.attempt } };
+  }
+  if (job.status === "ready") {
+    return { ...state, phase: "complete", job, error: null, connectivity: "connected" };
+  }
+  if (job.status === "cancelled" || job.status === "failed") {
+    return { ...state, phase: "error", job, error: terminalJobMessage(job), connectivity: "connected" };
+  }
+  return { ...state, cancel: { kind: "unconfirmed", jobId: action.jobId, attempt: action.attempt } };
+}
+
+/**
+ * A cancellation that failed. Nothing about the job changes: the page keeps
+ * showing it as running, with its last known progress. A request that may have
+ * reached the Worker is never sent again automatically; instead, when the
+ * status channel had already given up, ONE reconnecting session starts, so the
+ * page reads what actually happened as soon as the Worker can be reached.
+ */
+function applyCancelFailure(
+  state: DownloaderState,
+  action: Extract<DownloaderAction, { type: "cancel_failed" }>,
+): DownloaderState {
+  if (!isCurrentCancel(state, action)) return state;
+  if (action.failure === "refused") {
+    return {
+      ...state,
+      cancel: { kind: "refused", jobId: action.jobId, attempt: action.attempt, message: action.message },
+    };
+  }
+  const cancel: CancelRequestState = { kind: "unconfirmed", jobId: action.jobId, attempt: action.attempt };
+  if (state.connectivity !== "retry_exhausted") return { ...state, cancel };
+  return {
+    ...state,
+    cancel,
+    connectivity: "reconnecting",
+    poll: { generation: state.poll.generation + 1, initialDelayMs: 0 },
+  };
 }
 
 function applyStatusPollEvent(

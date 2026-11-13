@@ -181,6 +181,44 @@ export async function getJobStatus(
 ): Promise<PolledJob> {
   const res = await apiFetch(`/api/download/${jobId}/status`, { signal: options.signal });
   if (!res.ok) throw await responseError(res);
+  return readJobForId(res, jobId);
+}
+
+/**
+ * VIDEOFETCH-LD4A-CANCELLATION-UX-AND-OUTCOME-CONTRACT-001: asks the control
+ * plane to cancel `jobId`, and returns the job the Worker COMMITTED.
+ *
+ * A successful answer is not proof of cancellation: when a job had already
+ * ended, the Worker leaves it unchanged and answers it as it is (`ready`,
+ * `failed`, or an earlier `cancelled`). The caller acts on the returned status.
+ *
+ * Every failure is a `ClientApiError`, exactly as for a status read. A failure
+ * without a definitive answer (no response, a 5xx, a body that is not this
+ * job's status) says nothing about whether the cancellation happened.
+ *
+ * POST, same-origin credentials, no body. `keepalive` lets a cancellation the
+ * person has confirmed still reach the server if the tab is closed right away.
+ */
+export async function cancelDownload(
+  jobId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<PolledJob> {
+  const res = await apiFetch(`/api/download/${jobId}/cancel`, {
+    method: "POST",
+    credentials: "same-origin",
+    keepalive: true,
+    signal: options.signal,
+  });
+  if (!res.ok) throw await responseError(res);
+  return readJobForId(res, jobId);
+}
+
+/**
+ * Reads a 2xx body that must be THIS job's public status. Anything else — a
+ * body that breaks off (`network`), or that is not a job status for `jobId`
+ * (`response`, code null), such as an interstitial page — is a failure.
+ */
+async function readJobForId(res: Response, jobId: string): Promise<PolledJob> {
   let text: string;
   try {
     text = await res.text();
