@@ -43,6 +43,7 @@ import {
 import type { ObjectStoreSigner } from "../../web/storage/object-store-signer.server.ts";
 import { WorkerClient } from "../../web/worker/worker-client.server.ts";
 import { WORKER_RESTART_SAFE_MESSAGE } from "../../shared/worker/job-failure.ts";
+import { DOWNLOAD_TIMEOUT_MESSAGE } from "../../shared/worker/job-outcome.ts";
 
 const SECRET = "0123456789abcdef0123456789abcdef";
 const ANALYZE_LIMIT = config.rateLimitPerMinute;
@@ -754,7 +755,8 @@ describe("job status is served by the worker", () => {
       JOB_ID,
     );
     const body = await readJson(res);
-    assert.equal(body.error, ERROR_MESSAGES.TIMEOUT);
+    // LD-4a: a failed TIMEOUT's message is chosen by its stage, never the stored text.
+    assert.equal(body.error, DOWNLOAD_TIMEOUT_MESSAGE);
     assert.equal(body.errorCode, "TIMEOUT");
     assert.equal("safeErrorMessage" in body, false);
   });

@@ -11,6 +11,7 @@ import {
   FAILED_JOB_STAGE_LABELS,
   WORKER_RESTART_SAFE_MESSAGE,
 } from "../../shared/worker/job-failure.ts";
+import { DOWNLOAD_TIMEOUT_MESSAGE } from "../../shared/worker/job-outcome.ts";
 import { PublicJobSchema, isTerminalPublicStatus, toPublicJob } from "./public-job.ts";
 
 const JOB_ID = "0123456789abcdef0123456789abcdef";
@@ -120,7 +121,8 @@ describe("public browser job DTO", () => {
       }),
       NOW,
     );
-    assert.equal(dto.error, ERROR_MESSAGES.TIMEOUT);
+    // LD-4a: a failed TIMEOUT's message is chosen by its stage, never the stored text.
+    assert.equal(dto.error, DOWNLOAD_TIMEOUT_MESSAGE);
     assert.equal(dto.errorCode, "TIMEOUT");
     assert.equal("safeErrorMessage" in dto, false);
   });
@@ -274,7 +276,7 @@ describe("public job failure classification", () => {
         NOW,
       );
       assert.equal(dto.errorCode, code, code);
-      assert.equal(dto.error, ERROR_MESSAGES[code], code);
+      assert.equal(dto.error, code === "TIMEOUT" ? DOWNLOAD_TIMEOUT_MESSAGE : ERROR_MESSAGES[code], code);
       const json = JSON.stringify(dto);
       for (const fragment of ["/var/lib", "X-Amz-Signature", "sk-live", "worker.ts", "Invalid data"]) {
         assert.equal(json.includes(fragment), false, `${code} leaked ${fragment}`);
@@ -290,7 +292,7 @@ describe("public job failure classification", () => {
         NOW,
       );
       assert.equal(dto.errorCode, code);
-      assert.equal(dto.error, ERROR_MESSAGES[code]);
+      assert.equal(dto.error, code === "TIMEOUT" ? DOWNLOAD_TIMEOUT_MESSAGE : ERROR_MESSAGES[code]);
     }
   });
 
@@ -329,7 +331,11 @@ describe("public job failure classification", () => {
       ["PROCESSING_FAILED", `${WORKER_RESTART_SAFE_MESSAGE} ${HOSTILE}`],
     ] as const) {
       const dto = toPublicJob(workerJob({ status: "failed", errorCode, safeErrorMessage }), NOW);
-      assert.equal(dto.error, ERROR_MESSAGES[errorCode], JSON.stringify(safeErrorMessage));
+      assert.equal(
+        dto.error,
+        errorCode === "TIMEOUT" ? DOWNLOAD_TIMEOUT_MESSAGE : ERROR_MESSAGES[errorCode],
+        JSON.stringify(safeErrorMessage),
+      );
     }
   });
 

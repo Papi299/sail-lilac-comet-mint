@@ -7,10 +7,8 @@ import {
   type WorkerJobView,
 } from "../../shared/worker/contracts.ts";
 import { WorkerErrorCodeSchema, type WorkerErrorCode } from "../../shared/worker/errors.ts";
-import {
-  WORKER_RESTART_SAFE_MESSAGE,
-  isFailedJobStageLabel,
-} from "../../shared/worker/job-failure.ts";
+import { WORKER_RESTART_SAFE_MESSAGE } from "../../shared/worker/job-failure.ts";
+import { publicFailedStageLabel, timeoutMessageForStage } from "../../shared/worker/job-outcome.ts";
 
 /**
  * The browser-facing job DTO.
@@ -141,7 +139,7 @@ export function toPublicJob(job: WorkerJobView, now: number): PublicJob {
  * canonical fallback rather than no explanation at all.
  */
 function publicJobError(
-  job: Pick<WorkerJobView, "status" | "errorCode" | "safeErrorMessage">,
+  job: Pick<WorkerJobView, "status" | "errorCode" | "safeErrorMessage" | "stageLabel">,
 ): { errorCode: WorkerErrorCode | null; error: string | null } {
   const errorCode: WorkerErrorCode | null =
     job.errorCode ?? (job.status === "failed" ? "PROCESSING_FAILED" : null);
@@ -149,19 +147,28 @@ function publicJobError(
   if (errorCode === "PROCESSING_FAILED" && job.safeErrorMessage === WORKER_RESTART_SAFE_MESSAGE) {
     return { errorCode, error: WORKER_RESTART_SAFE_MESSAGE };
   }
+  // LD-4a: a failed TIMEOUT says WHICH stage ran out of time, from the closed
+  // stage the Worker recorded (job-outcome.ts), instead of the canonical
+  // "took too long to process", which is false for a download that hit its
+  // time limit. The code itself is unchanged.
+  if (errorCode === "TIMEOUT" && job.status === "failed") {
+    return { errorCode, error: timeoutMessageForStage(publicFailedStageLabel(job.stageLabel, errorCode)) };
+  }
   return { errorCode, error: ERROR_MESSAGES[errorCode] };
 }
 
 /**
  * A failed job's stage label is forwarded only when it is one of the closed
- * failure stages the Worker writes (`FAILED_JOB_STAGE_LABELS`). Anything else —
- * a row failed by an older Worker still holding its last progress label, for
+ * failure stages the Worker writes (`FAILED_JOB_STAGE_LABELS`), or — with
+ * `TIMEOUT` only — one of the two stages reserved for the acquisition watchdog
+ * (`RESERVED_FAILED_JOB_STAGE_LABELS`, written by no Worker yet). Anything else
+ * — a row failed by an older Worker still holding its last progress label, for
  * one — becomes the canonical "Failed". Every other status keeps the Worker's
  * progress label as before.
  */
-function publicStageLabel(job: Pick<WorkerJobView, "status" | "stageLabel">): string {
+function publicStageLabel(job: Pick<WorkerJobView, "status" | "stageLabel" | "errorCode">): string {
   if (job.status === "failed") {
-    return isFailedJobStageLabel(job.stageLabel) ? job.stageLabel : STAGE_FALLBACK.failed;
+    return publicFailedStageLabel(job.stageLabel, job.errorCode) ?? STAGE_FALLBACK.failed;
   }
   return job.stageLabel ?? STAGE_FALLBACK[job.status];
 }

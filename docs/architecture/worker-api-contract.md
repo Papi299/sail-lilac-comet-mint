@@ -959,6 +959,9 @@ newer control plane maps an older Worker's failed-row label to `Failed`.
 keyed by the stage: `Download failed`, `Processing failed`, `Upload failed`, or
 `Download interrupted` for a restart. For anything else it shows
 `We hit a snag`, including analysis errors and definitive status answers.
+(LD-4a, source only: a cancelled job gets `Download cancelled`, a failed
+`TIMEOUT` gets a stage-specific message, and two stages are reserved for the
+acquisition watchdog; see "Browser cancellation and job outcomes" below.)
 
 ### Browser status polling (`BROWSER-JOB-STATUS-POLL-RESILIENCE-001`)
 
@@ -982,3 +985,53 @@ at a time. After 120 s of continuous failure the browser stops and offers
 `cancelled` job status is terminal exactly as above. The status route must
 therefore answer `NOT_FOUND` only for a job id that is malformed or unknown to
 the Worker; an unexpected failure is a 500. Runbook §4l has the details.
+
+### Browser cancellation and job outcomes (`VIDEOFETCH-LD4A-CANCELLATION-UX-AND-OUTCOME-CONTRACT-001`)
+
+**IMPLEMENTED IN SOURCE — NOT DEPLOYED.** Vercel-only; no Worker change, no new
+error code, no schema change. Deploy order: this control plane first; a Worker
+that writes a reserved stage (LD-3b/LD-3c) only after it is live.
+
+**Route.** `POST /api/download/:jobId/cancel`. The same gate as every job route,
+in this order: private access (`Sec-Fetch-Site` isolation, then the HttpOnly,
+SameSite=Strict session cookie), a per-principal rate limit of its own (20 per
+sliding minute; analyze and download traffic cannot use it up), then the closed
+job-id schema (`NOT_FOUND` before any Worker call). It then calls the existing
+HMAC `POST /v1/jobs/:jobId/cancel` once, with no body and no `Idempotency-Key`.
+The answer is the job the Worker committed — `cancelled` when this request won,
+otherwise the unchanged terminal job (`ready`, `failed`, an earlier
+`cancelled`) — as the public projection, with `Cache-Control: no-store`. A
+terminal job past its retention answers `EXPIRED`, as a status read does. Every
+other method answers `405` with `Allow: POST` before any access check.
+
+**Browser.** A **Cancel download** button while a job runs opens a confirmation
+dialog (`role="alertdialog"`, focus on **Keep downloading**, Escape dismisses,
+nothing is sent unless confirmed). One request at a time; it is never resent
+automatically. The page shows only an outcome the Worker committed: a `200`
+with `ready` stays a finished download, with `failed` stays that failure. A
+failure with no definitive answer (no response, 5xx, `WORKER_UNAVAILABLE`, 408,
+a 2xx that is not this job) is "couldn't confirm — may still be running", and
+the status channel decides; a definitive 4xx is "wasn't cancelled". After an
+ending, **Try again** (**Choose another quality** for a time or size limit)
+returns to the quality choice; only pressing Download again creates a new job,
+which starts from the beginning. Nothing is resumed. **Retry status** still
+only reads the same job's status.
+
+**Outcome vocabulary** (`src/shared/worker/job-outcome.ts`). The stages a
+Worker writes (`FAILED_JOB_STAGE_LABELS`) are unchanged. Two more are reserved
+for the acquisition watchdog and written by no Worker yet: `Download stalled`
+and `Download time limit reached`. The control plane forwards a reserved stage
+only with `TIMEOUT`. A failed `TIMEOUT` message is chosen by stage:
+
+| Stage | Heading | Message |
+| :--- | :--- | :--- |
+| `Download failed` (today also the absolute download limit) | Download failed | The download didn't finish in time. |
+| `Download stalled` (reserved) | Download stalled | The source stopped sending data, so VideoFetch stopped waiting. |
+| `Download time limit reached` (reserved) | Time limit reached | The download was still running when it reached VideoFetch's maximum download time. |
+| `Processing failed` | Processing failed | Processing took too long. |
+| `Upload failed` | Upload failed | Uploading the finished file took too long. |
+| none recognised | We hit a snag | The download didn't finish in time. |
+
+`ERROR_MESSAGES.TIMEOUT` itself is unchanged: the Worker stores and envelopes
+it, and no failed job's card shows it any more. An older control plane shows a
+reserved stage as `Failed` with that canonical message.
