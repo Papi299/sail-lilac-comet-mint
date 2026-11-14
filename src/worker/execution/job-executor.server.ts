@@ -8,6 +8,12 @@ import { createJobDir, removeJobDir } from "@/services/temp/files.server";
 import { analyzeDirectMedia } from "./direct-media.server.ts";
 import { downloadDirectOriginalWorker } from "@/services/extractors/direct.server";
 import type { AcquisitionActivitySink } from "@/services/downloads/acquisition-activity";
+import {
+  createAcquisitionInactivityWatchdog,
+  resolveAcquisitionInactivityPolicy,
+  type AcquisitionInactivityPolicy,
+  type AcquisitionInactivityWatchdog,
+} from "@/services/downloads/acquisition-inactivity-watchdog";
 import { mimeForContainer } from "@/services/extractors/normalize";
 import {
   SPLIT_MERGE_TARGETS,
@@ -82,6 +88,19 @@ export type ExecutionBackstopTimerHandle = { unref?: () => unknown };
 export type ExecutionBackstopTimers = {
   setTimeoutFn: (handler: () => void, ms: number) => ExecutionBackstopTimerHandle;
   clearTimeoutFn: (handle: ExecutionBackstopTimerHandle) => void;
+};
+
+/**
+ * VIDEOFETCH-LD3B-INACTIVITY-WATCHDOG-CORE-001: what acquisition-inactivity
+ * enforcement needs. See `JobExecutorDeps.acquisitionInactivity`.
+ */
+export type AcquisitionInactivityEnforcement = {
+  /** The window and its tick. Validated when the executor is built. */
+  readonly policy: AcquisitionInactivityPolicy;
+  /** A MONOTONIC clock. Default: `performance.now`. */
+  readonly clock?: () => number;
+  /** The watchdog's timer hooks. Default: this executor's backstop timers. */
+  readonly timers?: ExecutionBackstopTimers;
 };
 
 /** Analysis is dependency-injected so tests can drive it without live network. */
@@ -466,6 +485,22 @@ export type JobExecutorDeps = {
    * acquisition in this release reports anywhere. LD-3b adds the consumer.
    */
   createAcquisitionActivitySink?: () => AcquisitionActivitySink | undefined;
+  /**
+   * LD-3b: acquisition-inactivity ENFORCEMENT. When supplied, every acquisition
+   * whose evidence is in-process transport bytes — direct, clear HLS (MPEG-TS
+   * and fMP4) and separate-audio HLS — gets one watchdog, which stops a live
+   * phase that made no meaningful progress for the window, through this
+   * execution's own controller. The absolute acquisition deadline stays each
+   * seam's own; the watchdog never extends or replaces it.
+   *
+   * DELIBERATELY DISCONNECTED: Production supplies none (`runtime.server.ts`;
+   * pinned by a structural test). The filesystem-observed plans cannot yet be
+   * subjected to the rule safely (LD-3c), and the setting that would own the
+   * window arrives only with complete enforcement. Whatever is supplied here, a
+   * plan acquired by the generic subprocess (single source, segmented, split
+   * pair) never gets a watchdog.
+   */
+  acquisitionInactivity?: AcquisitionInactivityEnforcement;
 };
 
 /** The byte half of `GenericDownloadLimits`: the executor's time comes from `timeLimits`. */
@@ -536,6 +571,25 @@ const SHUTDOWN_ABORTED_SIGNALS = new WeakSet<AbortSignal>();
  */
 const LIFETIME_ABORTED_SIGNALS = new WeakSet<AbortSignal>();
 
+/**
+ * VIDEOFETCH-LD3B-INACTIVITY-WATCHDOG-CORE-001: the provenance of an inactivity
+ * stop — an acquisition watchdog of THIS execution deciding that its live phase
+ * made no meaningful progress for the window. The same rules as the two sets
+ * above: object identity of the very signal aborted, module-private, per
+ * execution, and added only to a signal nothing had aborted yet.
+ */
+const INACTIVITY_STOPPED_SIGNALS = new WeakSet<AbortSignal>();
+
+/**
+ * LD-3b: the plans whose acquisition evidence is in-process transport bytes, by
+ * an explicit list: a plan kind not named here is never watched.
+ */
+function isInactivityWatchedPlan(plan: ExecutionPlan): boolean {
+  if (plan.strategy === "direct") return true;
+  const operation = plan.generic.operation;
+  return operation === "clear-hls-remux" || operation === "clear-hls-separate-audio-remux";
+}
+
 export class JobExecutor {
   private readonly store: WorkerJobStore;
   private readonly writer: ObjectStoreWriter;
@@ -559,6 +613,7 @@ export class JobExecutor {
   private readonly genericDownloadLimits: GenericDownloadLimits;
   private readonly backstopTimers: ExecutionBackstopTimers;
   private readonly createAcquisitionActivitySink: JobExecutorDeps["createAcquisitionActivitySink"];
+  private readonly acquisitionInactivity: Required<AcquisitionInactivityEnforcement> | undefined;
 
   constructor(
     store: WorkerJobStore,
@@ -656,6 +711,17 @@ export class JobExecutor {
       clearTimeoutFn: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     };
     this.createAcquisitionActivitySink = deps.createAcquisitionActivitySink;
+    // LD-3b: a window that cannot be measured is refused here, never discovered
+    // mid-download.
+    const enforcement = deps.acquisitionInactivity;
+    this.acquisitionInactivity =
+      enforcement === undefined
+        ? undefined
+        : Object.freeze({
+            policy: resolveAcquisitionInactivityPolicy(enforcement.policy),
+            clock: enforcement.clock ?? (() => performance.now()),
+            timers: enforcement.timers ?? this.backstopTimers,
+          });
   }
 
   /** Number of executions currently holding an AbortController (§11 diagnostics). */
@@ -776,7 +842,16 @@ export class JobExecutor {
       //    it. That is a TIMEOUT whatever the interrupted stage rejected with;
       //    `failJob()` derives the stage from the status it leaves. It ranks
       //    below cancellation and shutdown, which return above.
-      const code = LIFETIME_ABORTED_SIGNALS.has(signal) ? "TIMEOUT" : this.classifyErrorCode(err);
+      // 4. LD-3b: an acquisition watchdog of this execution stopped a phase that
+      //    made no meaningful progress (only where enforcement is supplied).
+      //    The same rank and the same TIMEOUT: whichever of the two aborted
+      //    first marked the signal, and the other then left it alone. It is
+      //    always the download stage: the stop can only land while the job is
+      //    `downloading`, and `acquire()` refuses to return after one.
+      const code =
+        LIFETIME_ABORTED_SIGNALS.has(signal) || INACTIVITY_STOPPED_SIGNALS.has(signal)
+          ? "TIMEOUT"
+          : this.classifyErrorCode(err);
       const safeMsg = ERROR_MESSAGES[code];
       // §27: the raw error is deliberately never logged and never persisted.
       this.store.failJob(jobId, code, safeMsg);
@@ -989,13 +1064,53 @@ export class JobExecutor {
 
     // VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001: every acquisition seam below receives
     // the SAME absolute deadline, from the one model. Each seam arms it once and
-    // keeps its own first-cause latch; nothing here arms a second timer.
+    // keeps its own first-cause latch; nothing here arms a second deadline timer.
     const downloadTimeLimitMs = this.stageTimeLimits.downloadTimeLimitMs;
 
-    // LD-3a: at most one sink per acquisition, and none in Production. A sink
-    // factory that fails is an observer failing: the acquisition goes on without it.
-    const activityOption = this.newAcquisitionActivityOption();
+    // LD-3b: at most one inactivity watchdog per acquisition, only for a plan
+    // whose evidence is transport bytes, and none in Production (no enforcement
+    // is supplied there). It decides inactivity only; the deadline above stays
+    // the seam's own.
+    const watchdog = this.newAcquisitionInactivityWatchdog(plan, jobId);
+    try {
+      // LD-3a: at most one observer sink per acquisition, and none in
+      // Production. A sink factory that fails is an observer failing: the
+      // acquisition goes on without it — and never without its watchdog.
+      const acquired = await this.acquireThroughSeam(
+        url,
+        plan,
+        workDir,
+        signal,
+        jobId,
+        downloadTimeLimitMs,
+        this.newAcquisitionActivityOption(watchdog),
+      );
+      // The first cause decides: a stop that landed while the seam was still
+      // running is the outcome, whatever an implementation returned after it.
+      // Processing, and so the upload, are never reached after one.
+      if (INACTIVITY_STOPPED_SIGNALS.has(signal)) throw new AppError("TIMEOUT");
+      return acquired;
+    } finally {
+      // Released the moment the seam settled, before any further await: no
+      // watchdog outlives its acquisition, so processing and upload are never
+      // watched.
+      watchdog?.dispose();
+    }
+  }
 
+  /**
+   * The seam dispatch of `acquire()`: exactly one acquisition seam per plan,
+   * and its result checked at the module boundary.
+   */
+  private async acquireThroughSeam(
+    url: string,
+    plan: ExecutionPlan,
+    workDir: string,
+    signal: AbortSignal,
+    jobId: string,
+    downloadTimeLimitMs: number,
+    activityOption: { activity: AcquisitionActivitySink } | Record<string, never>,
+  ): Promise<AcquiredExecutionMedia> {
     if (plan.strategy === "direct") {
       const original = await this.downloadOriginal(url, {
         workDir,
@@ -1129,15 +1244,70 @@ export class JobExecutor {
    * LD-3a: the option object every acquisition seam spreads in. Empty when no
    * sink exists — the Production case — so a seam's context then has no extra
    * key at all.
+   *
+   * LD-3b: with a watchdog, the ONE sink the seam reports to is the watchdog's,
+   * and an LD-3a observer, if any, receives the same events after it. Neither
+   * an observer factory that fails nor an observer that throws can keep an
+   * event from the watchdog.
    */
-  private newAcquisitionActivityOption(): { activity: AcquisitionActivitySink } | Record<string, never> {
+  private newAcquisitionActivityOption(
+    watchdog: AcquisitionInactivityWatchdog | null,
+  ): { activity: AcquisitionActivitySink } | Record<string, never> {
     let sink: AcquisitionActivitySink | undefined;
     try {
       sink = this.createAcquisitionActivitySink?.();
     } catch {
-      return {};
+      sink = undefined;
     }
-    return sink ? { activity: sink } : {};
+    if (watchdog === null) return sink ? { activity: sink } : {};
+    if (sink === undefined) return { activity: watchdog.record };
+    const observer = sink;
+    return {
+      activity: (event) => {
+        try {
+          watchdog.record(event);
+        } catch {
+          // The watchdog's own failure goes no further.
+        }
+        try {
+          observer(event);
+        } catch {
+          // Observer output only.
+        }
+      },
+    };
+  }
+
+  /**
+   * LD-3b: the inactivity watchdog of ONE acquisition, or null: no enforcement
+   * supplied (Production), or a plan whose evidence is not transport bytes.
+   *
+   * Its stop is the abort a cancellation sends, on this execution's EXISTING
+   * controller, with its provenance recorded first — so the transport teardown,
+   * the HLS body disposal, the process-group termination and the work-directory
+   * removal are the paths every abort already uses. A signal already aborted for
+   * another cause (cancellation, shutdown, the lifetime backstop, a halted
+   * progress reporter) is left alone, so that cause stays the outcome. It writes
+   * no durable state: `execute()`'s catch classifies the stop.
+   */
+  private newAcquisitionInactivityWatchdog(
+    plan: ExecutionPlan,
+    jobId: string,
+  ): AcquisitionInactivityWatchdog | null {
+    const enforcement = this.acquisitionInactivity;
+    if (enforcement === undefined || !isInactivityWatchedPlan(plan)) return null;
+    const controller = this.activeControllers.get(jobId);
+    if (controller === undefined) return null;
+    return createAcquisitionInactivityWatchdog({
+      policy: enforcement.policy,
+      clock: enforcement.clock,
+      timers: enforcement.timers,
+      onStall: () => {
+        if (controller.signal.aborted) return;
+        INACTIVITY_STOPPED_SIGNALS.add(controller.signal);
+        controller.abort(new AppError("TIMEOUT"));
+      },
+    });
   }
 
   /**
