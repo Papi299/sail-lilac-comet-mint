@@ -15,6 +15,7 @@ import {
   resolveAcquisitionInactivityPolicy,
   type AcquisitionInactivityPolicy,
   type AcquisitionInactivityStop,
+  type AcquisitionObservationLoss,
   type InactivityWatchdogTimerHandle,
   type InactivityWatchdogTimers,
 } from "./acquisition-inactivity-watchdog.ts";
@@ -98,6 +99,9 @@ function harness(
   const vt = virtualTime();
   const stops: AcquisitionInactivityStop[] = [];
   const stoppedAt: number[] = [];
+  // LD-3c: observation losses are recorded apart from stops: they are never one.
+  const losses: AcquisitionObservationLoss[] = [];
+  const lostAt: number[] = [];
   const t0 = vt.now();
   const watchdog = createAcquisitionInactivityWatchdog({
     policy: { windowMs: WINDOW, ...policy },
@@ -107,12 +111,19 @@ function harness(
       stops.push(stop);
       stoppedAt.push(vt.now() - t0);
     },
+    onObservationLost: (loss) => {
+      losses.push(loss);
+      lostAt.push(vt.now() - t0);
+    },
   });
   const rec = (event: AcquisitionActivityEvent) => watchdog.record(event);
   return {
     vt,
     watchdog,
     stops,
+    losses,
+    /** The first observation loss's instant, relative to t0, or null. */
+    lossAt: () => lostAt[0] ?? null,
     /** The first stop's instant, relative to t0, or null. */
     stopAt: () => stoppedAt[0] ?? null,
     t0,
@@ -755,22 +766,32 @@ describe("filesystem evidence: yt-dlp progressive, segmented DASH, split halves"
     assert.equal(stopTime(h, 400_000), 130_000);
   });
 
-  it("repeated stat failures pause the window, but only for a bounded blind allowance", () => {
+  // LD-3c changed this test's outcome. LD-3b asserted a STALL at 250 s (window +
+  // allowance after the last progress): once the blind allowance was spent the
+  // window ran again on blind time. Blind time now never counts toward a stall;
+  // spending the allowance is an observation loss of its own.
+  it("repeated stat failures pause the window; spending the blind allowance is an observation loss, never a stall (LD-3c)", () => {
     const h = harness();
     h.arm(9_000_000);
     h.start();
     h.at(10_000);
     h.bytes(3 * G, "filesystem");
-    for (let t = 20_000; t <= 600_000 && h.stops.length === 0; t += POLL) {
+    for (let t = 20_000; t <= 600_000 && h.state() === "watching"; t += POLL) {
       h.at(t);
-      if (h.stops.length > 0) break;
+      if (h.state() !== "watching") break;
       h.gap();
     }
-    // Last meaningful progress at 10 s; at most window + allowance = 240 s later.
-    assert.equal(h.stops.length, 1);
-    assert.equal(h.stopAt(), 250_000);
-    assert.equal(h.stops[0]!.idleMs, WINDOW);
+    // Blind from the third gap (20,300); the allowance (one window) is spent at
+    // 140,300, decided at the first tick after it.
+    assert.equal(h.stops.length, 0, "no stall: nothing was seen to stop");
+    assert.equal(h.losses.length, 1);
+    assert.equal(h.lossAt(), 141_000);
+    assert.equal(h.state(), "observation-lost");
+    assert.deepEqual(h.losses[0], { cause: "observation-lost", phase: "single", observedBytes: 3 * G, unobservedMs: 120_700, maxUnobservedMs: WINDOW });
+    assert.equal(h.watchdog.report().stop, null);
+    assert.deepEqual(h.watchdog.report().observationLoss, h.losses[0]);
     assert.equal(h.watchdog.report().unobservedCreditMs, WINDOW);
+    assert.equal(h.vt.pendingCount(), 0, "the decision released the timer");
   });
 
   it("three gaps and one readable sample, repeated, cannot re-arm the window forever", () => {
@@ -800,8 +821,11 @@ describe("filesystem evidence: yt-dlp progressive, segmented DASH, split halves"
     assert.equal(h.watchdog.report().honouredAnchorAtMs, h.t0 + 10_000, "no unbacked recovery was honoured");
   });
 
-  it("a recovery backed by real growth earns its fresh window (the design's size-invisible case)", () => {
-    const h = harness();
+  // LD-3c: the recovery rule this test pins is unchanged; it now states the
+  // allowance it relies on, because 200 s of blindness spends the DEFAULT
+  // allowance (one window) and is an observation loss (see the test above).
+  it("a recovery backed by real growth earns its fresh window (the design's size-invisible case, inside an explicit allowance)", () => {
+    const h = harness({ maxUnobservedMs: 300_000 });
     h.arm(9_000_000);
     h.start();
     h.at(10_000);
@@ -848,19 +872,30 @@ describe("filesystem evidence: yt-dlp progressive, segmented DASH, split halves"
     assert.equal(stopTime(h, 600_000), 310_000);
   });
 
-  it("blindness beyond the allowance stops even a run that was growing unseen (the LD-3c dependency, pinned)", () => {
+  // LD-3c resolved the dependency this test pinned. LD-3b asserted a STALL at
+  // 250 s here ("a sampler that cannot see is indistinguishable from a stalled
+  // source"); the typed observations and the observation-loss decision now tell
+  // them apart, so the same blindness is never reported as inactivity.
+  it("blindness beyond the allowance is an observation loss, never a stall, even for a run that was growing unseen (LD-3c)", () => {
     const h = harness();
     h.arm(9_000_000);
     h.start();
     h.at(10_000);
     h.bytes(3 * G, "filesystem");
-    for (let t = 20_000; t < 300_000 && h.stops.length === 0; t += POLL) {
+    for (let t = 20_000; t < 300_000 && h.state() === "watching"; t += POLL) {
       h.at(t);
-      if (h.stops.length > 0) break;
+      if (h.state() !== "watching") break;
       h.gap();
     }
-    assert.equal(h.stops.length, 1);
-    assert.equal(h.stopAt(), 250_000, "a sampler that cannot see is indistinguishable from a stalled source");
+    assert.equal(h.stops.length, 0, "an observer that cannot see is no evidence about the source");
+    assert.equal(h.losses.length, 1);
+    assert.equal(h.lossAt(), 141_000);
+    // Visible again, with real growth: too late, the decision stands.
+    h.at(300_000);
+    h.bytes(3 * G + 5_000_000, "filesystem");
+    assert.equal(h.state(), "observation-lost");
+    assert.equal(h.stops.length, 0);
+    assert.equal(h.losses.length, 1);
   });
 
   it("video to audio: no window between the phases, a fresh one for the audio half, one deadline for both", () => {

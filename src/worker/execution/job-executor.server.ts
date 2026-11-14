@@ -101,6 +101,14 @@ export type AcquisitionInactivityEnforcement = {
   readonly clock?: () => number;
   /** The watchdog's timer hooks. Default: this executor's backstop timers. */
   readonly timers?: ExecutionBackstopTimers;
+  /**
+   * VIDEOFETCH-LD3C-YTDLP-OBSERVATION-HARDENING-001: ALSO watch the plans whose
+   * evidence is the yt-dlp child's files — single source and split pair,
+   * segmented halves included (`isFilesystemObservedPlan`). Honoured only when
+   * exactly `true`, so enforcement supplied without it keeps LD-3b's
+   * transport-only scope. Production supplies no enforcement at all.
+   */
+  readonly watchFilesystemObservedPlans?: boolean;
 };
 
 /** Analysis is dependency-injected so tests can drive it without live network. */
@@ -171,6 +179,13 @@ export type GenericAcquisitionContext = {
     stage?: string;
   }) => void;
   activity?: AcquisitionActivitySink;
+  /**
+   * LD-3c: the watchdog's two stops for a watched yt-dlp plan, each its own
+   * cause in the seam (never a cancellation). Absent unless injected
+   * enforcement opts in to the filesystem-observed plans; Production: never.
+   */
+  stopForInactivity?: AbortSignal;
+  stopForObservationLoss?: AbortSignal;
 };
 
 /**
@@ -581,6 +596,14 @@ const LIFETIME_ABORTED_SIGNALS = new WeakSet<AbortSignal>();
 const INACTIVITY_STOPPED_SIGNALS = new WeakSet<AbortSignal>();
 
 /**
+ * VIDEOFETCH-LD3C-YTDLP-OBSERVATION-HARDENING-001: the provenance of an
+ * observation loss — an acquisition watchdog of THIS execution deciding that its
+ * live phase could not be observed for the whole allowance. Never an inactivity
+ * stop: it says nothing about the source. The same rules as the sets above.
+ */
+const OBSERVATION_LOST_SIGNALS = new WeakSet<AbortSignal>();
+
+/**
  * LD-3b: the plans whose acquisition evidence is in-process transport bytes, by
  * an explicit list: a plan kind not named here is never watched.
  */
@@ -589,6 +612,30 @@ function isInactivityWatchedPlan(plan: ExecutionPlan): boolean {
   const operation = plan.generic.operation;
   return operation === "clear-hls-remux" || operation === "clear-hls-separate-audio-remux";
 }
+
+/**
+ * LD-3c: the plans whose acquisition evidence is the yt-dlp child's files, by
+ * an explicit list. Watched only when injected enforcement sets
+ * `watchFilesystemObservedPlans`; a plan kind named in neither list is never
+ * watched.
+ */
+function isFilesystemObservedPlan(plan: ExecutionPlan): boolean {
+  if (plan.strategy !== "yt-dlp") return false;
+  const operation = plan.generic.operation;
+  return (
+    operation === "keep-original" ||
+    operation === "extract-m4a" ||
+    operation === "extract-mp3" ||
+    operation === "merge-split"
+  );
+}
+
+/** One acquisition's watchdog, and the stops its seam receives (LD-3c). */
+type AcquisitionWatch = {
+  readonly watchdog: AcquisitionInactivityWatchdog;
+  /** Empty unless the plan is filesystem-observed: the seam's context then gains nothing. */
+  readonly stops: { stopForInactivity: AbortSignal; stopForObservationLoss: AbortSignal } | Record<string, never>;
+};
 
 export class JobExecutor {
   private readonly store: WorkerJobStore;
@@ -642,6 +689,8 @@ export class JobExecutor {
           ...(ctx.signal ? { signal: ctx.signal } : {}),
           ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
           ...(ctx.activity ? { activity: ctx.activity } : {}),
+          ...(ctx.stopForInactivity ? { stopForInactivity: ctx.stopForInactivity } : {}),
+          ...(ctx.stopForObservationLoss ? { stopForObservationLoss: ctx.stopForObservationLoss } : {}),
         }).then((res) => ({
           filePath: res.filePath,
           container: res.container,
@@ -656,6 +705,8 @@ export class JobExecutor {
           ...(ctx.signal ? { signal: ctx.signal } : {}),
           ...(ctx.onProgress ? { onProgress: ctx.onProgress } : {}),
           ...(ctx.activity ? { activity: ctx.activity } : {}),
+          ...(ctx.stopForInactivity ? { stopForInactivity: ctx.stopForInactivity } : {}),
+          ...(ctx.stopForObservationLoss ? { stopForObservationLoss: ctx.stopForObservationLoss } : {}),
         }));
     this.processLocally = deps.processLocally ?? convertMedia;
     this.mergeSplit = deps.mergeSplit ?? mergeSplitMedia;
@@ -721,6 +772,7 @@ export class JobExecutor {
             policy: resolveAcquisitionInactivityPolicy(enforcement.policy),
             clock: enforcement.clock ?? (() => performance.now()),
             timers: enforcement.timers ?? this.backstopTimers,
+            watchFilesystemObservedPlans: enforcement.watchFilesystemObservedPlans === true,
           });
   }
 
@@ -848,10 +900,17 @@ export class JobExecutor {
       //    first marked the signal, and the other then left it alone. It is
       //    always the download stage: the stop can only land while the job is
       //    `downloading`, and `acquire()` refuses to return after one.
+      // 5. LD-3c: an acquisition watchdog of this execution could not observe
+      //    its live phase for the whole allowance. The same rank, but never a
+      //    TIMEOUT: an observer that cannot see is no evidence about the source.
+      //    It is a Worker-side workspace fault, PROCESSING_FAILED — the code
+      //    every other local workspace failure already uses.
       const code =
         LIFETIME_ABORTED_SIGNALS.has(signal) || INACTIVITY_STOPPED_SIGNALS.has(signal)
           ? "TIMEOUT"
-          : this.classifyErrorCode(err);
+          : OBSERVATION_LOST_SIGNALS.has(signal)
+            ? "PROCESSING_FAILED"
+            : this.classifyErrorCode(err);
       const safeMsg = ERROR_MESSAGES[code];
       // §27: the raw error is deliberately never logged and never persisted.
       this.store.failJob(jobId, code, safeMsg);
@@ -1068,10 +1127,11 @@ export class JobExecutor {
     const downloadTimeLimitMs = this.stageTimeLimits.downloadTimeLimitMs;
 
     // LD-3b: at most one inactivity watchdog per acquisition, only for a plan
-    // whose evidence is transport bytes, and none in Production (no enforcement
-    // is supplied there). It decides inactivity only; the deadline above stays
-    // the seam's own.
-    const watchdog = this.newAcquisitionInactivityWatchdog(plan, jobId);
+    // whose evidence is transport bytes — or, LD-3c, the yt-dlp child's files
+    // when enforcement opts in — and none in Production (no enforcement is
+    // supplied there). It decides inactivity and observation loss only; the
+    // deadline above stays the seam's own.
+    const watch = this.newAcquisitionInactivityWatch(plan, jobId);
     try {
       // LD-3a: at most one observer sink per acquisition, and none in
       // Production. A sink factory that fails is an observer failing: the
@@ -1083,18 +1143,20 @@ export class JobExecutor {
         signal,
         jobId,
         downloadTimeLimitMs,
-        this.newAcquisitionActivityOption(watchdog),
+        this.newAcquisitionActivityOption(watch?.watchdog ?? null),
+        watch?.stops ?? {},
       );
       // The first cause decides: a stop that landed while the seam was still
       // running is the outcome, whatever an implementation returned after it.
       // Processing, and so the upload, are never reached after one.
       if (INACTIVITY_STOPPED_SIGNALS.has(signal)) throw new AppError("TIMEOUT");
+      if (OBSERVATION_LOST_SIGNALS.has(signal)) throw new AppError("PROCESSING_FAILED");
       return acquired;
     } finally {
       // Released the moment the seam settled, before any further await: no
       // watchdog outlives its acquisition, so processing and upload are never
       // watched.
-      watchdog?.dispose();
+      watch?.watchdog.dispose();
     }
   }
 
@@ -1110,6 +1172,9 @@ export class JobExecutor {
     jobId: string,
     downloadTimeLimitMs: number,
     activityOption: { activity: AcquisitionActivitySink } | Record<string, never>,
+    // LD-3c: spread into the two yt-dlp seams' contexts only; empty unless the
+    // plan is a watched filesystem-observed one.
+    stopOption: AcquisitionWatch["stops"],
   ): Promise<AcquiredExecutionMedia> {
     if (plan.strategy === "direct") {
       const original = await this.downloadOriginal(url, {
@@ -1192,6 +1257,7 @@ export class JobExecutor {
         signal,
         onProgress: this.makeProgressReporter(jobId),
         ...activityOption,
+        ...stopOption,
       });
       return {
         kind: "single",
@@ -1229,6 +1295,7 @@ export class JobExecutor {
           if (acquisitionLive) report(update);
         },
         ...activityOption,
+        ...stopOption,
       });
     } finally {
       acquisitionLive = false;
@@ -1280,7 +1347,8 @@ export class JobExecutor {
 
   /**
    * LD-3b: the inactivity watchdog of ONE acquisition, or null: no enforcement
-   * supplied (Production), or a plan whose evidence is not transport bytes.
+   * supplied (Production), or a plan whose evidence is not transport bytes —
+   * nor, LD-3c, the yt-dlp child's files with enforcement opting in to them.
    *
    * Its stop is the abort a cancellation sends, on this execution's EXISTING
    * controller, with its provenance recorded first — so the transport teardown,
@@ -1289,25 +1357,46 @@ export class JobExecutor {
    * another cause (cancellation, shutdown, the lifetime backstop, a halted
    * progress reporter) is left alone, so that cause stays the outcome. It writes
    * no durable state: `execute()`'s catch classifies the stop.
+   *
+   * LD-3c: for a filesystem-observed plan the yt-dlp seam is told first, through
+   * the stop of the decided cause, so its own latch records `inactivity` or
+   * `observation-lost` before the execution abort reaches it as its caller's
+   * signal. An observation loss is marked in its own provenance set and is never
+   * an inactivity stop.
    */
-  private newAcquisitionInactivityWatchdog(
-    plan: ExecutionPlan,
-    jobId: string,
-  ): AcquisitionInactivityWatchdog | null {
+  private newAcquisitionInactivityWatch(plan: ExecutionPlan, jobId: string): AcquisitionWatch | null {
     const enforcement = this.acquisitionInactivity;
-    if (enforcement === undefined || !isInactivityWatchedPlan(plan)) return null;
+    if (enforcement === undefined) return null;
+    const filesystem = enforcement.watchFilesystemObservedPlans && isFilesystemObservedPlan(plan);
+    if (!filesystem && !isInactivityWatchedPlan(plan)) return null;
     const controller = this.activeControllers.get(jobId);
     if (controller === undefined) return null;
-    return createAcquisitionInactivityWatchdog({
+    const inactivityStop = filesystem ? new AbortController() : null;
+    const observationStop = filesystem ? new AbortController() : null;
+    const watchdog = createAcquisitionInactivityWatchdog({
       policy: enforcement.policy,
       clock: enforcement.clock,
       timers: enforcement.timers,
       onStall: () => {
         if (controller.signal.aborted) return;
         INACTIVITY_STOPPED_SIGNALS.add(controller.signal);
+        inactivityStop?.abort();
         controller.abort(new AppError("TIMEOUT"));
       },
+      onObservationLost: () => {
+        if (controller.signal.aborted) return;
+        OBSERVATION_LOST_SIGNALS.add(controller.signal);
+        observationStop?.abort();
+        controller.abort(new AppError("PROCESSING_FAILED"));
+      },
     });
+    return {
+      watchdog,
+      stops:
+        inactivityStop !== null && observationStop !== null
+          ? { stopForInactivity: inactivityStop.signal, stopForObservationLoss: observationStop.signal }
+          : {},
+    };
   }
 
   /**

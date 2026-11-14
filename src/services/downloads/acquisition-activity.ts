@@ -34,8 +34,16 @@
  *                       Never a percentage, never an upstream-declared size.
  *   resource-boundary   an HLS resource finished and the next has not produced
  *                       a byte. A boundary is NOT progress.
- *   sample-gap          a filesystem sample could not read a file this run had
- *                       already been seen to hold.
+ *   sample-gap          a filesystem sample yielded no complete, trustworthy byte
+ *                       count for the run: a file or the job directory could not
+ *                       be read (from the phase's start), a segmented listing
+ *                       could not be read completely, or a file the run had
+ *                       already been seen to hold is gone. A file the run has
+ *                       not created yet is NOT a gap. (Before
+ *                       VIDEOFETCH-LD3C-YTDLP-OBSERVATION-HARDENING-001 only the
+ *                       last case was reported; an unreadable file was silent
+ *                       until the first byte, and a partial segmented listing
+ *                       was reported as `bytes`.)
  *   phase-ended         the phase's transfer finished; local validation may
  *                       follow, and the next phase, if any, has not begun.
  *   settled             terminal, once: `completed`, `cancelled`,
