@@ -127,11 +127,104 @@ export const YTDLP_DOWNLOAD_MAX_STDERR_BYTES = 128 * 1024;
  */
 export const YTDLP_DOWNLOAD_SIZE_POLL_MS = 150;
 
-/** Bounded network behaviour, mirroring the analysis policy's intent. */
-const DOWNLOAD_SOCKET_TIMEOUT_SECONDS = 10;
-const DOWNLOAD_RETRIES = 2;
-const DOWNLOAD_FRAGMENT_RETRIES = 1;
-const DOWNLOAD_EXTRACTOR_RETRIES = 1;
+// ── Retry policy (VIDEOFETCH-LD3D-YTDLP-RETRY-SAFEGUARDS-001) ────────────────
+
+/**
+ * One closed, source-owned yt-dlp retry policy: the four values the
+ * acquisition command passes, and nothing else. No environment variable,
+ * request field or configuration can supply or widen one.
+ */
+export type YtdlpAcquisitionRetryPolicy = Readonly<{
+  /** `--socket-timeout`: seconds one socket operation (connect, one receive) may wait for bytes. */
+  socketTimeoutSeconds: number;
+  /** `--retries`: the HTTP downloader's retry budget (attempts = retries + 1). */
+  retries: number;
+  /** `--fragment-retries`: the per-fragment budget of a segmented run. */
+  fragmentRetries: number;
+  /** `--extractor-retries`: the budget of an extractor's own known-error retries. */
+  extractorRetries: number;
+}>;
+
+/**
+ * The ONLY two retry policies an acquisition can run under.
+ *
+ * What the pinned yt-dlp 2026.08.19 does with them, read out of its source
+ * (`utils/_utils.py` `RetryManager`, `downloader/http.py`,
+ * `downloader/fragment.py`, `downloader/common.py`):
+ *
+ *   - a budget of N retries is N + 1 attempts; there is no sleep between them
+ *     (`--retry-sleep` is never passed, and the pinned default is none), and
+ *     the release honours no server-requested retry delay;
+ *   - PROGRESSIVE: `HttpFD` holds ONE `--retries` budget for the WHOLE file.
+ *     Bytes received never refund an attempt. A transport error, a read that
+ *     waits longer than `--socket-timeout` for a byte, an HTTP 5xx or a short
+ *     body each spend one, and the retry resumes with `Range` from the
+ *     `.part`'s size (a server ignoring `Range` restarts the file from 0);
+ *   - SEGMENTED: every FRAGMENT gets its own `--fragment-retries` budget,
+ *     spent only by an HTTP error (in practice a 4xx) escaping the fragment's
+ *     inner HTTP downloader, and every fragment ATTEMPT gets a fresh
+ *     `--retries` budget inside that downloader for transport errors and 5xx.
+ *     A fragment that exhausts either is fatal: `--abort-on-unavailable-fragments`
+ *     ends the run, which exits non-zero;
+ *   - `--extractor-retries` is spent only by the extractors that use the
+ *     pinned `InfoExtractor.RetryManager` (the generic extractor does not).
+ *
+ * Every retry runs INSIDE the yt-dlp subprocess, so none of them can reach
+ * past this module's boundaries: the subprocess shares the acquisition's ONE
+ * absolute deadline (the runner's budget is what is left of it, and the
+ * runner SIGKILLs the whole process group when it passes or the operation
+ * aborts), the actual-byte guard reads the real files whatever yt-dlp is
+ * doing, and a zero exit is still only yt-dlp's opinion. The Worker itself
+ * never retries an acquisition.
+ *
+ *   bounded   the policy of every acquisition no inactivity watchdog owns —
+ *             Production's today, byte-for-byte the arguments this module has
+ *             always passed. yt-dlp is its own stall authority: a source that
+ *             sends nothing gives up after three silent attempts of 10 s.
+ *             The price: the budget is one per FILE, so a source that keeps
+ *             delivering but falls silent for 10 s or more three times in one
+ *             file is ended too, whatever it delivered in between.
+ *
+ *   watched   the approved long-download policy (LD-3d), and ONLY for an
+ *             acquisition the executor has attached an inactivity watchdog to.
+ *             Pauses shorter than 30 s spend nothing, and twenty retries let a
+ *             source that keeps making meaningful progress survive repeated
+ *             silences — while the WATCHDOG, not yt-dlp's counter, decides when
+ *             a source is dead: no meaningful growth for its window stops the
+ *             run long before the budget (21 attempts of up to 30 s) is spent.
+ *             Every count stays finite, and the absolute deadline still ends
+ *             the acquisition whatever yt-dlp would still try.
+ *
+ * Raising the budget WITHOUT the watchdog would let a dead source hold the
+ * Worker's single job slot until the absolute deadline instead of about 30 s,
+ * which is why the larger budget is bound to the watchdog's presence (see
+ * `selectYtdlpAcquisitionRetryPolicy`) and never to configuration.
+ */
+export const YTDLP_ACQUISITION_RETRY_POLICIES = Object.freeze({
+  bounded: Object.freeze({ socketTimeoutSeconds: 10, retries: 2, fragmentRetries: 1, extractorRetries: 1 }),
+  watched: Object.freeze({ socketTimeoutSeconds: 30, retries: 20, fragmentRetries: 3, extractorRetries: 1 }),
+} as const satisfies Record<string, YtdlpAcquisitionRetryPolicy>);
+
+export type YtdlpAcquisitionRetryPolicyName = keyof typeof YTDLP_ACQUISITION_RETRY_POLICIES;
+
+/**
+ * The retry policy ONE acquisition call runs under: `watched` only when the
+ * caller supplied BOTH of an inactivity watchdog's stops — which the executor
+ * does only for a filesystem-observed plan it has armed a watchdog for — and
+ * `bounded` for anything less, fail-closed. Read once per call, so both halves
+ * of a split pair run under the same policy.
+ */
+export function selectYtdlpAcquisitionRetryPolicy(
+  deps: Pick<GenericDownloadDeps, "stopForInactivity" | "stopForObservationLoss">,
+): YtdlpAcquisitionRetryPolicyName {
+  return deps.stopForInactivity !== undefined && deps.stopForObservationLoss !== undefined ? "watched" : "bounded";
+}
+
+/** A policy count as an argument: a positive safe integer, or the command is refused. */
+function retryCountArg(value: number): string {
+  if (!Number.isSafeInteger(value) || value < 1) throw new AppError("PROCESSING_FAILED");
+  return String(value);
+}
 
 /** Floor on the acquisition budget, mirroring the analysis floor. */
 export const YTDLP_DOWNLOAD_MIN_TIMEOUT_MS = 1_000;
@@ -242,12 +335,25 @@ export function buildYtdlpDownloadEnvironment(opts: { workDir: string }): NodeJS
  * `--no-part` is deliberately NOT passed. Keeping yt-dlp's default `.part`
  * behaviour is what gives the actual-byte guard a predictable path to watch
  * while bytes are still arriving (§30).
+ *
+ * LD-3d: the four retry values come from ONE named policy of
+ * `YTDLP_ACQUISITION_RETRY_POLICIES`, `bounded` unless the caller names
+ * `watched`. Nothing else about the command depends on the policy, and no
+ * other retry, sleep or resume option is ever passed: `--retry-sleep`,
+ * `--file-access-retries`, `--http-chunk-size`, `--throttled-rate`, the
+ * `--sleep-*` options, `--no-continue` and `--no-part` stay absent, and a
+ * count is never `infinite`.
  */
 export function ytdlpDownloadPolicyArgs(opts: {
   readonly formatSelector: string;
   readonly outputTemplate: string;
   readonly maxFileSizeBytes: number;
+  readonly retryPolicy?: YtdlpAcquisitionRetryPolicyName;
 }): readonly string[] {
+  const policyName: string = opts.retryPolicy ?? "bounded";
+  // A name outside the closed table (a JavaScript caller, a cast) is refused, never guessed.
+  if (!Object.hasOwn(YTDLP_ACQUISITION_RETRY_POLICIES, policyName)) throw new AppError("PROCESSING_FAILED");
+  const retry: YtdlpAcquisitionRetryPolicy = YTDLP_ACQUISITION_RETRY_POLICIES[policyName as YtdlpAcquisitionRetryPolicyName];
   return Object.freeze([
     // ── no filesystem residue ────────────────────────────────────────────
     "--no-cache-dir",
@@ -269,11 +375,11 @@ export function ytdlpDownloadPolicyArgs(opts: {
     "--no-progress",
     "--no-warnings",
 
-    // ── bounded network behaviour ────────────────────────────────────────
-    `--socket-timeout=${DOWNLOAD_SOCKET_TIMEOUT_SECONDS}`,
-    `--retries=${DOWNLOAD_RETRIES}`,
-    `--fragment-retries=${DOWNLOAD_FRAGMENT_RETRIES}`,
-    `--extractor-retries=${DOWNLOAD_EXTRACTOR_RETRIES}`,
+    // ── bounded network behaviour (one closed retry policy, LD-3d) ───────
+    `--socket-timeout=${retryCountArg(retry.socketTimeoutSeconds)}`,
+    `--retries=${retryCountArg(retry.retries)}`,
+    `--fragment-retries=${retryCountArg(retry.fragmentRetries)}`,
+    `--extractor-retries=${retryCountArg(retry.extractorRetries)}`,
 
     // ── FFmpeg denial ────────────────────────────────────────────────────
     `--ffmpeg-location=${YTDLP_DOWNLOAD_FFMPEG_LOCATION}`,
@@ -321,8 +427,14 @@ export function ytdlpDownloadPolicyArgs(opts: {
     "--abort-on-unavailable-fragments",
 
     // ── filesystem hygiene ───────────────────────────────────────────────
-    // No upstream mtime is applied, and an existing file is never silently
-    // reused as if it had just been downloaded.
+    // No upstream mtime is applied, and an existing file is never
+    // overwritten. LD-3d correction, from the pinned runtime: `--no-overwrites`
+    // does NOT stop an existing file from being reused — given an existing
+    // final file the pinned release reports it "already downloaded", fetches
+    // nothing and exits 0, and its default `--continue` resumes an existing
+    // `.part`. What keeps residue out is the Worker's own proof that the job
+    // directory holds exactly what it expects before every child (an empty
+    // directory, or a split pair's validated video half).
     "--no-mtime",
     "--no-overwrites",
 
@@ -367,12 +479,15 @@ export function buildYtdlpDownloadArgv(opts: {
    */
   readonly plan: GenericSingleSourceExecutionPlan;
   readonly maxFileSizeBytes: number;
+  /** LD-3d: `bounded` unless named (see `selectYtdlpAcquisitionRetryPolicy`). */
+  readonly retryPolicy?: YtdlpAcquisitionRetryPolicyName;
 }): readonly string[] {
   return buildAcquisitionArgv({
     validatedUrl: opts.validatedUrl,
     source: opts.plan.source,
     outputTemplate: outputTemplateFor(opts.workDir),
     maxFileSizeBytes: opts.maxFileSizeBytes,
+    retryPolicy: opts.retryPolicy ?? "bounded",
   });
 }
 
@@ -398,12 +513,15 @@ export function buildYtdlpSplitDownloadArgv(opts: {
   readonly role: GenericSplitRole;
   /** This half's allowance: the combined budget minus bytes already acquired. */
   readonly maxFileSizeBytes: number;
+  /** LD-3d: `bounded` unless named; both halves of one call share the call's policy. */
+  readonly retryPolicy?: YtdlpAcquisitionRetryPolicyName;
 }): readonly string[] {
   return buildAcquisitionArgv({
     validatedUrl: opts.validatedUrl,
     source: opts.plan.pair[opts.role],
     outputTemplate: splitOutputTemplateFor(opts.workDir, opts.role),
     maxFileSizeBytes: opts.maxFileSizeBytes,
+    retryPolicy: opts.retryPolicy ?? "bounded",
   });
 }
 
@@ -422,6 +540,7 @@ function buildAcquisitionArgv(opts: {
   readonly source: GenericSourceSelection;
   readonly outputTemplate: string;
   readonly maxFileSizeBytes: number;
+  readonly retryPolicy: YtdlpAcquisitionRetryPolicyName;
 }): readonly string[] {
   return Object.freeze([
     YTDLP_RUNTIME.artifactPath,
@@ -430,6 +549,7 @@ function buildAcquisitionArgv(opts: {
       formatSelector: buildGenericFormatSelector(opts.source),
       outputTemplate: opts.outputTemplate,
       maxFileSizeBytes: opts.maxFileSizeBytes,
+      retryPolicy: opts.retryPolicy,
     }),
     "--",
     opts.validatedUrl,
@@ -489,6 +609,17 @@ export function expectedSplitPartPath(
 // ── Error classification (§34) ───────────────────────────────────────────────
 
 /**
+ * LD-3d: the pinned release's report of an exhausted download retry, read from
+ * LOWER-CASED stderr. `RetryManager.report_retry` formats
+ * `f'{e}. Giving up after {count - 1} retries'` and `FileDownloader.report_retry`
+ * prefixes `[download] Got error: `; the capture is the last error's text.
+ */
+const PINNED_RETRY_EXHAUSTION_LINE = /\[download\] got error: (.*)\. giving up after \d+ retries/;
+
+/** The last errors that make an exhausted download retry a NETWORK failure (lower-cased; see `classifyDownloadFailure`). */
+const PINNED_NETWORK_LAST_ERROR = /^(?:http error 5\d\d\b|downloaded \d+ bytes, expected \d+ bytes$|\d+ bytes read(?:, \d+ more expected)?$)/;
+
+/**
  * Maps a failed acquisition to a canonical Worker error code.
  *
  * Same narrow contract as the analysis classifier: raw text goes IN, a
@@ -525,6 +656,22 @@ export function classifyDownloadFailure(raw: string): AppError["code"] {
     text.includes("this video is not available")
   ) {
     return "VIDEO_UNAVAILABLE";
+  }
+  // LD-3d: an EXHAUSTED download retry is classified by its last error, never
+  // by a word that happens to appear in it. The pinned release reports the
+  // exhaustion of a file's (or a fragment attempt's) HTTP budget as exactly
+  // `[download] Got error: <last error>. Giving up after <n> retries`. When the
+  // last error is the source's server answering 5xx, or a connection that kept
+  // ending short of its length (the pinned `ContentTooShortError`, "Downloaded
+  // X bytes, expected Y bytes", or `IncompleteRead`, "X bytes read[, Y more
+  // expected]"), the source failed at the network level after extraction had
+  // succeeded: NETWORK_ERROR — not EXTRACTION_FAILED, and not TIMEOUT merely
+  // because a 504's reason phrase is "Gateway Timeout". A last error of
+  // "timed out" (yt-dlp's own silence budget ran out) still falls through to
+  // TIMEOUT below, and a 4xx keeps its existing code.
+  const exhausted = PINNED_RETRY_EXHAUSTION_LINE.exec(text);
+  if (exhausted !== null && PINNED_NETWORK_LAST_ERROR.test(exhausted[1]!)) {
+    return "NETWORK_ERROR";
   }
   if (text.includes("timed out") || text.includes("timeout")) {
     return "TIMEOUT";
@@ -1050,12 +1197,25 @@ async function acquireGenericOriginal(
   const runtime = await probe({ signal: deps.signal, timeoutMs: probeBudgetMs });
   if (!runtime.available) throw new AppError("EXTRACTOR_UNAVAILABLE");
 
+  // LD-3d: the job directory must be EXACTLY empty before the child exists —
+  // the same proof each half of a split pair already runs. The pinned
+  // release's default `--continue` RESUMES any `source.<ext>.part` it finds
+  // (a `Range` request from that file's size, spliced onto whatever it holds),
+  // and under `--no-overwrites` an existing `source.<ext>` is reported "already
+  // downloaded" with no request at all and a zero exit. A retry must never
+  // splice, or deliver, bytes this run did not fetch. Nothing is deleted and
+  // continued past: residue is refused.
+  await assertExactEntries(workDir, [], readDir);
+
   const networkTimeoutMs = deadline - clock();
   if (networkTimeoutMs <= 0) throw new AppError("TIMEOUT");
 
   const container = validPlan.source.container;
   const finalPath = expectedSourcePath(workDir, container);
   const partPath = expectedPartPath(workDir, container);
+  // LD-3d: ONE retry policy for this call, decided by whether an inactivity
+  // watchdog owns it — never by configuration or by the request.
+  const retryPolicy = selectYtdlpAcquisitionRetryPolicy(deps);
 
   // ── the actual-byte guard (§30) ──────────────────────────────────────────
   //
@@ -1150,6 +1310,7 @@ async function acquireGenericOriginal(
           workDir,
           plan: validPlan,
           maxFileSizeBytes: allowance,
+          retryPolicy,
         }),
       workDir,
       // The executor's fresh per-job directory: a successful run leaves exactly
@@ -1930,6 +2091,10 @@ async function acquireGenericSplitSources(
   const audio = splitHalfPaths(workDir, "audio", validPlan.pair.audio);
   const paths = [video.finalPath, video.partPath, audio.finalPath, audio.partPath];
   if (new Set(paths).size !== paths.length) throw new AppError("PROCESSING_FAILED");
+  // LD-3d: ONE retry policy for the whole call, so both halves run under the
+  // same one; each half's subprocess holds its own yt-dlp budget, but never a
+  // deadline of its own (the audio half gets what the video half left).
+  const retryPolicy = selectYtdlpAcquisitionRetryPolicy(deps);
 
   // 2. The Worker's own URL/SSRF validation, ONCE, before anything is spawned.
   //    Both halves use this same validated URL: the API has no way to accept
@@ -2060,6 +2225,7 @@ async function acquireGenericSplitSources(
             plan: validPlan,
             role: half.role,
             maxFileSizeBytes: runAllowance,
+            retryPolicy,
           }),
         workDir,
         // Exactly what this half found: nothing before the video run, the
