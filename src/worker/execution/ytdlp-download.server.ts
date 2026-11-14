@@ -624,8 +624,17 @@ export function isPinnedMaxFilesizeRefusal(stdout: string, allowanceBytes: numbe
  * call. `caller` covers user cancellation and operator shutdown alike — both
  * arrive through the caller's signal — while `overflow` is this module's own
  * byte guard.
+ *
+ * VIDEOFETCH-LD3C-YTDLP-OBSERVATION-HARDENING-001 adds the two stops an
+ * acquisition watchdog can decide, each arriving through its OWN signal
+ * (`stopForInactivity`, `stopForObservationLoss`), so neither is ever read as
+ * the caller's cancellation: `inactivity` (no meaningful growth for the window:
+ * TIMEOUT) and `observation-lost` (the run's files could not be observed for the
+ * allowance: PROCESSING_FAILED, a Worker-side fault that says nothing about the
+ * source). Both reuse the operation's one controller, so the process group is
+ * terminated exactly as for every other abort.
  */
-type AbortCause = "caller" | "overflow" | null;
+type AbortCause = "caller" | "overflow" | "inactivity" | "observation-lost" | null;
 
 export type GenericDownloadLimits = {
   /**
@@ -688,24 +697,227 @@ export type GenericDownloadDeps = {
   readonly onProgress?: (p: GenericDownloadProgress) => void;
   /** Observation only (LD-3a): reported to, never consulted. */
   readonly activity?: AcquisitionActivitySink;
+  /**
+   * LD-3c: a stop decided by this acquisition's inactivity watchdog — no
+   * meaningful growth for the window. Its own cause (`inactivity`, TIMEOUT),
+   * never a cancellation. Supplied only by the executor, and only when injected
+   * enforcement opts in to the filesystem-observed plans; Production supplies none.
+   */
+  readonly stopForInactivity?: AbortSignal;
+  /**
+   * LD-3c: a stop decided because this acquisition's files could not be
+   * observed for the allowance. Its own cause (`observation-lost`,
+   * PROCESSING_FAILED), never a stall and never a cancellation. Supplied exactly
+   * like `stopForInactivity`.
+   */
+  readonly stopForObservationLoss?: AbortSignal;
   /** Test seams. Production uses the real hardened runner, probe, clock and fs. */
   readonly runner?: typeof runProcess;
   readonly probeRuntime?: (opts: YtdlpProbeOptions) => Promise<YtdlpRuntimeStatus>;
   readonly validateUrl?: (raw: string) => Promise<{ url: string; hostname: string }>;
   readonly clock?: () => number;
+  /**
+   * Test seam for the monitor's FILE observation (LD-3c meaning): a number is
+   * the file's size (validated; an impossible one is `invalid-size`), `null` is
+   * an absent file, and a throw is an unreadable file classified by its `code`
+   * (`ENOENT` still meaning absent). See `observeFilesystemFile`.
+   */
   readonly statSize?: (path: string) => Promise<number | null>;
+  /**
+   * Test seam for the job-directory listing. The monitor classifies a throw by
+   * its `code` (`ENOENT`: the job directory is absent); the artifact proofs
+   * refuse any throw, as before.
+   */
   readonly readDir?: (path: string) => Promise<string[]>;
   readonly sizePollMs?: number;
 };
 
-/** Default size probe: absent file is `null`, never an error. */
-async function defaultStatSize(path: string): Promise<number | null> {
+// ── Filesystem observation (LD-3c) ───────────────────────────────────────────
+
+/**
+ * Why a filesystem observation produced no byte count: a CLOSED,
+ * application-owned vocabulary. No path, message or operating-system text is
+ * ever kept, reported or attached to anything.
+ */
+export type FilesystemObservationFailure =
+  /** EACCES, EPERM. */
+  | "permission"
+  /** EIO. */
+  | "io"
+  /** EMFILE, ENFILE, ENOMEM, EAGAIN, EBUSY. */
+  | "resource"
+  /** ENOTDIR, ELOOP, ENAMETOOLONG: the path does not resolve as a plain path. */
+  | "path"
+  /** The entry exists and is not a regular file (a directory, a FIFO, a socket, a device). */
+  | "not-a-regular-file"
+  /** An entry `stat` cannot follow although `lstat` sees it: a dangling link. */
+  | "unsupported-entry"
+  /** A size that is not a finite, non-negative safe integer. */
+  | "invalid-size"
+  /** Anything else. */
+  | "other";
+
+/**
+ * One observation of ONE file, in a closed, serializable shape. `absent` is
+ * used only when the filesystem says there is no entry at all; `unreadable`
+ * never masquerades as zero bytes, and `absent` never as an empty file.
+ */
+export type FileObservation =
+  | { readonly kind: "bytes"; readonly bytes: number }
+  | { readonly kind: "absent" }
+  | { readonly kind: "unreadable"; readonly failure: FilesystemObservationFailure };
+
+/** One listing of ONE directory, in the same closed shape. */
+export type DirectoryObservation =
+  | { readonly kind: "entries"; readonly names: readonly string[] }
+  | { readonly kind: "absent" }
+  | { readonly kind: "unreadable"; readonly failure: FilesystemObservationFailure };
+
+const ABSENT = Object.freeze({ kind: "absent" as const });
+
+const OBSERVATION_FAILURE_BY_CODE: Readonly<Record<string, FilesystemObservationFailure>> = Object.freeze({
+  EACCES: "permission",
+  EPERM: "permission",
+  EIO: "io",
+  EMFILE: "resource",
+  ENFILE: "resource",
+  ENOMEM: "resource",
+  EAGAIN: "resource",
+  EBUSY: "resource",
+  ENOTDIR: "path",
+  ELOOP: "path",
+  ENAMETOOLONG: "path",
+});
+
+/** The error's `code`, if it is a string: the ONLY thing read from a thrown value. */
+function errorCode(err: unknown): string | null {
+  const code = typeof err === "object" && err !== null ? (err as { code?: unknown }).code : undefined;
+  return typeof code === "string" ? code : null;
+}
+
+function unreadable(failure: FilesystemObservationFailure): FileObservation & DirectoryObservation {
+  return Object.freeze({ kind: "unreadable" as const, failure });
+}
+
+/** A thrown filesystem error as a closed observation: ENOENT is absence, everything else is unreadable. */
+function observationFromError(err: unknown): FileObservation & DirectoryObservation {
+  const code = errorCode(err);
+  if (code === "ENOENT") return ABSENT;
+  return unreadable(code !== null && Object.hasOwn(OBSERVATION_FAILURE_BY_CODE, code) ? OBSERVATION_FAILURE_BY_CODE[code]! : "other");
+}
+
+/** A byte count is reported only when it is a real size. */
+function observedSize(size: unknown): FileObservation {
+  return typeof size === "number" && Number.isSafeInteger(size) && size >= 0
+    ? Object.freeze({ kind: "bytes" as const, bytes: size })
+    : unreadable("invalid-size");
+}
+
+type ObservationFs = {
+  readonly stat: (path: string) => Promise<{ isFile(): boolean; readonly size: number }>;
+  readonly lstat: (path: string) => Promise<{ isSymbolicLink(): boolean }>;
+};
+
+const REAL_OBSERVATION_FS: ObservationFs = { stat: fsStat, lstat: fsLstat };
+
+/**
+ * Observes ONE file. Never throws.
+ *
+ * `bytes` is exactly the reading the byte guard has always taken — `stat`, which
+ * follows a link — of a regular file with a real size. A `stat` that says ENOENT
+ * is confirmed with `lstat`: only when there is no entry at all is the file
+ * `absent`; an entry `stat` cannot follow (a dangling link) is
+ * `unsupported-entry`. A file that appears between the two calls is `absent`
+ * for this sample and seen by the next.
+ */
+export async function observeFilesystemFile(path: string, fs: ObservationFs = REAL_OBSERVATION_FS): Promise<FileObservation> {
+  let stats: { isFile(): boolean; readonly size: number };
   try {
-    const s = await fsStat(path);
-    return s.isFile() ? s.size : null;
-  } catch {
-    return null;
+    stats = await fs.stat(path);
+  } catch (err: unknown) {
+    const observed = observationFromError(err);
+    if (observed.kind !== "absent") return observed;
+    try {
+      return (await fs.lstat(path)).isSymbolicLink() ? unreadable("unsupported-entry") : ABSENT;
+    } catch (lstatErr: unknown) {
+      return observationFromError(lstatErr);
+    }
   }
+  if (!stats.isFile()) return unreadable("not-a-regular-file");
+  return observedSize(stats.size);
+}
+
+/** Lists ONE directory. Never throws. A listing that is not an array of names is `other`. */
+export async function observeFilesystemDirectory(
+  path: string,
+  readDir: (path: string) => Promise<unknown> = (p) => fsReaddir(p),
+): Promise<DirectoryObservation> {
+  let names: unknown;
+  try {
+    names = await readDir(path);
+  } catch (err: unknown) {
+    return observationFromError(err);
+  }
+  if (!Array.isArray(names) || !names.every((name) => typeof name === "string")) return unreadable("other");
+  return Object.freeze({ kind: "entries" as const, names: Object.freeze([...(names as string[])]) });
+}
+
+/**
+ * The file observer an acquisition uses: the real one, or the injected
+ * `statSize` seam read with its LD-3c meaning (number: size; null: absent;
+ * throw: classified). Never throws either way.
+ */
+function fileObserverFor(deps: Pick<GenericDownloadDeps, "statSize">): (path: string) => Promise<FileObservation> {
+  const seam = deps.statSize;
+  if (seam === undefined) return (path) => observeFilesystemFile(path);
+  return async (path) => {
+    let size: unknown;
+    try {
+      size = await seam(path);
+    } catch (err: unknown) {
+      return observationFromError(err);
+    }
+    return size === null ? ABSENT : observedSize(size);
+  };
+}
+
+/** The directory observer an acquisition's monitor uses: real, or the `readDir` seam. */
+function directoryObserverFor(deps: Pick<GenericDownloadDeps, "readDir">): (path: string) => Promise<DirectoryObservation> {
+  const seam = deps.readDir;
+  return seam === undefined ? (path) => observeFilesystemDirectory(path) : (path) => observeFilesystemDirectory(path, seam);
+}
+
+/**
+ * LD-3c: links a watchdog's two stop signals to an operation's first-cause
+ * latch. Each latches ITS cause — never `caller` — unless a cause is already
+ * latched (first wins) or the operation's own absolute deadline has passed (the
+ * runner's TIMEOUT owns that outcome). Returns the unlink.
+ */
+function linkAcquisitionStops(
+  deps: Pick<GenericDownloadDeps, "stopForInactivity" | "stopForObservationLoss">,
+  abortOnce: (cause: "inactivity" | "observation-lost", reason: unknown) => void,
+  deadlinePassed: () => boolean,
+): () => void {
+  const unlinks: Array<() => void> = [];
+  const links = [
+    [deps.stopForInactivity, "inactivity", "TIMEOUT"],
+    [deps.stopForObservationLoss, "observation-lost", "PROCESSING_FAILED"],
+  ] as const;
+  for (const [signal, cause, code] of links) {
+    if (signal === undefined) continue;
+    const relay = () => {
+      if (!deadlinePassed()) abortOnce(cause, new AppError(code));
+    };
+    if (signal.aborted) {
+      relay();
+      continue;
+    }
+    signal.addEventListener("abort", relay, { once: true });
+    unlinks.push(() => signal.removeEventListener("abort", relay));
+  }
+  return () => {
+    for (const unlink of unlinks.splice(0)) unlink();
+  };
 }
 
 // ── The downloader ───────────────────────────────────────────────────────────
@@ -754,7 +966,8 @@ async function acquireGenericOriginal(
   const probe = deps.probeRuntime ?? probeYtdlpRuntime;
   const validate = deps.validateUrl ?? assertSafeUrl;
   const clock = deps.clock ?? Date.now;
-  const statSize = deps.statSize ?? defaultStatSize;
+  const observeFile = fileObserverFor(deps);
+  const observeDirectory = directoryObserverFor(deps);
   const readDir = deps.readDir ?? ((p: string) => fsReaddir(p));
   const pollMs = deps.sizePollMs ?? YTDLP_DOWNLOAD_SIZE_POLL_MS;
 
@@ -876,6 +1089,8 @@ async function acquireGenericOriginal(
     if (deps.signal.aborted) relayCallerAbort();
     else deps.signal.addEventListener("abort", relayCallerAbort, { once: true });
   }
+  // LD-3c: a watchdog's stop latches its own cause on the same controller.
+  const unlinkStops = linkAcquisitionStops(deps, abortOnce, () => clock() >= deadline);
 
   let lastBytes = 0;
   let lastAt = clock();
@@ -950,7 +1165,8 @@ async function acquireGenericOriginal(
       layout: genericAcquisitionLayout(validPlan.source.protocol),
       partPath,
       finalPath,
-      statSize,
+      observeFile,
+      observeDirectory,
       pollMs,
       onObserved,
       activity: deps.activity,
@@ -958,6 +1174,7 @@ async function acquireGenericOriginal(
     });
   } finally {
     deps.signal?.removeEventListener("abort", relayCallerAbort);
+    unlinkStops();
   }
 
   return validateAcquiredSource({
@@ -1130,7 +1347,9 @@ async function runMonitoredAcquisition(opts: {
   readonly layout: GenericAcquisitionLayout;
   readonly partPath: string;
   readonly finalPath: string;
-  readonly statSize: (path: string) => Promise<number | null>;
+  /** LD-3c: closed, typed observations; neither ever throws. */
+  readonly observeFile: (path: string) => Promise<FileObservation>;
+  readonly observeDirectory: (path: string) => Promise<DirectoryObservation>;
   readonly pollMs: number;
   /** Called synchronously, and ONLY while this run's monitor is live. */
   readonly onObserved: (observed: ObservedAcquisitionBytes) => void;
@@ -1138,7 +1357,7 @@ async function runMonitoredAcquisition(opts: {
   readonly activity: AcquisitionActivitySink | undefined;
   readonly activityPhase: AcquisitionActivityPhase;
 }): Promise<void> {
-  const { statSize, partPath, finalPath } = opts;
+  const { observeFile, partPath, finalPath } = opts;
 
   // ── monitor liveness gate (CORRECTION-01 §7/§8) ──────────────────────────
   //
@@ -1163,36 +1382,57 @@ async function runMonitoredAcquisition(opts: {
   // and only after the byte guard has seen the sample. `onObserved` decides what
   // the guard and progress count; this reports the same raw per-run reading,
   // never a split pair's monotonic display floor.
+  //
+  // LD-3c: each sample first CONCLUDES, from typed observations, one of
+  //
+  //   a reading   a complete byte count for this run          -> `bytes`
+  //   absent      the run holds no file (no entry at all)     -> nothing until the
+  //               run has held bytes, then `sample-gap`: a file the run held
+  //               being gone is never 0 bytes and never a discard
+  //   unreadable  a file or the job directory could not be read, or a
+  //               segmented listing could not be read completely
+  //                                                           -> `sample-gap`,
+  //               from the phase's start: an observer that cannot see is never
+  //               "no file yet", so the window never runs on missing evidence
+  //
+  // The byte guard and the browser progress are fed exactly as before, from
+  // every byte count a sample could read, whatever it concludes.
   let seenBytes = false;
-  const reportSampledBytes = (totalBytes: number) => {
+  const reportReading = (totalBytes: number) => {
     seenBytes ||= totalBytes > 0;
     reportActivity(opts.activity, { kind: "bytes", totalBytes, evidence: "filesystem" });
   };
-  // A sample that reads nothing is a gap only once this run has held bytes.
-  // Before the first write, "absent" is just what the job directory looks like.
-  const reportSampleGap = () => {
+  const reportAbsent = () => {
     if (seenBytes) reportActivity(opts.activity, { kind: "sample-gap" });
+  };
+  const reportUnreadable = () => {
+    reportActivity(opts.activity, { kind: "sample-gap" });
   };
 
   const sampleProgressive = async () => {
     if (!monitorActive) return;
 
     // Either path may be absent: before yt-dlp creates the file, and after it
-    // renames `.part` away. Neither is an error.
-    const partSize = await statSize(partPath);
+    // renames `.part` away. Neither is an error. The final path is read only
+    // when the `.part` held no byte count, exactly as before.
+    const part = await observeFile(partPath);
     if (!monitorActive) return;
 
-    const finalSize = partSize === null ? await statSize(finalPath) : null;
+    const final = part.kind === "bytes" ? null : await observeFile(finalPath);
     if (!monitorActive) return;
 
-    const observed = partSize ?? finalSize;
-    if (observed === null) {
-      reportSampleGap();
+    const readable = part.kind === "bytes" ? part : final?.kind === "bytes" ? final : null;
+    if (readable !== null) {
+      opts.onObserved({ guardBytes: readable.bytes, progressBytes: readable.bytes });
+      // A final file read beside an unreadable `.part` is a lower bound, not a
+      // complete reading: the guard charges it, the evidence does not take it.
+      if (part.kind === "unreadable") reportUnreadable();
+      else reportReading(readable.bytes);
       return;
     }
 
-    opts.onObserved({ guardBytes: observed, progressBytes: observed });
-    reportSampledBytes(observed);
+    if (part.kind === "absent" && final?.kind === "absent") reportAbsent();
+    else reportUnreadable();
   };
 
   // GENERIC-SEGMENTED-DASH-EXECUTION-001. A segmented run's in-flight fragment
@@ -1212,17 +1452,18 @@ async function runMonitoredAcquisition(opts: {
   const sampleSegmented = async () => {
     if (!monitorActive) return;
 
-    let names: string[];
-    try {
-      names = await opts.readDir(opts.workDir);
-    } catch {
-      if (monitorActive) reportSampleGap();
+    // LD-3c: a missing or unreadable JOB DIRECTORY is never "no file yet". It
+    // is the run's own workspace, created before the run and removed only after
+    // it, unlike a fragment, which legitimately comes and goes.
+    const listing = await opts.observeDirectory(opts.workDir);
+    if (!monitorActive) return;
+    if (listing.kind !== "entries") {
+      reportUnreadable();
       return;
     }
-    if (!monitorActive) return;
 
     const before = new Set(opts.entriesBefore);
-    const owned = names
+    const owned = listing.names
       .filter((name) => !before.has(name))
       .map((name) => ({ name, kind: classifySegmentedAcquisitionEntry(finalName, name) }))
       // The bookkeeping file is JSON state, not media, and is bounded by the
@@ -1230,19 +1471,37 @@ async function runMonitoredAcquisition(opts: {
       .filter((entry) => entry.kind !== "bookkeeping")
       // The aggregate FIRST, so every fragment below is stat'ed after it.
       .sort((a, b) => Number(a.kind !== "aggregate") - Number(b.kind !== "aggregate"));
+    if (owned.length === 0) {
+      // Nothing of this run on disk: before the first write, just what the job
+      // directory looks like; afterwards, the files it held are gone.
+      reportAbsent();
+      return;
+    }
 
     let aggregate = 0;
+    // LD-3c: whether `aggregate` is a REAL reading of every aggregate entry
+    // listed — none listed is a true zero — so it can serve as the base a
+    // fragment in flight will extend. An unreadable or raced aggregate never
+    // becomes a guessed base of zero.
+    let aggregateKnown = true;
     let inFlight = 0;
     let unexpected = 0;
     const completed: Array<{ readonly name: string; readonly size: number }> = [];
     let sized = 0;
+    let complete = true;
     for (const entry of owned) {
       // Any entry may vanish between the listing and its stat — a fragment is
       // renamed, appended and removed in quick succession. That is not an
-      // error; the next sample sees the new state.
-      const size = await statSize(join(opts.workDir, entry.name));
+      // error, but it is not a complete reading either: the next sample sees
+      // the new state, and this one is never evidence of fewer bytes.
+      const seen = await observeFile(join(opts.workDir, entry.name));
       if (!monitorActive) return;
-      if (size === null) continue;
+      if (seen.kind !== "bytes") {
+        complete = false;
+        if (entry.kind === "aggregate") aggregateKnown = false;
+        continue;
+      }
+      const size = seen.bytes;
       sized += 1;
       switch (entry.kind) {
         case "aggregate":
@@ -1252,9 +1511,9 @@ async function runMonitoredAcquisition(opts: {
           inFlight += size;
           // This fragment was still in flight AFTER the aggregate was read, so
           // that reading predates its append: it is exactly the aggregate this
-          // fragment will extend.
+          // fragment will extend — when it was read.
           const fragment = entry.name.slice(0, -".part".length);
-          if (!aggregateBefore.has(fragment)) aggregateBefore.set(fragment, aggregate);
+          if (aggregateKnown && !aggregateBefore.has(fragment)) aggregateBefore.set(fragment, aggregate);
           break;
         }
         case "fragment-complete":
@@ -1265,7 +1524,8 @@ async function runMonitoredAcquisition(opts: {
       }
     }
     if (sized === 0) {
-      reportSampleGap();
+      // Every entry listed vanished or could not be read.
+      reportUnreadable();
       return;
     }
 
@@ -1291,7 +1551,11 @@ async function runMonitoredAcquisition(opts: {
       guardBytes: aggregate + inFlight + pendingCharged + unexpected,
       progressBytes: aggregate + inFlight + pendingKnown,
     });
-    reportSampledBytes(aggregate + inFlight + pendingKnown);
+    // A partial reading is charged by the guard but is never evidence: three
+    // such dips would otherwise confirm a discard whose recovery is then
+    // credited as new bytes.
+    if (complete) reportReading(aggregate + inFlight + pendingKnown);
+    else reportUnreadable();
   };
 
   const sample = opts.layout === "segmented" ? sampleSegmented : sampleProgressive;
@@ -1360,6 +1624,11 @@ async function runMonitoredAcquisition(opts: {
     // and, because the cause latch is one-way, a caller abort that arrived
     // afterwards cannot overwrite it either.
     if (opts.abortCause() === "overflow") throw new AppError("TOO_LARGE");
+    // LD-3c: a watchdog's stop is its own outcome, on the same terms: read from
+    // the one-way latch, before the caller's signal, so the execution abort that
+    // follows a stop can never turn it into a cancellation.
+    if (opts.abortCause() === "inactivity") throw new AppError("TIMEOUT");
+    if (opts.abortCause() === "observation-lost") throw new AppError("PROCESSING_FAILED");
     // Real cancellation propagates verbatim so the executor can tell it apart.
     if (opts.callerSignal?.aborted) throw err;
     if (err instanceof ProcessOutputLimitError) {
@@ -1426,7 +1695,9 @@ function failedRunOutcome(
   },
   err: unknown,
 ): AcquisitionActivityOutcome {
-  if (opts.abortCause() === "overflow") return "failed";
+  const cause = opts.abortCause();
+  // LD-3c: a watchdog's stop is neither a cancellation nor the absolute deadline.
+  if (cause === "overflow" || cause === "inactivity" || cause === "observation-lost") return "failed";
   if (opts.callerSignal?.aborted) return "cancelled";
   if (err instanceof AppError && err.code === "TIMEOUT") return "deadline-exceeded";
   return "failed";
@@ -1490,15 +1761,18 @@ async function isPinnedRefusalShape(opts: {
 
 /**
  * Throws for a cause that was established BEFORE a zero exit is interpreted,
- * in the order the failure path uses: an internal overflow stays TOO_LARGE, and
- * a caller abort — a user cancellation or an operator shutdown — stays a
- * cancellation and is never reported as a size refusal.
+ * in the order the failure path uses: an internal overflow stays TOO_LARGE, a
+ * watchdog's stop stays its own outcome (LD-3c), and a caller abort — a user
+ * cancellation or an operator shutdown — stays a cancellation and is never
+ * reported as a size refusal.
  */
 function throwIfEarlierCause(opts: {
   readonly abortCause: () => AbortCause;
   readonly callerSignal: AbortSignal | undefined;
 }): void {
   if (opts.abortCause() === "overflow") throw new AppError("TOO_LARGE");
+  if (opts.abortCause() === "inactivity") throw new AppError("TIMEOUT");
+  if (opts.abortCause() === "observation-lost") throw new AppError("PROCESSING_FAILED");
   if (opts.callerSignal?.aborted) {
     throw new AppError("PROCESSING_FAILED", "Download was cancelled.");
   }
@@ -1621,7 +1895,8 @@ async function acquireGenericSplitSources(
   const probe = deps.probeRuntime ?? probeYtdlpRuntime;
   const validate = deps.validateUrl ?? assertSafeUrl;
   const clock = deps.clock ?? Date.now;
-  const statSize = deps.statSize ?? defaultStatSize;
+  const observeFile = fileObserverFor(deps);
+  const observeDirectory = directoryObserverFor(deps);
   const readDir = deps.readDir ?? ((p: string) => fsReaddir(p));
   const pollMs = deps.sizePollMs ?? YTDLP_DOWNLOAD_SIZE_POLL_MS;
 
@@ -1687,13 +1962,19 @@ async function acquireGenericSplitSources(
     if (deps.signal.aborted) relayCallerAbort();
     else deps.signal.addEventListener("abort", relayCallerAbort, { once: true });
   }
+  // LD-3c: a watchdog's stop latches its own cause on the same controller, for
+  // whichever half is running, under the one deadline.
+  const unlinkStops = linkAcquisitionStops(deps, abortOnce, () => clock() >= deadline);
 
   // Nothing is running between the halves, so a pending abort there is a
-  // caller cancellation — or an overflow the video run latched in its final
-  // instant. The latch decides which, exactly as it does mid-run.
+  // caller cancellation — or an overflow, or a watchdog's stop, the video run
+  // latched in its final instant. The latch decides which, exactly as it does
+  // mid-run.
   const throwIfAborted = () => {
     if (!controller.signal.aborted) return;
     if (abortCause === "overflow") throw new AppError("TOO_LARGE");
+    if (abortCause === "inactivity") throw new AppError("TIMEOUT");
+    if (abortCause === "observation-lost") throw new AppError("PROCESSING_FAILED");
     throw new AppError("PROCESSING_FAILED", "Download was cancelled.");
   };
 
@@ -1795,7 +2076,8 @@ async function acquireGenericSplitSources(
         layout: half.layout,
         partPath: half.partPath,
         finalPath: half.finalPath,
-        statSize,
+        observeFile,
+        observeDirectory,
         pollMs,
         onObserved: ({ guardBytes, progressBytes }) => {
           // The COMBINED live guard: bytes already validated for earlier halves
@@ -1855,6 +2137,7 @@ async function acquireGenericSplitSources(
     return { video: videoArtifact, audio: audioArtifact, totalFileSize };
   } finally {
     deps.signal?.removeEventListener("abort", relayCallerAbort);
+    unlinkStops();
   }
 }
 

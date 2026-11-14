@@ -32,21 +32,28 @@
  * resource boundary or a repeated reading moves nothing. A confirmed discard
  * lowers the anchor's bytes and never its time.
  *
- * ─── Observation loss: bounded, never silent ────────────────────────────────
+ * ─── Observation loss: bounded, never silent, and never a stall ─────────────
  *
  * The tracker calls a phase `unobserved` after three consecutive filesystem
  * gaps and, when a sample is readable again, re-anchors it with a fresh window.
  * Taken as is, a repeated pattern of three gaps and one readable sample would
  * re-arm a fresh window forever. This watchdog therefore:
  *
- *   - PAUSES the window while the phase is unobserved, for at most
- *     `maxUnobservedMs` of blind time in total since its honoured anchor;
+ *   - PAUSES the window while the phase is unobserved: blind time never counts
+ *     toward inactivity, because an observer that cannot see is no evidence
+ *     that the source stopped (VIDEOFETCH-LD3C-YTDLP-OBSERVATION-HARDENING-001);
  *   - honours a recovery's fresh window only when the bytes grew by at least
- *     the floor over that anchor while it could not see them.
+ *     the floor over that anchor while it could not see them;
+ *   - ends the watch as an OBSERVATION LOSS — a decision of its own, reported
+ *     through `onObservationLost`, never through `onStall` — once the blind
+ *     time since its honoured anchor reaches `maxUnobservedMs`.
  *
- * A stalled phase therefore stops at most `windowMs + maxUnobservedMs` after
- * its last meaningful progress. Transport evidence (direct, clear HLS) never
- * reports a gap, so this applies to filesystem evidence only.
+ * A stall therefore always rests on a full window of VISIBLE time without
+ * meaningful growth, and a phase that cannot be seen ends at most
+ * `maxUnobservedMs` of blindness after its last honoured anchor. Transport
+ * evidence (direct, clear HLS) never reports a gap, so this applies to
+ * filesystem evidence only. (LD-3b let the window run again once the
+ * allowance was spent, so blindness could end as a stall; LD-3c replaced that.)
  *
  * ─── Time ───────────────────────────────────────────────────────────────────
  *
@@ -58,14 +65,19 @@
  * a finite number makes no decision, ever again: the absolute deadline remains
  * the bound.
  *
+ * A detected suspension also restarts the observation allowance from the
+ * resume: time in which the process did not run is neither visible nor blind.
+ *
  * ─── Ending ─────────────────────────────────────────────────────────────────
  *
- * `onStall` runs at most once, after the decision is latched; its exception is
- * dropped. The timer is released on a stop, when the acquisition reports how it
- * ended, once the deadline has passed, on a clock fault and on `dispose()`
- * (idempotent). After `dispose()` every event and every timer callback is a
- * no-op. The watchdog writes nothing durable and exposes only numbers and
- * fixed strings.
+ * At most ONE decision is made: `onStall` or `onObservationLost`, at most once,
+ * after the decision is latched; an exception from either is dropped. Without
+ * `onObservationLost` an observation loss still ends the watch (no callback),
+ * and the acquisition stays bounded by its absolute deadline alone. The timer is
+ * released on a decision, when the acquisition reports how it ended, once the
+ * deadline has passed, on a clock fault and on `dispose()` (idempotent). After
+ * `dispose()` every event and every timer callback is a no-op. The watchdog
+ * writes nothing durable and exposes only numbers and fixed strings.
  */
 
 import {
@@ -90,7 +102,11 @@ export type AcquisitionInactivityPolicy = Readonly<{
   tickMs?: number;
   /** Two ticks further apart than this mean the process did not run. Default 30,000 ms; more than a tick. */
   suspensionGapMs?: number;
-  /** Blind time a phase may pause its window for, in total, since its honoured anchor. Default: the window. */
+  /**
+   * The observation-loss allowance: blind time a phase may spend, in total, since
+   * its honoured anchor, before the watch ends as an observation loss. Default:
+   * the window.
+   */
   maxUnobservedMs?: number;
 }>;
 
@@ -115,6 +131,20 @@ export type AcquisitionInactivityStop = Readonly<{
   windowMs: number;
 }>;
 
+/**
+ * LD-3c: the other decision — the phase could not be observed for the whole
+ * allowance. It says nothing about the source: it is never an inactivity stop.
+ */
+export type AcquisitionObservationLoss = Readonly<{
+  cause: "observation-lost";
+  phase: AcquisitionActivityPhase;
+  /** The phase's high-water mark of real media bytes when the allowance ran out. */
+  observedBytes: number;
+  /** Blind time since the honoured anchor, when it was decided. */
+  unobservedMs: number;
+  maxUnobservedMs: number;
+}>;
+
 export type AcquisitionInactivityWatchdogState =
   /** No phase has started: no timer, no window. */
   | "idle"
@@ -122,6 +152,8 @@ export type AcquisitionInactivityWatchdogState =
   | "watching"
   /** This watchdog stopped the acquisition. */
   | "stopped"
+  /** LD-3c: the phase could not be observed for the whole allowance. */
+  | "observation-lost"
   /** The acquisition reported how it ended. */
   | "settled"
   /** The absolute deadline passed: the seam's own deadline decides. */
@@ -134,6 +166,8 @@ export type AcquisitionInactivityWatchdogState =
 export type AcquisitionInactivityWatchdogReport = Readonly<{
   state: AcquisitionInactivityWatchdogState;
   stop: AcquisitionInactivityStop | null;
+  /** LD-3c: the observation-loss decision, or null. At most one of `stop` and this is set. */
+  observationLoss: AcquisitionObservationLoss | null;
   /** Fresh windows granted after a detected suspension. */
   suspensions: number;
   /** The time the window is measured from (before blind-time credit and suspension), or null before a phase. */
@@ -190,10 +224,15 @@ export function createAcquisitionInactivityWatchdog(opts: {
   readonly timers: InactivityWatchdogTimers;
   /** Called at most once, when the window has passed with no meaningful progress. */
   readonly onStall: (stop: AcquisitionInactivityStop) => void;
+  /**
+   * LD-3c: called at most once — and never together with `onStall` — when the
+   * phase has been unobservable for the whole allowance.
+   */
+  readonly onObservationLost?: (loss: AcquisitionObservationLoss) => void;
 }): AcquisitionInactivityWatchdog {
   const policy = resolveAcquisitionInactivityPolicy(opts.policy);
   const { windowMs, tickMs, suspensionGapMs, maxUnobservedMs } = policy;
-  const { clock, timers, onStall } = opts;
+  const { clock, timers, onStall, onObservationLost } = opts;
 
   // The tracker reads the time of the event being recorded, so the tracker and
   // this watchdog's own accounting see one reading per event.
@@ -203,6 +242,7 @@ export function createAcquisitionInactivityWatchdog(opts: {
   let state: AcquisitionInactivityWatchdogState = "idle";
   let timer: InactivityWatchdogTimerHandle | null = null;
   let stop: AcquisitionInactivityStop | null = null;
+  let observationLoss: AcquisitionObservationLoss | null = null;
   let lastReading = 0;
   let lastTickAtMs: number | null = null;
   let suspensions = 0;
@@ -212,7 +252,12 @@ export function createAcquisitionInactivityWatchdog(opts: {
   // re-anchor that no visible growth backs.
   let honouredAnchorAtMs: number | null = null;
   let honouredAnchorBytes = 0;
+  // The tracker's anchor as last seen: a move is a new time OR more bytes at the
+  // same time (LD-3c: growth landing at the instant of the phase start, or of the
+  // previous anchor, used to be missed, leaving the honoured bytes stale so a
+  // later unbacked recovery looked like growth).
   let trackerAnchorAtMs: number | null = null;
+  let trackerAnchorBytes = 0;
   // Blind time since the honoured anchor: closed runs, and the open one.
   let unobservedMs = 0;
   let blindSinceMs: number | null = null;
@@ -252,8 +297,10 @@ export function createAcquisitionInactivityWatchdog(opts: {
     blindSinceMs = null;
   };
 
-  const blindCreditMs = (nowMs: number) =>
-    Math.min(unobservedMs + (blindSinceMs === null ? 0 : Math.max(0, nowMs - blindSinceMs)), maxUnobservedMs);
+  /** Blind time since the honoured anchor: the closed runs and the open one. */
+  const blindMs = (nowMs: number) => unobservedMs + (blindSinceMs === null ? 0 : Math.max(0, nowMs - blindSinceMs));
+  /** The same, as the report states it: never more than the allowance. */
+  const blindCreditMs = (nowMs: number) => Math.min(blindMs(nowMs), maxUnobservedMs);
 
   const schedule = () => {
     if (state !== "watching" || timer !== null) return;
@@ -272,9 +319,12 @@ export function createAcquisitionInactivityWatchdog(opts: {
     }
     lastReading = now;
     if (lastTickAtMs !== null && now - lastTickAtMs > suspensionGapMs) {
-      // The process did not run: one fresh window from the resume.
+      // The process did not run: one fresh window from the resume — and, since
+      // a frozen observer is not a blind one, a fresh observation allowance too.
       suspensionGrantAtMs = now;
       suspensions += 1;
+      unobservedMs = 0;
+      if (blindSinceMs !== null) blindSinceMs = now;
     }
     lastTickAtMs = now;
 
@@ -295,27 +345,56 @@ export function createAcquisitionInactivityWatchdog(opts: {
       return;
     }
 
-    let anchorMs = honouredAnchorAtMs + blindCreditMs(now);
-    if (suspensionGrantAtMs !== null && suspensionGrantAtMs > anchorMs) anchorMs = suspensionGrantAtMs;
-    const idleMs = now - anchorMs;
-    if (idleMs < windowMs || snapshot.phase === null) {
+    // LD-3c: the window runs from the later of the honoured anchor and a
+    // suspension's fresh start, and every blind millisecond since that point is
+    // excluded from it, uncapped (a suspension restarts the blind count, and an
+    // honoured anchor resets it), so a stall always rests on a full window of
+    // VISIBLE time without meaningful growth. Blindness is bounded separately,
+    // below, by its own decision.
+    const blind = blindMs(now);
+    const windowStartMs =
+      suspensionGrantAtMs !== null && suspensionGrantAtMs > honouredAnchorAtMs ? suspensionGrantAtMs : honouredAnchorAtMs;
+    const idleMs = now - (windowStartMs + blind);
+    if (snapshot.phase === null) {
       schedule();
       return;
     }
 
-    stop = Object.freeze({
-      cause: "inactivity",
-      phase: snapshot.phase,
-      observedBytes: snapshot.observedBytes,
-      idleMs: Math.floor(idleMs),
-      windowMs,
-    });
-    end("stopped");
-    try {
-      onStall(stop);
-    } catch {
-      // The owner's failure goes no further; the decision stands.
+    if (idleMs >= windowMs) {
+      stop = Object.freeze({
+        cause: "inactivity",
+        phase: snapshot.phase,
+        observedBytes: snapshot.observedBytes,
+        idleMs: Math.floor(idleMs),
+        windowMs,
+      });
+      end("stopped");
+      try {
+        onStall(stop);
+      } catch {
+        // The owner's failure goes no further; the decision stands.
+      }
+      return;
     }
+
+    if (blind > 0 && blind >= maxUnobservedMs) {
+      observationLoss = Object.freeze({
+        cause: "observation-lost",
+        phase: snapshot.phase,
+        observedBytes: snapshot.observedBytes,
+        unobservedMs: Math.floor(blind),
+        maxUnobservedMs,
+      });
+      end("observation-lost");
+      try {
+        onObservationLost?.(observationLoss);
+      } catch {
+        // The owner's failure goes no further; the decision stands.
+      }
+      return;
+    }
+
+    schedule();
   }
 
   const record: AcquisitionActivitySink = (event) => {
@@ -354,7 +433,10 @@ export function createAcquisitionInactivityWatchdog(opts: {
           unobservedMs += Math.max(0, now - (blindSinceMs as number));
           blindSinceMs = null;
         }
-        if (snapshot.anchorAtMs !== trackerAnchorAtMs && snapshot.anchorAtMs !== null) {
+        if (
+          snapshot.anchorAtMs !== null &&
+          (snapshot.anchorAtMs !== trackerAnchorAtMs || snapshot.anchorBytes > trackerAnchorBytes)
+        ) {
           // Meaningful growth moves the tracker's anchor; so does a recovery
           // from `unobserved`, which is honoured only when the bytes grew by the
           // floor while they could not be seen.
@@ -379,6 +461,7 @@ export function createAcquisitionInactivityWatchdog(opts: {
         break;
     }
     trackerAnchorAtMs = snapshot.anchorAtMs;
+    trackerAnchorBytes = snapshot.anchorBytes;
   };
 
   return {
@@ -388,6 +471,7 @@ export function createAcquisitionInactivityWatchdog(opts: {
       Object.freeze({
         state,
         stop,
+        observationLoss,
         suspensions,
         honouredAnchorAtMs,
         unobservedCreditMs: blindCreditMs(lastReading),
