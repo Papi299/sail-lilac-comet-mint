@@ -1248,7 +1248,9 @@ describe("generic download: the pinned --max-filesize refusal (YTDLP-MAX-FILESIZ
     let reads = 0;
     const readDir = async (path: string) => {
       reads += 1;
-      caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+      // LD-3d: the first listing is the pre-spawn proof that the job directory
+      // is empty; the cancellation lands on the refusal's own read after it.
+      if (reads === 2) caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
       return readdirSync(path);
     };
     await assert.rejects(
@@ -1262,7 +1264,7 @@ describe("generic download: the pinned --max-filesize refusal (YTDLP-MAX-FILESIZ
         err.code === "PROCESSING_FAILED" &&
         err.message === "Download was cancelled.",
     );
-    assert.equal(reads, 1, "the job directory really was read");
+    assert.equal(reads, 2, "the job directory really was read: the pre-spawn proof (LD-3d), then the refusal's own read");
   });
 
   it("an overflow the watcher latched FIRST stays TOO_LARGE through a witnessed zero exit", async () => {
@@ -1641,7 +1643,9 @@ describe("generic download: a pinned --max-filesize refusal on a LATER chunk (YT
     let reads = 0;
     const readDir = async (path: string) => {
       reads += 1;
-      caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
+      // LD-3d: the first listing is the pre-spawn proof that the job directory
+      // is empty; the cancellation lands on the shape proof's own read after it.
+      if (reads === 2) caller.abort(new AppError("PROCESSING_FAILED", "Job cancelled"));
       return readdirSync(path);
     };
     await assert.rejects(
@@ -1652,7 +1656,7 @@ describe("generic download: a pinned --max-filesize refusal on a LATER chunk (YT
         }),
       cancelled,
     );
-    assert.equal(reads, 1, "the job directory really was read");
+    assert.equal(reads, 2, "the job directory really was read: the pre-spawn proof (LD-3d), then the refusal's own read");
   });
 
   it("an overflow the watcher latched FIRST stays TOO_LARGE through a witnessed exit 0 beside its .part", async () => {
