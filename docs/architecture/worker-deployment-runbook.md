@@ -1473,8 +1473,9 @@ as of `PHASE-10C1-YTDLP-RUNTIME-FOUNDATION-001`.*
 | Property | Value |
 | :--- | :--- |
 | yt-dlp release | `2026.08.19` (exact, immutable release tag) |
-| Artifact | The official **platform-independent Unix zipimport executable** — the release's bare `yt-dlp` asset |
-| SHA-256 | Pinned in `Dockerfile.worker` via `ADD --checksum` and verified at build time |
+| Installed identity | `2026.08.19+videofetch.ld3e1` since the LD-3e source change (see below); `--version` prints it and the probe requires it exactly |
+| Artifact | The official **platform-independent Unix zipimport executable** — the release's bare `yt-dlp` asset — with two archive members replaced at image-build time (LD-3e) |
+| SHA-256 | Upstream asset: pinned in `Dockerfile.worker` via `ADD --checksum` and verified at build time. Installed artifact: `2dfa21ec…` (3,088,241 bytes), checked by `sha256sum` in the build stage and by `probeYtdlpRuntime` before every use |
 | Python | Debian Bookworm system `python3` (3.11). The release requires >= 3.10 |
 | Bundled EJS | `yt_dlp_ejs` 0.8.0, shipped **inside** the artifact |
 | Install path | `/usr/local/lib/videofetch/yt-dlp`, root-owned, mode `0555`, on the read-only root filesystem |
@@ -1490,10 +1491,28 @@ Worker runs as `node`, and the argument policy passes `--no-update`. Upgrading
 yt-dlp is a reviewed code change to the version and digest — together — followed
 by a deployment, never a runtime event.
 
+**The LD-3e patched build** (VIDEOFETCH-LD3E-PINNED-YTDLP-PATCHED-RUNTIME-SOURCE-IMPLEMENTATION-001;
+source only until a separately authorized image build and promotion). The pinned
+release's HTTP downloader could loop without limit, or append a whole-file answer
+to the pieces already written, in its chunked mode. The image therefore installs
+the upstream asset with two members replaced by the reviewed files in
+`vendor/yt-dlp/2026.08.19-videofetch-ld3e/`: `yt_dlp/downloader/http.py` (the
+correction) and `yt_dlp/version.py` (the identity above). A separate build stage
+fetches the asset by digest, runs the vendored deterministic builder with no
+network, and checks the output's SHA-256; only the output reaches the final
+image. At run time the probe reads the installed file and compares its SHA-256
+with the pin BEFORE it executes `--version`, so an unpatched, modified or
+replaced artifact is refused (`EXTRACTOR_UNAVAILABLE`) without being run. The
+directory's `PROVENANCE.md` and `PATCH-MANIFEST.json` record every digest. The
+release-image acceptance kit under `deploy/acceptance/ytdlp-generic/` still
+states the unpatched identity in its own, independent constants; updating them
+belongs to the separately authorized release-image qualification of this build.
+
 `src/worker/runtime/ytdlp-runtime.server.ts` holds the same version, digest and
 paths, and `container-policy.test.ts` asserts the image and the module agree, so
 a bump that touches only one of the two fails the build rather than shipping a
-Worker whose probe can never match its image.
+Worker whose probe can never match its image. `ytdlp-patched-runtime-policy.test.ts`
+does the same for the vendored members, the builder and its manifest.
 
 ### 4b. Execution policy
 

@@ -1,0 +1,62 @@
+{
+  "schema": "videofetch-ytdlp-patch-manifest/1",
+  "identity": "2026.08.19+videofetch.ld3e1",
+  "upstream": {
+    "project": "yt-dlp",
+    "repository": "https://github.com/yt-dlp/yt-dlp",
+    "release": "2026.08.19",
+    "tagCommit": "3a08beaf031ab68f966401ead017ac81fe8486cf",
+    "releaseGitHead": "594bd50c2c78ac432f81600d309fdc4e0a92d82c",
+    "asset": "yt-dlp",
+    "assetUrl": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp",
+    "assetBytes": 3072469,
+    "assetSha256": "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6",
+    "archiveMembers": 1053,
+    "memberInventorySha256": "0ec4533e7517564a1c00676a1e06ec2764b8094874ce93c187252a322ab9b92b"
+  },
+  "replacedMembers": [
+    {
+      "member": "yt_dlp/version.py",
+      "upstreamSha256": "5d7c9a50dbacbdb3596a77c9856a7c1aeded2ffce3cfdd25a7df76954791cf4d",
+      "upstreamGitBlob": "9b3a255f266bdea78505723455a5d546749a2b7c",
+      "replacement": "yt_dlp/version.py",
+      "replacementBytes": 518,
+      "replacementSha256": "108f4a37073c75f4610ce335e02740748a2f431f7d894026b32cd31feeebf92c",
+      "purpose": "distinct runtime identity: __version__ and _pkg_version become 2026.08.19+videofetch.ld3e1; RELEASE_GIT_HEAD, VARIANT, UPDATE_HINT, CHANNEL and ORIGIN are unchanged"
+    },
+    {
+      "member": "yt_dlp/downloader/http.py",
+      "upstreamSha256": "e111fffdc894f68253ce3c5155fa1aa7390e58caa9a33eeb28d9ef78134e2cd0",
+      "upstreamGitBlob": "6dcf7e7b6981156b8a59cf9ca065836d4d64882d",
+      "replacement": "yt_dlp/downloader/http.py",
+      "replacementBytes": 19585,
+      "replacementSha256": "657dae31370ae3b93c3071e80399195087dc3898fe41ce79e5c0b68720d0c75a",
+      "purpose": "the LD-3e chunk correction, byte-identical to the independently accepted laboratory source candidate-v1.http.py"
+    }
+  ],
+  "representation": {
+    "unchangedMembers": "copied byte for byte (local record and central fields), in the upstream order",
+    "replacedMembers": "STORED (method 0, version needed 10), with the upstream member's name, extra field, timestamp 2000-01-01 01:01:00 and attributes 0100644",
+    "shebang": "#!/usr/bin/env python3"
+  },
+  "builder": {
+    "file": "build_patched_ytdlp.py",
+    "sha256": "8f828d06cf28f136cd337befc69ec4a828fa39f0d4b335b1803b01bdc2119126",
+    "invocation": "python3 -I -B build_patched_ytdlp.py <upstream yt-dlp 2026.08.19 file> <output path>",
+    "network": "none"
+  },
+  "output": {
+    "identity": "2026.08.19+videofetch.ld3e1",
+    "bytes": 3088241,
+    "sha256": "2dfa21ec04eebb61612e3e6eb5d24f13527264275a0a34d6ef7e5d33a9260259",
+    "installedAt": "/usr/local/lib/videofetch/yt-dlp"
+  },
+  "review": {
+    "laboratoryTask": "VIDEOFETCH-LD3E-PINNED-YTDLP-CHUNK-DEPENDENCY-REMEDIATION-DESIGN-002",
+    "laboratoryArchiveSha256": "237279332c05d1a6653c3a19ed059c095997182a4e88bf82d6075981e659c873",
+    "laboratorySource": "evidence/I-candidate-patch/candidate-v1.http.py",
+    "laboratoryExecutableSha256": "98195b3e6d41980def10331eaacdc5e040c0a2f65da57200e409d3cd139c4a56",
+    "laboratoryExecutableNote": "the laboratory executable replaced http.py only and still reported 2026.08.19; this build adds the identity member, so its digest differs",
+    "implementationTask": "VIDEOFETCH-LD3E-PINNED-YTDLP-PATCHED-RUNTIME-SOURCE-IMPLEMENTATION-001"
+  }
+}

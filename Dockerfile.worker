@@ -17,9 +17,11 @@
 # deliberately NOT set here.
 #
 # Deliberately NOT part of this image:
-#   - pip / venv       : the yt-dlp artifact is a single pinned zipimport file
-#                        fetched by exact digest at build time. Nothing in this
-#                        image can install, upgrade or replace a Python package.
+#   - pip / venv       : the yt-dlp artifact is a single pinned zipimport file,
+#                        built at image-build time from the exact-digest upstream
+#                        asset and two reviewed members (see below). Nothing in
+#                        this image can install, upgrade or replace a Python
+#                        package.
 #   - curl / wget      : nothing inside this image probes over HTTP. Liveness is
 #                        probed by the deployment layer from OUTSIDE the
 #                        restricted media namespace.
@@ -28,7 +30,7 @@
 #                        boundary. The Worker must never be able to read,
 #                        weaken or mutate it, and must never hold NET_ADMIN.
 #   - docker CLI       : the container never talks to a Docker socket.
-FROM node:22-bookworm-slim
+FROM node:22-bookworm-slim AS worker-base
 
 # ffmpeg brings ffprobe with it. ca-certificates provides the TLS trust roots
 # used for outbound media fetches.
@@ -41,32 +43,52 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends ffmpeg ca-certificates python3 \
   && rm -rf /var/lib/apt/lists/*
 
-# The pinned yt-dlp runtime.
+# The pinned yt-dlp runtime: the LD-3e patched build of one exact upstream release.
 #
-# This is the official PLATFORM-INDEPENDENT UNIX ZIPIMPORT executable from an
-# exact upstream release — a single ~3 MB file with a `#!/usr/bin/env python3`
-# shebang and a zip payload. It is deliberately NOT `yt-dlp_linux_aarch64`: the
-# PyInstaller builds unpack themselves into a temporary directory on every run,
-# which this container's read-only root and `noexec` media tmpfs would break.
+# The upstream asset is the official PLATFORM-INDEPENDENT UNIX ZIPIMPORT
+# executable of yt-dlp 2026.08.19 — a single ~3 MB file with a
+# `#!/usr/bin/env python3` shebang and a zip payload. It is deliberately NOT
+# `yt-dlp_linux_aarch64`: the PyInstaller builds unpack themselves into a
+# temporary directory on every run, which this container's read-only root and
+# `noexec` media tmpfs would break.
 #
-# `ADD --checksum` verifies the digest published in the release's own
-# SHA2-256SUMS at BUILD time, so the build fails closed if the asset ever
-# differs. It also needs no download tooling in the final image, which is what
-# keeps curl and wget out.
+# The image does not install that asset as-is (VIDEOFETCH-LD3E-PINNED-YTDLP-
+# PATCHED-RUNTIME-SOURCE-IMPLEMENTATION-001). This build stage fetches it exactly
+# as before — `ADD --checksum` verifies the digest published in the release's
+# own SHA2-256SUMS at BUILD time, from an immutable release URL (no `latest`,
+# no nightly, no mirror, no `pip install`), with no download tooling in any
+# image — and the reviewed deterministic builder in
+# vendor/yt-dlp/2026.08.19-videofetch-ld3e/ replaces exactly two archive
+# members: yt_dlp/downloader/http.py (the LD-3e chunk correction) and
+# yt_dlp/version.py (the distinct identity `2026.08.19+videofetch.ld3e1`). The
+# builder runs with NO network, verifies every input and its own output, and
+# refuses to write anything else; the result's SHA-256 is checked once more
+# here before anything copies it. Only that one file reaches the final image:
+# the upstream asset, the vendored sources and the builder stay in this stage.
 #
-# The URL is an immutable release URL. There is no `latest`, no nightly, no
-# mirror, and no runtime `pip install`. Upgrading yt-dlp means changing this
-# version and this digest — together, in a reviewed commit, alongside
-# YTDLP_RUNTIME in src/worker/runtime/ytdlp-runtime.server.ts, which
-# container-policy.test.ts asserts must agree with these exact values.
+# Changing the runtime means changing the vendored members, the builder's
+# pins, the digests below and YTDLP_RUNTIME in
+# src/worker/runtime/ytdlp-runtime.server.ts together, in a reviewed commit;
+# container-policy.test.ts and ytdlp-patched-runtime-policy.test.ts assert that
+# they agree.
+FROM worker-base AS ytdlp-build
 ADD --checksum=sha256:1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6 \
     https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp \
-    /usr/local/lib/videofetch/yt-dlp
+    /build/upstream/yt-dlp
+COPY vendor/yt-dlp/2026.08.19-videofetch-ld3e/ /build/patch/
+RUN --network=none mkdir /build/out \
+  && python3 -I -B /build/patch/build_patched_ytdlp.py /build/upstream/yt-dlp /build/out/yt-dlp \
+  && echo "2dfa21ec04eebb61612e3e6eb5d24f13527264275a0a34d6ef7e5d33a9260259  /build/out/yt-dlp" | sha256sum --check --strict -
+
+# The Worker image proper.
+FROM worker-base
 
 # Root-owned and read-only, on the read-only root filesystem. The Worker runs
 # as `node` and therefore cannot rewrite, replace or self-update its own media
 # runtime — the property that makes `--no-update` a statement of intent rather
-# than the actual control.
+# than the actual control. Its SHA-256 is verified again before every use
+# (`probeYtdlpRuntime`), before the file is ever executed.
+COPY --from=ytdlp-build /build/out/yt-dlp /usr/local/lib/videofetch/yt-dlp
 RUN chown root:root /usr/local/lib/videofetch/yt-dlp \
   && chmod 0555 /usr/local/lib/videofetch/yt-dlp
 

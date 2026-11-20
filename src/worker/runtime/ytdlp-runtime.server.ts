@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { open as openFile, type FileHandle } from "node:fs/promises";
+import { AppError } from "../../lib/errors.ts";
 import { runProcess, type RunResult } from "../../services/processing/process-runner.server.ts";
 
 /**
@@ -17,7 +21,9 @@ import { runProcess, type RunResult } from "../../services/processing/process-ru
  * The only yt-dlp subprocess operation this module performs — and, after
  * Phase 10C1, the only one that exists anywhere in Production Worker code —
  * is a NON-NETWORK version probe. Generic user-URL execution is a later,
- * separately authorized phase.
+ * separately authorized phase. Before that probe runs, the module also reads
+ * the installed artifact once and compares its SHA-256 with the pin (LD-3e):
+ * a file read, never an execution.
  *
  * This module replaces the Worker's former dependence on the legacy
  * `src/services/extractors/ytdlp.server.ts`, which the diagnostics probe used
@@ -29,13 +35,22 @@ import { runProcess, type RunResult } from "../../services/processing/process-ru
 /**
  * The exact pinned runtime this image ships.
  *
- * Every value here is verified against the upstream release and is asserted
- * against `Dockerfile.worker` by `container-policy.test.ts`, so the code and
- * the image cannot drift apart. Changing the runtime means changing this
- * object AND the Dockerfile in the same reviewed commit.
+ * Every value here is asserted against `Dockerfile.worker` by
+ * `container-policy.test.ts`, and against the vendored patch by
+ * `ytdlp-patched-runtime-policy.test.ts`, so the code and the image cannot
+ * drift apart. Changing the runtime means changing this object, the vendored
+ * patch and the Dockerfile in the same reviewed commit.
  *
- * `sha256` is the digest published in the release's own `SHA2-256SUMS`.
- * Upgrades are code-review and deployment events, never runtime events.
+ * Since LD-3e (VIDEOFETCH-LD3E-PINNED-YTDLP-PATCHED-RUNTIME-SOURCE-
+ * IMPLEMENTATION-001) the installed artifact is NOT the upstream asset itself:
+ * it is that asset with exactly two archive members replaced by the reviewed
+ * files in `vendor/yt-dlp/2026.08.19-videofetch-ld3e/` — the chunk correction
+ * (`yt_dlp/downloader/http.py`) and a distinct identity (`yt_dlp/version.py`)
+ * — built deterministically at image-build time. `upstream` pins the asset the
+ * build starts from; `expectedVersion`, `sha256` and `sizeBytes` pin the file
+ * the Worker actually runs. Upgrades are code-review and deployment events,
+ * never runtime events: no environment variable, configuration value or
+ * request field can select another artifact or identity.
  */
 export const YTDLP_RUNTIME = Object.freeze({
   /**
@@ -57,15 +72,37 @@ export const YTDLP_RUNTIME = Object.freeze({
    */
   artifactPath: "/usr/local/lib/videofetch/yt-dlp",
 
-  /** Exact upstream release. The probe accepts this string and nothing else. */
-  expectedVersion: "2026.08.19",
+  /**
+   * The installed artifact's identity, exactly as its `--version` prints it.
+   * The probe accepts this string and nothing else.
+   *
+   * `2026.08.19` keeps the upstream release traceable; `+videofetch.ld3e1` is a
+   * PEP 440 local version label that no upstream build (release or nightly,
+   * whose versions are digits only) can print. The unmodified upstream
+   * artifact prints `2026.08.19` and is therefore refused.
+   */
+  expectedVersion: "2026.08.19+videofetch.ld3e1",
 
-  /** The exact asset the image fetches. Immutable release URL, never `latest`. */
-  releaseUrl:
-    "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp",
+  /**
+   * SHA-256 of the exact installed artifact (the LD-3e patched build). Checked
+   * at image-build time in `Dockerfile.worker`, and by `probeYtdlpRuntime`
+   * BEFORE the file is executed.
+   */
+  sha256: "2dfa21ec04eebb61612e3e6eb5d24f13527264275a0a34d6ef7e5d33a9260259",
 
-  /** Published in the release's SHA2-256SUMS; enforced at build time. */
-  sha256: "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6",
+  /** The installed artifact's exact size: the probe's digest read never reads more than this plus one byte. */
+  sizeBytes: 3_088_241,
+
+  /** The upstream release asset the image build starts from. */
+  upstream: Object.freeze({
+    /** The upstream release. */
+    version: "2026.08.19",
+    /** The exact asset the image fetches. Immutable release URL, never `latest`. */
+    releaseUrl:
+      "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp",
+    /** Published in the release's SHA2-256SUMS; enforced by `ADD --checksum` at build time. */
+    sha256: "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6",
+  }),
 
   /**
    * The `yt_dlp_ejs` package version bundled INSIDE the zipimport artifact
@@ -312,17 +349,24 @@ export const YTDLP_FFMPEG_ACQUISITION_MODES = Object.freeze([
 
 /** The outcome of a runtime probe. Never carries raw subprocess output. */
 export type YtdlpRuntimeStatus = {
-  /** True only when the exact pinned version answered. */
+  /** True only when the pinned bytes are installed AND the exact pinned version answered. */
   readonly available: boolean;
   /** The reported version when it matched the pin, else null. */
   readonly version: string | null;
-  /** Stable, non-secret reason code. Safe for logs; never surfaced raw. */
+  /**
+   * Stable, non-secret reason code. Safe for logs; never surfaced raw. A closed
+   * vocabulary: LD-3e added `artifact_unreadable` (the file could not be opened
+   * or read as a regular file) and `digest_mismatch` (it was read, and its size
+   * or SHA-256 is not the pin). Neither carries a path, a byte or a digest.
+   */
   readonly reason:
     | "ok"
     | "version_mismatch"
     | "malformed_output"
     | "process_error"
-    | "timeout";
+    | "timeout"
+    | "artifact_unreadable"
+    | "digest_mismatch";
 };
 
 const UNAVAILABLE = (reason: YtdlpRuntimeStatus["reason"]): YtdlpRuntimeStatus =>
@@ -334,6 +378,94 @@ let processRunner: ProcessRunner = runProcess;
 /** Test seam. Production always uses the hardened process runner. */
 export function setYtdlpRuntimeProcessRunnerForTests(runner: ProcessRunner | null): void {
   processRunner = runner ?? runProcess;
+}
+
+/** The file the probe authenticates, and the size and digest it must have. */
+export type YtdlpArtifactIdentity = {
+  readonly path: string;
+  readonly sha256: string;
+  readonly sizeBytes: number;
+};
+
+const PINNED_ARTIFACT: YtdlpArtifactIdentity = Object.freeze({
+  path: YTDLP_RUNTIME.artifactPath,
+  sha256: YTDLP_RUNTIME.sha256,
+  sizeBytes: YTDLP_RUNTIME.sizeBytes,
+});
+
+let artifactUnderTest: YtdlpArtifactIdentity | null = null;
+
+/**
+ * Test seam. Production always authenticates `YTDLP_RUNTIME.artifactPath`
+ * against `YTDLP_RUNTIME.sha256`; a test substitutes a temporary file and its
+ * own digest, because the pinned artifact is not on a developer machine. The
+ * subprocess command line never changes: it always names the real artifact.
+ */
+export function setYtdlpRuntimeArtifactForTests(identity: YtdlpArtifactIdentity | null): void {
+  artifactUnderTest = identity === null ? null : Object.freeze({ ...identity });
+}
+
+/** The digest read's buffer: the ~3 MB artifact is hashed in a dozen reads. */
+const ARTIFACT_READ_CHUNK_BYTES = 256 * 1024;
+
+/** The same error the hardened runner rejects with when its signal aborts. */
+const cancelled = (): AppError => new AppError("PROCESSING_FAILED", "Download was cancelled.");
+
+/**
+ * Authenticates the complete artifact bytes: one bounded, read-only pass.
+ *
+ * The file is opened with `O_NOFOLLOW` (a symbolic link is refused, not
+ * followed) and must be a regular file of exactly `sizeBytes`; it is then read
+ * in fixed chunks, never more than `sizeBytes + 1` bytes in total, and its
+ * SHA-256 must equal the pin. Any open, stat or read failure is
+ * `artifact_unreadable`; any size or digest difference, including a file that
+ * changes length while it is read, is `digest_mismatch`. The read honours the
+ * caller's budget (`timeout`) and its signal (a cancellation is RE-THROWN as
+ * the runner's own cancellation error, never reported as unavailability).
+ * Nothing it returns names the path or carries a byte or a digest.
+ */
+async function authenticateArtifact(
+  identity: YtdlpArtifactIdentity,
+  signal: AbortSignal | undefined,
+  deadline: number,
+): Promise<"ok" | "artifact_unreadable" | "digest_mismatch" | "timeout"> {
+  if (signal?.aborted) throw cancelled();
+  let handle: FileHandle;
+  try {
+    handle = await openFile(identity.path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch {
+    if (signal?.aborted) throw cancelled();
+    return "artifact_unreadable";
+  }
+  let outcome: "ok" | "artifact_unreadable" | "digest_mismatch" | "timeout" | "cancelled";
+  try {
+    outcome = await (async () => {
+      const stat = await handle.stat();
+      if (!stat.isFile()) return "artifact_unreadable";
+      if (stat.size !== identity.sizeBytes) return "digest_mismatch";
+      const hash = createHash("sha256");
+      const buffer = Buffer.alloc(ARTIFACT_READ_CHUNK_BYTES);
+      let total = 0;
+      for (;;) {
+        if (signal?.aborted) return "cancelled";
+        if (Date.now() > deadline) return "timeout";
+        const want = Math.min(buffer.length, identity.sizeBytes + 1 - total);
+        if (want <= 0) return "digest_mismatch";
+        const { bytesRead } = await handle.read(buffer, 0, want, total);
+        if (bytesRead === 0) break;
+        hash.update(buffer.subarray(0, bytesRead));
+        total += bytesRead;
+      }
+      if (total !== identity.sizeBytes) return "digest_mismatch";
+      return hash.digest("hex") === identity.sha256 ? "ok" : "digest_mismatch";
+    })();
+  } catch {
+    outcome = "artifact_unreadable";
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+  if (outcome === "cancelled" || signal?.aborted) throw cancelled();
+  return outcome;
 }
 
 /**
@@ -351,7 +483,9 @@ export function parseYtdlpVersion(stdout: string): string | null {
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
   if (lines.length !== 1) return null;
-  return /^\d{4}\.\d{2}\.\d{2}(\.\d+)?$/.test(lines[0]) ? lines[0] : null;
+  // A release tag (`2026.08.19`), an optional numeric revision, and an optional
+  // PEP 440 local version label (`+videofetch.ld3e1`, lower case, dot-separated).
+  return /^\d{4}\.\d{2}\.\d{2}(\.\d+)?(\+[a-z0-9]+(\.[a-z0-9]+)*)?$/.test(lines[0]) ? lines[0] : null;
 }
 
 /**
@@ -387,14 +521,35 @@ export type YtdlpProbeOptions = {
 /**
  * Probes the pinned yt-dlp runtime.
  *
- * Executes the interpreter and the artifact by ABSOLUTE path, under the closed
- * environment and the full base argument policy, and asks only for the
- * version. It performs no network request, touches no user input, and returns
- * `available: true` only when the reported version equals the pin exactly.
+ * Two steps, in this order, and the second never runs unless the first passed:
  *
- * Every failure mode — missing interpreter, missing artifact, wrong version,
- * malformed output, spawn error, timeout — is reported as unavailable with a
- * bounded reason code. Raw stdout/stderr never escapes this function.
+ *   1. INTEGRITY. The installed artifact is read once and its size and SHA-256
+ *      must equal `YTDLP_RUNTIME.sizeBytes` / `.sha256` (`authenticateArtifact`).
+ *      A missing, unreadable, linked, resized or modified file is refused
+ *      HERE, so a wrong artifact is never executed merely to read its version.
+ *   2. IDENTITY. The interpreter and the artifact are executed by ABSOLUTE
+ *      path, under the closed environment and the full base argument policy,
+ *      and asked only for the version, which must equal
+ *      `YTDLP_RUNTIME.expectedVersion` exactly.
+ *
+ * It performs no network request, touches no user input, and returns
+ * `available: true` only when BOTH the bytes and the reported version are the
+ * pinned ones. Every failure mode — unreadable or modified artifact, missing
+ * interpreter, wrong version, malformed output, spawn error, timeout — is
+ * reported as unavailable with a bounded reason code. Raw stdout/stderr, file
+ * contents, paths and digests never escape this function.
+ *
+ * LIFECYCLE. The digest is checked on EVERY probe: once per diagnostics call,
+ * and once per analysis and per acquisition, each of which probes immediately
+ * before it starts its own yt-dlp subprocess and refuses with
+ * `EXTRACTOR_UNAVAILABLE` when the probe says unavailable. Nothing else hashes
+ * the file (no progress path, no timer). The check authenticates the bytes at
+ * the moment they are read; the interpreter opens the path again moments
+ * later. That window is closed by the deployment, not by this code: the
+ * artifact lives on the read-only root filesystem, root-owned and mode 0555,
+ * and the Worker runs as a non-root user, so only a host- or root-level actor
+ * could swap it in between — one that could equally replace the Worker's own
+ * code. The probe does not claim protection against such an actor.
  *
  * Called with no arguments it behaves exactly as it did in Phase 10C1: the full
  * `YTDLP_PROBE_TIMEOUT_MS` budget, no signal, and no path that can throw
@@ -408,6 +563,16 @@ export async function probeYtdlpRuntime(
       ? YTDLP_PROBE_TIMEOUT_MS
       : Math.min(YTDLP_PROBE_TIMEOUT_MS, opts.timeoutMs);
 
+  // 1. Integrity, before anything is executed. The read shares the probe's
+  //    budget; on the local read-only root it takes milliseconds.
+  const integrity = await authenticateArtifact(
+    artifactUnderTest ?? PINNED_ARTIFACT,
+    opts.signal,
+    Date.now() + timeoutMs,
+  );
+  if (integrity !== "ok") return UNAVAILABLE(integrity);
+
+  // 2. Identity: the bounded, non-network version probe.
   let result: RunResult;
   try {
     result = await processRunner({

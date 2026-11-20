@@ -1,0 +1,3 @@
+# The vendored yt-dlp members and builder are pinned by SHA-256 (vendor/yt-dlp/*/PATCH-MANIFEST.json, Dockerfile.worker,
+# YTDLP_RUNTIME): a checkout must never rewrite their line endings.
+vendor/yt-dlp/** -text
