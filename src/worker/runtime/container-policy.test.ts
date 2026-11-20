@@ -70,10 +70,42 @@ describe("Dockerfile.worker container policy", () => {
     assert.ok(instructions.length > 0, "Dockerfile.worker must contain instructions");
   });
 
+  // LD-3e replaced "exactly one build stage" (a single FROM) with the three
+  // assertions below. The image still has exactly ONE external base image, the
+  // Node 22 Bookworm slim family; the only other stage is the patched yt-dlp
+  // build, which derives from that same base, so it adds no image, no package
+  // source and no interpreter, and the final stage is that base again.
   it("builds on the Node 22 Bookworm slim family", () => {
     const from = directives("FROM");
-    assert.equal(from.length, 1, "exactly one build stage");
-    assert.match(from[0].args, /^node:22[.\w-]*-bookworm-slim\b/, "Node 22 Bookworm slim base");
+    assert.match(from[0].args, /^node:22[.\w-]*-bookworm-slim\s+AS\s+worker-base$/i, "Node 22 Bookworm slim base, named worker-base");
+    const external = from.filter((f) => !/^(worker-base|ytdlp-build)\b/i.test(f.args));
+    assert.equal(external.length, 1, "exactly one external base image");
+  });
+
+  it("has exactly the base, the yt-dlp build and the final stage, all from the one base", () => {
+    const from = directives("FROM").map((f) => f.args);
+    assert.deepEqual(
+      from.map((f) => f.replace(/\s+/g, " ")),
+      [from[0].replace(/\s+/g, " "), "worker-base AS ytdlp-build", "worker-base"],
+      "stages: worker-base, ytdlp-build (FROM worker-base), the final stage (FROM worker-base)",
+    );
+  });
+
+  it("runs the final stage's instructions only after its own FROM", () => {
+    const lastFrom = instructions.map((i) => i.directive).lastIndexOf("FROM");
+    const finalStage = instructions.slice(lastFrom + 1);
+    for (const directive of ["USER", "CMD", "ENV", "EXPOSE", "WORKDIR"]) {
+      assert.ok(finalStage.some((i) => i.directive === directive), `${directive} belongs to the final stage`);
+    }
+    const buildStage = instructions.slice(
+      instructions.findIndex((i) => i.directive === "FROM" && /AS\s+ytdlp-build/i.test(i.args)) + 1,
+      lastFrom,
+    );
+    assert.deepEqual(
+      buildStage.map((i) => i.directive),
+      ["ADD", "COPY", "RUN"],
+      "the build stage only fetches the upstream asset, copies the vendored patch and runs the builder",
+    );
   });
 
   describe("does NOT", () => {
@@ -399,35 +431,61 @@ describe("Dockerfile.worker container policy", () => {
     });
   });
 
-  // ── pinned yt-dlp runtime (PHASE-10C1) ────────────────────────────────────
+  // ── pinned yt-dlp runtime (PHASE-10C1; patched build since LD-3e) ─────────
   //
   // The image and `ytdlp-runtime.server.ts` must describe the SAME runtime.
   // Asserting them against each other — rather than against a literal repeated
   // in the test — means a version bump that touches only one of the two fails
   // here instead of shipping a Worker whose probe can never match its image.
+  //
+  // LD-3e changed WHAT is installed: the upstream asset is fetched into a build
+  // stage and the reviewed builder replaces two members. Every PHASE-10C1
+  // assertion below survives with its subject made precise: "the" artifact is
+  // now the UPSTREAM asset where it is fetched (ADD, its URL and digest, never
+  // mutable or self-extracting) and the BUILT artifact where it is installed
+  // (path, owner, mode, writable mounts). New assertions cover the build step,
+  // its network isolation, the final digest and what reaches the final stage.
   describe("pinned yt-dlp runtime", () => {
     function addDirectives(): string[] {
       return directives("ADD").map((i) => i.args);
     }
+    function stageOf(index: number): string {
+      for (let i = index; i >= 0; i -= 1) {
+        if (instructions[i].directive === "FROM") return instructions[i].args.replace(/\s+/g, " ");
+      }
+      return "";
+    }
+    const VENDORED = "vendor/yt-dlp/2026.08.19-videofetch-ld3e/";
 
     it("fetches exactly one yt-dlp artifact, by ADD, with no download tooling", () => {
       const adds = addDirectives().filter((args) => args.includes("yt-dlp"));
       assert.equal(adds.length, 1, "exactly one yt-dlp artifact may be added");
-      // ADD --checksum verifies at build time and needs no curl or wget in the
-      // final image, which is what keeps both out of the runtime.
+      // ADD --checksum verifies at build time and needs no curl or wget in any
+      // image, which is what keeps both out of the runtime.
       assert.doesNotMatch(executable, /\bcurl\b/, "no curl anywhere in the image");
       assert.doesNotMatch(executable, /\bwget\b/, "no wget anywhere in the image");
+      assert.equal(directives("ADD").length, 1, "nothing else is fetched by ADD");
+    });
+
+    it("fetches the upstream asset only into the build stage", () => {
+      const index = instructions.findIndex((i) => i.directive === "ADD" && i.args.includes("yt-dlp"));
+      assert.equal(stageOf(index), "worker-base AS ytdlp-build", "the upstream asset is fetched in the build stage");
+      assert.match(instructions[index].args, /\s\/build\/upstream\/yt-dlp$/, "into the build stage's input path");
     });
 
     it("pins the exact version the runtime module expects", () => {
       const add = addDirectives().find((args) => args.includes("yt-dlp"))!;
       assert.ok(
-        add.includes(YTDLP_RUNTIME.releaseUrl),
+        add.includes(YTDLP_RUNTIME.upstream.releaseUrl),
         "the image must fetch the exact release URL the runtime module pins",
       );
       assert.ok(
-        add.includes(`/${YTDLP_RUNTIME.expectedVersion}/`),
-        "the fetched URL must carry the expected version",
+        add.includes(`/${YTDLP_RUNTIME.upstream.version}/`),
+        "the fetched URL must carry the expected upstream version",
+      );
+      assert.ok(
+        YTDLP_RUNTIME.expectedVersion.startsWith(`${YTDLP_RUNTIME.upstream.version}+`),
+        "the installed identity must name the upstream release it is built from",
       );
     });
 
@@ -435,16 +493,58 @@ describe("Dockerfile.worker container policy", () => {
       const add = addDirectives().find((args) => args.includes("yt-dlp"))!;
       assert.match(add, /--checksum=sha256:[0-9a-f]{64}/, "a sha256 digest must be pinned");
       assert.ok(
-        add.includes(`--checksum=sha256:${YTDLP_RUNTIME.sha256}`),
-        "the image digest must equal the runtime module's pinned digest",
+        add.includes(`--checksum=sha256:${YTDLP_RUNTIME.upstream.sha256}`),
+        "the upstream digest must equal the runtime module's pinned upstream digest",
       );
     });
 
-    it("installs the artifact at the exact path the runtime module executes", () => {
-      const add = addDirectives().find((args) => args.includes("yt-dlp"))!;
+    it("builds the patched artifact from the vendored patch with the reviewed builder, offline", () => {
+      const copies = directives("COPY").map((i) => i.args).filter((args) => args.includes(VENDORED));
+      assert.deepEqual(copies, [`${VENDORED} /build/patch/`], "the vendored patch is copied once, into the build stage");
+      const builds = instructions
+        .map((i, index) => ({ i, index }))
+        .filter(({ i }) => i.directive === "RUN" && i.args.includes("build_patched_ytdlp.py"));
+      assert.equal(builds.length, 1, "the builder runs exactly once");
+      const { i: run, index } = builds[0];
+      assert.equal(stageOf(index), "worker-base AS ytdlp-build", "in the build stage");
+      assert.match(run.args, /^--network=none\s/, "with no network at all");
+      assert.match(
+        run.args,
+        /(^|\s)python3 -I -B \/build\/patch\/build_patched_ytdlp\.py \/build\/upstream\/yt-dlp \/build\/out\/yt-dlp(\s|$)/,
+        "the system interpreter, isolated, on exactly the fetched asset and one new output path",
+      );
+    });
+
+    it("verifies the built artifact's exact SHA-256 before it can be copied", () => {
+      const run = directives("RUN").map((i) => i.args).find((args) => args.includes("build_patched_ytdlp.py"))!;
       assert.ok(
-        add.includes(YTDLP_RUNTIME.artifactPath),
-        "the install destination must equal the executed path",
+        run.includes(`echo "${YTDLP_RUNTIME.sha256}  /build/out/yt-dlp" | sha256sum --check --strict -`),
+        "the build fails closed unless the output digest equals the runtime module's pinned digest",
+      );
+      assert.notEqual(YTDLP_RUNTIME.sha256, YTDLP_RUNTIME.upstream.sha256, "the installed artifact is the patched build, not the upstream asset");
+    });
+
+    it("installs the artifact at the exact path the runtime module executes", () => {
+      const copies = instructions
+        .map((i, index) => ({ i, index }))
+        .filter(({ i }) => i.directive === "COPY" && i.args.includes(YTDLP_RUNTIME.artifactPath));
+      assert.equal(copies.length, 1, "the artifact is installed exactly once");
+      assert.equal(
+        copies[0].i.args,
+        `--from=ytdlp-build /build/out/yt-dlp ${YTDLP_RUNTIME.artifactPath}`,
+        "the install destination must equal the executed path, and the source is the verified build output",
+      );
+      assert.equal(stageOf(copies[0].index), "worker-base", "into the final stage");
+    });
+
+    it("carries no upstream asset, vendored source or builder into the final stage", () => {
+      const lastFrom = instructions.map((i) => i.directive).lastIndexOf("FROM");
+      const finalStage = instructions.slice(lastFrom + 1).map((i) => `${i.directive} ${i.args}`).join("\n");
+      assert.doesNotMatch(finalStage, /vendor\/yt-dlp|build_patched_ytdlp|\/build\/upstream|\/build\/patch/, "nothing of the build stage but its output");
+      assert.equal(
+        instructions.slice(lastFrom + 1).filter((i) => i.directive === "ADD").length,
+        0,
+        "the final stage fetches nothing",
       );
     });
 

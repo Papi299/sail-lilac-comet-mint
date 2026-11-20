@@ -1,11 +1,16 @@
-import { describe, it, afterEach } from "node:test";
+import { describe, it, afterEach, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AppError } from "../../lib/errors.ts";
 import {
   approvedJsRuntimePath,
   buildYtdlpEnvironment,
   parseYtdlpVersion,
   probeYtdlpRuntime,
+  setYtdlpRuntimeArtifactForTests,
   setYtdlpRuntimeProcessRunnerForTests,
   YTDLP_FFMPEG_ACQUISITION_MODES,
   YTDLP_PROBE_TIMEOUT_MS,
@@ -24,7 +29,31 @@ import {
  * cannot break them and only a real policy change can.
  *
  * No test here performs a network request or executes a real subprocess.
+ *
+ * LD-3e: the probe now authenticates the artifact's bytes BEFORE it runs the
+ * version subprocess, and the pinned artifact does not exist on a developer
+ * machine. The probe suites below therefore first install a small stand-in
+ * file with its own digest (`setYtdlpRuntimeArtifactForTests`), so that each
+ * of their cases still reaches the faked runner exactly as before. The
+ * integrity step itself is tested in `ytdlp-patched-runtime-integrity.server.test.ts`.
  */
+
+/** A verified stand-in for the pinned artifact, for the probe suites. */
+function installStandInArtifact(): () => void {
+  const dir = mkdtempSync(join(tmpdir(), "ytdlp-standin-"));
+  const bytes = Buffer.from("#!/usr/bin/env python3\nstand-in for the pinned yt-dlp artifact\n");
+  const path = join(dir, "yt-dlp");
+  writeFileSync(path, bytes);
+  setYtdlpRuntimeArtifactForTests({
+    path,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    sizeBytes: bytes.length,
+  });
+  return () => {
+    setYtdlpRuntimeArtifactForTests(null);
+    rmSync(dir, { recursive: true, force: true });
+  };
+}
 
 /** Splits the built argv into a shape that can be asserted precisely. */
 function parseArgs(args: readonly string[]) {
@@ -46,15 +75,21 @@ function parseArgs(args: readonly string[]) {
 describe("yt-dlp runtime pin", () => {
   it("pins an exact upstream release, digest and absolute paths", () => {
     // Date-shaped release tag: never `latest`, `nightly` or a channel name.
-    assert.match(YTDLP_RUNTIME.expectedVersion, /^\d{4}\.\d{2}\.\d{2}$/);
-    // A 64-hex SHA-256, not a placeholder.
+    assert.match(YTDLP_RUNTIME.upstream.version, /^\d{4}\.\d{2}\.\d{2}$/);
+    // LD-3e: the installed identity is that release plus a PEP 440 local
+    // version label, which no upstream build prints.
+    assert.equal(YTDLP_RUNTIME.expectedVersion, `${YTDLP_RUNTIME.upstream.version}+videofetch.ld3e1`);
+    // 64-hex SHA-256s, not placeholders, and the installed one is not the upstream one.
     assert.match(YTDLP_RUNTIME.sha256, /^[0-9a-f]{64}$/);
+    assert.match(YTDLP_RUNTIME.upstream.sha256, /^[0-9a-f]{64}$/);
+    assert.notEqual(YTDLP_RUNTIME.sha256, YTDLP_RUNTIME.upstream.sha256);
+    assert.ok(Number.isSafeInteger(YTDLP_RUNTIME.sizeBytes) && YTDLP_RUNTIME.sizeBytes > 0);
     // The release URL must embed the exact pinned version and must be an
     // immutable release asset, never a moving pointer.
-    assert.ok(YTDLP_RUNTIME.releaseUrl.startsWith("https://github.com/yt-dlp/yt-dlp/releases/download/"));
-    assert.ok(YTDLP_RUNTIME.releaseUrl.includes(`/${YTDLP_RUNTIME.expectedVersion}/`));
-    assert.equal(YTDLP_RUNTIME.releaseUrl.includes("latest"), false);
-    assert.equal(YTDLP_RUNTIME.releaseUrl.includes("nightly"), false);
+    assert.ok(YTDLP_RUNTIME.upstream.releaseUrl.startsWith("https://github.com/yt-dlp/yt-dlp/releases/download/"));
+    assert.ok(YTDLP_RUNTIME.upstream.releaseUrl.includes(`/${YTDLP_RUNTIME.upstream.version}/`));
+    assert.equal(YTDLP_RUNTIME.upstream.releaseUrl.includes("latest"), false);
+    assert.equal(YTDLP_RUNTIME.upstream.releaseUrl.includes("nightly"), false);
     // Executables are addressed absolutely; nothing is resolved through PATH.
     assert.ok(YTDLP_RUNTIME.pythonPath.startsWith("/"));
     assert.ok(YTDLP_RUNTIME.artifactPath.startsWith("/"));
@@ -64,10 +99,10 @@ describe("yt-dlp runtime pin", () => {
     // The PyInstaller executables unpack into a temp directory on every run,
     // which the read-only root and `noexec` media tmpfs would break. The
     // platform-independent zipimport asset is a bare `yt-dlp`.
-    assert.ok(YTDLP_RUNTIME.releaseUrl.endsWith("/yt-dlp"));
+    assert.ok(YTDLP_RUNTIME.upstream.releaseUrl.endsWith("/yt-dlp"));
     for (const variant of ["_linux", "_musllinux", "_macos", ".exe", "aarch64", ".zip", ".tar.gz"]) {
       assert.equal(
-        YTDLP_RUNTIME.releaseUrl.includes(variant),
+        YTDLP_RUNTIME.upstream.releaseUrl.includes(variant),
         false,
         `the pinned artifact must not be the ${variant} build`,
       );
@@ -395,6 +430,9 @@ describe("yt-dlp version parsing", () => {
     assert.equal(parseYtdlpVersion("2026.08.19\n"), "2026.08.19");
     assert.equal(parseYtdlpVersion("  2026.08.19  "), "2026.08.19");
     assert.equal(parseYtdlpVersion("2026.08.19.1"), "2026.08.19.1");
+    // LD-3e: a PEP 440 local version label, exactly as the patched build prints it.
+    assert.equal(parseYtdlpVersion("2026.08.19+videofetch.ld3e1\n"), "2026.08.19+videofetch.ld3e1");
+    assert.equal(parseYtdlpVersion(`${YTDLP_RUNTIME.expectedVersion}\n`), YTDLP_RUNTIME.expectedVersion);
   });
 
   it("rejects anything that is not exactly one version line", () => {
@@ -410,6 +448,13 @@ describe("yt-dlp version parsing", () => {
       "WARNING: something\n2026.08.19",
       "20260819",
       "2026.8.19",
+      "2026.08.19+",
+      "2026.08.19+videofetch.",
+      "2026.08.19+videofetch..ld3e1",
+      "2026.08.19+VideoFetch.ld3e1",
+      "2026.08.19+videofetch.ld3e1 extra",
+      "2026.08.19 +videofetch.ld3e1",
+      "2026.08.19+videofetch-ld3e1",
     ]) {
       assert.equal(parseYtdlpVersion(bad), null, `${JSON.stringify(bad)} must be rejected`);
     }
@@ -417,6 +462,11 @@ describe("yt-dlp version parsing", () => {
 });
 
 describe("yt-dlp runtime probe", () => {
+  let removeStandIn: () => void = () => undefined;
+  before(() => {
+    removeStandIn = installStandInArtifact();
+  });
+  after(() => removeStandIn());
   afterEach(() => setYtdlpRuntimeProcessRunnerForTests(null));
 
   it("reports available only for the exact pinned version", async () => {
@@ -517,6 +567,11 @@ describe("yt-dlp runtime probe", () => {
 });
 
 describe("yt-dlp runtime probe: opt-in cancellation and budget", () => {
+  let removeStandIn: () => void = () => undefined;
+  before(() => {
+    removeStandIn = installStandInArtifact();
+  });
+  after(() => removeStandIn());
   afterEach(() => setYtdlpRuntimeProcessRunnerForTests(null));
 
   it("preserves the Phase-10C1 no-argument contract exactly", async () => {

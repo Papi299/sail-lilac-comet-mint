@@ -200,10 +200,26 @@ describe("generic source: protocol policy (§16)", () => {
     // HERE until the boundary is reviewed again and this test restated. The
     // runtime proof itself is `ytdlp-dash-downloader-contract.server.test.ts`
     // and, inside the image, `verify-download-policy.py`.
-    assert.equal(YTDLP_RUNTIME.expectedVersion, "2026.08.19");
+    //
+    // RESTATED by VIDEOFETCH-LD3E-PINNED-YTDLP-PATCHED-RUNTIME-SOURCE-
+    // IMPLEMENTATION-001 after that review. The installed runtime is now the
+    // LD-3e patched build of the SAME upstream asset: it replaces only
+    // `yt_dlp/downloader/http.py` and `yt_dlp/version.py`, and every other
+    // member — `downloader/__init__.py` (the selection), `dash.py` and
+    // `fragment.py` included — is byte-identical to the 2026.08.19 asset (the
+    // vendored builder verifies each one). The selection is re-proven against
+    // the patched artifact by `ytdlp-dash-downloader-contract.server.test.ts`.
+    // Both pins are asserted, so a change to EITHER the upstream asset or the
+    // patch fails here again.
+    assert.equal(YTDLP_RUNTIME.upstream.version, "2026.08.19");
+    assert.equal(
+      YTDLP_RUNTIME.upstream.sha256,
+      "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6",
+    );
+    assert.equal(YTDLP_RUNTIME.expectedVersion, "2026.08.19+videofetch.ld3e1");
     assert.equal(
       YTDLP_RUNTIME.sha256,
-      "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6",
+      "2dfa21ec04eebb61612e3e6eb5d24f13527264275a0a34d6ef7e5d33a9260259",
     );
     assert.deepEqual(
       GENERIC_SOURCE_PROTOCOLS.filter((p) => genericAcquisitionLayout(p) === "segmented"),
