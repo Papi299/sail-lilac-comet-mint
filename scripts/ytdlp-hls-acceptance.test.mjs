@@ -73,6 +73,7 @@ import {
 import {
   HLS_MODE_EVIDENCE_SCHEMAS,
   acceptanceIdentityChecks,
+  acceptanceYtdlpPinHolds,
   buildAcceptanceEvidence,
   imageRemovalFact,
   parseHlsAcceptanceArgv,
@@ -1383,6 +1384,20 @@ describe("hls host driver", () => {
     }
   });
 
+  it("LD-3e: a present-day candidate's drift from the accepted base refuses the overlay before any Docker command", async () => {
+    // Between 593f47df and d6131124 these four differ (Dockerfile.worker only since LD-3e); the alias loader and hooks do not.
+    const drifted = ["package.json", "package-lock.json", "Dockerfile.worker", "src/worker/runtime/ytdlp-runtime.server.ts"];
+    const blobsAtHead = { ...repoState().blobsAtBase, ...Object.fromEntries(drifted.map((path) => [path, "e".repeat(40)])) };
+    const world = fakeWorld(repoState({ blobsAtHead }), { evidenceText: passText() });
+    await assert.rejects(
+      runHlsAcceptance(opts(), { ...world.deps, scratchRoot: scratch }),
+      (error) =>
+        error instanceof ProvenanceError &&
+        error.message.includes(`the accepted-image overlay is no longer justified: ${drifted.join(", ")} differ between`),
+    );
+    assert.equal(world.docker().length, 0, "no docker inspect, build or run");
+  });
+
   it("an unavailable or mismatched accepted base refuses before any build", async () => {
     const world = fakeWorld(repoState(), { baseId: `sha256:${"b".repeat(64)}`, evidenceText: passText() });
     await assert.rejects(runHlsAcceptance(opts(), { ...world.deps, scratchRoot: scratch }), /ACCEPTED RUNTIME IMAGE UNAVAILABLE/);
@@ -1585,6 +1600,70 @@ describe("hls acceptance identity checks", () => {
       assert.deepEqual(failing({}, interfaces), ["release/network-namespace-is-loopback-only"], String(JSON.stringify(interfaces)));
     }
     assert.throws(() => acceptanceIdentityChecks({ ...RELEASE_OPTS, mode: "both" }), /unknown acceptance mode/);
+  });
+});
+
+// ── LD-3e: the runtime pin per mode (VIDEOFETCH-LD3E-LINUX-ACCEPTANCE-KIT-IDENTITY-RECONCILIATION-001) ──
+
+describe("hls runtime pin per mode (LD-3e)", () => {
+  const PATCHED = "2026.08.19+videofetch.ld3e1";
+  const UPSTREAM = "2026.08.19";
+  const holds = (opts, reportedVersion, pinnedVersion) => acceptanceYtdlpPinHolds(opts, { reportedVersion, pinnedVersion });
+
+  it("D1/D2. release-image mode requires the candidate's own pin, and never the HLS-08 historical base", () => {
+    assert.notEqual(PATCHED, HLS08_ACCEPTED_BASE.ytdlpVersion);
+    assert.equal(holds(RELEASE_OPTS, PATCHED, PATCHED), true);
+    for (const [reported, pinned] of [
+      [UPSTREAM, PATCHED], // an image shipping the unpatched artifact under the LD-3e pin
+      [PATCHED, UPSTREAM],
+      ["2026.08.19+videofetch.ld3e2", PATCHED],
+      [null, PATCHED],
+      [undefined, PATCHED],
+      [PATCHED, ""],
+      [PATCHED, undefined],
+      ["", ""],
+    ]) {
+      assert.equal(holds(RELEASE_OPTS, reported, pinned), false, `${String(reported)} vs ${String(pinned)}`);
+    }
+  });
+
+  it("D3/D4. overlay mode keeps the historical premise: only a candidate pinned to the base's runtime can pass", () => {
+    assert.equal(HLS08_ACCEPTED_BASE.ytdlpVersion, UPSTREAM);
+    assert.equal(holds(OVERLAY_OPTS, UPSTREAM, UPSTREAM), true, "a historical HLS-08 candidate is unaffected");
+    assert.equal(holds(OVERLAY_OPTS, PATCHED, PATCHED), false, "an LD-3e candidate cannot be qualified by overlay");
+    assert.equal(holds(OVERLAY_OPTS, UPSTREAM, PATCHED), false, "LD-3e source on the historical image");
+    assert.equal(holds(OVERLAY_OPTS, PATCHED, UPSTREAM), false);
+    assert.equal(holds(OVERLAY_OPTS, null, UPSTREAM), false);
+  });
+
+  it("overlay mode is exactly the historical predicate over every combination", () => {
+    const values = [PATCHED, UPSTREAM, "2026.09.01", "", null, undefined];
+    for (const reported of values) {
+      for (const pinned of values) {
+        // The pre-LD-3e orchestrator's expression, verbatim in shape.
+        const historical = reported === pinned && reported === HLS08_ACCEPTED_BASE.ytdlpVersion;
+        assert.equal(holds(OVERLAY_OPTS, reported, pinned), historical, `${String(reported)} / ${String(pinned)}`);
+      }
+    }
+  });
+
+  it("an unknown or missing mode throws rather than choosing a predicate", () => {
+    for (const opts of [{ mode: "hybrid" }, { mode: "" }, {}, null, undefined]) {
+      assert.throws(() => holds(opts, PATCHED, PATCHED), /unknown acceptance mode/);
+    }
+  });
+
+  it("the in-image orchestrator decides the pin by its explicit mode, and reads no historical base itself", async () => {
+    const source = await readFile(new URL("../deploy/acceptance/ytdlp-generic/hls-full-path.mjs", import.meta.url), "utf8");
+    assert.equal(source.split('"preflight/ytdlp-exact-pin"').length - 1, 1);
+    assert.ok(
+      source.includes(
+        "acceptanceYtdlpPinHolds(opts, { reportedVersion: runtime.version, pinnedVersion: YTDLP_RUNTIME.expectedVersion })",
+      ),
+    );
+    assert.equal(source.split("await preflight(checks, opts)").length - 1, 1);
+    assert.ok(!source.includes("HLS08_ACCEPTED_BASE"), "the historical base is consulted only through the mode module");
+    assert.ok(HLS08_MANDATORY_CHECKS.includes("preflight/ytdlp-exact-pin"), "the check keeps its name in the ledger");
   });
 });
 

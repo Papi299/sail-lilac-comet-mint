@@ -227,6 +227,17 @@ import {
  *        webm + clear-HLS + segmented DASH + clear-HLS v2 (fMP4) + split-merge
  *        timing + separate-audio clear HLS (fMP4 + fMP4, one byte budget and
  *        one acquisition deadline).
+ *
+ *        The pinned runtime is a value, not part of the schema's meaning: a
+ *        PASS has always required that the candidate ship exactly the runtime
+ *        the harness pins (`EXPECTED_YTDLP_RUNTIME`), and every record states
+ *        the artifact it measured in its own `runtime` block. Since LD-3e
+ *        (VIDEOFETCH-LD3E-LINUX-ACCEPTANCE-KIT-IDENTITY-RECONCILIATION-001)
+ *        that pin is the patched `2026.08.19+videofetch.ld3e1` build, so the
+ *        schema is NOT bumped. -09 records measured under the earlier pin
+ *        (`2026.08.19`, `1fa6733c…`) stay valid for the candidates and the
+ *        artifact they recorded; they are not LD-3e evidence, and this
+ *        harness refuses them as a PASS of its own pin.
  */
 export const SPLIT07_EVIDENCE_SCHEMA = "split07-release-image-candidate-09";
 
@@ -412,11 +423,33 @@ export const FORBIDDEN_IMAGE_ENVIRONMENT_NAMES = Object.freeze([
   "R2_SIGNER_SESSION_TOKEN",
 ]);
 
-/** The pinned media runtime a release candidate must ship, exactly. */
+/**
+ * The pinned media runtime a release candidate must ship, exactly.
+ *
+ * Since LD-3e this is the PATCHED artifact `Dockerfile.worker` builds: the
+ * upstream 2026.08.19 asset with exactly two archive members replaced from
+ * `vendor/yt-dlp/2026.08.19-videofetch-ld3e/` (`PATCH-MANIFEST.json`), whose
+ * `--version` prints `2026.08.19+videofetch.ld3e1`. The unpatched upstream
+ * asset (`2026.08.19`, `1fa6733c…`) is that build's INPUT, pinned by the
+ * Dockerfile's `ADD --checksum` and `YTDLP_RUNTIME.upstream`; it is not a
+ * release runtime, and an image shipping it fails `runtime/ytdlp-version` and
+ * `runtime/ytdlp-sha256` here (VIDEOFETCH-LD3E-LINUX-ACCEPTANCE-KIT-IDENTITY-
+ * RECONCILIATION-001).
+ *
+ * An independent copy on purpose: the host driver runs this module on the VM's
+ * older Node, which cannot load `src/worker/runtime/ytdlp-runtime.server.ts`.
+ * `scripts/ytdlp-acceptance-kit-identity.test.mjs` asserts that it equals
+ * `YTDLP_RUNTIME`, the manifest's output and the Dockerfile's final checksum,
+ * so a one-sided change fails.
+ *
+ * A record produced under the previous value (`2026.08.19`, `1fa6733c…`) stays
+ * evidence of exactly what it measured — its own `runtime` block says which
+ * artifact that was — and is not evidence of this one (`assertPassEarned`).
+ */
 export const EXPECTED_YTDLP_RUNTIME = Object.freeze({
   path: "/usr/local/lib/videofetch/yt-dlp",
-  version: "2026.08.19",
-  sha256: "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6",
+  version: "2026.08.19+videofetch.ld3e1",
+  sha256: "2dfa21ec04eebb61612e3e6eb5d24f13527264275a0a34d6ef7e5d33a9260259",
   uid: 0,
   gid: 0,
   mode: "0555",
@@ -1254,6 +1287,29 @@ function assertPassEarned(record) {
   const separator = tag.lastIndexOf(":");
   if (separator < 0 || FORBIDDEN_CANDIDATE_TAGS.includes(tag.slice(separator + 1))) {
     throw new ReleaseEvidenceError(`refusing to emit a PASS record naming a deployable tag: ${tag}`);
+  }
+
+  // The runtime the record states is the runtime this harness pins. The
+  // `runtime/*` checks above already required it; this re-derives that from
+  // the record's own `runtime` block, so a PASS can never name another
+  // artifact, and a record measured under an earlier pin (the unpatched
+  // `2026.08.19` included) is refused as THIS pin's qualification rather than
+  // silently read as one. Not a new requirement, so no schema bump: such a
+  // record remains evidence of exactly what it measured.
+  const runtime = record.runtime ?? {};
+  const runtimeMismatches = [
+    ["ytdlpVersion", EXPECTED_YTDLP_RUNTIME.version],
+    ["ytdlpSha256", EXPECTED_YTDLP_RUNTIME.sha256],
+    ["ytdlpPath", EXPECTED_YTDLP_RUNTIME.path],
+    ["ytdlpUid", EXPECTED_YTDLP_RUNTIME.uid],
+    ["ytdlpGid", EXPECTED_YTDLP_RUNTIME.gid],
+    ["ytdlpMode", EXPECTED_YTDLP_RUNTIME.mode],
+  ].filter(([field, expected]) => runtime[field] !== expected).map(([field]) => field);
+  if (runtimeMismatches.length > 0) {
+    throw new ReleaseEvidenceError(
+      `refusing to emit a PASS record whose runtime is not the pinned yt-dlp ${EXPECTED_YTDLP_RUNTIME.version}: ` +
+        `${runtimeMismatches.join(", ")} differ`,
+    );
   }
 }
 

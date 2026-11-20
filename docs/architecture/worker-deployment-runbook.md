@@ -1504,9 +1504,14 @@ image. At run time the probe reads the installed file and compares its SHA-256
 with the pin BEFORE it executes `--version`, so an unpatched, modified or
 replaced artifact is refused (`EXTRACTOR_UNAVAILABLE`) without being run. The
 directory's `PROVENANCE.md` and `PATCH-MANIFEST.json` record every digest. The
-release-image acceptance kit under `deploy/acceptance/ytdlp-generic/` still
-states the unpatched identity in its own, independent constants; updating them
-belongs to the separately authorized release-image qualification of this build.
+release-image acceptance kit under `deploy/acceptance/ytdlp-generic/` states
+this same patched identity in its own, independent constants (SPLIT-07's
+version and digest, Stage A's version, both Python policy verifiers), and
+`scripts/ytdlp-acceptance-kit-identity.test.mjs` asserts they agree with
+`YTDLP_RUNTIME`, the manifest and the Dockerfile
+(VIDEOFETCH-LD3E-LINUX-ACCEPTANCE-KIT-IDENTITY-RECONCILIATION-001). That is
+source readiness only: no Linux image has been built from this source or
+qualified with the kit yet; that remains its own, separately authorized step.
 
 `src/worker/runtime/ytdlp-runtime.server.ts` holds the same version, digest and
 paths, and `container-policy.test.ts` asserts the image and the module agree, so

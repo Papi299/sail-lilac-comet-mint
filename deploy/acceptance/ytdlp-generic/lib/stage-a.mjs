@@ -12,9 +12,25 @@
 import { OUTCOMES, check, measuredCheck, summarize } from "./verdict.mjs";
 import { CONTAINER_ID_PATTERN, NET_NAMESPACE_PATTERN } from "./observers.mjs";
 
-/** The exact reviewed runtime contract (§13). Exact values, never ranges. */
+/**
+ * The exact reviewed runtime contract (§13). Exact values, never ranges.
+ *
+ * `ytdlpVersion` is ONE identity: the LD-3e patched build
+ * (`2026.08.19+videofetch.ld3e1`, VIDEOFETCH-LD3E-LINUX-ACCEPTANCE-KIT-
+ * IDENTITY-RECONCILIATION-001), which is what a Worker built from the current
+ * source reports, and reports only after its own probe has matched the
+ * artifact's SHA-256. Stage A grades the deployment under review; it never
+ * asserts what any other deployment runs. A deployment of an image that ships
+ * the unpatched upstream `2026.08.19` — every image built before LD-3e — fails
+ * this gate, truthfully. A Stage A record states
+ * the version it measured (`runtime.ytdlpVersion`) and the one it required (the
+ * check's detail), so a record sealed under the earlier pin keeps exactly that
+ * meaning. A standalone copy, like the rest of this module;
+ * `scripts/ytdlp-acceptance-kit-identity.test.mjs` asserts it equals
+ * `YTDLP_RUNTIME.expectedVersion`.
+ */
 export const EXPECTED_RUNTIME = Object.freeze({
-  ytdlpVersion: "2026.08.19",
+  ytdlpVersion: "2026.08.19+videofetch.ld3e1",
   bundledEjsVersion: "0.8.0",
   /** Bookworm's system interpreter. The minor may move within 3.11; the major/minor may not. */
   pythonSeries: "3.11",

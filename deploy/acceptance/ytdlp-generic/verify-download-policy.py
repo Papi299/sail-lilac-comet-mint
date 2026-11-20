@@ -32,7 +32,12 @@ import shutil
 import subprocess
 import sys
 
-EXPECTED_VERSION = "2026.08.19"
+# The LD-3e patched artifact's identity, as its own yt_dlp/version.py states it
+# (the unpatched upstream 2026.08.19 asset is the build's input, never the
+# runtime). Standalone on purpose, since this file runs inside the image with no
+# repository imports; scripts/ytdlp-acceptance-kit-identity.test.mjs asserts it
+# equals YTDLP_RUNTIME.expectedVersion.
+EXPECTED_VERSION = "2026.08.19+videofetch.ld3e1"
 
 DEAD_PATH = "/nonexistent/videofetch-yt-dlp-no-path"
 DEAD_FFMPEG = "/nonexistent/videofetch-yt-dlp-no-ffmpeg"

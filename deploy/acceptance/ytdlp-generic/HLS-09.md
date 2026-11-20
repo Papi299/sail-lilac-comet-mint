@@ -62,6 +62,15 @@ The orchestrator `hls-full-path.mjs` is not forked. It takes a required
   ordinary HLS-backed presets, the fresh execution analysis, the ordinary
   `deriveExecutionPlan()`, HLS-2, HLS-3, `beginProcessing()`, HLS-4, the upload
   lifecycle, `ready`, and the three bounded negatives.
+- The one identity-dependent preflight predicate is `preflight/ytdlp-exact-pin`
+  (`acceptanceYtdlpPinHolds`). In `overlay` mode the image's runtime and the
+  candidate's pin must both be the HLS-08 base's historical `2026.08.19`, as
+  before. In `release-image` mode the image's runtime must be the candidate's
+  **own** pin, and the historical base is never consulted. Since LD-3e the two
+  differ: the patched `2026.08.19+videofetch.ld3e1` candidate is qualified in
+  `release-image` mode, and overlay qualification against the historical base
+  does not apply to it and refuses — before any Docker command, at
+  `verifyOverlayContextProvenance`, and again at this predicate.
 
 The HLS-08 overlay invocation now passes `--acceptance-mode overlay`
 explicitly, and still emits `-02` with the same meaning and the same mandatory

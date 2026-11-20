@@ -78,6 +78,7 @@ import {
 import {
   evaluateStageA,
   enablementAuthorized,
+  EXPECTED_RUNTIME,
   rejectsStageBConfiguration,
   REQUIRED_SERVICES,
 } from "../deploy/acceptance/ytdlp-generic/lib/stage-a.mjs";
@@ -237,7 +238,7 @@ function passingStageAObservations(overrides = {}) {
       workerNetNamespace: "net:[4026532355]",
       mediaNetNamespace: "net:[4026532355]",
     }),
-    ytdlpVersion: measured("2026.08.19"),
+    ytdlpVersion: measured("2026.08.19+videofetch.ld3e1"),
     pythonVersion: measured("3.11.2"),
     nodeVersion: measured("v22.23.2"),
     bundledEjsVersion: measured("0.8.0"),
@@ -620,7 +621,7 @@ function makeFakeWorld(options = {}) {
     ytdlpEnabled: options.ytdlpEnabled ?? null,
     services: options.services ?? "active",
     egressExit: options.egressExit ?? 0,
-    ytdlpVersion: options.ytdlpVersion ?? "2026.08.19",
+    ytdlpVersion: options.ytdlpVersion ?? "2026.08.19+videofetch.ld3e1",
     sites: options.sites ?? { ytdlp: false, ytdlpInstalled: true, ytdlpEnabled: false, ffmpeg: true },
     imageIds: options.imageIds ?? { [`videofetch-worker:${SHA}`]: IMAGE_ID, "videofetch-worker:latest": IMAGE_ID },
     runningImage: options.runningImage ?? IMAGE_ID,
@@ -2650,7 +2651,12 @@ describe("Stage A gates", () => {
   });
 
   it("9. an inexact runtime is never accepted", () => {
-    for (const version of ["2026.09.01", "2025.01.01", "latest", "2026.08.19.1", ""]) {
+    for (const version of [
+      "2026.09.01", "2025.01.01", "latest", "2026.08.19.1", "",
+      // LD-3e: the unpatched upstream identity, and near misses of the patched one.
+      "2026.08.19", "2026.08.19+videofetch.ld3e2", "2026.08.19+VideoFetch.ld3e1", "2026.08.19+videofetch",
+      " 2026.08.19+videofetch.ld3e1", "2026.08.19+videofetch.ld3e1\n",
+    ]) {
       const result = evaluateStageA(passingStageAObservations({ ytdlpVersion: measured(version) }));
       assert.equal(result.summary.verdict, OUTCOMES.FAIL, version);
     }
@@ -2742,6 +2748,60 @@ describe("Stage A gates", () => {
     );
     assert.equal(result.summary.verdict, OUTCOMES.FAIL);
     assert.ok(result.summary.blocking.includes("direct.byte-integrity"));
+  });
+});
+
+// ── LD-3e: Stage A's ONE runtime identity (VIDEOFETCH-LD3E-LINUX-ACCEPTANCE-KIT-IDENTITY-RECONCILIATION-001) ──
+
+describe("Stage A runtime pin (LD-3e)", () => {
+  const PATCHED = "2026.08.19+videofetch.ld3e1";
+  const UPSTREAM = "2026.08.19";
+  const versionCheck = (result) => result.checks.find((entry) => entry.id === "runtime.ytdlp-version");
+
+  it("E1. the patched identity passes, and the check names the one identity it required", () => {
+    assert.equal(EXPECTED_RUNTIME.ytdlpVersion, PATCHED);
+    const result = evaluateStageA(passingStageAObservations({ ytdlpVersion: measured(PATCHED) }));
+    assert.equal(result.summary.verdict, OUTCOMES.PASS);
+    assert.equal(versionCheck(result).outcome, OUTCOMES.PASS);
+    assert.equal(versionCheck(result).detail, `yt-dlp is exactly ${PATCHED}`);
+    assert.equal(enablementAuthorized(result).authorized, true);
+  });
+
+  it("E2. the unpatched upstream identity — what an image without LD-3e reports — FAILS (measured), never BLOCKS", () => {
+    const result = evaluateStageA(passingStageAObservations({ ytdlpVersion: measured(UPSTREAM) }));
+    assert.equal(result.summary.verdict, OUTCOMES.FAIL);
+    assert.equal(versionCheck(result).outcome, OUTCOMES.FAIL);
+    assert.equal(versionCheck(result).detail, `yt-dlp is exactly ${PATCHED}`);
+    assert.deepEqual(result.summary.blocking, ["runtime.ytdlp-version"]);
+    assert.match(enablementAuthorized(result).reason, /STOP BEFORE GENERIC ENABLEMENT — FAIL: runtime\.ytdlp-version/);
+    // An unmeasured version stays BLOCKED, never coerced into either answer.
+    const unmeasurable = evaluateStageA(passingStageAObservations({ ytdlpVersion: unmeasured("diagnostics unavailable") }));
+    assert.equal(versionCheck(unmeasurable).outcome, OUTCOMES.BLOCKED);
+    assert.equal(unmeasurable.summary.verdict, OUTCOMES.BLOCKED);
+  });
+
+  it("E3. one observation can satisfy exactly one identity: the gate admits the patched string and nothing else", () => {
+    const candidates = [PATCHED, UPSTREAM, "2026.08.19+videofetch.ld3e2", "2026.08.19.1", `${PATCHED} `, PATCHED.toUpperCase()];
+    const admitted = candidates.filter(
+      (version) => versionCheck(evaluateStageA(passingStageAObservations({ ytdlpVersion: measured(version) }))).outcome === OUTCOMES.PASS,
+    );
+    assert.deepEqual(admitted, [PATCHED]);
+  });
+
+  it("E4. a live Stage A against a deployment reporting the upstream version writes a FAIL record stating what it measured", async () => {
+    const world = makeFakeWorld({ ytdlpVersion: UPSTREAM });
+    const run = await runCli(
+      ["--stage", "A", ...LIVE_ARGS, "--evidence", "/tmp/upstream-stage-a.json"],
+      LIVE_ENV({ VIDEOFETCH_ACCEPT_DIRECT_URL: "https://fixture.invalid/clip.mp4" }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch },
+    );
+    assert.equal(run.code, 1, `${run.out}\n${run.err}`);
+    const record = JSON.parse(run.files.get("/tmp/upstream-stage-a.json"));
+    assert.equal(record.verdict, OUTCOMES.FAIL);
+    assert.equal(record.runtime.ytdlpVersion, UPSTREAM);
+    const entry = record.checks.find((check) => check.id === "runtime.ytdlp-version");
+    assert.deepEqual([entry.outcome, entry.detail], [OUTCOMES.FAIL, `yt-dlp is exactly ${PATCHED}`]);
+    assert.equal(record.schemaVersion, EVIDENCE_SCHEMA_VERSION, "no evidence schema bump");
   });
 });
 

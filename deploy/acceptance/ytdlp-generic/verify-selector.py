@@ -40,7 +40,12 @@ from __future__ import annotations
 
 import sys
 
-EXPECTED_VERSION = "2026.08.19"
+# The LD-3e patched artifact's identity, as its own yt_dlp/version.py states it
+# (the unpatched upstream 2026.08.19 asset is the build's input, never the
+# runtime). Standalone on purpose, since this file runs inside the image with no
+# repository imports; scripts/ytdlp-acceptance-kit-identity.test.mjs asserts it
+# equals YTDLP_RUNTIME.expectedVersion.
+EXPECTED_VERSION = "2026.08.19+videofetch.ld3e1"
 
 # The application-owned selector, mirrored from
 # src/worker/execution/generic-source.ts `buildGenericFormatSelector`.

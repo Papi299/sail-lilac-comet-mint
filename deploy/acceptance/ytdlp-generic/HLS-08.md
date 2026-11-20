@@ -131,6 +131,12 @@ The accepted base is pinned in `HLS08_ACCEPTED_BASE`: source
 `sha256:5925515fb002cd7203228325e1d30fd5987eafde3043ca1663162b9fe04df21e`,
 yt-dlp `2026.08.19`. A tag is not evidence: the driver inspects the id, and
 after the build proves the overlay's layers begin with the base's layers.
+These are historical values and stay exactly as recorded. A present-day source
+differs from that base in runtime-critical files (`package.json`,
+`package-lock.json` and the runtime module since before LD-3e, `Dockerfile.worker`
+too since LD-3e, which pins the patched `2026.08.19+videofetch.ld3e1`), so the
+overlay refuses it before any Docker command; its applicable qualification is
+the release-image mode (HLS-09.md).
 
 ---
 
