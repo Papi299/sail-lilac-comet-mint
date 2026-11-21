@@ -19,6 +19,7 @@ import {
   existsSync,
   readFileSync,
   readdirSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -263,6 +264,21 @@ function passingStageAObservations(overrides = {}) {
 }
 
 const passingStageA = () => evaluateStageA(passingStageAObservations());
+
+/**
+ * The two runtime statements a genuine Stage A record carries, as the harness
+ * writes them: the version the deployment REPORTED (`runtime.ytdlpVersion`) and
+ * the Stage A evaluator's own GRADE of it under the current pin (the
+ * `runtime.ytdlp-version` check). `loadStageA` admits a Stage A record only with
+ * both (VIDEOFETCH-LD3E-STAGE-A-RUNTIME-ADMISSION-CORRECTION-001), so every
+ * hand-built fixture below that stands for a GENUINE current pass carries them.
+ * Taken from the authority and from the real evaluator, never from a copy.
+ */
+const currentPinRuntime = () => ({ ytdlpVersion: EXPECTED_RUNTIME.ytdlpVersion });
+const currentPinGrade = () => {
+  const { id, outcome, required, detail } = passingStageA().checks.find((entry) => entry.id === "runtime.ytdlp-version");
+  return { id, outcome, required, detail };
+};
 
 /** A process sample in which acquisition looks exactly as designed. */
 function acquisitionSample(extra = []) {
@@ -2805,6 +2821,414 @@ describe("Stage A runtime pin (LD-3e)", () => {
   });
 });
 
+// ── LD-3e: Stage A ADMISSION requires the current runtime pin ──────────────
+// (VIDEOFETCH-LD3E-STAGE-A-RUNTIME-ADMISSION-CORRECTION-001)
+//
+// `loadStageA` established four things about a prior Stage A record: it is
+// authentic, it is a Stage A PASS, its deployment binding is complete, and the
+// two copies of that binding agree. None of them says which runtime pin the
+// PASS was graded under, and the evidence schema deliberately did not move with
+// the LD-3e pin. So an authentic PASS sealed while the pin was the upstream
+// build, bound to an image kept for rollback, authorized a current-kit Stage B
+// on that image once it ran again (G1); and a sealed record stating the retired
+// runtime, bound to the patched deployment, authorized Stage B there (G2).
+// Condition 5 re-reads the record's OWN runtime statement and grade, after
+// authentication and without changing the record.
+
+describe("Stage A admission requires the current runtime pin (LD-3e)", () => {
+  /** TEST-ONLY run material. */
+  const KEY = "e".repeat(64);
+  const RUN = { runId: "1d3e1d3e1d3e1d3e", key: KEY };
+  /** The one authority: the pin the Stage A evaluator grades against. */
+  const PIN = EXPECTED_RUNTIME.ytdlpVersion;
+  /** The upstream pin every image built before LD-3e reports, and the one earlier Stage A records were graded under. */
+  const RETIRED = "2026.08.19";
+  const RUNTIME_CHECK = "runtime.ytdlp-version";
+  /** An earlier, unpatched deployment kept for rollback (synthetic identities). */
+  const ROLLBACK_SHA = "3".repeat(40);
+  const ROLLBACK_IMAGE = `sha256:${"9".repeat(64)}`;
+  const literally = (text) => new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+
+  /**
+   * A Stage A record exactly as the live harness writes one for the deployment
+   * `sha` / `image`: the REAL evaluator's checks over a passing observation, the
+   * REAL record builder, sealed under the test key. `gradedUnder` writes the
+   * runtime grade the way the evaluator of an earlier pin wrote it: the same
+   * check and the same template (unchanged since the harness was added), another
+   * pin. `edit` runs BEFORE sealing, so the record stays authentic.
+   */
+  const stageARecord = ({ sha = SHA, image = IMAGE_ID, measuredVersion = PIN, gradedUnder = PIN, edit } = {}) => {
+    const result = evaluateStageA(
+      passingStageAObservations({
+        expectedSha: sha,
+        runningImageId: measured(image),
+        imageShaTag: measured({ expectedSha: sha, taggedImageId: image, runningImageId: image }),
+        imageLatestAlias: measured({ latestImageId: image, taggedImageId: image }),
+      }),
+    );
+    assert.equal(result.summary.verdict, OUTCOMES.PASS, "precondition: the deployment passes Stage A");
+    const record = JSON.parse(
+      JSON.stringify(
+        buildEvidence({
+          stage: "A",
+          mode: "live",
+          schemaVersion: EVIDENCE_SCHEMA_VERSION,
+          runId: RUN.runId,
+          startedAt: "2026-11-21T00:00:00.000Z",
+          finishedAt: "2026-11-21T00:05:00.000Z",
+          expectedSha: sha,
+          binding: result.binding,
+          runningImageId: image,
+          imageTags: { expectedSha: sha, taggedImageId: image, runningImageId: image },
+          runtime: { ytdlpVersion: measuredVersion, pythonVersion: "3.11.2", nodeVersion: "v22.23.2", bundledEjsVersion: "0.8.0" },
+          checks: result.checks,
+          summary: result.summary,
+        }),
+      ),
+    );
+    if (gradedUnder !== PIN) {
+      const grade = record.checks.find((entry) => entry.id === RUNTIME_CHECK);
+      grade.detail = grade.detail.replace(PIN, gradedUnder);
+    }
+    edit?.(record);
+    return sealRecord(record, KEY);
+  };
+
+  /** Authentic, a PASS, bound to the unpatched deployment it ran against, and graded under the retired pin. */
+  const rollbackEra = () =>
+    stageARecord({ sha: ROLLBACK_SHA, image: ROLLBACK_IMAGE, measuredVersion: RETIRED, gradedUnder: RETIRED });
+
+  const admit = (record, expectedSha = SHA) =>
+    loadStageA("/tmp/stage-a.json", async () => JSON.stringify(record), { run: RUN, expectedSha });
+  const gradeOf = (record) => record.checks.find((entry) => entry.id === RUNTIME_CHECK);
+  const stated = (value) => JSON.stringify(value) ?? String(value);
+
+  it("P1. a genuine current-pin Stage A PASS is admitted", async () => {
+    const record = stageARecord();
+    assert.equal(record.runtime.ytdlpVersion, PIN);
+    assert.deepEqual(
+      record.checks.filter((entry) => entry.id === RUNTIME_CHECK),
+      [{ id: RUNTIME_CHECK, outcome: OUTCOMES.PASS, required: true, detail: `yt-dlp is exactly ${PIN}` }],
+      "precondition: the real evaluator's grade, exactly once",
+    );
+    const loaded = await admit(record);
+    assert.equal(loaded.ok, true, loaded.reason);
+    assert.equal(loaded.summary.verdict, OUTCOMES.PASS);
+    assert.deepEqual(loaded.binding, { expectedSha: SHA, runningImageId: IMAGE_ID, taggedImageId: IMAGE_ID });
+  });
+
+  it("P2. that record authorizes Stage B against the same observed image, and only that image", async () => {
+    const loaded = await admit(stageARecord());
+    assert.deepEqual(stageBAuthorization({ expectedSha: SHA, runningImageId: measured(IMAGE_ID) }, loaded), {
+      permitted: true,
+      reason: "Stage A passed and binds to this deployment",
+    });
+    const elsewhere = stageBAuthorization({ expectedSha: SHA, runningImageId: measured(ROLLBACK_IMAGE) }, loaded);
+    assert.equal(elsewhere.permitted, false);
+    assert.match(elsewhere.reason, /different image object/);
+  });
+
+  it("P3. a retired-pin record stays authentic history while admission refuses it", async () => {
+    const history = rollbackEra();
+    const bytes = JSON.stringify(history);
+    // Authentic under the contract it was sealed under: seal, harness, schema, run, source and image.
+    assert.equal(verifySeal(history, KEY).ok, true);
+    assert.equal(
+      verifyRecord(history, KEY, { runId: RUN.runId, expectedSha: ROLLBACK_SHA, runningImageId: ROLLBACK_IMAGE }).ok,
+      true,
+    );
+    assert.deepEqual([history.verdict, history.runtime.ytdlpVersion], [OUTCOMES.PASS, RETIRED]);
+    assert.equal(gradeOf(history).detail, `yt-dlp is exactly ${RETIRED}`);
+
+    const loaded = await admit(history, ROLLBACK_SHA);
+    assert.equal(loaded.ok, false);
+    assert.equal(loaded.binding, undefined, "it authorizes nothing");
+    assert.equal(JSON.stringify(history), bytes, "and it is left exactly as it was");
+    assert.equal(verifySeal(history, KEY).ok, true, "still authentic afterwards");
+  });
+
+  it("N1. G1: a rollback-era record bound to its own unpatched deployment cannot authorize a current-kit Stage B there", async () => {
+    const record = rollbackEra();
+    // Every condition the loader checked BEFORE this correction holds…
+    assert.equal(verifyRecord(record, KEY, { runId: RUN.runId, expectedSha: ROLLBACK_SHA, runningImageId: null }).ok, true);
+    assert.deepEqual([record.stage, record.verdict], ["A", OUTCOMES.PASS]);
+    assert.equal(validateDeploymentBinding(record.binding, ROLLBACK_SHA).ok, true);
+    assert.equal(bindingAgreesWithRecord(record).ok, true);
+    // …and once that image runs again, its binding alone would authorize Stage B.
+    assert.equal(
+      stageBAuthorization(
+        { expectedSha: ROLLBACK_SHA, runningImageId: measured(ROLLBACK_IMAGE) },
+        { summary: { verdict: record.verdict }, binding: record.binding },
+      ).permitted,
+      true,
+      "precondition: source and image binding alone cannot tell the pins apart",
+    );
+
+    const loaded = await admit(record, ROLLBACK_SHA);
+    assert.equal(loaded.ok, false);
+    assert.match(loaded.reason, literally(`measured yt-dlp "${RETIRED}", not the current runtime pin ${PIN}`));
+    assert.match(loaded.reason, /cannot authorize a current-kit Stage B/);
+    assert.equal(loaded.binding, undefined, "it authorizes nothing");
+  });
+
+  it("N2. G2: a record bound to the patched deployment but stating the retired runtime is refused", async () => {
+    for (const [what, gradedUnder] of [
+      ["measured and graded under the retired pin", RETIRED],
+      ["measured under the retired pin, graded under the current one", PIN],
+    ]) {
+      const record = stageARecord({ measuredVersion: RETIRED, gradedUnder });
+      assert.equal(
+        verifyRecord(record, KEY, { runId: RUN.runId, expectedSha: SHA, runningImageId: IMAGE_ID }).ok,
+        true,
+        `${what}: precondition: authentic, this run, this source, this image`,
+      );
+      const loaded = await admit(record);
+      assert.equal(loaded.ok, false, what);
+      assert.match(loaded.reason, literally(`measured yt-dlp "${RETIRED}", not the current runtime pin ${PIN}`), what);
+    }
+  });
+
+  it("N2b. the Stage B aggregate stops at the authorization edge on a G2 record and writes nothing", async () => {
+    const files = new Map();
+    files.set("/tmp/stage-a-g2.json", JSON.stringify(stageARecord({ measuredVersion: RETIRED, gradedUnder: RETIRED })));
+    files.set(RUN_KEY_PATH, JSON.stringify({ runId: RUN.runId, key: KEY }));
+    const world = makeFakeWorld({
+      ytdlpEnabled: "true",
+      sites: { ytdlp: true, ytdlpInstalled: true, ytdlpEnabled: true, ffmpeg: true },
+    });
+    const aggregate = await runCli(
+      [
+        "--stage", "B", "--aggregate", ...LIVE_ARGS,
+        "--stage-a", "/tmp/stage-a-g2.json",
+        "--case-evidence", "/tmp/case-never-read.json",
+        "--evidence", "/tmp/aggregate-g2.json",
+      ],
+      LIVE_ENV({ ...WORKER_ENV }),
+      { runReadOnly: world.runReadOnly, fetch: world.fetch, files },
+    );
+    assert.equal(aggregate.code, 2, `${aggregate.out}\n${aggregate.err}`);
+    assert.match(aggregate.err, /BLOCKED: the Stage A record is not usable — the Stage A record measured yt-dlp/);
+    assert.match(aggregate.err, literally(`"${RETIRED}", not the current runtime pin ${PIN}`));
+    assert.equal(aggregate.files.has("/tmp/aggregate-g2.json"), false, "no aggregate evidence is written");
+  });
+
+  it("N3. a record without a runtime block is refused", async () => {
+    for (const [what, edit] of [
+      ["runtime removed", (r) => { delete r.runtime; }],
+      ["runtime null", (r) => { r.runtime = null; }],
+    ]) {
+      const loaded = await admit(stageARecord({ edit }));
+      assert.equal(loaded.ok, false, what);
+      assert.match(loaded.reason, /states no measured yt-dlp runtime/, what);
+    }
+  });
+
+  it("N4. a null, malformed or inexact runtime identity is refused, even beside a genuine current grade", async () => {
+    for (const [what, edit] of [
+      ["version null", (r) => { r.runtime.ytdlpVersion = null; }],
+      ["version absent", (r) => { delete r.runtime.ytdlpVersion; }],
+      ["version a number", (r) => { r.runtime.ytdlpVersion = 20260819; }],
+      ["version a list", (r) => { r.runtime.ytdlpVersion = [PIN]; }],
+      ["version an object", (r) => { r.runtime.ytdlpVersion = { version: PIN }; }],
+      ["version a boolean", (r) => { r.runtime.ytdlpVersion = true; }],
+      ["runtime a string", (r) => { r.runtime = PIN; }],
+      ["runtime a list", (r) => { r.runtime = [PIN]; }],
+    ]) {
+      const record = stageARecord({ edit });
+      assert.equal(gradeOf(record).detail, `yt-dlp is exactly ${PIN}`, `${what}: precondition: the grade is genuine`);
+      const loaded = await admit(record);
+      assert.equal(loaded.ok, false, what);
+      assert.match(loaded.reason, /states no measured yt-dlp runtime/, what);
+    }
+    for (const version of [
+      "",
+      RETIRED,
+      `${PIN} `,
+      ` ${PIN}`,
+      `${PIN}\n`,
+      PIN.toUpperCase(),
+      `${PIN}1`,
+      `${RETIRED}+videofetch.ld3e2`,
+      `${RETIRED}+videofetch`,
+      `${RETIRED}.1`,
+    ]) {
+      const loaded = await admit(stageARecord({ measuredVersion: version }));
+      assert.equal(loaded.ok, false, stated(version));
+      assert.match(loaded.reason, literally(`not the current runtime pin ${PIN}`), stated(version));
+    }
+  });
+
+  it("N5. a record without its runtime grade, or without a check list, is refused", async () => {
+    const withoutGrade = stageARecord({ edit: (r) => { r.checks = r.checks.filter((entry) => entry.id !== RUNTIME_CHECK); } });
+    assert.ok(withoutGrade.checks.length > 10, "precondition: every other check is still there");
+    const loaded = await admit(withoutGrade);
+    assert.equal(loaded.ok, false);
+    assert.match(loaded.reason, /carries no runtime\.ytdlp-version grade/);
+
+    const asText = await admit(
+      stageARecord({ edit: (r) => { r.checks = r.checks.map((entry) => (entry.id === RUNTIME_CHECK ? RUNTIME_CHECK : entry)); } }),
+    );
+    assert.equal(asText.ok, false, "a grade that is only its id, as text, is no grade");
+    assert.match(asText.reason, /carries no runtime\.ytdlp-version grade/);
+
+    for (const [what, edit] of [
+      ["checks absent", (r) => { delete r.checks; }],
+      ["checks null", (r) => { r.checks = null; }],
+      ["checks an object keyed by id", (r) => { r.checks = { [RUNTIME_CHECK]: gradeOf(r) }; }],
+    ]) {
+      const refused = await admit(stageARecord({ edit }));
+      assert.equal(refused.ok, false, what);
+      assert.match(refused.reason, /carries no check list/, what);
+    }
+  });
+
+  it("N6. a current measured version graded under another pin, or graded in other words, is refused", async () => {
+    for (const other of [RETIRED, `${RETIRED}+videofetch.ld3e2`, `${PIN} `]) {
+      const record = stageARecord({ gradedUnder: other });
+      assert.equal(record.runtime.ytdlpVersion, PIN, `${stated(other)}: precondition: the measured version is current`);
+      const loaded = await admit(record);
+      assert.equal(loaded.ok, false, stated(other));
+      assert.match(loaded.reason, /graded under a different runtime pin or contract/, stated(other));
+    }
+    for (const [what, edit] of [
+      ["detail absent", (r) => { delete gradeOf(r).detail; }],
+      ["detail null", (r) => { gradeOf(r).detail = null; }],
+      ["detail reworded", (r) => { gradeOf(r).detail = `yt-dlp is ${PIN}`; }],
+      ["detail with a suffix", (r) => { gradeOf(r).detail += " — NOT MEASURABLE: diagnostics unavailable"; }],
+    ]) {
+      const loaded = await admit(stageARecord({ edit }));
+      assert.equal(loaded.ok, false, what);
+      assert.match(loaded.reason, /graded under a different runtime pin or contract/, what);
+    }
+  });
+
+  it("N7. a runtime grade that is not PASS is refused", async () => {
+    const edits = [OUTCOMES.FAIL, OUTCOMES.BLOCKED, OUTCOMES.NOT_EXERCISED, "pass", "", null].map((outcome) => [
+      stated(outcome),
+      (r) => { gradeOf(r).outcome = outcome; },
+    ]);
+    edits.push(["outcome absent", (r) => { delete gradeOf(r).outcome; }]);
+    for (const [what, edit] of edits) {
+      const loaded = await admit(stageARecord({ edit }));
+      assert.equal(loaded.ok, false, what);
+      assert.match(loaded.reason, /is not a required PASS/, what);
+    }
+  });
+
+  it("N8. an optional runtime grade is refused", async () => {
+    const edits = [false, "true", 1, null].map((required) => [stated(required), (r) => { gradeOf(r).required = required; }]);
+    edits.push(["required absent", (r) => { delete gradeOf(r).required; }]);
+    for (const [what, edit] of edits) {
+      const loaded = await admit(stageARecord({ edit }));
+      assert.equal(loaded.ok, false, what);
+      assert.match(loaded.reason, /is not a required PASS/, what);
+    }
+  });
+
+  it("N9. duplicated runtime grades are refused, whatever their order or agreement", async () => {
+    for (const [what, edit] of [
+      ["two identical PASS grades", (r) => { r.checks.push({ ...gradeOf(r) }); }],
+      ["PASS first, then FAIL", (r) => { r.checks.push({ ...gradeOf(r), outcome: OUTCOMES.FAIL }); }],
+      ["FAIL first, then PASS", (r) => { r.checks.unshift({ ...gradeOf(r), outcome: OUTCOMES.FAIL }); }],
+      ["a retired-pin PASS beside the current one", (r) => {
+        r.checks.push({ ...gradeOf(r), detail: gradeOf(r).detail.replace(PIN, RETIRED) });
+      }],
+    ]) {
+      const record = stageARecord({ edit });
+      assert.equal(record.checks.filter((entry) => entry.id === RUNTIME_CHECK).length, 2, `${what}: precondition`);
+      const loaded = await admit(record);
+      assert.equal(loaded.ok, false, what);
+      assert.match(loaded.reason, /carries 2 runtime\.ytdlp-version grades/, what);
+    }
+  });
+
+  it("N10. a tampered record fails authenticity first, whatever its runtime statement says", async () => {
+    // A retired-pin record relabelled to the current pin WITHOUT resealing: an edit cannot make it count.
+    const relabelled = rollbackEra();
+    relabelled.runtime.ytdlpVersion = PIN;
+    gradeOf(relabelled).detail = gradeOf(relabelled).detail.replace(RETIRED, PIN);
+    const laundered = await admit(relabelled, ROLLBACK_SHA);
+    assert.equal(laundered.ok, false, "relabelling without resealing must not admit the record");
+    assert.match(laundered.reason, /authenticator does not match its contents/);
+
+    // A current-pin record edited to state the retired runtime: the seal decides first.
+    const downgraded = stageARecord();
+    downgraded.runtime.ytdlpVersion = RETIRED;
+    const refused = await admit(downgraded);
+    assert.equal(refused.ok, false);
+    assert.match(refused.reason, /authenticator does not match its contents/);
+    assert.doesNotMatch(refused.reason, /runtime/, "no runtime statement is read from an unverified record");
+
+    // A genuine current-pin record from ANOTHER run key is not this run's evidence.
+    const foreign = sealRecord({ ...stageARecord(), authenticator: undefined }, "f".repeat(64));
+    delete foreign.authenticator.undefined;
+    const elsewhere = await admit(foreign);
+    assert.equal(elsewhere.ok, false);
+    assert.match(elsewhere.reason, /authenticator does not match its contents/);
+  });
+
+  it("N11. the source and image bindings still refuse a current-pin record of another deployment", async () => {
+    const otherSource = await admit(stageARecord({ sha: ROLLBACK_SHA }), SHA);
+    assert.equal(otherSource.ok, false);
+    assert.match(otherSource.reason, literally(`binds to source ${ROLLBACK_SHA}, not to ${SHA}`));
+
+    const untagged = await admit(
+      stageARecord({
+        edit: (r) => {
+          r.binding.taggedImageId = ROLLBACK_IMAGE;
+          r.taggedImageId = ROLLBACK_IMAGE;
+        },
+      }),
+    );
+    assert.equal(untagged.ok, false);
+    assert.match(untagged.reason, /not the image tagged with/);
+
+    // A binding complete and consistent in itself, but not the record's own top-level identity.
+    const skewed = await admit(
+      stageARecord({
+        edit: (r) => {
+          r.binding.runningImageId = ROLLBACK_IMAGE;
+          r.binding.taggedImageId = ROLLBACK_IMAGE;
+        },
+      }),
+    );
+    assert.equal(skewed.ok, false);
+    assert.match(skewed.reason, /runningImageId disagrees/);
+
+    const otherImage = await admit(stageARecord({ image: ROLLBACK_IMAGE }));
+    assert.equal(otherImage.ok, true, `precondition: admitted for its own image — ${otherImage.reason}`);
+    const authorization = stageBAuthorization({ expectedSha: SHA, runningImageId: measured(IMAGE_ID) }, otherImage);
+    assert.equal(authorization.permitted, false);
+    assert.match(authorization.reason, /different image object/);
+  });
+
+  it("N12. every refused record is left byte-identical, on disk and in its seal", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ld3e-runtime-admission-"));
+    try {
+      const refused = [
+        ["G1 rollback era", rollbackEra(), ROLLBACK_SHA],
+        ["G2 retired runtime", stageARecord({ measuredVersion: RETIRED, gradedUnder: RETIRED }), SHA],
+        ["no runtime", stageARecord({ edit: (r) => { delete r.runtime; } }), SHA],
+        ["no grade", stageARecord({ edit: (r) => { r.checks = r.checks.filter((entry) => entry.id !== RUNTIME_CHECK); } }), SHA],
+        ["graded under another pin", stageARecord({ gradedUnder: RETIRED }), SHA],
+        ["optional grade", stageARecord({ edit: (r) => { gradeOf(r).required = false; } }), SHA],
+        ["duplicated grade", stageARecord({ edit: (r) => { r.checks.push({ ...gradeOf(r) }); } }), SHA],
+      ];
+      for (const [what, record, expectedSha] of refused) {
+        const path = join(dir, `${what.replace(/\W+/g, "-")}.json`);
+        const bytes = `${JSON.stringify(record, null, 2)}\n`;
+        writeFileSync(path, bytes, { flag: "wx" });
+        const loaded = await loadStageA(path, readFile, { run: RUN, expectedSha });
+        assert.equal(loaded.ok, false, `${what}: refused`);
+        assert.equal(readFileSync(path, "utf8"), bytes, `${what}: the file is byte-identical`);
+        assert.equal(verifySeal(JSON.parse(readFileSync(path, "utf8")), KEY).ok, true, `${what}: still authentic`);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // ── CORRECTION-01 §29/§30: Stage A record binding ──────────────────────────
 
 describe("Stage A record binding", () => {
@@ -3393,6 +3817,8 @@ describe("evidence provenance", () => {
         runningImageId: IMAGE_ID,
         taggedImageId: IMAGE_ID,
         binding: { expectedSha: SHA, runningImageId: IMAGE_ID, taggedImageId: IMAGE_ID },
+        runtime: currentPinRuntime(),
+        checks: [currentPinGrade()],
       },
       KEY,
     );
@@ -8101,7 +8527,8 @@ describe("evidence producer contract version", () => {
         runningImageId: IMAGE_ID,
         taggedImageId: IMAGE_ID,
         binding: { expectedSha: SHA, runningImageId: IMAGE_ID, taggedImageId: IMAGE_ID },
-        checks: [{ id: "image.identity", outcome: "PASS", required: true, detail: "" }],
+        runtime: currentPinRuntime(),
+        checks: [{ id: "image.identity", outcome: "PASS", required: true, detail: "" }, currentPinGrade()],
       },
       KEY,
     );
@@ -9784,7 +10211,8 @@ describe("10D-REM-03 — the lifecycle evaluator boundary retires remediation-02
         runningImageId: IMAGE_ID,
         taggedImageId: IMAGE_ID,
         binding: { expectedSha: SHA, runningImageId: IMAGE_ID, taggedImageId: IMAGE_ID },
-        checks: [{ id: "image.identity", outcome: "PASS", required: true, detail: "" }],
+        runtime: currentPinRuntime(),
+        checks: [{ id: "image.identity", outcome: "PASS", required: true, detail: "" }, currentPinGrade()],
       },
       KEY,
     );

@@ -68,6 +68,7 @@ import {
   evaluateStageA,
   enablementAuthorized,
   rejectsStageBConfiguration,
+  EXPECTED_RUNTIME,
   REQUIRED_SERVICES,
   FORBIDDEN_WORKER_ENVIRONMENT,
   REQUIRED_WORKER_ENVIRONMENT,
@@ -1182,11 +1183,13 @@ async function runStageBAggregate(ctx) {
 
 /**
  * Loads a prior Stage A record and admits it ONLY if it is AUTHENTIC, genuinely
- * passed, and carries a COMPLETE deployment binding (§25-§28 of CORRECTION-02).
+ * passed, carries a COMPLETE deployment binding (§25-§28 of CORRECTION-02), and
+ * was measured and graded under the CURRENT runtime pin (condition 5,
+ * VIDEOFETCH-LD3E-STAGE-A-RUNTIME-ADMISSION-CORRECTION-001).
  *
  * Returns a reason on refusal rather than a bare null, because "the Stage A
  * record was rejected" is only actionable if the operator learns which of the
- * five conditions failed.
+ * conditions failed.
  */
 export async function loadStageA(path, read, { run, expectedSha } = {}) {
   if (!path) return { ok: false, reason: "--stage-a was not supplied" };
@@ -1224,7 +1227,111 @@ export async function loadStageA(path, read, { run, expectedSha } = {}) {
   const agreement = bindingAgreesWithRecord(parsed);
   if (!agreement.ok) return { ok: false, reason: agreement.reason };
 
+  // 5. The PASS must have been earned under the CURRENT runtime pin
+  //    (VIDEOFETCH-LD3E-STAGE-A-RUNTIME-ADMISSION-CORRECTION-001). Conditions
+  //    1-4 prove the record is authentic, passed, and binds to one source SHA
+  //    and one image object. They do not prove which runtime contract that
+  //    PASS was graded under, and the evidence schema deliberately did not move
+  //    with the LD-3e pin. Without this, a record sealed under the retired
+  //    upstream pin, bound to an image kept for rollback, would authorize a
+  //    current-kit Stage B on that image once it ran again: binding and image
+  //    checks all hold, yet this kit's own Stage A fails that deployment.
+  //    Evaluated only after authenticity, so no runtime statement is believed
+  //    from an unverified record; and read-only, so a refused record stays
+  //    byte-identical, authentic evidence of its own run.
+  const runtimePin = gradedUnderCurrentRuntimePin(parsed);
+  if (!runtimePin.ok) return { ok: false, reason: runtimePin.reason };
+
   return { ok: true, summary: { verdict: parsed.verdict }, binding: parsed.binding };
+}
+
+/** The Stage A check that grades the yt-dlp runtime pin (`lib/stage-a.mjs`, §13). */
+const RUNTIME_PIN_CHECK_ID = "runtime.ytdlp-version";
+
+/**
+ * Condition 5 of `loadStageA`: was this AUTHENTICATED Stage A record measured
+ * AND graded under the runtime pin this kit enforces today?
+ *
+ * Two statements inside the seal must both name the current pin:
+ *
+ *   - MEASURED — `runtime.ytdlpVersion`, what the deployment reported, is
+ *     exactly `EXPECTED_RUNTIME.ytdlpVersion`;
+ *   - GRADED — exactly one `runtime.ytdlp-version` check, a REQUIRED `PASS`
+ *     whose detail is the one the Stage A evaluator writes for the current pin.
+ *     That detail is the only place a record states the pin it was graded
+ *     AGAINST, so a record graded under a retired pin is refused even when its
+ *     measured version happens to be current.
+ *
+ * The pin is read from the Stage A evaluator's own `EXPECTED_RUNTIME`, never
+ * copied here, so admission cannot drift from what Stage A grades. Nothing is
+ * normalized: a missing, null, non-string, inexact, optional, failed,
+ * duplicated or differently worded statement is refused. There is no fallback,
+ * no legacy pin and no override, and the record is only read.
+ */
+function gradedUnderCurrentRuntimePin(record) {
+  const pin = EXPECTED_RUNTIME.ytdlpVersion;
+  const fresh = "a fresh Stage A against this deployment is required";
+
+  const runtime = record.runtime;
+  const measured =
+    runtime !== null && typeof runtime === "object" && !Array.isArray(runtime) ? runtime.ytdlpVersion : undefined;
+  if (typeof measured !== "string") {
+    return {
+      ok: false,
+      reason:
+        `the Stage A record states no measured yt-dlp runtime (runtime.ytdlpVersion is ${describeStated(measured)}), ` +
+        `so it cannot show it was graded under the current runtime pin ${pin}; ${fresh}`,
+    };
+  }
+  if (measured !== pin) {
+    return {
+      ok: false,
+      reason:
+        `the Stage A record measured yt-dlp ${describeStated(measured)}, not the current runtime pin ${pin}: ` +
+        `it remains authentic evidence of its own run, but it cannot authorize a current-kit Stage B; ${fresh}`,
+    };
+  }
+
+  if (!Array.isArray(record.checks)) {
+    return {
+      ok: false,
+      reason: `the Stage A record carries no check list, so it has no ${RUNTIME_PIN_CHECK_ID} grade under the current runtime pin ${pin}; ${fresh}`,
+    };
+  }
+  const grades = record.checks.filter(
+    (entry) => entry !== null && typeof entry === "object" && entry.id === RUNTIME_PIN_CHECK_ID,
+  );
+  if (grades.length !== 1) {
+    return {
+      ok: false,
+      reason:
+        grades.length === 0
+          ? `the Stage A record carries no ${RUNTIME_PIN_CHECK_ID} grade, so it lacks a trustworthy grade under the current runtime pin ${pin}; ${fresh}`
+          : `the Stage A record carries ${grades.length} ${RUNTIME_PIN_CHECK_ID} grades; an ambiguous grade cannot authorize Stage B; ${fresh}`,
+    };
+  }
+  const [grade] = grades;
+  const expected = `yt-dlp is exactly ${pin}`;
+  if (grade.outcome !== OUTCOMES.PASS || grade.required !== true || grade.detail !== expected) {
+    return {
+      ok: false,
+      reason:
+        `the Stage A record's ${RUNTIME_PIN_CHECK_ID} grade (outcome ${describeStated(grade.outcome)}, ` +
+        `required ${describeStated(grade.required)}, detail ${describeStated(grade.detail)}) is not a required PASS of ` +
+        `"${expected}": it was graded under a different runtime pin or contract; ${fresh}`,
+    };
+  }
+  return { ok: true };
+}
+
+/** A value a record states, rendered for a refusal reason: bounded, and never shown as a type it is not. */
+function describeStated(value) {
+  if (value === undefined) return "absent";
+  if (value === null) return "null";
+  if (typeof value === "boolean") return String(value);
+  if (typeof value === "string") return JSON.stringify(value.length > 80 ? `${value.slice(0, 80)}…` : value);
+  const kind = Array.isArray(value) ? "list" : typeof value;
+  return `${/^[aeiou]/.test(kind) ? "an" : "a"} ${kind}`;
 }
 
 // ── Case collaborators ─────────────────────────────────────────────────────

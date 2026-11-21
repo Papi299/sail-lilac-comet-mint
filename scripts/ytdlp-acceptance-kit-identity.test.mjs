@@ -147,6 +147,17 @@ describe("one patched runtime identity across every independent copy", () => {
     );
   });
 
+  it("Stage A ADMISSION holds no copy of the pin: loadStageA's runtime condition reads EXPECTED_RUNTIME", () => {
+    // VIDEOFETCH-LD3E-STAGE-A-RUNTIME-ADMISSION-CORRECTION-001. A record is admitted only if it was measured and
+    // graded under the pin the Stage A evaluator grades against, so the loader must read that one constant
+    // rather than keep its own copy that could drift from it.
+    const source = read("deploy/acceptance/ytdlp-generic/acceptance.mjs");
+    assert.ok(!source.includes(PATCHED.version), "no literal of the patched pin");
+    assert.ok(!source.includes(UPSTREAM.version), "no literal of the upstream version");
+    assert.match(source, /import \{[^}]*\bEXPECTED_RUNTIME\b[^}]*\} from "\.\/lib\/stage-a\.mjs";/);
+    assert.equal(source.match(/^ {2}const pin = EXPECTED_RUNTIME\.ytdlpVersion;$/gm)?.length, 1);
+  });
+
   it("both standalone Python verifiers pin that identity exactly once, read it from the artifact, and refuse any other", () => {
     for (const path of VERIFIERS) {
       const source = read(path);
