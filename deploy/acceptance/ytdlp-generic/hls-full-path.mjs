@@ -162,10 +162,10 @@ import {
   validateStructuredPrivacy,
   withProcessObserver,
 } from "./lib/hls-observers.mjs";
-import { HLS08_ACCEPTED_BASE } from "./lib/hls-container.mjs";
 import {
   acceptanceIdentityChecks,
   acceptanceLabel,
+  acceptanceYtdlpPinHolds,
   buildAcceptanceEvidence,
   imageRemovalFact,
   parseHlsAcceptanceArgv,
@@ -299,17 +299,21 @@ function memoizeOnce(fn) {
 
 // ── 1. Runtime preflight ───────────────────────────────────────────────────
 
-async function preflight(checks) {
+async function preflight(checks, opts) {
   const nodeVersion = process.version;
   checks.require("preflight/node-runtime-family", /^v22\./.test(nodeVersion), `node ${nodeVersion}`);
 
   const runtime = await probeYtdlpRuntime();
   checks.require("preflight/ytdlp-available", runtime.available === true, runtime.reason ?? null);
-  // A version pin, not a base-image assertion: the harness's yt-dlp pin is the
-  // same `2026.08.19` in both modes (and in SPLIT-07's EXPECTED_YTDLP_RUNTIME).
+  // The one identity-dependent preflight predicate, decided by the explicit
+  // mode (`acceptanceYtdlpPinHolds`): overlay still requires the candidate's
+  // pin to be the HLS-08 accepted base's historical runtime; release-image
+  // requires the image's runtime to be the candidate's OWN pin and never
+  // consults the historical base. Since LD-3e the two differ, so one
+  // mode-blind predicate could no longer be right for both.
   checks.require(
     "preflight/ytdlp-exact-pin",
-    runtime.version === YTDLP_RUNTIME.expectedVersion && runtime.version === HLS08_ACCEPTED_BASE.ytdlpVersion,
+    acceptanceYtdlpPinHolds(opts, { reportedVersion: runtime.version, pinnedVersion: YTDLP_RUNTIME.expectedVersion }),
     `${runtime.version} vs ${YTDLP_RUNTIME.expectedVersion}`,
   );
 
@@ -921,7 +925,7 @@ async function main(argv) {
   }
 
   try {
-    out.toolchain = await preflight(checks);
+    out.toolchain = await preflight(checks, opts);
     out.invariants = checkInvariants(checks);
 
     const prepared = await prepareFixture(checks, out.toolchain, fixtureDir);

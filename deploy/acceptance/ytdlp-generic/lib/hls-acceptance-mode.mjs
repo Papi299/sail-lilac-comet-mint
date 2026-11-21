@@ -217,6 +217,37 @@ export function acceptanceIdentityChecks(opts, observed = {}) {
 }
 
 /**
+ * `preflight/ytdlp-exact-pin`, per mode — the one preflight predicate that
+ * depends on identity (VIDEOFETCH-LD3E-LINUX-ACCEPTANCE-KIT-IDENTITY-
+ * RECONCILIATION-001). `reportedVersion` is what the image's runtime probe
+ * returned; `pinnedVersion` is the candidate source's own
+ * `YTDLP_RUNTIME.expectedVersion`. Exact string equality throughout.
+ *
+ *   overlay        BOTH must also be the HLS-08 accepted base's historical
+ *                  runtime (`HLS08_ACCEPTED_BASE.ytdlpVersion`), exactly as
+ *                  before. That equality is the overlay premise: the candidate
+ *                  source runs on the accepted image's own artifact. A
+ *                  candidate pinning any other runtime — the LD-3e patched
+ *                  build included — cannot be qualified by overlay, and fails
+ *                  here as it already fails `verifyOverlayContextProvenance`
+ *                  before any Docker command.
+ *   release-image  the image's runtime must be the candidate's OWN pin. The
+ *                  HLS-08 historical base plays no part: a release candidate is
+ *                  never required to equal it, and its value is never consulted.
+ *
+ * An unknown mode throws, as `acceptanceIdentityChecks` does.
+ */
+export function acceptanceYtdlpPinHolds(opts, { reportedVersion, pinnedVersion } = {}) {
+  const mode = opts?.mode;
+  if (mode !== HLS_ACCEPTANCE_MODES.overlay && mode !== HLS_ACCEPTANCE_MODES.releaseImage) {
+    throw new Error(`unknown acceptance mode: ${String(mode)}`);
+  }
+  const ownPin = typeof pinnedVersion === "string" && pinnedVersion.length > 0 && reportedVersion === pinnedVersion;
+  if (mode === HLS_ACCEPTANCE_MODES.releaseImage) return ownPin;
+  return ownPin && pinnedVersion === HLS08_ACCEPTED_BASE.ytdlpVersion;
+}
+
+/**
  * The mode's record. `behavioral` carries every block the orchestrator
  * measured — identical in both modes — plus `verdict`, timestamps, the fixture
  * network facts and the check ledger; this function adds only the identity.

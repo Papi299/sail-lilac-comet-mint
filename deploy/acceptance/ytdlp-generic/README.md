@@ -719,7 +719,7 @@ nothing proves nothing.
 | 4 | `service.*` | All seven units active: `videofetch-media-dns`, `-media-netns`, `-egress-policy`, `-egress-watchdog`, `-r2-broker`, `-worker`, `vf-cloudflared`. |
 | 5 | `safe-egress.verifier` | The existing read-only `vf-egress-policy-verify` exits 0. |
 | 6 | `worker.network-mode` | `container:videofetch-media-netns`, with no fallback network. |
-| 7 | `runtime.ytdlp-version` | **Exactly** `2026.08.19`. Not "newer", not date-shaped, not `latest`. |
+| 7 | `runtime.ytdlp-version` | **Exactly** `2026.08.19+videofetch.ld3e1`, the LD-3e patched build. Not "newer", not date-shaped, not `latest`, and not the unpatched upstream `2026.08.19` (which every image before LD-3e reports, and which therefore fails). |
 | 8 | `runtime.python-series` | A `3.11` series interpreter. |
 | 9 | `runtime.node-family` | The reviewed `v22` family. |
 | 10 | `runtime.bundled-ejs` | **Exactly** `0.8.0`. |

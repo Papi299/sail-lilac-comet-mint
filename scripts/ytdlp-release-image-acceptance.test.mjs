@@ -4473,3 +4473,162 @@ describe("SPLIT-07 -08 driver: the separate-audio clear-HLS child", () => {
     assert.equal(world.writeCalls.length, 0);
   });
 });
+
+// ── LD-3e: the patched runtime identity (VIDEOFETCH-LD3E-LINUX-ACCEPTANCE-KIT-IDENTITY-RECONCILIATION-001) ──
+//
+// Source-level and SYNTHETIC: the driver runs against the fake Docker world
+// above, whose runtime probe reports whatever each case says. None of this is a
+// Linux image build or an in-image measurement.
+
+describe("LD-3e patched runtime identity (synthetic observations, not a Linux image)", () => {
+  const PATCHED_VERSION = "2026.08.19+videofetch.ld3e1";
+  const PATCHED_SHA256 = "2dfa21ec04eebb61612e3e6eb5d24f13527264275a0a34d6ef7e5d33a9260259";
+  const UPSTREAM_VERSION = "2026.08.19";
+  const UPSTREAM_SHA256 = "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6";
+  // The design laboratory's executable: http.py replaced, identity NOT replaced, so it printed 2026.08.19.
+  const LAB_SHA256 = "98195b3e6d41980def10331eaacdc5e040c0a2f65da57200e409d3cd139c4a56";
+  const RUNTIME_CHECKS = [
+    "runtime/ytdlp-version",
+    "runtime/ytdlp-sha256",
+    "runtime/ytdlp-root-owned-and-unwritable",
+    "runtime/ytdlp-not-self-updatable-by-the-runtime-user",
+    "runtime/python-can-execute-the-pinned-artifact",
+  ];
+  const outcome = (result, name) => result.checks.find((check) => check.name === name)?.ok;
+  const withRuntime = (ytdlp) => drive({ probes: { runtime: { ytdlp } } });
+
+  it("A. the exact patched artifact — version, digest, path, root:root 0555, write refused — passes every runtime check", async () => {
+    assert.deepEqual(
+      [EXPECTED_YTDLP_RUNTIME.version, EXPECTED_YTDLP_RUNTIME.sha256],
+      [PATCHED_VERSION, PATCHED_SHA256],
+    );
+    const { result, error } = await withRuntime(pinnedArtifact({ version: PATCHED_VERSION, sha256: PATCHED_SHA256 }));
+    assert.equal(error, null, String(error));
+    assert.equal(result.verdict, "PASS");
+    for (const name of RUNTIME_CHECKS) assert.equal(outcome(result, name), true, name);
+    assert.deepEqual(
+      [result.record.runtime.ytdlpVersion, result.record.runtime.ytdlpSha256, result.record.runtime.ytdlpPath],
+      [PATCHED_VERSION, PATCHED_SHA256, "/usr/local/lib/videofetch/yt-dlp"],
+    );
+    assert.deepEqual(validateReleaseParentRecord(result.record, { sourceCommit: SOURCE, imageId: IMAGE_ID }), []);
+  });
+
+  it("B. the unpatched upstream artifact is refused: by its version alone, by its digest alone, and as a whole", async () => {
+    const byVersion = await withRuntime(pinnedArtifact({ version: UPSTREAM_VERSION }));
+    assert.equal(byVersion.error, null, String(byVersion.error));
+    assert.equal(byVersion.result.verdict, "FAIL");
+    assert.equal(outcome(byVersion.result, "runtime/ytdlp-version"), false);
+    assert.equal(outcome(byVersion.result, "runtime/ytdlp-sha256"), true, "the digest alone was right");
+
+    const byDigest = await withRuntime(pinnedArtifact({ sha256: UPSTREAM_SHA256 }));
+    assert.equal(byDigest.error, null, String(byDigest.error));
+    assert.equal(byDigest.result.verdict, "FAIL");
+    assert.equal(outcome(byDigest.result, "runtime/ytdlp-sha256"), false);
+    assert.equal(outcome(byDigest.result, "runtime/ytdlp-version"), true, "a version-only match is not enough");
+
+    const whole = await withRuntime(pinnedArtifact({ version: UPSTREAM_VERSION, sha256: UPSTREAM_SHA256 }));
+    assert.equal(whole.error, null, String(whole.error));
+    assert.equal(whole.result.verdict, "FAIL");
+    assert.equal(outcome(whole.result, "runtime/ytdlp-version"), false);
+    assert.equal(outcome(whole.result, "runtime/ytdlp-sha256"), false);
+    // The FAIL record states what was measured; it is never relabelled.
+    assert.deepEqual(
+      [whole.result.record.runtime.ytdlpVersion, whole.result.record.runtime.ytdlpSha256],
+      [UPSTREAM_VERSION, UPSTREAM_SHA256],
+    );
+  });
+
+  it("C. every other identity fault fails, each on its own check", async () => {
+    const flipped = `${PATCHED_SHA256.slice(0, -1)}${PATCHED_SHA256.endsWith("9") ? "8" : "9"}`;
+    const cases = [
+      ["correct version, the laboratory executable's digest", { sha256: LAB_SHA256 }, ["runtime/ytdlp-sha256"]],
+      ["correct version, a one-nibble digest change", { sha256: flipped }, ["runtime/ytdlp-sha256"]],
+      ["correct digest, a nightly-shaped version", { version: "2026.08.19.123456" }, ["runtime/ytdlp-version", "runtime/python-can-execute-the-pinned-artifact"]],
+      ["correct digest, the next local label", { version: "2026.08.19+videofetch.ld3e2" }, ["runtime/ytdlp-version", "runtime/python-can-execute-the-pinned-artifact"]],
+      ["correct digest, a case-changed label", { version: "2026.08.19+VideoFetch.ld3e1" }, ["runtime/ytdlp-version", "runtime/python-can-execute-the-pinned-artifact"]],
+      ["correct digest, a padded version", { version: `${PATCHED_VERSION}\n` }, ["runtime/ytdlp-version", "runtime/python-can-execute-the-pinned-artifact"]],
+      ["a missing version", { version: undefined }, ["runtime/ytdlp-version", "runtime/python-can-execute-the-pinned-artifact"]],
+      ["a null version", { version: null }, ["runtime/ytdlp-version", "runtime/python-can-execute-the-pinned-artifact"]],
+      ["a missing digest", { sha256: undefined }, ["runtime/ytdlp-sha256"]],
+      ["an upper-case digest", { sha256: PATCHED_SHA256.toUpperCase() }, ["runtime/ytdlp-sha256"]],
+      ["a prefixed digest", { sha256: `sha256:${PATCHED_SHA256}` }, ["runtime/ytdlp-sha256"]],
+      ["a truncated digest", { sha256: PATCHED_SHA256.slice(0, 63) }, ["runtime/ytdlp-sha256"]],
+      ["another executable path", { path: "/usr/local/bin/yt-dlp", realpath: "/usr/local/bin/yt-dlp" }, ["runtime/ytdlp-root-owned-and-unwritable"]],
+      ["the right path resolving elsewhere", { realpath: "/var/lib/videofetch/yt-dlp" }, ["runtime/ytdlp-root-owned-and-unwritable"]],
+      ["a non-root owner", { uid: 1000 }, ["runtime/ytdlp-root-owned-and-unwritable"]],
+      ["a non-root group", { gid: 1000 }, ["runtime/ytdlp-root-owned-and-unwritable"]],
+      ["a writable mode", { mode: "0777" }, ["runtime/ytdlp-root-owned-and-unwritable"]],
+      ["not a regular file", { isRegularFile: false }, ["runtime/ytdlp-root-owned-and-unwritable"]],
+      ["writable in fact", { writeAttempt: { attempted: true, succeeded: true, code: null } }, ["runtime/ytdlp-not-self-updatable-by-the-runtime-user"]],
+      ["a write never attempted", { writeAttempt: { attempted: false, succeeded: false, code: null } }, ["runtime/ytdlp-not-self-updatable-by-the-runtime-user"]],
+    ];
+    for (const [label, fault, failing] of cases) {
+      const { result, error } = await withRuntime(pinnedArtifact(fault));
+      assert.equal(error, null, `${label}: ${String(error)}`);
+      assert.equal(result.verdict, "FAIL", label);
+      for (const name of RUNTIME_CHECKS) {
+        assert.equal(outcome(result, name), !failing.includes(name), `${label}: ${name}`);
+      }
+    }
+
+    // No runtime observation at all: nothing about the artifact can pass.
+    const { result, error } = await withRuntime(undefined);
+    assert.equal(error, null, String(error));
+    assert.equal(result.verdict, "FAIL");
+    for (const name of RUNTIME_CHECKS) assert.equal(outcome(result, name), false, `no observation: ${name}`);
+  });
+
+  it("a PASS record must state the pinned runtime: each field, and the upstream identity, is refused at emit time", () => {
+    assert.equal(buildReleaseEvidence(evidenceInput()).runtime.ytdlpVersion, PATCHED_VERSION);
+    for (const [field, value] of [
+      ["ytdlpVersion", UPSTREAM_VERSION],
+      ["ytdlpSha256", UPSTREAM_SHA256],
+      ["ytdlpPath", "/usr/local/bin/yt-dlp"],
+      ["ytdlpUid", 1000],
+      ["ytdlpGid", 1000],
+      ["ytdlpMode", "0755"],
+    ]) {
+      assert.throws(
+        () => buildReleaseEvidence(evidenceInput({ runtime: { [field]: value } })),
+        (error) =>
+          error instanceof ReleaseEvidenceError &&
+          error.message === `refusing to emit a PASS record whose runtime is not the pinned yt-dlp ${PATCHED_VERSION}: ${field} differ`,
+        field,
+      );
+    }
+    assert.throws(
+      () => buildReleaseEvidence(evidenceInput({ runtime: { ytdlpVersion: UPSTREAM_VERSION, ytdlpSha256: UPSTREAM_SHA256 } })),
+      /runtime is not the pinned yt-dlp 2026\.08\.19\+videofetch\.ld3e1: ytdlpVersion, ytdlpSha256 differ/,
+    );
+    // A FAIL may record whatever artifact it measured.
+    const failing = evidenceInput({ verdict: "FAIL", runtime: { ytdlpVersion: UPSTREAM_VERSION, ytdlpSha256: UPSTREAM_SHA256 } });
+    failing.checks = failing.checks.map((check) =>
+      check.name === "runtime/ytdlp-version" || check.name === "runtime/ytdlp-sha256" ? { ...check, ok: false } : check);
+    const record = buildReleaseEvidence(failing);
+    assert.equal(record.verdict, "FAIL");
+    assert.equal(record.runtime.ytdlpVersion, UPSTREAM_VERSION);
+  });
+
+  it("a -09 PASS measured under the earlier pin stays as it is, and is never read as this pin's PASS", () => {
+    const current = buildReleaseEvidence(evidenceInput());
+    assert.deepEqual(validateReleaseParentRecord(current, { sourceCommit: SOURCE, imageId: IMAGE_ID }), []);
+
+    // The shape the pre-LD-3e harness emitted for an unpatched candidate: same schema, upstream runtime.
+    const earlier = JSON.parse(JSON.stringify(current));
+    earlier.runtime.ytdlpVersion = UPSTREAM_VERSION;
+    earlier.runtime.ytdlpSha256 = UPSTREAM_SHA256;
+    const before = JSON.stringify(earlier);
+    const problems = validateReleaseParentRecord(earlier, { sourceCommit: SOURCE, imageId: IMAGE_ID });
+    assert.deepEqual(problems, [
+      `refusing to emit a PASS record whose runtime is not the pinned yt-dlp ${PATCHED_VERSION}: ytdlpVersion, ytdlpSha256 differ`,
+    ]);
+    assert.equal(JSON.stringify(earlier), before, "validation never rewrites a record");
+    assert.equal(earlier.schema, SPLIT07_EVIDENCE_SCHEMA, "the schema is not bumped");
+
+    // The historical-schema refusal is unchanged.
+    for (const schema of HISTORICAL_SPLIT07_SCHEMAS) {
+      const [problem] = validateReleaseParentRecord({ ...current, schema });
+      assert.match(problem, new RegExp(`^${schema} is a historical schema, not ${SPLIT07_EVIDENCE_SCHEMA}; `));
+    }
+  });
+});
