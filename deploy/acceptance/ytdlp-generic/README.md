@@ -629,6 +629,69 @@ Then the pure evaluator re-judges every field. A hand-written
 `{"passed": true}` cannot produce a PASS: there is no field called `passed`, and
 nothing in a record is believed — only re-evaluated.
 
+### A Stage A record authorizes Stage B only under the runtime pin it was graded under
+
+`--stage B --aggregate` admits a prior Stage A record (`loadStageA`) only if:
+
+1. it is **authentic**: the seal verifies under this run's key, and `harness`,
+   `schemaVersion`, `runId`, the expected source SHA and the image-id shape are
+   this run's. This comes first, before any field is believed;
+2. it is a Stage A record whose verdict is `PASS`;
+3. its deployment binding is complete and self-consistent;
+4. the top-level identity and the nested binding agree;
+5. it was **measured and graded under the current runtime pin**
+   (`VIDEOFETCH-LD3E-STAGE-A-RUNTIME-ADMISSION-CORRECTION-001`).
+
+Condition 5 reads two statements the record already carries, both inside the
+seal:
+
+- **measured** — `runtime.ytdlpVersion` must be exactly
+  `EXPECTED_RUNTIME.ytdlpVersion`, the constant the Stage A evaluator grades
+  against (`lib/stage-a.mjs`). The loader imports it and holds no copy, so
+  admission cannot drift from grading;
+- **graded** — exactly one `runtime.ytdlp-version` check, a **required `PASS`**
+  whose detail is the one the evaluator writes for the current pin
+  (`yt-dlp is exactly <pin>`). That detail is the only place a record states the
+  pin it was graded *against*, so a record graded under another pin is refused
+  even when its measured version happens to be current.
+
+Anything else is refused: a missing, null, non-string or inexact version; a
+missing, failed, blocked, optional, reworded or duplicated grade; or no check
+list. There is no fallback, no legacy pin and no override. The refusal reason
+names the pin the record was measured or graded under and says that a fresh
+Stage A is required.
+
+**Why source and image binding were not enough.** Conditions 1-4 prove a
+record is authentic, passed, and binds to one source SHA and one image object.
+They do not say which runtime contract that `PASS` was earned under, and the
+evidence schema deliberately did not move with the LD-3e pin (below). An
+authentic `PASS` sealed while the pin was the upstream build, bound to an image
+that is kept for rollback, satisfies all four. After a rollback to that image,
+it would authorize a **current-kit** Stage B against a deployment this kit's own
+Stage A fails. Its binding is correct; the runtime contract it was graded under
+is not today's. A record bound to the patched image but stating the retired
+runtime fails the same way.
+
+**Why the evidence schema did not move.** The fix adds no field: every Stage A
+record already states the version it measured and the pin it was graded
+against. Bumping `EVIDENCE_SCHEMA_VERSION` would also retire every current
+Stage B case record, which changed in no way, and it would protect the next pin
+change only if someone remembered to bump again. Reading the runtime statement
+at admission covers every future pin change by construction.
+
+**Why history is not rewritten.** A record graded under an earlier pin is still
+authentic evidence of what its run measured. Admission only reads it: it is not
+edited, relabelled, resealed or moved, and it stays byte-identical and
+verifiable under its own run key. It simply no longer authorizes a current-kit
+Stage B. Resealing it would not upgrade it; that constructs a separate, new
+claim (see [What each mechanism actually guarantees](#what-each-mechanism-actually-guarantees)).
+
+**What is required instead.** A Stage B that needs authorization under the
+current pin needs a fresh Stage A against that exact deployment: its own run
+key path, the image tagged with the authorized source SHA, and the image
+running. No Stage A has been sealed under the current pin by this correction;
+it changes the harness only.
+
 ### Authentication
 
 A live run **requires** `VIDEOFETCH_ACCESS_SECRET` and calls the existing
@@ -984,6 +1047,7 @@ acceptance run**.
 | **Integrity** — the HMAC | The sealed bytes have not changed since somebody holding this run key sealed them. Nothing more. |
 | **Contract version** — `schemaVersion` | Which harness semantics may consume an artifact. The only field that can say, because the seal is silent about it. |
 | **Automatic version crossing** | **Refused, and test-detected.** Admission never normalizes, relabels or reseals a retired record on the way in — `validateCaseRecord`, `verifyRecord` and `loadStageA` each leave a refused artifact byte-identical. This is harness behaviour, so it is ours to guarantee. |
+| **Runtime pin** — `loadStageA` condition 5 | A Stage A record authorizes Stage B only if it was measured **and** graded under the pin the Stage A evaluator enforces now. A record graded under an earlier pin stays authentic history, byte-identical, and authorizes nothing. See [A Stage A record authorizes Stage B only under the runtime pin it was graded under](#a-stage-a-record-authorizes-stage-b-only-under-the-runtime-pin-it-was-graded-under). |
 | **Manual operator forgery** | **Outside this threat model**, exactly as [The acceptance run key](#the-acceptance-run-key) already says. The key is local operator-held material: whoever holds it can mint a new record bearing any `schemaVersion`, and its HMAC will verify. |
 
 So *never reseal historical evidence* is an **operating rule**, enforced by
