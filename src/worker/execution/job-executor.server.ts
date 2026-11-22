@@ -13,6 +13,7 @@ import {
   resolveAcquisitionInactivityPolicy,
   type AcquisitionInactivityPolicy,
   type AcquisitionInactivityWatchdog,
+  type ResolvedAcquisitionInactivityPolicy,
 } from "@/services/downloads/acquisition-inactivity-watchdog";
 import { mimeForContainer } from "@/services/extractors/normalize";
 import {
@@ -57,6 +58,7 @@ import type { CancelJobResult, DurableWorkerJob, WorkerJobStore } from "@/worker
 import type { ObjectStoreWriter } from "@/worker/storage/writer";
 import type { WorkerVideoMetadata } from "@/shared/worker/contracts";
 import { WorkerErrorCodeSchema } from "@/shared/worker/errors";
+import type { AcquisitionStopCause } from "@/shared/worker/job-failure";
 import { finalizeJobUpload, type FinalizeUploadResult } from "@/worker/storage/upload-lifecycle.server";
 import {
   DEFAULT_WORKER_TIME_LIMITS,
@@ -106,10 +108,25 @@ export type AcquisitionInactivityEnforcement = {
    * evidence is the yt-dlp child's files — single source and split pair,
    * segmented halves included (`isFilesystemObservedPlan`). Honoured only when
    * exactly `true`, so enforcement supplied without it keeps LD-3b's
-   * transport-only scope. Production supplies no enforcement at all.
+   * transport-only scope. Production sets it
+   * (VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001, `runtime.server.ts`).
    */
   readonly watchFilesystemObservedPlans?: boolean;
 };
+
+/**
+ * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: the enforcement an executor
+ * applies, as read-only facts: the resolved window, tick, suspension gap and
+ * observation allowance in milliseconds, and whether the filesystem-observed
+ * plans are watched. Numbers and one flag; no clock, timer or callback.
+ */
+export type AcquisitionInactivityEnforcementFacts = Readonly<{
+  windowMs: number;
+  tickMs: number;
+  suspensionGapMs: number;
+  maxUnobservedMs: number;
+  watchFilesystemObservedPlans: boolean;
+}>;
 
 /** Analysis is dependency-injected so tests can drive it without live network. */
 export type AnalyzeDirectMediaFn = (
@@ -181,8 +198,10 @@ export type GenericAcquisitionContext = {
   activity?: AcquisitionActivitySink;
   /**
    * LD-3c: the watchdog's two stops for a watched yt-dlp plan, each its own
-   * cause in the seam (never a cancellation). Absent unless injected
-   * enforcement opts in to the filesystem-observed plans; Production: never.
+   * cause in the seam (never a cancellation). Absent unless the enforcement
+   * opts in to the filesystem-observed plans — which Production's does, so in
+   * Production every yt-dlp acquisition receives both
+   * (VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001).
    */
   stopForInactivity?: AbortSignal;
   stopForObservationLoss?: AbortSignal;
@@ -506,14 +525,15 @@ export type JobExecutorDeps = {
    * and fMP4) and separate-audio HLS — gets one watchdog, which stops a live
    * phase that made no meaningful progress for the window, through this
    * execution's own controller. The absolute acquisition deadline stays each
-   * seam's own; the watchdog never extends or replaces it.
+   * seam's own; the watchdog never extends or replaces it. LD-3c: with
+   * `watchFilesystemObservedPlans`, so does every plan acquired by the generic
+   * subprocess (single source, split pair, segmented halves).
    *
-   * DELIBERATELY DISCONNECTED: Production supplies none (`runtime.server.ts`;
-   * pinned by a structural test). The filesystem-observed plans cannot yet be
-   * subjected to the rule safely (LD-3c), and the setting that would own the
-   * window arrives only with complete enforcement. Whatever is supplied here, a
-   * plan acquired by the generic subprocess (single source, segmented, split
-   * pair) never gets a watchdog.
+   * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: CONNECTED. Production
+   * composition (`runtime.server.ts`) always supplies it, built from the strict
+   * loader's `DOWNLOAD_INACTIVITY_TIMEOUT` with the filesystem-observed plans
+   * opted in, and its test seams cannot replace it. Absent — only an executor a
+   * test builds directly — no acquisition is watched.
    */
   acquisitionInactivity?: AcquisitionInactivityEnforcement;
 };
@@ -604,6 +624,19 @@ const INACTIVITY_STOPPED_SIGNALS = new WeakSet<AbortSignal>();
 const OBSERVATION_LOST_SIGNALS = new WeakSet<AbortSignal>();
 
 /**
+ * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: the provenance of an
+ * absolute-deadline ending — an acquisition seam of THIS execution reporting,
+ * as the first cause its own one-way latch recorded, that its absolute deadline
+ * ended it: the LD-3a `settled` event with outcome `deadline-exceeded`, read
+ * from the acquisition's one activity record. Never from an error code or a
+ * message: a `TIMEOUT` a seam derived from anything else — a per-request
+ * timeout, a subprocess's own text — is not this. A deadline does not abort the
+ * execution's controller (it is each seam's own), so the set is keyed by the
+ * execution's signal only as its identity. The same rules as the sets above.
+ */
+const ACQUISITION_DEADLINE_SIGNALS = new WeakSet<AbortSignal>();
+
+/**
  * LD-3b: the plans whose acquisition evidence is in-process transport bytes, by
  * an explicit list: a plan kind not named here is never watched.
  */
@@ -660,7 +693,11 @@ export class JobExecutor {
   private readonly genericDownloadLimits: GenericDownloadLimits;
   private readonly backstopTimers: ExecutionBackstopTimers;
   private readonly createAcquisitionActivitySink: JobExecutorDeps["createAcquisitionActivitySink"];
-  private readonly acquisitionInactivity: Required<AcquisitionInactivityEnforcement> | undefined;
+  private readonly acquisitionInactivity:
+    | (Required<Omit<AcquisitionInactivityEnforcement, "policy">> & {
+        readonly policy: ResolvedAcquisitionInactivityPolicy;
+      })
+    | undefined;
 
   constructor(
     store: WorkerJobStore,
@@ -787,6 +824,23 @@ export class JobExecutor {
   }
 
   /**
+   * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: the acquisition-inactivity
+   * enforcement this executor applies, as frozen facts, or null when none was
+   * supplied. In-process only: nothing serves it over HTTP.
+   */
+  public get inactivityEnforcement(): AcquisitionInactivityEnforcementFacts | null {
+    const enforcement = this.acquisitionInactivity;
+    if (enforcement === undefined) return null;
+    return Object.freeze({
+      windowMs: enforcement.policy.windowMs,
+      tickMs: enforcement.policy.tickMs,
+      suspensionGapMs: enforcement.policy.suspensionGapMs,
+      maxUnobservedMs: enforcement.policy.maxUnobservedMs,
+      watchFilesystemObservedPlans: enforcement.watchFilesystemObservedPlans,
+    });
+  }
+
+  /**
    * §22/§23: aborts every in-flight execution for an operator shutdown.
    *
    * INVARIANT (PHASE-10D-WORKER-RESTART-RECOVERY-DETERMINISM-001):
@@ -905,15 +959,33 @@ export class JobExecutor {
       //    TIMEOUT: an observer that cannot see is no evidence about the source.
       //    It is a Worker-side workspace fault, PROCESSING_FAILED — the code
       //    every other local workspace failure already uses.
+      //
+      // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: the two acquisition
+      // stops now carry their own stage, through the store's closed vocabulary.
+      //  - The acquisition seam's own latch recorded its ABSOLUTE DEADLINE as
+      //    the first cause: TIMEOUT, "time limit reached" — whatever aborted the
+      //    execution afterwards, a watchdog stop that came too late to be the
+      //    cause included (a stop past the deadline is a nearby timer, not the
+      //    cause, and is never relabelled as one).
+      //  - Otherwise a watchdog stop: TIMEOUT, "stalled".
+      // Every other outcome keeps the stage of the status it leaves, exactly as
+      // before; an observation loss is never a stall, and so has no stop.
+      const deadlineFirst = ACQUISITION_DEADLINE_SIGNALS.has(signal);
       const code =
-        LIFETIME_ABORTED_SIGNALS.has(signal) || INACTIVITY_STOPPED_SIGNALS.has(signal)
+        deadlineFirst || LIFETIME_ABORTED_SIGNALS.has(signal) || INACTIVITY_STOPPED_SIGNALS.has(signal)
           ? "TIMEOUT"
           : OBSERVATION_LOST_SIGNALS.has(signal)
             ? "PROCESSING_FAILED"
             : this.classifyErrorCode(err);
+      const acquisitionStop: AcquisitionStopCause | null = deadlineFirst
+        ? "time-limit"
+        : INACTIVITY_STOPPED_SIGNALS.has(signal)
+          ? "inactivity"
+          : null;
       const safeMsg = ERROR_MESSAGES[code];
       // §27: the raw error is deliberately never logged and never persisted.
-      this.store.failJob(jobId, code, safeMsg);
+      if (acquisitionStop === null) this.store.failJob(jobId, code, safeMsg);
+      else this.store.failJob(jobId, code, safeMsg, acquisitionStop);
     } finally {
       // Cleanup is NEVER skipped, on any of the three outcomes above: the
       // active controller is unregistered and the per-job working directory is
@@ -1128,9 +1200,10 @@ export class JobExecutor {
 
     // LD-3b: at most one inactivity watchdog per acquisition, only for a plan
     // whose evidence is transport bytes — or, LD-3c, the yt-dlp child's files
-    // when enforcement opts in — and none in Production (no enforcement is
-    // supplied there). It decides inactivity and observation loss only; the
-    // deadline above stays the seam's own.
+    // when enforcement opts in. Since VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001
+    // Production supplies the enforcement with that opt-in, so every plan kind
+    // there gets exactly one. It decides inactivity and observation loss only;
+    // the deadline above stays the seam's own.
     const watch = this.newAcquisitionInactivityWatch(plan, jobId);
     try {
       // LD-3a: at most one observer sink per acquisition, and none in
@@ -1152,6 +1225,17 @@ export class JobExecutor {
       if (INACTIVITY_STOPPED_SIGNALS.has(signal)) throw new AppError("TIMEOUT");
       if (OBSERVATION_LOST_SIGNALS.has(signal)) throw new AppError("PROCESSING_FAILED");
       return acquired;
+    } catch (err) {
+      // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: how the SEAM said its
+      // acquisition ended, read from the acquisition's one activity record
+      // before the watchdog is released. Every seam reports `settled` before it
+      // rejects, from its own one-way first-cause latch, and the first report
+      // wins; only `deadline-exceeded` — its absolute deadline, first — is
+      // recorded. `execute()`'s catch turns it into the stage.
+      if (watch?.watchdog.snapshot().outcome === "deadline-exceeded") {
+        ACQUISITION_DEADLINE_SIGNALS.add(signal);
+      }
+      throw err;
     } finally {
       // Released the moment the seam settled, before any further await: no
       // watchdog outlives its acquisition, so processing and upload are never
@@ -1309,8 +1393,9 @@ export class JobExecutor {
 
   /**
    * LD-3a: the option object every acquisition seam spreads in. Empty when no
-   * sink exists — the Production case — so a seam's context then has no extra
-   * key at all.
+   * sink exists — no watchdog and no observer, which since
+   * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001 is never the Production case
+   * — so a seam's context then has no extra key at all.
    *
    * LD-3b: with a watchdog, the ONE sink the seam reports to is the watchdog's,
    * and an LD-3a observer, if any, receives the same events after it. Neither
@@ -1347,8 +1432,9 @@ export class JobExecutor {
 
   /**
    * LD-3b: the inactivity watchdog of ONE acquisition, or null: no enforcement
-   * supplied (Production), or a plan whose evidence is not transport bytes —
-   * nor, LD-3c, the yt-dlp child's files with enforcement opting in to them.
+   * supplied (only an executor a test builds directly; Production always
+   * supplies it), or a plan whose evidence is not transport bytes — nor, LD-3c,
+   * the yt-dlp child's files with enforcement opting in to them.
    *
    * Its stop is the abort a cancellation sends, on this execution's EXISTING
    * controller, with its provenance recorded first — so the transport teardown,

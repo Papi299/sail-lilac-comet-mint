@@ -48,7 +48,7 @@ import {
   type GenericSingleSourceExecutionPlan,
 } from "./format-plan.ts";
 import { JobExecutor, type JobExecutorDeps } from "./job-executor.server.ts";
-import { downloadGenericOriginal, expectedPartPath } from "./ytdlp-download.server.ts";
+import { downloadGenericOriginal, expectedPartPath, selectYtdlpAcquisitionRetryPolicy } from "./ytdlp-download.server.ts";
 
 /**
  * VIDEOFETCH-LD3B-INACTIVITY-WATCHDOG-CORE-001 — enforcement through the REAL
@@ -60,8 +60,11 @@ import { downloadGenericOriginal, expectedPartPath } from "./ytdlp-download.serv
  * real waits below only let real I/O catch up (bounded at 10 s), never a
  * deadline.
  *
- * Enforcement is supplied here by injection only. Production supplies none:
- * the structural block at the end pins that, and why.
+ * Enforcement is supplied here by injection, so each test controls its clock.
+ * Since VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001 Production supplies it
+ * too, from the composition root: the structural block at the end pins that,
+ * and `inactivity-runtime-activation.server.test.ts` proves it on the real
+ * runtime.
  */
 
 const WINDOW = 120_000;
@@ -113,6 +116,14 @@ function virtualTime(startMs = 9_000_000) {
       }
       if (end > now) now = end;
     },
+    /**
+     * LD-3 activation: the clock moves and NO timer runs — a process that did
+     * not run (a frozen VM). The next `advance` fires what fell due meanwhile,
+     * and that late tick reads the jumped clock.
+     */
+    jump(ms: number) {
+      now += ms;
+    },
     pendingCount: () => pending.size,
   };
 }
@@ -151,10 +162,14 @@ function harness() {
   const store = new SQLiteJobStore({ db });
   const puts: ObjectStorePutInput[] = [];
   const failJobCalls: Array<{ code: string }> = [];
+  // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: forwards EVERY argument —
+  // the acquisition stop included — so the real store decides the stage.
+  const failJobStops: Array<string | undefined> = [];
   const realFailJob = store.failJob.bind(store);
-  store.failJob = (jobId: string, code: string, message: string) => {
-    failJobCalls.push({ code });
-    return realFailJob(jobId, code, message);
+  store.failJob = (...args: Parameters<SQLiteJobStore["failJob"]>) => {
+    failJobCalls.push({ code: args[1] });
+    failJobStops.push(args[3]);
+    return realFailJob(...args);
   };
   const writer: ObjectStoreWriter = {
     async put(input) {
@@ -181,6 +196,7 @@ function harness() {
     puts,
     writer,
     failJobCalls,
+    failJobStops,
     claim(formatId: WorkerRequestedFormatId = "direct-original", url = "https://cdn.example.com/clip.mp4"): DurableWorkerJob {
       store.createJob({ url, formatId, principalId: "private-access-user" }, randomUUID());
       const job = store.claimNextQueuedJob();
@@ -394,12 +410,21 @@ function hlsDeps(over: Partial<JobExecutorDeps> = {}): JobExecutorDeps {
   };
 }
 
-const failedAsTimeout = (view: ReturnType<SQLiteJobStore["getJob"]>) => {
+/**
+ * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: a stop is now recorded with
+ * its own download-stage label — `Download stalled` for the watchdog's stop,
+ * `Download time limit reached` when the seam's absolute deadline came first
+ * (LD-3b wrote `Download failed` for both, the LD-4a R3 deferral). Still always
+ * the download stage, never processing.
+ */
+const STALLED = "Download stalled";
+const TIME_LIMIT = "Download time limit reached";
+const failedAsTimeout = (view: ReturnType<SQLiteJobStore["getJob"]>, stage: typeof STALLED | typeof TIME_LIMIT) => {
   assert.ok(view);
   assert.equal(view.status, "failed");
   assert.equal(view.errorCode, "TIMEOUT");
   assert.equal(view.safeErrorMessage, ERROR_MESSAGES.TIMEOUT);
-  assert.equal(view.stageLabel, "Download failed", "always the download stage, never processing");
+  assert.equal(view.stageLabel, stage, "the stop's own download-stage label, never processing");
 };
 
 // ── Direct ───────────────────────────────────────────────────────────────────
@@ -426,7 +451,7 @@ describe("direct: a dead source is stopped one window after its last meaningful 
     assert.equal(h.store.getJob(job.jobId)!.status, "downloading", "not yet: the window has not passed");
     vt.advance(1_000);
     await done;
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
     assert.equal(body.stream.destroyed, true, "the transport stopped reading the source");
     assert.equal(h.puts.length, 0, "no upload after a stalled acquisition");
     assert.equal(h.jobDirExists(job.jobId), false, "the partial file and its directory are gone");
@@ -500,7 +525,7 @@ describe("direct: a dead source is stopped one window after its last meaningful 
     assert.equal(h.store.getJob(job.jobId)!.status, "downloading");
     vt.advance(10_000); // 120 s after the phase start: 44 kB in all, below the floor
     await done;
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
   });
 });
 
@@ -530,7 +555,7 @@ describe("clear HLS: the stop reaches the fragment transport", () => {
     await waitUntil(() => o.totals().includes(100_000), "the chunk");
     vt.advance(WINDOW);
     await done;
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
     assert.equal(body.stream.destroyed, true, "the fragment body was disposed");
     assert.equal(h.jobDirExists(job.jobId), false);
     assert.equal(h.puts.length, 0);
@@ -558,7 +583,7 @@ describe("clear HLS: the stop reaches the fragment transport", () => {
     await waitUntil(() => o.count("resource-boundary") === 1, "the map's boundary");
     vt.advance(WINDOW);
     await done;
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
     assert.equal(next.stream.destroyed, true);
   });
 
@@ -631,7 +656,7 @@ describe("clear HLS: the stop reaches the fragment transport", () => {
     await waitUntil(() => o.totals().includes(60), "the audio chunk");
     vt.advance(WINDOW);
     await done;
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
     assert.equal(audioSeg.stream.destroyed, true);
     assert.equal(h.jobDirExists(job.jobId), false, "both halves are gone with the job directory");
     assert.equal(h.puts.length, 0);
@@ -755,7 +780,7 @@ describe("terminal precedence, consistent with the existing executor", () => {
     assert.equal(deadlines.length, 1, "the seam armed its one deadline");
     deadlines[0]!();
     await done;
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), TIME_LIMIT);
     assert.deepEqual(o.settled(), ["deadline-exceeded"], "the time limit, not a stop, ended the transfer");
     assert.equal(vt.pendingCount(), 0);
   });
@@ -783,7 +808,7 @@ describe("terminal precedence, consistent with the existing executor", () => {
     assert.equal(vt.pendingCount(), 0, "and released its timer");
     deadlines[0]!();
     await done;
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), TIME_LIMIT);
     assert.deepEqual(o.settled(), ["deadline-exceeded"]);
   });
 
@@ -865,7 +890,7 @@ describe("terminal precedence, consistent with the existing executor", () => {
     await waitUntil(() => vt.pendingCount() === 1, "the watchdog to arm");
     vt.advance(WINDOW);
     await done;
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
     assert.equal(processed, 0, "no FFmpeg after a stopped acquisition");
     assert.equal(h.puts.length, 0, "no upload after a stopped acquisition");
   });
@@ -974,7 +999,7 @@ describe("terminal precedence, consistent with the existing executor", () => {
     vt.advance(10 * WINDOW); // while the transport tears down and the directory is removed
     await done;
     vt.advance(10 * WINDOW);
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
     assert.deepEqual(h.failJobCalls, [{ code: "TIMEOUT" }]);
   });
 
@@ -1121,7 +1146,7 @@ describe("scope: only transport-observed plans are watched", () => {
     await waitUntil(() => vt.pendingCount() === 1, "the watchdog to arm through the composite");
     vt.advance(WINDOW);
     await done;
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
   });
 
   it("a failing observer factory never removes the watchdog", async () => {
@@ -1143,7 +1168,7 @@ describe("scope: only transport-observed plans are watched", () => {
     await waitUntil(() => vt.pendingCount() === 1, "the watchdog to arm without its observer");
     vt.advance(WINDOW);
     await done;
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
   });
 
   it("a progress percentage or a browser-progress update is never evidence", async () => {
@@ -1171,7 +1196,7 @@ describe("scope: only transport-observed plans are watched", () => {
     });
     const job = h.claim();
     await executor.execute(job);
-    failedAsTimeout(h.store.getJob(job.jobId));
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
   });
 
   it("a stop never relabels an abort that already happened for another cause", async () => {
@@ -1326,21 +1351,28 @@ const source = (rel: string) => readFileSync(new URL(rel, ROOT), "utf8");
 /** Code only: block and line comments removed (a `//` inside a URL string is kept). */
 const code = (text: string) => text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
 
-describe("enforcement is deliberately disconnected, and nothing else moved", () => {
-  it("the composition root supplies no enforcement and names no watchdog", () => {
-    const runtime = source("src/worker/runtime/runtime.server.ts");
-    assert.equal(runtime.includes("acquisitionInactivity"), false);
+// VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: LD-3b pinned enforcement as
+// deliberately DISCONNECTED here. This change connects it, so the first two
+// pins are inverted; the rest of the block is unchanged.
+describe("enforcement is connected in Production, and nothing else moved", () => {
+  it("the composition root supplies the enforcement — and still builds no watchdog and names no observer sink", () => {
+    const runtime = code(source("src/worker/runtime/runtime.server.ts"));
+    assert.match(runtime, /policy: Object\.freeze\(\{ windowMs: timeLimits\.inactivityMs \}\)/);
+    assert.match(runtime, /watchFilesystemObservedPlans: true/);
+    assert.match(runtime, /\n\s*acquisitionInactivity,\n\s*timeLimits,\n/);
+    // It hands the executor a policy; the executor alone builds one watchdog per acquisition.
     assert.equal(runtime.includes("acquisition-inactivity-watchdog"), false);
+    assert.equal(runtime.includes("createAcquisitionInactivityWatchdog"), false);
     assert.equal(runtime.includes("createAcquisitionActivitySink"), false);
   });
 
-  it("no configuration owns the window yet: no variable read, no model field", () => {
-    for (const file of ["src/worker/runtime/config.server.ts", "src/worker/runtime/time-limits.ts", "src/worker/runtime/runtime.server.ts", "src/lib/config.ts"]) {
-      assert.equal(code(source(file)).includes("DOWNLOAD_INACTIVITY_TIMEOUT"), false, file);
-      assert.equal(/\binactivityMs\b/.test(code(source(file))), false, file);
-    }
-    // Positive control: the same reader does see the reserved name in the model's own comment.
-    assert.equal(source("src/worker/runtime/time-limits.ts").includes("DOWNLOAD_INACTIVITY_TIMEOUT"), true);
+  it("the strict configuration owns the window — the loader, the model and the composition root — and the lax loader never reads it", () => {
+    assert.equal(code(source("src/worker/runtime/config.server.ts")).includes("DOWNLOAD_INACTIVITY_TIMEOUT"), true);
+    assert.match(code(source("src/worker/runtime/time-limits.ts")), /\binactivityMs\b/);
+    assert.match(code(source("src/worker/runtime/runtime.server.ts")), /timeLimits\.inactivityMs/);
+    assert.equal(code(source("src/lib/config.ts")).includes("DOWNLOAD_INACTIVITY_TIMEOUT"), false);
+    assert.equal(/\binactivityMs\b/.test(code(source("src/lib/config.ts"))), false);
+    // Positive controls for the comment stripper.
     assert.equal(code("// DOWNLOAD_INACTIVITY_TIMEOUT\nconst x = 1;").includes("DOWNLOAD_INACTIVITY_TIMEOUT"), false);
     assert.equal(code('const u = "https://a.invalid/x";').includes("https://a.invalid/x"), true);
   });
@@ -1377,5 +1409,556 @@ describe("enforcement is deliberately disconnected, and nothing else moved", () 
     ]);
     assert.equal(WorkerJobViewSchema.safeParse({ ...view, activity: { state: "receiving" } }).success, false);
     assert.equal(WorkerJobViewSchema.safeParse(view).success, true, "positive control: the same view without it parses");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001
+//
+// The executor under the enforcement EXACTLY as Production now composes it
+// (`runtime.server.ts`: the configured window, the reviewed defaults, the
+// filesystem-observed plans opted in, no observer sink), on virtual time. The
+// real runtime itself is exercised in `inactivity-runtime-activation.server.test.ts`.
+// ═════════════════════════════════════════════════════════════════════════════
+
+const productionEnforcement = (vt: ReturnType<typeof virtualTime>) => ({
+  policy: { windowMs: WINDOW },
+  watchFilesystemObservedPlans: true,
+  clock: vt.clock,
+  timers: vt.timers,
+});
+
+const M4A_PLAN = GenericExecutionPlanSchema.parse({
+  strategy: "yt-dlp",
+  operation: "extract-m4a",
+  requestedFormatId: "preset:audio",
+  source: SOURCE,
+  targetContainer: "m4a",
+});
+const MP3_PLAN = GenericExecutionPlanSchema.parse({
+  strategy: "yt-dlp",
+  operation: "extract-mp3",
+  requestedFormatId: "preset:mp3",
+  source: SOURCE,
+  targetContainer: "mp3",
+});
+const DASH_SPLIT_PLAN = GenericExecutionPlanSchema.parse({
+  strategy: "yt-dlp",
+  operation: "merge-split",
+  requestedFormatId: "preset:1080",
+  pair: {
+    video: { ...SOURCE, formatId: "137", protocol: "http_dash_segments", hasAudio: false, audioConstraint: "absent" },
+    audio: { ...SOURCE, formatId: "140", protocol: "http_dash_segments", container: "m4a", hasVideo: false, videoConstraint: "absent" },
+  },
+  targetContainer: "mp4",
+});
+
+/**
+ * Every acquisition seam as a quick, successful fake that records what it was handed. Each reports a real
+ * phase to the sink it receives — deadline, phase start, bytes, phase end — so the watchdog arms its timer and a
+ * missing release is visible the moment the acquisition settles.
+ */
+function recordingSeams(handed: Array<Record<string, unknown>>): Partial<JobExecutorDeps> {
+  const keep = (ctx: object) => {
+    handed.push({ ...ctx });
+    const sink = (ctx as { activity?: AcquisitionActivitySink }).activity;
+    sink?.({ kind: "deadline-armed", limitMs: 600_000 });
+    sink?.({ kind: "phase-started", phase: "single" });
+    sink?.({ kind: "bytes", totalBytes: 2 * G, evidence: "transport" });
+    sink?.({ kind: "phase-ended" });
+  };
+  return {
+    downloadOriginal: async (_url, ctx) => {
+      keep(ctx);
+      const filePath = join(ctx.workDir, "source.mp4");
+      writeFileSync(filePath, "direct-media");
+      return { filePath, container: "mp4", mime: "video/mp4", fileSize: 12 };
+    },
+    downloadGeneric: async (_url, workDir, _plan, ctx) => {
+      keep(ctx);
+      const filePath = join(workDir, "source.mp4");
+      writeFileSync(filePath, "generic-media");
+      return { filePath, container: "mp4", mime: "video/mp4", fileSize: 13 };
+    },
+    downloadGenericSplit: async (_url, workDir, plan, ctx) => {
+      keep(ctx);
+      const video = join(workDir, `video-source.${plan.pair.video.container}`);
+      const audio = join(workDir, `audio-source.${plan.pair.audio.container}`);
+      writeFileSync(video, "video");
+      writeFileSync(audio, "audio");
+      return {
+        video: { filePath: video, container: plan.pair.video.container, fileSize: 5 },
+        audio: { filePath: audio, container: plan.pair.audio.container, fileSize: 5 },
+        totalFileSize: 10,
+      };
+    },
+    acquireClearHls: async (_plan, workDir, ctx) => {
+      keep(ctx);
+      const filePath = join(workDir, "hls.ts");
+      writeFileSync(filePath, "transport-stream");
+      return Object.freeze({ filePath, segmentType: "mpegts", fileSize: 16 }) as never;
+    },
+    acquireSeparateHls: async (_plan, workDir, ctx) => {
+      keep(ctx);
+      const v = join(workDir, "hls-video.fmp4");
+      const a = join(workDir, "hls-audio.fmp4");
+      writeFileSync(v, "video");
+      writeFileSync(a, "audio");
+      return Object.freeze({
+        video: Object.freeze({ filePath: v, segmentType: "fmp4", fileSize: 5 }),
+        audio: Object.freeze({ filePath: a, segmentType: "fmp4", fileSize: 5 }),
+        totalFileSize: 10,
+      }) as never;
+    },
+    processLocally: async (opts) => {
+      const out = join(opts.workDir, `converted.${opts.target}`);
+      writeFileSync(out, "converted");
+      return out;
+    },
+    mergeSplit: async (opts) => {
+      const out = join(opts.workDir, `merged.${opts.target}`);
+      writeFileSync(out, "merged");
+      return out;
+    },
+  };
+}
+
+describe("LD-3 activation: under Production's enforcement every acquisition family gets exactly one watchdog", () => {
+  const FAMILIES: ReadonlyArray<{
+    label: string;
+    formatId: WorkerRequestedFormatId;
+    deps: Partial<JobExecutorDeps>;
+    ytdlp: boolean;
+  }> = [
+    { label: "direct keep-original", formatId: "direct-original", deps: { analyze: async () => directMeta() }, ytdlp: false },
+    { label: "direct convert (MP3)", formatId: "preset:mp3", deps: { analyze: async () => directMeta(true) }, ytdlp: false },
+    { label: "clear HLS", formatId: "preset:1080", deps: hlsDeps({ derivePlanForExecution: () => yt(HLS_PLAN) }), ytdlp: false },
+    { label: "separate-audio HLS", formatId: "preset:1080", deps: hlsDeps({ derivePlanForExecution: () => yt(SEPARATE_PLAN) }), ytdlp: false },
+    { label: "yt-dlp progressive keep-original", formatId: "preset:1080", deps: { analyzeForExecution: async () => GENERIC_ANALYSIS, derivePlanForExecution: () => yt(SINGLE_PLAN) }, ytdlp: true },
+    { label: "yt-dlp extract-m4a", formatId: "preset:audio", deps: { analyzeForExecution: async () => GENERIC_ANALYSIS, derivePlanForExecution: () => yt(M4A_PLAN) }, ytdlp: true },
+    { label: "yt-dlp extract-mp3", formatId: "preset:mp3", deps: { analyzeForExecution: async () => GENERIC_ANALYSIS, derivePlanForExecution: () => yt(MP3_PLAN) }, ytdlp: true },
+    { label: "yt-dlp split pair (progressive halves)", formatId: "preset:1080", deps: { analyzeForExecution: async () => GENERIC_ANALYSIS, derivePlanForExecution: () => yt(SPLIT_PLAN) }, ytdlp: true },
+    { label: "yt-dlp split pair (segmented DASH halves)", formatId: "preset:1080", deps: { analyzeForExecution: async () => GENERIC_ANALYSIS, derivePlanForExecution: () => yt(DASH_SPLIT_PLAN) }, ytdlp: true },
+  ];
+
+  for (const family of FAMILIES) {
+    it(`${family.label}: one watchdog sink${family.ytdlp ? ", both stops (the watched retry policy)" : ", no yt-dlp stop"}, released on completion`, async () => {
+      const h = harness();
+      const vt = virtualTime();
+      const handed: Array<Record<string, unknown>> = [];
+      const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+        availableWorkDirBytes: async () => Number.MAX_SAFE_INTEGER,
+        ...recordingSeams(handed),
+        ...family.deps,
+        acquisitionInactivity: productionEnforcement(vt),
+      });
+      const job = h.claim(family.formatId, "https://example.invalid/watch");
+      await executor.execute(job);
+      // Read before any virtual time passes: the watchdog armed a timer, and only its release removes it.
+      assert.equal(vt.pendingCount(), 0, "the watchdog was released the moment the acquisition settled");
+      assert.equal(h.store.getJob(job.jobId)!.status, "ready", family.label);
+      assert.equal(handed.length, 1, "one acquisition");
+      const ctx = handed[0]!;
+      assert.equal(typeof ctx.activity, "function", "the watchdog's own sink");
+      if (family.ytdlp) {
+        assert.ok(ctx.stopForInactivity instanceof AbortSignal);
+        assert.ok(ctx.stopForObservationLoss instanceof AbortSignal);
+        assert.equal(selectYtdlpAcquisitionRetryPolicy(ctx as never), "watched");
+        assert.deepEqual({ ...(ctx.limits as object) }, { maxFileSizeBytes: Number((ctx.limits as { maxFileSizeBytes: number }).maxFileSizeBytes), downloadTimeLimitMs: 600_000 });
+      } else {
+        assert.equal("stopForInactivity" in ctx || "stopForObservationLoss" in ctx, false, "transport paths never get a yt-dlp stop");
+        assert.equal("limits" in ctx, false, "nor yt-dlp limits");
+        assert.equal(ctx.downloadTimeLimitMs, 600_000, "the one absolute limit");
+      }
+      assert.equal(vt.pendingCount(), 0, "no watchdog timer outlives the acquisition");
+      assert.deepEqual(h.failJobCalls, []);
+    });
+  }
+
+  it("a bare executor — the only way to have none — watches nothing and selects the bounded policy", async () => {
+    const h = harness();
+    const handed: Array<Record<string, unknown>> = [];
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+      availableWorkDirBytes: async () => Number.MAX_SAFE_INTEGER,
+      ...recordingSeams(handed),
+      analyzeForExecution: async () => GENERIC_ANALYSIS,
+      derivePlanForExecution: () => yt(SINGLE_PLAN),
+    });
+    assert.equal(executor.inactivityEnforcement, null);
+    await executor.execute(h.claim("preset:1080", "https://example.invalid/watch"));
+    assert.deepEqual(Object.keys(handed[0]!).sort(), ["limits", "onProgress", "signal"]);
+    assert.equal(selectYtdlpAcquisitionRetryPolicy(handed[0] as never), "bounded");
+  });
+});
+
+describe("LD-3 activation: the real HLS transports' own deadline is 'Download time limit reached'", () => {
+  /** A narrower injected acquisition limit, so the transports' REAL timers fire within the test. */
+  const narrow = { downloadTimeLimitMs: 40, processingMs: 600_000, uploadMs: 3_600_000 };
+
+  for (const [label, preflight] of [
+    ["MPEG-TS", () => hlsTsPlan([F1])],
+    ["fMP4", () => hlsFmp4Plan(INIT, [F1])],
+  ] as const) {
+    it(`clear HLS ${label}: a body still open at the deadline ends as the time limit, never a stall`, async () => {
+      const h = harness();
+      const vt = virtualTime();
+      const body = manualBody();
+      fakeHlsNetwork({ [INIT]: () => chunkedBody([chunk(100)]), [F1]: () => body.stream });
+      const o = observer();
+      const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), hlsDeps({
+        derivePlanForExecution: () => yt(HLS_PLAN),
+        acquireClearHls: (plan, workDir, ctx) =>
+          acquireSelectedClearHlsMedia(
+            { plan, workDir, signal: ctx.signal, downloadTimeLimitMs: ctx.downloadTimeLimitMs, ...(ctx.activity ? { activity: ctx.activity } : {}) },
+            { preflight: async () => preflight(), acquire: acquireClearHlsTs, acquireFmp4: acquireClearHlsFmp4 },
+          ),
+        timeLimits: narrow,
+        acquisitionInactivity: productionEnforcement(vt),
+        createAcquisitionActivitySink: o.factory,
+      }));
+      const job = h.claim("preset:1080", "https://example.invalid/watch");
+      await executor.execute(job);
+      failedAsTimeout(h.store.getJob(job.jobId), TIME_LIMIT);
+      assert.deepEqual(o.settled(), ["deadline-exceeded"], "the transport's own latch: its deadline, first");
+      assert.equal(body.stream.destroyed, true);
+      assert.equal(h.puts.length, 0);
+      assert.equal(vt.pendingCount(), 0);
+    });
+  }
+
+  it("separate-audio HLS: the ONE shared deadline ending the video half is the time limit too", async () => {
+    const h = harness();
+    const vt = virtualTime();
+    const videoSeg = manualBody();
+    fakeHlsNetwork({
+      [VIDEO_INIT]: () => chunkedBody([chunk(100)]),
+      [VIDEO_SEG]: () => videoSeg.stream,
+      [AUDIO_INIT]: () => chunkedBody([chunk(50)]),
+      [AUDIO_SEG]: () => chunkedBody([chunk(50)]),
+    });
+    let preflights = 0;
+    const o = observer();
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), hlsDeps({
+      derivePlanForExecution: () => yt(SEPARATE_PLAN),
+      acquireSeparateHls: (plan, workDir, ctx) =>
+        acquireSelectedSeparateHlsMedia(
+          { plan, workDir, signal: ctx.signal, downloadTimeLimitMs: ctx.downloadTimeLimitMs, ...(ctx.activity ? { activity: ctx.activity } : {}) },
+          {
+            preflight: async () => {
+              preflights += 1;
+              return preflights === 1 ? hlsFmp4Plan(VIDEO_INIT, [VIDEO_SEG]) : hlsFmp4Plan(AUDIO_INIT, [AUDIO_SEG]);
+            },
+            acquireVideo: acquireClearHlsSeparateVideoFmp4,
+            acquireAudio: acquireClearHlsSeparateAudioFmp4,
+          } as Parameters<typeof acquireSelectedSeparateHlsMedia>[1],
+        ),
+      timeLimits: narrow,
+      acquisitionInactivity: productionEnforcement(vt),
+      createAcquisitionActivitySink: o.factory,
+    }));
+    const job = h.claim("preset:1080", "https://example.invalid/watch");
+    await executor.execute(job);
+    failedAsTimeout(h.store.getJob(job.jobId), TIME_LIMIT);
+    assert.deepEqual(o.settled(), ["deadline-exceeded"]);
+    assert.equal(h.jobDirExists(job.jobId), false);
+  });
+});
+
+/** A direct seam under full test control: it reports what the test says and settles when told. */
+function scriptedDirectSeam() {
+  let sink: AcquisitionActivitySink | undefined;
+  let signal: AbortSignal | undefined;
+  let settle!: (outcome: "deadline-exceeded" | "cancelled" | "failed", err: unknown) => void;
+  let started!: () => void;
+  const startedP = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const seam = ((_url: string, ctx: { activity?: AcquisitionActivitySink; signal?: AbortSignal; downloadTimeLimitMs: number }) =>
+    new Promise((_resolve, reject) => {
+      sink = ctx.activity;
+      signal = ctx.signal;
+      settle = (outcome, err) => {
+        sink?.({ kind: "settled", outcome });
+        reject(err);
+      };
+      started();
+    })) as unknown as JobExecutorDeps["downloadOriginal"];
+  return {
+    seam,
+    started: startedP,
+    report: (event: AcquisitionActivityEvent) => sink?.(event),
+    settle: (outcome: "deadline-exceeded" | "cancelled" | "failed", err: unknown) => settle(outcome, err),
+    aborted: () => signal?.aborted === true,
+  };
+}
+
+describe("LD-3 activation: precedence between the stall and the absolute deadline", () => {
+  function directExecutor(h: ReturnType<typeof harness>, vt: ReturnType<typeof virtualTime>, seam: JobExecutorDeps["downloadOriginal"], extra: Partial<JobExecutorDeps> = {}) {
+    return new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+      analyze: async () => directMeta(),
+      availableWorkDirBytes: async () => Number.MAX_SAFE_INTEGER,
+      downloadOriginal: seam,
+      acquisitionInactivity: productionEnforcement(vt),
+      ...extra,
+    });
+  }
+
+  it("the seam latched its deadline FIRST and the stop landed before it settled: the time limit is the outcome, never relabelled", async () => {
+    const h = harness();
+    const vt = virtualTime();
+    const s = scriptedDirectSeam();
+    const job = h.claim();
+    const done = directExecutor(h, vt, s.seam).execute(job);
+    await s.started;
+    s.report({ kind: "deadline-armed", limitMs: 600_000 });
+    s.report({ kind: "phase-started", phase: "single" });
+    s.report({ kind: "bytes", totalBytes: 2 * G, evidence: "transport" });
+    // The deadline fires inside the seam (its one-way latch records it) ...
+    vt.advance(WINDOW); // ... and a watchdog tick lands before the seam's settlement: a nearby timer.
+    assert.equal(s.aborted(), true, "the watchdog did stop the execution");
+    s.settle("deadline-exceeded", new AppError("TIMEOUT"));
+    await done;
+    failedAsTimeout(h.store.getJob(job.jobId), TIME_LIMIT);
+    assert.deepEqual(h.failJobStops, ["time-limit"]);
+  });
+
+  it("the stop landed FIRST and the seam then saw its caller's abort: the stall is the outcome", async () => {
+    const h = harness();
+    const vt = virtualTime();
+    const s = scriptedDirectSeam();
+    const job = h.claim();
+    const done = directExecutor(h, vt, s.seam).execute(job);
+    await s.started;
+    s.report({ kind: "deadline-armed", limitMs: 600_000 });
+    s.report({ kind: "phase-started", phase: "single" });
+    vt.advance(WINDOW);
+    s.settle("cancelled", new AppError("PROCESSING_FAILED", "aborted"));
+    await done;
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
+    assert.deepEqual(h.failJobStops, ["inactivity"]);
+  });
+
+  it("a tick one millisecond before the deadline, with the window spent: the stall came first", async () => {
+    const h = harness();
+    const vt = virtualTime();
+    const s = scriptedDirectSeam();
+    const job = h.claim();
+    const done = directExecutor(h, vt, s.seam).execute(job);
+    await s.started;
+    s.report({ kind: "deadline-armed", limitMs: WINDOW + 1 });
+    s.report({ kind: "phase-started", phase: "single" });
+    vt.advance(WINDOW);
+    assert.equal(s.aborted(), true, "stopped at the window, 1 ms before the deadline");
+    s.settle("cancelled", new AppError("PROCESSING_FAILED", "aborted"));
+    await done;
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
+  });
+
+  it("the deadline and the window at the SAME instant: the watchdog defers, and the time limit is the outcome", async () => {
+    const h = harness();
+    const vt = virtualTime();
+    const s = scriptedDirectSeam();
+    const job = h.claim();
+    const done = directExecutor(h, vt, s.seam).execute(job);
+    await s.started;
+    s.report({ kind: "deadline-armed", limitMs: WINDOW });
+    s.report({ kind: "phase-started", phase: "single" });
+    vt.advance(WINDOW);
+    assert.equal(s.aborted(), false, "the watchdog deferred to the time limit");
+    assert.equal(vt.pendingCount(), 0, "and released its timer");
+    s.settle("deadline-exceeded", new AppError("TIMEOUT"));
+    await done;
+    failedAsTimeout(h.store.getJob(job.jobId), TIME_LIMIT);
+  });
+
+  it("a second deadline report can never move the absolute deadline: the watchdog still defers at the first one", async () => {
+    const h = harness();
+    const vt = virtualTime();
+    const s = scriptedDirectSeam();
+    const job = h.claim();
+    const done = directExecutor(h, vt, s.seam).execute(job);
+    await s.started;
+    s.report({ kind: "deadline-armed", limitMs: WINDOW });
+    s.report({ kind: "phase-started", phase: "single" });
+    vt.advance(WINDOW / 2);
+    // A later report — as each half of a separate-audio pair makes — of a longer limit.
+    s.report({ kind: "deadline-armed", limitMs: 600_000 });
+    vt.advance(WINDOW / 2);
+    assert.equal(s.aborted(), false, "at the FIRST deadline the watchdog defers: it was never moved");
+    assert.equal(vt.pendingCount(), 0, "and released its timer there");
+    s.settle("deadline-exceeded", new AppError("TIMEOUT"));
+    await done;
+    failedAsTimeout(h.store.getJob(job.jobId), TIME_LIMIT);
+  });
+
+  it("a TIMEOUT after a successful watched acquisition (processing) keeps its own stage: never an acquisition stop", async () => {
+    const h = harness();
+    const vt = virtualTime();
+    const executor = directExecutor(h, vt, recordingSeams([]).downloadOriginal, {
+      processLocally: async () => {
+        throw new AppError("TIMEOUT");
+      },
+      analyze: async () => directMeta(true),
+    });
+    const job = h.claim("preset:mp3");
+    await executor.execute(job);
+    const view = h.store.getJob(job.jobId)!;
+    assert.equal(view.errorCode, "TIMEOUT");
+    assert.equal(view.stageLabel, "Processing failed", "a processing timeout is never an acquisition stop");
+    assert.deepEqual(h.failJobStops, [undefined]);
+  });
+
+  it("the execution-lifetime backstop during a watched acquisition is TIMEOUT at the download stage, never a reserved stage", async () => {
+    const h = harness();
+    const vt = virtualTime();
+    const backstop = virtualTime();
+    const s = scriptedDirectSeam();
+    const job = h.claim();
+    const done = directExecutor(h, vt, s.seam, { backstopTimers: backstop.timers }).execute(job);
+    await s.started;
+    s.report({ kind: "deadline-armed", limitMs: 600_000 });
+    s.report({ kind: "phase-started", phase: "single" });
+    backstop.advance(job.expiresAt - Date.now() + 1_000); // the job's own lifetime ends
+    assert.equal(s.aborted(), true);
+    s.settle("cancelled", new AppError("PROCESSING_FAILED", "aborted"));
+    await done;
+    const view = h.store.getJob(job.jobId)!;
+    assert.equal(view.errorCode, "TIMEOUT");
+    assert.equal(view.stageLabel, "Download failed");
+    assert.deepEqual(h.failJobStops, [undefined]);
+    vt.advance(10 * WINDOW);
+    assert.equal(vt.pendingCount(), 0, "the watchdog was released with the acquisition");
+  });
+});
+
+describe("LD-3 activation: timing under Production's 120 s window", () => {
+  function started(vt: ReturnType<typeof virtualTime>) {
+    const h = harness();
+    const s = scriptedDirectSeam();
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), {
+      analyze: async () => directMeta(),
+      availableWorkDirBytes: async () => Number.MAX_SAFE_INTEGER,
+      downloadOriginal: s.seam,
+      acquisitionInactivity: productionEnforcement(vt),
+    });
+    const job = h.claim();
+    const done = executor.execute(job);
+    return { h, s, job, done };
+  }
+
+  it("never early: the stop lands at the first tick at or after 120 s of silence", async () => {
+    const vt = virtualTime();
+    const { h, s, job, done } = started(vt);
+    await s.started;
+    s.report({ kind: "deadline-armed", limitMs: 600_000 });
+    s.report({ kind: "phase-started", phase: "single" });
+    vt.advance(WINDOW - 1);
+    assert.equal(s.aborted(), false, "119.999 s: not yet");
+    vt.advance(1);
+    assert.equal(s.aborted(), true, "120 s: stopped");
+    s.settle("cancelled", new AppError("PROCESSING_FAILED", "aborted"));
+    await done;
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
+  });
+
+  it("no first byte at all is a stall too, one window after the phase began", async () => {
+    const vt = virtualTime();
+    const { h, s, job, done } = started(vt);
+    await s.started;
+    s.report({ kind: "deadline-armed", limitMs: 600_000 });
+    s.report({ kind: "phase-started", phase: "single" });
+    vt.advance(WINDOW);
+    s.settle("cancelled", new AppError("PROCESSING_FAILED", "aborted"));
+    await done;
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
+  });
+
+  it("a suspended process is not a stalled source: one fresh window from the resume, then a stall on visible silence", async () => {
+    const vt = virtualTime();
+    const { h, s, job, done } = started(vt);
+    await s.started;
+    s.report({ kind: "deadline-armed", limitMs: 3_600_000 });
+    s.report({ kind: "phase-started", phase: "single" });
+    s.report({ kind: "bytes", totalBytes: 2 * G, evidence: "transport" });
+    vt.advance(60_000); // a minute of visible silence
+    vt.jump(10 * 60_000); // the VM froze for ten minutes: no tick ran
+    vt.advance(0); // the late tick sees the gap: a suspension
+    assert.equal(s.aborted(), false, "the frozen time is never inactivity");
+    vt.advance(WINDOW - 1_000);
+    assert.equal(s.aborted(), false, "a fresh window from the resume");
+    vt.advance(1_000);
+    assert.equal(s.aborted(), true, "and visible silence for that window stops it");
+    s.settle("cancelled", new AppError("PROCESSING_FAILED", "aborted"));
+    await done;
+    failedAsTimeout(h.store.getJob(job.jobId), STALLED);
+  });
+
+  it("meaningful progress can never extend the absolute deadline: past it the watchdog stops deciding and releases its timer", async () => {
+    const vt = virtualTime();
+    const { h, s, job, done } = started(vt);
+    await s.started;
+    s.report({ kind: "deadline-armed", limitMs: 600_000 });
+    s.report({ kind: "phase-started", phase: "single" });
+    let bytes = 0;
+    for (let minute = 1; minute <= 9; minute += 1) {
+      bytes += 2 * G;
+      s.report({ kind: "bytes", totalBytes: bytes, evidence: "transport" });
+      vt.advance(60_000);
+    }
+    assert.equal(s.aborted(), false, "steady meaningful progress is never stopped");
+    vt.advance(60_000); // the 600 s deadline passes; the seam has not reported yet
+    assert.equal(vt.pendingCount(), 0, "no window is ever re-armed past the absolute deadline");
+    vt.advance(10 * WINDOW);
+    assert.equal(s.aborted(), false, "and nothing the watchdog does replaces the seam's own deadline");
+    s.settle("deadline-exceeded", new AppError("TIMEOUT"));
+    await done;
+    failedAsTimeout(h.store.getJob(job.jobId), TIME_LIMIT);
+  });
+});
+
+describe("LD-3 activation: separate-audio — a deadline that passes BETWEEN the halves is still the time limit", () => {
+  it("a video half ending in the shared deadline's last instant leaves the audio half nothing: Download time limit reached", async () => {
+    const h = harness();
+    const vt = virtualTime();
+    const o = observer();
+    let audioStarted = 0;
+    let preflights = 0;
+    const executor = new JobExecutor(h.store, h.writer, () => Date.now(), new Map(), hlsDeps({
+      derivePlanForExecution: () => yt(SEPARATE_PLAN),
+      acquireSeparateHls: (plan, workDir, ctx) =>
+        acquireSelectedSeparateHlsMedia(
+          { plan, workDir, signal: ctx.signal, downloadTimeLimitMs: ctx.downloadTimeLimitMs, ...(ctx.activity ? { activity: ctx.activity } : {}) },
+          {
+            preflight: async () => {
+              preflights += 1;
+              return preflights === 1 ? hlsFmp4Plan(VIDEO_INIT, [VIDEO_SEG]) : hlsFmp4Plan(AUDIO_INIT, [AUDIO_SEG]);
+            },
+            // A video half that completes only after the ONE deadline has run out.
+            acquireVideo: async (order: { workDir: string; activity?: AcquisitionActivitySink }) => {
+              order.activity?.({ kind: "phase-started", phase: "video" });
+              await new Promise((resolve) => setTimeout(resolve, 60));
+              const filePath = join(order.workDir, "hls-video.fmp4");
+              writeFileSync(filePath, chunk(100));
+              order.activity?.({ kind: "bytes", totalBytes: 100, evidence: "transport" });
+              order.activity?.({ kind: "phase-ended" });
+              return Object.freeze({ filePath, segmentType: "fmp4", fileSize: 100 });
+            },
+            acquireAudio: async () => {
+              audioStarted += 1;
+              throw new Error("the audio half must not start");
+            },
+          } as unknown as Parameters<typeof acquireSelectedSeparateHlsMedia>[1],
+        ),
+      // A 20 ms shared deadline, so the real clock passes it inside the video half.
+      timeLimits: { downloadTimeLimitMs: 20, processingMs: 600_000, uploadMs: 3_600_000 },
+      acquisitionInactivity: productionEnforcement(vt),
+      createAcquisitionActivitySink: o.factory,
+    }));
+    const job = h.claim("preset:1080", "https://example.invalid/watch");
+    await executor.execute(job);
+    failedAsTimeout(h.store.getJob(job.jobId), TIME_LIMIT);
+    assert.deepEqual(o.settled(), ["deadline-exceeded"], "the seam recorded its deadline at the boundary");
+    assert.equal(audioStarted, 0);
+    assert.equal(h.jobDirExists(job.jobId), false);
   });
 });

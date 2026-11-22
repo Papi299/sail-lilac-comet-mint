@@ -1,6 +1,11 @@
 import type { Server } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
-import { JobExecutor, type JobExecutorDeps } from "../execution/job-executor.server.ts";
+import {
+  JobExecutor,
+  type AcquisitionInactivityEnforcement,
+  type ExecutionBackstopTimers,
+  type JobExecutorDeps,
+} from "../execution/job-executor.server.ts";
 import { QueuePump } from "../execution/queue-pump.server.ts";
 import { QueueRunner } from "../execution/queue-runner.server.ts";
 import type { AnalyzeFn } from "../http/business-service.server.ts";
@@ -83,11 +88,27 @@ export type WorkerRuntimeOverrides = {
   analyze?: AnalyzeFn;
   probeBinaries?: WorkerBinaryProbe;
   /**
-   * Executor seams for tests. It cannot carry `timeLimits`: the strict
-   * configuration is the one owner of every stage time limit, so a test that
-   * needs different limits configures them, exactly as an operator would.
+   * Executor seams for tests. It cannot carry `timeLimits` or
+   * `acquisitionInactivity`: the strict configuration is the one owner of every
+   * stage time limit and of the inactivity window, so a test that needs
+   * different limits configures them, exactly as an operator would. (A
+   * JavaScript caller passing either anyway is overridden: both are composed
+   * AFTER these seams.)
    */
-  executorDeps?: Omit<JobExecutorDeps, "timeLimits">;
+  executorDeps?: Omit<JobExecutorDeps, "timeLimits" | "acquisitionInactivity">;
+  /**
+   * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001, tests only: the acquisition
+   * watchdog's MONOTONIC clock and timer hooks, so a test can drive the
+   * configured window in virtual time. It carries no policy: the window is
+   * `DOWNLOAD_INACTIVITY_TIMEOUT`, and the tick, suspension gap and observation
+   * allowance are the watchdog's reviewed constants. The executable entry
+   * (`main.server.ts`) passes no overrides at all. Default: `performance.now`
+   * and the executor's backstop timers.
+   */
+  acquisitionInactivityTime?: {
+    readonly clock: () => number;
+    readonly timers: ExecutionBackstopTimers;
+  };
   maintenanceIntervalMs?: number;
   maintenanceBatchSize?: number;
   maintenanceTimers?: Pick<WorkerMaintenanceDeps, "setIntervalFn" | "clearIntervalFn">;
@@ -155,6 +176,7 @@ export async function createWorkerRuntime(
   const timeLimits = buildWorkerTimeLimits({
     analysisTimeoutSeconds: config.media.analysisTimeoutSeconds,
     downloadTimeLimitSeconds: config.media.downloadTimeLimitSeconds,
+    downloadInactivityTimeoutSeconds: config.media.downloadInactivityTimeoutSeconds,
     processingTimeoutSeconds: config.media.processingTimeoutSeconds,
     uploadTimeoutSeconds: config.media.uploadTimeoutSeconds,
     fileExpirationMinutes: config.media.fileExpirationMinutes,
@@ -272,6 +294,28 @@ export async function createWorkerRuntime(
     const injectsOwnAnalysis =
       executorDeps.analyzeForExecution !== undefined || executorDeps.analyze !== undefined;
 
+    // ── Acquisition-inactivity enforcement (VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001)
+    //
+    // ALWAYS supplied: there is no configuration, flag or environment value that
+    // disconnects it. ONE window, `DOWNLOAD_INACTIVITY_TIMEOUT` from the strict
+    // loader through the one time-limit model (already proven shorter than the
+    // acquisition limit); the tick, suspension gap and observation allowance
+    // are the watchdog's reviewed defaults. The filesystem-observed plans (every
+    // yt-dlp single source and split pair, segmented halves included) are opted
+    // in, so every acquisition family gets exactly one watchdog per acquisition
+    // — and the yt-dlp seams receive both stops, which alone selects their
+    // `watched` retry policy. Only a test can replace the clock and timers.
+    const acquisitionInactivity: AcquisitionInactivityEnforcement = Object.freeze({
+      policy: Object.freeze({ windowMs: timeLimits.inactivityMs }),
+      watchFilesystemObservedPlans: true,
+      ...(overrides.acquisitionInactivityTime
+        ? {
+            clock: overrides.acquisitionInactivityTime.clock,
+            timers: overrides.acquisitionInactivityTime.timers,
+          }
+        : {}),
+    });
+
     const executor = new JobExecutor(
       store,
       writer,
@@ -292,7 +336,9 @@ export async function createWorkerRuntime(
         // separate-audio acquisition, every processing stage, and (LD-2b) the
         // upload stage. The executor keeps only those three; the lifetimes went
         // to the store above, and it reads its execution deadline back from the
-        // job it claims.
+        // job it claims. The inactivity enforcement is composed here too, for
+        // the same reason: no test seam can replace or weaken it.
+        acquisitionInactivity,
         timeLimits,
       },
     );

@@ -11,7 +11,10 @@ import type { WorkerJobStatus } from "./contracts.ts";
  *
  * Nothing here is ever derived from an exception, a subprocess stream or an
  * upstream response. A stage label says WHICH phase of the Worker's own
- * lifecycle a job failed in; the durable status it was leaving decides that.
+ * lifecycle a job failed in; the durable status it was leaving decides that —
+ * or, since VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001, one of two closed
+ * acquisition stops, named by the executor from its own typed provenance and
+ * honoured only where it can be true.
  */
 
 /**
@@ -26,9 +29,11 @@ export const WORKER_RESTART_SAFE_MESSAGE = "Worker restarted before the job comp
 export const WORKER_RESTART_STAGE_LABEL = "Worker restarted";
 
 /**
- * Every stage label a failed job may carry. The first three are written by
- * `failJob()` from the durable status the job was leaving; the last by
- * `recover()`.
+ * The status-derived stage labels and the restart stage. The first three are
+ * written by `failJob()` from the durable status the job was leaving; the last
+ * by `recover()`. Since VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001
+ * `failJob()` may also write one of the two acquisition-stop stages below, kept
+ * out of this list on purpose (see `ACQUISITION_STOP_FAILED_STAGE_LABELS`).
  */
 export const FAILED_JOB_STAGE_LABELS = [
   "Download failed",
@@ -74,4 +79,52 @@ const FAILED_JOB_STAGE_LABEL_SET: ReadonlySet<string> = new Set<string>(FAILED_J
 
 export function isFailedJobStageLabel(value: unknown): value is FailedJobStageLabel {
   return typeof value === "string" && FAILED_JOB_STAGE_LABEL_SET.has(value);
+}
+
+/**
+ * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: the two acquisition stops
+ * whose failure carries a stage of its own, by cause.
+ *
+ *   inactivity   the acquisition watchdog stopped a live phase that had made no
+ *                meaningful progress for its window (`DOWNLOAD_INACTIVITY_TIMEOUT`);
+ *   time-limit   the acquisition's own absolute deadline (`DOWNLOAD_TIME_LIMIT`)
+ *                ended it, as the first cause its seam recorded.
+ *
+ * The values are exactly the control plane's reserved, `TIMEOUT`-only stages
+ * (`RESERVED_FAILED_JOB_STAGE_LABELS`, LD-4a), and a test binds the two tables.
+ * They are deliberately NOT members of `FAILED_JOB_STAGE_LABELS`: the control
+ * plane forwards those beside any code, while these may reach a browser only
+ * beside `TIMEOUT`. An observation loss has no entry: an observer that could
+ * not see is no evidence about the source, so it keeps the download stage.
+ */
+export const ACQUISITION_STOP_FAILED_STAGE_LABELS = Object.freeze({
+  inactivity: "Download stalled",
+  "time-limit": "Download time limit reached",
+} as const);
+
+export type AcquisitionStopCause = keyof typeof ACQUISITION_STOP_FAILED_STAGE_LABELS;
+
+export type AcquisitionStopFailedStageLabel =
+  (typeof ACQUISITION_STOP_FAILED_STAGE_LABELS)[AcquisitionStopCause];
+
+export function isAcquisitionStopCause(value: unknown): value is AcquisitionStopCause {
+  return typeof value === "string" && Object.hasOwn(ACQUISITION_STOP_FAILED_STAGE_LABELS, value);
+}
+
+/**
+ * The stage a failure records. An acquisition stop's own stage only where it
+ * can be true — the job is leaving `downloading`, the one status an acquisition
+ * runs in, with `TIMEOUT`, the one code either stop produces — and otherwise the
+ * stage of the status it is leaving (`failedJobStageLabelFor`). A stop named in
+ * any other combination claims nothing.
+ */
+export function failedJobStageLabelForFailure(
+  status: FailableWorkerJobStatus,
+  errorCode: string,
+  acquisitionStop: AcquisitionStopCause | undefined,
+): Exclude<FailedJobStageLabel, typeof WORKER_RESTART_STAGE_LABEL> | AcquisitionStopFailedStageLabel {
+  if (isAcquisitionStopCause(acquisitionStop) && status === "downloading" && errorCode === "TIMEOUT") {
+    return ACQUISITION_STOP_FAILED_STAGE_LABELS[acquisitionStop];
+  }
+  return failedJobStageLabelFor(status);
 }

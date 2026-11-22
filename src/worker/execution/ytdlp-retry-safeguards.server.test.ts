@@ -934,16 +934,24 @@ describe("C: retry exhaustion keeps the closed codes, classified by the LAST err
   });
 });
 
-// ── X: nothing was activated, and nothing public moved ───────────────────────
+// ── X: the policy follows the watchdog, and nothing public moved ─────────────
 
-describe("X: the larger budget stays bound to a watchdog nothing in Production attaches", () => {
+// VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: LD-3d pinned that nothing in
+// Production attached a watchdog, so Production ran `bounded`. This change
+// attaches it, so X1 is inverted: the composition root supplies the enforcement
+// with the filesystem opt-in — and still names no stop and no policy, because
+// the stops are the executor's per acquisition and the policy follows them.
+describe("X: the larger budget stays bound to the watchdog — which Production now attaches", () => {
   const ROOT = new URL("../../../", import.meta.url);
   const source = (rel: string) => readFileSync(new URL(rel, ROOT), "utf8");
   const code = (text: string) => text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
 
-  it("X1: the composition root supplies no watchdog stop, so every Production acquisition runs `bounded`", () => {
-    const runtime = source("src/worker/runtime/runtime.server.ts");
-    for (const needle of ["acquisitionInactivity", "watchFilesystemObservedPlans", "stopForInactivity", "stopForObservationLoss", "retryPolicy", "YTDLP_ACQUISITION_RETRY_POLICIES"]) {
+  it("X1: the composition root attaches the watchdog to every yt-dlp acquisition, so Production runs `watched` — through the stops alone", () => {
+    const runtime = code(source("src/worker/runtime/runtime.server.ts"));
+    for (const needle of ["acquisitionInactivity", "watchFilesystemObservedPlans: true"]) {
+      assert.equal(runtime.includes(needle), true, needle);
+    }
+    for (const needle of ["stopForInactivity", "stopForObservationLoss", "retryPolicy", "YTDLP_ACQUISITION_RETRY_POLICIES"]) {
       assert.equal(runtime.includes(needle), false, needle);
     }
     // Positive control: the same reader finds the selector where it is defined.

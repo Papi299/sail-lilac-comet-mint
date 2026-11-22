@@ -167,6 +167,7 @@ function makeConfig(
       maxVideoDurationSeconds: 7200,
       fileExpirationMinutes: 45,
       downloadTimeLimitSeconds: 600,
+      downloadInactivityTimeoutSeconds: 120,
       processingTimeoutSeconds: 600,
       uploadTimeoutSeconds: 3600,
       analysisTimeoutSeconds: 45,
@@ -730,6 +731,9 @@ describe("Worker runtime composition", () => {
         makeConfig(join(root, "state"), await reservePort(), {
           analysisTimeoutSeconds: 30,
           downloadTimeLimitSeconds: 120,
+          // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: a 120 s acquisition
+          // limit needs a shorter inactivity window; it is not part of L.
+          downloadInactivityTimeoutSeconds: 60,
           processingTimeoutSeconds: 90,
           uploadTimeoutSeconds: 300,
           fileExpirationMinutes: 7,

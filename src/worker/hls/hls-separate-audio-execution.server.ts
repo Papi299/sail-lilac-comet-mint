@@ -266,7 +266,14 @@ async function runSeparateHlsAcquisition(
   reportActivity(activity, { kind: "deadline-armed", limitMs: downloadTimeLimitMs });
   const remainingMs = (): number => {
     const left = Math.floor(deadline - performance.now());
-    if (left <= 0) throw new AppError("TIMEOUT");
+    if (left <= 0) {
+      // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: nothing is left of the ONE
+      // deadline at a half's start — the video half ended in its last instant.
+      // That IS the deadline ending the acquisition, recorded as such (the
+      // first `settled` wins) before the TIMEOUT it has always been.
+      reportActivity(activity, { kind: "settled", outcome: "deadline-exceeded" });
+      throw new AppError("TIMEOUT");
+    }
     return left;
   };
 

@@ -439,6 +439,7 @@ describe("Worker runtime configuration", () => {
       assert.equal(media.maxVideoDurationSeconds, 7200);
       assert.equal(media.fileExpirationMinutes, 45);
       assert.equal(media.downloadTimeLimitSeconds, 600);
+      assert.equal(media.downloadInactivityTimeoutSeconds, 120);
       assert.equal(media.processingTimeoutSeconds, 600);
       assert.equal(media.uploadTimeoutSeconds, 3600);
       assert.equal(media.analysisTimeoutSeconds, 45);
@@ -454,6 +455,8 @@ describe("Worker runtime configuration", () => {
           MAX_VIDEO_DURATION: "60",
           FILE_EXPIRATION_MINUTES: "15",
           DOWNLOAD_TIME_LIMIT: "120",
+          // LD-3 activation: a 120 s acquisition limit needs a shorter window.
+          DOWNLOAD_INACTIVITY_TIMEOUT: "60",
           PROCESSING_TIMEOUT: "90",
           ANALYSIS_TIMEOUT: "30",
           MAX_REDIRECTS: "0",
@@ -466,6 +469,7 @@ describe("Worker runtime configuration", () => {
       assert.equal(media.maxVideoDurationSeconds, 60);
       assert.equal(media.fileExpirationMinutes, 15);
       assert.equal(media.downloadTimeLimitSeconds, 120);
+      assert.equal(media.downloadInactivityTimeoutSeconds, 60);
       assert.equal(media.processingTimeoutSeconds, 90);
       assert.equal(media.analysisTimeoutSeconds, 30);
       assert.equal(media.maxRedirects, 0);
@@ -728,8 +732,15 @@ describe("VIDEOFETCH-LD1 stage time limits", () => {
       }
 
       it("accepts the range ends and the values just inside them", () => {
+        // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: an acquisition limit
+        // needs an inactivity window strictly below it, so this loop gives it
+        // the shortest one (60 s). Its own minimum, 60, still parses — and has
+        // no window under it at all: pinned on its own in the LD-3 block below.
+        const companion: Record<string, string> =
+          v.name === "DOWNLOAD_TIME_LIMIT" ? { DOWNLOAD_INACTIVITY_TIMEOUT: "60" } : {};
         for (const n of [v.min, v.min + 1, 600, v.max - 1, v.max]) {
-          assert.equal(read(baseEnv({ [v.name]: String(n) }), v.field), n, String(n));
+          if (v.name === "DOWNLOAD_TIME_LIMIT" && n === v.min) continue;
+          assert.equal(read(baseEnv({ ...companion, [v.name]: String(n) }), v.field), n, String(n));
         }
       });
 
@@ -984,5 +995,145 @@ describe("VIDEOFETCH-LD2A job-lifetime inputs", () => {
     assert.equal(Object.hasOwn(media, "jobLifetimeSeconds"), false);
     assert.equal(Object.hasOwn(media, "executionMarginSeconds"), false);
     assert.equal(media.uploadTimeoutSeconds, 3600);
+  });
+});
+
+/**
+ * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001 — `DOWNLOAD_INACTIVITY_TIMEOUT`.
+ *
+ * The acquisition watchdog's window, owned by this loader alone: 60..900 s,
+ * default 120 (the accepted design's range), in the loader's existing grammar
+ * — unset, empty or whitespace-only means the default; anything else must be
+ * `^[0-9]{1,17}$` inside the range — and, the design's cross-field rule,
+ * strictly below `DOWNLOAD_TIME_LIMIT`, naming both variables when it is not.
+ */
+describe("VIDEOFETCH-LD3 DOWNLOAD_INACTIVITY_TIMEOUT", () => {
+  const NAME = "DOWNLOAD_INACTIVITY_TIMEOUT";
+  const BOTH = ["DOWNLOAD_INACTIVITY_TIMEOUT", "DOWNLOAD_TIME_LIMIT"];
+  /** A limit far above the window's whole range, so only the window's own grammar decides. */
+  const WIDE = { DOWNLOAD_TIME_LIMIT: "21600" };
+  const window = (env: NodeJS.ProcessEnv) => loadWorkerRuntimeConfig(env).media.downloadInactivityTimeoutSeconds;
+  const refusedNaming = (env: NodeJS.ProcessEnv, names: readonly string[], hidden?: string) =>
+    assert.throws(
+      () => loadWorkerRuntimeConfig(env),
+      (err: unknown) => {
+        assert.ok(err instanceof WorkerRuntimeConfigError, String(err));
+        assert.deepEqual([...err.variables], [...names]);
+        if (hidden !== undefined) assert.equal(err.message.includes(hidden), false, "the value is never rendered");
+        return true;
+      },
+    );
+
+  it("defaults to 120 s when absent — the case of Production's recorded worker.env, which sets neither variable", () => {
+    const media = loadWorkerRuntimeConfig(baseEnv()).media;
+    assert.equal(media.downloadInactivityTimeoutSeconds, 120);
+    assert.equal(media.downloadTimeLimitSeconds, 600, "the absolute acquisition limit keeps its 600 s default");
+  });
+
+  for (const blank of ["", " ", "   ", "\t", " \n ", "\r\n"]) {
+    it(`treats ${JSON.stringify(blank)} as unset (the default), never as zero`, () => {
+      assert.equal(window(baseEnv({ [NAME]: blank })), 120);
+    });
+  }
+
+  it("accepts the range ends, the values just inside them and a custom value", () => {
+    for (const n of [60, 61, 120, 300, 899, 900]) {
+      assert.equal(window(baseEnv({ ...WIDE, [NAME]: String(n) })), n, String(n));
+    }
+  });
+
+  it("refuses the values just outside the range, zero and negatives, naming only itself", () => {
+    for (const raw of ["59", "901", "0", "1", "-1", "-120"]) {
+      refusedNaming(baseEnv({ ...WIDE, [NAME]: raw }), [NAME]);
+    }
+  });
+
+  it("refuses decimals, exponents, signs, separators, hex and words", () => {
+    for (const raw of [
+      "120.0", "120.5", "60.1", "1.2e2", "12e1", "1E2", "+120", "120_000", "1 20", "0x78", "120s", "2m", "ninety",
+      "Infinity", "NaN",
+    ]) {
+      refusedNaming(baseEnv({ ...WIDE, [NAME]: raw }), [NAME]);
+    }
+  });
+
+  it("refuses unsafe and oversized integers rather than rounding them", () => {
+    for (const raw of ["9007199254740992", "9007199254740993", "99999999999999999", "123456789012345678"]) {
+      refusedNaming(baseEnv({ ...WIDE, [NAME]: raw }), [NAME]);
+    }
+  });
+
+  it("accepts leading zeros within the 17-digit grammar, and trims surrounding whitespace", () => {
+    assert.equal(window(baseEnv({ [NAME]: "0120" })), 120);
+    assert.equal(window(baseEnv({ [NAME]: "00000000000000120" })), 120);
+    assert.equal(window(baseEnv({ [NAME]: " 90 " })), 90);
+    refusedNaming(baseEnv({ [NAME]: "000000000000000120" }), [NAME]);
+  });
+
+  it("names only the variable, never the rejected value", () => {
+    refusedNaming(baseEnv({ [NAME]: "SENTINEL-INACTIVITY-VALUE" }), [NAME], "SENTINEL-INACTIVITY-VALUE");
+  });
+
+  describe("the design's cross-field rule: strictly below DOWNLOAD_TIME_LIMIT", () => {
+    it("accepts a window strictly below the limit, at both ends of its range", () => {
+      for (const [limit, win] of [["61", "60"], ["121", "120"], ["601", "600"], ["901", "900"], ["21600", "900"]] as const) {
+        const media = loadWorkerRuntimeConfig(baseEnv({ DOWNLOAD_TIME_LIMIT: limit, [NAME]: win })).media;
+        assert.equal(media.downloadTimeLimitSeconds, Number(limit));
+        assert.equal(media.downloadInactivityTimeoutSeconds, Number(win));
+      }
+      // The default window under the smallest limit it fits.
+      assert.equal(window(baseEnv({ DOWNLOAD_TIME_LIMIT: "121" })), 120);
+    });
+
+    it("refuses a window equal to or above the limit, naming both and neither value", () => {
+      for (const [limit, win] of [["600", "600"], ["600", "601"], ["900", "900"], ["61", "61"], ["61", "900"]] as const) {
+        refusedNaming(baseEnv({ DOWNLOAD_TIME_LIMIT: limit, [NAME]: win }), BOTH);
+        // Neither value is rendered: the message carries the two names and no digit at all.
+        assert.throws(
+          () => loadWorkerRuntimeConfig(baseEnv({ DOWNLOAD_TIME_LIMIT: limit, [NAME]: win })),
+          (err: unknown) => err instanceof Error && !/[0-9]/.test(err.message),
+        );
+      }
+    });
+
+    it("applies to the DEFAULT window too: a limit of 120 s or less needs an explicit, shorter window", () => {
+      for (const limit of ["60", "61", "90", "119", "120"]) {
+        refusedNaming(baseEnv({ DOWNLOAD_TIME_LIMIT: limit }), BOTH);
+      }
+    });
+
+    it("leaves DOWNLOAD_TIME_LIMIT's own minimum, 60 s, with no window under it: refused for every window", () => {
+      for (let win = 60; win <= 900; win += 1) {
+        refusedNaming(baseEnv({ DOWNLOAD_TIME_LIMIT: "60", [NAME]: String(win) }), BOTH);
+      }
+      refusedNaming(baseEnv({ DOWNLOAD_TIME_LIMIT: "60" }), BOTH);
+    });
+
+    it("is checked only between two individually valid values: a malformed one is named alone", () => {
+      refusedNaming(baseEnv({ DOWNLOAD_TIME_LIMIT: "59", [NAME]: "60" }), ["DOWNLOAD_TIME_LIMIT"]);
+      refusedNaming(baseEnv({ DOWNLOAD_TIME_LIMIT: "ten", [NAME]: "900" }), ["DOWNLOAD_TIME_LIMIT"]);
+      refusedNaming(baseEnv({ DOWNLOAD_TIME_LIMIT: "60", [NAME]: "59" }), [NAME]);
+      refusedNaming(baseEnv({ DOWNLOAD_TIME_LIMIT: "600", [NAME]: "901" }), [NAME]);
+      // Both malformed: each is named for itself.
+      refusedNaming(baseEnv({ DOWNLOAD_TIME_LIMIT: "0", [NAME]: "0" }), BOTH);
+    });
+
+    it("is refused beside the retired DOWNLOAD_TIMEOUT: every offending name at once, sorted", () => {
+      refusedNaming(baseEnv({ DOWNLOAD_TIMEOUT: "600", DOWNLOAD_TIME_LIMIT: "100" }), [
+        "DOWNLOAD_INACTIVITY_TIMEOUT",
+        "DOWNLOAD_TIMEOUT",
+        "DOWNLOAD_TIME_LIMIT",
+      ]);
+    });
+  });
+
+  it("moves nothing else: every other limit keeps its value, and the long-download limit is not enabled", () => {
+    const media = loadWorkerRuntimeConfig(baseEnv({ [NAME]: "900", DOWNLOAD_TIME_LIMIT: "901" })).media;
+    assert.equal(media.processingTimeoutSeconds, 600);
+    assert.equal(media.uploadTimeoutSeconds, 3600);
+    assert.equal(media.fileExpirationMinutes, 45);
+    assert.equal(media.analysisTimeoutSeconds, 45);
+    assert.equal(loadWorkerRuntimeConfig(baseEnv()).media.downloadTimeLimitSeconds, 600);
+    assert.notEqual(loadWorkerRuntimeConfig(baseEnv()).media.downloadTimeLimitSeconds, 9000, "LD-5b, not this change");
   });
 });

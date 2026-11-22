@@ -10,6 +10,7 @@ import {
   WorkerRequestedFormatIdSchema
 } from "../../shared/worker/contracts.ts";
 import { WorkerErrorCodeSchema } from "../../shared/worker/errors.ts";
+import type { AcquisitionStopCause } from "../../shared/worker/job-failure.ts";
 
 /**
  * Internal durable worker job schema.
@@ -237,8 +238,19 @@ export interface WorkerJobStore {
    * Moves a non-terminal job to `failed` with an allowlisted code and its safe
    * message, and sets `stageLabel` to the closed failure stage for the status
    * it left (`failedJobStageLabelFor`). A terminal job is left untouched.
+   *
+   * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: `acquisitionStop`, when
+   * given, names one of the two closed acquisition stops, and the stage is that
+   * stop's own — but only where it can be true: the job is leaving
+   * `downloading` and the code is `TIMEOUT` (`failedJobStageLabelForFailure`).
+   * A value outside the closed set is refused before anything is written.
    */
-  failJob(jobId: string, errorCode: string, errorMessage: string): boolean;
+  failJob(
+    jobId: string,
+    errorCode: string,
+    errorMessage: string,
+    acquisitionStop?: AcquisitionStopCause,
+  ): boolean;
 
   getJob(jobId: string): WorkerJobView | null;
 
