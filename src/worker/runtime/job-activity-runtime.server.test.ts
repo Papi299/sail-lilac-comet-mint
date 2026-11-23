@@ -175,6 +175,31 @@ describe("the real composition root carries it to the job status, and nothing el
     }
   });
 
+  it("a downloading job's durable progress is never turned into activity: no watched acquisition, no activity", async () => {
+    const runtime = await production(load({ JOB_STATUS_ACTIVITY_ENABLED: "true" }));
+    const jobId = queued(runtime);
+    assert.equal(runtime.store.claimNextQueuedJob()?.jobId, jobId);
+    assert.equal(
+      runtime.store.completeAnalysis(jobId, { title: "Clip", thumbnail: null, source: "cdn.example", extractor: "direct" }).type,
+      "updated",
+    );
+    assert.equal(
+      runtime.store.updateExecutionProgress(jobId, "downloading", {
+        progress: 64,
+        downloadedBytes: 1_000_000,
+        totalBytes: 2_000_000,
+        speed: 0,
+        eta: 9_999,
+        stageLabel: "Downloading",
+      }).type,
+      "updated",
+    );
+    const body = await runtime.service.getJob(jobId);
+    assert.equal(body.job.status, "downloading");
+    assert.equal(body.job.progress, 64);
+    assert.equal(body.job.activity, null, "a percentage, a zero speed and a long ETA say nothing about the source");
+  });
+
   it("the composition passes the validated value and nothing else (one line, from configuration)", () => {
     const source = readFileSync(new URL("./runtime.server.ts", import.meta.url), "utf8");
     const lines = source.split("\n").filter((line) => line.includes("publishJobActivity"));

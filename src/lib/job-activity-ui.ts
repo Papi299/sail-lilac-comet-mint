@@ -26,9 +26,9 @@ const MAX_ACTIVITY_SECONDS = 86_400;
 
 export const ACTIVITY_LABELS: Readonly<Record<JobActivityState, string>> = Object.freeze({
   starting: "Getting the download ready",
-  "awaiting-first-byte": "Waiting for the source to start sending data",
+  "awaiting-first-byte": "Waiting for the first data from the source",
   receiving: "Receiving data from the source",
-  waiting: "Waiting for the source to send more data",
+  waiting: "Waiting for more data from the source",
   "between-resources": "Moving on to the next part of the stream",
   "between-phases": "One part received. Starting the next part",
   unobserved: "Still downloading. Progress can't be measured right now",
@@ -43,7 +43,13 @@ export const STAGE_DESCRIPTIONS: Readonly<Partial<Record<JobProgress["status"], 
   uploading: "Download complete. Finishing up",
 });
 
-export const WAITING_NOTICE_TITLE = "Waiting for the source to send more data.";
+/** The notice's title, by the state it appears in; it replaces that state's activity line. */
+export const WAITING_NOTICE_TITLES = Object.freeze({
+  "awaiting-first-byte": "Still waiting for the source to start sending data.",
+  waiting: "Waiting for the source to send more data.",
+  "between-resources": "Waiting for the source to send the next part.",
+} as const);
+export const WAITING_NOTICE_TITLE = WAITING_NOTICE_TITLES.waiting;
 export const WAITING_NOTICE_MESSAGE =
   "The download is still running. VideoFetch will stop it if the source stays inactive for too long.";
 
@@ -51,11 +57,8 @@ export const ELAPSED_LABEL = "Elapsed since request";
 export const DOWNLOAD_LIMIT_LABEL = "Download time limit";
 export const DOWNLOADING_FOR_LABEL = "Downloading for";
 
-const NOTICE_STATES: ReadonlySet<JobActivityState> = new Set<JobActivityState>([
-  "awaiting-first-byte",
-  "waiting",
-  "between-resources",
-]);
+type NoticeState = keyof typeof WAITING_NOTICE_TITLES;
+const isNoticeState = (state: JobActivityState): state is NoticeState => Object.hasOwn(WAITING_NOTICE_TITLES, state);
 
 function isCount(value: unknown, min = 0): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= MAX_ACTIVITY_SECONDS;
@@ -83,9 +86,11 @@ export function knownActivity(job: Pick<JobProgress, "status" | "activity">): Jo
 export type ProgressCardView = Readonly<{
   /** The stage in words (changes rarely: suitable for a polite live region). */
   stageDescription: string | null;
-  /** The activity in words, or null when there is none to show right now. */
+  /** The activity in words, or null when there is none to show right now (or the notice says it). */
   activityLabel: string | null;
   showWaitingNotice: boolean;
+  /** The notice's title for the current state, or null when it is not shown. */
+  waitingNoticeTitle: string | null;
   /** Whole seconds since the request was made, or null when the clocks disagree. */
   elapsedSinceRequestSeconds: number | null;
   /** The armed acquisition limit, while downloading and known. */
@@ -124,16 +129,20 @@ export function progressCardView(
   const live = options.connectivity === "connected";
   const activity = live ? knownActivity(job) : null;
   const downloading = job.status === "downloading";
-  const showWaitingNotice =
+  const noticeState =
     activity !== null &&
-    NOTICE_STATES.has(activity.state) &&
+    isNoticeState(activity.state) &&
     activity.idleSeconds !== null &&
-    activity.idleSeconds >= WAITING_NOTICE_AFTER_SECONDS;
+    activity.idleSeconds >= WAITING_NOTICE_AFTER_SECONDS
+      ? activity.state
+      : null;
   const known = downloading ? knownActivity(job) : null;
   return Object.freeze({
     stageDescription: STAGE_DESCRIPTIONS[job.status] ?? null,
-    activityLabel: activity === null ? null : ACTIVITY_LABELS[activity.state],
-    showWaitingNotice,
+    // The notice says it in full, so the line is not repeated beside it.
+    activityLabel: activity === null || noticeState !== null ? null : ACTIVITY_LABELS[activity.state],
+    showWaitingNotice: noticeState !== null,
+    waitingNoticeTitle: noticeState === null ? null : WAITING_NOTICE_TITLES[noticeState],
     elapsedSinceRequestSeconds: elapsedSinceRequestSeconds(job, options.nowMs),
     // The limit is a fixed fact of the armed acquisition: still true during an outage.
     downloadLimitSeconds: known?.limitSeconds ?? null,

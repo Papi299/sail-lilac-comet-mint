@@ -7,7 +7,6 @@ import {
   DOWNLOAD_LIMIT_LABEL,
   ELAPSED_LABEL,
   WAITING_NOTICE_MESSAGE,
-  WAITING_NOTICE_TITLE,
   formatClock,
   formatLimit,
   knownActivity,
@@ -85,9 +84,9 @@ export function ProgressCard({
           <span className="min-w-0">{view.activityLabel}</span>
         </p>
       ) : null}
-      {view.showWaitingNotice ? (
+      {view.showWaitingNotice && view.waitingNoticeTitle ? (
         <div role="status" aria-live="polite" className="space-y-1 rounded-lg border border-border bg-muted/50 p-3 text-sm">
-          <p className="font-medium">{WAITING_NOTICE_TITLE}</p>
+          <p className="font-medium">{view.waitingNoticeTitle}</p>
           <p className="text-muted-foreground">{WAITING_NOTICE_MESSAGE}</p>
         </div>
       ) : null}

@@ -1103,11 +1103,13 @@ the activity line, **Elapsed since request** (browser clock vs `createdAt`;
 unknown when the clocks disagree), and — while downloading with an activity —
 **Download time limit** and **Downloading for** (both from the Worker). The
 ETA reads "Estimated … left". After 20 s of `idleSeconds` in
-`awaiting-first-byte`, `waiting` or `between-resources`, a polite notice says
-"Waiting for the source to send more data. The download is still running.
-VideoFetch will stop it if the source stays inactive for too long." It is
-presentation only, hidden while the status channel is down, and never derived
-from the percentage. No remaining time is shown.
+`awaiting-first-byte`, `waiting` or `between-resources`, a polite notice
+replaces the activity line: a title for the state ("Still waiting for the
+source to start sending data." / "Waiting for the source to send more data." /
+"Waiting for the source to send the next part.") and "The download is still
+running. VideoFetch will stop it if the source stays inactive for too long."
+It is presentation only, hidden while the status channel is down, and never
+derived from the percentage. No remaining time is shown.
 
 **Reload reattachment.** The tab keeps `{"v":1,"jobId":…}` under
 `sessionStorage["videofetch:active-job:v1"]` — the job id only. After a reload

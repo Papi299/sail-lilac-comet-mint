@@ -351,8 +351,8 @@ describe("reload during a running job: the SAME job, by one status read — neve
     assert.deepEqual(wire.statusCalls, [JOB_ID], "one immediate status read");
     assert.equal(wire.createCalls, 0, "no job is created");
     const html = decode(page.render());
-    assert.ok(html.includes(ACTIVITY_LABELS.waiting));
     assert.ok(html.includes(WAITING_NOTICE_TITLE), "24 s without new data: the waiting notice");
+    assert.equal(html.includes(ACTIVITY_LABELS.waiting), false, "which replaces the activity line");
     assert.ok(html.includes("Download time limit") && html.includes("10 min"));
     assert.ok(html.includes("Regression clip"), "the job's own title, without an analysis");
     await clock.advance(2_000);

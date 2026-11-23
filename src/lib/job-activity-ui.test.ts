@@ -4,6 +4,8 @@ import {
   ACTIVITY_LABELS,
   STAGE_DESCRIPTIONS,
   WAITING_NOTICE_AFTER_SECONDS,
+  WAITING_NOTICE_TITLE,
+  WAITING_NOTICE_TITLES,
   elapsedSinceRequestSeconds,
   formatClock,
   formatLimit,
@@ -74,10 +76,26 @@ describe("the waiting notice: after about 20 s without new data, and only when t
     assert.equal(view(job({ activity: activity("waiting", 115) })).showWaitingNotice, true);
   });
 
-  it("also while waiting for the first byte, or for the next stream resource", () => {
-    assert.equal(view(job({ activity: activity("awaiting-first-byte", 25) })).showWaitingNotice, true);
-    assert.equal(view(job({ activity: activity("between-resources", 25) })).showWaitingNotice, true);
+  it("also while waiting for the first byte, or for the next stream resource — each with its own title", () => {
+    const first = view(job({ activity: activity("awaiting-first-byte", 25) }));
+    assert.equal(first.showWaitingNotice, true);
+    assert.equal(first.waitingNoticeTitle, WAITING_NOTICE_TITLES["awaiting-first-byte"]);
+    const next = view(job({ activity: activity("between-resources", 25) }));
+    assert.equal(next.waitingNoticeTitle, WAITING_NOTICE_TITLES["between-resources"]);
     assert.equal(view(job({ activity: activity("between-resources", 3) })).showWaitingNotice, false);
+    assert.equal(view(job({ activity: activity("waiting", 30) })).waitingNoticeTitle, WAITING_NOTICE_TITLE);
+  });
+
+  it("the notice replaces the activity line instead of repeating it", () => {
+    const quiet = view(job({ activity: activity("waiting", 12) }));
+    assert.equal(quiet.activityLabel, ACTIVITY_LABELS.waiting);
+    assert.equal(quiet.waitingNoticeTitle, null);
+    const long = view(job({ activity: activity("waiting", 20) }));
+    assert.equal(long.activityLabel, null);
+    assert.equal(long.waitingNoticeTitle, WAITING_NOTICE_TITLE);
+    for (const title of Object.values(WAITING_NOTICE_TITLES)) {
+      for (const label of Object.values(ACTIVITY_LABELS)) assert.equal(title.includes(label), false, `${title} / ${label}`);
+    }
   });
 
   it("healthy progress suppresses it", () => {

@@ -73,6 +73,7 @@ describe("the progress card's announcements", () => {
     assert.match(regions[1].tag, /aria-live="polite"/);
     assert.ok(regions[1].text.includes(WAITING_NOTICE_TITLE) && regions[1].text.includes(WAITING_NOTICE_MESSAGE));
     assert.equal(/stall|fail|error/i.test(regions[1].text), false);
+    assert.equal(html.includes(ACTIVITY_LABELS.waiting), false, "the line is not repeated beside the notice");
   });
 
   it("each activity is told apart by its words and its icon, never by colour alone", () => {
