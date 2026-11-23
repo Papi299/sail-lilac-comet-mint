@@ -24,9 +24,12 @@ export function PrivateAccessGate({ children }: { children: ReactNode }) {
     let cancelled = false;
     void getAccessSession()
       .then((next) => {
+        // Only the current check counts: an answer arriving after this effect
+        // was cleaned up changes neither storage nor state.
+        if (cancelled) return;
         // LD-4b: a tab found without private access forgets its job id.
         clearActiveJobWithoutAccess(next);
-        if (!cancelled) setSession(next);
+        setSession(next);
       })
       .catch((err: Error) => {
         if (!cancelled) setLoadError(err.message);
