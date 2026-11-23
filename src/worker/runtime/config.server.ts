@@ -292,6 +292,23 @@ export type WorkerRuntimeConfig = {
       readonly enabled: boolean;
     };
   };
+  /**
+   * VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: what a job
+   * STATUS publishes beyond the durable job view. The loader always sets it;
+   * it is optional in the type only so a configuration written out by hand
+   * need not name it, and absent means off.
+   */
+  readonly jobStatus?: {
+    /**
+     * `JOB_STATUS_ACTIVITY_ENABLED`: publish the live acquisition `activity`
+     * (`src/shared/worker/job-activity.ts`) in job statuses. Fail-closed:
+     * absent means off, and off keeps every status body byte-compatible with
+     * the control plane that predates the field. Switch it on only after a
+     * control plane that accepts the field is in place; switch it off BEFORE
+     * any control plane that rejects it is restored.
+     */
+    readonly activityEnabled: boolean;
+  };
 };
 
 /**
@@ -670,6 +687,19 @@ export function loadWorkerRuntimeConfig(
     }),
   };
 
+  // LD-4b: absent => off. The same strict two-spelling grammar as
+  // `YTDLP_ENABLED`: a malformed value is a startup failure, never a silent
+  // fallback to either state.
+  const jobStatus = Object.freeze({
+    activityEnabled: readOptionalField(
+      "JOB_STATUS_ACTIVITY_ENABLED",
+      env.JOB_STATUS_ACTIVITY_ENABLED,
+      YtdlpEnabledSchema,
+      invalid,
+      false,
+    ),
+  });
+
   // Cross-field (VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001, the accepted
   // design's §2.4): the inactivity window must end strictly before the absolute
   // acquisition deadline, or the watchdog could never decide anything. It is
@@ -732,5 +762,6 @@ export function loadWorkerRuntimeConfig(
       brokerSocketPath: brokerSocketPath.value,
     }),
     media: Object.freeze(media),
+    jobStatus,
   });
 }

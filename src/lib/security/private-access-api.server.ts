@@ -237,15 +237,21 @@ export async function handleDownloadStatus(request: Request, jobId: string): Pro
     requirePrivateAccess(request);
     const validId = validateJobId(jobId);
     const result = await getWorkerClient().getJob(validId);
-    return Response.json(toPublicJob(result.job, Date.now()));
+    // VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: a job
+    // status is private and changes by the second, so no cache may keep it —
+    // a page restored after a reload must read the job as it is now.
+    return jsonNoStore(toPublicJob(result.job, Date.now()));
   } catch (err) {
     // Every definitive answer — a missing or malformed job id (NOT_FOUND), an
     // expired job (EXPIRED), an access failure, an unreachable Worker
     // (WORKER_UNAVAILABLE) — arrives here as an AppError and keeps its code.
     // Anything else is an unexpected failure of this handler: it is answered
     // as an unclassified 500, never as a NOT_FOUND that would tell the browser
-    // a job which may still be running does not exist.
-    return safeJsonError(err, "PROCESSING_FAILED");
+    // a job which may still be running does not exist. A Worker status that
+    // breaks the strict contract — a malformed `activity` field included —
+    // reaches here as the client's PROCESSING_FAILED, a 500: the browser keeps
+    // the job and keeps asking (it never reads a 5xx as the job's outcome).
+    return withNoStore(safeJsonError(err, "PROCESSING_FAILED"));
   }
 }
 

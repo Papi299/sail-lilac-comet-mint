@@ -8,7 +8,37 @@ import {
 } from "../../shared/worker/contracts.ts";
 import { WorkerErrorCodeSchema, type WorkerErrorCode } from "../../shared/worker/errors.ts";
 import { WORKER_RESTART_SAFE_MESSAGE } from "../../shared/worker/job-failure.ts";
+import {
+  WORKER_JOB_ACTIVITY_STATES,
+  WORKER_JOB_ACTIVITY_STATUS,
+  WorkerJobActivityLimitSecondsSchema,
+  WorkerJobActivitySecondsSchema,
+  jobActivityConsistencyIssues,
+} from "../../shared/worker/job-activity.ts";
 import { publicFailedStageLabel, timeoutMessageForStage } from "../../shared/worker/job-outcome.ts";
+
+/**
+ * VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: the browser's
+ * view of a job's live acquisition activity. Its four fields are enumerated
+ * HERE, independently of the Worker's schema, and copied one by one in
+ * `publicActivity`, so a field the Worker adds later can never reach the
+ * browser without a change to this file. One closed state and three bounded
+ * whole-second counts (see `job-activity.ts`): no text, no URL, no path, no
+ * key.
+ */
+export const PublicJobActivitySchema = z
+  .object({
+    state: z.enum(WORKER_JOB_ACTIVITY_STATES),
+    elapsedSeconds: WorkerJobActivitySecondsSchema.nullable(),
+    limitSeconds: WorkerJobActivityLimitSecondsSchema.nullable(),
+    idleSeconds: WorkerJobActivitySecondsSchema.nullable(),
+  })
+  .strict()
+  .superRefine((a, ctx) => {
+    for (const message of jobActivityConsistencyIssues(a)) ctx.addIssue({ code: "custom", message });
+  });
+
+export type PublicJobActivity = z.infer<typeof PublicJobActivitySchema>;
 
 /**
  * The browser-facing job DTO.
@@ -16,6 +46,10 @@ import { publicFailedStageLabel, timeoutMessageForStage } from "../../shared/wor
  * This is the ONLY shape that may be serialized to the browser for a job. It is
  * `.strict()`, so any field added to WorkerJobView in future is a parse failure
  * here rather than a silent leak.
+ *
+ * `activity` (LD-4b) is always present: the live acquisition activity while
+ * the job is downloading and the Worker published one, otherwise `null` — a
+ * Worker that publishes none (any Worker before LD-4b) gives `null` too.
  *
  * Deliberately absent:
  *  - objectKey           — server-to-server only; would be an object-store leak
@@ -48,8 +82,12 @@ export const PublicJobSchema = z
     updatedAt: z.number().int().nonnegative(),
     expiresAt: z.number().int().nonnegative(),
     downloadUrl: z.string().nullable(),
+    activity: PublicJobActivitySchema.nullable(),
   })
-  .strict();
+  .strict()
+  .refine((job) => job.activity === null || job.status === WORKER_JOB_ACTIVITY_STATUS, {
+    message: "activity is live only while the job is downloading",
+  });
 
 export type PublicJob = z.infer<typeof PublicJobSchema>;
 
@@ -117,7 +155,24 @@ export function toPublicJob(job: WorkerJobView, now: number): PublicJob {
     updatedAt: job.updatedAt,
     expiresAt: job.expiresAt,
     downloadUrl: isLiveReady ? publicDownloadPath(job.jobId) : null,
+    activity: publicActivity(job),
   });
+}
+
+/**
+ * LD-4b: the live activity, field by field, only for a downloading job. An
+ * absent field (a Worker that publishes none) and `null` (nothing observed)
+ * are both `null` to the browser: neither says anything about the source.
+ */
+function publicActivity(job: Pick<WorkerJobView, "status" | "activity">): PublicJobActivity | null {
+  const activity = job.activity;
+  if (activity === undefined || activity === null || job.status !== WORKER_JOB_ACTIVITY_STATUS) return null;
+  return {
+    state: activity.state,
+    elapsedSeconds: activity.elapsedSeconds,
+    limitSeconds: activity.limitSeconds,
+    idleSeconds: activity.idleSeconds,
+  };
 }
 
 /**

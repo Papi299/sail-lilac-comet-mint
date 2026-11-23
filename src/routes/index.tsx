@@ -12,6 +12,8 @@ import { PrivateAccessGate } from "@/components/video/private-access-gate";
 import { ErrorCard } from "@/components/video/error-card";
 import { StatusConnectionNotice } from "@/components/video/status-connection-notice";
 import { CancelDownload } from "@/components/video/cancel-download";
+import { JobSummary } from "@/components/video/job-summary";
+import { RestoringCard } from "@/components/video/restoring-card";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -35,6 +37,7 @@ import {
   type DownloaderState,
 } from "@/lib/downloader-state";
 import { createCancelController, type CancelController } from "@/lib/download-cancel";
+import { applyStoredJobDirective, restoreActionFromStorage } from "@/lib/active-job-storage";
 import { errorCardHeading, jobOutcomeRetry } from "@/lib/job-failure-ui";
 import type { VideoMetadata } from "@/types/media";
 
@@ -51,7 +54,7 @@ function Home() {
 function Downloader() {
   const [url, setUrl] = useState("");
   const [state, dispatch] = useReducer(downloaderReducer, initialDownloaderState);
-  const { phase, job, error, connectivity } = state;
+  const { phase, job, error, connectivity, notice } = state;
   const [video, setVideo] = useState<VideoMetadata | null>(null);
   const [simpleMode, setSimpleMode] = useState(true);
   const [selectedId, setSelectedId] = useState("");
@@ -72,6 +75,25 @@ function Downloader() {
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+
+  // VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: after a
+  // reload, find this tab's job again — by reading its status, never by
+  // creating one. Runs once, after hydration (storage does not exist on the
+  // server); a repeated run (React's development double effect) asks the
+  // reducer to restore the same id again, which changes nothing. An entry that
+  // is not a well-formed id of this version is removed.
+  useEffect(() => {
+    const restore = restoreActionFromStorage();
+    if (restore) dispatch(restore);
+  }, []);
+
+  // The reducer decides what this tab remembers; this only carries it out. The
+  // initial "keep" touches nothing, so the restore above reads what the
+  // previous page stored.
+  const storedDirective = state.stored;
+  useEffect(() => {
+    applyStoredJobDirective(storedDirective);
+  }, [storedDirective]);
 
   // LD-4a: one cancellation controller for the page's lifetime. Unmounting
   // ignores a pending answer but never aborts a cancellation the person
@@ -111,7 +133,12 @@ function Downloader() {
   const finishedJob = finishedJobForHistory(state);
   useEffect(() => {
     if (!finishedJob) return;
-    saveHistoryItem(historyEntryForJob(finishedJob, videoRef.current, Date.now()));
+    // LD-4b: a reload that finds an ended job shows it again; its history
+    // entry already says how it ended, so it is not rewritten.
+    const recorded = loadHistory().some(
+      (item) => item.jobId === finishedJob.jobId && item.status === finishedJob.status,
+    );
+    if (!recorded) saveHistoryItem(historyEntryForJob(finishedJob, videoRef.current, Date.now()));
     setHistory(loadHistory());
   }, [finishedJob]);
 
@@ -204,10 +231,20 @@ function Downloader() {
         onChange={setUrl}
         onSubmit={(next) => void handleAnalyze(next)}
         loading={phase === "analyzing"}
-        disabled={phase === "processing"}
+        disabled={phase === "processing" || phase === "restoring"}
       />
 
       <div className="mt-8 space-y-8">
+        {phase === "idle" && notice ? (
+          <p role="status" className="rounded-lg border border-border bg-muted/50 p-3 text-sm text-muted-foreground">
+            {notice}
+          </p>
+        ) : null}
+
+        {phase === "restoring" ? (
+          <RestoringCard connectivity={connectivity} onRetryStatus={retryStatus} onReset={reset} />
+        ) : null}
+
         {phase === "analyzing" ? (
           <Card>
             <CardContent className="space-y-4 p-5 sm:p-6">
@@ -239,11 +276,13 @@ function Downloader() {
           />
         ) : null}
 
-        {video && (phase === "ready" || phase === "processing" || phase === "complete") ? (
+        {(video && phase === "ready") || ((phase === "processing" || phase === "complete") && job) ? (
           <Card>
             <CardContent className="space-y-6 p-5 sm:p-6">
-              <VideoCard video={video} />
-              {phase === "ready" ? (
+              {/* LD-4b: a job restored after a reload has no analysis on this
+                  page; it is described by its own status instead. */}
+              {video ? <VideoCard video={video} /> : job ? <JobSummary job={job} /> : null}
+              {phase === "ready" && video ? (
                 hasDownloadOptions(video) ? (
                   <FormatSelector
                     video={video}
@@ -263,7 +302,7 @@ function Downloader() {
               ) : null}
               {phase === "processing" && job ? (
                 <>
-                  <ProgressCard job={job} />
+                  <ProgressCard job={job} connectivity={connectivity} />
                   <CancelDownload
                     downloadedBytes={job.downloadedBytes}
                     cancel={state.cancel}

@@ -83,6 +83,9 @@ describe("public browser job DTO", () => {
   it("exposes exactly the browser contract and no worker internals", () => {
     const dto = toPublicJob(readyJob(), NOW);
     assert.deepEqual(Object.keys(dto).sort(), [
+      // VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: always
+      // present; null unless the job is downloading with a published activity.
+      "activity",
       "container",
       "createdAt",
       "downloadUrl",
@@ -106,6 +109,7 @@ describe("public browser job DTO", () => {
       "totalBytes",
       "updatedAt",
     ]);
+    assert.equal(dto.activity, null, "a ready job has no live activity");
     assert.equal("mime" in dto, false, "mime is not part of the browser contract");
     assert.equal("safeErrorMessage" in dto, false, "the raw field must not be duplicated");
     assert.equal("url" in dto, false);

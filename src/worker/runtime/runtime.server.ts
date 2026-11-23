@@ -354,6 +354,11 @@ export async function createWorkerRuntime(
       // boundary to diagnostics explicitly. Nothing below this layer reads the
       // environment for it.
       ytdlpEnabled: config.media.ytdlp.enabled,
+      // VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: the
+      // validated `JOB_STATUS_ACTIVITY_ENABLED`, and nothing else. No override
+      // can supply it: a status gains the `activity` field only when the
+      // operator's configuration says so.
+      publishJobActivity: config.jobStatus?.activityEnabled === true,
       analysisLimits: {
         analysisTimeoutSeconds: config.media.analysisTimeoutSeconds,
         maxVideoDurationSeconds: config.media.maxVideoDurationSeconds,
