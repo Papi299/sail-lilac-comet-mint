@@ -13,7 +13,9 @@ import { WorkerErrorCodeSchema } from "../../shared/worker/errors.ts";
 import {
   WORKER_RESTART_SAFE_MESSAGE,
   WORKER_RESTART_STAGE_LABEL,
-  failedJobStageLabelFor,
+  failedJobStageLabelForFailure,
+  isAcquisitionStopCause,
+  type AcquisitionStopCause,
 } from "../../shared/worker/job-failure.ts";
 import {
   CompleteAnalysisInputSchema,
@@ -439,8 +441,19 @@ export class SQLiteJobStore implements WorkerJobStore {
     }
   }
 
-  failJob(jobId: string, errorCode: string, errorMessage: string): boolean {
+  failJob(
+    jobId: string,
+    errorCode: string,
+    errorMessage: string,
+    acquisitionStop?: AcquisitionStopCause,
+  ): boolean {
     const validErrorCode = WorkerErrorCodeSchema.parse(errorCode);
+    // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: a stop outside the closed
+    // set is a caller fault, refused like an unknown code — before the
+    // transaction, so nothing is written.
+    if (acquisitionStop !== undefined && !isAcquisitionStopCause(acquisitionStop)) {
+      throw new Error("Unknown acquisition stop");
+    }
     const now = this.nowMs();
     
     this.db.exec("BEGIN IMMEDIATE");
@@ -462,9 +475,14 @@ export class SQLiteJobStore implements WorkerJobStore {
 
       // MEDIA-EXECUTION-FAILURE-CLASSIFICATION-001: the stage label records
       // WHICH phase failed, from the closed vocabulary, decided by the durable
-      // status this very transaction is leaving — never by the caller, and never
-      // by anything the failure itself said. Without it the row keeps whatever
-      // the last progress write left, which says nothing about where it failed.
+      // status this very transaction is leaving — never by anything the failure
+      // itself said. Without it the row keeps whatever the last progress write
+      // left, which says nothing about where it failed.
+      //
+      // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: a closed acquisition
+      // stop named by the executor replaces the status's stage only where it
+      // can be true — this transaction is leaving `downloading`, with `TIMEOUT`
+      // — and otherwise claims nothing.
       //
       // LD-2a: the failed outcome stays viewable for `R` after it is reached —
       // a failure near the end of a long execution would otherwise already
@@ -484,7 +502,7 @@ export class SQLiteJobStore implements WorkerJobStore {
       const result = updateStmt.run(
         validErrorCode,
         errorMessage,
-        failedJobStageLabelFor(leaving),
+        failedJobStageLabelForFailure(leaving, validErrorCode, acquisitionStop),
         now,
         now,
         failExpiresAt,

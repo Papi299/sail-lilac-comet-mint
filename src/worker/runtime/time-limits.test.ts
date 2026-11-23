@@ -5,6 +5,11 @@ import { createServer } from "node:net";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  ACQUISITION_INACTIVITY_SUSPENSION_GAP_MS,
+  ACQUISITION_INACTIVITY_TICK_MS,
+  resolveAcquisitionInactivityPolicy,
+} from "../../services/downloads/acquisition-inactivity-watchdog.ts";
 import { VideoMetadataSchema, type WorkerVideoMetadata } from "../../shared/worker/contracts.ts";
 import type { ObjectStoreHead, ObjectStorePutInput, ObjectStoreWriter } from "../storage/writer.ts";
 import type { WorkerObjectKey } from "../../shared/worker/contracts.ts";
@@ -14,6 +19,7 @@ import { createWorkerRuntime } from "./runtime.server.ts";
 import {
   ANALYSIS_TIMEOUT_SECONDS,
   DEFAULT_WORKER_TIME_LIMITS,
+  DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS,
   DOWNLOAD_TIME_LIMIT_SECONDS,
   EXECUTION_MARGIN_SECONDS,
   FILE_EXPIRATION_MINUTES_RANGE,
@@ -49,6 +55,7 @@ const BAD_FIELD = (field: string) => (err: unknown) => {
 const DEFAULT_INPUTS: WorkerTimeLimitInputs = Object.freeze({
   analysisTimeoutSeconds: 45,
   downloadTimeLimitSeconds: 600,
+  downloadInactivityTimeoutSeconds: 120,
   processingTimeoutSeconds: 600,
   uploadTimeoutSeconds: 3600,
   fileExpirationMinutes: 45,
@@ -75,9 +82,12 @@ describe("WorkerTimeLimits: the model", () => {
     assert.deepEqual({ ...PROCESSING_TIMEOUT_SECONDS }, { min: 60, max: 14_400, default: 600 });
     assert.deepEqual({ ...UPLOAD_TIMEOUT_SECONDS }, { min: 300, max: 14_400, default: 3_600 });
     assert.deepEqual({ ...FILE_EXPIRATION_MINUTES_RANGE }, { min: 1, max: 55, default: 45 });
+    // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: the accepted design's window.
+    assert.deepEqual({ ...DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS }, { min: 60, max: 900, default: 120 });
     assert.equal(EXECUTION_MARGIN_SECONDS, 600);
     for (const range of [
       ANALYSIS_TIMEOUT_SECONDS,
+      DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS,
       DOWNLOAD_TIME_LIMIT_SECONDS,
       PROCESSING_TIMEOUT_SECONDS,
       UPLOAD_TIMEOUT_SECONDS,
@@ -93,6 +103,8 @@ describe("WorkerTimeLimits: the model", () => {
       {
         analysisMs: 45_000,
         downloadTimeLimitMs: 600_000,
+        // LD-3 activation: the watchdog's window, subordinate and outside L.
+        inactivityMs: 120_000,
         processingMs: 600_000,
         uploadMs: 3_600_000,
         retentionMs: 2_700_000,
@@ -120,6 +132,8 @@ describe("WorkerTimeLimits: the model", () => {
       "analysisMs",
       "downloadTimeLimitMs",
       "executionLifetimeMs",
+      // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: arrived with its watchdog.
+      "inactivityMs",
       "processingMs",
       "retentionMs",
       "uploadMs",
@@ -133,29 +147,35 @@ describe("WorkerTimeLimits: the model", () => {
     assert.throws(() => {
       (limits as { executionLifetimeMs: number }).executionLifetimeMs = 1;
     }, TypeError);
-    // No stage-anonymous field, and the inactivity watchdog's field only with
-    // its watchdog (LD-3b).
-    for (const absent of ["timeoutMs", "inactivityMs", "jobTtlMs"]) {
+    // No stage-anonymous field. The inactivity watchdog's field arrived only
+    // with its watchdog (VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001).
+    for (const absent of ["timeoutMs", "jobTtlMs"]) {
       assert.equal(Object.hasOwn(limits, absent), false, absent);
     }
+    assert.equal(limits.inactivityMs, 120_000);
   });
 
   it("derives L from every component, exactly, and R from the minutes", () => {
-    for (const [a, d, p, u, m] of [
-      [45, 600, 600, 3_600, 45],
-      [1, 60, 60, 300, 1],
-      [30, 120, 90, 300, 7],
-      [45, 9_000, 600, 3_600, 45],
-      [3_600, 21_600, 14_400, 14_400, 55],
-      [17, 6_013, 4_021, 1_009, 54],
+    // LD-3 activation: each row also names its inactivity window `w`, strictly
+    // below its acquisition limit. The smallest row's limit is therefore 61 s:
+    // 60 s, the limit's own minimum, has no window under it (pinned below).
+    for (const [a, d, p, u, m, w] of [
+      [45, 600, 600, 3_600, 45, 120],
+      [1, 61, 60, 300, 1, 60],
+      [30, 120, 90, 300, 7, 60],
+      [45, 9_000, 600, 3_600, 45, 900],
+      [3_600, 21_600, 14_400, 14_400, 55, 900],
+      [17, 6_013, 4_021, 1_009, 54, 333],
     ] as const) {
       const model = buildWorkerTimeLimits({
         analysisTimeoutSeconds: a,
         downloadTimeLimitSeconds: d,
+        downloadInactivityTimeoutSeconds: w,
         processingTimeoutSeconds: p,
         uploadTimeoutSeconds: u,
         fileExpirationMinutes: m,
       });
+      assert.equal(model.inactivityMs, w * 1000);
       assert.equal(model.executionLifetimeMs, (a + d + p + u + EXECUTION_MARGIN_SECONDS) * 1000, `${[a, d, p, u]}`);
       assert.equal(model.retentionMs, m * 60_000);
       // Invariant I2: L covers every stage bound plus the margin, never less.
@@ -172,6 +192,7 @@ describe("WorkerTimeLimits: the model", () => {
     const widest = buildWorkerTimeLimits({
       analysisTimeoutSeconds: 3_600,
       downloadTimeLimitSeconds: 21_600,
+      downloadInactivityTimeoutSeconds: 900,
       processingTimeoutSeconds: 14_400,
       uploadTimeoutSeconds: 14_400,
       fileExpirationMinutes: 55,
@@ -188,15 +209,24 @@ describe("WorkerTimeLimits: the model", () => {
     const a = buildWorkerTimeLimits(inputs({ downloadTimeLimitSeconds: 21_600, processingTimeoutSeconds: 60 }));
     assert.equal(a.downloadTimeLimitMs, 21_600_000);
     assert.equal(a.processingMs, 60_000);
-    const b = buildWorkerTimeLimits(inputs({ downloadTimeLimitSeconds: 60, processingTimeoutSeconds: 14_400 }));
-    assert.equal(b.downloadTimeLimitMs, 60_000);
+    // LD-3 activation: the shortest acquisition limit a window fits under, 61 s.
+    const b = buildWorkerTimeLimits(
+      inputs({ downloadTimeLimitSeconds: 61, downloadInactivityTimeoutSeconds: 60, processingTimeoutSeconds: 14_400 }),
+    );
+    assert.equal(b.downloadTimeLimitMs, 61_000);
     assert.equal(b.processingMs, 14_400_000);
   });
 
   for (const { field, range, unitMs, out } of INPUT_FIELDS) {
     it(`${field}: accepts each range end and refuses one beyond it`, () => {
+      // LD-3 activation: an acquisition limit needs a window strictly below it;
+      // this loop gives it the shortest (60 s). Its own minimum has none at all,
+      // which the inactivity block below pins on its own.
+      const companion: Partial<WorkerTimeLimitInputs> =
+        field === "downloadTimeLimitSeconds" ? { downloadInactivityTimeoutSeconds: 60 } : {};
       for (const value of [range.min, range.min + 1, range.default, range.max - 1, range.max]) {
-        assert.equal(buildWorkerTimeLimits(inputs({ [field]: value }))[out], value * unitMs, String(value));
+        if (field === "downloadTimeLimitSeconds" && value === range.min) continue;
+        assert.equal(buildWorkerTimeLimits(inputs({ ...companion, [field]: value }))[out], value * unitMs, String(value));
       }
       for (const value of [range.min - 1, range.max + 1, 0]) {
         assert.throws(() => buildWorkerTimeLimits(inputs({ [field]: value })), BAD_FIELD(field));
@@ -228,6 +258,89 @@ describe("WorkerTimeLimits: the model", () => {
       }
     });
   }
+
+  // ── VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: the inactivity window ──
+
+  /** A limit far above the window's range, so only the window's own rules decide. */
+  const wide = (w: unknown) =>
+    inputs({ downloadTimeLimitSeconds: 21_600, downloadInactivityTimeoutSeconds: w as number });
+
+  it("inactivityMs: accepts each range end under a wide limit and refuses one beyond it", () => {
+    for (const w of [60, 61, 120, 899, 900]) {
+      assert.equal(buildWorkerTimeLimits(wide(w)).inactivityMs, w * 1000, String(w));
+    }
+    for (const w of [59, 901, 0]) {
+      assert.throws(() => buildWorkerTimeLimits(wide(w)), BAD_FIELD("downloadInactivityTimeoutSeconds"));
+    }
+  });
+
+  it("inactivityMs: refuses non-integers, non-finite, unsafe and non-number values, naming the field only", () => {
+    for (const w of [-1, 120.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, "120", null, undefined, 987_654_321]) {
+      assert.throws(
+        () => buildWorkerTimeLimits(wide(w)),
+        (err: unknown) => {
+          BAD_FIELD("downloadInactivityTimeoutSeconds")(err);
+          assert.equal((err as Error).message, "Invalid Worker time limit: downloadInactivityTimeoutSeconds");
+          return true;
+        },
+      );
+    }
+  });
+
+  it("inactivityMs: must end strictly before the acquisition limit (the design's cross-field rule)", () => {
+    assert.equal(buildWorkerTimeLimits(inputs({ downloadTimeLimitSeconds: 61, downloadInactivityTimeoutSeconds: 60 })).inactivityMs, 60_000);
+    assert.equal(buildWorkerTimeLimits(inputs({ downloadTimeLimitSeconds: 901, downloadInactivityTimeoutSeconds: 900 })).inactivityMs, 900_000);
+    for (const [d, w] of [[600, 600], [600, 601], [61, 61], [120, 120], [900, 900]] as const) {
+      assert.throws(
+        () => buildWorkerTimeLimits(inputs({ downloadTimeLimitSeconds: d, downloadInactivityTimeoutSeconds: w })),
+        BAD_FIELD("downloadInactivityTimeoutSeconds"),
+        `${d}/${w}`,
+      );
+    }
+    // The acquisition limit's own minimum has no window under it at all.
+    for (let w = 60; w <= 900; w += 1) {
+      assert.throws(
+        () => buildWorkerTimeLimits(inputs({ downloadTimeLimitSeconds: 60, downloadInactivityTimeoutSeconds: w })),
+        BAD_FIELD("downloadInactivityTimeoutSeconds"),
+      );
+    }
+    // A malformed limit is still named for itself, before the cross-field rule.
+    assert.throws(
+      () => buildWorkerTimeLimits(inputs({ downloadTimeLimitSeconds: 59, downloadInactivityTimeoutSeconds: 60 })),
+      BAD_FIELD("downloadTimeLimitSeconds"),
+    );
+  });
+
+  it("inactivityMs: is never part of L and moves no other field", () => {
+    const short = buildWorkerTimeLimits(wide(60));
+    const long = buildWorkerTimeLimits(wide(900));
+    assert.equal(short.executionLifetimeMs, long.executionLifetimeMs);
+    assert.equal(short.executionLifetimeMs, (45 + 21_600 + 600 + 3_600 + 600) * 1000);
+    for (const field of ["analysisMs", "downloadTimeLimitMs", "processingMs", "uploadMs", "retentionMs"] as const) {
+      assert.equal(short[field], long[field], field);
+    }
+    assert.equal(DEFAULT_WORKER_TIME_LIMITS.executionLifetimeMs, 5_445_000, "L at the defaults is unchanged");
+    assert.equal(DEFAULT_WORKER_TIME_LIMITS.downloadTimeLimitMs, 600_000, "the absolute limit is unchanged");
+    assert.ok(DEFAULT_WORKER_TIME_LIMITS.inactivityMs < DEFAULT_WORKER_TIME_LIMITS.downloadTimeLimitMs);
+  });
+
+  it("inactivityMs: every configurable window stays inside the watchdog's own timer requirements", () => {
+    // The watchdog reads its window every tick and treats a gap of more than the
+    // suspension gap between two reads as a suspension. Every window is above
+    // both, is accepted by the watchdog's own policy check, and is far below the
+    // platform timer limit — though no timer of its length is ever armed.
+    assert.equal(ACQUISITION_INACTIVITY_TICK_MS, 1_000);
+    assert.equal(ACQUISITION_INACTIVITY_SUSPENSION_GAP_MS, 30_000);
+    for (const w of [DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS.min, DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS.max]) {
+      const ms = buildWorkerTimeLimits(wide(w)).inactivityMs;
+      assert.ok(ms >= ACQUISITION_INACTIVITY_TICK_MS && ms > ACQUISITION_INACTIVITY_SUSPENSION_GAP_MS, String(ms));
+      assert.ok(ms < 2 ** 31 - 1, String(ms));
+      assert.deepEqual(
+        { ...resolveAcquisitionInactivityPolicy({ windowMs: ms }) },
+        { windowMs: ms, tickMs: 1_000, suspensionGapMs: 30_000, maxUnobservedMs: ms },
+      );
+    }
+  });
 
   it("validates an INJECTED stage model: narrower is allowed, malformed or wider is refused", () => {
     // Narrower than the environment minimum: tests and harnesses prove a
@@ -386,6 +499,7 @@ function makeConfig(
       maxVideoDurationSeconds: 7200,
       fileExpirationMinutes: 45,
       downloadTimeLimitSeconds: 600,
+      downloadInactivityTimeoutSeconds: 120,
       processingTimeoutSeconds: 600,
       uploadTimeoutSeconds: 3600,
       analysisTimeoutSeconds: 45,
@@ -477,10 +591,12 @@ describe("WorkerTimeLimits: built once by the runtime and handed to every stage"
         {
           analysisMs: 45_000,
           downloadTimeLimitMs: 1_234_000,
+          inactivityMs: 120_000,
           processingMs: 2_345_000,
           uploadMs: 3_600_000,
           retentionMs: 2_700_000,
-          // L follows the configured stage limits: 45 + 1234 + 2345 + 3600 + 600 s.
+          // L follows the configured stage limits: 45 + 1234 + 2345 + 3600 + 600 s
+          // — and never the inactivity window.
           executionLifetimeMs: 7_824_000,
         },
       );
@@ -573,6 +689,12 @@ describe("WorkerTimeLimits: built once by the runtime and handed to every stage"
     ["a retention past the R2 backstop margin", { fileExpirationMinutes: 56 }, "fileExpirationMinutes"],
     ["the pre-LD-2a retention maximum", { fileExpirationMinutes: 1440 }, "fileExpirationMinutes"],
     ["an analysis limit of zero", { analysisTimeoutSeconds: 0 }, "analysisTimeoutSeconds"],
+    // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: the inactivity window.
+    ["an inactivity window below its range", { downloadInactivityTimeoutSeconds: 59 }, "downloadInactivityTimeoutSeconds"],
+    ["an inactivity window above its range", { downloadInactivityTimeoutSeconds: 901 }, "downloadInactivityTimeoutSeconds"],
+    ["an inactivity window equal to the acquisition limit", { downloadTimeLimitSeconds: 600, downloadInactivityTimeoutSeconds: 600 }, "downloadInactivityTimeoutSeconds"],
+    ["the default window over a 120 s acquisition limit", { downloadTimeLimitSeconds: 120 }, "downloadInactivityTimeoutSeconds"],
+    ["a configuration with no inactivity window at all", { downloadInactivityTimeoutSeconds: undefined as unknown as number }, "downloadInactivityTimeoutSeconds"],
   ] as const) {
     it(`refuses ${label} before touching the state directory`, async () => {
       const dataDirectory = join(root, "never-created");
@@ -596,6 +718,24 @@ describe("WorkerTimeLimits: built once by the runtime and handed to every stage"
       assert.deepEqual(
         { ...runtime.executor.timeLimits },
         { downloadTimeLimitMs: 600_000, processingMs: 600_000, uploadMs: 3_600_000 },
+      );
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("LD-3 activation: the inactivity window cannot be replaced or weakened through an executor test seam either", async () => {
+    const runtime = await createWorkerRuntime(makeConfig(join(root, "state"), await reservePort()), {
+      objectStoreWriter: new MemoryWriter(),
+      // Refused by the type; a JavaScript caller passing it anyway is overridden.
+      executorDeps: {
+        acquisitionInactivity: { policy: { windowMs: 3_600_000 }, watchFilesystemObservedPlans: false },
+      } as never,
+    });
+    try {
+      assert.deepEqual(
+        { ...runtime.executor.inactivityEnforcement },
+        { windowMs: 120_000, tickMs: 1_000, suspensionGapMs: 30_000, maxUnobservedMs: 120_000, watchFilesystemObservedPlans: true },
       );
     } finally {
       await runtime.shutdown();
@@ -695,6 +835,50 @@ describe("startup refuses the retired DOWNLOAD_TIMEOUT by presence", () => {
       { FILE_EXPIRATION_MINUTES: "55", UPLOAD_TIMEOUT: "300" },
       { FILE_EXPIRATION_MINUTES: "1", UPLOAD_TIMEOUT: "14400" },
     ]) {
+      const run = await start(validEnv(env));
+      assert.equal(run.workspaceChecks, 1, JSON.stringify(env));
+      assert.deepEqual(run.errors, ["[worker] startup failed: Error"]);
+    }
+  });
+
+  // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: a malformed inactivity
+  // window blocks startup end to end, before the workspace check — and so
+  // before any state directory or database — naming only the variable.
+  for (const value of ["59", "901", "0", "-1", "120.5", "1e2", "SENTINEL-INACTIVITY-VALUE"]) {
+    it(`DOWNLOAD_INACTIVITY_TIMEOUT=${JSON.stringify(value)} blocks startup before the workspace check, naming only the variable`, async () => {
+      const run = await start(validEnv({ DOWNLOAD_INACTIVITY_TIMEOUT: value }));
+      assert.equal(run.runtime, null);
+      assert.equal(run.exitCode, 1);
+      assert.equal(run.workspaceChecks, 0, "nothing past configuration ran");
+      assert.deepEqual(run.errors, ["[worker] startup blocked: invalid configuration for DOWNLOAD_INACTIVITY_TIMEOUT"]);
+      assert.deepEqual(run.logs, []);
+      assert.equal(run.errors.join("\n").includes(value), false, "the value is never rendered");
+    });
+  }
+
+  for (const env of [
+    { DOWNLOAD_TIME_LIMIT: "120" },
+    { DOWNLOAD_TIME_LIMIT: "600", DOWNLOAD_INACTIVITY_TIMEOUT: "600" },
+    { DOWNLOAD_TIME_LIMIT: "60", DOWNLOAD_INACTIVITY_TIMEOUT: "60" },
+  ] as ReadonlyArray<Record<string, string>>) {
+    it(`a window not strictly below the acquisition limit blocks startup, naming both: ${JSON.stringify(env)}`, async () => {
+      const run = await start(validEnv(env));
+      assert.equal(run.runtime, null);
+      assert.equal(run.exitCode, 1);
+      assert.equal(run.workspaceChecks, 0, "nothing past configuration ran");
+      assert.deepEqual(run.errors, [
+        "[worker] startup blocked: invalid configuration for DOWNLOAD_INACTIVITY_TIMEOUT, DOWNLOAD_TIME_LIMIT",
+      ]);
+    });
+  }
+
+  it("positive control: the inactivity window's range ends and its default pass configuration", async () => {
+    for (const env of [
+      {},
+      { DOWNLOAD_INACTIVITY_TIMEOUT: "60" },
+      { DOWNLOAD_INACTIVITY_TIMEOUT: "900", DOWNLOAD_TIME_LIMIT: "901" },
+      { DOWNLOAD_INACTIVITY_TIMEOUT: "60", DOWNLOAD_TIME_LIMIT: "61" },
+    ] as ReadonlyArray<Record<string, string>>) {
       const run = await start(validEnv(env));
       assert.equal(run.workspaceChecks, 1, JSON.stringify(env));
       assert.deepEqual(run.errors, ["[worker] startup failed: Error"]);

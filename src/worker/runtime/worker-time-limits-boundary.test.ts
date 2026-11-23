@@ -117,7 +117,14 @@ function ownersOf(node: ts.Node): string[] {
 }
 
 // LD-2a adds UPLOAD_TIMEOUT: parsed by the strict loader alone, like the LD-1 pair.
-const STAGE_VARIABLES = new Set(["DOWNLOAD_TIME_LIMIT", "PROCESSING_TIMEOUT", "UPLOAD_TIMEOUT"]);
+// VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001 adds DOWNLOAD_INACTIVITY_TIMEOUT
+// on the same terms: one owner, and no downstream environment read.
+const STAGE_VARIABLES = new Set([
+  "DOWNLOAD_TIME_LIMIT",
+  "PROCESSING_TIMEOUT",
+  "UPLOAD_TIMEOUT",
+  "DOWNLOAD_INACTIVITY_TIMEOUT",
+]);
 
 function scan(file: string, source: string): Finding[] {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
@@ -251,9 +258,12 @@ describe("Worker time-limit boundary (VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001)", ()
     assert.equal(strict.filter((f) => f.kind === "retired-variable").length, 1);
     assert.deepEqual(
       strict.filter((f) => f.kind === "stage-variable").length,
-      6,
-      "DOWNLOAD_TIME_LIMIT, PROCESSING_TIMEOUT and UPLOAD_TIMEOUT, each as a name and an env read",
+      12,
+      "DOWNLOAD_TIME_LIMIT, PROCESSING_TIMEOUT, UPLOAD_TIMEOUT and DOWNLOAD_INACTIVITY_TIMEOUT, each as a name and an " +
+        "env read (8), plus LD-3's cross-field rule naming the window and the limit twice each (4)",
     );
+    // All of them inside the one loader function.
+    assert.ok(strict.filter((f) => f.kind === "stage-variable").every((f) => f.owners.at(-1) === "loadWorkerRuntimeConfig"));
     const direct = of("src/services/extractors/direct.server.ts");
     assert.ok(direct.length >= 1, "the legacy application path's reads are seen");
     assert.ok(direct.every((f) => f.owners.join(">") === "downloadDirect"));
@@ -356,6 +366,18 @@ describe("Worker time-limit boundary: planted dependencies are caught (in-memory
       "src/worker/storage/upload-lifecycle.server.ts",
       "export const ld1PlantedH = process.env.UPLOAD_TIMEOUT;",
       "src/worker/storage/upload-lifecycle.server.ts",
+    ],
+    [
+      "a downstream read of DOWNLOAD_INACTIVITY_TIMEOUT in the executor (LD-3 activation)",
+      "src/worker/execution/job-executor.server.ts",
+      "export const ld1PlantedI = process.env.DOWNLOAD_INACTIVITY_TIMEOUT;",
+      "src/worker/execution/job-executor.server.ts",
+    ],
+    [
+      "a downstream read of DOWNLOAD_INACTIVITY_TIMEOUT in the watchdog core (LD-3 activation)",
+      "src/services/downloads/acquisition-inactivity-watchdog.ts",
+      'export const ld1PlantedJ = Number(process.env["DOWNLOAD_INACTIVITY_TIMEOUT"]);',
+      "src/services/downloads/acquisition-inactivity-watchdog.ts",
     ],
     [
       "the retired field reintroduced in the runtime",
@@ -621,6 +643,123 @@ describe("LD-2a/LD-2b: the lifetime is derived once, and UPLOAD_TIMEOUT reaches 
     ]) {
       assert.equal(real(file).includes("ld2aPlanted"), false, file);
       assert.equal(real(file).includes("ld2bPlanted"), false, file);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: ONE inactivity window, from
+// the strict loader through the model to the watchdog, handed over by the
+// composition root alone
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Where each LD-3 name may appear in the Worker's production graph — as an
+ * identifier or a string literal, comments excluded:
+ *
+ *  - `inactivityMs`: the model, which defines it, and the composition root,
+ *    which hands it to the executor's enforcement as the watchdog's window.
+ *    Never the executor (it receives a policy, not a model field), never the
+ *    watchdog core, the seams, the store or the HTTP layer.
+ *  - `downloadInactivityTimeoutSeconds`: the loader (parses it), the model
+ *    (validates it) and the composition root (passes it from one to the other).
+ *  - `DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS`: the model (defines the range) and
+ *    the loader (reads it). Nothing else knows the range.
+ */
+const LD3_NAMES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  inactivityMs: ["src/worker/runtime/runtime.server.ts", "src/worker/runtime/time-limits.ts"],
+  downloadInactivityTimeoutSeconds: [
+    "src/worker/runtime/config.server.ts",
+    "src/worker/runtime/runtime.server.ts",
+    "src/worker/runtime/time-limits.ts",
+  ],
+  DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS: ["src/worker/runtime/config.server.ts", "src/worker/runtime/time-limits.ts"],
+});
+
+function ld3NameUses(file: string, source: string): Array<{ name: string; file: string; line: number }> {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
+  const out: Array<{ name: string; file: string; line: number }> = [];
+  const visit = (node: ts.Node) => {
+    let name: string | null = null;
+    if (ts.isIdentifier(node)) name = node.text;
+    else if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) name = node.text;
+    if (name !== null && Object.hasOwn(LD3_NAMES, name)) {
+      out.push({ name, file: rel(file), line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1 });
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return out;
+}
+
+function ld3Violations(graph: Map<string, string>): string[] {
+  const out: string[] = [];
+  for (const [file, source] of graph) {
+    for (const use of ld3NameUses(file, source)) {
+      if (!LD3_NAMES[use.name]!.includes(use.file)) out.push(`${use.file}:${use.line} ${use.name}`);
+    }
+  }
+  return out;
+}
+
+describe("LD-3 activation: the inactivity window has one owner and one route to the watchdog", () => {
+  const graph = workerGraph();
+  const real = (file: string) => readFileSync(join(ROOT, file), "utf8");
+  const plant = (file: string, code: string): Overlay => ({ [file]: `${real(file)}\n${code}\n` });
+  const squash = (text: string) => text.replace(/\s+/g, " ");
+
+  it("finds every LD-3 name only where the table allows it", () => {
+    assert.deepEqual(ld3Violations(graph), []);
+  });
+
+  it("positive controls: the scan sees each allowed use in the real graph", () => {
+    const uses = [...graph].flatMap(([file, source]) => ld3NameUses(file, source));
+    const where = (name: string) => [...new Set(uses.filter((u) => u.name === name).map((u) => u.file))].sort();
+    for (const name of Object.keys(LD3_NAMES)) assert.deepEqual(where(name), [...LD3_NAMES[name]!].sort(), name);
+  });
+
+  it("the composition root hands the model's window to the watchdog exactly once, with the opt-in, AFTER the test seams", () => {
+    const runtime = squash(real("src/worker/runtime/runtime.server.ts"));
+    assert.equal(runtime.split("policy: Object.freeze({ windowMs: timeLimits.inactivityMs })").length - 1, 1);
+    assert.equal(runtime.split("watchFilesystemObservedPlans: true").length - 1, 1);
+    assert.equal(runtime.split("new JobExecutor(").length - 1, 1, "one executor");
+    // Composed after the spread of the test seams, next to `timeLimits`.
+    assert.match(runtime, /\.\.\.executorDeps, \/\/ [^\n]*?acquisitionInactivity, timeLimits, \}/);
+    // Test seams can carry neither, by type.
+    assert.match(runtime, /executorDeps\?: Omit<JobExecutorDeps, "timeLimits" \| "acquisitionInactivity">;/);
+  });
+
+  it("the executable entry passes the runtime no overrides: the test-only time hook is unreachable in Production", () => {
+    const main = squash(real("src/worker/runtime/main.server.ts"));
+    assert.equal(main.split("createWorkerRuntime(").length - 1, 1);
+    assert.match(main, /runtime = await createWorkerRuntime\(config\);/);
+    assert.equal(main.includes("acquisitionInactivityTime"), false);
+  });
+
+  for (const [label, file, code, name] of [
+    ["the executor reading the model's window", "src/worker/execution/job-executor.server.ts", "export const ld3PlantedA = (x: { inactivityMs: number }) => x.inactivityMs;", "inactivityMs"],
+    ["the watchdog core reading the model's window", "src/services/downloads/acquisition-inactivity-watchdog.ts", "export const ld3PlantedB = (x: { inactivityMs: number }) => x.inactivityMs;", "inactivityMs"],
+    ["the HTTP service reading the model's window", "src/worker/http/business-service.server.ts", "export const ld3PlantedC = (x: { inactivityMs: number }) => x.inactivityMs;", "inactivityMs"],
+    ["the yt-dlp seam knowing the window's range", "src/worker/execution/ytdlp-download.server.ts", 'import { DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS as ld3PlantedD } from "../runtime/time-limits.ts";\nvoid ld3PlantedD;', "DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS"],
+    ["the store reading the configured window", "src/worker/state/sqlite-job-store.server.ts", "export const ld3PlantedE = (x: { downloadInactivityTimeoutSeconds: number }) => x.downloadInactivityTimeoutSeconds;", "downloadInactivityTimeoutSeconds"],
+  ] as const) {
+    it(`catches ${label} (in-memory overlay)`, () => {
+      const found = ld3Violations(workerGraph(plant(file, code)));
+      assert.ok(found.length >= 1, `${label}: nothing flagged`);
+      assert.ok(found.every((f) => f.startsWith(`${file}:`) && f.endsWith(` ${name}`)), found.join("; "));
+    });
+  }
+
+  it("never wrote anything: the real sources carry no planted marker", () => {
+    for (const file of [
+      "src/worker/execution/job-executor.server.ts",
+      "src/services/downloads/acquisition-inactivity-watchdog.ts",
+      "src/worker/http/business-service.server.ts",
+      "src/worker/execution/ytdlp-download.server.ts",
+      "src/worker/state/sqlite-job-store.server.ts",
+    ]) {
+      assert.equal(real(file).includes("ld3Planted"), false, file);
+      assert.equal(real(file).includes("ld1Planted"), false, file);
     }
   });
 });

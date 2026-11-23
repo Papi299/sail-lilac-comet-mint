@@ -1192,7 +1192,7 @@ async function acquireGenericOriginal(
   reportActivity(deps.activity, { kind: "deadline-armed", limitMs: acquisitionBudgetMs(deps.limits) });
 
   const probeBudgetMs = Math.min(YTDLP_PROBE_TIMEOUT_MS, deadline - clock());
-  if (probeBudgetMs <= 0) throw new AppError("TIMEOUT");
+  if (probeBudgetMs <= 0) throw deadlinePassedAtBoundary(deps.activity);
 
   const runtime = await probe({ signal: deps.signal, timeoutMs: probeBudgetMs });
   if (!runtime.available) throw new AppError("EXTRACTOR_UNAVAILABLE");
@@ -1208,7 +1208,7 @@ async function acquireGenericOriginal(
   await assertExactEntries(workDir, [], readDir);
 
   const networkTimeoutMs = deadline - clock();
-  if (networkTimeoutMs <= 0) throw new AppError("TIMEOUT");
+  if (networkTimeoutMs <= 0) throw deadlinePassedAtBoundary(deps.activity);
 
   const container = validPlan.source.container;
   const finalPath = expectedSourcePath(workDir, container);
@@ -1356,6 +1356,20 @@ async function acquireGenericOriginal(
  */
 function acquisitionBudgetMs(limits: GenericDownloadLimits): number {
   return Math.max(YTDLP_DOWNLOAD_MIN_TIMEOUT_MS, Math.floor(limits.downloadTimeLimitMs));
+}
+
+/**
+ * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: the acquisition's ONE absolute
+ * deadline has already passed at a step boundary — before the probe, before a
+ * child, or between the two halves of a pair, where no runner is running to
+ * time out. That IS the deadline ending the acquisition, so it is recorded as
+ * such in the LD-3a activity record (the first `settled` wins) before the
+ * TIMEOUT it has always been. The executor reads that record to tell the
+ * absolute time limit from every other TIMEOUT.
+ */
+function deadlinePassedAtBoundary(activity: AcquisitionActivitySink | undefined): AppError {
+  reportActivity(activity, { kind: "settled", outcome: "deadline-exceeded" });
+  return new AppError("TIMEOUT");
 }
 
 /** True when the injected acquisition limit is a positive safe integer of milliseconds. */
@@ -2147,7 +2161,7 @@ async function acquireGenericSplitSources(
     // 5. The EXACT pinned runtime, probed ONCE for both halves, inside the
     //    shared deadline and under the operation's controller.
     const probeBudgetMs = Math.min(YTDLP_PROBE_TIMEOUT_MS, deadline - clock());
-    if (probeBudgetMs <= 0) throw new AppError("TIMEOUT");
+    if (probeBudgetMs <= 0) throw deadlinePassedAtBoundary(deps.activity);
     const runtime = await probe({ signal: controller.signal, timeoutMs: probeBudgetMs });
     if (!runtime.available) throw new AppError("EXTRACTOR_UNAVAILABLE");
 
@@ -2213,7 +2227,7 @@ async function acquireGenericSplitSources(
       const allowance = maxBytes - acquiredBytes;
       if (allowance <= 0) throw new AppError("TOO_LARGE");
       const timeoutMs = deadline - clock();
-      if (timeoutMs <= 0) throw new AppError("TIMEOUT");
+      if (timeoutMs <= 0) throw deadlinePassedAtBoundary(deps.activity);
 
       await runMonitoredAcquisition({
         runner,

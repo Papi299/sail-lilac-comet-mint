@@ -473,7 +473,9 @@ describe("M6-M8: through the real executor, a stopped acquisition never proceeds
     const view = store.getJob(job.jobId)!;
     assert.equal(view.status, "failed");
     assert.equal(view.errorCode, "TIMEOUT");
-    assert.equal(view.stageLabel, "Download failed");
+    // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: an inactivity stop now
+    // records its own download stage (LD-3c wrote "Download failed").
+    assert.equal(view.stageLabel, "Download stalled");
     assert.deepEqual(transitions, [], "the acquisition did not proceed into processing");
     assert.equal(puts.length, 0, "nothing was uploaded");
     assert.equal(executor.activeJobCount, 0);

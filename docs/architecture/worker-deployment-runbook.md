@@ -6568,6 +6568,115 @@ image retag and a Worker-only restart, with an empty queue as in §7b. An upload
 flight at the restart is aborted by the shutdown in either image and recovered as
 "Worker restarted".
 
+### 7d. Acquisition inactivity watchdog (`VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001`) — source change, NOT MERGED, NOT DEPLOYED
+
+**Status.** A source change on a Draft PR, for independent review. It is not
+merged, no image has been built from it, and nothing is deployed: the
+Production Worker (LD-3e, `sha256:1eca1cda…`) still runs with the watchdog
+DISCONNECTED, as every image before it. The default absolute acquisition limit
+stays 600 s; long downloads (9,000 s) are a later phase (LD-5b).
+
+**What it connects.** LD-3a (activity observation), LD-3b (the inactivity
+watchdog), LD-3c (filesystem observation hardening) and LD-3d (the `watched`
+yt-dlp retry policy) were merged as source with the watchdog deliberately
+disconnected. This change connects it in the composition root
+(`createWorkerRuntime()`): the executor ALWAYS receives the enforcement — the
+window from the strict loader, the reviewed tick (1 s), suspension gap (30 s)
+and observation allowance (= the window), and the filesystem-observed plans
+opted in. There is no flag, variable or value that disconnects it.
+
+| Variable | Unit, range | Default | Meaning |
+| :--- | :--- | ---: | :--- |
+| `DOWNLOAD_INACTIVITY_TIMEOUT` | seconds, 60–900, **strictly below `DOWNLOAD_TIME_LIMIT`** | 120 | The watchdog's window: a live acquisition phase with no growth of at least 65,536 real media bytes for this long is stopped. Subordinate to the absolute limit: it never extends it, and it is not part of the job lifetime `L`. |
+
+The loader's grammar is the existing one (unset, empty or whitespace = the
+default; otherwise `^[0-9]{1,17}$` inside the range). The range is the accepted
+design's: at least 60 s, more than one yt-dlp attempt at the watched policy's
+30 s socket timeout and more than the watchdog's 30 s suspension gap; at most
+900 s, beyond which it stops being a stall detector. The cross-field rule
+(`< DOWNLOAD_TIME_LIMIT`) names **both** variables, and applies to the default
+too: a `DOWNLOAD_TIME_LIMIT` of 120 s or less needs an explicit, shorter window,
+and `DOWNLOAD_TIME_LIMIT=60` — its own minimum — has no window under it and is
+refused. Every refusal happens before any directory or database is touched.
+
+**Which acquisitions are watched — all of them, one watchdog each.**
+
+| Family | Evidence the watchdog reads |
+| :--- | :--- |
+| Direct | bytes accepted by the in-process transport |
+| Clear HLS, MPEG-TS and fMP4 | bytes accepted, per chunk — never per completed fragment; a resource boundary is not progress |
+| Separate-audio clear HLS | the same, per half (`video`, then `audio`), under the one shared deadline |
+| yt-dlp progressive (keep-original, extract-m4a, extract-mp3) | the child's real file growth (`.part`, then the final file) |
+| yt-dlp split pair, progressive or segmented (DASH) halves | real file growth per half; for a segmented half the aggregate and the fragment in flight |
+
+A percentage, a progress callback, a rename, a fragment boundary, a retry, a
+log line or a metadata request is never progress. A filesystem observer that
+cannot read (an unreadable file or directory, an incomplete segmented listing, a
+held file vanishing) is blind, never "stalled": blind time does not count toward
+the window, and blindness for the whole allowance ends the acquisition as an
+**observation loss**. A detected suspension (two ticks more than 30 s apart)
+grants one fresh window from the resume; the absolute deadline is never
+re-anchored, and past it the watchdog decides nothing.
+
+**Retry policy.** A yt-dlp acquisition now receives the watchdog's two stops,
+which alone select the `watched` policy (`--socket-timeout=30 --retries=20
+--fragment-retries=3 --extractor-retries=1`) instead of `bounded` (10/2/1/1);
+both halves of a split pair run under the same policy. No configuration or
+request value can select a policy. All counts stay finite, the watchdog remains
+the stall authority, and the absolute deadline the final bound.
+
+**Durable outcomes.**
+
+| Cause | Status / code / stage |
+| :--- | :--- |
+| The watchdog stops a stalled acquisition | `failed` / `TIMEOUT` / `Download stalled` |
+| The acquisition's own absolute deadline ends it first (the seam's first-cause latch, also at a step boundary) | `failed` / `TIMEOUT` / `Download time limit reached` |
+| A `TIMEOUT` the seam did not attribute to its deadline (a per-request timeout, a subprocess's own failure) | `failed` / `TIMEOUT` / `Download failed` (no cause claimed) |
+| Observation loss | `failed` / `PROCESSING_FAILED` / `Download failed` (never a stall) |
+| User cancellation | `cancelled` (always wins; never `TIMEOUT`) |
+| Operator shutdown | left active; the next process's `recover()` writes `Worker restarted` |
+| Execution-lifetime backstop, processing or upload timeout | unchanged: `TIMEOUT` with `Download failed` / `Processing failed` / `Upload failed` |
+
+The two stages are written only by `failJob()`, only for a job leaving
+`downloading` and only beside `TIMEOUT`, from a closed two-entry table — never
+from an error message. No new error code, no schema change and no migration:
+the stage is the existing `stage_label` column, which every older image reads
+unchanged. The control plane has recognised both stages since LD-4a and
+forwards them only with `TIMEOUT`, so the deployed N4 control plane already
+shows `Download stalled` / `Time limit reached` with their messages.
+
+#### Pre-deployment check — names only, before an image with this change starts
+
+```
+sudo grep -E '^[[:space:]]*(DOWNLOAD_TIME_LIMIT|DOWNLOAD_INACTIVITY_TIMEOUT)[[:space:]]*=' /etc/videofetch/worker.env
+```
+
+| Finding | Action |
+| :--- | :--- |
+| neither present (the recorded state of `worker.env` `3583770c…`) | Proceed: 600 s absolute, 120 s window. |
+| `DOWNLOAD_TIME_LIMIT` at 120 or below without a shorter window, or a window at or above the limit | **BLOCK**: the image refuses to start; correct `worker.env` in a separately authorised change first. |
+| `DOWNLOAD_INACTIVITY_TIMEOUT` present | **STOP** for a decision: an override of the reviewed 120 s. |
+
+#### Release qualification — before promotion (a later, separate task)
+
+- The watchdog-specific suites inside the candidate image (Node 22), including
+  `inactivity-runtime-activation.server.test.ts`, which builds the REAL runtime.
+- The pinned-artifact contracts in the image's own Python, both retry policies
+  (`ytdlp-retry-contract.server.test.ts`): the release-image download-policy
+  verifier (`verify-download-policy.py`) still parses the `bounded` arguments
+  only, while Production yt-dlp acquisitions now run `watched`.
+- A controlled stall fixture (never a public source): a 120 s silence ends as
+  `Download stalled`, and a slow-but-steady source completes.
+- Linux real-process containment of a stopped child (process group gone).
+
+#### Mixed versions and rollback
+
+No schema or contract change. Rollback to the LD-3e image is a retag and a
+Worker-only restart; rows this image wrote with `Download stalled` or
+`Download time limit reached` stay readable by it (the stage column is free
+text), and the control plane forwards them unchanged. An acquisition in flight
+at the restart is recovered as `Worker restarted`, as before.
+
 ---
 
 ## 8. Health and maintenance

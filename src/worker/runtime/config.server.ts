@@ -5,6 +5,7 @@ import { WorkerKeyIdSchema } from "../../shared/worker/auth.ts";
 import { DEFAULT_MAX_FILE_SIZE_BYTES } from "../../shared/media-limits.ts";
 import {
   ANALYSIS_TIMEOUT_SECONDS,
+  DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS,
   DOWNLOAD_TIME_LIMIT_SECONDS,
   FILE_EXPIRATION_MINUTES_RANGE,
   PROCESSING_TIMEOUT_SECONDS,
@@ -206,6 +207,9 @@ const MEDIA_DEFAULTS = {
   // so the loader and the model cannot disagree. The acquisition default stays
   // 600 s; the long-download value is a later, separate change (LD-5b).
   downloadTimeLimitSeconds: DOWNLOAD_TIME_LIMIT_SECONDS.default,
+  // VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001: the acquisition watchdog's
+  // window, subordinate to the acquisition limit above (range in `time-limits.ts`).
+  downloadInactivityTimeoutSeconds: DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS.default,
   processingTimeoutSeconds: PROCESSING_TIMEOUT_SECONDS.default,
   // LD-2a: parsed and budgeted into the derived job lifetime; enforced from LD-2b.
   uploadTimeoutSeconds: UPLOAD_TIMEOUT_SECONDS.default,
@@ -248,6 +252,13 @@ export type WorkerRuntimeConfig = {
     readonly fileExpirationMinutes: number;
     /** `DOWNLOAD_TIME_LIMIT`: ONE absolute deadline for a job's acquisition stage. */
     readonly downloadTimeLimitSeconds: number;
+    /**
+     * `DOWNLOAD_INACTIVITY_TIMEOUT` (VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001):
+     * the acquisition watchdog's window — no meaningful growth for this long
+     * stops a live acquisition phase. 60..900, default 120, and always strictly
+     * below `downloadTimeLimitSeconds`. Never extends the acquisition deadline.
+     */
+    readonly downloadInactivityTimeoutSeconds: number;
     /** `PROCESSING_TIMEOUT`: ONE absolute deadline per processing stage. */
     readonly processingTimeoutSeconds: number;
     /**
@@ -597,6 +608,13 @@ export function loadWorkerRuntimeConfig(
       invalid,
       MEDIA_DEFAULTS.downloadTimeLimitSeconds,
     ),
+    downloadInactivityTimeoutSeconds: readOptionalField(
+      "DOWNLOAD_INACTIVITY_TIMEOUT",
+      env.DOWNLOAD_INACTIVITY_TIMEOUT,
+      boundedInt(DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS.min, DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS.max),
+      invalid,
+      MEDIA_DEFAULTS.downloadInactivityTimeoutSeconds,
+    ),
     processingTimeoutSeconds: readOptionalField(
       "PROCESSING_TIMEOUT",
       env.PROCESSING_TIMEOUT,
@@ -651,6 +669,20 @@ export function loadWorkerRuntimeConfig(
       ),
     }),
   };
+
+  // Cross-field (VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001, the accepted
+  // design's §2.4): the inactivity window must end strictly before the absolute
+  // acquisition deadline, or the watchdog could never decide anything. It is
+  // checked only when both values are individually valid — a malformed one is
+  // already named on its own — and it names both, the defaults included: an
+  // acquisition limit of 120 s or less needs an explicit, shorter window.
+  if (
+    !invalid.includes("DOWNLOAD_TIME_LIMIT") &&
+    !invalid.includes("DOWNLOAD_INACTIVITY_TIMEOUT") &&
+    media.downloadInactivityTimeoutSeconds >= media.downloadTimeLimitSeconds
+  ) {
+    invalid.push("DOWNLOAD_INACTIVITY_TIMEOUT", "DOWNLOAD_TIME_LIMIT");
+  }
 
   // Cross-field: the durable state volume and the ephemeral media scratch are
   // two distinct filesystem roles and must not overlap. An overlap would put

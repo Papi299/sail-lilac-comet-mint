@@ -4,7 +4,13 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { ERROR_MESSAGES } from "../../lib/errors.ts";
 import { WORKER_ERROR_CODES } from "./errors.ts";
-import { FAILED_JOB_STAGE_LABELS, WORKER_RESTART_STAGE_LABEL } from "./job-failure.ts";
+import {
+  ACQUISITION_STOP_FAILED_STAGE_LABELS,
+  FAILED_JOB_STAGE_LABELS,
+  WORKER_RESTART_STAGE_LABEL,
+  failedJobStageLabelFor,
+  failedJobStageLabelForFailure,
+} from "./job-failure.ts";
 import {
   DOWNLOAD_STALLED_STAGE_LABEL,
   DOWNLOAD_TIME_LIMIT_STAGE_LABEL,
@@ -21,8 +27,10 @@ import {
 
 /**
  * VIDEOFETCH-LD4A-CANCELLATION-UX-AND-OUTCOME-CONTRACT-001: the closed outcome
- * vocabulary, and the proof that its two reserved stages stay inert until a
- * Worker that writes them is built in an approved order.
+ * vocabulary. Its two reserved stages stayed inert until a Worker that writes
+ * them was built in the approved order; since
+ * VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001 (source, not deployed) the
+ * Worker writes them through one closed table, pinned at the end.
  */
 
 const HOSTILE = "Download stalled: yt-dlp ERROR https://media.example/v.mp4?X-Amz-Signature=x /var/lib/videofetch";
@@ -208,7 +216,16 @@ describe("classifyJobOutcome: the required distinctions", () => {
   });
 });
 
-// ── Inertness: nothing that runs in the Worker can write a reserved stage ───
+// ── Activation: the Worker writes a reserved stage only through ONE closed table ──
+//
+// LD-4a pinned both reserved stages as INERT until a Worker that writes them
+// was built in the approved order. VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001
+// is that Worker change, so the inertness proof is replaced here by the
+// narrower contract that now holds: the Worker names neither label anywhere but
+// its one shared vocabulary table, imports nothing of this presentation
+// contract, and its store writes a reserved stage only through the one function
+// that honours a stop where it can be true (leaving `downloading`, beside
+// `TIMEOUT`). The control-plane side of the contract above is unchanged.
 
 const ROOT = process.cwd();
 
@@ -227,7 +244,7 @@ function sourceFiles(dir: string): string[] {
 /** Every production file that runs in the Worker image, or that the Worker graph shares. */
 const WORKER_SIDE_ROOTS = ["src/worker", "src/services", "src/broker"];
 
-describe("the reserved stages are inert in this repository", () => {
+describe("the reserved stages are written by the Worker only through its closed acquisition-stop table", () => {
   const files = WORKER_SIDE_ROOTS.flatMap((root) => sourceFiles(join(ROOT, root)));
 
   it("scans a real Worker graph", () => {
@@ -235,7 +252,16 @@ describe("the reserved stages are inert in this repository", () => {
     assert.ok(files.some((f) => f.endsWith(join("src", "worker", "state", "sqlite-job-store.server.ts"))));
   });
 
-  it("no Worker-side module names a reserved stage or imports the outcome contract", () => {
+  it("the Worker's table is exactly the reserved stages, in order, and still outside the written list", () => {
+    assert.deepEqual(Object.values(ACQUISITION_STOP_FAILED_STAGE_LABELS), [...RESERVED_FAILED_JOB_STAGE_LABELS]);
+    assert.equal(ACQUISITION_STOP_FAILED_STAGE_LABELS.inactivity, DOWNLOAD_STALLED_STAGE_LABEL);
+    assert.equal(ACQUISITION_STOP_FAILED_STAGE_LABELS["time-limit"], DOWNLOAD_TIME_LIMIT_STAGE_LABEL);
+    for (const label of RESERVED_FAILED_JOB_STAGE_LABELS) {
+      assert.equal((FAILED_JOB_STAGE_LABELS as readonly string[]).includes(label), false, label);
+    }
+  });
+
+  it("no Worker-side module names a reserved stage literally or imports the outcome contract", () => {
     for (const file of files) {
       const source = readFileSync(file, "utf8");
       for (const label of RESERVED_FAILED_JOB_STAGE_LABELS) {
@@ -245,14 +271,38 @@ describe("the reserved stages are inert in this repository", () => {
     }
   });
 
-  it("positive control: the same scan finds both labels in the contract itself", () => {
-    const contract = readFileSync(join(ROOT, "src/shared/worker/job-outcome.ts"), "utf8");
-    for (const label of RESERVED_FAILED_JOB_STAGE_LABELS) assert.ok(contract.includes(label), label);
+  it("positive control: the same scan finds both labels in the shared Worker vocabulary and in the contract", () => {
+    for (const rel of ["src/shared/worker/job-failure.ts", "src/shared/worker/job-outcome.ts"]) {
+      const text = readFileSync(join(ROOT, rel), "utf8");
+      for (const label of RESERVED_FAILED_JOB_STAGE_LABELS) assert.ok(text.includes(label), `${rel}: ${label}`);
+    }
   });
 
-  it("the store still derives every failed stage from the written list only", () => {
+  it("the store writes every failed stage through the one function that honours a stop only where it can be true", () => {
     const store = readFileSync(join(ROOT, "src/worker/state/sqlite-job-store.server.ts"), "utf8");
-    assert.match(store, /failedJobStageLabelFor\(leaving\)/);
+    assert.equal(store.split("failedJobStageLabelForFailure(leaving, validErrorCode, acquisitionStop)").length - 1, 1);
     assert.equal(store.includes("RESERVED_FAILED_JOB_STAGE_LABELS"), false);
+    assert.equal(store.includes("ACQUISITION_STOP_FAILED_STAGE_LABELS"), false, "the table is read through the function only");
+    // The function: a stop's stage only for `downloading` beside `TIMEOUT`.
+    for (const cause of ["inactivity", "time-limit"] as const) {
+      assert.equal(failedJobStageLabelForFailure("downloading", "TIMEOUT", cause), ACQUISITION_STOP_FAILED_STAGE_LABELS[cause]);
+      for (const status of ["queued", "analyzing", "processing", "uploading"] as const) {
+        assert.equal(failedJobStageLabelForFailure(status, "TIMEOUT", cause), failedJobStageLabelFor(status), status);
+      }
+      for (const code of WORKER_ERROR_CODES.filter((c) => c !== "TIMEOUT")) {
+        assert.equal(failedJobStageLabelForFailure("downloading", code, cause), "Download failed", code);
+      }
+    }
+    assert.equal(failedJobStageLabelForFailure("downloading", "TIMEOUT", undefined), "Download failed");
+    assert.equal(failedJobStageLabelForFailure("downloading", "TIMEOUT", "stall" as never), "Download failed");
+  });
+
+  it("whatever the Worker writes, the control plane forwards it exactly as N4's contract already did", () => {
+    for (const cause of ["inactivity", "time-limit"] as const) {
+      const stage = failedJobStageLabelForFailure("downloading", "TIMEOUT", cause);
+      assert.equal(publicFailedStageLabel(stage, "TIMEOUT"), stage);
+      assert.equal(isPublicFailedJobStageLabel(stage), true);
+      assert.notEqual(timeoutMessageForStage(publicFailedStageLabel(stage, "TIMEOUT")), DOWNLOAD_TIMEOUT_MESSAGE);
+    }
   });
 });

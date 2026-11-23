@@ -69,16 +69,24 @@
  * (`worker-time-limits-boundary.test.ts`); the upload lifecycle receives the
  * absolute deadline the executor derives from it, never the duration.
  *
- * `inactivityMs` (`DOWNLOAD_INACTIVITY_TIMEOUT`) arrives with its watchdog in
- * LD-3b. A field that nothing enforces would be a value some later code could
- * read before the change that gives it meaning.
+ * ─── Acquisition inactivity (VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001) ─
+ *
+ *  - `inactivityMs` (`DOWNLOAD_INACTIVITY_TIMEOUT`) is the acquisition
+ *    watchdog's window: a live acquisition phase that has not grown by at least
+ *    65,536 real media bytes for this long is stopped. It is a SUBORDINATE
+ *    window inside the acquisition stage, never a stage of its own: it is not
+ *    part of `L`, it never extends `downloadTimeLimitMs`, and it must end
+ *    strictly before it (`buildWorkerTimeLimits` refuses anything else). It
+ *    arrived with the enforcement that reads it: the composition root hands it
+ *    to the executor's watchdog and nothing else reads it.
  *
  * ─── Defaults ────────────────────────────────────────────────────────────────
  *
  * The acquisition default stays 600 s. The long-download value (9,000 s) is a
  * later, separate change (LD-5b), made only after expiry, upload, inactivity,
  * yt-dlp retry and cancellation are bounded. At the defaults L is 5,445 s
- * (1 h 30 min 45 s) and R is 2,700 s (45 min). This module imports nothing, so
+ * (1 h 30 min 45 s), R is 2,700 s (45 min) and the inactivity window is 120 s,
+ * which leaves `L` unchanged. This module imports nothing, so
  * the executor and the store can depend on it without reaching the loader.
  */
 
@@ -115,6 +123,29 @@ export const UPLOAD_TIMEOUT_SECONDS = Object.freeze({
 } as const);
 
 /**
+ * `DOWNLOAD_INACTIVITY_TIMEOUT`, in seconds: the strict loader's range and
+ * default (VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001), exactly the accepted
+ * long-download design's (`LONG-DOWNLOAD-CONFIGURATION-DESIGN.md` §2.1, §2.4):
+ *
+ *  - at least 60 s: the window must outlast one yt-dlp attempt under the
+ *    watched retry policy's 30 s socket timeout (about 31 s, the design's
+ *    invariant I5), and it stays above the watchdog's 30 s suspension gap, so a
+ *    scheduling gap the watchdog does not treat as a suspension can never
+ *    exhaust it on its own;
+ *  - at most 900 s: beyond that it stops being a stall detector;
+ *  - and strictly below `DOWNLOAD_TIME_LIMIT`: a window that cannot end before
+ *    the absolute deadline would never decide anything.
+ *
+ * The watchdog arms only its 1 s tick, never a timer of the window's length,
+ * so no value in the range comes near the platform timer's limit.
+ */
+export const DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS = Object.freeze({
+  min: 60,
+  max: 900,
+  default: 120,
+} as const);
+
+/**
  * `FILE_EXPIRATION_MINUTES`, in minutes: the strict loader's range and default.
  * The maximum keeps a ready link at least five minutes inside the R2 lifecycle
  * rule, which deletes an object 3,600 s after it is written.
@@ -136,6 +167,11 @@ export type WorkerTimeLimits = Readonly<{
   analysisMs: number;
   /** ONE absolute deadline for a job's whole acquisition stage. */
   downloadTimeLimitMs: number;
+  /**
+   * `DOWNLOAD_INACTIVITY_TIMEOUT`: the acquisition watchdog's window, always
+   * shorter than `downloadTimeLimitMs` and never part of `L`.
+   */
+  inactivityMs: number;
   /** ONE absolute deadline per processing stage, shared by its subprocesses. */
   processingMs: number;
   /** `UPLOAD_TIMEOUT`. ONE absolute deadline for a job's upload stage, budgeted into `L`. */
@@ -163,6 +199,7 @@ export type WorkerJobLifetimes = Pick<WorkerTimeLimits, "executionLifetimeMs" | 
 export type WorkerTimeLimitInputs = Readonly<{
   analysisTimeoutSeconds: number;
   downloadTimeLimitSeconds: number;
+  downloadInactivityTimeoutSeconds: number;
   processingTimeoutSeconds: number;
   uploadTimeoutSeconds: number;
   fileExpirationMinutes: number;
@@ -219,6 +256,17 @@ export function buildWorkerTimeLimits(inputs: WorkerTimeLimitInputs): WorkerTime
     DOWNLOAD_TIME_LIMIT_SECONDS,
     1000,
   );
+  const inactivityMs = toMilliseconds(
+    "downloadInactivityTimeoutSeconds",
+    inputs.downloadInactivityTimeoutSeconds,
+    DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS,
+    1000,
+  );
+  // The design's cross-field rule (§2.4), re-checked like the ranges: a window
+  // that does not end strictly before the absolute deadline could never decide.
+  if (inactivityMs >= downloadTimeLimitMs) {
+    throw new WorkerTimeLimitsError("downloadInactivityTimeoutSeconds");
+  }
   const processingMs = toMilliseconds(
     "processingTimeoutSeconds",
     inputs.processingTimeoutSeconds,
@@ -247,6 +295,7 @@ export function buildWorkerTimeLimits(inputs: WorkerTimeLimitInputs): WorkerTime
   return Object.freeze({
     analysisMs,
     downloadTimeLimitMs,
+    inactivityMs,
     processingMs,
     uploadMs,
     retentionMs,
@@ -263,6 +312,7 @@ export function buildWorkerTimeLimits(inputs: WorkerTimeLimitInputs): WorkerTime
 export const DEFAULT_WORKER_TIME_LIMITS: WorkerTimeLimits = buildWorkerTimeLimits({
   analysisTimeoutSeconds: ANALYSIS_TIMEOUT_SECONDS.default,
   downloadTimeLimitSeconds: DOWNLOAD_TIME_LIMIT_SECONDS.default,
+  downloadInactivityTimeoutSeconds: DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS.default,
   processingTimeoutSeconds: PROCESSING_TIMEOUT_SECONDS.default,
   uploadTimeoutSeconds: UPLOAD_TIMEOUT_SECONDS.default,
   fileExpirationMinutes: FILE_EXPIRATION_MINUTES_RANGE.default,
@@ -272,6 +322,7 @@ export const DEFAULT_WORKER_TIME_LIMITS: WorkerTimeLimits = buildWorkerTimeLimit
 const MAXIMUM_WORKER_TIME_LIMITS: WorkerTimeLimits = buildWorkerTimeLimits({
   analysisTimeoutSeconds: ANALYSIS_TIMEOUT_SECONDS.max,
   downloadTimeLimitSeconds: DOWNLOAD_TIME_LIMIT_SECONDS.max,
+  downloadInactivityTimeoutSeconds: DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS.max,
   processingTimeoutSeconds: PROCESSING_TIMEOUT_SECONDS.max,
   uploadTimeoutSeconds: UPLOAD_TIMEOUT_SECONDS.max,
   fileExpirationMinutes: FILE_EXPIRATION_MINUTES_RANGE.max,

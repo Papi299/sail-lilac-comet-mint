@@ -1035,3 +1035,16 @@ only with `TIMEOUT`. A failed `TIMEOUT` message is chosen by stage:
 `ERROR_MESSAGES.TIMEOUT` itself is unchanged: the Worker stores and envelopes
 it, and no failed job's card shows it any more. An older control plane shows a
 reserved stage as `Failed` with that canonical message.
+
+**Worker side (`VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001`, source only —
+NOT MERGED, NOT DEPLOYED).** The Worker writes the two reserved stages once its
+acquisition watchdog is connected: `Download stalled` when the watchdog stops an
+acquisition that made no meaningful progress for `DOWNLOAD_INACTIVITY_TIMEOUT`,
+and `Download time limit reached` when the acquisition's own absolute deadline
+ended it first. Both are written only with `TIMEOUT`, only for a job that was
+downloading, from a closed table in `src/shared/worker/job-failure.ts`
+(`ACQUISITION_STOP_FAILED_STAGE_LABELS`, bound by a test to the reserved list
+above). The control-plane contract in this section is unchanged: the deployed
+control plane already forwards both. An observation loss keeps
+`PROCESSING_FAILED` / `Download failed`, and every other timeout keeps its
+earlier stage. No new error code and no schema change. Runbook §7d.
