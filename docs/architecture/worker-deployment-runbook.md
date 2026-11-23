@@ -6679,6 +6679,39 @@ at the restart is recovered as `Worker restarted`, as before.
 
 ---
 
+### 7e. Job-status activity and reload reattachment (`VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001`) — source change, NOT MERGED, NOT DEPLOYED
+
+**Status.** A Draft PR for independent review; its public `activity` schema is
+a proposal awaiting Product Owner acceptance. Nothing is built or deployed.
+The acquisition limit stays 600 s and the inactivity window 120 s.
+
+| Variable | Values | Default | Meaning |
+| :--- | :--- | ---: | :--- |
+| `JOB_STATUS_ACTIVITY_ENABLED` | exactly `true` or `false` (whitespace tolerated; unset, empty = default; anything else is startup-fatal, naming the variable only) | `false` | Publish the live acquisition `activity` in job statuses. Off keeps every status body exactly as an LD-3 Worker's. |
+
+**Compatibility.** A control plane that predates LD-4b (N4) parses Worker
+statuses strictly and REJECTS any `activity` key, `null` included: every status
+read would answer 500 and browsers would show "Reconnecting…". Hence:
+
+| Control plane ↓ / Worker → | LD-3 `f8007864` | LD-4b, flag off | LD-4b, flag on |
+| :--- | :--- | :--- | :--- |
+| N4 (current) | compatible (today) | compatible (wire identical) | **INCOMPATIBLE** — never run |
+| LD-4b control plane | compatible (`activity: null`) | compatible | compatible (activity shown) |
+
+**Release order.** (1) Deploy the LD-4b control plane; verify it against the
+running LD-3 Worker. (2) The LD-4b Worker image may be promoted with the flag
+unset — before or after (1); its wire is unchanged. (3) Only after (1) is
+accepted, set `JOB_STATUS_ACTIVITY_ENABLED=true` in `worker.env` and restart the
+Worker. **Rollback order.** First remove the flag (or roll the Worker back to
+`f8007864` / `1eca1cda`), then — only then — roll Vercel back to N4. Rolling the
+Worker back alone is always safe with the LD-4b control plane.
+
+**Nothing else changes.** No migration, no new route, no new credential, no
+change to the watchdog, the deadline, the yt-dlp runtime, `Dockerfile.worker`,
+the units, the broker or the egress policy. The browser part (progress details,
+`sessionStorage` reattachment) ships with the control plane and works — without
+activity details — against the LD-3 Worker.
+
 ## 8. Health and maintenance
 
 | Endpoint | Use |

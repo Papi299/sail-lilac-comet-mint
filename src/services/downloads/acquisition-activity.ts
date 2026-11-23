@@ -172,6 +172,13 @@ export type AcquisitionActivitySnapshot = Readonly<{
   discardPending: boolean;
   sampleGaps: number;
   deadlineAtMs: number | null;
+  /**
+   * The armed deadline's duration, as its first `deadline-armed` reported it;
+   * null until then. Set together with `deadlineAtMs` and never changed
+   * (VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: the
+   * public status reads the armed limit from here, not from configuration).
+   */
+  deadlineLimitMs: number | null;
   outcome: AcquisitionActivityOutcome | null;
 }>;
 
@@ -205,6 +212,7 @@ export function createAcquisitionActivityTracker(opts: {
   let lowSamples = 0;
   let sampleGaps = 0;
   let deadlineAtMs: number | null = null;
+  let deadlineLimitMs: number | null = null;
   let outcome: AcquisitionActivityOutcome | null = null;
 
   const phaseLive = () => phase !== null && !phaseEnded;
@@ -256,6 +264,7 @@ export function createAcquisitionActivityTracker(opts: {
       case "deadline-armed":
         if (deadlineAtMs === null && Number.isSafeInteger(event.limitMs) && event.limitMs > 0) {
           deadlineAtMs = now + event.limitMs;
+          deadlineLimitMs = event.limitMs;
         }
         return;
       case "phase-started":
@@ -307,6 +316,7 @@ export function createAcquisitionActivityTracker(opts: {
         discardPending,
         sampleGaps,
         deadlineAtMs,
+        deadlineLimitMs,
         outcome,
       }),
   };

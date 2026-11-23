@@ -20,6 +20,7 @@ import {
 import type { JobExecutor } from "../execution/job-executor.server.ts";
 import { WORKER_MAX_CONCURRENT_JOBS, type QueuePump } from "../execution/queue-pump.server.ts";
 import { WorkerExecutionProgressStatusSchema, type WorkerJobStore } from "../state/job-store.ts";
+import { WORKER_JOB_ACTIVITY_STATUS } from "../../shared/worker/job-activity.ts";
 import { probeWorkerBinaries, type WorkerBinaryProbe } from "./binaries.server.ts";
 import { WorkerBusinessError } from "./errors.server.ts";
 
@@ -80,6 +81,16 @@ export type WorkerServiceDeps = {
    * enabled and actually reached.
    */
   analysisLimits?: GenericAnalysisLimits;
+  /**
+   * VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: whether a
+   * job STATUS carries the `activity` field (`job-activity.ts`). The validated
+   * `JOB_STATUS_ACTIVITY_ENABLED`, supplied by the composition root; absent
+   * means off, and off keeps the status body exactly as before (no key at
+   * all). A control plane that predates the field refuses any status carrying
+   * it, so it is switched on only once a control plane that accepts it is
+   * deployed — never by this service on its own.
+   */
+  publishJobActivity?: boolean;
 };
 
 export class WorkerService implements WorkerBusinessService {
@@ -91,6 +102,7 @@ export class WorkerService implements WorkerBusinessService {
   private readonly clock: () => number;
   private readonly ytdlpEnabled: boolean;
   private readonly analysisLimits: GenericAnalysisLimits;
+  private readonly publishJobActivity: boolean;
 
   constructor(deps: WorkerServiceDeps) {
     this.store = deps.store;
@@ -101,6 +113,8 @@ export class WorkerService implements WorkerBusinessService {
     // built, because the analyzer closes over it.
     this.ytdlpEnabled = deps.ytdlpEnabled ?? false;
     this.analysisLimits = deps.analysisLimits ?? CONSERVATIVE_ANALYSIS_LIMITS;
+    // Exactly `true` only: anything else keeps the pre-LD-4b status body.
+    this.publishJobActivity = deps.publishJobActivity === true;
     // Phase 10C3: analysis is the SHARED strategy router, not the direct
     // analyzer alone. It still tries direct FIRST and only considers generic on
     // exactly one error code, and only when the operator enabled it — so a
@@ -174,7 +188,16 @@ export class WorkerService implements WorkerBusinessService {
     if (!active && this.clock() >= job.expiresAt) {
       throw new WorkerBusinessError("EXPIRED");
     }
-    return WorkerJobStatusSuccessSchema.parse({ success: true, job });
+    if (!this.publishJobActivity) {
+      return WorkerJobStatusSuccessSchema.parse({ success: true, job });
+    }
+    // LD-4b: the live acquisition activity, read from the executor's watchdog
+    // of THIS job only while the durable status says it is downloading — the
+    // view and the read happen in one synchronous step, so they describe the
+    // same moment. Every other status, and a downloading job with no
+    // acquisition in flight yet, states `null`: nothing is observed.
+    const activity = job.status === WORKER_JOB_ACTIVITY_STATUS ? this.executor.acquisitionActivity(job.jobId) : null;
+    return WorkerJobStatusSuccessSchema.parse({ success: true, job: { ...job, activity } });
   }
 
   public async cancelJob(jobId: string): Promise<WorkerCancelJobSuccess> {

@@ -11,6 +11,7 @@ import {
   logoutAccess,
   type AccessSession,
 } from "@/lib/client-api";
+import { clearActiveJob, clearActiveJobWithoutAccess } from "@/lib/active-job-storage";
 
 export function PrivateAccessGate({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<AccessSession | null>(null);
@@ -23,7 +24,12 @@ export function PrivateAccessGate({ children }: { children: ReactNode }) {
     let cancelled = false;
     void getAccessSession()
       .then((next) => {
-        if (!cancelled) setSession(next);
+        // Only the current check counts: an answer arriving after this effect
+        // was cleaned up changes neither storage nor state.
+        if (cancelled) return;
+        // LD-4b: a tab found without private access forgets its job id.
+        clearActiveJobWithoutAccess(next);
+        setSession(next);
       })
       .catch((err: Error) => {
         if (!cancelled) setLoadError(err.message);
@@ -54,6 +60,8 @@ export function PrivateAccessGate({ children }: { children: ReactNode }) {
     setError(null);
     try {
       const next = await logoutAccess();
+      // Locked: the job this tab was showing is not reopened by a later unlock.
+      clearActiveJob();
       setSession(next);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not lock VideoFetch.");

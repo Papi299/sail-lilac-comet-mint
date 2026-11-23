@@ -92,6 +92,7 @@ Safe for transmission to Vercel. When ready, it contains:
 - `updatedAt`
 - `expiresAt`
 - `objectKey` (SERVER-TO-SERVER CONTROL METADATA ONLY)
+- `activity` (OPTIONAL; live acquisition activity, `VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001` — see *Live acquisition activity and reload reattachment* below)
 
 **Important:** `objectKey` travels from the Worker to the authenticated Vercel control plane, but it MUST NOT appear in the browser-facing/public VideoFetch job DTO. Vercel strictly strips `objectKey` before returning the public response to the browser.
 
@@ -1048,3 +1049,73 @@ above). The control-plane contract in this section is unchanged: the deployed
 control plane already forwards both. An observation loss keeps
 `PROCESSING_FAILED` / `Download failed`, and every other timeout keeps its
 earlier stage. No new error code and no schema change. Runbook §7d.
+
+### Live acquisition activity and reload reattachment (`VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001`)
+
+**IMPLEMENTED IN SOURCE — NOT MERGED, NOT DEPLOYED. The public `activity`
+schema below is a PROPOSAL awaiting Product Owner acceptance.** Deploy order:
+this control plane first; a Worker publishes the field only after that, by
+configuration (runbook §7e).
+
+**Worker → control plane (`src/shared/worker/job-activity.ts`).** A job view
+MAY carry `activity`: absent (every Worker before LD-4b, and an LD-4b Worker
+with publishing off), `null` (published, nothing observed), or one object —
+non-null only while `status == downloading`:
+
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `state` | closed enum (below) | what the current acquisition is doing |
+| `elapsedSeconds` | integer 0–86,400 or null | since the acquisition's absolute deadline was armed (Worker monotonic clock); null until armed |
+| `limitSeconds` | integer 1–86,400 or null | that deadline's duration, as armed; null until armed; never extended |
+| `idleSeconds` | integer 0–86,400 or null | since the current part's last observed byte advance (or its start, before its first byte); null exactly for `starting`, `between-phases`, `unobserved` |
+
+| `state` | From the LD-3a assessment | Meaning |
+| :--- | :--- | :--- |
+| `starting` | `not-started` | no transfer part has started yet |
+| `awaiting-first-byte` | `awaiting-first-byte` | a part started; no media byte yet |
+| `receiving` | `receiving`, `not-advancing`, `retry-discarded` with `idleSeconds` ≤ 4 | bytes advanced within the last few seconds |
+| `waiting` | the same three with `idleSeconds` ≥ 5 | no new bytes for longer — NOT a stall |
+| `between-resources` | `between-resources` | a stream resource ended; the next has not produced a byte |
+| `between-phases` | `between-phases` | one part of a pair finished; the next has not started |
+| `unobserved` | `unobserved` | the Worker cannot measure the transfer right now — never a stall |
+| (null) | `deadline-exceeded`, `completed`, `cancelled`, `failed` | the acquisition is over; the job status decides |
+
+The object is strict (no other key), and cross-field rules hold (`elapsed`
+and `limit` null together, `elapsed ≤ limit`, `idleSeconds` exactly for the
+live states, the receiving/waiting boundary). A malformed field makes the
+whole status invalid: the control plane answers a `500 PROCESSING_FAILED`,
+which the browser retries — never a job outcome. A stall or an observation
+loss is only ever the job's outcome (`failed`), decided by the watchdog.
+
+The Worker reads the activity from the acquisition's OWN inactivity watchdog
+(its tracker snapshot, at the watchdog's clock), once per status read, from an
+in-memory map that holds an entry only while that acquisition is in flight. It
+writes nothing, arms nothing, and cannot move the window or the deadline. No
+database change.
+
+**Control plane → browser.** `PublicJob.activity` is always present: the four
+fields copied one by one while downloading, otherwise `null`. A status from an
+older Worker gives `null`. The status route now answers `Cache-Control:
+no-store` on success and on error.
+
+**Browser.** The progress card adds the stage in words (a polite live region),
+the activity line, **Elapsed since request** (browser clock vs `createdAt`;
+unknown when the clocks disagree), and — while downloading with an activity —
+**Download time limit** and **Downloading for** (both from the Worker). The
+ETA reads "Estimated … left". After 20 s of `idleSeconds` in
+`awaiting-first-byte`, `waiting` or `between-resources`, a polite notice
+replaces the activity line: a title for the state ("Still waiting for the
+source to start sending data." / "Waiting for the source to send more data." /
+"Waiting for the source to send the next part.") and "The download is still
+running. VideoFetch will stop it if the source stays inactive for too long."
+It is presentation only, hidden while the status channel is down, and never
+derived from the percentage. No remaining time is shown.
+
+**Reload reattachment.** The tab keeps `{"v":1,"jobId":…}` under
+`sessionStorage["videofetch:active-job:v1"]` — the job id only. After a reload
+the page reads that job's status with `GET …/status` (the same single-flight,
+retrying poller) and shows what the Worker answers; it never sends
+`POST /api/download` and never resends a cancellation. Unknown or expired: a
+short note and the entry removed. Unreachable: "Checking on your download" with
+the usual reconnect / Retry status. Starting over, a new analysis, a new job,
+locking, and a load without private access all clear the entry.

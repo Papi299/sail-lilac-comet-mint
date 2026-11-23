@@ -16,6 +16,8 @@ import {
   type ResolvedAcquisitionInactivityPolicy,
 } from "@/services/downloads/acquisition-inactivity-watchdog";
 import { mimeForContainer } from "@/services/extractors/normalize";
+import type { WorkerJobActivity } from "@/shared/worker/job-activity";
+import { projectAcquisitionActivity } from "./acquisition-activity-status.ts";
 import {
   SPLIT_MERGE_TARGETS,
   convertMedia,
@@ -698,6 +700,15 @@ export class JobExecutor {
         readonly policy: ResolvedAcquisitionInactivityPolicy;
       })
     | undefined;
+  /**
+   * VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: the
+   * watchdog of each acquisition in flight, by job id — read-only, for the
+   * public status (`acquisitionActivity`). An entry exists only between the
+   * watchdog's creation and its disposal in `acquire()`, so it holds at most
+   * one entry per executing job and never survives an acquisition, a job or
+   * the process.
+   */
+  private readonly liveAcquisitionWatchdogs = new Map<string, AcquisitionInactivityWatchdog>();
 
   constructor(
     store: WorkerJobStore,
@@ -838,6 +849,36 @@ export class JobExecutor {
       maxUnobservedMs: enforcement.policy.maxUnobservedMs,
       watchFilesystemObservedPlans: enforcement.watchFilesystemObservedPlans,
     });
+  }
+
+  /**
+   * VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: the public
+   * activity of `jobId`'s acquisition IN FLIGHT, or null — no acquisition of
+   * that job is being watched by this executor (it is not acquiring, or not
+   * yet, or no longer), its watchdog has already decided or ended, or its
+   * execution has been aborted.
+   *
+   * A pure read: one snapshot of that acquisition's own watchdog, at one
+   * reading of the watchdog's own clock, projected by
+   * `projectAcquisitionActivity`. It records nothing, arms nothing and moves
+   * nothing, so reading it — at any rate — cannot change when or whether the
+   * watchdog stops the acquisition, nor its absolute deadline.
+   */
+  public acquisitionActivity(jobId: string): WorkerJobActivity | null {
+    const watchdog = this.liveAcquisitionWatchdogs.get(jobId);
+    const enforcement = this.acquisitionInactivity;
+    if (watchdog === undefined || enforcement === undefined) return null;
+    const { state } = watchdog.report();
+    if (state !== "idle" && state !== "watching") return null;
+    const controller = this.activeControllers.get(jobId);
+    if (controller === undefined || controller.signal.aborted) return null;
+    let nowMs: number;
+    try {
+      nowMs = enforcement.clock();
+    } catch {
+      return null;
+    }
+    return projectAcquisitionActivity(watchdog.snapshot(), { nowMs, windowMs: enforcement.policy.windowMs });
   }
 
   /**
@@ -1205,6 +1246,8 @@ export class JobExecutor {
     // there gets exactly one. It decides inactivity and observation loss only;
     // the deadline above stays the seam's own.
     const watch = this.newAcquisitionInactivityWatch(plan, jobId);
+    // LD-4b: published read-only while this acquisition is in flight.
+    if (watch !== null) this.liveAcquisitionWatchdogs.set(jobId, watch.watchdog);
     try {
       // LD-3a: at most one observer sink per acquisition, and none in
       // Production. A sink factory that fails is an observer failing: the
@@ -1239,8 +1282,11 @@ export class JobExecutor {
     } finally {
       // Released the moment the seam settled, before any further await: no
       // watchdog outlives its acquisition, so processing and upload are never
-      // watched.
+      // watched — and (LD-4b) none is published after it.
       watch?.watchdog.dispose();
+      if (watch !== null && this.liveAcquisitionWatchdogs.get(jobId) === watch.watchdog) {
+        this.liveAcquisitionWatchdogs.delete(jobId);
+      }
     }
   }
 

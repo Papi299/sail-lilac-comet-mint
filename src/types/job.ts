@@ -1,3 +1,5 @@
+import type { WorkerJobActivityState } from "@/shared/worker/job-activity";
+
 /**
  * Browser-facing job status.
  *
@@ -17,6 +19,21 @@ export type JobStatusName =
   | "ready"
   | "failed"
   | "cancelled";
+
+/**
+ * VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: a job's live
+ * acquisition activity, as the control plane's DTO states it
+ * (`PublicJobActivitySchema`): one closed state and three bounded whole-second
+ * counts, only while the job is downloading.
+ */
+export type JobActivityState = WorkerJobActivityState;
+
+export type JobActivity = {
+  state: JobActivityState;
+  elapsedSeconds: number | null;
+  limitSeconds: number | null;
+  idleSeconds: number | null;
+};
 
 export type JobProgress = {
   status: JobStatusName;
@@ -40,6 +57,12 @@ export type JobProgress = {
   updatedAt: number;
   expiresAt: number;
   downloadUrl: string | null;
+  /**
+   * LD-4b. Optional: a page loaded from a control plane that predates the
+   * field may still receive a status without it, and the legacy in-process
+   * stack never sets it. Absent and `null` mean the same: nothing observed.
+   */
+  activity?: JobActivity | null;
 };
 
 export type JobRecord = JobProgress & {

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { WORKER_PRIVATE_PRINCIPAL, WORKER_JOBS_PATH } from "./constants.ts";
 import { WorkerErrorCodeSchema } from "./errors.ts";
+import { WORKER_JOB_ACTIVITY_STATUS, WorkerJobActivitySchema } from "./job-activity.ts";
 
 // --- Identifiers ---
 
@@ -122,6 +123,13 @@ export const WorkerJobViewSchema = z
     updatedAt: z.number().int().nonnegative(),
     expiresAt: z.number().int().nonnegative(),
     objectKey: WorkerObjectKeySchema.nullable(), // SERVER-TO-SERVER ONLY. Vercel strips this for browser.
+    // VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001: the live
+    // acquisition activity (`job-activity.ts`). OPTIONAL, so a Worker that
+    // predates it, or publishes none, still validates. Because this schema is
+    // strict, a control plane that predates the field REJECTS a Worker that
+    // sends it — `null` included: the control plane must deploy first, and a
+    // Worker may publish it only once that control plane is in place.
+    activity: WorkerJobActivitySchema.nullable().optional(),
   })
   .strict()
   .refine(
@@ -136,6 +144,10 @@ export const WorkerJobViewSchema = z
       return true;
     },
     { message: "objectKey must be non-null and match jobId if ready, else null" }
+  )
+  .refine(
+    (data) => data.activity === undefined || data.activity === null || data.status === WORKER_JOB_ACTIVITY_STATUS,
+    { message: "activity is live only while the job is downloading" },
   );
 export type WorkerJobView = z.infer<typeof WorkerJobViewSchema>;
 
