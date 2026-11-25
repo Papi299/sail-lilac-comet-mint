@@ -122,6 +122,7 @@ class MemoryWriter implements ObjectStoreWriter {
       contentLength: received,
       contentType: input.contentType,
       contentDisposition: input.contentDisposition,
+      lastModifiedAtMs: Math.floor(Date.now() / 1000) * 1000,
     });
   }
   async head(objectKey: WorkerObjectKey): Promise<ObjectStoreHead | null> {

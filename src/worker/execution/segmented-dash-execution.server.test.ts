@@ -127,7 +127,7 @@ function makeHarness(): Harness {
     async head(key) {
       const last = puts.find((p) => p.objectKey === key);
       return last
-        ? { objectKey: last.objectKey, contentLength: last.contentLength, contentType: last.contentType, contentDisposition: last.contentDisposition }
+        ? { objectKey: last.objectKey, contentLength: last.contentLength, contentType: last.contentType, contentDisposition: last.contentDisposition, lastModifiedAtMs: Math.floor(Date.now() / 1000) * 1000 }
         : null;
     },
     async delete() {},

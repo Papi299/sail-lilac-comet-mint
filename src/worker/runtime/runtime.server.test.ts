@@ -74,6 +74,8 @@ function metadata(): WorkerVideoMetadata {
 class MemoryWriter implements ObjectStoreWriter {
   public readonly objects = new Map<string, ObjectStoreHead>();
   public readonly deleted: string[] = [];
+  /** LD-5b: the clock the provider stamps Last-Modified with — the runtime's own clock in a virtual-clock test. */
+  public providerClock: () => number = () => Date.now();
 
   async put(input: ObjectStorePutInput): Promise<void> {
     let received = 0;
@@ -83,6 +85,7 @@ class MemoryWriter implements ObjectStoreWriter {
       contentLength: received,
       contentType: input.contentType,
       contentDisposition: input.contentDisposition,
+      lastModifiedAtMs: Math.floor(this.providerClock() / 1000) * 1000,
     });
   }
   async head(objectKey: WorkerObjectKey): Promise<ObjectStoreHead | null> {
@@ -772,7 +775,7 @@ describe("Worker runtime composition", () => {
       const runtime = await createWorkerRuntime(
         makeConfig(join(root, "state"), await reservePort(), { fileExpirationMinutes: 7 }),
         {
-          objectStoreWriter: new MemoryWriter(),
+          objectStoreWriter: Object.assign(new MemoryWriter(), { providerClock: () => now }),
           executorDeps: {
             ...mediaDeps(),
             // Acquisition takes a simulated minute: the ready instant is later

@@ -16,6 +16,10 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   const validKey = "videofetch/jobs/0123456789abcdef0123456789abcdef/0123456789abcdef0123456789abcdef" as WorkerObjectKey;
 
+  // LD-5b: the provider's Last-Modified as the SDK hands it over (a Date, whole seconds). Every head fake below
+  // carries a VALID one, so each negative case fails only on the field it is about.
+  const LAST_MODIFIED = new Date(1_795_599_531_000);
+
   it("default endpoint derivation", async () => {
     // Check derivation via real config object
     const realWriter = new CloudflareR2ObjectStoreWriter(validConfig);
@@ -178,6 +182,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
           ContentLength: 123,
           ContentType: "video/mp4",
           ContentDisposition: "attachment",
+          LastModified: LAST_MODIFIED,
         };
       },
     };
@@ -194,6 +199,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
       contentLength: 123,
       contentType: "video/mp4",
       contentDisposition: "attachment",
+      lastModifiedAtMs: 1_795_599_531_000,
     });
   });
 
@@ -302,7 +308,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentLength = -1 -> throws safe CloudflareR2Error", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: -1, ContentType: "video/mp4", ContentDisposition: "attachment" }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: -1, ContentType: "video/mp4", ContentDisposition: "attachment" }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), (err) => {
@@ -314,7 +320,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentLength = NaN -> throws", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: NaN, ContentType: "video/mp4", ContentDisposition: "attachment" }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: NaN, ContentType: "video/mp4", ContentDisposition: "attachment" }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), /Invalid head response/);
@@ -322,7 +328,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentLength = Infinity -> throws", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: Infinity, ContentType: "video/mp4", ContentDisposition: "attachment" }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: Infinity, ContentType: "video/mp4", ContentDisposition: "attachment" }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), /Invalid head response/);
@@ -330,7 +336,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentLength = Number.MAX_SAFE_INTEGER + 1 -> throws", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: Number.MAX_SAFE_INTEGER + 1, ContentType: "video/mp4", ContentDisposition: "attachment" }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: Number.MAX_SAFE_INTEGER + 1, ContentType: "video/mp4", ContentDisposition: "attachment" }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), /Invalid head response/);
@@ -338,7 +344,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentType empty -> throws", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: 0, ContentType: "", ContentDisposition: "attachment" }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: 0, ContentType: "", ContentDisposition: "attachment" }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), /Invalid head response/);
@@ -346,7 +352,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentType CR -> throws", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: 0, ContentType: "video/\rmp4", ContentDisposition: "attachment" }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: 0, ContentType: "video/\rmp4", ContentDisposition: "attachment" }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), /Invalid head response/);
@@ -354,7 +360,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentType LF -> throws", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: 0, ContentType: "video/\nmp4", ContentDisposition: "attachment" }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: 0, ContentType: "video/\nmp4", ContentDisposition: "attachment" }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), /Invalid head response/);
@@ -362,7 +368,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentType other ASCII control -> throws", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: 0, ContentType: "video/\x07mp4", ContentDisposition: "attachment" }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: 0, ContentType: "video/\x07mp4", ContentDisposition: "attachment" }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), /Invalid head response/);
@@ -370,7 +376,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentType overlong -> throws", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: 0, ContentType: "a".repeat(256), ContentDisposition: "attachment" }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: 0, ContentType: "a".repeat(256), ContentDisposition: "attachment" }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), /Invalid head response/);
@@ -378,7 +384,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentDisposition empty -> throws", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: 0, ContentType: "video/mp4", ContentDisposition: "" }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: 0, ContentType: "video/mp4", ContentDisposition: "" }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), /Invalid head response/);
@@ -386,7 +392,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentDisposition overlong -> throws", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: 0, ContentType: "video/mp4", ContentDisposition: "a".repeat(1025) }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: 0, ContentType: "video/mp4", ContentDisposition: "a".repeat(1025) }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), /Invalid head response/);
@@ -394,7 +400,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
 
   it("ContentDisposition ASCII control -> throws", async () => {
     const fakeClient: S3SendClient = {
-      send: async () => ({ ContentLength: 0, ContentType: "video/mp4", ContentDisposition: "attachment\r" }),
+      send: async () => ({ LastModified: LAST_MODIFIED, ContentLength: 0, ContentType: "video/mp4", ContentDisposition: "attachment\r" }),
     };
     const writer = new CloudflareR2ObjectStoreWriter(validConfig, fakeClient);
     await assert.rejects(() => writer.head(validKey), /Invalid head response/);
@@ -471,7 +477,7 @@ describe("CloudflareR2ObjectStoreWriter", () => {
       send: async (command: any, options?: unknown) => {
         seen.push({ command: command.constructor.name, options });
         if (command instanceof HeadObjectCommand) {
-          return { ContentLength: 1, ContentType: "video/mp4", ContentDisposition: "attachment" };
+          return { ContentLength: 1, ContentType: "video/mp4", ContentDisposition: "attachment", LastModified: LAST_MODIFIED };
         }
         return {};
       },
@@ -565,5 +571,52 @@ describe("CloudflareR2ObjectStoreWriter", () => {
     assert.ok(!source.includes("DeleteBucketCommand"), "Must not import DeleteBucketCommand");
     assert.ok(!source.includes("PutBucket"), "Must not import PutBucket");
     assert.ok(!source.includes("GetBucket"), "Must not import GetBucket");
+  });
+
+  // ── VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001 ───────────────────
+  //
+  // The HEAD keeps the provider's own Last-Modified, from the SDK's own
+  // deserialization (a Date), and checks the provider's lifecycle report when
+  // there is one. The values below are what @aws-sdk/client-s3 3.1120.0 really
+  // returns for those headers (no-network probe of its HeadObject
+  // deserializer); the real SDK over a socket is in `r2-head-lifecycle.server.test.ts`.
+
+  const headAnswer = (extra: Record<string, unknown>) => ({
+    send: async () => ({ ContentLength: 8, ContentType: "video/mp4", ContentDisposition: "attachment", ...extra }),
+  });
+  const EXPIRATION = 'expiry-date="Wed, 25 Nov 2026 10:38:51 GMT", rule-id="videofetch-expired-job-backstop"';
+
+  it("LD-5b: carries the provider's Last-Modified as whole-second epoch milliseconds", async () => {
+    const writer = new CloudflareR2ObjectStoreWriter(validConfig, headAnswer({ LastModified: LAST_MODIFIED }));
+    const head = await writer.head(validKey);
+    assert.strictEqual(head?.lastModifiedAtMs, 1_795_599_531_000);
+  });
+
+  for (const [label, value] of [
+    ["absent (the header was missing)", undefined],
+    ["null", null],
+    ["an invalid Date", new Date(Number.NaN)],
+    ["a pre-1970 Date (the SDK's reading of 31 Dec 1969 23:59:59 GMT)", new Date(-1_000)],
+    ["a fractional-second Date (the SDK's reading of 09:38:51.500 GMT)", new Date(1_795_599_531_500)],
+    ["a number instead of a Date", 1_795_599_531_000],
+    ["a string instead of a Date", "Wed, 25 Nov 2026 09:38:51 GMT"],
+  ] as const) {
+    it(`LD-5b: a Last-Modified that is ${label} -> Invalid head response (never a local time)`, async () => {
+      const writer = new CloudflareR2ObjectStoreWriter(validConfig, headAnswer({ LastModified: value }));
+      await assert.rejects(() => writer.head(validKey), (err: unknown) => err instanceof CloudflareR2Error && err.message === "Invalid head response");
+    });
+  }
+
+  it("LD-5b: the provider's x-amz-expiration report is not consumed — evaluated, not enforced; only Last-Modified is carried", async () => {
+    for (const expiration of [EXPIRATION, 'expiry-date="Wed, 25 Nov 2026 10:08:51 GMT", rule-id="short"', "garbage", undefined]) {
+      const writer = new CloudflareR2ObjectStoreWriter(validConfig, headAnswer({ LastModified: LAST_MODIFIED, Expiration: expiration }));
+      assert.deepStrictEqual(await writer.head(validKey), {
+        objectKey: validKey,
+        contentLength: 8,
+        contentType: "video/mp4",
+        contentDisposition: "attachment",
+        lastModifiedAtMs: 1_795_599_531_000,
+      });
+    }
   });
 });

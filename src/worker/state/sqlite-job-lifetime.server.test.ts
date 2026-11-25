@@ -123,6 +123,8 @@ function commitReady(h: Harness, jobId: string) {
     mime: "video/mp4",
     quality: "original",
     container: "mp4",
+    // LD-5b: the provider stamped the object just before this commit (whole seconds).
+    lastModifiedAtMs: Math.floor(h.clock.now / 1000) * 1000,
   });
 }
 
@@ -397,6 +399,7 @@ describe("LD-2a durable lifetime: each assignment is exact", () => {
         mime: "video/mp4",
         quality: null,
         container: "mp4",
+        lastModifiedAtMs: Math.floor(d.clock.now / 1000) * 1000,
       });
       assert.equal(ready.type, "ready");
       assert.equal(jobRow(d.db, jobId).expires_at_ms, T0 + 80 * 60_000 + 2_700_000, "ready + 45 min");

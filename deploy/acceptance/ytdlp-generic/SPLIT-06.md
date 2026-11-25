@@ -161,6 +161,13 @@ than echoing the PUT. `declaredLength` and `observedBytes` are recorded apart,
 and HEAD never answers with the caller's declaration, so a provider that stored
 different bytes is refused by the real `finalizeJobUpload` comparison itself.
 
+Since `VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001` the Worker's strict
+head schema also requires the object's provider timestamp, `lastModifiedAtMs`. The
+sink reports the persisted file's own modification time from the same HEAD-time
+`lstat`, truncated to the whole second, as R2 reports `Last-Modified`; the ready commit
+caps the result's expiry by it. The writer and the Worker it runs against must match:
+an older sink against a newer Worker, or the reverse, fails every upload verification.
+
 **A SPLIT-06 PASS is not R2 acceptance.**
 
 ---

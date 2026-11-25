@@ -22,7 +22,29 @@ export type StubObject = {
   readonly size: number;
   readonly contentType: string;
   readonly contentDisposition: string;
+  /**
+   * VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001: the instant the PUT
+   * completed, truncated to the whole second — what R2 reports as
+   * `Last-Modified` (LD-5a Q16) — in epoch milliseconds.
+   */
+  readonly lastModifiedMs: number;
 };
+
+/**
+ * LD-5b: the lifecycle headers a HEAD answers with. By default the R2 shape
+ * observed by LD-5a: `last-modified` (IMF-fixdate of `lastModifiedMs`) and an
+ * `x-amz-expiration` of `last-modified` + 3,600 s under the backstop rule. A
+ * test may replace either, or drop it with `null`.
+ */
+export type StubHeadLifecycle = (object: StubObject) => {
+  readonly lastModified?: string | null;
+  readonly expiration?: string | null;
+};
+
+export const R2_LIKE_HEAD_LIFECYCLE: StubHeadLifecycle = (object) => ({
+  lastModified: new Date(object.lastModifiedMs).toUTCString(),
+  expiration: `expiry-date="${new Date(object.lastModifiedMs + 3_600_000).toUTCString()}", rule-id="videofetch-expired-job-backstop"`,
+});
 
 /** One request as the stub saw it. Mutated in place while it is in flight. */
 export type StubExchange = {
@@ -74,6 +96,8 @@ export type StubS3Server = {
 export async function startStubS3Server(options: {
   bucket: string;
   mode?: (exchange: StubExchange) => StubMode;
+  /** LD-5b: the HEAD's lifecycle headers; default `R2_LIKE_HEAD_LIFECYCLE`. */
+  headLifecycle?: StubHeadLifecycle;
 }): Promise<StubS3Server> {
   const exchanges: StubExchange[] = [];
   const objects = new Map<string, StubObject>();
@@ -126,17 +150,21 @@ export async function startStubS3Server(options: {
         size: exchange.bytesReceived,
         contentType: String(req.headers["content-type"] ?? ""),
         contentDisposition: String(req.headers["content-disposition"] ?? ""),
+        lastModifiedMs: Math.floor(Date.now() / 1000) * 1000,
       });
       return answer(res, exchange, 200, { etag: '"stub"' });
     }
     if (exchange.method === "HEAD") {
       const object = objects.get(exchange.key);
       if (!object) return s3Error(res, exchange, 404, "NotFound");
+      const lifecycle = (options.headLifecycle ?? R2_LIKE_HEAD_LIFECYCLE)(object);
       return answer(res, exchange, 200, {
         "content-length": String(object.size),
         "content-type": object.contentType,
         "content-disposition": object.contentDisposition,
         etag: '"stub"',
+        ...(lifecycle.lastModified == null ? {} : { "last-modified": lifecycle.lastModified }),
+        ...(lifecycle.expiration == null ? {} : { "x-amz-expiration": lifecycle.expiration }),
       });
     }
     if (exchange.method === "DELETE") {

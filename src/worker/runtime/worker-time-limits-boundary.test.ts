@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import ts from "typescript";
 
@@ -760,6 +760,171 @@ describe("LD-3 activation: the inactivity window has one owner and one route to 
     ]) {
       assert.equal(real(file).includes("ld3Planted"), false, file);
       assert.equal(real(file).includes("ld1Planted"), false, file);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001: the provider-lifecycle
+// cap is derived once, applied only by the durable ready transition, and the
+// provider timestamp never leaves the Worker's storage layer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Where each LD-5b name may appear — as an identifier or a string literal,
+ * comments excluded — in the Worker's production graph:
+ *
+ *  - `deriveReadyExpiresAtMs`: the model (defines it) and the durable store
+ *    (calls it inside the ready transaction). Never the upload finalizer, the
+ *    executor or the HTTP layer: the expiry is decided at the commit.
+ *  - `R2_OBJECT_LIFECYCLE_AGE_MS`, `R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS`,
+ *    `R2_LAST_MODIFIED_FUTURE_TOLERANCE_MS`: the model alone.
+ *  - `lastModifiedAtMs`: the storage contract, the R2 writer, the finalizer, the
+ *    store's contract and the store, and the model's derivation. Never the job
+ *    view, the HTTP layer, the executor or anything shared with the control plane.
+ */
+const LD5B_NAMES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  deriveReadyExpiresAtMs: ["src/worker/runtime/time-limits.ts", "src/worker/state/sqlite-job-store.server.ts"],
+  R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS: ["src/worker/runtime/time-limits.ts"],
+  R2_LAST_MODIFIED_FUTURE_TOLERANCE_MS: ["src/worker/runtime/time-limits.ts"],
+  R2_OBJECT_LIFECYCLE_AGE_MS: ["src/worker/runtime/time-limits.ts"],
+  lastModifiedAtMs: [
+    "src/worker/runtime/time-limits.ts",
+    "src/worker/state/job-store.ts",
+    "src/worker/state/sqlite-job-store.server.ts",
+    "src/worker/storage/cloudflare-r2-writer.server.ts",
+    "src/worker/storage/upload-lifecycle.server.ts",
+    "src/worker/storage/writer.ts",
+  ],
+});
+
+function ld5bNameUses(file: string, source: string): Array<{ name: string; file: string; line: number }> {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.ES2022, true, file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+  const out: Array<{ name: string; file: string; line: number }> = [];
+  const visit = (node: ts.Node) => {
+    let name: string | null = null;
+    if (ts.isIdentifier(node)) name = node.text;
+    else if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) name = node.text;
+    if (name !== null && Object.hasOwn(LD5B_NAMES, name)) {
+      out.push({ name, file: rel(file), line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1 });
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return out;
+}
+
+function ld5bViolations(graph: Map<string, string>): string[] {
+  const out: string[] = [];
+  for (const [file, source] of graph) {
+    for (const use of ld5bNameUses(file, source)) {
+      if (!LD5B_NAMES[use.name]!.includes(use.file)) out.push(`${use.file}:${use.line} ${use.name}`);
+    }
+  }
+  return out;
+}
+
+/** Every non-test control-plane, browser and shared module: none may carry the provider timestamp. */
+function controlPlaneSources(overlay: Overlay = {}): Map<string, string> {
+  const { read } = makeReader(overlay);
+  const out = new Map<string, string>();
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (/\.(ts|tsx)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) && !/\.fixtures\.ts$/.test(entry.name)) {
+        out.set(full, read(full));
+      }
+    }
+  };
+  for (const dir of ["src/web", "src/lib", "src/routes", "src/components", "src/shared"]) {
+    if (existsSync(join(ROOT, dir))) walk(join(ROOT, dir));
+  }
+  for (const [relPath, source] of Object.entries(overlay)) out.set(join(ROOT, relPath), source);
+  return out;
+}
+
+const timestampLeaks = (sources: Map<string, string>) =>
+  [...sources].flatMap(([file, source]) =>
+    ld5bNameUses(file, source)
+      .filter((u) => u.name === "lastModifiedAtMs")
+      .map((u) => `${u.file}:${u.line}`),
+  );
+
+describe("LD-5b: one lifecycle cap, applied at the durable commit; the provider timestamp stays internal", () => {
+  const graph = workerGraph();
+  const real = (file: string) => readFileSync(join(ROOT, file), "utf8");
+  const plant = (file: string, code: string): Overlay => ({ [file]: `${real(file)}\n${code}\n` });
+  const squash = (text: string) => text.replace(/\s+/g, " ");
+
+  it("finds every LD-5b name only where the table allows it", () => {
+    assert.deepEqual(ld5bViolations(graph), []);
+  });
+
+  it("positive controls: the scan sees each allowed use in the real graph", () => {
+    const uses = [...graph].flatMap(([file, source]) => ld5bNameUses(file, source));
+    const where = (name: string) => [...new Set(uses.filter((u) => u.name === name).map((u) => u.file))].sort();
+    for (const name of Object.keys(LD5B_NAMES)) assert.deepEqual(where(name), [...LD5B_NAMES[name]!].sort(), name);
+  });
+
+  it("the store derives the ready expiry exactly once, inside the ready transaction, from its own commit instant", () => {
+    const store = squash(real("src/worker/state/sqlite-job-store.server.ts"));
+    const calls = store.match(/deriveReadyExpiresAtMs\(\{[^}]*\}\)/g) ?? [];
+    assert.equal(calls.length, 1, "one derivation");
+    assert.match(calls[0]!, /lastModifiedAtMs: validatedInput\.lastModifiedAtMs,/, "the validated provider timestamp");
+    assert.match(calls[0]!, /readyCommitAtMs: now,/, "the transaction's own commit instant");
+    assert.match(calls[0]!, /retentionMs: this\.retentionMs,/, "the one model's R");
+    const ready = store.slice(store.indexOf("commitReadyFromUploading(jobId: string"), store.indexOf("listExpiredReadyObjects(limit: number)"));
+    assert.ok(ready.includes(calls[0]!), "inside commitReadyFromUploading");
+    const begin = ready.indexOf('this.db.exec("BEGIN IMMEDIATE")');
+    assert.ok(begin > 0 && ready.indexOf("const now = this.nowMs();") > begin, "the commit instant is read once the write lock is held");
+    assert.ok(ready.indexOf("deriveReadyExpiresAtMs(") > begin, "after BEGIN IMMEDIATE");
+    assert.equal(ready.includes("terminalExpiresAt("), false, "the ready path is never floored at creation");
+    assert.match(ready, /const readyExpiresAt = ready\.expiresAtMs;/);
+  });
+
+  it("the finalizer hands the commit the VERIFIED head's timestamp, and decides no expiry itself", () => {
+    const lifecycle = squash(real("src/worker/storage/upload-lifecycle.server.ts"));
+    const assignments = lifecycle.match(/lastModifiedAtMs: [^,}]+/g) ?? [];
+    assert.deepEqual(assignments, ["lastModifiedAtMs: validatedHead.lastModifiedAtMs"], "the one assignment, from the verified head");
+  });
+
+  it("no control-plane, browser or shared module carries the provider timestamp", () => {
+    const sources = controlPlaneSources();
+    assert.ok(sources.size > 50, `a real scan, saw ${sources.size} modules`);
+    assert.ok([...sources.keys()].some((f) => f.endsWith("src/shared/worker/contracts.ts")), "the shared contract is scanned");
+    assert.ok([...sources.keys()].some((f) => f.endsWith("src/web/jobs/public-job.ts")), "the browser DTO is scanned");
+    assert.deepEqual(timestampLeaks(sources), []);
+  });
+
+  for (const [label, file, code, name] of [
+    ["the upload finalizer deriving the expiry itself", "src/worker/storage/upload-lifecycle.server.ts", 'import { deriveReadyExpiresAtMs as ld5bPlantedA } from "../runtime/time-limits.ts";\nvoid ld5bPlantedA;', "deriveReadyExpiresAtMs"],
+    ["the HTTP service applying the margin", "src/worker/http/business-service.server.ts", 'import { R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS as ld5bPlantedB } from "../runtime/time-limits.ts";\nvoid ld5bPlantedB;', "R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS"],
+    ["the shared job contract carrying the provider timestamp", "src/shared/worker/contracts.ts", "export const ld5bPlantedC = { lastModifiedAtMs: 0 };", "lastModifiedAtMs"],
+    ["the executor reading the provider timestamp", "src/worker/execution/job-executor.server.ts", "export const ld5bPlantedD = (x: { lastModifiedAtMs: number }) => x.lastModifiedAtMs;", "lastModifiedAtMs"],
+  ] as const) {
+    it(`catches ${label} (in-memory overlay)`, () => {
+      const found = ld5bViolations(workerGraph(plant(file, code)));
+      assert.ok(found.length >= 1, `${label}: nothing flagged`);
+      assert.ok(found.every((f) => f.startsWith(`${file}:`) && f.endsWith(` ${name}`)), found.join("; "));
+    });
+  }
+
+  it("catches the browser DTO carrying the provider timestamp (in-memory overlay)", () => {
+    const file = "src/web/jobs/public-job.ts";
+    const leaks = timestampLeaks(controlPlaneSources(plant(file, "export const ld5bPlantedE = { lastModifiedAtMs: 0 };")));
+    assert.ok(leaks.length >= 1 && leaks.every((l) => l.startsWith(`${file}:`)), leaks.join("; "));
+  });
+
+  it("never wrote anything: the real sources carry no planted marker", () => {
+    for (const file of [
+      "src/worker/storage/upload-lifecycle.server.ts",
+      "src/worker/http/business-service.server.ts",
+      "src/shared/worker/contracts.ts",
+      "src/worker/execution/job-executor.server.ts",
+      "src/web/jobs/public-job.ts",
+    ]) {
+      assert.equal(real(file).includes("ld5bPlanted"), false, file);
     }
   });
 });

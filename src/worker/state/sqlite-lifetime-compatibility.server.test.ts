@@ -232,6 +232,7 @@ describe("LD-2a × previous-store databases (mixed versions)", () => {
       mime: "video/mp4",
       quality: null,
       container: "mp4",
+      lastModifiedAtMs: Math.floor(clock.now / 1000) * 1000,
     });
     store.failJob(create(), "TIMEOUT", "The video took too long to process.");
     store.cancelJob(create());

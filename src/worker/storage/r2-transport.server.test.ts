@@ -270,11 +270,13 @@ describe("LD-2b R2 transport: a healthy exchange", () => {
     const { state, body } = countingBody(size);
     const outcome = await settle(h.writer.put(putInput(body, size)), "a healthy put");
     assert.equal(outcome.ok, true);
-    assert.deepEqual(h.stub.objects.get(KEY), {
+    const { lastModifiedMs, ...stored } = h.stub.objects.get(KEY)!;
+    assert.deepEqual(stored, {
       size,
       contentType: "video/mp4",
       contentDisposition: 'attachment; filename="clip.mp4"',
     });
+    assert.equal(lastModifiedMs % 1000, 0, "LD-5b: the stub stamps the completion like R2, in whole seconds");
     const [exchange] = h.stub.exchanges;
     assert.equal(exchange!.headers["content-length"], String(size), "the declared Content-Length");
     assert.equal(exchange!.headers["expect"], "100-continue");
@@ -295,6 +297,8 @@ describe("LD-2b R2 transport: a healthy exchange", () => {
       contentLength: 1024,
       contentType: "video/mp4",
       contentDisposition: 'attachment; filename="clip.mp4"',
+      // LD-5b: the provider's Last-Modified, through the real SDK's own deserializer.
+      lastModifiedAtMs: h.stub.objects.get(KEY)!.lastModifiedMs,
     });
     await h.writer.delete(KEY);
     // Only successful exchanges so far: an error response would make the SDK

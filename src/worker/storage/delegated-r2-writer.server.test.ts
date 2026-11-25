@@ -107,6 +107,7 @@ describe("DelegatedR2ObjectStoreWriter", () => {
         contentLength: 7,
         contentType: "video/mp4",
         contentDisposition: 'attachment; filename="v.mp4"',
+        lastModifiedAtMs: NOW,
       }),
     );
 
@@ -641,5 +642,50 @@ describe("DelegatedR2ObjectStoreWriter: the operation's signal (LD-2b)", () => {
     await makeWriter(without.provider, recordingWriterFactory([], []), deadline).put(putInput());
     assert.deepEqual(withSignal.mints[0]!.request, without.mints[0]!.request);
     assert.equal(withSignal.mints[0]!.request.ttlSeconds, 300, "min(remaining, PutObject ceiling)");
+  });
+});
+
+describe("DelegatedR2ObjectStoreWriter: the provider timestamp (VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001)", () => {
+  const head = (lastModifiedAtMs: unknown) =>
+    ({
+      objectKey: KEY,
+      contentLength: 7,
+      contentType: "video/mp4",
+      contentDisposition: 'attachment; filename="v.mp4"',
+      lastModifiedAtMs,
+    }) as ObjectStoreHead;
+
+  it("preserves the per-operation writer's Last-Modified exactly through its strict boundary", async () => {
+    // A provider value unlike the delegated writer's own clock (NOW), so neither a drop nor a substitution can pass.
+    const writer = makeWriter(recordingProvider([]), recordingWriterFactory([], [], head(1_795_599_531_000)));
+    const outcome = await writer.head(KEY).then(
+      (value) => value,
+      (error: unknown) => (error instanceof DelegatedR2Error ? `rejected: ${error.failure}` : "rejected"),
+    );
+    assert.deepEqual(outcome, head(1_795_599_531_000), "the provider's own Last-Modified, unchanged");
+  });
+
+  for (const [label, value] of [
+    ["missing", undefined],
+    ["a sub-second (local clock) value", 1_795_599_531_437],
+    ["negative", -1_000],
+    ["NaN", Number.NaN],
+    ["a Date object", new Date(1_795_599_531_000)],
+  ] as const) {
+    it(`refuses a per-operation head whose Last-Modified is ${label}: operation_failed, never a substitute`, async () => {
+      const inner = head(value) as Record<string, unknown>;
+      if (value === undefined) delete inner.lastModifiedAtMs;
+      const writer = makeWriter(recordingProvider([]), recordingWriterFactory([], [], inner as ObjectStoreHead));
+      await assert.rejects(
+        () => writer.head(KEY),
+        (err: unknown) => err instanceof DelegatedR2Error && err.failure === "operation_failed",
+      );
+    });
+  }
+
+  it("refuses an unknown extra field next to it: the boundary stays strict", async () => {
+    const inner = { ...head(1_795_599_531_000), expiration: "expiry-date=..." } as ObjectStoreHead;
+    const writer = makeWriter(recordingProvider([]), recordingWriterFactory([], [], inner));
+    await assert.rejects(() => writer.head(KEY), (err: unknown) => err instanceof DelegatedR2Error && err.failure === "operation_failed");
   });
 });

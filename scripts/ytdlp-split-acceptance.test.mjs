@@ -17,7 +17,7 @@ import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -654,12 +654,17 @@ describe("split acceptance: local ObjectStoreWriter", () => {
   it("answers head with the same length when declaration and body agree", async () => {
     const writer = createLocalObjectStoreWriter({ sinkDir: join(dir, randomUUID()) });
     await writer.put(putInput(stream("abc"), { contentLength: 3 }));
-    assert.deepEqual(await writer.head(key(jobId)), {
+    const head = await writer.head(key(jobId));
+    // LD-5b: the stored file's own modification time, whole seconds, as R2 reports Last-Modified.
+    const { mtimeMs } = await lstat(writer.soleObject().path);
+    assert.deepEqual(head, {
       objectKey: key(jobId),
       contentLength: 3,
       contentType: "video/mp4",
       contentDisposition: 'attachment; filename="x.mp4"',
+      lastModifiedAtMs: Math.floor(mtimeMs / 1000) * 1000,
     });
+    assert.equal(head.lastModifiedAtMs % 1000, 0);
   });
 
   it("measures the stored object at HEAD time instead of replaying the put", async () => {

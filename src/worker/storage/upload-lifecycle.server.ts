@@ -1,6 +1,6 @@
 /* eslint-disable no-control-regex */
 import { z } from "zod";
-import type { WorkerJobStore } from "../state/job-store.ts";
+import type { CommitReadyInput, WorkerJobStore } from "../state/job-store.ts";
 import { WorkerJobIdSchema, type WorkerJobView } from "../../shared/worker/contracts.ts";
 import { ObjectStorePutInputSchema, ObjectStoreHeadSchema, type ObjectStoreWriter, type ObjectStorePutInput, type ObjectStoreHead } from "./writer.ts";
 import { generateWorkerObjectKey } from "./object-key.ts";
@@ -371,7 +371,11 @@ async function runUploadStage(
     fileSize: number;
     mime: string;
     contentDisposition: string;
-    commit: Parameters<WorkerJobStore["commitReadyFromUploading"]>[1];
+    /**
+     * Everything the ready commit records except the provider timestamp, which
+     * only the verified HEAD below can supply (LD-5b).
+     */
+    commit: Omit<CommitReadyInput, "lastModifiedAtMs">;
   },
 ): Promise<StageOutcome> {
   const { jobId, store, writer, objectKey, fileSize, mime, contentDisposition } = op;
@@ -426,32 +430,49 @@ async function runUploadStage(
 
   // 8. Commit Ready — the last point the stage can refuse, synchronous from
   //    here: no timer, signal or provider answer can land in between.
+  //
+  //    VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001: the commit carries
+  //    the object's provider `Last-Modified` from the VERIFIED head, and only
+  //    that. The expiry is decided inside the commit, against the commit's own
+  //    instant — never here, so the time this stage took cannot be lost.
   const beforeCommit = interrupted(true);
   if (beforeCommit) return beforeCommit;
   let commitResult;
   try {
-    commitResult = store.commitReadyFromUploading(jobId, op.commit);
+    commitResult = store.commitReadyFromUploading(jobId, {
+      ...op.commit,
+      lastModifiedAtMs: validatedHead.lastModifiedAtMs,
+    });
   } catch {
     return { type: "storage_failure", code: "ready_commit_failed" };
   }
 
-  if (commitResult.type === "ready") {
-    return { type: "ready", job: commitResult.job };
+  // 9. Every outcome is mapped by name (LD-5b: exhaustively, so a result the
+  //    store adds later cannot silently fall into "another writer won" and
+  //    leave the job `uploading`). Anything but ready: the caller cleans up.
+  switch (commitResult.type) {
+    case "ready":
+      return { type: "ready", job: commitResult.job };
+    case "lifetime_expired":
+      return { type: "lifetime_expired" };
+    case "ready_expiry_refused":
+      // LD-5b: no ready expiry satisfies every bound — the stored object's
+      // provider lifecycle leaves no safe window, or its timestamp is unusable —
+      // so the upload could not be verified as a result that may be offered.
+      // Nothing was committed; the caller
+      // deletes the exact key under its own allowance, and the executor fails
+      // the job as for any storage failure.
+      return { type: "storage_failure", code: "verification_failed" };
+    case "not_found":
+      return { type: "job_state_conflict", reason: "missing" };
+    case "terminal":
+    case "not_uploading":
+      return { type: "job_state_conflict", reason: mapJobStatusToConflictReason(commitResult.job.status) };
+    default: {
+      const unmapped: never = commitResult;
+      return unmapped;
+    }
   }
-
-  // 9. Races: the caller cleans up.
-  if (commitResult.type === "lifetime_expired") {
-    return { type: "lifetime_expired" };
-  }
-  let reason: JobStateConflictReason = "not_uploading";
-  if (commitResult.type === "not_found") {
-    reason = "missing";
-  } else if (commitResult.type === "terminal") {
-    reason = mapJobStatusToConflictReason(commitResult.job.status);
-  } else if (commitResult.type === "not_uploading") {
-    reason = mapJobStatusToConflictReason(commitResult.job.status);
-  }
-  return { type: "job_state_conflict", reason };
 }
 
 export type CleanupResult = {

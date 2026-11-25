@@ -101,6 +101,14 @@ Safe for transmission to Vercel. When ready, it contains:
 DEPLOYED** (deployment runbook §7b). The field, its type and its name are
 unchanged; what it holds depends on the job's state:
 
+> **Status update (2026-11-25).** LD-2a has been live since 2026-10-30. The `ready` row
+> below changes with `VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001` (runbook §7f;
+> source change, not yet merged or deployed): a ready job's `expiresAt` becomes
+> `min(readyAt + R, Last-Modified + 3,300 s)`, where `Last-Modified` is the stored object's
+> own provider timestamp. The field's name, type and meaning — "the instant after which
+> the job is no longer authorised" — are unchanged, so the control plane needs no change.
+> The provider timestamp itself never appears in any Worker or control-plane response.
+
 | Status | `expiresAt` | `GET /v1/jobs/:jobId` |
 | :--- | :--- | :--- |
 | `queued` | `createdAt + L` | the job until then; `410 EXPIRED` from then |
@@ -109,7 +117,8 @@ unchanged; what it holds depends on the job's state:
 
 `L` is the Worker's derived execution lifetime and `R` its retention
 (`FILE_EXPIRATION_MINUTES`, 1–55 min). A ready link is therefore authorised for
-`R` from the moment the file exists. The control plane needs no change: it
+`R` from the moment the file exists — at most; since LD-5b, never past the stored
+object's `Last-Modified` + 55 minutes, five minutes inside the R2 lifecycle rule. The control plane needs no change: it
 signs only while `status == ready` and `now < expiresAt`. A Worker image without
 this change holds `createdAt + FILE_EXPIRATION_MINUTES` in every state and
 answers 410 past it for any status.
@@ -937,7 +946,7 @@ a row failed by an older Worker, which still holds its last progress label.
 | Generic extraction disabled or its runtime unavailable | `EXTRACTOR_UNAVAILABLE` | Download failed |
 | Over the size or duration limit | `TOO_LARGE` / `TOO_LONG` | the phase that measured it |
 | Local merge, remux or transcode failure; output validation | `PROCESSING_FAILED` | Processing failed |
-| Object-store write, verification or ready commit | `PROCESSING_FAILED` | Upload failed |
+| Object-store write, verification or ready commit — including, since LD-5b, a ready commit refused because the stored object's provider lifecycle leaves no safe window or its `Last-Modified` is unusable | `PROCESSING_FAILED` | Upload failed |
 | Worker restart during execution | `PROCESSING_FAILED` (restart message) | Worker restarted |
 | Anything unclassifiable (local capacity, job directory, unexpected exception) | `PROCESSING_FAILED` | the phase it ran in |
 | Worker unreachable or failing at the transport level | `WORKER_UNAVAILABLE` (control plane only) | — |

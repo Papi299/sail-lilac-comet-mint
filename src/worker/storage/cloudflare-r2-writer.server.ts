@@ -126,6 +126,16 @@ export interface S3SendClient {
 }
 
 /**
+ * LD-5b: the HEAD's provider timestamp, from the SDK's OWN deserialization of
+ * `Last-Modified` (a `Date`), never from any local clock. Anything else —
+ * absent, not a `Date`, an invalid `Date` — yields `undefined`, which the
+ * strict head schema refuses; so does a negative or fractional instant.
+ */
+function headLastModifiedAtMs(value: unknown): number | undefined {
+  return value instanceof Date ? value.getTime() : undefined;
+}
+
+/**
  * The options handed to the SDK for one operation. With a signal, aborting it
  * makes the SDK's request handler destroy the in-flight request — socket and
  * all — and reject; an attempt that has not started yet is refused outright.
@@ -236,6 +246,7 @@ export class CloudflareR2ObjectStoreWriter implements ObjectStoreWriter {
         contentLength: response.ContentLength,
         contentType: response.ContentType,
         contentDisposition: response.ContentDisposition,
+        lastModifiedAtMs: headLastModifiedAtMs(response.LastModified),
       });
     } catch (error) {
       throw new CloudflareR2Error("Invalid head response", error);

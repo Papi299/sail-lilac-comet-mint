@@ -262,6 +262,7 @@ describe("Worker business service", () => {
         mime: "video/mp4",
         quality: null,
         container: "mp4",
+        lastModifiedAtMs: Math.floor(now / 1000) * 1000,
       });
       assert.equal(ready.type, "ready");
 

@@ -128,6 +128,7 @@ beforeEach(() => {
               contentLength: last.contentLength,
               contentType: last.contentType,
               contentDisposition: last.contentDisposition,
+              lastModifiedAtMs: Math.floor(Date.now() / 1000) * 1000,
             }
           : null;
       },

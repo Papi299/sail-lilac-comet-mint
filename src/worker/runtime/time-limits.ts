@@ -47,8 +47,12 @@
  *
  *  - creation (`queued`): `created + L`, the queue-wait bound;
  *  - claim (`queued → analyzing`): `claimed + L`, the execution bound;
- *  - every terminal transition (`ready`, `failed`, `cancelled`, restart
- *    recovery): `finished + R`, the retention.
+ *  - every terminal transition (`failed`, `cancelled`, restart recovery):
+ *    `finished + R`, the retention;
+ *  - `ready` (VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001): the same
+ *    `finished + R`, capped by the stored object's provider lifecycle —
+ *    `min(finished + R, Last-Modified + R2_OBJECT_LIFECYCLE_AGE_MS
+ *    − R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS)` (`deriveReadyExpiresAtMs`).
  *
  * `executionLifetimeMs` (`L`) is DERIVED here and nowhere else:
  *
@@ -57,8 +61,14 @@
  *
  * so it can never disagree with the stage limits it must cover. It is not
  * configurable, and there is no `JOB_LIFETIME` variable. `retentionMs` (`R`) is
- * `FILE_EXPIRATION_MINUTES`, capped at 55 minutes because the R2 lifecycle rule
- * deletes an object 60 minutes after it is written: the link must end first.
+ * `FILE_EXPIRATION_MINUTES`, at most 55 minutes: the R2 lifecycle rule makes an
+ * object eligible for deletion 60 minutes after its `Last-Modified` instant
+ * (the upload's completion), and a link must end at least five minutes before
+ * that. The 55-minute maximum ALONE does not guarantee it: the ready commit can
+ * follow the completion by minutes (every wait between them is an inactivity
+ * bound, not a total), so `ready + R` can pass the provider's eligibility. The
+ * ready transition's lifecycle cap is what keeps every ready link inside it,
+ * at any `R`.
  *
  * `analysisMs` (`ANALYSIS_TIMEOUT`) exists here only because `L` must budget for
  * it. Analysis is still bounded by the analysis policy, which the runtime builds
@@ -147,14 +157,63 @@ export const DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS = Object.freeze({
 
 /**
  * `FILE_EXPIRATION_MINUTES`, in minutes: the strict loader's range and default.
- * The maximum keeps a ready link at least five minutes inside the R2 lifecycle
- * rule, which deletes an object 3,600 s after it is written.
+ * The maximum is the R2 lifecycle age less the safety margin
+ * (`R2_OBJECT_LIFECYCLE_AGE_MS − R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS`, pinned by
+ * `time-limits.test.ts`). It bounds `R`; it does not by itself keep a ready link
+ * five minutes inside the rule, because the rule counts from the object's
+ * `Last-Modified`, not from the ready commit. The ready transition's cap
+ * (`deriveReadyExpiresAtMs`) does.
  */
 export const FILE_EXPIRATION_MINUTES_RANGE = Object.freeze({
   min: 1,
   max: 55,
   default: 45,
 } as const);
+
+/**
+ * VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001: the R2 bucket's
+ * lifecycle rule (`videofetch-expired-job-backstop`, prefix `videofetch/jobs/`,
+ * condition Age, 3,600 s; runbook §5h) makes an object eligible for deletion
+ * this long after its `Last-Modified` instant. LD-5a measured it against real
+ * R2: `Last-Modified` is the upload's COMPLETION, truncated to the whole second,
+ * and the provider reports `expiry-date = Last-Modified + 3,600 s` exactly, with
+ * the rule id, on PutObject, HeadObject and GetObject.
+ *
+ * A property of the bucket's configuration, not a Worker setting: no
+ * environment variable changes it.
+ */
+export const R2_OBJECT_LIFECYCLE_AGE_MS = 3_600_000;
+
+/**
+ * LD-5b: how long before the provider's lifecycle eligibility every ready link
+ * has already ended. Both ends are judged on R2's OWN clock: the provider makes
+ * the object eligible at `Last-Modified + R2_OBJECT_LIFECYCLE_AGE_MS`, and it
+ * honours a signed GET only until its `X-Amz-Date + X-Amz-Expires`, which the
+ * control plane's signer keeps at or before the job's `expiresAt`
+ * (`cloudflare-r2-signer.server.ts`). With `expiresAt <= Last-Modified + 55 min`
+ * the five minutes therefore hold whatever the Worker's or the control plane's
+ * clock reads; they are spent on nothing but a link used at its last moment.
+ */
+export const R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS = 300_000;
+
+/**
+ * LD-5b: how far after the ready commit, on the Worker's clock, a provider
+ * `Last-Modified` may lie before it is refused as bad data.
+ *
+ * An object cannot complete after the HEAD that reported it, so a later
+ * `Last-Modified` means either a Worker clock behind R2's — harmless to the cap,
+ * which is on R2's clock — or a wrong timestamp, which would silently disable
+ * the cap (`min()` would then always pick `finished + R`). The bound separates
+ * the two at the system's existing clock-skew budget: the Worker already refuses
+ * a control-plane request whose timestamp is more than
+ * `WORKER_TIMESTAMP_TOLERANCE_SECONDS` (300 s) off its clock, and the Worker
+ * VM's guest clock has been recorded stepping by minutes after a host sleep
+ * (+236 s, 2026-09-17), so a tighter bound would fail every completed upload
+ * during such a lag. Beyond the budget the timestamp is refused, never clamped.
+ * Pinned equal to that constant by `ready-result-lifecycle.test.ts` (this
+ * module imports nothing).
+ */
+export const R2_LAST_MODIFIED_FUTURE_TOLERANCE_MS = 300_000;
 
 /**
  * The reviewed slack inside `L`, in seconds: two HLS preflights, the yt-dlp
@@ -404,14 +463,124 @@ export function deriveUploadStageDeadlineMs(input: {
 }
 
 /**
+ * LD-5b: a provider `Last-Modified` instant as the Worker carries it internally
+ * (`ObjectStoreHead.lastModifiedAtMs`, `CommitReadyInput.lastModifiedAtMs`):
+ * epoch MILLISECONDS, a nonnegative safe integer, and a whole number of seconds,
+ * the HTTP-date resolution the provider sends. NaN (an invalid `Date`),
+ * Infinity, a negative (pre-1970) instant, a fractional second and a local
+ * millisecond clock reading are all refused, never rounded.
+ */
+export function isProviderLastModifiedAtMs(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value % 1000 === 0;
+}
+
+/** Why a ready commit is refused: no expiry satisfies every bound, or the timestamp is unusable. */
+export type ReadyExpiryRefusal =
+  /** Not a provider `Last-Modified` instant at all, or one whose cap overflows the safe integers. */
+  | "invalid_last_modified"
+  /** Later than the commit by more than `R2_LAST_MODIFIED_FUTURE_TOLERANCE_MS`: bad data. */
+  | "last_modified_in_future"
+  /** The provider-safe instant is not after the commit: no availability window is left. */
+  | "provider_window_elapsed"
+  /**
+   * The expiry would fall before the job's own creation, which the row's
+   * `CHECK(expires_at_ms >= created_at_ms)` forbids: the Worker's clock stepped
+   * back past the creation by more than R, or `Last-Modified` predates the job
+   * by more than 55 minutes. Refused, never floored into a longer expiry.
+   */
+  | "expiry_before_job";
+
+export type ReadyExpiry =
+  | { readonly ok: true; readonly expiresAtMs: number; readonly providerSafeExpiresAtMs: number }
+  | { readonly ok: false; readonly reason: ReadyExpiryRefusal };
+
+/**
+ * LD-5b: the ONE derivation of a ready result's expiry (PO-20):
+ *
+ *     expiresAt = min(finished + R,
+ *                     lastModifiedAt + R2_OBJECT_LIFECYCLE_AGE_MS
+ *                                    − R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS)
+ *
+ * where `finished` is the ready commit's own instant (`finishedAtMs ?? readyCommitAtMs`).
+ * The ONE caller is the durable ready transition, inside its own transaction,
+ * with that transaction's own commit instant. Nothing earlier — not the upload
+ * finalizer, not the HEAD — decides the expiry, so neither a delayed HEAD nor a
+ * delayed commit can carry it past either bound.
+ *
+ * `lastModifiedAtMs` is the provider's own timestamp, never a local substitute.
+ * The second term is on R2's clock, as the provider's deletion is, so it holds
+ * whatever the Worker's clock reads. A refusal means the result must not become
+ * ready (the caller deletes the exact key it uploaded):
+ *
+ *  - not a provider instant (`isProviderLastModifiedAtMs`), or a cap past the
+ *    safe integers → `invalid_last_modified`;
+ *  - after `readyCommitAtMs + R2_LAST_MODIFIED_FUTURE_TOLERANCE_MS` →
+ *    `last_modified_in_future` (bad data: it would disable the cap);
+ *  - an expiry not after `readyCommitAtMs` → `provider_window_elapsed` (only
+ *    the provider term can do this: `finished + R` is after the commit);
+ *  - an expiry before `jobCreatedAtMs` → `expiry_before_job`.
+ *
+ * Nothing is clamped or floored: a refused timestamp is never turned into a
+ * plausible one, and no expiry is ever lengthened to satisfy the row. The
+ * Worker's own instants and `retentionMs` are validated values; anything else
+ * there is a caller fault, refused by field name.
+ */
+export function deriveReadyExpiresAtMs(input: {
+  lastModifiedAtMs: number;
+  readyCommitAtMs: number;
+  finishedAtMs: number | null;
+  retentionMs: number;
+  jobCreatedAtMs: number;
+}): ReadyExpiry {
+  const { lastModifiedAtMs, readyCommitAtMs, finishedAtMs, retentionMs, jobCreatedAtMs } = input;
+  if (!Number.isSafeInteger(readyCommitAtMs) || readyCommitAtMs < 0) {
+    throw new WorkerTimeLimitsError("readyCommitAtMs");
+  }
+  if (finishedAtMs !== null && (!Number.isSafeInteger(finishedAtMs) || finishedAtMs < 0)) {
+    throw new WorkerTimeLimitsError("finishedAtMs");
+  }
+  if (!Number.isSafeInteger(retentionMs) || retentionMs <= 0) {
+    throw new WorkerTimeLimitsError("retentionMs");
+  }
+  if (!Number.isSafeInteger(jobCreatedAtMs) || jobCreatedAtMs < 0) {
+    throw new WorkerTimeLimitsError("jobCreatedAtMs");
+  }
+  const retentionBoundMs = (finishedAtMs ?? readyCommitAtMs) + retentionMs;
+  if (!Number.isSafeInteger(retentionBoundMs)) {
+    throw new WorkerTimeLimitsError("readyCommitAtMs");
+  }
+  if (!isProviderLastModifiedAtMs(lastModifiedAtMs)) {
+    return { ok: false, reason: "invalid_last_modified" };
+  }
+  if (lastModifiedAtMs - readyCommitAtMs > R2_LAST_MODIFIED_FUTURE_TOLERANCE_MS) {
+    return { ok: false, reason: "last_modified_in_future" };
+  }
+  const providerSafeExpiresAtMs =
+    lastModifiedAtMs + R2_OBJECT_LIFECYCLE_AGE_MS - R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS;
+  if (!Number.isSafeInteger(providerSafeExpiresAtMs)) {
+    return { ok: false, reason: "invalid_last_modified" };
+  }
+  const expiresAtMs = Math.min(retentionBoundMs, providerSafeExpiresAtMs);
+  if (expiresAtMs <= readyCommitAtMs) {
+    return { ok: false, reason: "provider_window_elapsed" };
+  }
+  if (expiresAtMs < jobCreatedAtMs) {
+    return { ok: false, reason: "expiry_before_job" };
+  }
+  return { ok: true, expiresAtMs, providerSafeExpiresAtMs };
+}
+
+/**
  * Validates the two lifetimes handed to the durable store and returns a frozen
  * copy of exactly them.
  *
  * The same rule as an injected stage model: narrower than the environment
  * minimum is allowed — tests prove an expiry with a few milliseconds — while a
  * malformed value or one wider than the strict ranges can produce is refused.
- * In particular no injection can give a ready link a retention that outlives
- * the R2 lifecycle backstop.
+ * In particular no injection can give `R` more than the 55-minute maximum. A
+ * ready link is additionally capped at the stored object's `Last-Modified`
+ * plus 55 minutes by the ready transition (`deriveReadyExpiresAtMs`):
+ * that cap, not `R`'s range, keeps it inside the R2 lifecycle backstop.
  */
 export function assertWorkerJobLifetimes(value: unknown): WorkerJobLifetimes {
   if (typeof value !== "object" || value === null) {

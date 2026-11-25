@@ -43,6 +43,12 @@
 // `contentType` and `contentDisposition` are replayed from what the put stored,
 // as a real provider replays the metadata it persisted with the object.
 //
+// `lastModifiedAtMs` (VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001) is
+// the persisted file's own modification time, from the SAME `lstat()` at HEAD
+// time, truncated to the whole second — as R2 reports `Last-Modified`: the
+// instant the stored object was last written. The Worker's strict head schema
+// requires it, and the ready commit caps the result's expiry by it.
+//
 // ── Why it validates its own input ─────────────────────────────────────────
 //
 // `finalizeJobUpload` already parses the put candidate through
@@ -88,8 +94,11 @@ export function createLocalObjectStoreWriter({ sinkDir, onPut }) {
   const sinkPathFor = (objectKey) =>
     join(sinkDir, `${createHash("sha256").update(objectKey).digest("hex")}.object`);
 
-  /** The stored object's size, measured now; null when it no longer exists. */
-  async function persistedSize(record) {
+  /**
+   * The stored object, measured now: its size and its whole-second
+   * modification time (LD-5b); null when it no longer exists.
+   */
+  async function persistedObject(record) {
     let info;
     try {
       info = await lstat(record.path);
@@ -99,7 +108,7 @@ export function createLocalObjectStoreWriter({ sinkDir, onPut }) {
     }
     // Anything but a plain file is an operational failure, not "missing".
     if (!info.isFile()) throw new Error("the persisted object is not a regular file");
-    return info.size;
+    return { size: info.size, lastModifiedAtMs: Math.floor(info.mtimeMs / 1000) * 1000 };
   }
 
   return {
@@ -153,17 +162,19 @@ export function createLocalObjectStoreWriter({ sinkDir, onPut }) {
       const key = WorkerObjectKeySchema.parse(objectKey);
       const record = objects.get(key);
       // A second, independent observation of the STORED object: its length
-      // comes from the persisted file, measured at HEAD time.
-      const contentLength = record ? await persistedSize(record) : null;
-      if (!record || contentLength === null) {
-        heads.push({ objectKey: key, contentLength: null, contentType: null, contentDisposition: null });
+      // and its modification time come from the persisted file, measured at
+      // HEAD time.
+      const stored = record ? await persistedObject(record) : null;
+      if (!record || stored === null) {
+        heads.push({ objectKey: key, contentLength: null, contentType: null, contentDisposition: null, lastModifiedAtMs: null });
         return null;
       }
       const head = {
         objectKey: record.objectKey,
-        contentLength,
+        contentLength: stored.size,
         contentType: record.contentType,
         contentDisposition: record.contentDisposition,
+        lastModifiedAtMs: stored.lastModifiedAtMs,
       };
       heads.push({ ...head });
       return head;

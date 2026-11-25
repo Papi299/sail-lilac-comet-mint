@@ -5802,6 +5802,12 @@ operation have opposite relationships to job expiry.
 **Deadline-bound (`PutObject` / `HeadObject`).** The credential must never
 outlive the job it serves.
 
+*LD-5a (2026-11-25, observed, not documented by Cloudflare):* a credential bounds when
+a request may *start*, not how long an accepted single `PutObject` may run. R2 completed
+single-PUT bodies of about 3,360 s that streamed 41 minutes past their 900 s credential,
+and refused every new request made with an expired one (`403 SignatureDoesNotMatch`).
+Re-qualify after any change Cloudflare makes to R2's authentication.
+
 - remaining lifetime known and positive → `min(remaining, ceiling)`. A job with
   30 seconds left yields a 30-second credential, not a floored 60-second one.
 - remaining lifetime known and **already expired** → **fail closed.** No
@@ -5849,6 +5855,11 @@ Set the provider lifecycle retention slightly **longer** than the application
 expiration (`FILE_EXPIRATION_MINUTES`) so ordinary Worker cleanup attempts the
 exact-key deletion first and the provider TTL only catches what the Worker
 missed.
+
+*LD-5b (§7f, not yet deployed):* the relation becomes exact rather than "slightly
+longer": a ready result's expiry is capped at the object's `Last-Modified` + 55 minutes,
+five minutes inside the 60-minute rule, whatever `FILE_EXPIRATION_MINUTES` is. The cap
+assumes the rule's age is exactly 3,600 s: that age is a deployment invariant (§7f).
 
 Expiration is enforced by `expiresAt` in durable metadata, independently of
 whether cleanup succeeded. A failed object deletion never extends user
@@ -5996,10 +6007,16 @@ mid-job, a delete that failed and was never retried. 60 minutes is deliberately
 *longer* than 45 so the application always gets its attempt first, and bounded
 enough that an escaped object is measured in minutes rather than days.
 
-*LD-2a (§7b, not deployed):* the 45 minutes are then counted from the job's
-`ready` commit — moments after the object write — instead of from job
-creation, and `FILE_EXPIRATION_MINUTES` is capped at 55, so a ready link still
-ends at least five minutes before this rule can delete its object.
+*LD-2a (§7b, deployed since 2026-10-30):* the 45 minutes are counted from the job's
+`ready` commit instead of from job creation, and `FILE_EXPIRATION_MINUTES` is capped
+at 55. *Corrected 2026-11-25 (LD-5a, LD-5b):* this note used to conclude that the cap
+alone keeps a ready link at least five minutes before this rule can delete its object.
+It does not. The rule counts from the object's `Last-Modified`, which LD-5a measured to
+be the upload's completion (R2 reports `expiry-date = Last-Modified + 3,600 s` exactly),
+while the ready commit may follow the completion by minutes: every wait between them
+is an inactivity bound, not a total. LD-5b (§7f) caps the ready expiry at
+`Last-Modified + 55 min`, which keeps every ready link at least five minutes inside this
+rule at any `R`. Until it is deployed, keep `FILE_EXPIRATION_MINUTES` at 45.
 
 Two properties worth stating precisely:
 
@@ -6198,7 +6215,55 @@ restart message never appeared. See §11f.
 Configure the platform's termination grace period to at least the Worker's
 shutdown grace so a clean SIGTERM is not truncated by an immediate SIGKILL.
 
+### Long-download phases — state of record (2026-11-25)
+
+The §7a–§7e sections below were written as source changes for review. Their status
+paragraphs are kept as written; this table records what is live. Identities are from
+each phase's accepted release record.
+
+| Phase | Source | Production | State |
+| :--- | :--- | :--- | :--- |
+| LD-1 stage time limits (§7a) | PR #113 | Worker `e067a435` since 2026-10-24 | live, carried by every later image |
+| LD-2a job lifetime and retention (§7b) | PR #114 | Worker `02b6e110` since 2026-10-30 | live, carried by every later image |
+| LD-2b bounded, cancellable upload (§7c) | PR #115 | Worker `a3657ed8` since 2026-11-09 | live, carried by every later image |
+| LD-3 inactivity watchdog (§7d) | PR #128, `main` `388b187c` | Worker `f8007864` since 2026-11-23 | live; closed by Product Owner adjudication |
+| LD-4a protected cancellation (§7e's predecessor) | PR #121, `main` `93f0027b` | Vercel N4 2026-11-13 → 2026-11-23, carried by N5 | live |
+| LD-4b activity and reattachment (§7e) | PR #129, `main` `f95c655e` | Vercel N5 `dpl_47noctv6…` since 2026-11-23 17:55Z; Worker `6e2f9edc` since 2026-11-24 12:13Z; `JOB_STATUS_ACTIVITY_ENABLED=true` since 2026-11-24 22:41Z | **live, activity publishing ON** |
+| LD-5a R2 long-upload qualification | no source change | none (disposable bucket) | **QUALIFIED** 2026-11-25, `LD5A_G_UPLOAD_EXISTING_ARCHITECTURE_QUALIFIED`, accepted by the Product Owner under ADJ-D |
+| LD-5b retention hardening (§7f) | this change | none | **NOT MERGED, NOT DEPLOYED** |
+| LD-5b activation (`DOWNLOAD_TIME_LIMIT=9000`) | — | none | **NOT ACTIVATED**: Production stays at 600 s |
+
+**Current Production rollback constraint.** The Worker publishes `activity`. Vercel's
+Hobby one-step rollback target is N4 (`dpl_6sCxg3t2…`), which rejects any Worker status
+that carries an `activity` key, `null` included. **N4 MUST NOT BE RESTORED WHILE THE
+WORKER PUBLISHES ACTIVITY**: first remove `JOB_STATUS_ACTIVITY_ENABLED` from
+`worker.env` (restore the original), restart the Worker, and verify that the switch is
+absent and raw status answers omit `activity`; only then roll Vercel back to N4 (§7e).
+
+**LD-5a in brief (2026-11-25; evidence archive SHA-256 `f1c3adbf…`).** Real R2, the
+production signer and broker, the existing single-PUT architecture:
+
+- An in-flight single `PutObject` completes after its ≤ 900 s credential expires: the
+  longest measured bodies streamed about **3,360 s** (D1b, D1b-x2), 41 minutes past the
+  credential, and each became ready about 4 minutes before the 3,600 s stage deadline. A
+  new request with an expired credential is refused. This is observed provider behaviour,
+  not documented by Cloudflare: re-qualify it after any change to R2's authentication.
+- The pre-registered near-hour attempt **D1 failed with HTTP 502 at 229.5 s**; the
+  frozen gate D stays FAIL. Two further sequential attempts passed, and Q14 is accepted
+  under ADJ-D. The 502's cause is not established; two passes show capability, not
+  guaranteed reliability. A single PUT cannot resume: such a fault costs the transfer.
+- Lifecycle: `Last-Modified` is the upload's completion, and `expiry-date` =
+  `Last-Modified + 3,600 s` exactly on PUT, HEAD and GET.
+- Not verified: sizes above 105 MiB over near-hour durations (a 4 GiB body in about
+  3,360 s needs about 10.2 Mbit/s sustained), and the provider's single-PUT maximum.
+- No credential, multipart or upload-architecture change follows; the retention
+  hardening (§7f) is the one application change it called for.
+
 ### 7a. Stage time limits (`VIDEOFETCH-LD1-STAGE-TIME-LIMITS-001`) — source change, NOT DEPLOYED
+
+> **Status update (2026-11-25).** Merged and live since 2026-10-24, carried by the current Worker `6e2f9edc`; see the state of record above.
+> The status paragraph below is this section's original text, kept as written.
+
 
 **Status.** A source change for review. No image has been built for Production
 and nothing is deployed: the Production Worker still runs its earlier image,
@@ -6277,6 +6342,10 @@ old control plane and a new Worker are compatible in either order.
 
 ### 7b. Job lifetime and retention (`VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001`) — source change, NOT DEPLOYED
 
+> **Status update (2026-11-25).** Merged and live since 2026-10-30, carried by the current Worker `6e2f9edc`. LD-5b (§7f) caps the `ready` assignment at the object's `Last-Modified` + 55 minutes; until it is deployed, keep `FILE_EXPIRATION_MINUTES` at 45.
+> The status paragraph below is this section's original text, kept as written.
+
+
 **Status.** A source change for review. No image has been built for Production
 and nothing is deployed. A Worker image without this change keeps the
 creation-based expiry: every job's `expires_at_ms` is
@@ -6295,6 +6364,9 @@ job's idempotency record:
 | create (→ `queued`) | `created + L` | the queue wait |
 | claim (`queued` → `analyzing`) | `claimed + L` | the execution |
 | `ready`, `failed`, `cancelled`, restart recovery | `finished + R` | the retention |
+
+*Since LD-5b (§7f, not yet deployed): the `ready` row is `min(finished + R, Last-Modified + 3,300 s)`;
+`failed`, `cancelled` and restart recovery keep `finished + R`.*
 
 - `L` = `ANALYSIS_TIMEOUT` + `DOWNLOAD_TIME_LIMIT` + `PROCESSING_TIMEOUT` +
   `UPLOAD_TIMEOUT` + 600 s, derived once in `src/worker/runtime/time-limits.ts`
@@ -6358,12 +6430,17 @@ record is retained. At the widest configuration a job can stay authorised past
 - A `PutObject` credential is at most 900 s. Whether R2 completes a single PUT
   whose body outlives its credential is **unverified** (gate G-UPLOAD, LD-2b /
   LD-5a).
+  *Answered by LD-5a (2026-11-25): yes, as observed provider behaviour; see the state of
+  record above.*
 - **Provider lifecycle margin.** `R` ≤ 55 min keeps a ready link at least five
   minutes inside the 3,600 s backstop (§5h) when the ready commit closely
   follows the object write, which it does: a HEAD and one SQLite transaction.
   If R2 dates an object from the start of a long upload rather than its
   completion, the margin shrinks by that upload's duration. Unverified; it
   belongs with G-UPLOAD.
+  *Answered by LD-5a: R2 dates the object at its completion. But "closely follows" is
+  measured, not guaranteed — the code allows minutes between them — so LD-5b (§7f) caps
+  the ready expiry at `Last-Modified` + 55 minutes.*
 - **Wall-clock regression.** Every assignment after creation is floored at
   `created_at_ms`, which the schema's `CHECK` requires. Only a clock stepped
   back past a job's creation by more than the window reaches the floor; without
@@ -6400,6 +6477,10 @@ link then fails rather than serving it. Rolling back with an empty queue (the
 promotion procedure's in-flight check) avoids it.
 
 ### 7c. Bounded, cancellable R2 upload (`VIDEOFETCH-LD2B-BOUNDED-CANCELLABLE-UPLOAD-001`) — source change, NOT DEPLOYED
+
+> **Status update (2026-11-25).** Merged and live since 2026-11-09, carried by the current Worker `6e2f9edc`. Gate G-UPLOAD, described below as unverified, was answered by LD-5a on 2026-11-25 (state of record above). LD-5b (§7f) adds the provider `Last-Modified` to the HeadObject verification.
+> The status paragraph below is this section's original text, kept as written.
+
 
 **Status.** A source change for review. No image has been built for Production
 and nothing is deployed. LD-2a (§7b) is the reported accepted Production
@@ -6570,6 +6651,10 @@ flight at the restart is aborted by the shutdown in either image and recovered a
 
 ### 7d. Acquisition inactivity watchdog (`VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001`) — source change, NOT MERGED, NOT DEPLOYED
 
+> **Status update (2026-11-25).** Merged as `388b187c` and live since 2026-11-23, carried by the current Worker `6e2f9edc`; see the state of record above.
+> The status paragraph below is this section's original text, kept as written.
+
+
 **Status.** A source change on a Draft PR, for independent review. It is not
 merged, no image has been built from it, and nothing is deployed: the
 Production Worker (LD-3e, `sha256:1eca1cda…`) still runs with the watchdog
@@ -6681,6 +6766,10 @@ at the restart is recovered as `Worker restarted`, as before.
 
 ### 7e. Job-status activity and reload reattachment (`VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001`) — source change, NOT MERGED, NOT DEPLOYED
 
+> **Status update (2026-11-25).** Merged as `f95c655e`; the schema was accepted by the Product Owner. Vercel N5 has been Production since 2026-11-23 and the Worker `6e2f9edc` since 2026-11-24, with `JOB_STATUS_ACTIVITY_ENABLED=true` since 2026-11-24. The table's "N4 (current)" row is now the Hobby rollback target: N4 must not be restored while the flag is on (state of record above).
+> The status paragraph below is this section's original text, kept as written.
+
+
 **Status.** A Draft PR for independent review; its public `activity` schema is
 a proposal awaiting Product Owner acceptance. Nothing is built or deployed.
 The acquisition limit stays 600 s and the inactivity window 120 s.
@@ -6711,6 +6800,91 @@ change to the watchdog, the deadline, the yt-dlp runtime, `Dockerfile.worker`,
 the units, the broker or the egress policy. The browser part (progress details,
 `sessionStorage` reattachment) ships with the control plane and works — without
 activity details — against the LD-3 Worker.
+
+### 7f. Ready-result retention bounded by the R2 lifecycle (`VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001`) — source change, NOT MERGED, NOT DEPLOYED
+
+**Status.** A Draft PR for independent review. Nothing is built or deployed:
+Production stays Worker `6e2f9edc` with Vercel N5, and `DOWNLOAD_TIME_LIMIT` stays
+600 s. This is the retention prerequisite of LD-5b, not its activation.
+
+**Why.** The backstop rule (§5h) makes an object eligible for deletion at
+`Last-Modified + 3,600 s`. LD-5a measured that `Last-Modified` is the upload's
+completion, truncated to the whole second. A ready result's expiry was `ready + R`,
+and every wait between the completion and the ready commit is an inactivity bound,
+not a total: with silent waits the code allows a commit about 381 s after the
+completion (about 936 s if R2 did not refuse an expired HEAD credential), and a
+trickling peer can stretch it to the stage deadline. At `R` = 55 minutes a link could
+then outlive its object (LD-5a: about −81 s in the worst case it considered); at the
+45-minute default the margin falls to about +519 s.
+
+**The invariant (Product Owner decision PO-20).**
+
+```
+expiresAt(ready) = min(finished + R, Last-Modified + 3,600,000 − 300,000)
+```
+
+- `R2_OBJECT_LIFECYCLE_AGE_MS` = 3,600,000 and `R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS` =
+  300,000 live in `src/worker/runtime/time-limits.ts`, the one source;
+  `FILE_EXPIRATION_MINUTES`'s 55-minute maximum is pinned equal to age − margin.
+- `deriveReadyExpiresAtMs` computes it. Its one caller is the durable ready transition
+  (`commitReadyFromUploading`), inside its `BEGIN IMMEDIATE` transaction, with the
+  commit instant read once the write lock is held. The committed value is mirrored into
+  the idempotency record in the same transaction. Nothing earlier decides it, so neither
+  a delayed HEAD nor a delayed commit can carry it past either bound.
+- Failed, cancelled and recovered jobs keep `finished + R`.
+- The second term is on R2's clock, and so is the provider's deletion. The control
+  plane's signer keeps every URL's `X-Amz-Date + X-Amz-Expires` at or before
+  `expiresAt`, so R2 stops honouring every link at least 300 s before it may delete the
+  object, whatever the Worker's or Vercel's clock reads. No Vercel change is needed:
+  the signer, the file route and the DTO already read the Worker's `expiresAt` as is.
+
+**The provider timestamp.** `ObjectStoreHead` gains a required `lastModifiedAtMs`: the
+HeadObject's `Last-Modified` as whole-second epoch milliseconds, taken from the SDK's
+own `Date` (`@aws-sdk/client-s3` 3.1120.0; garbage, RFC 850 or ISO values make the SDK
+itself fail the HEAD, without a retry). The delegated writer re-validates it through
+the same strict schema, and the ready commit's input requires it: there is no fallback
+to `finished + R` alone and no local time substitutes for it. It is never stored and
+never appears in a job view, the N5 DTO, activity, browser storage or a signed URL;
+only the capped `expiresAt` does, as before. No migration, no new public field, no new
+error code. The provider's `x-amz-expiration` report is evaluated but not enforced:
+a runtime interlock on it would be a separate decision.
+
+**Refusals.** No ready commit; nothing is written; the exact key is deleted; the job
+fails `PROCESSING_FAILED` · "Upload failed" and is retained `finished + R`.
+
+| Internal reason | When |
+| :--- | :--- |
+| `invalid_last_modified` | missing, not a nonnegative safe whole-second integer, or a cap past the safe integers |
+| `last_modified_in_future` | more than 300 s after the commit (the Worker's request-timestamp tolerance): bad data that would disable the cap |
+| `provider_window_elapsed` | `Last-Modified + 55 min` is not after the commit |
+| `expiry_before_job` | the expiry would precede the job's creation (a wall clock stepped back): refused, never floored into a longer expiry |
+
+**Operations.**
+
+- **Clock.** The Worker VM's clock must stay within 300 s of R2's. A larger lag refuses
+  every ready commit until it is corrected. Guest clock steps of minutes after a host
+  sleep have been recorded (+236 s, 2026-09-17). Symptom: a run of "Upload failed" jobs
+  whose uploads themselves completed.
+- **Lifecycle rule.** The cap assumes the rule's age is 3,600 s. Never shorten the
+  Production rule before shipping a matching constant and letting existing rows expire.
+  LD-5b's pre-flight reads the rule read-only.
+- **Retention.** Once this is deployed, `FILE_EXPIRATION_MINUTES` may be raised toward 55
+  without a dead-link risk. It stays 45 unless the Product Owner decides otherwise.
+- **Versions and rollback.** No contract or schema change. Rolling the Worker back to
+  `6e2f9edc` restores `ready + R`; rows this version wrote keep their shorter expiry. The
+  acceptance kit's local writer (`deploy/acceptance/ytdlp-generic/lib/local-object-writer.mjs`)
+  must match the image it runs against: both sides are strict.
+
+**Known limitations.**
+
+- A provider-safe window of 1–999 ms commits ready but cannot be served (the signer
+  needs at least one second). It needs a commit about 3,299 s after the completion;
+  a minimum usable window would be a Product Owner decision.
+- The refusal reason is internal: the public outcome is the existing
+  `PROCESSING_FAILED` · "Upload failed", and the Worker logs nothing per job.
+- A plausible but wrong `Last-Modified` cannot be detected.
+- Maintenance deletes on the Worker's clock, so a Worker clock running ahead deletes an
+  object early (pre-existing, unchanged).
 
 ## 8. Health and maintenance
 

@@ -41,6 +41,7 @@ import {
   DEFAULT_WORKER_TIME_LIMITS,
   WorkerTimeLimitsError,
   assertWorkerJobLifetimes,
+  deriveReadyExpiresAtMs,
 } from "../runtime/time-limits.ts";
 
 export interface SQLiteJobStoreOptions {
@@ -148,7 +149,8 @@ export class SQLiteJobStore implements WorkerJobStore {
 
   /**
    * LD-2a: every `expires_at_ms` this store writes after creation goes through
-   * here. The schema requires `expires_at_ms >= created_at_ms`, and only a wall
+   * here — except the ready transition's since LD-5b, which refuses an expiry
+   * that would need this floor instead of lengthening it. The schema requires `expires_at_ms >= created_at_ms`, and only a wall
    * clock stepped back past a job's creation by more than the window could
    * produce a smaller value, so the floor never binds on a monotonic clock: the
    * assignment is then exactly the value asked for. Without it such a clock
@@ -164,8 +166,10 @@ export class SQLiteJobStore implements WorkerJobStore {
   }
 
   /**
-   * LD-2a: the terminal assignment, `finished + R`, for ready, failed,
-   * cancelled and recovered jobs alike. `finished` is the instant the
+   * LD-2a: the terminal assignment, `finished + R`, for failed, cancelled and
+   * recovered jobs. (Ready jobs, since VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001:
+   * `deriveReadyExpiresAtMs`, the same `finished + R` capped by the object's
+   * provider lifecycle.) `finished` is the instant the
    * transition records: the row's existing `finished_at_ms`, which the UPDATE's
    * `COALESCE` keeps, or else `now`. Assigned exactly, never `MAX`ed with the
    * execution lifetime it replaces: a later value could outlive a ready object.
@@ -705,10 +709,12 @@ export class SQLiteJobStore implements WorkerJobStore {
       throw new Error("Embedded job ID in objectKey does not match the target job ID");
     }
 
-    const now = this.nowMs();
-
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      // LD-5b: the commit's own instant, read once the write lock is held, so
+      // no wait for the lock can make the instant the expiry is computed
+      // from — and recorded as `finished_at_ms` — earlier than the commit.
+      const now = this.nowMs();
       const stmt = this.db.prepare("SELECT * FROM worker_jobs WHERE job_id = ?");
       const row = stmt.get(jobId);
 
@@ -741,8 +747,30 @@ export class SQLiteJobStore implements WorkerJobStore {
       }
 
       // LD-2a: the person gets the full retention from the moment the file
-      // exists: `ready + R`.
-      const readyExpiresAt = this.terminalExpiresAt(durableJob, now);
+      // exists: `ready + R` —
+      //
+      // VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001: — but never past
+      // the stored object's provider lifecycle, less the safety margin:
+      // `min(finished + R, Last-Modified + 55 min)`. This is the ONE place the
+      // ready expiry is decided: here, inside the transition's own transaction,
+      // against this commit's own instant `now`, so neither a delayed HEAD nor a
+      // delayed commit can carry it past either bound. It is not floored at the
+      // row's creation like the other terminal assignments: an expiry that could
+      // only satisfy the row by growing is refused instead. A refused result —
+      // no window left, or an unusable `Last-Modified` — may not become ready:
+      // nothing is written, and the caller deletes the exact key it uploaded.
+      const ready = deriveReadyExpiresAtMs({
+        lastModifiedAtMs: validatedInput.lastModifiedAtMs,
+        readyCommitAtMs: now,
+        finishedAtMs: durableJob.finishedAt,
+        retentionMs: this.retentionMs,
+        jobCreatedAtMs: durableJob.createdAt,
+      });
+      if (!ready.ok) {
+        this.db.exec("COMMIT");
+        return { type: "ready_expiry_refused", reason: ready.reason, job: durableJobToView(durableJob) };
+      }
+      const readyExpiresAt = ready.expiresAtMs;
       const updateStmt = this.db.prepare(`
         UPDATE worker_jobs
         SET status = 'ready',
@@ -789,6 +817,11 @@ export class SQLiteJobStore implements WorkerJobStore {
       }
       if (resultingJob.expiresAt !== readyExpiresAt) {
         throw new Error("Ready job must carry its retention");
+      }
+      // LD-5b, a backstop to the derivation: the row as written keeps a window
+      // and never outlives the provider-safe instant; a breach rolls back.
+      if (resultingJob.expiresAt <= now || resultingJob.expiresAt > ready.providerSafeExpiresAtMs) {
+        throw new Error("Ready job must not outlive its provider lifecycle");
       }
 
       const view = durableJobToView(resultingJob);

@@ -11,6 +11,7 @@ import {
 } from "../../shared/worker/contracts.ts";
 import { WorkerErrorCodeSchema } from "../../shared/worker/errors.ts";
 import type { AcquisitionStopCause } from "../../shared/worker/job-failure.ts";
+import { isProviderLastModifiedAtMs, type ReadyExpiryRefusal } from "../runtime/time-limits.ts";
 
 /**
  * Internal durable worker job schema.
@@ -171,6 +172,14 @@ export const CommitReadyInputSchema = z.object({
   mime: z.string().min(1).max(255).regex(/^[^\u0000-\u001F\u007F]+$/, "no control characters allowed"),
   quality: z.string().max(255).regex(/^[^\u0000-\u001F\u007F]+$/, "no control characters allowed").nullable(),
   container: z.string().max(255).regex(/^[^\u0000-\u001F\u007F]+$/, "no control characters allowed").nullable(),
+  /**
+   * VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001: the uploaded object's
+   * provider `Last-Modified`, from the verified HEAD, in whole-second epoch
+   * milliseconds. Required: without it no ready commit is possible — there is
+   * no fallback to `finished + R` alone. Used only to cap this transition's
+   * expiry; never stored.
+   */
+  lastModifiedAtMs: z.number().refine(isProviderLastModifiedAtMs, "a provider Last-Modified instant in whole-second epoch milliseconds"),
 }).strict();
 
 export type CommitReadyInput = z.infer<typeof CommitReadyInputSchema>;
@@ -185,6 +194,17 @@ export type CommitReadyResult =
    * written; the caller must delete the exact key it uploaded.
    */
   | { type: "lifetime_expired"; job: WorkerJobView }
+  /**
+   * LD-5b: the job is still `uploading` and its execution lifetime still runs,
+   * but no ready expiry satisfies every bound at this commit — the stored
+   * object's provider lifecycle leaves no safe window, its `Last-Modified` is
+   * unusable, or the expiry would precede the job's creation
+   * (`deriveReadyExpiresAtMs`). It may not become ready. Nothing was written —
+   * the job, its expiry and its idempotency record are untouched — and the
+   * caller must delete the exact key it uploaded. Internal only: `reason` never
+   * leaves the Worker.
+   */
+  | { type: "ready_expiry_refused"; reason: ReadyExpiryRefusal; job: WorkerJobView }
   | { type: "not_found" };
 
 export const ExpiredReadyObjectSchema = z.object({
@@ -215,8 +235,13 @@ export type ExpiredReadyObject = z.infer<typeof ExpiredReadyObjectSchema>;
  *  - `createJob` (→ `queued`): `created + L`, the queue-wait bound;
  *  - `claimNextQueuedJob` (`queued` → `analyzing`): `claimed + L`, the
  *    execution bound;
- *  - every terminal transition — `commitReadyFromUploading`, `failJob`,
- *    `cancelJob`, `recover` — `finished + R`, the retention.
+ *  - every terminal transition — `failJob`, `cancelJob`, `recover` —
+ *    `finished + R`, the retention;
+ *  - `commitReadyFromUploading` (VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001):
+ *    `min(finished + R, Last-Modified + R2_OBJECT_LIFECYCLE_AGE_MS −
+ *    R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS)`, computed inside the ready
+ *    transaction with its own commit instant, so a ready link always ends at
+ *    least the safety margin before the provider may delete its object.
  *
  * Nothing else moves it: no progress write, no stage transition, no replay.
  * The status machine is acyclic, so the assignments are finite and there is
@@ -263,6 +288,11 @@ export interface WorkerJobStore {
    * `uploading` → `ready`, only while the job's execution lifetime is still
    * running (`expiresAt > now`, part of the conditional write). A late upload
    * gets `lifetime_expired` and nothing is written.
+   *
+   * LD-5b: the ready expiry is `min(finished + R, providerSafeExpiresAt)`, from
+   * `input.lastModifiedAtMs`, inside this transaction with its own commit
+   * instant; an object whose provider lifecycle leaves no safe window gets
+   * `ready_expiry_refused` and nothing is written.
    */
   commitReadyFromUploading(jobId: string, input: CommitReadyInput): CommitReadyResult;
 

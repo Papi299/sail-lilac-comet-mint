@@ -1,6 +1,7 @@
 /* eslint-disable no-control-regex */
 import { z } from "zod";
 import { WorkerObjectKeySchema, type WorkerObjectKey } from "../../shared/worker/contracts.ts";
+import { isProviderLastModifiedAtMs } from "../runtime/time-limits.ts";
 
 export const ObjectStorePutInputSchema = z.object({
   objectKey: WorkerObjectKeySchema,
@@ -20,6 +21,16 @@ export const ObjectStoreHeadSchema = z.object({
   contentLength: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   contentType: z.string().min(1).max(255).regex(/^[^\x00-\x1F\x7F]+$/, "no control characters allowed"),
   contentDisposition: z.string().min(1).max(1024).regex(/^[^\x00-\x1F\x7F]+$/, "no control characters allowed"),
+  /**
+   * VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001: the provider's own
+   * `Last-Modified` for the object — the instant its lifecycle counts from
+   * (for R2, the upload's completion) — in epoch MILLISECONDS, a whole number
+   * of seconds (`isProviderLastModifiedAtMs`). Required: a HEAD that cannot
+   * state it is not a verified upload, and nothing substitutes a local time.
+   * Internal to the Worker's storage layer and the ready commit; never stored,
+   * never part of any job view.
+   */
+  lastModifiedAtMs: z.number().refine(isProviderLastModifiedAtMs, "a provider Last-Modified instant in whole-second epoch milliseconds"),
 }).strict();
 
 export type ObjectStoreHead = z.infer<typeof ObjectStoreHeadSchema>;

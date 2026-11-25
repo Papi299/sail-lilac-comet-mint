@@ -159,6 +159,8 @@ class StageWriter implements ObjectStoreWriter {
   readonly objects = new Map<string, ObjectStorePutInput>();
   hold = false;
   putFails = false;
+  /** LD-5b: the clock the provider stamps Last-Modified with — the harness's store clock. */
+  providerClock: () => number = () => Date.now();
   putEntered = false;
   putSawAbort = false;
   deleteGate: Promise<void> | null = null;
@@ -188,7 +190,7 @@ class StageWriter implements ObjectStoreWriter {
     this.signals.push({ op: "head", signal: context.signal });
     const put = this.objects.get(objectKey);
     return put
-      ? { objectKey, contentLength: put.contentLength, contentType: put.contentType, contentDisposition: put.contentDisposition }
+      ? { objectKey, contentLength: put.contentLength, contentType: put.contentType, contentDisposition: put.contentDisposition, lastModifiedAtMs: Math.floor(this.providerClock() / 1000) * 1000 }
       : null;
   }
 
@@ -232,7 +234,7 @@ function virtualHarness(L: number): VirtualHarness {
     db,
     clock,
     store,
-    writer: new StageWriter(),
+    writer: Object.assign(new StageWriter(), { providerClock: () => clock.now }),
     timers: new VirtualTimers(),
     failCalls,
     cleanup: () => {
@@ -362,6 +364,24 @@ describe("LD-2b executor: UPLOAD_TIMEOUT is ONE absolute deadline, enforced", ()
     assert.equal(r.stage_label, "Upload failed");
     assert.equal((h.writer.puts[0]!.body as unknown as ReadStream).closed, true);
     assert.deepEqual(h.writer.deletes, [h.writer.puts[0]!.objectKey]);
+  });
+
+  it("LD-5b: a ready commit the provider lifecycle refuses ends the job PROCESSING_FAILED, 'Upload failed', retained finished + R; the exact key deleted", async () => {
+    h = virtualHarness(10_000_000);
+    const job = claim(h.store, h.clock);
+    // The provider's clock reads an hour ahead of the Worker's: its Last-Modified
+    // is beyond the 300 s clock-skew budget, so the ready commit is refused.
+    h.writer.providerClock = () => h.clock.now + 3_600_000;
+    await virtualExecutor(h, 60_000).execute(job);
+    const r = rowOf(h.db, job.jobId);
+    assert.equal(r.status, "failed", "never left uploading: the refusal is mapped, not treated as another writer's win");
+    assert.equal(r.error_code, "PROCESSING_FAILED");
+    assert.equal(r.safe_error_message, ERROR_MESSAGES.PROCESSING_FAILED);
+    assert.equal(r.stage_label, "Upload failed");
+    assert.equal(r.object_key, null, "a failed job never references the attempted object");
+    assert.equal(r.expires_at_ms, Number(r.finished_at_ms) + R, "the failed retention is finished + R, unchanged");
+    assert.deepEqual(h.writer.deletes, [h.writer.puts[0]!.objectKey], "exactly the attempted key");
+    assert.ok(h.timers.armed.every((t) => t.cleared), "no timer outlives the execution");
   });
 });
 

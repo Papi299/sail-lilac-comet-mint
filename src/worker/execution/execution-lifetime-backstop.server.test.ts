@@ -94,6 +94,8 @@ class VirtualTimers implements ExecutionBackstopTimers {
 class RecordingWriter implements ObjectStoreWriter {
   readonly puts: ObjectStorePutInput[] = [];
   readonly deletes: string[] = [];
+  /** LD-5b: the clock the provider stamps Last-Modified with — the harness's store clock. */
+  providerClock: () => number = () => Date.now();
   /** When set, `put` waits for it after consuming the body: an upload still in flight. */
   gate: Promise<void> | null = null;
   /**
@@ -135,6 +137,7 @@ class RecordingWriter implements ObjectStoreWriter {
           contentLength: put.contentLength,
           contentType: put.contentType,
           contentDisposition: put.contentDisposition,
+          lastModifiedAtMs: Math.floor(this.providerClock() / 1000) * 1000,
         }
       : null;
   }
@@ -259,7 +262,7 @@ function makeHarness(): Harness {
     db,
     clock,
     store,
-    writer: new RecordingWriter(),
+    writer: Object.assign(new RecordingWriter(), { providerClock: () => clock.now }),
     timers: new VirtualTimers(),
     failCalls,
     cleanup: () => {
