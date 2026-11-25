@@ -235,9 +235,10 @@ describe("LD-5b finalizer × store: a delayed HEAD and commit can never carry th
     }
   }
 
-  it("the commit instant, not the HEAD's answer, is what counts: time passing after the HEAD still shortens nothing it should not", async () => {
-    // The HEAD answers at once; the time is spent before the HEAD starts (a slow
-    // credential mint), so the commit happens 700 s after completion.
+  it("a HEAD answered 700 s after completion: the cap binds, not ready + R", async () => {
+    // The 700 s pass inside the HEAD (a slow answer), so the commit happens 700 s
+    // after completion. The HEAD's answer and the commit are told apart by the
+    // storeLag tests below.
     const w = world(R_DEFAULT, UPLOADING_AT);
     w.clock.now = COMPLETED_AT;
     w.provider.duringHead = ({ clock }) => {
@@ -314,7 +315,7 @@ describe("LD-5b finalizer × store: cancellation, the stage deadline and termina
     assert.deepEqual(w.provider.deletes, [w.key]);
   });
 
-  it("the deadline reached exactly when the HEAD answers (no timer fired): the last check before the commit refuses", async () => {
+  it("the deadline reached during the HEAD (no timer fired): the check after the HEAD refuses", async () => {
     const w = world(R_MAX, UPLOADING_AT);
     w.clock.now = COMPLETED_AT;
     w.provider.duringHead = ({ clock }) => {
@@ -489,6 +490,23 @@ describe("LD-5b finalizer × store: the commit's own instant decides, even when 
       w.storeLag.ms = 20_000;
     };
     assert.deepEqual(await finalize(w), { type: "lifetime_expired", cleanup: "deleted" });
+  });
+
+  it("lifetime crossing during the lag with a Last-Modified the cap would refuse: the execution lifetime still wins (lifetime_expired)", async () => {
+    const w = world(R_DEFAULT, UPLOADING_AT, 600_000);
+    const claimedPlusL = UPLOADING_AT - 3_000 + 600_000;
+    // R2 reports a completion an hour before the upload began: its provider-safe
+    // instant passed before the HEAD, so the cap alone would refuse this result.
+    const elapsedLm = Math.floor((UPLOADING_AT - 3_600_000) / 1000) * 1000;
+    assert.ok(elapsedLm + CAP < claimedPlusL - 10_000, "the provider-safe window is already gone");
+    w.provider.lastModifiedOverride = elapsedLm;
+    w.clock.now = claimedPlusL - 10_000;
+    w.provider.duringHead = () => {
+      w.storeLag.ms = 20_000;
+    };
+    assert.deepEqual(await finalize(w), { type: "lifetime_expired", cleanup: "deleted" });
+    assert.equal(w.commits, 1, "the store decided");
+    assert.equal(durable(w).status, "uploading");
   });
 });
 

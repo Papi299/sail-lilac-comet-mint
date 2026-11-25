@@ -194,7 +194,8 @@ export async function createWorkerRuntime(
     // The model's lifetimes are authoritative for durable job rows
     // (VIDEOFETCH-LD2A-JOB-LIFETIME-AND-RETENTION-001): the store assigns
     // `expiresAt` from them — `created + L` queued, `claimed + L` running,
-    // `finished + R` once terminal — and Vercel refuses to sign a download URL
+    // `finished + R` once terminal (at ready, capped at the stored object's
+    // `Last-Modified` + 55 min, LD-5b) — and Vercel refuses to sign a download URL
     // past that instant. There is no test override: the configuration is the
     // one owner, exactly as for the stage limits.
     const store = new SQLiteJobStore({

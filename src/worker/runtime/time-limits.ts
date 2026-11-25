@@ -159,7 +159,7 @@ export const DOWNLOAD_INACTIVITY_TIMEOUT_SECONDS = Object.freeze({
  * `FILE_EXPIRATION_MINUTES`, in minutes: the strict loader's range and default.
  * The maximum is the R2 lifecycle age less the safety margin
  * (`R2_OBJECT_LIFECYCLE_AGE_MS − R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS`, pinned by
- * `time-limits.test.ts`). It bounds `R`; it does not by itself keep a ready link
+ * `ready-result-lifecycle.test.ts`). It bounds `R`; it does not by itself keep a ready link
  * five minutes inside the rule, because the rule counts from the object's
  * `Last-Modified`, not from the ready commit. The ready transition's cap
  * (`deriveReadyExpiresAtMs`) does.
@@ -501,7 +501,11 @@ export type ReadyExpiry =
  *                     lastModifiedAt + R2_OBJECT_LIFECYCLE_AGE_MS
  *                                    − R2_RESULT_LIFECYCLE_SAFETY_MARGIN_MS)
  *
- * where `finished` is the ready commit's own instant (`finishedAtMs ?? readyCommitAtMs`).
+ * where `finished` is the instant the transition records as `finished_at_ms`:
+ * the row's existing value (`finishedAtMs`, which the UPDATE's `COALESCE`
+ * keeps, as at every terminal transition), or else the commit instant
+ * `readyCommitAtMs`. An `uploading` row never carries one, so for every row
+ * this code produces `finished` is the commit instant: PO-20's `readyCommitAt`.
  * The ONE caller is the durable ready transition, inside its own transaction,
  * with that transaction's own commit instant. Nothing earlier — not the upload
  * finalizer, not the HEAD — decides the expiry, so neither a delayed HEAD nor a
@@ -516,8 +520,10 @@ export type ReadyExpiry =
  *    safe integers → `invalid_last_modified`;
  *  - after `readyCommitAtMs + R2_LAST_MODIFIED_FUTURE_TOLERANCE_MS` →
  *    `last_modified_in_future` (bad data: it would disable the cap);
- *  - an expiry not after `readyCommitAtMs` → `provider_window_elapsed` (only
- *    the provider term can do this: `finished + R` is after the commit);
+ *  - an expiry not after `readyCommitAtMs` → `provider_window_elapsed` (for
+ *    every row this code produces only the provider term can do this, since
+ *    `finished + R` is then after the commit; a recorded finish more than `R`
+ *    before the commit would too);
  *  - an expiry before `jobCreatedAtMs` → `expiry_before_job`.
  *
  * Nothing is clamped or floored: a refused timestamp is never turned into a
@@ -547,7 +553,7 @@ export function deriveReadyExpiresAtMs(input: {
   }
   const retentionBoundMs = (finishedAtMs ?? readyCommitAtMs) + retentionMs;
   if (!Number.isSafeInteger(retentionBoundMs)) {
-    throw new WorkerTimeLimitsError("readyCommitAtMs");
+    throw new WorkerTimeLimitsError(finishedAtMs === null ? "readyCommitAtMs" : "finishedAtMs");
   }
   if (!isProviderLastModifiedAtMs(lastModifiedAtMs)) {
     return { ok: false, reason: "invalid_last_modified" };

@@ -80,6 +80,14 @@ describe("LD-5b: the HEAD's Last-Modified through the real SDK over a socket", (
     assert.equal((await writer.head(KEY))?.lastModifiedAtMs, 1_795_599_531_000);
   });
 
+  it("a Last-Modified that is missing while x-amz-expiration is present: Invalid head response — never rebuilt from the lifecycle report", async () => {
+    const writer = await writerWith(() => ({
+      lastModified: null,
+      expiration: 'expiry-date="Wed, 25 Nov 2026 10:38:51 GMT", rule-id="videofetch-expired-job-backstop"',
+    }));
+    await assert.rejects(() => writer.head(KEY), invalidHead);
+  });
+
   for (const [label, lastModified] of [
     ["missing", null],
     ["fractional seconds (the SDK accepts them; R2 never sends them)", "Wed, 25 Nov 2026 09:38:51.500 GMT"],

@@ -824,22 +824,26 @@ function ld5bViolations(graph: Map<string, string>): string[] {
   return out;
 }
 
-/** Every non-test control-plane, browser and shared module: none may carry the provider timestamp. */
+/**
+ * Every non-test module under `src/` outside the Worker (`src/worker`) and the
+ * broker (`src/broker`): the control plane, the browser, shared code, types and
+ * the root-level modules. None may carry the provider timestamp.
+ */
 function controlPlaneSources(overlay: Overlay = {}): Map<string, string> {
   const { read } = makeReader(overlay);
   const out = new Map<string, string>();
+  const excluded = new Set([join(ROOT, "src/worker"), join(ROOT, "src/broker")]);
   const walk = (dir: string) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (/\.(ts|tsx)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) && !/\.fixtures\.ts$/.test(entry.name)) {
+      if (entry.isDirectory()) {
+        if (!excluded.has(full)) walk(full);
+      } else if (/\.(ts|tsx)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) && !/\.fixtures\.ts$/.test(entry.name)) {
         out.set(full, read(full));
       }
     }
   };
-  for (const dir of ["src/web", "src/lib", "src/routes", "src/components", "src/shared"]) {
-    if (existsSync(join(ROOT, dir))) walk(join(ROOT, dir));
-  }
+  walk(join(ROOT, "src"));
   for (const [relPath, source] of Object.entries(overlay)) out.set(join(ROOT, relPath), source);
   return out;
 }
@@ -894,6 +898,9 @@ describe("LD-5b: one lifecycle cap, applied at the durable commit; the provider 
     assert.ok(sources.size > 50, `a real scan, saw ${sources.size} modules`);
     assert.ok([...sources.keys()].some((f) => f.endsWith("src/shared/worker/contracts.ts")), "the shared contract is scanned");
     assert.ok([...sources.keys()].some((f) => f.endsWith("src/web/jobs/public-job.ts")), "the browser DTO is scanned");
+    assert.ok([...sources.keys()].some((f) => f.endsWith("src/types/job.ts")), "the browser's job type is scanned");
+    assert.ok([...sources.keys()].some((f) => f.endsWith("src/router.tsx")), "root-level modules are scanned");
+    assert.equal([...sources.keys()].some((f) => f.startsWith(join(ROOT, "src/worker/")) || f.startsWith(join(ROOT, "src/broker/"))), false, "the Worker and the broker are not part of this scan");
     assert.deepEqual(timestampLeaks(sources), []);
   });
 

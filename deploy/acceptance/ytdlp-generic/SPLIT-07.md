@@ -192,6 +192,15 @@ The topology is recorded as **observed**, not assumed:
 SPLIT-07A uses two checkouts at two commits. SPLIT-07B may use one merged
 commit, and even one checkout, for both roles.
 
+**LD-5b boundary.** Since `VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001` the
+local object writer reports `lastModifiedAtMs`, and it validates against the image's
+own `src` (SPLIT-06 §2), whose head schema is strict on both sides of that change. A
+harness and a release context on different sides of LD-5b therefore fail every
+full-path child at upload verification, which reads like a product failure. A
+SPLIT-07A or HLS-9A pair must not straddle LD-5b: qualify an image that contains it with
+a harness from the same commit (SPLIT-07B style). The driver records
+`harness.commitIsReleaseSource` but does not refuse a straddling pair.
+
 ### The candidate is its immutable image id (since `-02`)
 
 The temporary tag is a mutable pointer. Between the moment the driver inspects

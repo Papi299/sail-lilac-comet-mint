@@ -247,7 +247,9 @@ export type WorkerRuntimeConfig = {
     readonly maxVideoDurationSeconds: number;
     /**
      * `FILE_EXPIRATION_MINUTES`: how long a job's terminal outcome — a ready
-     * file's link included — stays authorised after the job ends. 1..55.
+     * file's link included — stays authorised after the job ends. 1..55. A
+     * ready link additionally ends no later than the stored object's
+     * `Last-Modified` + 55 min (LD-5b, `deriveReadyExpiresAtMs`).
      */
     readonly fileExpirationMinutes: number;
     /** `DOWNLOAD_TIME_LIMIT`: ONE absolute deadline for a job's acquisition stage. */
@@ -610,7 +612,9 @@ export function loadWorkerRuntimeConfig(
     ),
     // LD-2a: capped at 55 (was 1440). Retention is now counted from the moment
     // a job ends, and a ready link must end before the R2 lifecycle rule
-    // deletes the object 60 minutes after it was written.
+    // deletes the object 60 minutes after it was written. The cap bounds `R`
+    // only; the ready transition's own cap at `Last-Modified` + 55 min (LD-5b)
+    // is what keeps a ready link inside the rule.
     fileExpirationMinutes: readOptionalField(
       "FILE_EXPIRATION_MINUTES",
       env.FILE_EXPIRATION_MINUTES,

@@ -127,9 +127,9 @@ export interface S3SendClient {
 
 /**
  * LD-5b: the HEAD's provider timestamp, from the SDK's OWN deserialization of
- * `Last-Modified` (a `Date`), never from any local clock. Anything else —
- * absent, not a `Date`, an invalid `Date` — yields `undefined`, which the
- * strict head schema refuses; so does a negative or fractional instant.
+ * `Last-Modified` (a `Date`), never from any local clock. Absent or not a
+ * `Date` yields `undefined`; an invalid `Date` yields `NaN`. The strict head
+ * schema refuses both, as it does a negative or fractional instant.
  */
 function headLastModifiedAtMs(value: unknown): number | undefined {
   return value instanceof Date ? value.getTime() : undefined;

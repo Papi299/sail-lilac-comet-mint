@@ -54,7 +54,11 @@ export interface SQLiteJobStoreOptions {
    * derives it.
    */
   executionLifetimeMs?: number;
-  /** `R`: assigned at every terminal transition as `finished + R`. Same defaulting. */
+  /**
+   * `R`: assigned at every terminal transition as `finished + R`; at ready, at
+   * most that and never later than the stored object's `Last-Modified` + 55 min
+   * (`deriveReadyExpiresAtMs`, LD-5b). Same defaulting.
+   */
   retentionMs?: number;
   clock?: () => number;
   generateJobId?: () => string;

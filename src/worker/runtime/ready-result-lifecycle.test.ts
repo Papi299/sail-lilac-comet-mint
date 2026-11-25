@@ -217,6 +217,15 @@ describe("LD-5b: deriveReadyExpiresAtMs — refusals, never a clamp", () => {
     assert.deepEqual(derive(CREATED - 3_360_000, CREATED - 200_000, R_DEFAULT), refused("expiry_before_job"));
   });
 
+  it("accepts an expiry exactly at the job's creation: the expiry_before_job boundary is strict", () => {
+    // The Worker's clock stepped back 10 s past the creation, with a 10 s retention: finished + R = created.
+    assert.deepEqual(derive(CREATED - 5_000, CREATED - 10_000, 10_000), {
+      ok: true,
+      expiresAtMs: CREATED,
+      providerSafeExpiresAtMs: CREATED - 5_000 + CAP,
+    });
+  });
+
   it("refuses a cap past the safe integers instead of overflowing", () => {
     // A 1 ms retention keeps `finished + R` representable, so the provider term is what overflows.
     const top = 9_007_199_254_740_000;
@@ -233,6 +242,7 @@ describe("LD-5b: deriveReadyExpiresAtMs — refusals, never a clamp", () => {
     assert.throws(() => derive(LM, LM, Number.NaN), field("retentionMs"));
     assert.throws(() => derive(LM, LM, R_DEFAULT, CREATED, -1), field("finishedAtMs"));
     assert.throws(() => derive(LM, Number.MAX_SAFE_INTEGER, R_DEFAULT, 0), field("readyCommitAtMs"), "finished + R past the safe integers");
+    assert.throws(() => derive(LM, LM, R_DEFAULT, 0, Number.MAX_SAFE_INTEGER - 1_000), field("finishedAtMs"), "a recorded finish + R past the safe integers");
   });
 
   it("judges an invalid value before any clock comparison", () => {

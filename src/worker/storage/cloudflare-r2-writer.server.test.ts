@@ -576,8 +576,8 @@ describe("CloudflareR2ObjectStoreWriter", () => {
   // ── VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001 ───────────────────
   //
   // The HEAD keeps the provider's own Last-Modified, from the SDK's own
-  // deserialization (a Date), and checks the provider's lifecycle report when
-  // there is one. The values below are what @aws-sdk/client-s3 3.1120.0 really
+  // deserialization (a Date); it does not read the provider's lifecycle report
+  // (x-amz-expiration). The values below are what @aws-sdk/client-s3 3.1120.0 really
   // returns for those headers (no-network probe of its HeadObject
   // deserializer); the real SDK over a socket is in `r2-head-lifecycle.server.test.ts`.
 
@@ -607,7 +607,12 @@ describe("CloudflareR2ObjectStoreWriter", () => {
     });
   }
 
-  it("LD-5b: the provider's x-amz-expiration report is not consumed — evaluated, not enforced; only Last-Modified is carried", async () => {
+  it("LD-5b: a Last-Modified that is absent while an R2-shaped x-amz-expiration is present -> Invalid head response (never rebuilt from the lifecycle report)", async () => {
+    const writer = new CloudflareR2ObjectStoreWriter(validConfig, headAnswer({ LastModified: undefined, Expiration: EXPIRATION }));
+    await assert.rejects(() => writer.head(validKey), (err: unknown) => err instanceof CloudflareR2Error && err.message === "Invalid head response");
+  });
+
+  it("LD-5b: the provider's x-amz-expiration report is not read; only Last-Modified is carried", async () => {
     for (const expiration of [EXPIRATION, 'expiry-date="Wed, 25 Nov 2026 10:08:51 GMT", rule-id="short"', "garbage", undefined]) {
       const writer = new CloudflareR2ObjectStoreWriter(validConfig, headAnswer({ LastModified: LAST_MODIFIED, Expiration: expiration }));
       assert.deepStrictEqual(await writer.head(validKey), {

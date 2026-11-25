@@ -7,6 +7,7 @@ import { openWorkerDatabase } from "./database.server.ts";
 import { applyMigrations } from "./migrations.server.ts";
 import { SQLiteJobStore } from "./sqlite-job-store.server.ts";
 import type { CommitReadyResult } from "./job-store.ts";
+import { deriveReadyExpiresAtMs } from "../runtime/time-limits.ts";
 
 /**
  * VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001 — the ready transition's
@@ -264,6 +265,18 @@ describe("LD-5b store: a missing, malformed or implausible Last-Modified never b
     assert.equal(idem(h, jobId).job_expires_at_ms, LM + CAP);
   });
 
+  it("accepts an expiry exactly at the job's creation (the row's CHECK allows equality): neither refused nor floored", () => {
+    // The Worker's clock stepped back 10 s past the creation, with a 10 s retention: finished + R = created.
+    const h = harness(10_000, 2 * 3_600_000 + 1_500_000);
+    const jobId = uploadingJob(h);
+    h.clock.now = T0 - 10_000;
+    const res = commit(h, jobId, T0 - 5_000);
+    assert.equal(res.type, "ready");
+    assert.equal(row(h, jobId).created_at_ms, T0);
+    assert.equal(row(h, jobId).expires_at_ms, T0);
+    assert.equal(idem(h, jobId).job_expires_at_ms, T0);
+  });
+
   it("refuses a cap past the safe integers (arithmetic overflow) without writing", () => {
     // Unreachable through createJob, whose 24-hour idempotency floor needs
     // `created + 24 h` to be a safe integer; the uploading row is inserted
@@ -289,13 +302,61 @@ describe("LD-5b store: a missing, malformed or implausible Last-Modified never b
 });
 
 describe("LD-5b store: the existing precedence and the other terminal retentions are unchanged", () => {
-  it("an execution lifetime that ended still wins: lifetime_expired, even with an elapsed provider window", () => {
-    const h = harness(R_DEFAULT, 1_000_000);
-    const jobId = uploadingJob(h);
-    h.clock.now = T0 + 1_000 + 1_000_000; // exactly claimed + L
-    assert.equal(commit(h, jobId, T0).type, "lifetime_expired");
-    assert.equal(row(h, jobId).status, "uploading");
-  });
+  // The derivation itself, called with the row's own values at the commit
+  // instant: proves that each Last-Modified below WOULD be refused there, so a
+  // test expecting an earlier outcome really exercises the precedence.
+  const wouldRefuse = (h: Harness, jobId: string, lastModifiedAtMs: number) => {
+    const r = row(h, jobId);
+    const derived = deriveReadyExpiresAtMs({
+      lastModifiedAtMs,
+      readyCommitAtMs: h.clock.now,
+      finishedAtMs: r.finished_at_ms,
+      retentionMs: R_DEFAULT,
+      jobCreatedAtMs: r.created_at_ms,
+    });
+    return derived.ok ? null : derived.reason;
+  };
+
+  for (const [label, lm, reason] of [
+    ["an elapsed provider window", T0 - 3_600_000, "provider_window_elapsed"],
+    ["a far-future Last-Modified", LM * 1000, "last_modified_in_future"],
+  ] as const) {
+    it(`an execution lifetime that ended still wins: lifetime_expired, even with ${label} (${reason})`, () => {
+      const h = harness(R_DEFAULT, 1_000_000);
+      const jobId = uploadingJob(h);
+      h.clock.now = T0 + 1_000 + 1_000_000; // exactly claimed + L
+      assert.equal(wouldRefuse(h, jobId, lm), reason, "the condition is real: the derivation refuses this Last-Modified here");
+      const before = row(h, jobId);
+      const beforeIdem = idem(h, jobId);
+      assert.equal(commit(h, jobId, lm).type, "lifetime_expired");
+      assert.deepEqual(row(h, jobId), before, "the job row is untouched");
+      assert.deepEqual(idem(h, jobId), beforeIdem, "the idempotency record is untouched");
+    });
+
+    it(`a job not yet uploading still answers not_uploading, even with ${label} (${reason})`, () => {
+      const h = harness(R_DEFAULT);
+      const created = h.store.createJob(
+        { url: "https://cdn.example/clip.mp4", formatId: "direct-original", principalId: "private-access-user" },
+        randomUUID(),
+      );
+      assert.equal(created.type, "created");
+      const jobId = created.type === "created" ? created.job.jobId : "";
+      h.clock.now += 1_000;
+      assert.equal(h.store.claimNextQueuedJob()?.jobId, jobId);
+      h.clock.now += 1_000;
+      assert.equal(h.store.completeAnalysis(jobId, { title: "Clip", thumbnail: null, source: "cdn.example", extractor: "direct" }).type, "updated");
+      h.clock.now += 1_000;
+      assert.equal(h.store.beginProcessing(jobId).type, "updated");
+      h.clock.now = LM + 1_000;
+      assert.equal(wouldRefuse(h, jobId, lm), reason, "the condition is real: the derivation refuses this Last-Modified here");
+      const before = row(h, jobId);
+      const beforeIdem = idem(h, jobId);
+      assert.equal(commit(h, jobId, lm).type, "not_uploading");
+      assert.deepEqual(row(h, jobId), before, "the job row is untouched");
+      assert.deepEqual(idem(h, jobId), beforeIdem, "the idempotency record is untouched");
+      assert.equal(row(h, jobId).status, "processing");
+    });
+  }
 
   it("a terminal winner still wins: terminal, whatever the Last-Modified says", () => {
     const h = harness(R_DEFAULT);
