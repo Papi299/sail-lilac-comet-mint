@@ -101,6 +101,16 @@ Safe for transmission to Vercel. When ready, it contains:
 DEPLOYED** (deployment runbook §7b). The field, its type and its name are
 unchanged; what it holds depends on the job's state:
 
+> **Status update (2026-11-25).** LD-2a has been live since 2026-10-30. The `ready` row
+> below changes with `VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001` (runbook §7f;
+> source change, not yet merged or deployed): a ready job's `expiresAt` becomes
+> `min(readyAt + R, Last-Modified + 3,300 s)`, where `Last-Modified` is the stored object's
+> own provider timestamp. The field's name, type and meaning — "the instant after which
+> the job is no longer authorised" — are unchanged, so the control plane needs no change.
+> The raw provider timestamp is never stored or serialised in any Worker or control-plane
+> response; but whenever the cap binds, `expiresAt − 3,300 s` equals the object's
+> `Last-Modified`, the user's own upload-completion second.
+
 | Status | `expiresAt` | `GET /v1/jobs/:jobId` |
 | :--- | :--- | :--- |
 | `queued` | `createdAt + L` | the job until then; `410 EXPIRED` from then |
@@ -109,7 +119,8 @@ unchanged; what it holds depends on the job's state:
 
 `L` is the Worker's derived execution lifetime and `R` its retention
 (`FILE_EXPIRATION_MINUTES`, 1–55 min). A ready link is therefore authorised for
-`R` from the moment the file exists. The control plane needs no change: it
+`R` from the moment the file exists — at most; with LD-5b (not yet deployed), never past the stored
+object's `Last-Modified` + 55 minutes, at least five minutes inside the R2 lifecycle rule. The control plane needs no change: it
 signs only while `status == ready` and `now < expiresAt`. A Worker image without
 this change holds `createdAt + FILE_EXPIRATION_MINUTES` in every state and
 answers 410 past it for any status.
@@ -869,7 +880,7 @@ Vercel validates the returned code against the shared allowlist before mapping i
 | Invalid URL (yt-dlp fails) | 400 Bad Request | `INVALID_URL` |
 | Processing Timeout | 408 Request Timeout | `TIMEOUT` |
 | Processing Failed | 500 Internal Error | `PROCESSING_FAILED` |
-| Job Expired | 410 Gone | `EXPIRED` — since LD-2a (not deployed) only a queued or terminal job past its `expiresAt`, never an active one |
+| Job Expired | 410 Gone | `EXPIRED` — since LD-2a (not deployed when written; live since 2026-10-30) only a queued or terminal job past its `expiresAt`, never an active one |
 
 ### Failed-job classification
 
@@ -937,7 +948,7 @@ a row failed by an older Worker, which still holds its last progress label.
 | Generic extraction disabled or its runtime unavailable | `EXTRACTOR_UNAVAILABLE` | Download failed |
 | Over the size or duration limit | `TOO_LARGE` / `TOO_LONG` | the phase that measured it |
 | Local merge, remux or transcode failure; output validation | `PROCESSING_FAILED` | Processing failed |
-| Object-store write, verification or ready commit | `PROCESSING_FAILED` | Upload failed |
+| Object-store write, verification or ready commit — including, with LD-5b (not yet deployed), a ready commit refused because the stored object's provider lifecycle leaves no safe window or its `Last-Modified` is unusable | `PROCESSING_FAILED` | Upload failed |
 | Worker restart during execution | `PROCESSING_FAILED` (restart message) | Worker restarted |
 | Anything unclassifiable (local capacity, job directory, unexpected exception) | `PROCESSING_FAILED` | the phase it ran in |
 | Worker unreachable or failing at the transport level | `WORKER_UNAVAILABLE` (control plane only) | — |
@@ -989,6 +1000,10 @@ the Worker; an unexpected failure is a 500. Runbook §4l has the details.
 
 ### Browser cancellation and job outcomes (`VIDEOFETCH-LD4A-CANCELLATION-UX-AND-OUTCOME-CONTRACT-001`)
 
+> **Status update (2026-11-25).** Merged as `93f0027b`; live since 2026-11-13 (Vercel
+> N4), carried by N5 since 2026-11-23. The paragraph below is the original text, kept as
+> written.
+
 **IMPLEMENTED IN SOURCE — NOT DEPLOYED.** Vercel-only; no Worker change, no new
 error code, no schema change. Deploy order: this control plane first; a Worker
 that writes a reserved stage (LD-3b/LD-3c) only after it is live.
@@ -1037,6 +1052,10 @@ only with `TIMEOUT`. A failed `TIMEOUT` message is chosen by stage:
 it, and no failed job's card shows it any more. An older control plane shows a
 reserved stage as `Failed` with that canonical message.
 
+> **Status update (2026-11-25).** The Worker side below was merged as `388b187c` and has
+> been live since 2026-11-23 (Worker `f8007864`), carried by the current Worker
+> `6e2f9edc`. The paragraph is the original text, kept as written.
+
 **Worker side (`VIDEOFETCH-LD3-WATCHDOG-RUNTIME-ACTIVATION-001`, source only —
 NOT MERGED, NOT DEPLOYED).** The Worker writes the two reserved stages once its
 acquisition watchdog is connected: `Download stalled` when the watchdog stops an
@@ -1051,6 +1070,13 @@ control plane already forwards both. An observation loss keeps
 earlier stage. No new error code and no schema change. Runbook §7d.
 
 ### Live acquisition activity and reload reattachment (`VIDEOFETCH-LD4B-ACTIVITY-CONTRACT-PROGRESS-AND-REATTACHMENT-001`)
+
+> **Status update (2026-11-25).** Merged as `f95c655e`. The `activity` schema below was
+> accepted by the Product Owner and is live: Vercel N5 (`dpl_47noctv6…`) since
+> 2026-11-23 17:55Z, Worker `6e2f9edc` since 2026-11-24 12:13Z, and
+> `JOB_STATUS_ACTIVITY_ENABLED=true` since 2026-11-24 22:41Z. **N4 must not be restored
+> while the Worker publishes activity** (runbook §7, state of record). The paragraph
+> below is the original text, kept as written.
 
 **IMPLEMENTED IN SOURCE — NOT MERGED, NOT DEPLOYED. The public `activity`
 schema below is a PROPOSAL awaiting Product Owner acceptance.** Deploy order:

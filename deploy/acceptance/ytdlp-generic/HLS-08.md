@@ -106,7 +106,9 @@ Both hooks are cleared in a `finally`, and the run observes the restoration.
 ### 3. The local object writer (`lib/local-object-writer.mjs`)
 
 Reused unchanged from SPLIT-06. Cloudflare R2 is substituted; everything on the
-Worker's side stays real, and its HEAD measures the persisted file.
+Worker's side stays real, and its HEAD measures the persisted file — since LD-5b its
+length and its whole-second modification time (SPLIT-06 §2). A harness and an image on
+different sides of LD-5b fail the upload verification: see SPLIT-07, "LD-5b boundary".
 
 ---
 

@@ -346,7 +346,7 @@ describe("SQLiteJobStore.failJob: the acquisition stops' own stages", () => {
     const ready = uploading();
     const objectKey = `videofetch/jobs/${ready}/${"a".repeat(32)}` as never;
     assert.equal(
-      store.commitReadyFromUploading(ready, { objectKey, filename: "x.mp4", fileSize: 1, mime: "video/mp4", quality: null, container: "mp4" }).type,
+      store.commitReadyFromUploading(ready, { objectKey, filename: "x.mp4", fileSize: 1, mime: "video/mp4", quality: null, container: "mp4", lastModifiedAtMs: Math.floor(Date.now() / 1000) * 1000 }).type,
       "ready",
     );
     const readyView = store.getJob(ready);

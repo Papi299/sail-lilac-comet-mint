@@ -33,12 +33,18 @@ class FakeObjectStoreWriter implements ObjectStoreWriter {
   public deleteFailures = new Set<string>();
   public headOverride: ((obj: ObjectStorePutInput) => ObjectStoreHead) | null = null;
 
+  // LD-5b: the provider's whole-second Last-Modified for each stored object, stamped at completion
+  // on `providerClock` — the clock of the store the test commits to.
+  public lastModified = new Map<string, number>();
+  public providerClock: () => number = () => Date.now();
+
   async put(input: ObjectStorePutInput): Promise<void> {
     this.putCalls.push(input);
     if (this.putShouldThrow) {
       throw this.putShouldThrow instanceof Error ? this.putShouldThrow : new Error("Fake put failure");
     }
     this.objects.set(input.objectKey, input);
+    this.lastModified.set(input.objectKey, Math.floor(this.providerClock() / 1000) * 1000);
   }
 
   async head(objectKey: string): Promise<ObjectStoreHead | null> {
@@ -58,6 +64,7 @@ class FakeObjectStoreWriter implements ObjectStoreWriter {
       contentLength: obj.contentLength,
       contentType: obj.contentType,
       contentDisposition: obj.contentDisposition,
+      lastModifiedAtMs: this.lastModified.get(objectKey)!,
     };
   }
 
@@ -228,30 +235,45 @@ describe("Upload Lifecycle Coordinator", () => {
   });
 
   it("metadata mismatch test matrix", async () => {
-    const cases = [
-      { 
-        name: "wrong contentLength", 
-        override: (obj: ObjectStorePutInput) => ({ ...obj, contentLength: obj.contentLength + 1 } as ObjectStoreHead) 
-      },
-      { 
-        name: "wrong contentType", 
-        override: (obj: ObjectStorePutInput) => ({ ...obj, contentType: "text/plain" } as ObjectStoreHead) 
-      },
-      { 
-        name: "wrong contentDisposition", 
-        override: (obj: ObjectStorePutInput) => ({ ...obj, contentDisposition: "inline" } as ObjectStoreHead) 
-      },
-      { 
-        name: "wrong objectKey", 
-        override: (obj: ObjectStorePutInput) => ({ ...obj, objectKey: "wrong" } as ObjectStoreHead) 
-      },
-      { 
-        name: "malformed head result (negative length)", 
-        override: (obj: ObjectStorePutInput) => ({ ...obj, contentLength: -1 } as unknown as ObjectStoreHead) 
+    // VIDEOFETCH-LD5B-R2-RETENTION-LIFECYCLE-HARDENING-001: every case starts
+    // from a VALID five-field head and changes exactly one thing, so each one
+    // reaches the check it names. (Before, each override spread the put input —
+    // its `body` included — so the strict head schema refused every case on that
+    // extra key, and the comparison below it was never reached.) A positive
+    // control proves the same head, unchanged, commits.
+    const validHead = (obj: ObjectStorePutInput): ObjectStoreHead => ({
+      objectKey: obj.objectKey,
+      contentLength: obj.contentLength,
+      contentType: obj.contentType,
+      contentDisposition: obj.contentDisposition,
+      lastModifiedAtMs: writer.lastModified.get(obj.objectKey)!,
+    });
+    const otherKey = (obj: ObjectStorePutInput) => `${obj.objectKey.slice(0, -32)}${"b".repeat(32)}`;
+    const cases: Array<{ name: string; override: (obj: ObjectStorePutInput) => ObjectStoreHead }> = [
+      { name: "wrong contentLength", override: (obj) => ({ ...validHead(obj), contentLength: obj.contentLength + 1 }) },
+      { name: "wrong contentType", override: (obj) => ({ ...validHead(obj), contentType: "text/plain" }) },
+      { name: "wrong contentDisposition", override: (obj) => ({ ...validHead(obj), contentDisposition: "inline" }) },
+      { name: "a different, valid objectKey", override: (obj) => ({ ...validHead(obj), objectKey: otherKey(obj) }) },
+      { name: "malformed head result (negative length)", override: (obj) => ({ ...validHead(obj), contentLength: -1 }) },
+      { name: "LD-5b: a sub-second lastModifiedAtMs (a local clock reading)", override: (obj) => ({ ...validHead(obj), lastModifiedAtMs: validHead(obj).lastModifiedAtMs + 437 }) },
+      {
+        name: "LD-5b: no lastModifiedAtMs",
+        override: (obj) => {
+          const head: Partial<ObjectStoreHead> = { ...validHead(obj) };
+          delete head.lastModifiedAtMs;
+          return head as ObjectStoreHead;
+        },
       },
     ];
 
-    for (const { override } of cases) {
+    // Positive control: the valid head, unchanged, reaches ready.
+    {
+      const job = setupUploadingJob();
+      writer.headOverride = validHead;
+      assert.strictEqual((await finalizeJobUpload(getUploadInput(job.jobId))).type, "ready", "positive control");
+    }
+
+    for (const { name, override } of cases) {
       writer.putCalls = [];
       writer.headCalls = [];
       writer.deleteCalls = [];
@@ -260,15 +282,11 @@ describe("Upload Lifecycle Coordinator", () => {
       writer.headOverride = override;
 
       const result = await finalizeJobUpload(input);
-      
-      assert.strictEqual(result.type, "storage_failure");
-      if (result.type === "storage_failure") {
-        assert.ok(["verification_failed"].includes(result.code)); 
-        assert.strictEqual(result.cleanup, "deleted");
-      }
-      assert.strictEqual(writer.deleteCalls.length, 1);
+
+      assert.deepStrictEqual(result, { type: "storage_failure", code: "verification_failed", cleanup: "deleted" }, name);
+      assert.strictEqual(writer.deleteCalls.length, 1, name);
       const dbJob = store.getJob(job.jobId);
-      assert.strictEqual(dbJob!.status, "uploading");
+      assert.strictEqual(dbJob!.status, "uploading", name);
     }
     writer.headOverride = null;
   });
@@ -328,6 +346,7 @@ describe("Upload Lifecycle Coordinator", () => {
   function lifetimeStore() {
     const clock = { now: 1_800_000_000_000 };
     const timed = new SQLiteJobStore({ db, clock: () => clock.now, executionLifetimeMs: 60_000, retentionMs: 30_000 });
+    writer.providerClock = () => clock.now; // LD-5b: the provider stamps on the same virtual clock
     const { job } = timed.createJob(
       { url: "https://example.com/video", formatId: "preset:1080", principalId: "private-access-user" },
       randomUUID(),
@@ -626,8 +645,10 @@ describe("Upload Lifecycle Coordinator", () => {
         mime: "video/mp4",
         quality: "1080p",
         container: "mp4",
+        // LD-5b: a valid provider timestamp, so the commit fails only on the corrupting trigger.
+        lastModifiedAtMs: Math.floor(Date.now() / 1000) * 1000,
       });
-    });
+    }, /Job must be ready after commitReadyFromUploading|objectKey mismatch|ready job must have a non-null objectKey/);
 
     db.exec("DROP TRIGGER test_corrupt_ready;");
 
@@ -783,7 +804,13 @@ class GatedWriter implements ObjectStoreWriter {
     await this.run("head", objectKey, context);
     const object = this.objects.get(objectKey);
     return object
-      ? { objectKey, contentLength: object.contentLength, contentType: object.contentType, contentDisposition: object.contentDisposition }
+      ? {
+          objectKey,
+          contentLength: object.contentLength,
+          contentType: object.contentType,
+          contentDisposition: object.contentDisposition,
+          lastModifiedAtMs: Math.floor(Date.now() / 1000) * 1000,
+        }
       : null;
   }
 

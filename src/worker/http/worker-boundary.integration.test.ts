@@ -85,6 +85,7 @@ class MemoryWriter implements ObjectStoreWriter {
       contentLength: input.contentLength,
       contentType: input.contentType,
       contentDisposition: input.contentDisposition,
+      lastModifiedAtMs: Math.floor(Date.now() / 1000) * 1000,
     });
   }
 

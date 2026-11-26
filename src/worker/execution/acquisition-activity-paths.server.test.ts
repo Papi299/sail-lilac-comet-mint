@@ -1341,7 +1341,7 @@ describe("the executor's activity plumbing", () => {
     const db = new DatabaseSync(join(dir, "test.sqlite"));
     applyMigrations(db);
     const store = new SQLiteJobStore({ db });
-    const puts: Array<{ objectKey: string; contentLength: number; contentType: string; contentDisposition: string }> = [];
+    const puts: Array<{ objectKey: string; contentLength: number; contentType: string; contentDisposition: string; lastModifiedAtMs: number }> = [];
     const writer: ObjectStoreWriter = {
       async put(input) {
         puts.push({
@@ -1349,6 +1349,7 @@ describe("the executor's activity plumbing", () => {
           contentLength: input.contentLength,
           contentType: input.contentType,
           contentDisposition: input.contentDisposition,
+          lastModifiedAtMs: Math.floor(Date.now() / 1000) * 1000,
         });
         for await (const piece of input.body) void piece;
       },

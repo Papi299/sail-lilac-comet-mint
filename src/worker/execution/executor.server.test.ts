@@ -30,7 +30,7 @@ describe("Job Executor and Queue Runner", () => {
 
     let lastPut: any = null;
     fakeWriter = {
-      async head(key) { return { objectKey: key, contentLength: 8, contentType: "video/mp4", contentDisposition: lastPut?.contentDisposition || "attachment" } as any; },
+      async head(key) { return { objectKey: key, contentLength: 8, contentType: "video/mp4", contentDisposition: lastPut?.contentDisposition || "attachment", lastModifiedAtMs: Math.floor(Date.now() / 1000) * 1000 } as any; },
       async put(opts) {
         lastPut = opts;
         for await (const _chunk of opts.body) { /* noop */ }
